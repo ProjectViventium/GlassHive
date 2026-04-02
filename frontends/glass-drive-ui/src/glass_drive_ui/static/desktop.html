@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GlassHive Desktop</title>
+    <style>
+      html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        background: #000;
+        color: #eef2f6;
+        overflow: hidden;
+        font-family: "Manrope", system-ui, sans-serif;
+      }
+      #desktop-shell {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        background: #000;
+      }
+      #desktop-stage {
+        position: absolute;
+        inset: 0;
+        background: #000;
+      }
+      #desktop-overlay {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        text-align: center;
+        padding: 24px;
+        background: linear-gradient(180deg, rgba(0,0,0,0.42), rgba(0,0,0,0.78));
+        z-index: 2;
+      }
+      #desktop-overlay[hidden] {
+        display: none;
+      }
+      .overlay-copy {
+        max-width: 720px;
+      }
+      .overlay-label {
+        margin: 0 0 10px;
+        color: rgba(238, 242, 246, 0.68);
+        font-size: 12px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+      #desktop-status {
+        margin: 0;
+        font-size: clamp(26px, 4vw, 44px);
+        letter-spacing: -0.04em;
+      }
+      #desktop-detail {
+        margin: 14px 0 0;
+        color: rgba(238, 242, 246, 0.78);
+        line-height: 1.55;
+      }
+      #clipboard-status {
+        position: absolute;
+        left: 18px;
+        bottom: 18px;
+        z-index: 3;
+        padding: 10px 14px;
+        border-radius: 999px;
+        background: rgba(8, 11, 16, 0.74);
+        border: 1px solid rgba(255,255,255,0.1);
+        color: rgba(238, 242, 246, 0.82);
+        font-size: 12px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+      #desktop-stage canvas {
+        outline: none;
+      }
+    </style>
+  </head>
+  <body>
+    <main id="desktop-shell">
+      <div id="desktop-stage"></div>
+      <div id="desktop-overlay">
+        <div class="overlay-copy">
+          <p class="overlay-label">GlassHive Desktop</p>
+          <h1 id="desktop-status">Connecting to sandbox…</h1>
+          <p id="desktop-detail">The live desktop will attach here automatically. Click once inside the surface to focus input and enable clipboard sync.</p>
+        </div>
+      </div>
+      <div id="clipboard-status">Clipboard sync: starting…</div>
+    </main>
+    <script src="/static/desktop.js?v=20260326a" type="module"></script>
+  </body>
+</html>

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GlassHive</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260326f" />
+  </head>
+  <body class="watch-body">
+    <div class="watch-app">
+      <header class="watch-ribbon">
+        <div class="watch-brand">
+          <span class="brand-mark">GlassHive</span>
+          <div>
+            <h1 id="watch-title">Worker live view</h1>
+            <p id="watch-subtitle">Connecting to sandbox…</p>
+          </div>
+        </div>
+        <div class="watch-summary">
+          <span id="status-label" class="meta-label">Live status</span>
+          <button id="result-toggle" class="result-toggle" type="button" aria-expanded="false">
+            <span id="latest-output-inline">No run output yet.</span>
+          </button>
+        </div>
+        <div class="watch-controls">
+          <span id="watch-state" class="state-pill">starting</span>
+          <button data-action="pause" type="button">Pause</button>
+          <button data-action="resume" type="button">Play</button>
+          <button data-action="interrupt" type="button">Interrupt</button>
+          <button id="menu-toggle" class="menu-toggle" type="button" aria-expanded="false">☰</button>
+        </div>
+      </header>
+      <section id="result-panel" class="result-panel" hidden>
+        <div class="result-panel-header">
+          <div>
+            <span class="meta-label">Latest worker output</span>
+            <h2 id="result-panel-title">Latest result</h2>
+          </div>
+          <button id="result-close" class="result-close" type="button">Close</button>
+        </div>
+        <pre id="latest-output-full">No run output yet.</pre>
+      </section>
+      <aside id="more-menu" class="more-menu" hidden>
+        <button id="surface-terminal" type="button">Watch exact live session</button>
+        <button id="surface-desktop" type="button">Watch live desktop</button>
+        <button id="open-external" type="button">Open current view in new tab</button>
+        <button id="open-terminal-link" type="button">Open terminal page</button>
+        <button id="open-worker-console" type="button">Open worker console</button>
+        <button data-action="codex" type="button">Open Codex</button>
+        <button data-action="claude" type="button">Open Claude</button>
+        <button data-action="openclaw" type="button">Open OpenClaw</button>
+        <button data-action="terminal" type="button">Open terminal</button>
+        <button data-action="files" type="button">Open files</button>
+        <button data-action="browser" type="button">Open browser</button>
+        <button data-action="terminate" class="danger" type="button">Shut down and delete</button>
+      </aside>
+      <main class="watch-stage">
+        <div id="stage-overlay" class="stage-overlay">
+          <div>
+            <p class="overlay-label">Worker warming up</p>
+            <h2 id="overlay-title">Preparing live sandbox…</h2>
+            <p id="overlay-detail">The view will attach automatically when the sandbox is ready.</p>
+          </div>
+        </div>
+        <iframe id="desktop-frame" title="Worker live surface" allow="clipboard-read; clipboard-write; fullscreen" allowfullscreen></iframe>
+      </main>
+      <footer class="watch-footer">
+        <form id="steer-form" class="steer-form">
+          <input id="steer-input" type="text" placeholder="Steer the worker from here. Ask for a checkpoint, redirect the plan, or tell it exactly what to do next." />
+          <button type="submit">Send</button>
+        </form>
+      </footer>
+    </div>
+    <script src="/static/watch.js?v=20260326f" type="module"></script>
+  </body>
+</html>

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GlassHive</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260326e" />
+  </head>
+  <body class="launch-body">
+    <main class="launch-shell">
+      <div class="ambient ambient-a"></div>
+      <div class="ambient ambient-b"></div>
+      <section class="composer-frame">
+        <div class="brand-row">
+          <span class="brand-mark">GlassHive</span>
+          <span class="brand-mode">Projects</span>
+        </div>
+        <div class="composer-copy">
+          <h1>Define the project once. Watch the worker do the rest.</h1>
+          <p>Describe the job. Set the success bar. Add context if it matters. The worker spins up and the live sandbox takes over the screen.</p>
+        </div>
+        <form id="launch-form" class="composer-form">
+          <label>
+            <span>Describe your project</span>
+            <textarea id="description" name="description" rows="6" placeholder="What should the worker actually accomplish?" required></textarea>
+          </label>
+          <label>
+            <span>Success Criteria</span>
+            <textarea id="success_criteria" name="success_criteria" rows="4" placeholder="What must be true before the project is considered complete?" required></textarea>
+          </label>
+          <label>
+            <span>Context</span>
+            <textarea id="context" name="context" rows="3" placeholder="Optional background, links, constraints, files, or access notes."></textarea>
+          </label>
+          <div class="worker-row">
+            <label class="worker-picker">
+              <span>Worker</span>
+              <select id="worker-option" name="worker_option"></select>
+            </label>
+            <button id="launch-button" type="submit" class="primary-button">Launch project</button>
+          </div>
+          <p id="launch-status" class="launch-status" aria-live="polite"></p>
+        </form>
+      </section>
+    </main>
+    <script src="/static/app.js?v=20260326e" type="module"></script>
+  </body>
+</html>

@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+from fastapi import Body, FastAPI, HTTPException
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from .prompt_template import build_operator_brief, build_project_title, desktop_action_for_launch, watch_surface_for_launch
+from .runtime_client import RuntimeClient
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+class LaunchRequest(BaseModel):
+    description: str = Field(min_length=1)
+    success_criteria: str = Field(min_length=1)
+    context: str | None = None
+    worker_option: str = "new:codex-cli"
+
+
+class MessageRequest(BaseModel):
+    message: str = Field(min_length=1)
+
+
+class ActionRequest(BaseModel):
+    url: str | None = None
+
+
+def flatten_workers(client: RuntimeClient) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for project in client.list_projects():
+        project_id = str(project["project_id"])
+        for worker in client.list_workers(project_id):
+            items.append(
+                {
+                    "project_id": project_id,
+                    "project_title": project.get("title") or project_id,
+                    "worker_id": worker["worker_id"],
+                    "name": worker.get("name") or worker["worker_id"],
+                    "profile": worker.get("profile") or "",
+                    "state": worker.get("state") or "",
+                }
+            )
+    return sorted(items, key=lambda item: (item["project_title"], item["name"]))
+
+
+def _project_title_for_worker(client: RuntimeClient, project_id: str) -> str:
+    try:
+        project = client.get_project(project_id)
+        return str(project.get("title") or project_id)
+    except Exception:
+        return project_id
+
+
+def _launch_browser_url(description: str) -> str | None:
+    lowered = description.strip()
+    match = re.search(r"https?://[^\s<>'\"`]+", lowered, flags=re.IGNORECASE)
+    if match:
+        return match.group(0).rstrip(").,;")
+    domain = re.search(r"\b([a-z0-9-]+(?:\.[a-z0-9-]+)+)\b", lowered, flags=re.IGNORECASE)
+    if domain:
+        host = domain.group(1)
+        if host.lower() not in {"localhost", "127.0.0.1", "0.0.0.0"}:
+            return f"https://{host}"
+    return None
+
+
+def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
+    client = runtime_client or RuntimeClient()
+    app = FastAPI(title="GlassHive", version="0.1.0")
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @app.get("/health")
+    def health() -> dict[str, Any]:
+        return {"status": "ok", "runtime": client.health()}
+
+    @app.get("/api/bootstrap")
+    def bootstrap() -> dict[str, Any]:
+        owner_id = os.environ.get("GLASSHIVE_DEFAULT_OWNER_ID", "demo-owner")
+        return {
+            "owner_id": owner_id,
+            "default_worker_option": "new:codex-cli",
+            "new_worker_options": [
+                {"value": "new:codex-cli", "label": "New main worker · Codex"},
+                {"value": "new:claude-code", "label": "New main worker · Claude Code"},
+                {"value": "new:openclaw-general", "label": "New main worker · OpenClaw"},
+            ],
+            "existing_workers": flatten_workers(client),
+        }
+
+    @app.post("/api/launch")
+    def launch(payload: LaunchRequest) -> dict[str, Any]:
+        owner_id = os.environ.get("GLASSHIVE_DEFAULT_OWNER_ID", "demo-owner")
+        brief = build_operator_brief(payload.description, payload.success_criteria, payload.context)
+        project_id: str
+        worker_id: str
+        profile: str
+
+        if payload.worker_option.startswith("existing:"):
+            worker_id = payload.worker_option.split(":", 1)[1]
+            worker = client.get_worker(worker_id)
+            project_id = str(worker["project_id"])
+            profile = str(worker.get("profile") or "codex-cli")
+        else:
+            profile = payload.worker_option.split(":", 1)[1] if ":" in payload.worker_option else "codex-cli"
+            project = client.create_project(owner_id, build_project_title(payload.description), payload.description.strip(), profile)
+            project_id = str(project["project_id"])
+            worker = client.create_worker(project_id, owner_id, profile)
+            worker_id = str(worker["worker_id"])
+
+        run = client.assign_run(worker_id, brief)
+        surface = watch_surface_for_launch(profile, payload.description)
+        try:
+            action = desktop_action_for_launch(profile, payload.description)
+            browser_url = _launch_browser_url(payload.description) if action == "browser" else None
+            if action != "browser" or browser_url:
+                client.desktop_action(
+                    worker_id,
+                    action,
+                    url=browser_url,
+                )
+        except Exception:
+            pass
+
+        return {
+            "project_id": project_id,
+            "worker_id": worker_id,
+            "run_id": run["run_id"],
+            "watch_url": f"/watch/{worker_id}?project_id={project_id}&surface={surface}",
+        }
+
+    @app.get("/api/worker/{worker_id}/live")
+    def worker_live(worker_id: str) -> dict[str, Any]:
+        payload = client.worker_live(worker_id)
+        worker = payload.get("worker") or {}
+        project_id = str(worker.get("project_id") or "")
+        payload["project_title"] = _project_title_for_worker(client, project_id) if project_id else ""
+        return payload
+
+    @app.get("/novnc/{worker_id}/{asset_path:path}")
+    def novnc_asset(worker_id: str, asset_path: str) -> Response:
+        payload = client.worker_live(worker_id)
+        runtime = payload.get("runtime_details") or {}
+        view_url = str(runtime.get("view_url") or "").strip()
+        if not view_url:
+            raise HTTPException(status_code=404, detail="No live desktop is available for this worker")
+        parsed = urlparse(view_url)
+        if not parsed.scheme or not parsed.netloc:
+            raise HTTPException(status_code=400, detail="Invalid live desktop URL")
+        target = f"{parsed.scheme}://{parsed.netloc}/{asset_path.lstrip('/')}"
+        with httpx.Client(timeout=30.0) as upstream:
+            upstream_response = upstream.get(target)
+        return Response(
+            content=upstream_response.content,
+            status_code=upstream_response.status_code,
+            media_type=upstream_response.headers.get("content-type"),
+        )
+
+    @app.post("/api/worker/{worker_id}/message")
+    def worker_message(worker_id: str, payload: MessageRequest) -> dict[str, Any]:
+        return client.message(worker_id, payload.message)
+
+    @app.post("/api/worker/{worker_id}/action/{action}")
+    def worker_action(worker_id: str, action: str, payload: ActionRequest | None = Body(default=None)) -> dict[str, Any]:
+        if action in {"pause", "resume", "interrupt", "terminate"}:
+            return client.lifecycle(worker_id, action)
+        if action in {"terminal", "files", "browser", "focus_browser", "codex", "claude", "openclaw"}:
+            return client.desktop_action(worker_id, action, url=(payload.url if payload else None))
+        raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
+
+    @app.get("/")
+    def home() -> FileResponse:
+        return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/watch/{worker_id}")
+    def watch(worker_id: str) -> FileResponse:
+        return FileResponse(STATIC_DIR / "watch.html")
+
+    @app.get("/desktop/{worker_id}")
+    def desktop(worker_id: str) -> FileResponse:
+        return FileResponse(STATIC_DIR / "desktop.html")
+
+    return app
+
+
+app = create_app()

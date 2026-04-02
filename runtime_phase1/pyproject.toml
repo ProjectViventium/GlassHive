@@ -1,0 +1,27 @@
+[project]
+name = "glass-hive-runtime-phase1"
+version = "0.3.0"
+description = "Glass Hive phase-1 runtime for persistent workstation-backed workers and sandboxes"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "httpx>=0.28,<1.0",
+  "mcp>=1.26,<2.0",
+  "uvicorn>=0.34,<1.0",
+  "websockets>=15.0,<16.0",
+  "wsproto>=1.2,<2.0",
+]
+
+[dependency-groups]
+dev = [
+  "fastmcp>=2.14,<3.0",
+  "pytest>=8.3,<9.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
