@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import shutil
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Lock
 
 from .openclaw_runtime import (
@@ -68,8 +71,51 @@ class WorkersProjectsService:
         self.store.add_event(project_id, worker["worker_id"], None, "worker.ready", f"Worker ready on {info.gateway_url}")
         return updated or worker
 
+    def duplicate_worker(
+        self,
+        source_worker_id: str,
+        project_id: str,
+        owner_id: str,
+        name: str,
+        role: str,
+    ) -> dict:
+        source_worker = self.require_worker(source_worker_id)
+        bootstrap_bundle = self._bootstrap_bundle_for(source_worker)
+        duplicated = self.create_worker(
+            project_id=project_id,
+            owner_id=owner_id,
+            name=name,
+            role=role,
+            profile=str(source_worker.get("profile") or "codex-cli"),
+            backend=str(source_worker.get("backend") or "openclaw"),
+            bootstrap_profile=str(source_worker.get("bootstrap_profile") or "") or None,
+            bootstrap_bundle=bootstrap_bundle,
+        )
+        try:
+            self._copy_workspace_contents(source_worker, duplicated)
+        except Exception as exc:
+            self.store.update_worker(duplicated["worker_id"], state="failed", last_error=str(exc))
+            self.store.add_event(
+                project_id,
+                duplicated["worker_id"],
+                None,
+                "worker.duplicate_failed",
+                str(exc),
+            )
+            raise
+        self.store.add_event(
+            project_id,
+            duplicated["worker_id"],
+            None,
+            "worker.duplicated",
+            f"Workspace duplicated from {source_worker_id}",
+        )
+        return self.store.get_worker(duplicated["worker_id"]) or duplicated
+
     def assign_run(self, worker_id: str, instruction: str, event_type: str = "run.queued") -> dict:
         worker = self.require_worker(worker_id)
+        if worker["state"] == "paused":
+            worker = self.resume_worker(worker_id)
         run = self.store.create_run(worker_id, worker["project_id"], instruction, state="queued")
         self.store.add_event(worker["project_id"], worker_id, run["run_id"], event_type, instruction)
         self._ensure_worker_processor(worker_id)
@@ -240,6 +286,34 @@ class WorkersProjectsService:
             last_error=last_error,
         )
 
+    def _bootstrap_bundle_for(self, worker: dict) -> dict | None:
+        raw = str(worker.get("bootstrap_bundle_json") or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _copy_workspace_contents(self, source_worker: dict, target_worker: dict) -> None:
+        source_root_raw = str(source_worker.get("workspace_dir") or "").strip()
+        target_root_raw = str(target_worker.get("workspace_dir") or "").strip()
+        if not source_root_raw or not target_root_raw:
+            return
+        source_root = Path(source_root_raw)
+        target_root = Path(target_root_raw)
+        if not source_root.exists():
+            return
+        target_root.mkdir(parents=True, exist_ok=True)
+        for item in source_root.iterdir():
+            target = target_root / item.name
+            if item.is_dir():
+                shutil.copytree(item, target, dirs_exist_ok=True, symlinks=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, target)
+
     def _refresh_runtime_info(self, worker_id: str, state: str, last_error: str = "") -> dict | None:
         worker = self.store.get_worker(worker_id)
         if not worker:
@@ -283,6 +357,7 @@ class WorkersProjectsService:
                             raise
                         output = self.runtime.run_task(worker, run["instruction"])
                 except WorkerPausedError as exc:
+                    self.store.finalize_run(run["run_id"], state="paused", error_text=str(exc))
                     self.store.update_worker_state(worker_id, "paused", last_error="")
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.paused", str(exc))
                     return

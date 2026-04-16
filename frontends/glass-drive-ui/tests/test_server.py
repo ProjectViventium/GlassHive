@@ -9,6 +9,11 @@ class FakeRuntimeClient:
         self.desktop_actions = []
         self.launch_failures = []
         self.fail_assign = False
+        self.duplicate_requests = []
+        self.create_project_requests = []
+        self.create_worker_requests = []
+        self.assign_requests = []
+        self.get_worker_requests = []
 
     def health(self):
         return {"status": "ok"}
@@ -17,9 +22,13 @@ class FakeRuntimeClient:
         return [{"project_id": "prj_1", "title": "Alpha"}]
 
     def list_workers(self, project_id: str):
-        return [{"worker_id": "wrk_1", "name": "Main Worker", "profile": "codex-cli", "state": "ready"}]
+        return [
+            {"worker_id": "wrk_1", "name": "Main Worker", "profile": "codex-cli", "state": "ready"},
+            {"worker_id": "wrk_dead", "name": "Old Worker", "profile": "codex-cli", "state": "terminated"},
+        ]
 
     def get_worker(self, worker_id: str):
+        self.get_worker_requests.append(worker_id)
         return {"worker_id": worker_id, "project_id": "prj_1", "profile": "codex-cli"}
 
     def get_project(self, project_id: str):
@@ -39,12 +48,28 @@ class FakeRuntimeClient:
         }
 
     def create_project(self, owner_id: str, title: str, goal: str, default_worker_profile: str):
+        self.create_project_requests.append(
+            {
+                "owner_id": owner_id,
+                "title": title,
+                "goal": goal,
+                "default_worker_profile": default_worker_profile,
+            }
+        )
         return {"project_id": "prj_new"}
 
     def create_worker(self, project_id: str, owner_id: str, profile: str):
+        self.create_worker_requests.append({"project_id": project_id, "owner_id": owner_id, "profile": profile})
         return {"worker_id": "wrk_new"}
 
+    def duplicate_worker(self, project_id: str, source_worker_id: str, owner_id: str):
+        self.duplicate_requests.append(
+            {"project_id": project_id, "source_worker_id": source_worker_id, "owner_id": owner_id}
+        )
+        return {"worker_id": "wrk_dup"}
+
     def assign_run(self, worker_id: str, instruction: str):
+        self.assign_requests.append({"worker_id": worker_id, "instruction": instruction})
         if self.fail_assign:
             raise RuntimeError("assign failed")
         return {"run_id": "run_1"}
@@ -68,14 +93,15 @@ def test_bootstrap_and_launch_flow():
     client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
     boot = client.get('/api/bootstrap')
     assert boot.status_code == 200
-    assert boot.json()['new_worker_options'][0]['value'] == 'new:codex-cli'
+    assert boot.json()['new_workspace_options'][0]['value'] == 'new:codex-cli'
     assert boot.json()['default_launch_surface'] == 'desktop'
+    assert len(boot.json()['existing_workspaces']) == 1
 
     launch = client.post('/api/launch', json={
         'description': 'Research a self-hosted worker runtime',
         'success_criteria': 'Return three viable options',
         'context': 'Focus on resumable sandboxes',
-        'worker_option': 'new:codex-cli',
+        'workspace_option': 'new:codex-cli',
     })
     assert launch.status_code == 200
     assert launch.json()['watch_url'].startswith('/watch/wrk_new')
@@ -87,10 +113,12 @@ def test_watch_assets_render():
     home = client.get('/')
     assert home.status_code == 200
     assert 'GlassHive' in home.text
+    assert 'Workspace' in home.text
     assert 'Glass Drive' not in home.text
     watch = client.get('/watch/wrk_1')
     assert watch.status_code == 200
     assert 'GlassHive' in watch.text
+    assert 'Workspace live view' in watch.text
     assert 'Open project workspace' in watch.text
     assert 'Open worker details' in watch.text
     assert 'Glass Drive' not in watch.text
@@ -110,7 +138,7 @@ def test_launch_uses_desktop_surface_for_browser_projects():
         'description': 'Create a hello world landing page and verify it renders in the browser',
         'success_criteria': 'The page is visible and renders HELLO WORLD',
         'context': '',
-        'worker_option': 'new:codex-cli',
+        'workspace_option': 'new:codex-cli',
     })
     assert launch.status_code == 200
     assert 'surface=desktop' in launch.json()['watch_url']
@@ -126,7 +154,7 @@ def test_launch_preopens_browser_for_explicit_external_navigation():
         'description': 'Open the browser to https://example.com and inspect the page',
         'success_criteria': 'The page is visible and the title is captured',
         'context': '',
-        'worker_option': 'new:codex-cli',
+        'workspace_option': 'new:codex-cli',
     })
     assert launch.status_code == 200
     assert 'surface=desktop' in launch.json()['watch_url']
@@ -156,7 +184,7 @@ def test_launch_respects_explicit_terminal_surface_override():
         'description': 'Research a self-hosted worker runtime',
         'success_criteria': 'Return three viable options',
         'context': '',
-        'worker_option': 'new:codex-cli',
+        'workspace_option': 'new:codex-cli',
         'launch_surface': 'terminal',
     })
     assert launch.status_code == 200
@@ -172,10 +200,61 @@ def test_launch_failure_marks_new_worker_failed():
         'description': 'Research a self-hosted worker runtime',
         'success_criteria': 'Return three viable options',
         'context': '',
-        'worker_option': 'new:codex-cli',
+        'workspace_option': 'new:codex-cli',
     })
     assert launch.status_code == 502
     assert runtime.launch_failures == [{'worker_id': 'wrk_new', 'reason': 'assign failed'}]
+
+
+def test_launch_duplicate_workspace_uses_runtime_duplicate_endpoint():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    launch = client.post('/api/launch', json={
+        'description': 'Branch the existing workspace for a parallel experiment',
+        'success_criteria': 'The experiment starts in a duplicated workspace',
+        'context': '',
+        'workspace_option': 'duplicate:wrk_1',
+    })
+    assert launch.status_code == 200
+    assert launch.json()['watch_url'].startswith('/watch/wrk_dup')
+    assert runtime.duplicate_requests == [
+        {'project_id': 'prj_new', 'source_worker_id': 'wrk_1', 'owner_id': 'demo-owner'},
+    ]
+
+
+def test_launch_open_workspace_reuses_existing_worker():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    launch = client.post('/api/launch', json={
+        'description': 'Resume the existing workspace for another task',
+        'success_criteria': 'The same workspace starts a new run',
+        'context': '',
+        'workspace_option': 'open:wrk_1',
+        'launch_surface': 'terminal',
+    })
+    assert launch.status_code == 200
+    assert launch.json()['watch_url'].startswith('/watch/wrk_1')
+    assert runtime.get_worker_requests == ['wrk_1']
+    assert runtime.create_project_requests == []
+    assert runtime.create_worker_requests == []
+    assert runtime.duplicate_requests == []
+    assert runtime.assign_requests[0]['worker_id'] == 'wrk_1'
+
+
+def test_launch_accepts_legacy_worker_option_fallback():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    launch = client.post('/api/launch', json={
+        'description': 'Resume through the legacy worker option fallback',
+        'success_criteria': 'The same workspace starts a new run',
+        'context': '',
+        'worker_option': 'open:wrk_1',
+        'launch_surface': 'terminal',
+    })
+    assert launch.status_code == 200
+    assert launch.json()['watch_url'].startswith('/watch/wrk_1')
+    assert runtime.create_project_requests == []
+    assert runtime.assign_requests[0]['worker_id'] == 'wrk_1'
 
 
 def test_novnc_proxy_uses_worker_view_origin(monkeypatch):

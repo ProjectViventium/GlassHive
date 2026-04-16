@@ -45,9 +45,9 @@ let lastPromotedDeliverableKey = '';
 let deliverablePromotionPending = false;
 
 function syncDocumentTitle(workerName, projectTitle) {
-  const safeWorkerName = String(workerName || 'Worker').trim() || 'Worker';
-  const safeProjectTitle = String(projectTitle || 'Project').trim() || 'Project';
-  document.title = `GlassHive | ${safeWorkerName} - ${safeProjectTitle}`;
+  const safeProjectTitle = String(projectTitle || 'Workspace').trim() || 'Workspace';
+  const safeWorkerName = String(workerName || 'Workspace').trim() || 'Workspace';
+  document.title = `GlassHive | ${safeProjectTitle} - ${safeWorkerName}`;
 }
 
 function clearRetryTimers() {
@@ -144,7 +144,7 @@ function summarizeOutput(data) {
     if (deliverable && deliverable.preferred_surface === 'desktop' && deliverable.browser_url) {
       const label = String(deliverable.label || deliverable.workspace_path || deliverable.browser_url || 'Preview');
       const full = [
-        `Preview available while the worker continues verification · ${label}`,
+        `Preview available while the workspace continues verification · ${label}`,
         deliverable.browser_url ? `Browser target: ${deliverable.browser_url}` : '',
         raw || '',
       ].filter(Boolean).join('\n\n');
@@ -156,11 +156,11 @@ function summarizeOutput(data) {
       };
     }
     const summary = activeSurface === 'desktop'
-      ? 'Worker is actively executing. You are watching the live sandbox desktop for this run.'
-      : 'Worker is actively executing. You are attached to the exact live session for this run.';
+      ? 'Workspace is actively executing. You are watching the live desktop for this run.'
+      : 'Workspace is actively executing. You are attached to the exact live session for this run.';
     const full = raw || (activeSurface === 'desktop'
-      ? 'Worker is actively executing. You are watching the live sandbox desktop. Switch to Watch exact live session from the menu if you want the raw terminal session.'
-      : 'Worker is actively executing. Open the current view or steer the worker from the ribbon controls if you need to intervene.');
+      ? 'Workspace is actively executing. You are watching the live desktop. Switch to Watch exact live session from the menu if you want the raw terminal session.'
+      : 'Workspace is actively executing. Open the current view or steer the workspace from the ribbon controls if you need to intervene.');
     return {
       label: 'Live status',
       panelTitle: 'Live session details',
@@ -185,10 +185,10 @@ function summarizeOutput(data) {
   }
 
   if (!raw) {
-    const idle = data.worker?.state === 'ready' ? 'Worker is ready for the next instruction.' : 'No run output yet.';
+    const idle = data.worker?.state === 'ready' ? 'Workspace is ready for the next instruction.' : 'No run output yet.';
     return {
-      label: 'Worker status',
-      panelTitle: 'Worker status',
+      label: 'Workspace status',
+      panelTitle: 'Workspace status',
       summary: idle,
       full: idle,
     };
@@ -197,8 +197,8 @@ function summarizeOutput(data) {
   const firstBlock = raw.split(/\n\s*\n|\n/)[0].trim();
   const summary = firstBlock.length <= 180 ? firstBlock : `${firstBlock.slice(0, 177)}...`;
   return {
-    label: runState === 'completed' ? 'Latest result' : 'Worker status',
-    panelTitle: runState === 'completed' ? 'Latest result' : 'Worker output',
+    label: runState === 'completed' ? 'Latest result' : 'Workspace status',
+    panelTitle: runState === 'completed' ? 'Latest result' : 'Workspace output',
     summary,
     full: raw,
   };
@@ -262,25 +262,25 @@ function setOverlay(state, detail) {
   if (!waiting) return;
 
   if (state === 'paused') {
-    overlayTitle.textContent = 'Worker paused';
+    overlayTitle.textContent = 'Workspace paused';
     overlayDetail.textContent = activeSurface === 'desktop'
-      ? 'The sandbox is frozen. Press Play to continue, or open the desktop in a new tab and steer directly.'
-      : 'The exact live session is frozen. Press Play to continue the same run, or steer it directly from this session.';
+      ? 'The workspace is frozen. Press Play to continue, or open the desktop in a new tab and steer directly.'
+      : 'The exact live session is frozen. Press Play to continue the same workspace run, or steer it directly from this session.';
     return;
   }
 
   if (connecting) {
-    overlayTitle.textContent = activeSurface === 'desktop' ? 'Attaching live sandbox…' : 'Attaching exact live session…';
+    overlayTitle.textContent = activeSurface === 'desktop' ? 'Attaching live workspace…' : 'Attaching exact live session…';
     overlayDetail.textContent = activeSurface === 'desktop'
       ? 'The desktop is waking up. If it takes more than a few seconds, open the current desktop in a new tab.'
-      : 'We are connecting to the worker’s exact running session. If it takes more than a few seconds, open the current session in a new tab.';
+      : 'We are connecting to the exact running session. If it takes more than a few seconds, open the current session in a new tab.';
     return;
   }
 
-  overlayTitle.textContent = activeSurface === 'desktop' ? 'Preparing live sandbox…' : 'Preparing exact live session…';
+  overlayTitle.textContent = activeSurface === 'desktop' ? 'Preparing live workspace…' : 'Preparing exact live session…';
   overlayDetail.textContent = detail || (activeSurface === 'desktop'
-    ? 'The desktop will attach automatically when the sandbox is ready.'
-    : 'The exact worker session will appear here as soon as the sandbox is ready.');
+    ? 'The desktop will attach automatically when the workspace is ready.'
+    : 'The exact workspace session will appear here as soon as the workspace is ready.');
 }
 
 async function refresh() {
@@ -292,9 +292,9 @@ async function refresh() {
   currentProjectTitle = String(data.project_title || worker.project_id || projectId || 'Project');
   currentDeliverable = data.deliverable || null;
 
-  title.textContent = worker.name || 'Worker live view';
-  subtitle.textContent = `${worker.profile || 'worker'} · ${currentProjectTitle}`;
-  syncDocumentTitle(worker.name, currentProjectTitle);
+  title.textContent = currentProjectTitle || 'Workspace live view';
+  subtitle.textContent = `${worker.profile || 'worker'} workspace · ${worker.state || 'starting'}`;
+  syncDocumentTitle(currentProjectTitle, worker.name);
   statePill.textContent = worker.state;
 
   currentDesktopUrl = `${uiBase}/desktop/${workerId}`;
@@ -307,10 +307,10 @@ async function refresh() {
   setOverlay(
     worker.state,
     worker.state === 'paused'
-      ? 'Use Play to continue the same sandbox.'
+      ? 'Use Play to continue the same workspace.'
       : activeSurface === 'desktop'
-        ? 'The desktop will attach automatically when the sandbox is ready.'
-        : 'The exact worker session will attach automatically when the sandbox is ready.'
+        ? 'The desktop will attach automatically when the workspace is ready.'
+        : 'The exact workspace session will attach automatically when the workspace is ready.'
   );
 }
 
@@ -326,7 +326,7 @@ for (const button of document.querySelectorAll('[data-action]')) {
       closeMenu();
       await refresh();
     } catch (error) {
-      statusLabel.textContent = 'Worker status';
+      statusLabel.textContent = 'Workspace status';
       latestOutputInline.textContent = error.message;
       latestOutputFull.textContent = error.message;
       openResultPanel();
@@ -426,7 +426,7 @@ document.getElementById('steer-form').addEventListener('submit', async (event) =
     });
     input.value = '';
     statusLabel.textContent = 'Live status';
-    latestOutputInline.textContent = 'Message sent to worker.';
+    latestOutputInline.textContent = 'Message sent to workspace.';
     latestOutputFull.textContent = `Operator message sent:\n\n${message}`;
   } catch (error) {
     latestOutputInline.textContent = error.message;

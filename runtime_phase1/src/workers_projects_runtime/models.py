@@ -52,6 +52,13 @@ class CreateWorkerRequest(BaseModel):
     bootstrap_bundle: dict[str, object] | None = None
 
 
+class DuplicateWorkerRequest(BaseModel):
+    owner_id: str
+    source_worker_id: str
+    name: str
+    role: str
+
+
 class WorkerResponse(BaseModel):
     worker_id: str
     project_id: str

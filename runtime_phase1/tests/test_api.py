@@ -7,7 +7,7 @@ from threading import Event
 from fastapi.testclient import TestClient
 
 from workers_projects_runtime.api import create_app
-from workers_projects_runtime.openclaw_runtime import RuntimeInfo, StubRuntime, WorkerInterruptedError
+from workers_projects_runtime.openclaw_runtime import RuntimeInfo, StubRuntime, WorkerInterruptedError, WorkerPausedError
 
 
 def wait_for_run(client: TestClient, run_id: str, timeout: float = 3.0) -> dict:
@@ -109,6 +109,177 @@ def test_project_worker_lifecycle_with_stub_runtime(tmp_path):
     assert metrics["runs"] == 2
     assert metrics["queued_runs"] == 0
     assert metrics["events"] >= 7
+
+
+def test_duplicate_worker_copies_workspace_into_new_worker(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    source_project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Source Workspace",
+            "goal": "Provide a reusable workspace to duplicate.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    source_worker = client.post(
+        f"/v1/projects/{source_project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Main Workspace",
+            "role": "main",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+            "bootstrap_profile": "host-login",
+            "bootstrap_bundle": {
+                "files": [
+                    {
+                        "scope": "workspace",
+                        "path": "notes/from-bootstrap.txt",
+                        "content": "seeded",
+                    }
+                ]
+            },
+        },
+    ).json()
+
+    source_workspace = Path(source_worker["workspace_dir"])
+    source_workspace.mkdir(parents=True, exist_ok=True)
+    (source_workspace / "app.txt").write_text("copied from source")
+    (source_workspace / ".mcp.json").write_text('{"seed":"source"}')
+
+    target_project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Duplicate Workspace",
+            "goal": "Create a duplicated workspace",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+
+    duplicate = client.post(
+        f"/v1/projects/{target_project['project_id']}/workers/duplicate",
+        json={
+            "owner_id": "demo-owner",
+            "source_worker_id": source_worker["worker_id"],
+            "name": "Main Workspace",
+            "role": "main",
+        },
+    )
+    assert duplicate.status_code == 201
+    duplicated_worker = duplicate.json()
+    duplicated_workspace = Path(duplicated_worker["workspace_dir"])
+
+    assert (duplicated_workspace / "app.txt").read_text() == "copied from source"
+    assert (duplicated_workspace / ".mcp.json").read_text() == '{"seed":"source"}'
+
+    events = client.get(f"/v1/workers/{duplicated_worker['worker_id']}/events")
+    assert events.status_code == 200
+    assert any(item["event_type"] == "worker.duplicated" for item in events.json()["items"])
+
+
+def test_duplicate_worker_does_not_copy_home_directory(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    source_project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Source Workspace",
+            "goal": "Provide a reusable workspace to duplicate.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    source_worker = client.post(
+        f"/v1/projects/{source_project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Main Workspace",
+            "role": "main",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+        },
+    ).json()
+
+    source_workspace = Path(source_worker["workspace_dir"])
+    source_home = source_workspace.parent / "home"
+    source_home.mkdir(parents=True, exist_ok=True)
+    source_workspace.mkdir(parents=True, exist_ok=True)
+    (source_home / ".qa-home-marker").write_text("home-only")
+    (source_workspace / "qa_workspace_marker.txt").write_text("workspace-only")
+
+    target_project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Duplicate Workspace",
+            "goal": "Create a duplicated workspace",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+
+    duplicate = client.post(
+        f"/v1/projects/{target_project['project_id']}/workers/duplicate",
+        json={
+            "owner_id": "demo-owner",
+            "source_worker_id": source_worker["worker_id"],
+            "name": "Main Workspace",
+            "role": "main",
+        },
+    )
+    assert duplicate.status_code == 201
+    duplicated_worker = duplicate.json()
+    duplicated_workspace = Path(duplicated_worker["workspace_dir"])
+    duplicated_home = duplicated_workspace.parent / "home"
+
+    assert (duplicated_workspace / "qa_workspace_marker.txt").read_text() == "workspace-only"
+    assert not (duplicated_home / ".qa-home-marker").exists()
+
+
+def test_assign_run_on_paused_worker_resumes_before_queueing(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Resume Workspace",
+            "goal": "Resume the paused workspace before queueing a new run.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Main Workspace",
+            "role": "main",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+        },
+    ).json()
+
+    pause_resp = client.post(f"/v1/workers/{worker['worker_id']}/pause")
+    assert pause_resp.status_code == 202
+    assert pause_resp.json()["state"] == "paused"
+
+    assign_resp = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Resume this paused workspace and start a fresh run."},
+    )
+    assert assign_resp.status_code == 202
+
+    events = client.get(f"/v1/workers/{worker['worker_id']}/events")
+    assert events.status_code == 200
+    event_types = [item["event_type"] for item in events.json()["items"]]
+    assert "worker.paused" in event_types
+    assert "worker.resumed" in event_types
+    assert "run.queued" in event_types
 
 
 def test_openclaw_worker_exposes_operator_control_surface(tmp_path):
@@ -321,6 +492,94 @@ def test_pause_resume_freezes_active_run_without_losing_it(tmp_path):
     settled = wait_for_run(client, run["run_id"], timeout=3.0)
     assert settled["state"] == "completed"
     assert settled["output_text"] == "CONTROLLABLE_OK"
+
+
+class RaisingPauseRuntime:
+    def __init__(self) -> None:
+        self.running = Event()
+        self.paused = Event()
+
+    def resolve_model(self, profile: str) -> str:
+        return "pause-raising/test"
+
+    def _info(self, worker: dict, pid: int | None = 2222) -> RuntimeInfo:
+        return RuntimeInfo(
+            runtime="pause-raising",
+            model=worker.get("model") or self.resolve_model(worker.get("profile", "")),
+            gateway_url="",
+            gateway_port=None,
+            gateway_token=None,
+            session_key=worker.get("session_key") or f"pause-raising:{worker['worker_id']}",
+            state_dir="/tmp/pause-raising/state",
+            workspace_dir="/tmp/pause-raising/workspace",
+            pid=pid,
+        )
+
+    def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+        self.paused.clear()
+        return self._info(worker)
+
+    def pause_worker(self, worker: dict) -> RuntimeInfo:
+        self.paused.set()
+        return self._info(worker, pid=None)
+
+    def interrupt_worker(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker)
+
+    def terminate_worker(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker, pid=None)
+
+    def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker, pid=None if self.paused.is_set() else 2222)
+
+    def run_task(self, worker: dict, instruction: str, timeout_sec: int = 300) -> str:
+        self.running.set()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if self.paused.is_set():
+                raise WorkerPausedError("Worker was paused while a run was active")
+            time.sleep(0.05)
+        raise AssertionError("RaisingPauseRuntime timed out in test")
+
+
+def test_worker_paused_error_finalizes_run_as_paused(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime = RaisingPauseRuntime()
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
+
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Pause Finalize", "goal": "Finalize paused runs cleanly."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Pause Finalize Worker", "role": "coder"},
+    ).json()
+
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Begin a run that will raise WorkerPausedError when paused."},
+    ).json()
+    assert runtime.running.wait(timeout=2), "worker run never started"
+
+    paused = client.post(f"/v1/workers/{worker['worker_id']}/pause")
+    assert paused.status_code == 202
+    assert paused.json()["state"] == "paused"
+
+    deadline = time.time() + 3.0
+    settled = None
+    while time.time() < deadline:
+        response = client.get(f"/v1/runs/{run['run_id']}")
+        assert response.status_code == 200
+        candidate = response.json()
+        if candidate["state"] == "paused":
+            settled = candidate
+            break
+        time.sleep(0.05)
+
+    assert settled is not None, "run did not settle into paused state"
+    assert settled["state"] == "paused"
+    assert "paused while a run was active" in settled["error_text"]
 
 
 def test_interrupt_stops_active_run_and_keeps_worker_ready(tmp_path):

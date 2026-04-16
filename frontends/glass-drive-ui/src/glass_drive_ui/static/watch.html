@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260326f" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260416a" />
   </head>
   <body class="watch-body">
     <div class="watch-app">
@@ -16,8 +16,8 @@
         <div class="watch-brand">
           <span class="brand-mark">GlassHive</span>
           <div>
-            <h1 id="watch-title">Worker live view</h1>
-            <p id="watch-subtitle">Connecting to sandbox…</p>
+            <h1 id="watch-title">Workspace live view</h1>
+            <p id="watch-subtitle">Connecting to workspace…</p>
             <div class="watch-quick-links">
               <button id="open-project-workspace" class="watch-link-chip" type="button" hidden>Open project workspace</button>
             </div>
@@ -40,7 +40,7 @@
       <section id="result-panel" class="result-panel" hidden>
         <div class="result-panel-header">
           <div>
-            <span class="meta-label">Latest worker output</span>
+            <span class="meta-label">Latest workspace output</span>
             <h2 id="result-panel-title">Latest result</h2>
           </div>
           <button id="result-close" class="result-close" type="button">Close</button>
@@ -65,20 +65,20 @@
       <main class="watch-stage">
         <div id="stage-overlay" class="stage-overlay">
           <div>
-            <p class="overlay-label">Worker warming up</p>
-            <h2 id="overlay-title">Preparing live sandbox…</h2>
-            <p id="overlay-detail">The view will attach automatically when the sandbox is ready.</p>
+            <p class="overlay-label">Workspace warming up</p>
+            <h2 id="overlay-title">Preparing live workspace…</h2>
+            <p id="overlay-detail">The view will attach automatically when the workspace is ready.</p>
           </div>
         </div>
-        <iframe id="desktop-frame" title="Worker live surface" allow="clipboard-read; clipboard-write; fullscreen" allowfullscreen></iframe>
+        <iframe id="desktop-frame" title="Workspace live surface" allow="clipboard-read; clipboard-write; fullscreen" allowfullscreen></iframe>
       </main>
       <footer class="watch-footer">
         <form id="steer-form" class="steer-form">
-          <input id="steer-input" type="text" placeholder="Steer the worker from here. Ask for a checkpoint, redirect the plan, or tell it exactly what to do next." />
+          <input id="steer-input" type="text" placeholder="Steer the workspace from here. Ask for a checkpoint, redirect the plan, or tell it exactly what to do next." />
           <button type="submit">Send</button>
         </form>
       </footer>
     </div>
-    <script src="/static/watch.js?v=20260326f" type="module"></script>
+    <script src="/static/watch.js?v=20260416a" type="module"></script>
   </body>
 </html>

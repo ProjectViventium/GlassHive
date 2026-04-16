@@ -36,6 +36,20 @@ Pass if:
 - home/config survives
 - session continuity is believable
 
+## 2.1 Duplicate Workspace Safety
+
+1. Create a file inside a source workspace.
+2. Duplicate that workspace through the glossy UI.
+3. Confirm the duplicate opens as a new workspace.
+4. Confirm the file is present in the duplicate.
+5. Confirm browser-session state was not cloned implicitly.
+
+Pass if:
+
+- file/context continuity carries into the duplicate
+- the duplicate has its own workspace identity
+- browser-session cloning is not silently happening
+
 ## 3. Terminal + Desktop Takeover
 
 1. Open the live worker desktop.

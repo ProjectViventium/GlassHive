@@ -79,11 +79,12 @@ The easiest non-technical user flow should be:
 
 1. show recent named workspaces first, not raw worker IDs
 2. make `Open workspace` the primary reuse action
-3. make `New workspace` the only primary creation action
-4. auto-reuse the matching workspace when the parent system already knows the stable alias for the
+3. make `Duplicate workspace` a first-class default option for branching from an existing workspace
+4. make `New workspace` the clean-start option
+5. auto-reuse the matching workspace when the parent system already knows the stable alias for the
    task or service
-5. land directly in the desktop-first watch view after open or create
-6. keep advanced lifecycle or debugging controls behind the existing ribbon / more menu
+6. land directly in the desktop-first watch view after open, duplicate, or create
+7. keep advanced lifecycle or debugging controls behind the existing ribbon / more menu
 
 `Open workspace` should automatically resume a paused workspace. Non-technical users should not
 need to choose between `open` and `resume`.
@@ -93,37 +94,35 @@ need to choose between `open` and `resume`.
 Primary:
 
 1. `Open workspace`
-2. `New workspace`
+2. `Duplicate workspace`
+3. `New workspace`
 
 Secondary:
 
-1. `Rename workspace`
-2. `Pause`
-3. `Resume`
-4. `Interrupt`
-5. `Delete`
+1. `Pause`
+2. `Resume`
+3. `Interrupt`
+4. `Delete`
 
-### Not A V1 Primary Action
+### Duplicate Semantics
 
-Do not make `Duplicate workspace` part of the default v1 flow.
+`Duplicate workspace` is approved for the default v1 flow, but only with safe semantics.
 
-Reason:
+V1 duplicate should:
 
-1. the docs support stable named workspace reuse, not browser-profile cloning
-2. blindly duplicating a browser profile can clone cookies and active sessions in surprising ways
-3. the simplest user story is reuse-or-new, not branching into clone semantics
+1. create a new workspace identity
+2. copy project files and project-scoped context from the selected source workspace
+3. keep browser-session state clean instead of cloning cookies or active website logins
 
-If duplication is added later, it should default to copying project files and bootstrap context
-without copying browser-session state unless the product explicitly defines and approves that
-behavior.
+This gives users a real branch/fork action without silently carrying over sensitive browser state.
 
-## Rename Semantics
+## Post-V1 Rename Semantics
 
 - A workspace should have:
   - a stable internal alias for parent-side routing
   - a user-facing display label for the glossy UI
-- `Rename workspace` in the glossy UI should update the display label, not silently rewrite the
-  stable routing alias.
+- If `Rename workspace` is added later, it should update only the display label and not silently
+  rewrite the stable routing alias.
 - If the product later supports alias editing, that must be a separate explicit flow because it can
   affect parent-side auto-reuse behavior.
 
@@ -168,9 +167,9 @@ Use a separate frontend service that:
 11. Launches that fail after worker creation leave an explicit failure trail instead of a silent orphan worker.
 12. The UI feels simple enough for a non-technical user.
 13. A non-technical user can understand that reopening a named workspace returns them to the same files, browser setup, and login state.
-14. The primary action set is reuse-or-new; duplicate behavior is not required for v1 acceptance.
+14. The primary action set is open-duplicate-new and each action is understandable to a non-technical user.
 15. `Open workspace` is the single reuse verb and automatically resumes paused workspaces.
-16. Renaming a workspace changes the user-facing label without breaking the stable parent-side routing alias.
+16. `Duplicate workspace` creates a new workspace with copied files/context but a clean browser-session state.
 
 ## Current Phase-1 Clipboard Note
 

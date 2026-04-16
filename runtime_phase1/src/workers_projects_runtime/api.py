@@ -16,6 +16,7 @@ from .models import (
     CreateWorkerRequest,
     DesktopActionRequest,
     DesktopActionResponse,
+    DuplicateWorkerRequest,
     EventResponse,
     LaunchFailureRequest,
     MetricsSummary,
@@ -408,6 +409,19 @@ def create_app(
             payload.backend,
             payload.bootstrap_profile,
             payload.bootstrap_bundle,
+        )
+        return WorkerResponse(**worker)
+
+    @app.post("/v1/projects/{project_id}/workers/duplicate", response_model=WorkerResponse, status_code=201)
+    def duplicate_worker(project_id: str, payload: DuplicateWorkerRequest) -> WorkerResponse:
+        require_project(project_id)
+        require_worker(payload.source_worker_id)
+        worker = service.duplicate_worker(
+            payload.source_worker_id,
+            project_id,
+            payload.owner_id,
+            payload.name,
+            payload.role,
         )
         return WorkerResponse(**worker)
 

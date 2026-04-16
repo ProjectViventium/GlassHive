@@ -28,7 +28,8 @@ class LaunchRequest(BaseModel):
     description: str = Field(min_length=1)
     success_criteria: str = Field(min_length=1)
     context: str | None = None
-    worker_option: str = "new:codex-cli"
+    workspace_option: str | None = None
+    worker_option: str | None = None
     launch_surface: str | None = None
 
 
@@ -40,22 +41,27 @@ class ActionRequest(BaseModel):
     url: str | None = None
 
 
-def flatten_workers(client: RuntimeClient) -> list[dict[str, Any]]:
+def flatten_workspaces(client: RuntimeClient) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for project in client.list_projects():
         project_id = str(project["project_id"])
         for worker in client.list_workers(project_id):
+            if str(worker.get("state") or "").strip().lower() == "terminated":
+                continue
+            project_title = str(project.get("title") or project_id)
+            worker_name = str(worker.get("name") or worker["worker_id"])
             items.append(
                 {
                     "project_id": project_id,
-                    "project_title": project.get("title") or project_id,
+                    "project_title": project_title,
                     "worker_id": worker["worker_id"],
-                    "name": worker.get("name") or worker["worker_id"],
+                    "name": worker_name,
+                    "workspace_label": project_title or worker_name,
                     "profile": worker.get("profile") or "",
                     "state": worker.get("state") or "",
                 }
             )
-    return sorted(items, key=lambda item: (item["project_title"], item["name"]))
+    return items
 
 
 def _project_title_for_worker(client: RuntimeClient, project_id: str) -> str:
@@ -152,36 +158,47 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     @app.get("/api/bootstrap")
     def bootstrap() -> dict[str, Any]:
         owner_id = os.environ.get("GLASSHIVE_DEFAULT_OWNER_ID", "demo-owner")
+        existing_workspaces = flatten_workspaces(client)
         return {
             "owner_id": owner_id,
-            "default_worker_option": "new:codex-cli",
+            "default_workspace_option": "new:codex-cli",
             "default_launch_surface": _default_launch_surface(),
             "launch_surface_options": _launch_surface_options(),
-            "new_worker_options": [
-                {"value": "new:codex-cli", "label": "New main worker · Codex"},
-                {"value": "new:claude-code", "label": "New main worker · Claude Code"},
-                {"value": "new:openclaw-general", "label": "New main worker · OpenClaw"},
+            "new_workspace_options": [
+                {"value": "new:codex-cli", "label": "New workspace · Codex", "profile": "codex-cli"},
+                {"value": "new:claude-code", "label": "New workspace · Claude Code", "profile": "claude-code"},
+                {"value": "new:openclaw-general", "label": "New workspace · OpenClaw", "profile": "openclaw-general"},
             ],
-            "existing_workers": flatten_workers(client),
+            "existing_workspaces": existing_workspaces,
         }
 
     @app.post("/api/launch")
     def launch(payload: LaunchRequest) -> dict[str, Any]:
         owner_id = os.environ.get("GLASSHIVE_DEFAULT_OWNER_ID", "demo-owner")
         brief = build_operator_brief(payload.description, payload.success_criteria, payload.context)
+        workspace_option = payload.workspace_option or payload.worker_option or "new:codex-cli"
         project_id: str
         worker_id: str | None = None
         profile: str
         created_new_worker = False
 
         try:
-            if payload.worker_option.startswith("existing:"):
-                worker_id = payload.worker_option.split(":", 1)[1]
+            if workspace_option.startswith("open:") or workspace_option.startswith("existing:"):
+                worker_id = workspace_option.split(":", 1)[1]
                 worker = client.get_worker(worker_id)
                 project_id = str(worker["project_id"])
                 profile = str(worker.get("profile") or "codex-cli")
+            elif workspace_option.startswith("duplicate:"):
+                source_worker_id = workspace_option.split(":", 1)[1]
+                source_worker = client.get_worker(source_worker_id)
+                profile = str(source_worker.get("profile") or "codex-cli")
+                project = client.create_project(owner_id, build_project_title(payload.description), payload.description.strip(), profile)
+                project_id = str(project["project_id"])
+                worker = client.duplicate_worker(project_id, source_worker_id, owner_id)
+                worker_id = str(worker["worker_id"])
+                created_new_worker = True
             else:
-                profile = payload.worker_option.split(":", 1)[1] if ":" in payload.worker_option else "codex-cli"
+                profile = workspace_option.split(":", 1)[1] if ":" in workspace_option else "codex-cli"
                 project = client.create_project(owner_id, build_project_title(payload.description), payload.description.strip(), profile)
                 project_id = str(project["project_id"])
                 worker = client.create_worker(project_id, owner_id, profile)

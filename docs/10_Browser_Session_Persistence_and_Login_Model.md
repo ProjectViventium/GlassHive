@@ -5,9 +5,10 @@
 
 This document is the source of truth for how browser sessions should persist inside GlassHive, what that means for named workers, and how parent systems should route long-lived personal browser tasks.
 
-This is a proposal and review document only.
+This document now reflects the approved v1 product model for workspace continuity and safe
+workspace duplication.
 
-Do not implement the design in this document until it is explicitly approved.
+Future extensions that would clone browser-session state across workspaces are still unapproved.
 
 ## Terminology
 
@@ -217,29 +218,30 @@ Those are future extensions, not v1 requirements.
 The least-resistance user-facing action model is:
 
 1. `Open workspace`
-2. `New workspace`
-3. `Rename workspace`
+2. `Duplicate workspace`
+3. `New workspace`
 
-This is enough to support the real continuity promise without introducing clone confusion.
+This is enough to support the real continuity promise while still giving users a safe branch/fork
+path.
 
 `Open workspace` should also cover the paused case. The user should not have to choose between
 `open` and `resume`.
 
-## Rename Semantics
+## Post-V1 Rename Semantics
 
 The least-resistance rename model is:
 
 1. keep one stable routing alias for the parent system
-2. allow the glossy UI to change only the display label in v1
+2. allow the glossy UI to change only the display label when rename is added
 3. do not silently rewrite parent-side routing aliases when a user renames a workspace
 
 This keeps auto-reuse stable while still letting the user personalize visible workspace names.
 
-### Later, If Explicitly Approved
+## Duplicate Semantics
 
-`Duplicate workspace` may be added later only with explicit semantics.
+`Duplicate workspace` is approved for v1 only with explicit safe semantics.
 
-Recommended safe default if it is added:
+Recommended safe default:
 
 1. copy project files and seeded context
 2. keep a new worker identity
@@ -305,9 +307,10 @@ Current likely file owners:
 2. treat browser-authenticated work as stable named workers behind that label
 3. keep browser profile persistence worker-scoped
 4. add or use find-or-resume semantics from the parent side
-5. make `open` and `new` the default user actions
-6. default to pause/resume after successful tasks
-7. reserve destroy for explicit teardown
+5. make `open`, `duplicate`, and `new` the default user actions
+6. implement duplicate by copying workspace files/context, not browser home/profile state
+7. default to pause/resume after successful tasks
+8. reserve destroy for explicit teardown
 
 ## Acceptance Criteria For This Proposal
 
@@ -320,7 +323,7 @@ A future implementation based on this document should satisfy all of these:
 5. the model remains compatible with Telegram, LibreChat, and other parent systems
 6. the parent can answer “find or resume my LinkedIn worker” without depending on ephemeral UUIDs in the user-facing flow
 7. a non-technical user can understand “open my workspace again” without learning worker or sandbox terms
-8. renaming a workspace does not silently break the parent-side alias used for auto-reuse
+8. duplicating a workspace creates a new workspace identity without cloning browser-session state by default
 
 ## Non-Goals
 
@@ -334,11 +337,11 @@ This proposal does not approve:
 
 ## Recommended Next Review Questions
 
-Before implementation approval, decide:
+After the v1 rollout, decide:
 
 1. should worker alias lookup live only in the parent, or also as a GlassHive convenience tool?
 2. do we want an explicit `archived` state in v1, or can `paused` cover the initial product need?
 3. which browser-authenticated workflows deserve dedicated named workers by default?
 4. should browser workers auto-pause after success, or remain active for a configurable warm window?
-5. if `Duplicate workspace` is ever added, should it copy only files/context or also browser state?
-6. do we ever want users to edit stable routing aliases directly, or is display-label rename enough?
+5. should future duplicate options ever permit browser-state cloning, or should v1 safe semantics remain mandatory?
+6. when rename is added, do we ever want users to edit stable routing aliases directly, or is display-label rename enough?

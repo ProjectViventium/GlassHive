@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260326e" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260416a" />
   </head>
   <body class="launch-body">
     <main class="launch-shell">
@@ -17,16 +17,16 @@
       <section class="composer-frame">
         <div class="brand-row">
           <span class="brand-mark">GlassHive</span>
-          <span class="brand-mode">Projects</span>
+          <span class="brand-mode">Workspaces</span>
         </div>
         <div class="composer-copy">
-          <h1>Define the project once. Watch the worker do the rest.</h1>
-          <p>Describe the job. Set the success bar. Add context if it matters. The worker spins up and the live sandbox takes over the screen.</p>
+          <h1>Define the project once. Watch the workspace do the rest.</h1>
+          <p>Describe the job. Set the success bar. Add context if it matters. Then choose whether to open, duplicate, or start a workspace before the live sandbox takes over the screen.</p>
         </div>
         <form id="launch-form" class="composer-form">
           <label>
             <span>Describe your project</span>
-            <textarea id="description" name="description" rows="6" placeholder="What should the worker actually accomplish?" required></textarea>
+            <textarea id="description" name="description" rows="6" placeholder="What should this workspace actually accomplish?" required></textarea>
           </label>
           <label>
             <span>Success Criteria</span>
@@ -48,8 +48,9 @@
           </details>
           <div class="worker-row">
             <label class="worker-picker">
-              <span>Worker</span>
-              <select id="worker-option" name="worker_option"></select>
+              <span>Workspace</span>
+              <select id="workspace-option" name="workspace_option"></select>
+              <small id="workspace-help" class="field-help"></small>
             </label>
             <button id="launch-button" type="submit" class="primary-button">Launch project</button>
           </div>
@@ -57,6 +58,6 @@
         </form>
       </section>
     </main>
-    <script src="/static/app.js?v=20260326e" type="module"></script>
+    <script src="/static/app.js?v=20260416a" type="module"></script>
   </body>
 </html>

@@ -53,7 +53,7 @@ class RuntimeClient:
             f"/v1/projects/{project_id}/workers",
             json_body={
                 "owner_id": owner_id,
-                "name": "Main Worker",
+                "name": "Main Workspace",
                 "role": "main",
                 "profile": profile,
                 "backend": "openclaw",
@@ -62,6 +62,18 @@ class RuntimeClient:
                     "claude-code": "claude-host",
                     "openclaw-general": "host-login",
                 }.get(profile, "host-login"),
+            },
+        )
+
+    def duplicate_worker(self, project_id: str, source_worker_id: str, owner_id: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/v1/projects/{project_id}/workers/duplicate",
+            json_body={
+                "owner_id": owner_id,
+                "source_worker_id": source_worker_id,
+                "name": "Main Workspace",
+                "role": "main",
             },
         )
 

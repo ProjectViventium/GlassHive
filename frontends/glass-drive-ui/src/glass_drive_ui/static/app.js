@@ -1,58 +1,141 @@
 async function loadBootstrap() {
   const response = await fetch('/api/bootstrap');
-  if (!response.ok) throw new Error('Failed to load worker options');
+  if (!response.ok) throw new Error('Failed to load workspace options');
   return response.json();
 }
 
 function renderLaunchSurfaceOptions(select, data) {
-  const opts = [];
+  const options = [];
   for (const item of data.launch_surface_options || []) {
-    opts.push(`<option value="${item.value}">${item.label}</option>`);
+    const option = document.createElement('option');
+    option.value = String(item.value || '');
+    option.textContent = String(item.label || item.value || '');
+    options.push(option);
   }
-  select.innerHTML = opts.join('');
+  select.replaceChildren(...options);
   select.value = String(data.default_launch_surface || 'desktop');
 }
 
-function renderWorkerOptions(select, data) {
-  const opts = [];
-  for (const item of data.new_worker_options) {
-    opts.push(`<option value="${item.value}">${item.label}</option>`);
-  }
-  if (data.existing_workers.length) {
-    opts.push('<optgroup label="Existing workers">');
-    for (const worker of data.existing_workers) {
-      const label = `${worker.name} · ${worker.profile} · ${worker.project_title}`;
-      opts.push(`<option value="existing:${worker.worker_id}">${label}</option>`);
+function renderWorkspaceOptions(select, data) {
+  const existing = data.existing_workspaces || [];
+  const groups = [];
+
+  if (existing.length) {
+    const openGroup = document.createElement('optgroup');
+    openGroup.label = 'Open workspace';
+    for (const workspace of existing) {
+      const option = document.createElement('option');
+      option.value = `open:${String(workspace.worker_id || '')}`;
+      option.textContent = `${String(workspace.workspace_label || workspace.worker_id || 'Workspace')} · ${String(workspace.profile || '')} · ${String(workspace.state || '')}`;
+      openGroup.appendChild(option);
     }
-    opts.push('</optgroup>');
+    groups.push(openGroup);
+
+    const duplicateGroup = document.createElement('optgroup');
+    duplicateGroup.label = 'Duplicate workspace';
+    for (const workspace of existing) {
+      const option = document.createElement('option');
+      option.value = `duplicate:${String(workspace.worker_id || '')}`;
+      option.textContent = `${String(workspace.workspace_label || workspace.worker_id || 'Workspace')} · ${String(workspace.profile || '')} · ${String(workspace.state || '')}`;
+      duplicateGroup.appendChild(option);
+    }
+    groups.push(duplicateGroup);
   }
-  select.innerHTML = opts.join('');
-  select.value = data.default_worker_option;
+
+  const newGroup = document.createElement('optgroup');
+  newGroup.label = 'New workspace';
+  for (const item of data.new_workspace_options || []) {
+    const option = document.createElement('option');
+    option.value = String(item.value || '');
+    option.textContent = String(item.label || item.value || '');
+    newGroup.appendChild(option);
+  }
+  groups.push(newGroup);
+
+  select.replaceChildren(...groups);
+  select.value = String(data.default_workspace_option || 'new:codex-cli');
+}
+
+function findWorkspace(existing, workerId) {
+  return (existing || []).find((item) => item.worker_id === workerId) || null;
+}
+
+function workspaceMeta(selectValue, data) {
+  const existing = data.existing_workspaces || [];
+  if ((selectValue || '').startsWith('open:')) {
+    const workspace = findWorkspace(existing, selectValue.split(':', 2)[1]);
+    const label = workspace?.workspace_label || 'Selected workspace';
+    return {
+      buttonText: 'Open workspace',
+      statusText: 'Opening workspace…',
+      help: `Reuses ${label}. If it is paused, GlassHive resumes it automatically before the new run starts.`,
+    };
+  }
+  if ((selectValue || '').startsWith('duplicate:')) {
+    const workspace = findWorkspace(existing, selectValue.split(':', 2)[1]);
+    const label = workspace?.workspace_label || 'Selected workspace';
+    return {
+      buttonText: 'Duplicate workspace',
+      statusText: 'Duplicating workspace…',
+      help: `Creates a new workspace using the files and project context from ${label}. Browser sessions do not copy.`,
+    };
+  }
+
+  const profile = (selectValue || '').split(':', 2)[1] || 'codex-cli';
+  const profileLabel = {
+    'codex-cli': 'Codex',
+    'claude-code': 'Claude Code',
+    'openclaw-general': 'OpenClaw',
+  }[profile] || profile;
+  return {
+    buttonText: 'New workspace',
+    statusText: 'Creating workspace…',
+    help: `Creates a fresh ${profileLabel} workspace with a clean browser profile and new project files.`,
+  };
+}
+
+function syncWorkspaceUI(select, data, button, help) {
+  const meta = workspaceMeta(select.value, data);
+  button.textContent = meta.buttonText;
+  help.textContent = meta.help;
+  return meta;
 }
 
 async function main() {
   const form = document.getElementById('launch-form');
-  const select = document.getElementById('worker-option');
+  const select = document.getElementById('workspace-option');
+  const help = document.getElementById('workspace-help');
   const launchSurface = document.getElementById('launch-surface');
   const status = document.getElementById('launch-status');
   const button = document.getElementById('launch-button');
+  let bootstrap = null;
+
   try {
-    const data = await loadBootstrap();
-    renderWorkerOptions(select, data);
-    renderLaunchSurfaceOptions(launchSurface, data);
+    bootstrap = await loadBootstrap();
+    renderWorkspaceOptions(select, bootstrap);
+    renderLaunchSurfaceOptions(launchSurface, bootstrap);
+    syncWorkspaceUI(select, bootstrap, button, help);
   } catch (error) {
     status.textContent = error.message;
   }
 
+  select.addEventListener('change', () => {
+    if (!bootstrap) return;
+    syncWorkspaceUI(select, bootstrap, button, help);
+  });
+
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     button.disabled = true;
-    status.textContent = 'Launching worker…';
+    const meta = bootstrap
+      ? syncWorkspaceUI(select, bootstrap, button, help)
+      : { statusText: 'Launching workspace…' };
+    status.textContent = meta.statusText;
     const payload = {
       description: document.getElementById('description').value.trim(),
       success_criteria: document.getElementById('success_criteria').value.trim(),
       context: document.getElementById('context').value.trim(),
-      worker_option: select.value,
+      workspace_option: select.value,
       launch_surface: launchSurface.value,
     };
     try {
