@@ -18,6 +18,9 @@
           <div>
             <h1 id="watch-title">Worker live view</h1>
             <p id="watch-subtitle">Connecting to sandbox…</p>
+            <div class="watch-quick-links">
+              <button id="open-project-workspace" class="watch-link-chip" type="button" hidden>Open project workspace</button>
+            </div>
           </div>
         </div>
         <div class="watch-summary">
@@ -45,11 +48,12 @@
         <pre id="latest-output-full">No run output yet.</pre>
       </section>
       <aside id="more-menu" class="more-menu" hidden>
+        <button id="open-project-workspace-menu" type="button">Open project workspace</button>
         <button id="surface-terminal" type="button">Watch exact live session</button>
         <button id="surface-desktop" type="button">Watch live desktop</button>
         <button id="open-external" type="button">Open current view in new tab</button>
         <button id="open-terminal-link" type="button">Open terminal page</button>
-        <button id="open-worker-console" type="button">Open worker console</button>
+        <button id="open-worker-console" type="button">Open worker details</button>
         <button data-action="codex" type="button">Open Codex</button>
         <button data-action="claude" type="button">Open Claude</button>
         <button data-action="openclaw" type="button">Open OpenClaw</button>

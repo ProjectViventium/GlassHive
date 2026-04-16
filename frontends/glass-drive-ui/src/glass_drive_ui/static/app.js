@@ -4,6 +4,15 @@ async function loadBootstrap() {
   return response.json();
 }
 
+function renderLaunchSurfaceOptions(select, data) {
+  const opts = [];
+  for (const item of data.launch_surface_options || []) {
+    opts.push(`<option value="${item.value}">${item.label}</option>`);
+  }
+  select.innerHTML = opts.join('');
+  select.value = String(data.default_launch_surface || 'desktop');
+}
+
 function renderWorkerOptions(select, data) {
   const opts = [];
   for (const item of data.new_worker_options) {
@@ -24,11 +33,13 @@ function renderWorkerOptions(select, data) {
 async function main() {
   const form = document.getElementById('launch-form');
   const select = document.getElementById('worker-option');
+  const launchSurface = document.getElementById('launch-surface');
   const status = document.getElementById('launch-status');
   const button = document.getElementById('launch-button');
   try {
     const data = await loadBootstrap();
     renderWorkerOptions(select, data);
+    renderLaunchSurfaceOptions(launchSurface, data);
   } catch (error) {
     status.textContent = error.message;
   }
@@ -42,6 +53,7 @@ async function main() {
       success_criteria: document.getElementById('success_criteria').value.trim(),
       context: document.getElementById('context').value.trim(),
       worker_option: select.value,
+      launch_surface: launchSurface.value,
     };
     try {
       const response = await fetch('/api/launch', {

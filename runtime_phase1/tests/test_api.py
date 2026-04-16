@@ -149,6 +149,8 @@ def test_openclaw_worker_exposes_operator_control_surface(tmp_path):
     assert terminal_ui.status_code == 200
     assert "Connecting to worker terminal" in terminal_ui.text
     assert f"const workerId = '{worker['worker_id']}'" in terminal_ui.text
+    assert 'target="_top">Back to project workspace</a>' in terminal_ui.text
+    assert 'target="_top">Worker console</a>' in terminal_ui.text
 
 
 def test_project_workspace_ui_supports_simple_run_flow(tmp_path):
@@ -355,6 +357,7 @@ def test_interrupt_stops_active_run_and_keeps_worker_ready(tmp_path):
 class DesktopStubRuntime:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.last_desktop_action: dict[str, object] | None = None
 
     def resolve_model(self, profile: str) -> str:
         return "desktop-stub/test"
@@ -408,7 +411,20 @@ class DesktopStubRuntime:
             "view_url": "http://127.0.0.1:57906/?autoconnect=1",
         }
 
-    def desktop_action(self, worker: dict, action: str, *, url: str | None = None) -> dict[str, object]:
+    def desktop_action(
+        self,
+        worker: dict,
+        action: str,
+        *,
+        url: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, object]:
+        self.last_desktop_action = {
+            "worker_id": worker["worker_id"],
+            "action": action,
+            "url": url,
+            "run_id": run_id,
+        }
         return {
             "action": action,
             "status": "launched",
@@ -443,13 +459,19 @@ def test_desktop_action_and_artifact_preview_surface_in_project_ui(tmp_path):
 
     action = client.post(
         f"/v1/workers/{worker['worker_id']}/desktop-action",
-        json={"action": "codex"},
+        json={"action": "codex", "run_id": "run_demo123"},
     )
     assert action.status_code == 202
     action_payload = action.json()
     assert action_payload["mode"] == "workstation-desktop"
     assert action_payload["status"] == "launched"
     assert action_payload["url"].startswith("http://127.0.0.1:57906/")
+    assert runtime.last_desktop_action == {
+        "worker_id": worker["worker_id"],
+        "action": "codex",
+        "url": None,
+        "run_id": "run_demo123",
+    }
 
     artifact = client.get(f"/v1/workers/{worker['worker_id']}/artifacts/latest-image")
     assert artifact.status_code == 200
@@ -461,3 +483,29 @@ def test_desktop_action_and_artifact_preview_surface_in_project_ui(tmp_path):
     assert "Open Codex" in project_ui.text
     assert "Latest Visual Artifact" in project_ui.text
     assert f"/v1/workers/{worker['worker_id']}/artifacts/latest-image" in project_ui.text
+
+
+def test_launch_failed_endpoint_marks_worker_failed(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Launch Failure", "goal": "Record a failed launch clearly."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Launch Worker", "role": "operator", "profile": "codex-cli"},
+    ).json()
+
+    response = client.post(
+        f"/v1/workers/{worker['worker_id']}/launch-failed",
+        json={"reason": "assign failed during launch"},
+    )
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["state"] == "failed"
+    assert payload["last_error"] == "assign failed during launch"
+
+    events = client.get(f"/v1/workers/{worker['worker_id']}/events").json()["items"]
+    assert any(event["event_type"] == "worker.launch_failed" for event in events)

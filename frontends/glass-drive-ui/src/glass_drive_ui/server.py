@@ -12,7 +12,13 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .prompt_template import build_operator_brief, build_project_title, desktop_action_for_launch, watch_surface_for_launch
+from .prompt_template import (
+    build_operator_brief,
+    build_project_title,
+    desktop_action_for_launch,
+    initial_watch_surface_for_launch,
+    normalize_launch_surface,
+)
 from .runtime_client import RuntimeClient
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -23,6 +29,7 @@ class LaunchRequest(BaseModel):
     success_criteria: str = Field(min_length=1)
     context: str | None = None
     worker_option: str = "new:codex-cli"
+    launch_surface: str | None = None
 
 
 class MessageRequest(BaseModel):
@@ -72,6 +79,67 @@ def _launch_browser_url(description: str) -> str | None:
     return None
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _default_launch_surface() -> str:
+    return normalize_launch_surface(os.environ.get("GLASSHIVE_DEFAULT_LAUNCH_SURFACE", "desktop"))
+
+
+def _show_live_terminal_in_desktop() -> bool:
+    return _env_flag("GLASSHIVE_SHOW_LIVE_TERMINAL_IN_DESKTOP", True)
+
+
+def _launch_surface_options() -> list[dict[str, str]]:
+    return [
+        {
+            "value": "desktop",
+            "label": "Live desktop",
+            "description": "Open the workstation desktop first. This is the recommended default.",
+        },
+        {
+            "value": "terminal",
+            "label": "Exact live session",
+            "description": "Open the raw live terminal session first instead of the desktop.",
+        },
+        {
+            "value": "auto",
+            "label": "Auto",
+            "description": "Let GlassHive choose the initial surface from the task type.",
+        },
+    ]
+
+
+def _format_launch_error(exc: Exception) -> str:
+    detail = str(exc).strip()
+    if detail:
+        return detail
+    return "The project launch failed before the first run could start."
+
+
+def _launch_desktop_surfaces(
+    client: RuntimeClient,
+    *,
+    worker_id: str,
+    profile: str,
+    description: str,
+    run_id: str,
+    surface: str,
+) -> None:
+    if surface != "desktop":
+        return
+    action = desktop_action_for_launch(profile, description)
+    browser_url = _launch_browser_url(description) if action == "browser" else None
+    if action == "browser" and browser_url:
+        client.desktop_action(worker_id, "browser", url=browser_url)
+    if _show_live_terminal_in_desktop():
+        client.desktop_action(worker_id, "terminal", run_id=run_id)
+
+
 def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     client = runtime_client or RuntimeClient()
     app = FastAPI(title="GlassHive", version="0.1.0")
@@ -87,6 +155,8 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         return {
             "owner_id": owner_id,
             "default_worker_option": "new:codex-cli",
+            "default_launch_surface": _default_launch_surface(),
+            "launch_surface_options": _launch_surface_options(),
             "new_worker_options": [
                 {"value": "new:codex-cli", "label": "New main worker · Codex"},
                 {"value": "new:claude-code", "label": "New main worker · Claude Code"},
@@ -100,38 +170,53 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         owner_id = os.environ.get("GLASSHIVE_DEFAULT_OWNER_ID", "demo-owner")
         brief = build_operator_brief(payload.description, payload.success_criteria, payload.context)
         project_id: str
-        worker_id: str
+        worker_id: str | None = None
         profile: str
+        created_new_worker = False
 
-        if payload.worker_option.startswith("existing:"):
-            worker_id = payload.worker_option.split(":", 1)[1]
-            worker = client.get_worker(worker_id)
-            project_id = str(worker["project_id"])
-            profile = str(worker.get("profile") or "codex-cli")
-        else:
-            profile = payload.worker_option.split(":", 1)[1] if ":" in payload.worker_option else "codex-cli"
-            project = client.create_project(owner_id, build_project_title(payload.description), payload.description.strip(), profile)
-            project_id = str(project["project_id"])
-            worker = client.create_worker(project_id, owner_id, profile)
-            worker_id = str(worker["worker_id"])
-
-        run = client.assign_run(worker_id, brief)
-        surface = watch_surface_for_launch(profile, payload.description)
         try:
-            action = desktop_action_for_launch(profile, payload.description)
-            browser_url = _launch_browser_url(payload.description) if action == "browser" else None
-            if action != "browser" or browser_url:
-                client.desktop_action(
-                    worker_id,
-                    action,
-                    url=browser_url,
-                )
+            if payload.worker_option.startswith("existing:"):
+                worker_id = payload.worker_option.split(":", 1)[1]
+                worker = client.get_worker(worker_id)
+                project_id = str(worker["project_id"])
+                profile = str(worker.get("profile") or "codex-cli")
+            else:
+                profile = payload.worker_option.split(":", 1)[1] if ":" in payload.worker_option else "codex-cli"
+                project = client.create_project(owner_id, build_project_title(payload.description), payload.description.strip(), profile)
+                project_id = str(project["project_id"])
+                worker = client.create_worker(project_id, owner_id, profile)
+                worker_id = str(worker["worker_id"])
+                created_new_worker = True
+            run = client.assign_run(str(worker_id), brief)
+        except Exception as exc:
+            reason = _format_launch_error(exc)
+            if created_new_worker and worker_id:
+                try:
+                    client.launch_failed(str(worker_id), reason)
+                except Exception:
+                    pass
+            raise HTTPException(status_code=502, detail=reason) from exc
+
+        surface = initial_watch_surface_for_launch(
+            profile,
+            payload.description,
+            launch_surface=payload.launch_surface or _default_launch_surface(),
+        )
+        try:
+            _launch_desktop_surfaces(
+                client,
+                worker_id=str(worker_id),
+                profile=profile,
+                description=payload.description,
+                run_id=str(run["run_id"]),
+                surface=surface,
+            )
         except Exception:
             pass
 
         return {
             "project_id": project_id,
-            "worker_id": worker_id,
+            "worker_id": str(worker_id),
             "run_id": run["run_id"],
             "watch_url": f"/watch/{worker_id}?project_id={project_id}&surface={surface}",
         }

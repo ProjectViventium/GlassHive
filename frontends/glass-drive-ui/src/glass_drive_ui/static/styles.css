@@ -79,6 +79,35 @@ button, input, textarea, select { font: inherit; }
 .composer-form { display: grid; gap: 18px; }
 .composer-form label { display: grid; gap: 10px; }
 .composer-form span { font-size: 0.9rem; font-weight: 700; letter-spacing: -0.01em; }
+.advanced-panel {
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 24px;
+  background: rgba(255,255,255,0.025);
+  overflow: hidden;
+}
+.advanced-panel summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 16px 18px;
+  color: var(--muted);
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+.advanced-panel summary::-webkit-details-marker { display: none; }
+.advanced-panel[open] summary {
+  color: var(--text);
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.advanced-grid {
+  display: grid;
+  gap: 14px;
+  padding: 16px 18px 18px;
+}
+.advanced-field small {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
 textarea, select, .steer-form input {
   width: 100%;
   border: 1px solid rgba(255,255,255,0.1);
@@ -133,6 +162,21 @@ textarea { resize: vertical; min-height: 96px; }
 .watch-brand { min-width: 0; }
 .watch-brand h1 { margin: 0; font-size: 1rem; }
 .watch-brand p { margin: 2px 0 0; color: var(--muted); font-size: 0.82rem; }
+.watch-quick-links {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.watch-link-chip {
+  padding: 9px 12px;
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 999px;
+  background: rgba(255,255,255,0.06);
+  color: var(--text);
+  cursor: pointer;
+}
+.watch-link-chip:hover { transform: translateY(-1px); }
 .watch-summary {
   min-width: 0;
   display: grid;
@@ -288,6 +332,7 @@ textarea { resize: vertical; min-height: 96px; }
     align-items: start;
   }
   .watch-controls { flex-wrap: wrap; }
+  .watch-quick-links { margin-bottom: 4px; }
   .result-panel {
     top: 140px;
   }
@@ -296,6 +341,7 @@ textarea { resize: vertical; min-height: 96px; }
   body { overflow: auto; }
   .launch-shell { padding: 20px; }
   .composer-frame { padding: 22px 18px 20px; border-radius: 24px; }
+  .advanced-grid { padding: 14px 16px 16px; }
   .worker-row { grid-template-columns: 1fr; }
   #desktop-frame { min-height: min(62vh, 520px); }
   .steer-form { grid-template-columns: 1fr; }

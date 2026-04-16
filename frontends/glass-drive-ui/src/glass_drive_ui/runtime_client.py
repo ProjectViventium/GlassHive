@@ -68,14 +68,25 @@ class RuntimeClient:
     def assign_run(self, worker_id: str, instruction: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/workers/{worker_id}/assign", json_body={"instruction": instruction})
 
+    def launch_failed(self, worker_id: str, reason: str) -> dict[str, Any]:
+        return self._request("POST", f"/v1/workers/{worker_id}/launch-failed", json_body={"reason": reason})
+
     def message(self, worker_id: str, message: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/workers/{worker_id}/message", json_body={"message": message})
 
     def lifecycle(self, worker_id: str, action: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/workers/{worker_id}/{action}")
 
-    def desktop_action(self, worker_id: str, action: str, url: str | None = None) -> dict[str, Any]:
+    def desktop_action(
+        self,
+        worker_id: str,
+        action: str,
+        url: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {"action": action}
         if url:
             payload["url"] = url
+        if run_id:
+            payload["run_id"] = run_id
         return self._request("POST", f"/v1/workers/{worker_id}/desktop-action", json_body=payload)

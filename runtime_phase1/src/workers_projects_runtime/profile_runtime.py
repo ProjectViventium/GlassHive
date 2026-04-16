@@ -92,10 +92,17 @@ class ProfiledWorkerRuntime:
             return runtime.collect_completed_run(worker)
         return None
 
-    def desktop_action(self, worker: dict, action: str, *, url: str | None = None) -> dict[str, object]:
+    def desktop_action(
+        self,
+        worker: dict,
+        action: str,
+        *,
+        url: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, object]:
         runtime = self._runtime_for_worker(worker)
         if hasattr(runtime, "desktop_action"):
-            return runtime.desktop_action(worker, action, url=url)
+            return runtime.desktop_action(worker, action, url=url, run_id=run_id)
         raise RuntimeErrorBase(f"Desktop actions are not supported for profile {worker.get('profile') or 'unknown'}")
 
 
@@ -404,11 +411,30 @@ class BaseCliWorkerRuntime:
             subtitle=f"{self.runtime_name} active run" if active_session else f"{self.runtime_name} sandbox",
         )
 
-    def desktop_action(self, worker: dict, action: str, *, url: str | None = None) -> dict[str, object]:
+    def desktop_action(
+        self,
+        worker: dict,
+        action: str,
+        *,
+        url: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, object]:
         self.ensure_worker_ready(worker)
-        launched = self.sandbox.desktop_action(worker["worker_id"], self.runtime_name, action, url=url, worker=worker)
+        session_name = self._session_name_for_run_id(run_id) if action == "terminal" and run_id else None
+        launched = self.sandbox.desktop_action(
+            worker["worker_id"],
+            self.runtime_name,
+            action,
+            url=url,
+            session_name=session_name,
+            worker=worker,
+        )
         notes = {
-            "terminal": "Opened a workstation shell inside the worker sandbox.",
+            "terminal": (
+                "Opened the exact live worker terminal session inside the workstation desktop."
+                if session_name
+                else "Opened a workstation shell inside the worker sandbox."
+            ),
             "files": "Opened the workspace file manager inside the worker sandbox.",
             "browser": "Opened the sandbox browser in the live workstation.",
             "focus_browser": "Tried to raise the existing browser window to the front.",

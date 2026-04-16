@@ -3,6 +3,13 @@ from __future__ import annotations
 import re
 
 
+def normalize_launch_surface(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"desktop", "terminal", "auto"}:
+        return normalized
+    return "auto"
+
+
 def build_operator_brief(description: str, success_criteria: str, context: str | None = None) -> str:
     body = (context or "").strip() or "No additional context provided."
     return (
@@ -94,3 +101,15 @@ def watch_surface_for_launch(profile: str, description: str) -> str:
     if action == "browser":
         return "desktop"
     return "terminal"
+
+
+def initial_watch_surface_for_launch(
+    profile: str,
+    description: str,
+    *,
+    launch_surface: str | None = None,
+) -> str:
+    normalized = normalize_launch_surface(launch_surface)
+    if normalized in {"desktop", "terminal"}:
+        return normalized
+    return watch_surface_for_launch(profile, description)

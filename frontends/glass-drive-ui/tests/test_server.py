@@ -6,7 +6,9 @@ from glass_drive_ui.server import create_app
 
 class FakeRuntimeClient:
     def __init__(self):
-        self.last_desktop_action = None
+        self.desktop_actions = []
+        self.launch_failures = []
+        self.fail_assign = False
 
     def health(self):
         return {"status": "ok"}
@@ -43,10 +45,16 @@ class FakeRuntimeClient:
         return {"worker_id": "wrk_new"}
 
     def assign_run(self, worker_id: str, instruction: str):
+        if self.fail_assign:
+            raise RuntimeError("assign failed")
         return {"run_id": "run_1"}
 
-    def desktop_action(self, worker_id: str, action: str, url: str | None = None):
-        self.last_desktop_action = {"worker_id": worker_id, "action": action, "url": url}
+    def launch_failed(self, worker_id: str, reason: str):
+        self.launch_failures.append({"worker_id": worker_id, "reason": reason})
+        return {"worker_id": worker_id, "state": "failed", "last_error": reason}
+
+    def desktop_action(self, worker_id: str, action: str, url: str | None = None, run_id: str | None = None):
+        self.desktop_actions.append({"worker_id": worker_id, "action": action, "url": url, "run_id": run_id})
         return {"status": "launched", "action": action}
 
     def message(self, worker_id: str, message: str):
@@ -61,6 +69,7 @@ def test_bootstrap_and_launch_flow():
     boot = client.get('/api/bootstrap')
     assert boot.status_code == 200
     assert boot.json()['new_worker_options'][0]['value'] == 'new:codex-cli'
+    assert boot.json()['default_launch_surface'] == 'desktop'
 
     launch = client.post('/api/launch', json={
         'description': 'Research a self-hosted worker runtime',
@@ -70,7 +79,7 @@ def test_bootstrap_and_launch_flow():
     })
     assert launch.status_code == 200
     assert launch.json()['watch_url'].startswith('/watch/wrk_new')
-    assert 'surface=terminal' in launch.json()['watch_url']
+    assert 'surface=desktop' in launch.json()['watch_url']
 
 
 def test_watch_assets_render():
@@ -82,6 +91,8 @@ def test_watch_assets_render():
     watch = client.get('/watch/wrk_1')
     assert watch.status_code == 200
     assert 'GlassHive' in watch.text
+    assert 'Open project workspace' in watch.text
+    assert 'Open worker details' in watch.text
     assert 'Glass Drive' not in watch.text
     desktop = client.get('/desktop/wrk_1')
     assert desktop.status_code == 200
@@ -103,7 +114,9 @@ def test_launch_uses_desktop_surface_for_browser_projects():
     })
     assert launch.status_code == 200
     assert 'surface=desktop' in launch.json()['watch_url']
-    assert runtime.last_desktop_action is None
+    assert runtime.desktop_actions == [
+        {'worker_id': 'wrk_new', 'action': 'terminal', 'url': None, 'run_id': 'run_1'},
+    ]
 
 
 def test_launch_preopens_browser_for_explicit_external_navigation():
@@ -117,7 +130,10 @@ def test_launch_preopens_browser_for_explicit_external_navigation():
     })
     assert launch.status_code == 200
     assert 'surface=desktop' in launch.json()['watch_url']
-    assert runtime.last_desktop_action == {'worker_id': 'wrk_new', 'action': 'browser', 'url': 'https://example.com'}
+    assert runtime.desktop_actions == [
+        {'worker_id': 'wrk_new', 'action': 'browser', 'url': 'https://example.com', 'run_id': None},
+        {'worker_id': 'wrk_new', 'action': 'terminal', 'url': None, 'run_id': 'run_1'},
+    ]
 
 
 def test_browser_action_accepts_explicit_url():
@@ -125,11 +141,41 @@ def test_browser_action_accepts_explicit_url():
     client = TestClient(create_app(runtime_client=runtime))
     response = client.post('/api/worker/wrk_1/action/browser', json={'url': 'file:///workspace/project/index.html'})
     assert response.status_code == 200
-    assert runtime.last_desktop_action == {
+    assert runtime.desktop_actions[-1] == {
         'worker_id': 'wrk_1',
         'action': 'browser',
         'url': 'file:///workspace/project/index.html',
+        'run_id': None,
     }
+
+
+def test_launch_respects_explicit_terminal_surface_override():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    launch = client.post('/api/launch', json={
+        'description': 'Research a self-hosted worker runtime',
+        'success_criteria': 'Return three viable options',
+        'context': '',
+        'worker_option': 'new:codex-cli',
+        'launch_surface': 'terminal',
+    })
+    assert launch.status_code == 200
+    assert 'surface=terminal' in launch.json()['watch_url']
+    assert runtime.desktop_actions == []
+
+
+def test_launch_failure_marks_new_worker_failed():
+    runtime = FakeRuntimeClient()
+    runtime.fail_assign = True
+    client = TestClient(create_app(runtime_client=runtime))
+    launch = client.post('/api/launch', json={
+        'description': 'Research a self-hosted worker runtime',
+        'success_criteria': 'Return three viable options',
+        'context': '',
+        'worker_option': 'new:codex-cli',
+    })
+    assert launch.status_code == 502
+    assert runtime.launch_failures == [{'worker_id': 'wrk_new', 'reason': 'assign failed'}]
 
 
 def test_novnc_proxy_uses_worker_view_origin(monkeypatch):

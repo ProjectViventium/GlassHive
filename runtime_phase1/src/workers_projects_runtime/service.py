@@ -75,15 +75,34 @@ class WorkersProjectsService:
         self._ensure_worker_processor(worker_id)
         return run
 
+    def record_launch_failed(self, worker_id: str, reason: str) -> dict:
+        worker = self.require_worker(worker_id)
+        self.store.cancel_pending_runs(worker_id, error_text=reason, state="failed")
+        updated = self.store.update_worker(worker_id, state="failed", last_error=reason)
+        self.store.add_event(worker["project_id"], worker_id, None, "worker.launch_failed", reason)
+        return updated or worker
+
     def send_message(self, worker_id: str, message: str) -> dict:
         instruction = f"Operator message for the current worker session:\n\n{message}"
         return self.assign_run(worker_id, instruction, event_type="worker.message")
 
-    def desktop_action(self, worker_id: str, action: str, *, url: str | None = None) -> dict[str, object]:
+    def desktop_action(
+        self,
+        worker_id: str,
+        action: str,
+        *,
+        url: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, object]:
         worker = self.require_worker(worker_id)
         if not hasattr(self.runtime, "desktop_action"):
             raise RuntimeErrorBase("Desktop actions are not supported by the configured runtime")
-        launched = self.runtime.desktop_action(worker, action, url=url)
+        try:
+            launched = self.runtime.desktop_action(worker, action, url=url, run_id=run_id)
+        except TypeError as exc:
+            if "run_id" not in str(exc):
+                raise
+            launched = self.runtime.desktop_action(worker, action, url=url)
         self.store.add_event(
             worker["project_id"],
             worker_id,

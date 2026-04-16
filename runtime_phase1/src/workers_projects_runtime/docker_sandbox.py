@@ -49,6 +49,12 @@ class DockerSandboxManager:
         self.vnc_password = os.environ.get("WPR_SANDBOX_VNC_PASSWORD", "secret")
         self.vnc_no_password = os.environ.get("WPR_SANDBOX_VNC_NO_PASSWORD", "1").strip().lower() in {"1", "true", "yes", "on"}
 
+    def _env_flag(self, name: str, default: bool) -> bool:
+        raw = str(os.environ.get(name, "")).strip().lower()
+        if not raw:
+            return default
+        return raw in {"1", "true", "yes", "on"}
+
     def ensure_ready(self, worker: dict, runtime_name: str, *, start_if_paused: bool = True) -> SandboxInfo:
         self._require_docker()
         self._ensure_image()
@@ -57,9 +63,11 @@ class DockerSandboxManager:
         self._seed_bootstrap(paths["home_dir"], paths["workspace_dir"], runtime_name, worker)
         container_name = self._container_name(worker["worker_id"])
         sandbox = self.inspect(worker["worker_id"])
+        needs_idle_prime = False
         if sandbox is None:
             self._create_container(container_name, paths)
             sandbox = self.inspect(worker["worker_id"])
+            needs_idle_prime = True
         if sandbox is None:
             raise RuntimeError("Failed to create worker sandbox")
         if sandbox.state == "paused" and start_if_paused:
@@ -68,9 +76,12 @@ class DockerSandboxManager:
         elif sandbox.state in {"created", "exited", "dead"}:
             self._docker(["start", container_name])
             sandbox = self.inspect(worker["worker_id"])
+            needs_idle_prime = True
         if sandbox is None:
             raise RuntimeError("Failed to start worker sandbox")
         self._set_plain_background(sandbox.container_name)
+        if needs_idle_prime and self._env_flag("WPR_IDLE_DESKTOP_PRIME_BROWSER", True):
+            self._prime_idle_desktop(sandbox.container_name)
         return sandbox
 
     def inspect(self, worker_id: str) -> SandboxInfo | None:
@@ -272,12 +283,13 @@ class DockerSandboxManager:
         action: str,
         *,
         url: str | None = None,
+        session_name: str | None = None,
         worker: dict | None = None,
     ) -> dict[str, object]:
         resolved_worker = worker or {"worker_id": worker_id}
         sandbox = self.ensure_ready(resolved_worker, runtime_name=runtime_name)
         normalized = action.strip().lower().replace("-", "_")
-        command = self._desktop_action_command(normalized, url=url)
+        command = self._desktop_action_command(normalized, url=url, session_name=session_name)
         if not command:
             raise ValueError(f"Unsupported desktop action: {action}")
         merged_env = {
@@ -509,7 +521,34 @@ class DockerSandboxManager:
             cwd=self.workspace_mount,
         )
 
-    def _desktop_action_command(self, action: str, *, url: str | None = None) -> list[str] | None:
+    def _prime_idle_desktop(self, container_name: str) -> None:
+        safe_url = shlex.quote(self._default_browser_url())
+        self._docker_exec(
+            container_name,
+            [
+                "bash",
+                "-lc",
+                (
+                    f"(chromium --no-sandbox --disable-dev-shm-usage --new-window {safe_url} >/dev/null 2>&1 &) ; "
+                    "sleep 1; "
+                    "wmctrl -xa chromium.Chromium || wmctrl -a Chromium || true"
+                ),
+            ],
+            env={
+                "HOME": self.home_mount,
+                "TERM": self.term_value,
+                "DISPLAY": self.display_value,
+            },
+            cwd=self.workspace_mount,
+        )
+
+    def _desktop_action_command(
+        self,
+        action: str,
+        *,
+        url: str | None = None,
+        session_name: str | None = None,
+    ) -> list[str] | None:
         safe_url = (url or "").strip() or self._default_browser_url()
         workspace = shlex.quote(self.workspace_mount)
         title = {
@@ -520,6 +559,19 @@ class DockerSandboxManager:
             "openclaw": "OpenClaw CLI",
         }
         if action == "terminal":
+            attach_script = f"cd {workspace}; exec bash --noprofile --norc"
+            if session_name:
+                session_literal = shlex.quote(session_name)
+                attach_script = (
+                    f"cd {workspace}; "
+                    f"SESSION={session_literal}; "
+                    "for _ in $(seq 1 180); do "
+                    "if screen -ls | grep -Fq \".${SESSION}\"; then exec screen -xRR \"$SESSION\"; fi; "
+                    "sleep 1; "
+                    "done; "
+                    "printf '\\nLive session %s was not found. Opening a shell instead.\\n' \"$SESSION\"; "
+                    "exec bash --noprofile --norc"
+                )
             return [
                 "xterm",
                 "-bg",
@@ -533,13 +585,13 @@ class DockerSandboxManager:
                 "-geometry",
                 "140x40",
                 "-T",
-                title["terminal"],
+                "WPR Live Run" if session_name else title["terminal"],
                 "-e",
                 "bash",
                 "--noprofile",
                 "--norc",
                 "-c",
-                f"cd {workspace}; exec bash --noprofile --norc",
+                attach_script,
             ]
         if action == "files":
             return ["pcmanfm", self.workspace_mount]

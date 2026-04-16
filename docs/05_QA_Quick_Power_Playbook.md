@@ -10,12 +10,17 @@ Use this playbook to rapidly test whether Glass Hive is behaving like a real pow
 3. Run a task.
 4. Confirm live worker state appears immediately.
 5. Confirm the worker can be paused, resumed, interrupted, and terminated.
+6. Confirm the project-first watch flow lands on the desktop by default.
+7. Confirm the active live terminal is visible inside that desktop by default.
+8. Confirm a fresh worker desktop does not default to the Selenium splash screen.
 
 Pass if:
 
 - the operator path feels simple
 - the worker is resumable
 - the run/event history is coherent
+- the desktop-first view still shows the real live run terminal
+- fresh workers open on a GlassHive-owned surface instead of Selenium branding
 
 ## 2. Sandbox Persistence
 

@@ -87,3 +87,45 @@ def test_seed_bootstrap_writes_project_scope_files(tmp_path):
     manifest = json.loads((home_dir / ".glasshive" / "bootstrap-manifest.json").read_text())
     assert manifest["bootstrap_profile"] == "clean-room"
     assert "claude_project_mcp" in manifest["bundle_keys"]
+
+
+def test_terminal_desktop_action_waits_for_live_session(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    command = manager._desktop_action_command("terminal", session_name="job-run_123456")
+    assert command is not None
+    assert command[0] == "xterm"
+    assert "WPR Live Run" in command
+    assert "screen -xRR" in command[-1]
+    assert "job-run_123456" in command[-1]
+
+
+def test_ensure_ready_primes_idle_desktop_when_container_is_new(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[str] = []
+
+    class FakeSandbox:
+        def __init__(self, state: str):
+            self.container_name = "wpr-test"
+            self.state = state
+            self.container_id = "cid"
+            self.workspace_dir = str(tmp_path / "workspace")
+            self.home_dir = str(tmp_path / "home")
+            self.pid = 1234
+            self.image = "img"
+            self.novnc_port = 57900
+            self.selenium_port = 57901
+            self.openclaw_port = 57902
+
+    sandbox_states = [None, FakeSandbox("running")]
+
+    manager._require_docker = lambda: None  # type: ignore[method-assign]
+    manager._ensure_image = lambda: None  # type: ignore[method-assign]
+    manager._ensure_host_dirs = lambda paths: None  # type: ignore[method-assign]
+    manager._seed_bootstrap = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    manager._create_container = lambda *args, **kwargs: calls.append("create")  # type: ignore[method-assign]
+    manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
+    manager._prime_idle_desktop = lambda container_name: calls.append("prime")  # type: ignore[method-assign]
+    manager.inspect = lambda worker_id: sandbox_states.pop(0)  # type: ignore[method-assign]
+
+    manager.ensure_ready({"worker_id": "wrk_test"}, "codex-cli")
+    assert calls == ["create", "background", "prime"]

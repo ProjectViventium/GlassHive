@@ -88,6 +88,11 @@ class SendMessageRequest(BaseModel):
 class DesktopActionRequest(BaseModel):
     action: DesktopActionName
     url: str | None = None
+    run_id: str | None = None
+
+
+class LaunchFailureRequest(BaseModel):
+    reason: str = Field(min_length=1)
 
 
 class RunResponse(BaseModel):

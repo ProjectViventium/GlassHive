@@ -36,6 +36,16 @@
             <span>Context</span>
             <textarea id="context" name="context" rows="3" placeholder="Optional background, links, constraints, files, or access notes."></textarea>
           </label>
+          <details class="advanced-panel">
+            <summary>Advanced</summary>
+            <div class="advanced-grid">
+              <label class="advanced-field">
+                <span>Initial watch surface</span>
+                <select id="launch-surface" name="launch_surface"></select>
+                <small>Desktop is the default. When live terminal-in-desktop is enabled, the active run still stays visible there.</small>
+              </label>
+            </div>
+          </details>
           <div class="worker-row">
             <label class="worker-picker">
               <span>Worker</span>

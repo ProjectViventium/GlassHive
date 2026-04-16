@@ -1,4 +1,11 @@
-from glass_drive_ui.prompt_template import build_operator_brief, build_project_title, desktop_action_for_launch, watch_surface_for_launch
+from glass_drive_ui.prompt_template import (
+    build_operator_brief,
+    build_project_title,
+    desktop_action_for_launch,
+    initial_watch_surface_for_launch,
+    normalize_launch_surface,
+    watch_surface_for_launch,
+)
 
 
 def test_build_operator_brief_includes_required_sections():
@@ -28,3 +35,15 @@ def test_watch_surface_for_launch():
     assert watch_surface_for_launch("codex-cli", "Refactor the API and add tests") == "terminal"
     assert watch_surface_for_launch("codex-cli", "Open the browser to example.com") == "desktop"
     assert watch_surface_for_launch("codex-cli", "Build a minimal landing page that renders hello world") == "desktop"
+
+
+def test_initial_watch_surface_honors_explicit_override():
+    assert initial_watch_surface_for_launch("codex-cli", "Refactor the API and add tests", launch_surface="desktop") == "desktop"
+    assert initial_watch_surface_for_launch("codex-cli", "Create a landing page", launch_surface="terminal") == "terminal"
+    assert initial_watch_surface_for_launch("codex-cli", "Create a landing page", launch_surface="auto") == "desktop"
+
+
+def test_normalize_launch_surface_defaults_to_auto():
+    assert normalize_launch_surface("desktop") == "desktop"
+    assert normalize_launch_surface("terminal") == "terminal"
+    assert normalize_launch_surface("weird-value") == "auto"

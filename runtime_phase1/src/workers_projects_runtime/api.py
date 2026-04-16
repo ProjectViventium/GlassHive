@@ -17,6 +17,7 @@ from .models import (
     DesktopActionRequest,
     DesktopActionResponse,
     EventResponse,
+    LaunchFailureRequest,
     MetricsSummary,
     ProjectResponse,
     RunResponse,
@@ -451,6 +452,11 @@ def create_app(
         run = service.send_message(worker_id, payload.message)
         return RunResponse(**run)
 
+    @app.post("/v1/workers/{worker_id}/launch-failed", response_model=WorkerResponse, status_code=202)
+    def launch_failed(worker_id: str, payload: LaunchFailureRequest) -> WorkerResponse:
+        require_worker(worker_id)
+        return WorkerResponse(**service.record_launch_failed(worker_id, payload.reason))
+
     @app.post("/v1/workers/{worker_id}/interrupt", response_model=WorkerResponse, status_code=202)
     def interrupt(worker_id: str) -> WorkerResponse:
         require_worker(worker_id)
@@ -475,7 +481,7 @@ def create_app(
     def desktop_action(worker_id: str, payload: DesktopActionRequest, request: Request) -> DesktopActionResponse:
         worker = require_worker(worker_id)
         try:
-            launched = service.desktop_action(worker_id, payload.action, url=payload.url)
+            launched = service.desktop_action(worker_id, payload.action, url=payload.url, run_id=payload.run_id)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         runtime_details = _runtime_details(require_worker(worker_id))
@@ -1244,7 +1250,7 @@ def create_app(
                   <h1>{escape(worker['name'])}</h1>
                   <p>{subtitle}</p>
                   <p>No workstation desktop view is available for this worker right now.</p>
-                  <p><a href="/ui/projects/{escape(project['project_id'])}?worker_id={escape(worker_id)}">Back to project workspace</a> · <a href="/ui/workers/{escape(worker_id)}/terminal">Take over terminal</a></p>
+                  <p><a href="/ui/projects/{escape(project['project_id'])}?worker_id={escape(worker_id)}" target="_top">Back to project workspace</a> · <a href="/ui/workers/{escape(worker_id)}/terminal" target="_top">Take over terminal</a></p>
                 </div>
               </body>
             </html>
@@ -1271,7 +1277,7 @@ def create_app(
               <div>
                 <div><strong>{escape(worker['name'])}</strong></div>
                 <div class="meta">{subtitle} · {escape(str(runtime_details.get('container_name') or worker.get('session_key') or worker_id))}</div>
-                <div class="meta"><a href="/ui/projects/{escape(project['project_id'])}?worker_id={escape(worker_id)}">Back to project workspace</a> · <a href="/ui/workers/{escape(worker_id)}">Worker console</a> · <a href="/ui/workers/{escape(worker_id)}/terminal">Terminal</a> · <a href="{escape(external_view_url, quote=True)}" target="_blank" rel="noreferrer">Desktop directly</a></div>
+                <div class="meta"><a href="/ui/projects/{escape(project['project_id'])}?worker_id={escape(worker_id)}" target="_top">Back to project workspace</a> · <a href="/ui/workers/{escape(worker_id)}" target="_top">Worker console</a> · <a href="/ui/workers/{escape(worker_id)}/terminal" target="_top">Terminal</a> · <a href="{escape(external_view_url, quote=True)}" target="_blank" rel="noreferrer">Desktop directly</a></div>
               </div>
               <div class="actions">
                 <button onclick="action('resume')">Resume</button>
@@ -1344,7 +1350,7 @@ def create_app(
               <div>
                 <div><strong>{escape(worker['name'])}</strong></div>
                 <div class="meta">{subtitle} · {escape(str(runtime_details.get('container_name') or worker.get('session_key') or worker['worker_id']))}</div>
-                <div class="meta"><a href="/ui/projects/{escape(project['project_id'])}?worker_id={escape(worker_id)}">Back to project workspace</a> · <a href="/ui/workers/{escape(worker_id)}">Worker console</a></div>
+                <div class="meta"><a href="/ui/projects/{escape(project['project_id'])}?worker_id={escape(worker_id)}" target="_top">Back to project workspace</a> · <a href="/ui/workers/{escape(worker_id)}" target="_top">Worker console</a></div>
               </div>
               <div class="actions">
                 <button onclick="action('resume')">Resume</button>

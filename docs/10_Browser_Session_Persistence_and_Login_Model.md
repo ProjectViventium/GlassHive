@@ -68,6 +68,22 @@ Examples:
 
 Parent systems should resume these workers instead of recreating them.
 
+## User-Facing Terminology
+
+In user-facing product surfaces, the right term is `Workspace`.
+
+That means:
+
+1. users see `LinkedIn workspace`, `Research workspace`, or `Default workspace`
+2. runtime and API layers may still use `worker` and `sandbox`
+3. the user does not need to reason about worker IDs or container lifecycle terms
+
+The product model is:
+
+1. one user-facing workspace
+2. backed by one stable worker alias
+3. backed by one worker-scoped browser profile and persistent home/workspace state
+
 ## Lifecycle Model
 
 ### Recommended States
@@ -168,10 +184,11 @@ That is the simplest reliable model.
 
 The parent should persist:
 
-1. worker alias
-2. associated GlassHive `worker_id`
-3. service label such as `linkedin`, `gmail-browser`, or `sales`
-4. last-known lifecycle state
+1. stable worker alias
+2. user-facing display label
+3. associated GlassHive `worker_id`
+4. service label such as `linkedin`, `gmail-browser`, or `sales`
+5. last-known lifecycle state
 
 That is enough to provide a smooth `create or resume` experience without making GlassHive learn parent-specific identity rules.
 
@@ -181,14 +198,52 @@ That is enough to provide a smooth `create or resume` experience without making 
 2. cookie and session data are predictable
 3. user takeover stays understandable
 4. support/debugging stays tractable
+5. user-facing rename can stay lightweight because display label and routing alias do not have to be
+   the same field
 
 ### Do Not Start With
 
 1. shared cross-worker profiles
 2. multiple profiles per worker
 3. per-site browser-profile switching
+4. a user-facing duplicate action that blindly clones browser cookies or session state
 
 Those are future extensions, not v1 requirements.
+
+## Recommended User Actions
+
+### V1
+
+The least-resistance user-facing action model is:
+
+1. `Open workspace`
+2. `New workspace`
+3. `Rename workspace`
+
+This is enough to support the real continuity promise without introducing clone confusion.
+
+`Open workspace` should also cover the paused case. The user should not have to choose between
+`open` and `resume`.
+
+## Rename Semantics
+
+The least-resistance rename model is:
+
+1. keep one stable routing alias for the parent system
+2. allow the glossy UI to change only the display label in v1
+3. do not silently rewrite parent-side routing aliases when a user renames a workspace
+
+This keeps auto-reuse stable while still letting the user personalize visible workspace names.
+
+### Later, If Explicitly Approved
+
+`Duplicate workspace` may be added later only with explicit semantics.
+
+Recommended safe default if it is added:
+
+1. copy project files and seeded context
+2. keep a new worker identity
+3. start with a clean browser profile unless the product intentionally approves session cloning
 
 ## Website-Side Reality
 
@@ -246,11 +301,13 @@ Current likely file owners:
 
 ## Least-Resistance Implementation Sequence
 
-1. treat browser-authenticated work as stable named workers
-2. keep browser profile persistence worker-scoped
-3. add or use find-or-resume semantics from the parent side
-4. default to pause/resume after successful tasks
-5. reserve destroy for explicit teardown
+1. present persistent personal environments as named `Workspaces` in user-facing surfaces
+2. treat browser-authenticated work as stable named workers behind that label
+3. keep browser profile persistence worker-scoped
+4. add or use find-or-resume semantics from the parent side
+5. make `open` and `new` the default user actions
+6. default to pause/resume after successful tasks
+7. reserve destroy for explicit teardown
 
 ## Acceptance Criteria For This Proposal
 
@@ -262,6 +319,8 @@ A future implementation based on this document should satisfy all of these:
 4. destroy is the only lifecycle action that intentionally clears the session
 5. the model remains compatible with Telegram, LibreChat, and other parent systems
 6. the parent can answer “find or resume my LinkedIn worker” without depending on ephemeral UUIDs in the user-facing flow
+7. a non-technical user can understand “open my workspace again” without learning worker or sandbox terms
+8. renaming a workspace does not silently break the parent-side alias used for auto-reuse
 
 ## Non-Goals
 
@@ -271,6 +330,7 @@ This proposal does not approve:
 2. GlassHive learning Telegram-specific routing logic
 3. promising that third-party websites will never invalidate a session
 4. forcing Chrome-specific behavior into the core architecture
+5. approving browser-session cloning as default duplicate behavior
 
 ## Recommended Next Review Questions
 
@@ -280,3 +340,5 @@ Before implementation approval, decide:
 2. do we want an explicit `archived` state in v1, or can `paused` cover the initial product need?
 3. which browser-authenticated workflows deserve dedicated named workers by default?
 4. should browser workers auto-pause after success, or remain active for a configurable warm window?
+5. if `Duplicate workspace` is ever added, should it copy only files/context or also browser state?
+6. do we ever want users to edit stable routing aliases directly, or is display-label rename enough?

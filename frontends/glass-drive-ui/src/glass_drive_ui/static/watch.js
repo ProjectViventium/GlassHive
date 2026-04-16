@@ -26,6 +26,8 @@ const surfaceDesktopButton = document.getElementById('surface-desktop');
 const openExternal = document.getElementById('open-external');
 const openTerminalLink = document.getElementById('open-terminal-link');
 const openWorkerConsole = document.getElementById('open-worker-console');
+const openProjectWorkspace = document.getElementById('open-project-workspace');
+const openProjectWorkspaceMenu = document.getElementById('open-project-workspace-menu');
 
 let activeSurface = requestedSurface;
 let currentDesktopUrl = `${uiBase}/desktop/${workerId}`;
@@ -103,6 +105,17 @@ function currentSurfaceUrl() {
     return currentDesktopUrl || currentTerminalUrl;
   }
   return currentTerminalUrl || currentDesktopUrl;
+}
+
+function projectWorkspaceUrl() {
+  if (!projectId) return '';
+  return `${runtimeBase}/ui/projects/${projectId}?worker_id=${workerId}`;
+}
+
+function syncProjectWorkspaceLinks() {
+  const available = Boolean(projectWorkspaceUrl());
+  openProjectWorkspace.hidden = !available;
+  openProjectWorkspaceMenu.hidden = !available;
 }
 
 function syncMenuLabels() {
@@ -381,6 +394,15 @@ openExternal.addEventListener('click', () => {
   window.open(currentSurfaceUrl(), '_blank', 'noopener,noreferrer');
 });
 
+for (const button of [openProjectWorkspace, openProjectWorkspaceMenu]) {
+  button.addEventListener('click', () => {
+    const url = projectWorkspaceUrl();
+    closeMenu();
+    if (!url) return;
+    window.open(url, '_blank', 'noopener,noreferrer');
+  });
+}
+
 openTerminalLink.addEventListener('click', () => {
   closeMenu();
   window.open(currentTerminalUrl, '_blank', 'noopener,noreferrer');
@@ -414,5 +436,6 @@ document.getElementById('steer-form').addEventListener('submit', async (event) =
 });
 
 syncMenuLabels();
+syncProjectWorkspaceLinks();
 refresh();
 setInterval(refresh, 2000);
