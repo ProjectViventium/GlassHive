@@ -269,6 +269,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     def worker_message(worker_id: str, payload: MessageRequest) -> dict[str, Any]:
         return client.message(worker_id, payload.message)
 
+    @app.post("/api/worker/{worker_id}/steer")
+    def worker_steer(worker_id: str, payload: MessageRequest) -> dict[str, Any]:
+        return client.steer(worker_id, payload.message)
+
     @app.post("/api/worker/{worker_id}/action/{action}")
     def worker_action(worker_id: str, action: str, payload: ActionRequest | None = Body(default=None)) -> dict[str, Any]:
         if action in {"pause", "resume", "interrupt", "terminate"}:

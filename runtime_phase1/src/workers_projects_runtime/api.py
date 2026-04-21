@@ -466,6 +466,12 @@ def create_app(
         run = service.send_message(worker_id, payload.message)
         return RunResponse(**run)
 
+    @app.post("/v1/workers/{worker_id}/steer", response_model=RunResponse, status_code=202)
+    def steer_worker(worker_id: str, payload: SendMessageRequest) -> RunResponse:
+        require_worker(worker_id)
+        run = service.steer_worker(worker_id, payload.message)
+        return RunResponse(**run)
+
     @app.post("/v1/workers/{worker_id}/launch-failed", response_model=WorkerResponse, status_code=202)
     def launch_failed(worker_id: str, payload: LaunchFailureRequest) -> WorkerResponse:
         require_worker(worker_id)

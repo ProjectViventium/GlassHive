@@ -332,6 +332,14 @@ class Store:
             ).fetchone()
         return self._row(row)
 
+    def has_queued_runs(self, worker_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM runs WHERE worker_id = ? AND state = 'queued' LIMIT 1",
+                (worker_id,),
+            ).fetchone()
+        return row is not None
+
     def finalize_run(self, run_id: str, state: str, output_text: str = "", error_text: str = "") -> dict[str, Any] | None:
         return self.update_run(
             run_id,

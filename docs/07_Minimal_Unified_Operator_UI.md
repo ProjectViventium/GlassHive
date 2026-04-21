@@ -59,6 +59,20 @@ Calm dark glass over a bright signal core, like a modern appliance or Tesla cont
 18. The latest result must be visible in the top ribbon and expandable without leaving the live view.
 19. The steering box must remain visible across normal desktop widths and mobile-safe layouts.
 20. A non-technical user should be able to understand the flow with near-zero explanation.
+21. `Steer + send` must behave like a real redirect, not a passive note:
+   - interrupt the active run
+   - stop the exact live run session and its process tree
+   - queue the replacement steer run automatically
+   - keep the replacement steer run in execution mode until the requested action is actually performed or a blocker is raised
+22. The watch footer must expose a safe secondary queue gesture without diluting the default steer meaning:
+   - normal `Send` or plain Enter redirects now
+   - long-pressing `Send` queues a follow-up without interrupting current work
+   - `Cmd/Ctrl+Enter` and modifier-click send must also queue the follow-up
+   - the footer must explain this visibly in the UI, not only in hidden docs or shortcuts
+   - once queued, the UI/runtime contract must keep the workspace marked `running` until that queued follow-up actually settles
+23. Exact run interruption depends on standard process utilities being present inside the sandbox image:
+   - workstation images must include `ps`, `awk`, and `pkill`/procps
+   - GlassHive uses those tools to stop the exact `.glasshive-runs/<run_id>` process tree during steer redirects
 
 ## User-Facing Workspace Model
 

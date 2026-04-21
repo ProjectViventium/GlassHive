@@ -276,6 +276,36 @@ class DockerSandboxManager:
             detail = (result.stderr or result.stdout or "").strip()[-1200:]
             raise RuntimeError(f"Failed to stop screen session {session_name}: {detail}")
 
+    def terminate_run_processes(
+        self,
+        worker_id: str,
+        runtime_name: str,
+        run_id: str,
+        *,
+        worker: dict | None = None,
+    ) -> None:
+        resolved_worker = worker or {"worker_id": worker_id}
+        sandbox = self.ensure_ready(resolved_worker, runtime_name=runtime_name)
+        run_root = f"{self.home_mount}/.glasshive-runs/{run_id}"
+        script = (
+            f"needle={shlex.quote(run_root)}; "
+            "pids=$(ps -eo pid=,ppid=,args= | awk -v needle=\"$needle\" 'index($0, needle) > 0 { print $1 }'); "
+            "if [ -z \"$pids\" ]; then exit 0; fi; "
+            "for pid in $pids; do pkill -TERM -P \"$pid\" >/dev/null 2>&1 || true; kill -TERM \"$pid\" >/dev/null 2>&1 || true; done; "
+            "sleep 1; "
+            "for pid in $pids; do pkill -KILL -P \"$pid\" >/dev/null 2>&1 || true; kill -KILL \"$pid\" >/dev/null 2>&1 || true; done"
+        )
+        self._docker_exec(
+            sandbox.container_name,
+            ["bash", "-lc", script],
+            env={
+                "HOME": self.home_mount,
+                "TERM": self.term_value,
+                "DISPLAY": self.display_value,
+            },
+            cwd=self.workspace_mount,
+        )
+
     def desktop_action(
         self,
         worker_id: str,

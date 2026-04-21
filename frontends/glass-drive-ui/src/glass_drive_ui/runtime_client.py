@@ -86,6 +86,9 @@ class RuntimeClient:
     def message(self, worker_id: str, message: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/workers/{worker_id}/message", json_body={"message": message})
 
+    def steer(self, worker_id: str, message: str) -> dict[str, Any]:
+        return self._request("POST", f"/v1/workers/{worker_id}/steer", json_body={"message": message})
+
     def lifecycle(self, worker_id: str, action: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/workers/{worker_id}/{action}")
 

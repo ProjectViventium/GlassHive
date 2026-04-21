@@ -14,6 +14,8 @@ class FakeRuntimeClient:
         self.create_worker_requests = []
         self.assign_requests = []
         self.get_worker_requests = []
+        self.message_requests = []
+        self.steer_requests = []
 
     def health(self):
         return {"status": "ok"}
@@ -83,7 +85,12 @@ class FakeRuntimeClient:
         return {"status": "launched", "action": action}
 
     def message(self, worker_id: str, message: str):
+        self.message_requests.append({"worker_id": worker_id, "message": message})
         return {"status": "queued"}
+
+    def steer(self, worker_id: str, message: str):
+        self.steer_requests.append({"worker_id": worker_id, "message": message})
+        return {"run_id": "run_steer", "worker_id": worker_id, "project_id": "prj_1", "instruction": message, "state": "queued", "queued_at": "2026-04-17T00:00:00+00:00", "started_at": None, "ended_at": None, "output_text": "", "error_text": ""}
 
     def lifecycle(self, worker_id: str, action: str):
         return {"status": action}
@@ -121,6 +128,8 @@ def test_watch_assets_render():
     assert 'Workspace live view' in watch.text
     assert 'Open project workspace' in watch.text
     assert 'Open worker details' in watch.text
+    assert 'Send redirects now' in watch.text
+    assert 'Hold Send or Cmd/Ctrl+Enter to queue instead' in watch.text
     assert 'Glass Drive' not in watch.text
     desktop = client.get('/desktop/wrk_1')
     assert desktop.status_code == 200
@@ -284,3 +293,19 @@ def test_novnc_proxy_uses_worker_view_origin(monkeypatch):
     response = client.get('/novnc/wrk_1/core/rfb.js')
     assert response.status_code == 200
     assert response.text == 'export default "ok";'
+
+
+def test_worker_steer_endpoint_uses_runtime_steer():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    response = client.post('/api/worker/wrk_1/steer', json={'message': 'Redirect to the new plan now.'})
+    assert response.status_code == 200
+    assert runtime.steer_requests == [{'worker_id': 'wrk_1', 'message': 'Redirect to the new plan now.'}]
+
+
+def test_worker_message_endpoint_uses_runtime_queue_message():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    response = client.post('/api/worker/wrk_1/message', json={'message': 'Queue this after the current run finishes.'})
+    assert response.status_code == 200
+    assert runtime.message_requests == [{'worker_id': 'wrk_1', 'message': 'Queue this after the current run finishes.'}]

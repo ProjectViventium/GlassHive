@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260416a" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260417a" />
   </head>
   <body class="watch-body">
     <div class="watch-app">
@@ -70,15 +70,28 @@
             <p id="overlay-detail">The view will attach automatically when the workspace is ready.</p>
           </div>
         </div>
-        <iframe id="desktop-frame" title="Workspace live surface" allow="clipboard-read; clipboard-write; fullscreen" allowfullscreen></iframe>
+        <iframe id="desktop-frame" title="Workspace live surface" allow="clipboard-read; clipboard-write; fullscreen"></iframe>
       </main>
       <footer class="watch-footer">
         <form id="steer-form" class="steer-form">
-          <input id="steer-input" type="text" placeholder="Steer the workspace from here. Ask for a checkpoint, redirect the plan, or tell it exactly what to do next." />
-          <button type="submit">Send</button>
+          <input
+            id="steer-input"
+            type="text"
+            aria-describedby="steer-guidance"
+            placeholder="Steer the workspace from here. Redirect the plan, ask for a checkpoint, or tell it exactly what to do next. GlassHive will pivot to this direction now."
+          />
+          <button
+            id="send-button"
+            type="submit"
+            title="Send redirects now. Hold Send or use Cmd/Ctrl+Enter to queue a follow-up without interrupting current work."
+          >Send</button>
         </form>
+        <div id="steer-guidance" class="steer-guidance" aria-live="polite">
+          <span id="steer-guidance-primary" class="steer-guidance-chip" data-active="true">Send redirects now</span>
+          <span id="steer-guidance-queue" class="steer-guidance-chip">Hold Send or Cmd/Ctrl+Enter to queue instead</span>
+        </div>
       </footer>
     </div>
-    <script src="/static/watch.js?v=20260416a" type="module"></script>
+    <script src="/static/watch.js?v=20260417a" type="module"></script>
   </body>
 </html>

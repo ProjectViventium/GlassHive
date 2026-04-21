@@ -50,10 +50,15 @@ class ProfiledWorkerRuntime:
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).terminate_worker(worker)
 
-    def interrupt_worker(self, worker: dict) -> RuntimeInfo:
+    def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
         runtime = self._runtime_for_worker(worker)
         if hasattr(runtime, "interrupt_worker"):
-            return runtime.interrupt_worker(worker)
+            try:
+                return runtime.interrupt_worker(worker, run_id=run_id)
+            except TypeError as exc:
+                if "run_id" not in str(exc):
+                    raise
+                return runtime.interrupt_worker(worker)
         return runtime.pause_worker(worker)
 
     def run_task(self, worker: dict, instruction: str, timeout_sec: int = 300, run_id: str | None = None) -> str:
@@ -86,10 +91,15 @@ class ProfiledWorkerRuntime:
             "state_dir": str(worker.get("state_dir") or ""),
         }
 
-    def collect_completed_run(self, worker: dict) -> dict[str, str] | None:
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, str] | None:
         runtime = self._runtime_for_worker(worker)
         if hasattr(runtime, "collect_completed_run"):
-            return runtime.collect_completed_run(worker)
+            try:
+                return runtime.collect_completed_run(worker, run_id=run_id)
+            except TypeError as exc:
+                if "run_id" not in str(exc):
+                    raise
+                return runtime.collect_completed_run(worker)
         return None
 
     def desktop_action(
@@ -221,29 +231,44 @@ class BaseCliWorkerRuntime:
     def _session_name_for_run_id(self, run_id: str) -> str:
         return f"job-{run_id[:12]}"
 
-    def _infer_active_session(self, worker: dict) -> dict[str, str] | None:
+    def _run_payload(self, worker_id: str, run_id: str) -> dict[str, str] | None:
+        run_root = self._run_root(worker_id, run_id)
+        if not run_root.exists():
+            return None
+        return {
+            "session_name": self._session_name_for_run_id(run_id),
+            "run_id": run_id,
+            "stdout_path": str(run_root / "stdout.log"),
+            "stderr_path": str(run_root / "stderr.log"),
+            "exit_path": str(run_root / "exit_code"),
+        }
+
+    def _infer_active_session(self, worker: dict, run_id: str | None = None) -> dict[str, str] | None:
         current = self._read_active_session(worker["worker_id"])
-        if current:
+        if current and (run_id is None or current.get("run_id") == run_id):
             return current
         screen_sessions = set(self.sandbox.list_screen_sessions(worker["worker_id"], self.runtime_name, worker=worker))
-        for run_root in self._run_root_candidates(worker["worker_id"]):
-            run_id = run_root.name
-            session_name = self._session_name_for_run_id(run_id)
+        candidate_run_ids = [run_id] if run_id else [run_root.name for run_root in self._run_root_candidates(worker["worker_id"])]
+        for candidate_run_id in candidate_run_ids:
+            if not candidate_run_id:
+                continue
+            session_name = self._session_name_for_run_id(candidate_run_id)
             if session_name not in screen_sessions:
                 continue
-            return {
-                "session_name": session_name,
-                "run_id": run_id,
-                "stdout_path": str(run_root / "stdout.log"),
-                "stderr_path": str(run_root / "stderr.log"),
-                "exit_path": str(run_root / "exit_code"),
-            }
+            payload = self._run_payload(worker["worker_id"], candidate_run_id)
+            if payload:
+                return payload
         return None
 
-    def _latest_completed_run_payload(self, worker_id: str) -> dict[str, str] | None:
+    def _latest_completed_run_payload(self, worker_id: str, run_id: str | None = None) -> dict[str, str] | None:
         current = self._read_active_session(worker_id)
-        if current:
+        if current and (run_id is None or current.get("run_id") == run_id):
             return current
+        if run_id:
+            payload = self._run_payload(worker_id, run_id)
+            if payload and Path(str(payload.get("exit_path") or "")).exists():
+                return payload
+            return None
         for run_root in self._run_root_candidates(worker_id):
             exit_path = run_root / "exit_code"
             if not exit_path.exists():
@@ -280,14 +305,31 @@ class BaseCliWorkerRuntime:
         with self._process_lock:
             self._active_processes.pop(worker_id, None)
 
-    def _stop_active_process(self, worker_id: str) -> None:
+    def _stop_active_process(self, worker_id: str, *, worker: dict | None = None, run_id: str | None = None) -> None:
         active_session = self._read_active_session(worker_id)
+        if active_session and run_id and active_session.get("run_id") != run_id:
+            active_session = None
+        if not active_session:
+            active_session = self._infer_active_session(worker or {"worker_id": worker_id}, run_id=run_id)
+        if not active_session and run_id:
+            active_session = self._run_payload(worker_id, run_id)
         if active_session:
             try:
                 self.sandbox.stop_screen_session(
                     worker_id,
                     self.runtime_name,
                     active_session["session_name"],
+                    worker=worker,
+                    missing_ok=True,
+                )
+            except Exception:
+                pass
+            try:
+                self.sandbox.terminate_run_processes(
+                    worker_id,
+                    self.runtime_name,
+                    active_session["run_id"],
+                    worker=worker,
                 )
             except Exception:
                 pass
@@ -333,9 +375,9 @@ class BaseCliWorkerRuntime:
         self.sandbox.pause(worker["worker_id"])
         return self._runtime_info(worker, pid=None)
 
-    def interrupt_worker(self, worker: dict) -> RuntimeInfo:
+    def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
         self._note_stop_reason(worker["worker_id"], "interrupted")
-        self._stop_active_process(worker["worker_id"])
+        self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
         sandbox = self.sandbox.inspect(worker["worker_id"])
         pid = sandbox.pid if sandbox and sandbox.state == "running" else None
         return self._runtime_info(worker, pid=pid)
@@ -469,8 +511,8 @@ class BaseCliWorkerRuntime:
             "pid": sandbox["pid"],
         }
 
-    def collect_completed_run(self, worker: dict) -> dict[str, str] | None:
-        active_session = self._latest_completed_run_payload(worker["worker_id"])
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, str] | None:
+        active_session = self._latest_completed_run_payload(worker["worker_id"], run_id=run_id)
         if not active_session:
             return None
         exit_path = Path(str(active_session.get("exit_path") or "").strip())
@@ -736,10 +778,10 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
         self.sandbox.pause(worker["worker_id"])
         return self._runtime_info(worker, pid=None)
 
-    def interrupt_worker(self, worker: dict) -> RuntimeInfo:
+    def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
         if str(worker.get("state") or "") == "running":
             self._note_stop_reason(worker["worker_id"], "interrupted")
-        self._stop_active_process(worker["worker_id"])
+        self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
         sandbox = self.sandbox.inspect(worker["worker_id"])
         pid = sandbox.pid if sandbox and sandbox.state == "running" else None
         return self._runtime_info(worker, pid=pid)

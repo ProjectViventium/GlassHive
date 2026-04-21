@@ -4,6 +4,11 @@ const projectId = params.get('project_id');
 const requestedSurface = params.get('surface') === 'desktop' ? 'desktop' : 'terminal';
 const runtimeBase = `${window.location.protocol}//${window.location.hostname}:8766`;
 const uiBase = `${window.location.protocol}//${window.location.host}`;
+const isApplePlatform = /Mac|iPhone|iPad|iPod/i.test(
+  navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || ''
+);
+const queueShortcutLabel = isApplePlatform ? '⌘+Enter' : 'Ctrl+Enter';
+const LONG_PRESS_MS = 550;
 
 const frame = document.getElementById('desktop-frame');
 const overlay = document.getElementById('stage-overlay');
@@ -28,6 +33,11 @@ const openTerminalLink = document.getElementById('open-terminal-link');
 const openWorkerConsole = document.getElementById('open-worker-console');
 const openProjectWorkspace = document.getElementById('open-project-workspace');
 const openProjectWorkspaceMenu = document.getElementById('open-project-workspace-menu');
+const steerForm = document.getElementById('steer-form');
+const steerInput = document.getElementById('steer-input');
+const sendButton = document.getElementById('send-button');
+const guidancePrimary = document.getElementById('steer-guidance-primary');
+const guidanceQueue = document.getElementById('steer-guidance-queue');
 
 let activeSurface = requestedSurface;
 let currentDesktopUrl = `${uiBase}/desktop/${workerId}`;
@@ -43,6 +53,10 @@ let currentProjectTitle = projectId || 'Project';
 let currentDeliverable = null;
 let lastPromotedDeliverableKey = '';
 let deliverablePromotionPending = false;
+let queueModifierActive = false;
+let longPressTimer = 0;
+let longPressArmed = false;
+let suppressNextClick = false;
 
 function syncDocumentTitle(workerName, projectTitle) {
   const safeProjectTitle = String(projectTitle || 'Workspace').trim() || 'Workspace';
@@ -118,6 +132,39 @@ function syncProjectWorkspaceLinks() {
   openProjectWorkspaceMenu.hidden = !available;
 }
 
+function syncSendAffordance() {
+  const queueMode = queueModifierActive || longPressArmed;
+  sendButton.dataset.mode = queueMode ? 'queue' : 'steer';
+  sendButton.textContent = queueMode ? 'Queue' : 'Send';
+  guidancePrimary.dataset.active = String(!queueMode);
+  guidanceQueue.dataset.active = String(queueMode);
+  guidanceQueue.dataset.mode = queueMode ? 'queue' : 'steer';
+  if (longPressArmed) {
+    guidanceQueue.textContent = 'Release to queue this follow-up without interrupting current work';
+  } else if (queueModifierActive) {
+    guidanceQueue.textContent = `Click Send or press ${queueShortcutLabel} to queue without interrupting current work`;
+  } else {
+    guidanceQueue.textContent = `Hold Send or ${queueShortcutLabel} to queue instead`;
+  }
+  sendButton.title = `Send redirects now. Hold Send or use ${queueShortcutLabel} to queue a follow-up without interrupting current work.`;
+}
+
+function clearLongPress() {
+  if (longPressTimer) {
+    window.clearTimeout(longPressTimer);
+    longPressTimer = 0;
+  }
+  if (!longPressArmed) return;
+  longPressArmed = false;
+  syncSendAffordance();
+}
+
+function setQueueModifierActive(active) {
+  if (queueModifierActive === active) return;
+  queueModifierActive = active;
+  syncSendAffordance();
+}
+
 function syncMenuLabels() {
   surfaceTerminalButton.dataset.active = String(activeSurface === 'terminal');
   surfaceDesktopButton.dataset.active = String(activeSurface === 'desktop');
@@ -138,7 +185,27 @@ function summarizeOutput(data) {
   const runState = String(data.latest_run?.state || '').trim();
   const raw = String(data.latest_output || '').trim();
   const deliverable = data.deliverable || null;
+  const latestInstruction = String(data.latest_run?.instruction || '').trim();
   currentRunState = runState;
+
+  if (runState === 'queued') {
+    const isSteer = latestInstruction.startsWith('Operator steer instruction');
+    const isMessage = latestInstruction.startsWith('Operator message for the current worker session');
+    return {
+      label: isSteer ? 'Steer handoff' : isMessage ? 'Queued follow-up' : 'Queued next step',
+      panelTitle: isSteer ? 'Steer handoff' : isMessage ? 'Queued follow-up' : 'Queued next step',
+      summary: isSteer
+        ? 'GlassHive is redirecting the workspace to your latest steer instruction.'
+        : isMessage
+          ? 'Current work keeps running. Your queued follow-up will start next.'
+        : 'The workspace has another instruction queued and is preparing the next step.',
+      full: isSteer
+        ? 'Your steer instruction has been accepted. GlassHive will interrupt the current run when needed and continue from the same workspace state.'
+        : isMessage
+          ? 'Your follow-up was queued successfully. GlassHive will keep the current run going, then apply this queued instruction from the same workspace state.'
+        : 'A follow-up instruction is queued for this workspace and will start next.',
+    };
+  }
 
   if (runState === 'running') {
     if (deliverable && deliverable.preferred_surface === 'desktop' && deliverable.browser_url) {
@@ -253,6 +320,42 @@ async function postAction(action, payload) {
     throw new Error(await response.text());
   }
   return response.json();
+}
+
+async function submitFooterInstruction(mode) {
+  const message = steerInput.value.trim();
+  if (!message) return;
+  const path = mode === 'queue' ? 'message' : 'steer';
+  try {
+    const response = await fetch(`/api/worker/${workerId}/${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+    steerInput.value = '';
+    closeResultPanel();
+    if (mode === 'queue') {
+      statusLabel.textContent = 'Queued follow-up';
+      resultPanelTitle.textContent = 'Queued follow-up';
+      latestOutputInline.textContent = 'GlassHive queued your follow-up. Current work keeps running.';
+      latestOutputFull.textContent = `Queued follow-up accepted.\n\nGlassHive will keep the current run going, then apply this next instruction:\n\n${message}`;
+    } else {
+      statusLabel.textContent = 'Steer handoff';
+      resultPanelTitle.textContent = 'Steer handoff';
+      latestOutputInline.textContent = 'GlassHive is redirecting the workspace now.';
+      latestOutputFull.textContent = `Steer instruction accepted.\n\nGlassHive will pivot the workspace to this direction immediately:\n\n${message}`;
+    }
+    currentSummary = latestOutputInline.textContent;
+    currentFullOutput = latestOutputFull.textContent;
+    resultToggle.hidden = false;
+  } catch (error) {
+    latestOutputInline.textContent = error.message;
+    latestOutputFull.textContent = error.message;
+    openResultPanel();
+  }
 }
 
 function setOverlay(state, detail) {
@@ -387,6 +490,16 @@ document.addEventListener('keydown', (event) => {
     closeMenu();
     closeResultPanel();
   }
+  setQueueModifierActive(Boolean(event.metaKey || event.ctrlKey));
+});
+
+document.addEventListener('keyup', (event) => {
+  setQueueModifierActive(Boolean(event.metaKey || event.ctrlKey));
+});
+
+window.addEventListener('blur', () => {
+  setQueueModifierActive(false);
+  clearLongPress();
 });
 
 openExternal.addEventListener('click', () => {
@@ -413,29 +526,60 @@ openWorkerConsole.addEventListener('click', () => {
   window.open(`${runtimeBase}/ui/workers/${workerId}`, '_blank', 'noopener,noreferrer');
 });
 
-document.getElementById('steer-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const input = document.getElementById('steer-input');
-  const message = input.value.trim();
-  if (!message) return;
-  try {
-    await fetch(`/api/worker/${workerId}/message`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message }),
-    });
-    input.value = '';
-    statusLabel.textContent = 'Live status';
-    latestOutputInline.textContent = 'Message sent to workspace.';
-    latestOutputFull.textContent = `Operator message sent:\n\n${message}`;
-  } catch (error) {
-    latestOutputInline.textContent = error.message;
-    latestOutputFull.textContent = error.message;
-    openResultPanel();
+steerInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault();
+    submitFooterInstruction('queue');
   }
+});
+
+sendButton.addEventListener('pointerdown', (event) => {
+  if (event.button !== 0 || event.metaKey || event.ctrlKey) return;
+  clearLongPress();
+  longPressTimer = window.setTimeout(() => {
+    longPressTimer = 0;
+    longPressArmed = true;
+    syncSendAffordance();
+  }, LONG_PRESS_MS);
+});
+
+for (const eventName of ['pointercancel', 'pointerleave']) {
+  sendButton.addEventListener(eventName, () => {
+    clearLongPress();
+  });
+}
+
+sendButton.addEventListener('pointerup', (event) => {
+  if (!longPressArmed) {
+    clearLongPress();
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  suppressNextClick = true;
+  clearLongPress();
+  submitFooterInstruction('queue');
+});
+
+sendButton.addEventListener('click', (event) => {
+  if (suppressNextClick) {
+    suppressNextClick = false;
+    event.preventDefault();
+    return;
+  }
+  if (event.metaKey || event.ctrlKey) {
+    event.preventDefault();
+    submitFooterInstruction('queue');
+  }
+});
+
+steerForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  await submitFooterInstruction('steer');
 });
 
 syncMenuLabels();
 syncProjectWorkspaceLinks();
+syncSendAffordance();
 refresh();
 setInterval(refresh, 2000);

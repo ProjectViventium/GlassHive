@@ -8,6 +8,8 @@ from fastapi.testclient import TestClient
 
 from workers_projects_runtime.api import create_app
 from workers_projects_runtime.openclaw_runtime import RuntimeInfo, StubRuntime, WorkerInterruptedError, WorkerPausedError
+from workers_projects_runtime.service import WorkersProjectsService
+from workers_projects_runtime.store import Store
 
 
 def wait_for_run(client: TestClient, run_id: str, timeout: float = 3.0) -> dict:
@@ -406,6 +408,7 @@ class ControllableRuntime:
         self.release = Event()
         self.interrupted = Event()
         self.paused = Event()
+        self.interrupt_run_ids: list[str | None] = []
 
     def resolve_model(self, profile: str) -> str:
         return "controllable/test"
@@ -431,7 +434,8 @@ class ControllableRuntime:
         self.paused.set()
         return self._info(worker, pid=None)
 
-    def interrupt_worker(self, worker: dict) -> RuntimeInfo:
+    def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
+        self.interrupt_run_ids.append(run_id)
         self.interrupted.set()
         return self._info(worker)
 
@@ -455,6 +459,24 @@ class ControllableRuntime:
                 return "CONTROLLABLE_OK"
             time.sleep(0.05)
         raise AssertionError("ControllableRuntime timed out in test")
+
+
+class SteerableControllableRuntime(ControllableRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.instructions: list[str] = []
+
+    def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+        info = super().ensure_worker_ready(worker)
+        if self.instructions:
+            self.interrupted.clear()
+        return info
+
+    def run_task(self, worker: dict, instruction: str, timeout_sec: int = 300) -> str:
+        self.instructions.append(instruction)
+        if instruction.startswith("Operator steer instruction"):
+            return "STEER_REDIRECT_OK"
+        return super().run_task(worker, instruction, timeout_sec=timeout_sec)
 
 
 def test_pause_resume_freezes_active_run_without_losing_it(tmp_path):
@@ -523,7 +545,7 @@ class RaisingPauseRuntime:
         self.paused.set()
         return self._info(worker, pid=None)
 
-    def interrupt_worker(self, worker: dict) -> RuntimeInfo:
+    def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
         return self._info(worker)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
@@ -605,12 +627,244 @@ def test_interrupt_stops_active_run_and_keeps_worker_ready(tmp_path):
     interrupted = client.post(f"/v1/workers/{worker['worker_id']}/interrupt")
     assert interrupted.status_code == 202
     assert interrupted.json()["state"] == "ready"
+    assert runtime.interrupt_run_ids == [run["run_id"]]
 
     settled = wait_for_run(client, run["run_id"], timeout=3.0)
     assert settled["state"] == "interrupted"
 
     worker_after = client.get(f"/v1/workers/{worker['worker_id']}").json()
     assert worker_after["state"] == "ready"
+
+
+def test_steer_interrupts_active_run_and_redirects_to_new_instruction(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime = SteerableControllableRuntime()
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
+
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Steer Redirect", "goal": "Redirect an active run immediately."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Steer Worker", "role": "coder"},
+    ).json()
+
+    first_run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Do the original long-running task."},
+    ).json()
+    assert runtime.running.wait(timeout=2), "worker run never started"
+
+    steer_resp = client.post(
+        f"/v1/workers/{worker['worker_id']}/steer",
+        json={"message": "Switch immediately to the new operator direction."},
+    )
+    assert steer_resp.status_code == 202
+    steer_run = steer_resp.json()
+    assert steer_run["state"] == "queued"
+    assert runtime.interrupt_run_ids == [first_run["run_id"]]
+
+    interrupted = wait_for_run(client, first_run["run_id"], timeout=3.0)
+    assert interrupted["state"] == "interrupted"
+    redirected = wait_for_run(client, steer_run["run_id"], timeout=3.0)
+    assert redirected["state"] == "completed"
+    assert redirected["output_text"] == "STEER_REDIRECT_OK"
+
+    events = client.get(f"/v1/workers/{worker['worker_id']}/events").json()["items"]
+    event_types = [event["event_type"] for event in events]
+    assert "worker.interrupted" in event_types
+    assert "worker.steer" in event_types
+    assert runtime.instructions[1].startswith("Operator steer instruction")
+    assert "Do not stop at an acknowledgement" in runtime.instructions[1]
+
+
+class HealRecoveryRuntime:
+    def __init__(self) -> None:
+        self.collect_run_ids: list[str | None] = []
+
+    def resolve_model(self, profile: str) -> str:
+        return "heal-recovery/test"
+
+    def _info(self, worker: dict, pid: int | None = 4242) -> RuntimeInfo:
+        return RuntimeInfo(
+            runtime="heal-recovery",
+            model=worker.get("model") or self.resolve_model(worker.get("profile", "")),
+            gateway_url="",
+            gateway_port=None,
+            gateway_token=None,
+            session_key=worker.get("session_key") or f"heal-recovery:{worker['worker_id']}",
+            state_dir="/tmp/heal-recovery/state",
+            workspace_dir="/tmp/heal-recovery/workspace",
+            pid=pid,
+        )
+
+    def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker)
+
+    def pause_worker(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker, pid=None)
+
+    def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
+        return self._info(worker)
+
+    def terminate_worker(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker, pid=None)
+
+    def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker)
+
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, str] | None:
+        self.collect_run_ids.append(run_id)
+        return {
+            "state": "completed",
+            "output_text": "HEAL_COMPLETED_OK",
+            "error_text": "",
+        }
+
+
+def test_heal_worker_restarts_processor_when_queued_runs_remain(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    runtime = HealRecoveryRuntime()
+    service = WorkersProjectsService(store, runtime)
+
+    project = service.create_project("demo-owner", "Heal Queue", "Recover completion and continue queued runs.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Heal Queue Worker",
+        role="coder",
+        profile="codex-cli",
+        backend="openclaw",
+    )
+
+    running = store.create_run(worker["worker_id"], project["project_id"], "original run", state="running")
+    queued = store.create_run(worker["worker_id"], project["project_id"], "queued follow-up", state="queued")
+    store.update_worker(worker["worker_id"], state="running")
+
+    restart_requests: list[str] = []
+    service._ensure_worker_processor = lambda worker_id: restart_requests.append(worker_id)  # type: ignore[method-assign]
+    service._active_processors.add(worker["worker_id"])
+
+    healed = service.heal_worker(worker["worker_id"])
+
+    assert healed is not None
+    assert store.get_run(running["run_id"])["state"] == "completed"
+    assert store.get_run(queued["run_id"])["state"] == "queued"
+    assert restart_requests == [worker["worker_id"]]
+    assert runtime.collect_run_ids == [running["run_id"]]
+
+
+class HealingRaceRuntime:
+    def __init__(self) -> None:
+        self.initial_started = Event()
+        self.release_initial = Event()
+        self.queued_started = Event()
+        self.release_queued = Event()
+        self.collect_run_ids: list[str | None] = []
+
+    def resolve_model(self, profile: str) -> str:
+        return "healing-race/test"
+
+    def _info(self, worker: dict, pid: int | None = 4242) -> RuntimeInfo:
+        return RuntimeInfo(
+            runtime="healing-race",
+            model=worker.get("model") or self.resolve_model(worker.get("profile", "")),
+            gateway_url="",
+            gateway_port=None,
+            gateway_token=None,
+            session_key=f"healing-race:{worker['worker_id']}",
+            state_dir=f"/tmp/{worker['worker_id']}/state",
+            workspace_dir=f"/tmp/{worker['worker_id']}/workspace",
+            pid=pid,
+        )
+
+    def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker)
+
+    def pause_worker(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker, pid=None)
+
+    def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
+        return self._info(worker)
+
+    def terminate_worker(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker, pid=None)
+
+    def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker)
+
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, str] | None:
+        self.collect_run_ids.append(run_id)
+        return {
+            "state": "completed",
+            "output_text": "HEAL_RECOVERED_INITIAL",
+            "error_text": "",
+        }
+
+    def run_task(self, worker: dict, instruction: str, timeout_sec: int = 300, run_id: str | None = None) -> str:
+        if "initial" in instruction:
+            self.initial_started.set()
+            assert self.release_initial.wait(timeout=3)
+            return "INITIAL_RETURNED_LATE"
+        self.queued_started.set()
+        assert self.release_queued.wait(timeout=3)
+        return "QUEUED_COMPLETED_OK"
+
+
+def test_heal_worker_replacement_processor_keeps_running_state_while_follow_up_executes(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    runtime = HealingRaceRuntime()
+    service = WorkersProjectsService(store, runtime)
+
+    project = service.create_project("demo-owner", "Queue Race", "Ensure healed processors cannot overwrite a replacement run.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Queue Race Worker",
+        role="coder",
+        profile="codex-cli",
+        backend="openclaw",
+    )
+
+    initial = service.assign_run(worker["worker_id"], "initial run that will be healed")
+    assert runtime.initial_started.wait(timeout=2)
+
+    queued = service.assign_run(worker["worker_id"], "queued follow-up that must keep running")
+    healed = service.heal_worker(worker["worker_id"])
+    assert healed is not None
+    assert runtime.collect_run_ids == [initial["run_id"]]
+    assert runtime.queued_started.wait(timeout=2)
+
+    runtime.release_initial.set()
+
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        refreshed_worker = store.get_worker(worker["worker_id"])
+        active_run = store.get_active_run(worker["worker_id"])
+        if refreshed_worker and refreshed_worker["state"] == "running" and active_run and active_run["run_id"] == queued["run_id"]:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("Replacement processor did not keep the queued follow-up marked as running")
+
+    runtime.release_queued.set()
+
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        queued_run = store.get_run(queued["run_id"])
+        refreshed_worker = store.get_worker(worker["worker_id"])
+        if queued_run and queued_run["state"] == "completed" and refreshed_worker and refreshed_worker["state"] == "ready":
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("Queued follow-up did not complete cleanly")
+
+    assert store.get_run(initial["run_id"])["state"] == "completed"
+    assert store.get_run(queued["run_id"])["output_text"] == "QUEUED_COMPLETED_OK"
+    assert store.get_worker(worker["worker_id"])["last_run_id"] == queued["run_id"]
 
 
 class DesktopStubRuntime:
@@ -647,7 +901,7 @@ class DesktopStubRuntime:
     def pause_worker(self, worker: dict) -> RuntimeInfo:
         return self._info(worker, pid=None)
 
-    def interrupt_worker(self, worker: dict) -> RuntimeInfo:
+    def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
         return self._info(worker)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:

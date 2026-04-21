@@ -66,7 +66,7 @@ class WorkerRuntime(Protocol):
 
     def pause_worker(self, worker: dict) -> RuntimeInfo: ...
 
-    def interrupt_worker(self, worker: dict) -> RuntimeInfo: ...
+    def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo: ...
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo: ...
 
@@ -101,7 +101,7 @@ class StubRuntime:
     def pause_worker(self, worker: dict) -> RuntimeInfo:
         return self.ensure_worker_ready(worker)
 
-    def interrupt_worker(self, worker: dict) -> RuntimeInfo:
+    def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
         return self.ensure_worker_ready(worker)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
@@ -220,7 +220,7 @@ class OpenClawRuntime:
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
         return self.pause_worker(worker)
 
-    def interrupt_worker(self, worker: dict) -> RuntimeInfo:
+    def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
         return self.pause_worker(worker)
 
     def run_task(self, worker: dict, instruction: str, timeout_sec: int = 300, run_id: str | None = None) -> str:

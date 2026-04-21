@@ -24,6 +24,7 @@ class WorkersProjectsService:
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="wpr-runner")
         self._processors_lock = Lock()
         self._active_processors: set[str] = set()
+        self._processor_generations: dict[str, int] = {}
         self.reconcile_all_workers()
 
     def shutdown(self) -> None:
@@ -129,8 +130,24 @@ class WorkersProjectsService:
         return updated or worker
 
     def send_message(self, worker_id: str, message: str) -> dict:
-        instruction = f"Operator message for the current worker session:\n\n{message}"
+        instruction = self._instruction_for_message(message)
         return self.assign_run(worker_id, instruction, event_type="worker.message")
+
+    def steer_worker(self, worker_id: str, message: str) -> dict:
+        worker = self.require_worker(worker_id)
+        active_run = self.store.get_active_run(worker_id)
+        if active_run:
+            interrupted = self.interrupt_worker(worker_id)
+            worker = self.store.get_worker(worker_id) or interrupted or worker
+            self.store.add_event(
+                worker["project_id"],
+                worker_id,
+                active_run["run_id"],
+                "worker.steer",
+                "Active run interrupted so the workspace can follow the new steer instruction.",
+            )
+        instruction = self._instruction_for_steer(message)
+        return self.assign_run(worker_id, instruction, event_type="worker.steer")
 
     def desktop_action(
         self,
@@ -168,9 +185,14 @@ class WorkersProjectsService:
 
     def interrupt_worker(self, worker_id: str) -> dict:
         worker = self.require_worker(worker_id)
-        info = self.runtime.interrupt_worker(worker)
-        updated = self._apply_runtime_info(worker_id, info, state="ready", last_error="")
         active_run = self.store.get_active_run(worker_id)
+        try:
+            info = self.runtime.interrupt_worker(worker, run_id=active_run["run_id"] if active_run else None)
+        except TypeError as exc:
+            if "run_id" not in str(exc):
+                raise
+            info = self.runtime.interrupt_worker(worker)
+        updated = self._apply_runtime_info(worker_id, info, state="ready", last_error="")
         if active_run:
             self.store.finalize_run(
                 active_run["run_id"],
@@ -235,7 +257,12 @@ class WorkersProjectsService:
         active_run = self.store.get_active_run(worker_id)
         if not active_run or not hasattr(self.runtime, "collect_completed_run"):
             return worker
-        recovered = self.runtime.collect_completed_run(worker)
+        try:
+            recovered = self.runtime.collect_completed_run(worker, run_id=active_run["run_id"])
+        except TypeError as exc:
+            if "run_id" not in str(exc):
+                raise
+            recovered = self.runtime.collect_completed_run(worker)
         if not recovered:
             return worker
         state = str(recovered.get("state") or "failed")
@@ -253,8 +280,14 @@ class WorkersProjectsService:
             self.store.add_event(worker["project_id"], worker_id, active_run["run_id"], "run.failed", error_text or "Run failed")
             self._refresh_runtime_info(worker_id, state="ready", last_error=error_text)
         with self._processors_lock:
+            # Stale processors also check active membership before every state write,
+            # so dropping membership here is enough to make an externally healed
+            # processor stop touching worker state until a replacement generation is spawned.
             self._active_processors.discard(worker_id)
-        return self.store.get_worker(worker_id)
+        refreshed = self.store.get_worker(worker_id)
+        if refreshed and refreshed["state"] not in {"paused", "terminated"} and self.store.has_queued_runs(worker_id):
+            self._ensure_worker_processor(worker_id)
+        return refreshed
 
     def _start_worker_again(self, worker: dict, event_type: str, message: str) -> dict:
         self.store.update_worker_state(worker["worker_id"], "starting")
@@ -324,16 +357,50 @@ class WorkersProjectsService:
             return worker
         return self._apply_runtime_info(worker_id, info, state=state, last_error=last_error) or worker
 
+    def _instruction_for_message(self, message: str) -> str:
+        return f"Operator message for the current worker session:\n\n{message}"
+
+    def _instruction_for_steer(self, message: str) -> str:
+        return (
+            "Operator steer instruction for the current worker session.\n\n"
+            "Treat this as the new highest-priority direction and continue from the current workspace state.\n\n"
+            "Execution requirements:\n"
+            "- Act on this steer inside the workspace immediately.\n"
+            "- Do not stop at an acknowledgement, summary, or plan when the steer requires concrete action.\n"
+            "- If the steer redirects or cancels earlier work, perform that interruption first, then carry out the new action.\n"
+            "- Use the terminal, files, browser, and available tools as needed.\n"
+            "- Remain in execution mode until the steer instruction is satisfied or a real blocker requires operator help.\n\n"
+            f"{message}"
+        )
+
     def _ensure_worker_processor(self, worker_id: str) -> None:
+        generation: int | None = None
         with self._processors_lock:
             if worker_id in self._active_processors:
                 return
+            generation = self._processor_generations.get(worker_id, 0) + 1
+            self._processor_generations[worker_id] = generation
             self._active_processors.add(worker_id)
-        self.executor.submit(self._process_worker_queue, worker_id)
+        self.executor.submit(self._process_worker_queue, worker_id, generation)
 
-    def _process_worker_queue(self, worker_id: str) -> None:
+    def _processor_is_current(self, worker_id: str, generation: int) -> bool:
+        with self._processors_lock:
+            return worker_id in self._active_processors and self._processor_generations.get(worker_id) == generation
+
+    def _release_processor(self, worker_id: str, generation: int) -> bool:
+        with self._processors_lock:
+            if worker_id not in self._active_processors:
+                return False
+            if self._processor_generations.get(worker_id) != generation:
+                return False
+            self._active_processors.discard(worker_id)
+            return True
+
+    def _process_worker_queue(self, worker_id: str, generation: int) -> None:
         try:
             while True:
+                if not self._processor_is_current(worker_id, generation):
+                    return
                 worker = self.store.get_worker(worker_id)
                 if not worker or worker["state"] in {"paused", "terminated"}:
                     return
@@ -341,7 +408,12 @@ class WorkersProjectsService:
                 run = self.store.claim_next_queued_run(worker_id)
                 if not run:
                     current = self.store.get_worker(worker_id)
-                    if current and current["state"] not in {"paused", "terminated", "failed"}:
+                    if (
+                        self._processor_is_current(worker_id, generation)
+                        and current
+                        and current["state"] not in {"paused", "terminated", "failed"}
+                        and not self.store.get_active_run(worker_id)
+                    ):
                         self.store.update_worker_state(worker_id, "ready", last_error="")
                     return
 
@@ -357,21 +429,29 @@ class WorkersProjectsService:
                             raise
                         output = self.runtime.run_task(worker, run["instruction"])
                 except WorkerPausedError as exc:
+                    if not self._processor_is_current(worker_id, generation):
+                        return
                     self.store.finalize_run(run["run_id"], state="paused", error_text=str(exc))
                     self.store.update_worker_state(worker_id, "paused", last_error="")
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.paused", str(exc))
                     return
                 except WorkerInterruptedError as exc:
+                    if not self._processor_is_current(worker_id, generation):
+                        return
                     self.store.finalize_run(run["run_id"], state="interrupted", error_text=str(exc))
                     self.store.update_worker_state(worker_id, "ready", last_error="")
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.interrupted", str(exc))
                     continue
                 except WorkerTerminatedError as exc:
+                    if not self._processor_is_current(worker_id, generation):
+                        return
                     self.store.finalize_run(run["run_id"], state="cancelled", error_text=str(exc))
                     self.store.update_worker_state(worker_id, "terminated", last_error=str(exc))
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.cancelled", str(exc))
                     return
                 except RuntimeErrorBase as exc:
+                    if not self._processor_is_current(worker_id, generation):
+                        return
                     worker_state = (self.store.get_worker(worker_id) or worker)["state"]
                     final_state = "failed"
                     if worker_state == "paused":
@@ -385,19 +465,23 @@ class WorkersProjectsService:
                         return
                     continue
                 except Exception as exc:
+                    if not self._processor_is_current(worker_id, generation):
+                        return
                     self.store.finalize_run(run["run_id"], state="failed", error_text=str(exc))
                     self.store.update_worker_state(worker_id, "ready", last_error=str(exc))
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.failed", str(exc))
                     continue
 
+                if not self._processor_is_current(worker_id, generation):
+                    return
                 self.store.finalize_run(run["run_id"], state="completed", output_text=output)
                 self.store.update_worker(worker_id, state="ready", last_error="", last_run_id=run["run_id"])
                 preview = output.replace("\n", " ")[:240]
                 self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.completed", preview or "Run completed")
                 self._refresh_runtime_info(worker_id, state="ready", last_error="")
         finally:
-            with self._processors_lock:
-                self._active_processors.discard(worker_id)
+            if not self._release_processor(worker_id, generation):
+                return
             pending = self.store.get_worker(worker_id)
             if pending and pending["state"] not in {"paused", "terminated"}:
                 queued = next((item for item in self.store.list_runs_for_worker(worker_id, limit=10) if item["state"] == "queued"), None)
