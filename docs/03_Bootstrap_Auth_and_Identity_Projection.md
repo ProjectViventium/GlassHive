@@ -53,14 +53,46 @@ Current phase-1 fields supported by the runtime:
 - `claude_settings_local`
 - `codex_config_append`
 - `claude_md`
+- `codex_md`
 - `agents_md`
 - `system_instructions`
+- `callbacks`
+- `project_definition`
+
+Host-native workers also materialize visible prompt/context files in the host workspace:
+
+- `project-definition.md`
+- `work-log.md`
+- `harness-prompt.md`
+- `agents.md` / `AGENTS.md`
+- `claude.md` / `CLAUDE.md`
+- `codex.md` / `CODEX.md`
+
+When Viventium passes existing upload metadata, GlassHive reuses the existing file path contract
+instead of adding a second upload route:
+
+- virtual `/uploads/...` paths can map to `WPR_LIBRECHAT_UPLOADS_ROOT`
+- extracted text can be materialized directly
+- metadata-only attachments become an `uploads/*.metadata.json` manifest
+
+Any actual `source_path` copy is still gated by `WPR_BOOTSTRAP_SOURCE_ROOTS`, symlink rejection, and
+the bootstrap size limit. Request-derived metadata must never become an arbitrary host-file read.
 
 ## Source-Specific Best Practice
 
 ### A. Host CLI login projection
 
 Best when the host machine already has working local Codex and Claude Code logins.
+
+For Docker sandboxes, minimal host CLI auth is copied into the worker home according to
+`bootstrap_profile`.
+
+For host-native workers, the CLI runs on the host and uses the host's existing CLI/browser/OS
+session directly. v1 caps active host workers to one per CLI family unless isolated CLI homes are
+explicitly enabled later.
+
+Host-native CLI subprocesses receive a minimal runtime environment. Parent process secrets, provider
+API keys, callback secrets, and LibreChat internals are not inherited by default.
 
 Current validated local footprints on this machine:
 

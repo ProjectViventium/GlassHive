@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from contextlib import asynccontextmanager
 from html import escape
 from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from .models import (
     AssignRunRequest,
@@ -27,10 +28,13 @@ from .models import (
     WorkerResponse,
 )
 from .openclaw_runtime import StubRuntime, WorkerRuntime
-from .profile_runtime import ProfiledWorkerRuntime
-from .service import WorkersProjectsService
+from .profile_runtime import ProfiledWorkerRuntime, _redact_text
+from .runtime_env import load_viventium_runtime_env
+from .service import HostWorkersDisabledError, WorkersProjectsService
 from .store import Store
 from .terminal_takeover import TerminalTarget, bridge_terminal
+
+load_viventium_runtime_env()
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "runtime_phase1.db"
 SANDBOX_WORKSPACE_MOUNT = Path(os.environ.get("WPR_SANDBOX_WORKSPACE", "/workspace/project"))
@@ -49,6 +53,7 @@ def create_app(
     runtime_backend: str | None = None,
     runtime: WorkerRuntime | None = None,
 ) -> FastAPI:
+    load_viventium_runtime_env()
     resolved_db_path = db_path or os.environ.get("WPR_DB_PATH", str(DEFAULT_DB_PATH))
     resolved_runtime_backend = (runtime_backend or os.environ.get("WPR_RUNTIME_BACKEND", "openclaw")).strip().lower()
     data_root = Path(resolved_db_path).resolve().parent
@@ -70,6 +75,12 @@ def create_app(
         version="0.3.0",
         lifespan=lifespan,
     )
+
+    @app.exception_handler(HostWorkersDisabledError)
+    async def host_workers_disabled_handler(request: Request, exc: HostWorkersDisabledError) -> JSONResponse:
+        _ = request
+        return JSONResponse(status_code=403, content={"detail": str(exc)})
+
     api_token = os.environ.get("WPR_API_TOKEN", "").strip()
     unauthenticated_prefixes = (
         "/health",
@@ -150,21 +161,53 @@ def create_app(
             handle.seek(0, 2)
             size = handle.tell()
             handle.seek(max(size - max_bytes, 0))
-            return handle.read().decode("utf-8", errors="replace")
+            return _redact_text(handle.read().decode("utf-8", errors="replace"))
 
     def _log_paths(worker: dict) -> tuple[Path, Path]:
         runtime_name = str(worker.get("runtime") or "")
-        root_map = {
-            "openclaw": "openclaw_runtime",
-            "openclaw-stub": "openclaw_runtime",
-            "codex-cli": "codex_cli_runtime",
-            "claude-code": "claude_code_runtime",
-        }
+        if str(worker.get("execution_mode") or "docker") == "host":
+            root_map = {
+                "openclaw": "host_openclaw_runtime",
+                "codex-cli": "host_codex_cli_runtime",
+                "claude-code": "host_claude_code_runtime",
+            }
+        else:
+            root_map = {
+                "openclaw": "openclaw_runtime",
+                "openclaw-stub": "openclaw_runtime",
+                "codex-cli": "codex_cli_runtime",
+                "claude-code": "claude_code_runtime",
+            }
         runtime_root = data_root / root_map.get(runtime_name, "openclaw_runtime")
         return (
             runtime_root / "logs" / f"{worker['worker_id']}.stdout.log",
             runtime_root / "logs" / f"{worker['worker_id']}.stderr.log",
         )
+
+    def _read_jsonl_tail(path: Path, limit: int = 25) -> list[dict[str, object]]:
+        if not path.exists():
+            return []
+        lines = path.read_text(errors="replace").splitlines()[-limit:]
+        items: list[dict[str, object]] = []
+        for line in lines:
+            try:
+                value = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(value, dict):
+                items.append(value)
+        return items
+
+    def _host_visibility(worker: dict, runtime_details: dict[str, object]) -> dict[str, object]:
+        workspace = Path(str(worker.get("workspace_dir") or ""))
+        state_dir = Path(str(worker.get("state_dir") or ""))
+        prompt_paths = runtime_details.get("prompt_paths") if isinstance(runtime_details.get("prompt_paths"), dict) else {}
+        work_log_path = workspace / "work-log.md"
+        return {
+            "work_log_tail": _read_tail(work_log_path, max_bytes=8000),
+            "action_audit_tail": _read_jsonl_tail(state_dir / "action-audit.jsonl"),
+            "prompt_paths": prompt_paths,
+        }
 
     def _workspace_items(worker: dict, max_entries: int = 120, max_depth: int = 3) -> list[dict[str, object]]:
         raw_root = str(worker.get("workspace_dir") or "").strip()
@@ -251,6 +294,8 @@ def create_app(
             rel = path.relative_to(root)
         except ValueError:
             return None
+        if str(worker.get("execution_mode") or "docker") == "host":
+            return path.resolve().as_uri()
         container_path = (SANDBOX_WORKSPACE_MOUNT / rel.as_posix()).as_posix()
         return f"file://{quote(container_path, safe='/:')}"
 
@@ -332,6 +377,8 @@ def create_app(
         stdout_path, stderr_path = _log_paths(worker)
         stdout_text = _read_tail(stdout_path)
         stderr_text = _read_tail(stderr_path)
+        runtime_details = _runtime_details(worker)
+        host_visibility = _host_visibility(worker, runtime_details) if str(worker.get("execution_mode") or "docker") == "host" else {}
         latest_output = ""
         if latest_run:
             latest_output = str(latest_run.get("output_text") or latest_run.get("error_text") or "")
@@ -344,11 +391,12 @@ def create_app(
             "runs": runs,
             "project_runs": project_runs,
             "events": events,
-            "runtime_details": _runtime_details(worker),
+            "runtime_details": runtime_details,
             "console": {
                 "stdout": stdout_text,
                 "stderr": stderr_text,
             },
+            **host_visibility,
             "workspace": {
                 "root": worker.get("workspace_dir") or "",
                 "items": _workspace_items(worker),
@@ -407,8 +455,30 @@ def create_app(
             payload.role,
             payload.profile,
             payload.backend,
+            payload.execution_mode,
+            payload.alias,
+            payload.workspace_root,
             payload.bootstrap_profile,
             payload.bootstrap_bundle,
+        )
+        return WorkerResponse(**worker)
+
+    @app.post("/v1/projects/{project_id}/workers/find-or-resume", response_model=WorkerResponse, status_code=200)
+    def find_or_resume_worker(project_id: str, payload: CreateWorkerRequest) -> WorkerResponse:
+        require_project(project_id)
+        alias = (payload.alias or payload.name or payload.profile).strip()
+        worker = service.find_or_create_worker(
+            project_id,
+            payload.owner_id,
+            payload.name,
+            payload.role,
+            payload.profile,
+            payload.backend,
+            alias=alias,
+            execution_mode=payload.execution_mode,
+            workspace_root=payload.workspace_root,
+            bootstrap_profile=payload.bootstrap_profile,
+            bootstrap_bundle=payload.bootstrap_bundle,
         )
         return WorkerResponse(**worker)
 
@@ -628,6 +698,7 @@ def create_app(
         selected_events = store.list_events(selected_worker["worker_id"]) if selected_worker else []
         selected_runtime_details = _runtime_details(selected_worker) if selected_worker else {}
         selected_view_url = str(selected_runtime_details.get("view_url") or "").strip()
+        selected_is_host = str((selected_worker or {}).get("execution_mode") or "docker") == "host"
         selected_latest_image_url = (
             f"/v1/workers/{selected_worker['worker_id']}/artifacts/latest-image" if selected_worker and _latest_image_path(selected_worker) else ""
         )
@@ -679,11 +750,17 @@ def create_app(
                 </div>
                 """
             workstation_tools_card = ""
-            if selected_view_url:
+            if selected_worker:
+                tools_label = "Host Computer Tools" if selected_is_host else "Workstation Tools"
+                tools_description = (
+                    "These request real surfaces on the host computer for this worker."
+                    if selected_is_host
+                    else "These launch real surfaces inside the same persistent worker sandbox."
+                )
                 workstation_tools_card = f"""
                 <div class="card">
-                  <h2>Workstation Tools</h2>
-                  <p class="muted">These launch real surfaces inside the same persistent worker sandbox.</p>
+                  <h2>{tools_label}</h2>
+                  <p class="muted">{tools_description}</p>
                   <div class="actions">
                     <button onclick="desktopAction('terminal')">Open Shell</button>
                     <button onclick="desktopAction('files')">Open Files</button>
@@ -711,6 +788,7 @@ def create_app(
               <p><strong>Name:</strong> {escape(selected_worker['name'])}</p>
               <p><strong>State:</strong> <span id="selected-worker-state">{escape(selected_worker['state'])}</span></p>
               <p><strong>Runtime:</strong> <span id="selected-worker-runtime">{escape(selected_worker.get('runtime') or '')}</span></p>
+              <p><strong>Execution:</strong> <span id="selected-worker-execution">{escape(selected_worker.get('execution_mode') or 'docker')}</span></p>
               <p><strong>Profile:</strong> <span id="selected-worker-profile">{escape(selected_worker['profile'])}</span></p>
               <p><strong>Model:</strong> <span id="selected-worker-model">{escape(selected_worker.get('model') or '')}</span></p>
               <p><strong>Gateway:</strong> {escape(selected_worker.get('gateway_url') or '')}</p>
@@ -962,6 +1040,7 @@ def create_app(
                   const live = await res.json();
                   document.getElementById('selected-worker-state').textContent = live.worker.state || '';
                   document.getElementById('selected-worker-runtime').textContent = live.worker.runtime || '';
+                  document.getElementById('selected-worker-execution').textContent = live.worker.execution_mode || 'docker';
                   document.getElementById('selected-worker-profile').textContent = live.worker.profile || '';
                   document.getElementById('selected-worker-model').textContent = live.worker.model || '';
                   document.getElementById('latest-output').textContent = live.latest_output || 'No completed output yet.';
@@ -995,6 +1074,7 @@ def create_app(
         console = live["console"]
         workspace = live["workspace"]
         runtime_details = live["runtime_details"]
+        is_host_worker = str(worker.get("execution_mode") or "docker") == "host"
         artifacts = live["artifacts"]
         latest_run_marker = escape(str((latest_run or {}).get("ended_at") or (latest_run or {}).get("started_at") or ""), quote=True)
         run_items = "".join(
@@ -1018,15 +1098,28 @@ def create_app(
             "</li>"
             for item in workspace["items"]
         ) or "<li>Workspace is empty</li>"
+        def detail_value_html(value: object) -> str:
+            if isinstance(value, dict):
+                nested = "".join(
+                    f"<div><code>{escape(str(nested_key))}</code>: <code>{escape(str(nested_value))}</code></div>"
+                    for nested_key, nested_value in value.items()
+                    if nested_value is not None and nested_value != ""
+                )
+                return f'<div class="detail-map">{nested or "None"}</div>'
+            if isinstance(value, list):
+                nested = "".join(f"<li>{escape(str(item))}</li>" for item in value)
+                return f"<ul>{nested}</ul>" if nested else "None"
+            return escape(str(value))
+
         detail_items = "".join(
-            f"<li><strong>{escape(str(key).replace('_', ' ').title())}:</strong> {escape(str(value))}</li>"
+            f"<li><strong>{escape(str(key).replace('_', ' ').title())}:</strong> {detail_value_html(value)}</li>"
             for key, value in runtime_details.items()
             if value is not None and value != "" and value != []
         ) or "<li>No runtime details yet</li>"
         workstation_tools = ""
-        if runtime_details.get("view_url"):
-            workstation_tools = """
-                <h3>Workstation Tools</h3>
+        tools_label = "Host Computer Tools" if is_host_worker else "Workstation Tools"
+        workstation_tools = f"""
+                <h3>{tools_label}</h3>
                 <div class="actions">
                   <button onclick="desktopAction('terminal')">Open Shell</button>
                   <button onclick="desktopAction('files')">Open Files</button>
@@ -1070,6 +1163,7 @@ def create_app(
                 <p><strong>Worker ID:</strong> {escape(worker['worker_id'])}</p>
                 <p><strong>Role:</strong> {escape(worker['role'])}</p>
                 <p><strong>Profile:</strong> {escape(worker['profile'])}</p>
+                <p><strong>Execution:</strong> {escape(worker.get('execution_mode') or 'docker')}</p>
                 <p><strong>Model:</strong> {escape(worker.get('model') or '')}</p>
                 <p><strong>State:</strong> <span id="worker-state">{escape(worker['state'])}</span></p>
                 <p><strong>Gateway:</strong> {escape(worker.get('gateway_url') or '')}</p>
@@ -1174,7 +1268,21 @@ def create_app(
               function renderDetails(details) {{
                 const entries = Object.entries(details || {{}}).filter(([, value]) => value !== null && value !== '' && !(Array.isArray(value) && value.length === 0));
                 if (!entries.length) return '<li>No runtime details yet</li>';
-                return entries.map(([key, value]) => `<li><strong>${{escapeHtml(key.replaceAll('_', ' '))}}:</strong> ${{escapeHtml(value)}}</li>`).join('');
+                return entries.map(([key, value]) => `<li><strong>${{escapeHtml(key.replaceAll('_', ' '))}}:</strong> ${{renderDetailValue(value)}}</li>`).join('');
+              }}
+
+              function renderDetailValue(value) {{
+                if (Array.isArray(value)) {{
+                  return value.length ? `<ul>${{value.map((item) => `<li>${{escapeHtml(item)}}</li>`).join('')}}</ul>` : 'None';
+                }}
+                if (value && typeof value === 'object') {{
+                  const rows = Object.entries(value)
+                    .filter(([, nestedValue]) => nestedValue !== null && nestedValue !== '')
+                    .map(([nestedKey, nestedValue]) => `<div><code>${{escapeHtml(nestedKey)}}</code>: <code>${{escapeHtml(nestedValue)}}</code></div>`)
+                    .join('');
+                  return `<div class="detail-map">${{rows || 'None'}}</div>`;
+                }}
+                return escapeHtml(value);
               }}
 
               async function action(name) {{

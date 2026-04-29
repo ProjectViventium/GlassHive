@@ -40,10 +40,13 @@ def test_inspect_reports_paused_when_docker_state_is_paused(tmp_path):
     assert sandbox.selenium_port == 58101
 
 
-def test_seed_bootstrap_writes_project_scope_files(tmp_path):
+def test_seed_bootstrap_writes_project_scope_files(tmp_path, monkeypatch):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     home_dir = tmp_path / "home"
     workspace_dir = tmp_path / "workspace"
+    upload_source = tmp_path / "uploaded.txt"
+    upload_source.write_text("Uploaded content")
+    monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", str(tmp_path))
     home_dir.mkdir(parents=True)
     workspace_dir.mkdir(parents=True)
 
@@ -70,6 +73,11 @@ def test_seed_bootstrap_writes_project_scope_files(tmp_path):
                         "scope": "workspace",
                         "path": "notes/bootstrap.txt",
                         "content": "Bootstrapped",
+                    },
+                    {
+                        "scope": "workspace",
+                        "path": "uploads/uploaded.txt",
+                        "source_path": str(upload_source),
                     }
                 ],
             }
@@ -83,6 +91,7 @@ def test_seed_bootstrap_writes_project_scope_files(tmp_path):
     assert json.loads((workspace_dir / ".mcp.json").read_text())["glass-hive"]["url"] == "http://127.0.0.1:8767/mcp"
     assert json.loads((workspace_dir / ".claude" / "settings.local.json").read_text())["permissions"]["allow"] == ["Bash(ls *)"]
     assert (workspace_dir / "notes" / "bootstrap.txt").read_text() == "Bootstrapped"
+    assert (workspace_dir / "uploads" / "uploaded.txt").read_text() == "Uploaded content"
     assert "TEST_FLAG" in (home_dir / ".glasshive" / "runtime.env").read_text()
     manifest = json.loads((home_dir / ".glasshive" / "bootstrap-manifest.json").read_text())
     assert manifest["bootstrap_profile"] == "clean-room"
@@ -97,6 +106,29 @@ def test_terminal_desktop_action_waits_for_live_session(tmp_path):
     assert "WPR Live Run" in command
     assert "screen -xRR" in command[-1]
     assert "job-run_123456" in command[-1]
+
+
+def test_start_screen_session_prepares_runtime_dir(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[tuple[str | None, list[str]]] = []
+
+    class FakeSandbox:
+        container_name = "wpr-test"
+
+    manager.ensure_ready = lambda *args, **kwargs: FakeSandbox()  # type: ignore[method-assign]
+    manager.stop_screen_session = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+    def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, user=None):
+        calls.append((user, command))
+        return subprocess.CompletedProcess(["docker"], returncode=0, stdout="", stderr="")
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+
+    manager.start_screen_session("wrk_test", "codex-cli", "job-run_123456", ["echo", "ok"])
+
+    assert calls[0][0] == "root"
+    assert "mkdir -p /run/screen" in calls[0][1][-1]
+    assert calls[1][1][:2] == ["screen", "-DmS"]
 
 
 def test_ensure_ready_primes_idle_desktop_when_container_is_new(tmp_path):

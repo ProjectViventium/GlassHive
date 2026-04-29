@@ -7,7 +7,7 @@ Glass Hive is split into four layers:
 
 1. `Control Plane`
 2. `Worker Runtime`
-3. `Sandbox Substrate`
+3. `Execution Substrate`
 4. `Client Adapters`
 
 ## 1. Control Plane
@@ -39,9 +39,10 @@ Current worker profiles:
 
 Design principle:
 
-- all worker profiles should converge on the same workstation sandbox model so takeover semantics stay consistent
+- all worker profiles should share the same project/run/lifecycle API whether they execute in a
+  Docker workstation sandbox or in host-native mode
 
-## 3. Sandbox Substrate
+## 3. Execution Substrate
 
 Current phase-1 substrate:
 
@@ -49,6 +50,14 @@ Current phase-1 substrate:
 - persistent home and workspace mounts
 - noVNC desktop view
 - terminal bridge
+
+Approved host-native substrate:
+
+- local process execution on the user's main computer
+- no Docker and no sandbox
+- local Codex, Claude, and OpenClaw CLIs
+- user-scoped workspace root
+- structured action audit and work-log visibility
 
 Current honest boundary:
 

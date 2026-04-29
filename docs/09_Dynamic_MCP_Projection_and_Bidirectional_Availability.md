@@ -5,9 +5,9 @@
 
 This document is the source of truth for how parent systems such as Viventium / LibreChat should project MCP capability, auth, instructions, and callbacks into GlassHive workers without coupling GlassHive to parent internals.
 
-This is a proposal and review document only.
-
-Do not implement the design in this document until it is explicitly approved.
+This document started as a proposal. The first production slice is now approved for host-native
+GlassHive workers: MCP request headers seed callback context into `bootstrap_bundle`, and GlassHive
+emits signed callback events back to Viventium/LibreChat when callback metadata is present.
 
 ## Terminology
 
@@ -15,13 +15,15 @@ Do not implement the design in this document until it is explicitly approved.
 - **MCP Projection**: "Tool Sharing". The process of taking tools that belong to LibreChat and passing them securely into the worker's environment.
 - **Bidirectional Communication**: Allowing LibreChat to send tasks to the worker, and allowing the worker to send results/webhooks back to LibreChat.
 - **Adapter Layer**: The bridge code in LibreChat that packages up the user's tools into the Bootstrap Bundle before starting the worker.
-- **Sandbox**: The isolated, secure environment where the worker runs so it doesn't interfere with the main app.
+- **Sandbox**: The isolated Docker workstation environment where a worker runs.
+- **Host Worker**: A no-sandbox worker that runs local CLIs on the user's main computer and uses the
+  same MCP/API lifecycle as a sandbox worker.
 
 ## The Actual Problem To Solve
 
 The real requirement is not abstract “bidirectional capability.” It is three concrete tasks:
 
-1. take the MCP servers and user-linked auth that already exist in LibreChat and make selected ones available inside a GlassHive worker sandbox
+1. take the MCP servers and user-linked auth that already exist in LibreChat and make selected ones available inside a GlassHive worker sandbox or host-native worker
 2. let the worker report useful results back to the parent system without inventing a new mesh of server-to-server protocols
 3. let parent channels such as Telegram route work into the right persistent worker without forcing GlassHive to know about Telegram internals
 
@@ -89,8 +91,72 @@ LibreChat / Viventium request
   -> resolve auth material per server
   -> package these into a startup payload (bootstrap_bundle)
   -> call GlassHive worker_create or worker_find_or_resume with the bundle
-  -> worker sandbox materializes .mcp.json / env / CLAUDE.md / AGENTS.md
+  -> worker materializes .mcp.json / env / CLAUDE.md / AGENTS.md or host-native prompt files
 ```
+
+### Implemented Host-Worker Callback Slice
+
+Viventium's generated GlassHive MCP config injects request context headers:
+
+- `X-Viventium-User-Id`
+- `X-Viventium-Agent-Id`
+- `X-Viventium-Conversation-Id`
+- `X-Viventium-Parent-Message-Id`
+- `X-Viventium-Message-Id`
+- `X-Viventium-Surface`
+- `X-Viventium-Input-Mode`
+- `X-Viventium-Stream-Id`
+- `X-Viventium-Voice-Call-Session-Id`
+- `X-Viventium-Voice-Request-Id`
+- `X-Viventium-Telegram-Chat-Id`
+- `X-Viventium-Telegram-User-Id`
+- `X-Viventium-Telegram-Message-Id`
+- `X-Viventium-Request-Files`
+- `X-Viventium-Request-Attachments`
+- `X-Viventium-Tool-Resources`
+- `X-Viventium-File-Ids`
+
+GlassHive's MCP layer merges those headers into `bootstrap_bundle.callbacks` and adds the generated
+callback URL/secret from runtime env when available. The runtime emits signed events with
+`X-GlassHive-Signature`; Viventium validates the per-worker/run signature, callback freshness,
+replay key, and conversation ownership before persisting a same-conversation assistant callback
+message. The runtime writes callbacks to its local outbox before delivery and performs first-attempt
+delivery in the background so worker create/run requests are not blocked by a slow parent callback
+endpoint. Transient callback delivery failures are retried with the same callback id.
+`GLASSHIVE_CALLBACK_RETRY_ATTEMPTS` and `GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S` tune the retry
+budget for local deployments that expect parent restarts or slow tunnel recovery.
+
+The MCP/API process environment is the primary source for callback URL/secret. For local-first
+Viventium installs, the process also loads the generated Viventium runtime env as a fallback when
+those values are absent, so manually started GlassHive sidecars still preserve callback delivery.
+Secrets must not be printed in logs or projected into worker-visible prompt files.
+
+User-visible callbacks are intentionally quiet:
+
+- Worker lifecycle and queue/start events are lifecycle/audit-only by default.
+- `run.completed` posts the final user-facing result.
+- `run.failed` posts the blocker/failure in human terms.
+- `checkpoint.ready` posts the specific approval request.
+- Repeated visible callbacks for the same run update one task-status message instead of creating
+  callback branches.
+- Visible callbacks require the assistant response `message_id`; unanchored visible callbacks are
+  ignored/retried instead of being attached as sibling assistant branches under the user message.
+- Parent callback text is sanitized before persistence so local paths, diagnostic IDs, and local
+  worker terminal links do not leak into normal chat or voice surfaces.
+- Worker IDs, run IDs, project IDs, ports, and terminal links are diagnostic-only unless the parent
+  user explicitly asks for them.
+
+Voice and Telegram surfaces poll this same persisted callback message after the main response, just
+as they already do for persisted follow-ups. GlassHive does not get a separate upload or result path;
+the parent conversation message remains the source of truth for surfaced completion/blocker text.
+
+Request upload headers are carried as encoded JSON. GlassHive projects local `/uploads/...` paths
+through the configured `WPR_LIBRECHAT_UPLOADS_ROOT`, extracted text directly, or metadata manifests.
+The final workspace copy still goes through the bootstrap trusted-source allowlist, so request
+metadata cannot request arbitrary host file reads.
+
+This keeps routing context in the parent request path without adding a controller-level
+`@codex`/`@claude` parser.
 
 ### Exact Adapter Inputs And Outputs
 
@@ -275,7 +341,7 @@ Use a parent-side lookup table or deterministic alias rule:
 
 Example aliases:
 
-1. `demo-linkedin-primary`
+1. `demo-browser-primary`
 2. `demo-outbound-sales`
 3. `demo-browser-admin`
 

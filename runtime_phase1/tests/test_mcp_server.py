@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
+import pytest
 
+from workers_projects_runtime import mcp_server
 from workers_projects_runtime.mcp_server import create_mcp_server
 
 
@@ -39,7 +43,21 @@ class FakeApiClient:
     def list_workers(self, project_id: str):
         return [{"worker_id": "wrk_123", "project_id": project_id, "profile": "openclaw-general", "state": "ready"}]
 
-    def create_worker(self, *, project_id: str, owner_id: str | None, name: str, role: str, profile: str = "openclaw-general", backend: str = "openclaw"):
+    def create_worker(
+        self,
+        *,
+        project_id: str,
+        owner_id: str | None,
+        name: str,
+        role: str,
+        profile: str = "openclaw-general",
+        backend: str = "openclaw",
+        execution_mode: str = "docker",
+        alias: str | None = None,
+        workspace_root: str | None = None,
+        bootstrap_profile: str | None = None,
+        bootstrap_bundle: dict | None = None,
+    ):
         return {
             "worker_id": "wrk_new",
             "project_id": project_id,
@@ -48,8 +66,17 @@ class FakeApiClient:
             "role": role,
             "profile": profile,
             "backend": backend,
+            "execution_mode": execution_mode,
+            "alias": alias,
+            "workspace_root": workspace_root,
             "state": "ready",
+            "bootstrap_bundle": bootstrap_bundle,
         }
+
+    def find_or_resume_worker(self, **kwargs):
+        payload = self.create_worker(**kwargs)
+        payload["worker_id"] = "wrk_resumed"
+        return payload
 
     def get_worker(self, worker_id: str):
         return {"worker_id": worker_id, "project_id": "prj_123", "profile": "openclaw-general", "state": "ready"}
@@ -105,6 +132,7 @@ def test_mcp_server_exposes_tools_and_resources():
             tool_names = {tool.name for tool in tools}
             assert "project_create" in tool_names
             assert "worker_takeover" in tool_names
+            assert "worker_find_or_resume" in tool_names
 
             created = await client.call_tool(
                 "project_create",
@@ -112,6 +140,22 @@ def test_mcp_server_exposes_tools_and_resources():
             )
             created_payload = _tool_json(created)
             assert created_payload["project_id"] == "prj_new"
+
+            worker = await client.call_tool(
+                "worker_find_or_resume",
+                {
+                    "project_id": "prj_new",
+                    "owner_id": "demo-owner",
+                    "name": "Codex Host",
+                    "role": "coding",
+                    "alias": "codex-main",
+                    "profile": "codex-cli",
+                    "execution_mode": "host",
+                },
+            )
+            worker_payload = _tool_json(worker)
+            assert worker_payload["worker_id"] == "wrk_resumed"
+            assert worker_payload["execution_mode"] == "host"
 
             takeover = await client.call_tool("worker_takeover", {"worker_id": "wrk_123"})
             takeover_payload = _tool_json(takeover)
@@ -124,3 +168,265 @@ def test_mcp_server_exposes_tools_and_resources():
             assert live_payload["worker"]["worker_id"] == "wrk_123"
 
     asyncio.run(scenario())
+
+
+def test_worker_tools_default_to_docker_even_when_host_default_configured(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    server = create_mcp_server(api_client=FakeApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            worker = await client.call_tool(
+                "worker_find_or_resume",
+                {
+                    "project_id": "prj_new",
+                    "owner_id": "demo-owner",
+                    "name": "Codex Host",
+                    "role": "coding",
+                    "alias": "codex-main",
+                    "profile": "codex-cli",
+                },
+            )
+            worker_payload = _tool_json(worker)
+            assert worker_payload["execution_mode"] == "docker"
+
+    asyncio.run(scenario())
+
+
+def test_host_worker_disabled_forces_docker_default_and_rejects_host(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "false")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    server = create_mcp_server(api_client=FakeApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            worker = await client.call_tool(
+                "worker_find_or_resume",
+                {
+                    "project_id": "prj_new",
+                    "owner_id": "demo-owner",
+                    "name": "Docker Worker",
+                    "role": "coding",
+                    "alias": "docker-main",
+                    "profile": "codex-cli",
+                },
+            )
+            worker_payload = _tool_json(worker)
+            assert worker_payload["execution_mode"] == "docker"
+
+            with pytest.raises(ToolError, match="host-native GlassHive workers are disabled"):
+                await client.call_tool(
+                    "worker_find_or_resume",
+                    {
+                        "project_id": "prj_new",
+                        "owner_id": "demo-owner",
+                        "name": "Codex Host",
+                        "role": "coding",
+                        "alias": "codex-main",
+                        "profile": "codex-cli",
+                        "execution_mode": "host",
+                    },
+                )
+
+    asyncio.run(scenario())
+
+
+def test_worker_tools_default_owner_from_request_headers(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-User-Id": "user-from-request",
+        },
+    )
+    server = create_mcp_server(api_client=FakeApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            project = await client.call_tool(
+                "project_create",
+                {
+                    "title": "Host Browser QA",
+                    "goal": "Open a host browser.",
+                    "default_worker_profile": "codex-cli",
+                },
+            )
+            project_payload = _tool_json(project)
+            assert project_payload["owner_id"] == "user-from-request"
+
+            worker = await client.call_tool(
+                "worker_find_or_resume",
+                {
+                    "project_id": "prj_new",
+                    "name": "Codex Host",
+                    "role": "host browser control",
+                    "alias": "codex-main",
+                    "profile": "codex-cli",
+                    "execution_mode": "host",
+                },
+            )
+            worker_payload = _tool_json(worker)
+            assert worker_payload["owner_id"] == "user-from-request"
+            assert worker_payload["execution_mode"] == "host"
+
+    asyncio.run(scenario())
+
+
+def test_merge_request_context_adds_callback_metadata(monkeypatch):
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", "http://localhost:3080/api/viventium/glasshive/callback")
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "callback-secret")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-User-Id": "user-123",
+            "X-Viventium-Agent-Id": "agent-main",
+            "X-Viventium-Conversation-Id": "conv-123",
+            "X-Viventium-Parent-Message-Id": "msg-parent",
+            "X-Viventium-Message-Id": "msg-current",
+            "X-Viventium-Surface": "telegram",
+            "X-Viventium-Input-Mode": "voice_note",
+            "X-Viventium-Stream-Id": "stream-123",
+            "X-Viventium-Voice-Call-Session-Id": "call-123",
+            "X-Viventium-Voice-Request-Id": "voice-req-123",
+            "X-Viventium-Telegram-Chat-Id": "chat-123",
+            "X-Viventium-Telegram-User-Id": "tg-user-123",
+            "X-Viventium-Telegram-Message-Id": "tg-msg-123",
+        },
+    )
+
+    bundle = mcp_server._merge_request_context({"project_definition": "Do the work"})
+
+    assert bundle is not None
+    callbacks = bundle["callbacks"]
+    assert callbacks["events_webhook_url"].endswith("/api/viventium/glasshive/callback")
+    assert callbacks["hmac_secret"] == "callback-secret"
+    assert callbacks["conversation_id"] == "conv-123"
+    assert callbacks["parent_message_id"] == "msg-parent"
+    assert callbacks["surface"] == "telegram"
+    assert callbacks["stream_id"] == "stream-123"
+    assert callbacks["voice_call_session_id"] == "call-123"
+    assert callbacks["telegram_chat_id"] == "chat-123"
+    assert bundle["viventium_context"]["user_id"] == "user-123"
+
+
+def test_merge_request_context_loads_callback_metadata_from_runtime_env(tmp_path, monkeypatch):
+    runtime_env = tmp_path / "runtime.env"
+    runtime_env.write_text(
+        "\n".join(
+            [
+                "VIVENTIUM_GLASSHIVE_CALLBACK_URL=http://localhost:3080/api/viventium/glasshive/callback",
+                "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET=runtime-secret",
+            ]
+        )
+        + "\n"
+    )
+    monkeypatch.setenv("VIVENTIUM_ENV_FILE", str(runtime_env))
+    monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", raising=False)
+    monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", raising=False)
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-User-Id": "user-123",
+            "X-Viventium-Conversation-Id": "conv-123",
+            "X-Viventium-Parent-Message-Id": "msg-parent",
+        },
+    )
+
+    bundle = mcp_server._merge_request_context({"project_definition": "Do the work"})
+
+    assert bundle is not None
+    callbacks = bundle["callbacks"]
+    assert callbacks["events_webhook_url"].endswith("/api/viventium/glasshive/callback")
+    assert callbacks["hmac_secret"] == "runtime-secret"
+
+
+def test_merge_request_context_projects_uploaded_file_headers(monkeypatch):
+    monkeypatch.setattr(mcp_server, "load_viventium_runtime_env", lambda: {})
+    monkeypatch.delenv("WPR_LIBRECHAT_UPLOADS_ROOT", raising=False)
+    files = [
+        {
+            "file_id": "file-123",
+            "filename": "brief.txt",
+            "filepath": "/uploads/user/brief.txt",
+            "source": "local",
+            "context": "message_attachment",
+        }
+    ]
+    encoded_files = "b64:" + base64.b64encode(json.dumps(files).encode()).decode()
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Request-Files": encoded_files,
+        },
+    )
+
+    bundle = mcp_server._merge_request_context({"project_definition": "Read the attachment."})
+
+    assert bundle is not None
+    assert bundle["viventium_upload_context"]["request_files"][0]["file_id"] == "file-123"
+    assert bundle["files"][0]["path"] == "uploads/brief.txt.metadata.json"
+    assert "source_path" not in bundle["files"][0]
+    manifest = json.loads(bundle["files"][0]["content"])
+    assert manifest["file_id"] == "file-123"
+    assert manifest["source_ref"] == "/uploads/user/brief.txt"
+
+
+def test_merge_request_context_maps_virtual_uploads_to_trusted_local_source(monkeypatch, tmp_path):
+    uploads_root = tmp_path / "uploads"
+    upload_path = uploads_root / "user-123" / "brief.txt"
+    upload_path.parent.mkdir(parents=True)
+    upload_path.write_text("Use this brief.")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
+    files = [
+        {
+            "file_id": "file-123",
+            "filename": "brief.txt",
+            "filepath": "/uploads/user-123/brief.txt",
+            "source": "local",
+            "context": "message_attachment",
+        }
+    ]
+    encoded_files = "b64:" + base64.b64encode(json.dumps(files).encode()).decode()
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Request-Files": encoded_files,
+        },
+    )
+
+    bundle = mcp_server._merge_request_context({"project_definition": "Read the attachment."})
+
+    assert bundle is not None
+    assert bundle["files"][0]["path"] == "uploads/brief.txt"
+    assert bundle["files"][0]["source_path"] == str(upload_path)
+
+
+def test_merge_request_context_projects_extracted_upload_text(monkeypatch):
+    files = [
+        {
+            "file_id": "file-456",
+            "filename": "brief.txt",
+            "text": "Use this brief.",
+            "source": "local",
+            "context": "message_attachment",
+        }
+    ]
+    encoded_files = "b64:" + base64.b64encode(json.dumps(files).encode()).decode()
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Request-Files": encoded_files,
+        },
+    )
+
+    bundle = mcp_server._merge_request_context({"project_definition": "Read the attachment."})
+
+    assert bundle is not None
+    assert bundle["files"][0]["path"] == "uploads/brief.txt"
+    assert bundle["files"][0]["content"] == "Use this brief."

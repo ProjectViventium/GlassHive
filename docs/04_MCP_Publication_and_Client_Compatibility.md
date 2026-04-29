@@ -25,6 +25,20 @@ Current official guidance from Claude Code and modern MCP tooling points in the 
 ### Viventium / LibreChat
 Use Glass Hive as an external MCP server.
 
+For host-native worker delegation, Viventium injects request context headers into the MCP call:
+
+- user id
+- agent id
+- conversation id
+- parent message id
+- current message id
+- request files, attachments, tool resources, and file ids as encoded metadata headers
+
+The MCP adapter folds those values into `bootstrap_bundle.callbacks` so GlassHive can report
+completion or blockers back to the same conversation without reading LibreChat internals. Upload
+metadata is projected into `bootstrap_bundle.files` only when a local path or extracted text is
+available, reusing the parent upload path.
+
 ### Claude / Claude Code
 Support:
 
@@ -47,6 +61,8 @@ For broader publication:
 - require auth in front of the MCP server
 - keep write-capable tools explicit and well-described
 - do not duplicate runtime logic inside the MCP layer
+- `execution_mode=host` must be an explicit tool argument; the MCP server should not infer host
+  execution from natural-language phrasing
 
 ## Compatibility Alias
 

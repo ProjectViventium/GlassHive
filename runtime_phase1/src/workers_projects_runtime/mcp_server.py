@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+from .runtime_env import load_viventium_runtime_env
+
+try:
+    from fastmcp.server.dependencies import get_http_headers
+except Exception:  # pragma: no cover - optional dependency path differs by FastMCP package
+    get_http_headers = None  # type: ignore[assignment]
+
+load_viventium_runtime_env()
 
 DEFAULT_BASE_URL = os.environ.get("WPR_MCP_BASE_URL", "http://127.0.0.1:8766").rstrip("/")
 DEFAULT_HOST = os.environ.get("WPR_MCP_HOST", "127.0.0.1")
@@ -16,6 +27,268 @@ DEFAULT_PORT = int(os.environ.get("WPR_MCP_PORT", "8767"))
 DEFAULT_TIMEOUT_SEC = float(os.environ.get("WPR_MCP_TIMEOUT_SEC", "120"))
 DEFAULT_OWNER_ID = os.environ.get("WPR_DEFAULT_OWNER_ID", "").strip()
 DEFAULT_API_TOKEN = os.environ.get("WPR_API_TOKEN", "").strip()
+HEADER_USER_ID = "x-viventium-user-id"
+HEADER_AGENT_ID = "x-viventium-agent-id"
+HEADER_CONVERSATION_ID = "x-viventium-conversation-id"
+HEADER_PARENT_MESSAGE_ID = "x-viventium-parent-message-id"
+HEADER_MESSAGE_ID = "x-viventium-message-id"
+HEADER_SURFACE = "x-viventium-surface"
+HEADER_INPUT_MODE = "x-viventium-input-mode"
+HEADER_STREAM_ID = "x-viventium-stream-id"
+HEADER_VOICE_CALL_SESSION_ID = "x-viventium-voice-call-session-id"
+HEADER_VOICE_REQUEST_ID = "x-viventium-voice-request-id"
+HEADER_TELEGRAM_CHAT_ID = "x-viventium-telegram-chat-id"
+HEADER_TELEGRAM_USER_ID = "x-viventium-telegram-user-id"
+HEADER_TELEGRAM_MESSAGE_ID = "x-viventium-telegram-message-id"
+HEADER_REQUEST_FILES = "x-viventium-request-files"
+HEADER_REQUEST_ATTACHMENTS = "x-viventium-request-attachments"
+HEADER_TOOL_RESOURCES = "x-viventium-tool-resources"
+HEADER_FILE_IDS = "x-viventium-file-ids"
+
+
+def _default_execution_mode() -> str:
+    if not _host_workers_enabled():
+        return "docker"
+    mode = os.environ.get("WPR_DEFAULT_EXECUTION_MODE", "docker").strip().lower()
+    return mode if mode in {"docker", "host"} else "docker"
+
+
+def _host_workers_enabled() -> bool:
+    value = os.environ.get("GLASSHIVE_HOST_WORKERS_ENABLED", "true").strip().lower()
+    return value not in {"0", "false", "no", "off", "disabled"}
+
+
+def _resolve_execution_mode(value: str | None) -> str:
+    mode = str(value or "").strip().lower()
+    if not mode:
+        mode = "docker"
+    if mode not in {"docker", "host"}:
+        raise ValueError("execution_mode must be either 'docker' or 'host'")
+    if mode == "host" and not _host_workers_enabled():
+        raise ValueError("host-native GlassHive workers are disabled by Viventium config")
+    return mode
+
+
+def _normalize_headers(raw_headers: object) -> dict[str, str]:
+    if raw_headers is None:
+        return {}
+    if hasattr(raw_headers, "items"):
+        items = raw_headers.items()
+    elif isinstance(raw_headers, list):
+        items = raw_headers
+    else:
+        return {}
+    return {str(key).lower(): str(value) for key, value in items}
+
+
+def _request_headers() -> dict[str, str]:
+    if get_http_headers is None:
+        return {}
+    try:
+        return _normalize_headers(get_http_headers())
+    except Exception:
+        return {}
+
+
+def _request_owner_id(owner_id: str | None) -> str | None:
+    explicit = _sanitize_context_value(owner_id)
+    if explicit:
+        return explicit
+    return _sanitize_context_value(_request_headers().get(HEADER_USER_ID)) or None
+
+
+def _sanitize_context_value(value: str | None) -> str:
+    stripped = str(value or "").strip()
+    if stripped.startswith("{{") and stripped.endswith("}}"):
+        return ""
+    if stripped.startswith("${") and stripped.endswith("}"):
+        return ""
+    return stripped
+
+
+def _decode_json_header(value: str | None) -> Any:
+    sanitized = _sanitize_context_value(value)
+    if not sanitized:
+        return None
+    raw = sanitized
+    if raw.startswith("b64:"):
+        try:
+            raw = base64.b64decode(raw[4:]).decode("utf-8")
+        except Exception:
+            return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def _safe_upload_filename(value: object, fallback: str) -> str:
+    name = str(value or "").replace("\\", "/").rsplit("/", 1)[-1].strip() or fallback
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
+    return safe or fallback
+
+
+def _trusted_virtual_upload_source(value: str) -> str:
+    root = os.environ.get("WPR_LIBRECHAT_UPLOADS_ROOT", "").strip()
+    if not root or not value.startswith("/uploads/"):
+        return ""
+    clean_value = value.split("?", 1)[0]
+    relative = clean_value.split("/uploads/", 1)[1].strip("/")
+    if not relative:
+        return ""
+    relative_path = os.path.normpath(relative)
+    if relative_path == "." or relative_path.startswith("..") or os.path.isabs(relative_path):
+        return ""
+    if ".." in relative_path.split(os.path.sep):
+        return ""
+    return str(Path(root).expanduser() / relative_path)
+
+
+def _iter_upload_file_objects(value: Any):
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_upload_file_objects(item)
+        return
+    if not isinstance(value, dict):
+        return
+    if any(key in value for key in ("file_id", "filename", "filepath", "source_path", "local_path", "text")):
+        yield value
+    for child in value.values():
+        if isinstance(child, (dict, list)):
+            yield from _iter_upload_file_objects(child)
+
+
+def _project_upload_file_entry(file_obj: dict[str, Any], index: int) -> dict[str, Any] | None:
+    file_id = str(file_obj.get("file_id") or file_obj.get("id") or "").strip()
+    filename = _safe_upload_filename(
+        file_obj.get("filename") or file_obj.get("name") or file_obj.get("filepath") or file_id,
+        f"upload-{index}",
+    )
+    metadata = {
+        key: file_obj.get(key)
+        for key in ("file_id", "filename", "source", "context", "type", "bytes")
+        if file_obj.get(key) is not None
+    }
+    source_ref = ""
+    for key in ("filepath", "path", "local_path", "upload_path", "absolute_path", "url", "uri"):
+        candidate = str(file_obj.get(key) or "").strip()
+        if candidate:
+            source_ref = candidate
+            break
+    if source_ref:
+        metadata["source_ref"] = source_ref
+    trusted_source = _trusted_virtual_upload_source(source_ref)
+    if trusted_source:
+        return {
+            "scope": "workspace",
+            "path": f"uploads/{filename}",
+            "source_path": trusted_source,
+            **metadata,
+        }
+    text = file_obj.get("text")
+    if isinstance(text, str) and text.strip():
+        text_filename = filename if filename.lower().endswith((".txt", ".md", ".csv", ".json")) else f"{filename}.txt"
+        return {
+            "scope": "workspace",
+            "path": f"uploads/{text_filename}",
+            "content": text,
+            **metadata,
+        }
+    if not metadata:
+        return None
+    manifest_name = f"{filename}.metadata.json"
+    return {
+        "scope": "workspace",
+        "path": f"uploads/{manifest_name}",
+        "content": json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        **{key: value for key, value in metadata.items() if key != "source_ref"},
+    }
+
+
+def _project_upload_files(upload_context: dict[str, Any]) -> list[dict[str, Any]]:
+    projected: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for file_obj in _iter_upload_file_objects(upload_context):
+        entry = _project_upload_file_entry(file_obj, len(projected) + 1)
+        if not entry:
+            continue
+        key = (str(entry.get("file_id") or ""), str(entry.get("source_path") or entry.get("path") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        projected.append(entry)
+    return projected
+
+
+def _merge_bundle_files(existing: Any, projected: list[dict[str, Any]]) -> list[Any]:
+    files = list(existing) if isinstance(existing, list) else []
+    seen_file_ids = {str(item.get("file_id")) for item in files if isinstance(item, dict) and item.get("file_id")}
+    seen_sources = {str(item.get("source_path")) for item in files if isinstance(item, dict) and item.get("source_path")}
+    seen_paths = {str(item.get("path")) for item in files if isinstance(item, dict) and item.get("path")}
+    for entry in projected:
+        file_id = str(entry.get("file_id") or "")
+        source_path = str(entry.get("source_path") or "")
+        path = str(entry.get("path") or "")
+        if (file_id and file_id in seen_file_ids) or (source_path and source_path in seen_sources) or (path and path in seen_paths):
+            continue
+        files.append(entry)
+        if file_id:
+            seen_file_ids.add(file_id)
+        if source_path:
+            seen_sources.add(source_path)
+        if path:
+            seen_paths.add(path)
+    return files
+
+
+def _merge_request_context(bundle: dict[str, Any] | None) -> dict[str, Any] | None:
+    load_viventium_runtime_env()
+    headers = _request_headers()
+    callback_url = os.environ.get("VIVENTIUM_GLASSHIVE_CALLBACK_URL", "").strip()
+    callback_secret = os.environ.get("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "").strip()
+    context = {
+        "user_id": _sanitize_context_value(headers.get(HEADER_USER_ID)),
+        "agent_id": _sanitize_context_value(headers.get(HEADER_AGENT_ID)),
+        "conversation_id": _sanitize_context_value(headers.get(HEADER_CONVERSATION_ID)),
+        "parent_message_id": _sanitize_context_value(headers.get(HEADER_PARENT_MESSAGE_ID)),
+        "message_id": _sanitize_context_value(headers.get(HEADER_MESSAGE_ID)),
+        "surface": _sanitize_context_value(headers.get(HEADER_SURFACE)),
+        "input_mode": _sanitize_context_value(headers.get(HEADER_INPUT_MODE)),
+        "stream_id": _sanitize_context_value(headers.get(HEADER_STREAM_ID)),
+        "voice_call_session_id": _sanitize_context_value(headers.get(HEADER_VOICE_CALL_SESSION_ID)),
+        "voice_request_id": _sanitize_context_value(headers.get(HEADER_VOICE_REQUEST_ID)),
+        "telegram_chat_id": _sanitize_context_value(headers.get(HEADER_TELEGRAM_CHAT_ID)),
+        "telegram_user_id": _sanitize_context_value(headers.get(HEADER_TELEGRAM_USER_ID)),
+        "telegram_message_id": _sanitize_context_value(headers.get(HEADER_TELEGRAM_MESSAGE_ID)),
+    }
+    context = {key: value for key, value in context.items() if value}
+    upload_context = {
+        "request_files": _decode_json_header(headers.get(HEADER_REQUEST_FILES)),
+        "request_attachments": _decode_json_header(headers.get(HEADER_REQUEST_ATTACHMENTS)),
+        "tool_resources": _decode_json_header(headers.get(HEADER_TOOL_RESOURCES)),
+        "file_ids": _decode_json_header(headers.get(HEADER_FILE_IDS)),
+    }
+    upload_context = {key: value for key, value in upload_context.items() if value not in (None, "", [], {})}
+    if not context and not callback_url and not upload_context:
+        return bundle
+    merged: dict[str, Any] = dict(bundle or {})
+    existing_callbacks = merged.get("callbacks")
+    callbacks = dict(existing_callbacks) if isinstance(existing_callbacks, dict) else {}
+    callbacks.update({key: value for key, value in context.items() if value})
+    if callback_url:
+        callbacks.setdefault("events_webhook_url", callback_url)
+    if callback_secret:
+        callbacks.setdefault("hmac_secret", callback_secret)
+    if callbacks:
+        merged["callbacks"] = callbacks
+    if context:
+        merged.setdefault("viventium_context", context)
+    if upload_context:
+        merged["viventium_upload_context"] = upload_context
+        projected = _project_upload_files(upload_context)
+        if projected:
+            merged["files"] = _merge_bundle_files(merged.get("files"), projected)
+    return merged
 
 
 @dataclass
@@ -84,6 +357,9 @@ class WorkersProjectsApiClient:
         role: str,
         profile: str = "openclaw-general",
         backend: str = "openclaw",
+        execution_mode: str | None = None,
+        alias: str | None = None,
+        workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
         bootstrap_bundle: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -96,6 +372,41 @@ class WorkersProjectsApiClient:
                 "role": role,
                 "profile": profile,
                 "backend": backend,
+                "execution_mode": _resolve_execution_mode(execution_mode),
+                "alias": alias,
+                "workspace_root": workspace_root,
+                "bootstrap_profile": bootstrap_profile,
+                "bootstrap_bundle": bootstrap_bundle,
+            },
+        )
+
+    def find_or_resume_worker(
+        self,
+        *,
+        project_id: str,
+        owner_id: str | None,
+        name: str,
+        role: str,
+        alias: str,
+        profile: str = "openclaw-general",
+        backend: str = "openclaw",
+        execution_mode: str | None = None,
+        workspace_root: str | None = None,
+        bootstrap_profile: str | None = None,
+        bootstrap_bundle: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/v1/projects/{project_id}/workers/find-or-resume",
+            json_body={
+                "owner_id": self._owner_id(owner_id),
+                "name": name,
+                "role": role,
+                "profile": profile,
+                "backend": backend,
+                "execution_mode": _resolve_execution_mode(execution_mode),
+                "alias": alias,
+                "workspace_root": workspace_root,
                 "bootstrap_profile": bootstrap_profile,
                 "bootstrap_bundle": bootstrap_bundle,
             },
@@ -146,10 +457,17 @@ def create_mcp_server(
     api_client: WorkersProjectsApiClient | None = None,
 ) -> FastMCP:
     client = api_client or WorkersProjectsApiClient(base_url=base_url)
+    host_instruction = (
+        "Set execution_mode='host' only when the user explicitly wants the worker to operate on the main computer. "
+        if _host_workers_enabled()
+        else "Host-native workers are disabled by Viventium config; do not request execution_mode='host'. "
+    )
     server = FastMCP(
         name="glass-hive",
         instructions=(
-            "Use this server to manage persistent projects, resumable workers, and workstation sandboxes in Glass Hive. "
+            "Use this server to manage persistent projects, resumable workers, workstation sandboxes, and host-native workers in Glass Hive. "
+            "When execution_mode is omitted, MCP worker tools use 'docker'. "
+            f"{host_instruction}"
             "Read status before mutating when possible. Use worker_takeover or worker_desktop_action before risky browser "
             "or desktop actions so a human can intervene."
         ),
@@ -180,7 +498,7 @@ def create_mcp_server(
         default_worker_profile: str = "openclaw-general",
     ) -> dict[str, Any]:
         return client.create_project(
-            owner_id=owner_id,
+            owner_id=_request_owner_id(owner_id),
             title=title,
             goal=goal,
             default_worker_profile=default_worker_profile,
@@ -218,19 +536,68 @@ def create_mcp_server(
         owner_id: str | None = None,
         profile: str = "openclaw-general",
         backend: str = "openclaw",
+        execution_mode: str | None = None,
+        alias: str | None = None,
+        workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
         bootstrap_bundle_json: str | None = None,
     ) -> dict[str, Any]:
         parsed_bundle: dict[str, Any] | None = None
         if bootstrap_bundle_json:
             parsed_bundle = json.loads(bootstrap_bundle_json)
+        parsed_bundle = _merge_request_context(parsed_bundle)
+        resolved_execution_mode = _resolve_execution_mode(execution_mode)
         return client.create_worker(
             project_id=project_id,
-            owner_id=owner_id,
+            owner_id=_request_owner_id(owner_id),
             name=name,
             role=role,
             profile=profile,
             backend=backend,
+            execution_mode=resolved_execution_mode,
+            alias=alias,
+            workspace_root=workspace_root,
+            bootstrap_profile=bootstrap_profile,
+            bootstrap_bundle=parsed_bundle,
+        )
+
+    @server.tool(
+        name="worker_find_or_resume",
+        title="Find Or Resume Worker",
+        description=(
+            "Find an existing non-terminated worker by alias for a project/owner, or create one. "
+            "Use execution_mode='host' for host-native workers on the user's main computer only when host-native workers are enabled."
+        ),
+        structured_output=True,
+    )
+    def worker_find_or_resume(
+        project_id: str,
+        name: str,
+        role: str,
+        alias: str,
+        owner_id: str | None = None,
+        profile: str = "openclaw-general",
+        backend: str = "openclaw",
+        execution_mode: str | None = None,
+        workspace_root: str | None = None,
+        bootstrap_profile: str | None = None,
+        bootstrap_bundle_json: str | None = None,
+    ) -> dict[str, Any]:
+        parsed_bundle: dict[str, Any] | None = None
+        if bootstrap_bundle_json:
+            parsed_bundle = json.loads(bootstrap_bundle_json)
+        parsed_bundle = _merge_request_context(parsed_bundle)
+        resolved_execution_mode = _resolve_execution_mode(execution_mode)
+        return client.find_or_resume_worker(
+            project_id=project_id,
+            owner_id=_request_owner_id(owner_id),
+            name=name,
+            role=role,
+            alias=alias,
+            profile=profile,
+            backend=backend,
+            execution_mode=resolved_execution_mode,
+            workspace_root=workspace_root,
             bootstrap_profile=bootstrap_profile,
             bootstrap_bundle=parsed_bundle,
         )
@@ -251,11 +618,11 @@ def create_mcp_server(
     def worker_message(worker_id: str, message: str) -> dict[str, Any]:
         return client.send_message(worker_id, message)
 
-    @server.tool(name="worker_pause", title="Pause Worker", description="Pause a worker and freeze its sandbox.", structured_output=True)
+    @server.tool(name="worker_pause", title="Pause Worker", description="Pause a worker. Docker workers are frozen; host-native workers stop the active process.", structured_output=True)
     def worker_pause(worker_id: str) -> dict[str, Any]:
         return client.lifecycle(worker_id, "pause")
 
-    @server.tool(name="worker_resume", title="Resume Worker", description="Resume a paused worker from its persistent sandbox.", structured_output=True)
+    @server.tool(name="worker_resume", title="Resume Worker", description="Resume a paused persistent worker.", structured_output=True)
     def worker_resume(worker_id: str) -> dict[str, Any]:
         return client.lifecycle(worker_id, "resume")
 
@@ -270,7 +637,7 @@ def create_mcp_server(
     @server.tool(
         name="worker_desktop_action",
         title="Launch Worker Desktop Action",
-        description="Launch a workstation surface such as terminal, files, browser, codex, claude, or openclaw inside a worker sandbox.",
+        description="Launch a worker surface such as terminal, files, browser, codex, claude, or openclaw inside a sandbox or on the host computer.",
         structured_output=True,
     )
     def worker_desktop_action(worker_id: str, action: str, url: str | None = None) -> dict[str, Any]:

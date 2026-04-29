@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
+import logging
+import os
 import shutil
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Lock
+
+import httpx
 
 from .openclaw_runtime import (
     RuntimeErrorBase,
@@ -14,7 +22,36 @@ from .openclaw_runtime import (
     WorkerRuntime,
     WorkerTerminatedError,
 )
+from .runtime_env import load_viventium_runtime_env
 from .store import Store
+
+
+logger = logging.getLogger(__name__)
+
+
+def _bounded_int_env(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    try:
+        value = int(str(os.environ.get(name, "")).strip())
+    except ValueError:
+        return default
+    return max(min_value, min(value, max_value))
+
+
+def _bounded_float_env(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    try:
+        value = float(str(os.environ.get(name, "")).strip())
+    except ValueError:
+        return default
+    return max(min_value, min(value, max_value))
+
+
+class HostWorkersDisabledError(RuntimeError):
+    pass
+
+
+def host_workers_enabled() -> bool:
+    value = os.environ.get("GLASSHIVE_HOST_WORKERS_ENABLED", "true").strip().lower()
+    return value not in {"0", "false", "no", "off", "disabled"}
 
 
 class WorkersProjectsService:
@@ -26,9 +63,197 @@ class WorkersProjectsService:
         self._active_processors: set[str] = set()
         self._processor_generations: dict[str, int] = {}
         self.reconcile_all_workers()
+        self.executor.submit(self._replay_pending_callbacks)
 
     def shutdown(self) -> None:
         self.executor.shutdown(wait=False, cancel_futures=False)
+
+    def _callback_config_for(self, worker: dict) -> dict:
+        bundle = self._bootstrap_bundle_for(worker) or {}
+        callbacks = bundle.get("callbacks")
+        if not isinstance(callbacks, dict) or not callbacks:
+            return {}
+        resolved = dict(callbacks)
+        load_viventium_runtime_env()
+        callback_url = os.environ.get("VIVENTIUM_GLASSHIVE_CALLBACK_URL", "").strip()
+        callback_secret = os.environ.get("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "").strip()
+        recovered: list[str] = []
+        if callback_url and not (resolved.get("events_webhook_url") or resolved.get("url")):
+            resolved["events_webhook_url"] = callback_url
+            recovered.append("endpoint")
+        if callback_secret and not (resolved.get("hmac_secret") or resolved.get("secret")):
+            resolved["hmac_secret"] = callback_secret
+            recovered.append("secret")
+        if recovered:
+            logger.warning(
+                "Recovered GlassHive callback %s from canonical runtime env for worker %s; "
+                "check MCP/bootstrap request-context propagation.",
+                ", ".join(recovered),
+                worker.get("worker_id"),
+            )
+        return resolved
+
+    def _derive_callback_secret(self, secret: str, worker_id: str, run_id: str | None) -> bytes:
+        binding = f"{worker_id}:{run_id or ''}".encode("utf-8")
+        return hmac.new(secret.encode("utf-8"), binding, hashlib.sha256).hexdigest().encode("utf-8")
+
+    def _encode_callback_payload(self, payload: dict) -> bytes:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+    def _callback_headers(self, callbacks: dict, payload: dict, encoded: bytes) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        secret = str(callbacks.get("hmac_secret") or callbacks.get("secret") or "")
+        if secret:
+            derived_secret = self._derive_callback_secret(
+                secret,
+                str(payload.get("worker_id") or ""),
+                str(payload.get("run_id") or "") or None,
+            )
+            headers["X-GlassHive-Signature"] = "sha256=" + hmac.new(derived_secret, encoded, hashlib.sha256).hexdigest()
+        return headers
+
+    def _deliver_callback_record(self, worker: dict, record: dict, callbacks: dict) -> None:
+        url = str(callbacks.get("events_webhook_url") or callbacks.get("url") or record.get("url") or "").strip()
+        if not url:
+            self.store.mark_callback_pending(
+                str(record.get("callback_id") or ""),
+                attempts=0,
+                payload_json=str(record.get("payload_json") or "{}"),
+                last_error="missing callback url",
+            )
+            return
+        try:
+            payload = json.loads(str(record.get("payload_json") or "{}"))
+        except json.JSONDecodeError:
+            self.store.mark_callback_pending(
+                str(record.get("callback_id") or ""),
+                attempts=0,
+                payload_json=str(record.get("payload_json") or "{}"),
+                last_error="invalid callback payload json",
+            )
+            return
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["callback_id"] = str(record.get("callback_id") or payload.get("callback_id") or f"cb_{uuid.uuid4().hex}")
+
+        retry_attempts = _bounded_int_env("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", 3, min_value=1, max_value=25)
+        retry_base_delay_s = _bounded_float_env(
+            "GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S",
+            0.5,
+            min_value=0.0,
+            max_value=60.0,
+        )
+        last_exc: Exception | None = None
+        attempts = 0
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        for attempt in range(retry_attempts):
+            attempts += 1
+            payload["callback_ts"] = int(time.time())
+            encoded = self._encode_callback_payload(payload)
+            headers = self._callback_headers(callbacks, payload, encoded)
+            payload_json = json.dumps(payload, ensure_ascii=False)
+            try:
+                response = httpx.post(url, content=encoded, headers=headers, timeout=5.0)
+                if response.status_code == 409:
+                    self.store.mark_callback_delivered(payload["callback_id"], attempts=attempts, payload_json=payload_json)
+                    return
+                response.raise_for_status()
+                self.store.mark_callback_delivered(payload["callback_id"], attempts=attempts, payload_json=payload_json)
+                return
+            except httpx.HTTPStatusError as exc:
+                last_exc = exc
+                status_code = exc.response.status_code if exc.response is not None else 0
+                if 400 <= status_code < 500 and status_code not in {408, 409, 425, 429}:
+                    break
+            except Exception as exc:
+                last_exc = exc
+            if attempt < retry_attempts - 1 and retry_base_delay_s > 0:
+                time.sleep(retry_base_delay_s * (attempt + 1))
+        self.store.mark_callback_pending(
+            payload["callback_id"],
+            attempts=attempts,
+            payload_json=payload_json,
+            last_error=str(last_exc or "callback delivery failed"),
+        )
+        try:
+            self.store.add_event(
+                str(record.get("project_id") or worker.get("project_id") or ""),
+                str(record.get("worker_id") or worker.get("worker_id") or ""),
+                record.get("run_id"),
+                "callback.failed",
+                f"{record.get('event_type')}: {last_exc}",
+            )
+        except Exception:
+            pass
+
+    def _replay_pending_callbacks(self) -> None:
+        try:
+            pending = self.store.list_pending_callbacks(limit=50)
+        except Exception:
+            return
+        for record in pending:
+            worker = self.store.get_worker(str(record.get("worker_id") or ""))
+            if not worker:
+                continue
+            callbacks = self._callback_config_for(worker)
+            self._deliver_callback_record(worker, record, callbacks)
+
+    def _ensure_execution_allowed(self, worker_or_mode: dict | str) -> None:
+        execution_mode = (
+            str(worker_or_mode.get("execution_mode") or "docker")
+            if isinstance(worker_or_mode, dict)
+            else str(worker_or_mode or "docker")
+        )
+        if execution_mode == "host" and not host_workers_enabled():
+            raise HostWorkersDisabledError(
+                "GlassHive host-native workers are disabled by Viventium config"
+            )
+
+    def _emit_callback(
+        self,
+        worker: dict,
+        event_type: str,
+        *,
+        run: dict | None = None,
+        message: str = "",
+    ) -> None:
+        callbacks = self._callback_config_for(worker)
+        url = str(callbacks.get("events_webhook_url") or callbacks.get("url") or "").strip()
+        if not url:
+            return
+        payload = {
+            "callback_id": f"cb_{uuid.uuid4().hex}",
+            "callback_ts": int(time.time()),
+            "event": event_type,
+            "project_id": worker.get("project_id"),
+            "worker_id": worker.get("worker_id"),
+            "run_id": (run or {}).get("run_id"),
+            "run_state": (run or {}).get("state"),
+            "message": message,
+            "user_id": callbacks.get("user_id"),
+            "agent_id": callbacks.get("agent_id"),
+            "conversation_id": callbacks.get("conversation_id"),
+            "parent_message_id": callbacks.get("parent_message_id"),
+            "message_id": callbacks.get("message_id"),
+            "surface": callbacks.get("surface"),
+            "input_mode": callbacks.get("input_mode"),
+            "stream_id": callbacks.get("stream_id"),
+            "voice_call_session_id": callbacks.get("voice_call_session_id"),
+            "voice_request_id": callbacks.get("voice_request_id"),
+            "telegram_chat_id": callbacks.get("telegram_chat_id"),
+            "telegram_user_id": callbacks.get("telegram_user_id"),
+            "telegram_message_id": callbacks.get("telegram_message_id"),
+        }
+        record = self.store.upsert_callback_outbox(
+            callback_id=str(payload["callback_id"]),
+            project_id=str(worker.get("project_id") or ""),
+            worker_id=str(worker.get("worker_id") or ""),
+            run_id=(run or {}).get("run_id"),
+            event_type=event_type,
+            url=url,
+            payload_json=json.dumps(payload, ensure_ascii=False),
+        )
+        self.executor.submit(self._deliver_callback_record, dict(worker), record, callbacks)
 
     def create_project(self, owner_id: str, title: str, goal: str, default_worker_profile: str) -> dict:
         return self.store.create_project(owner_id, title, goal, default_worker_profile)
@@ -41,9 +266,13 @@ class WorkersProjectsService:
         role: str,
         profile: str,
         backend: str,
+        execution_mode: str = "docker",
+        alias: str | None = None,
+        workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
         bootstrap_bundle: dict | None = None,
     ) -> dict:
+        self._ensure_execution_allowed(execution_mode)
         model = self.runtime.resolve_model(profile)
         worker = self.store.create_worker(
             project_id=project_id,
@@ -54,6 +283,9 @@ class WorkersProjectsService:
             backend=backend,
             runtime="openclaw",
             model=model,
+            execution_mode=execution_mode,
+            alias=alias,
+            workspace_root=workspace_root,
             bootstrap_profile=bootstrap_profile,
             bootstrap_bundle=bootstrap_bundle,
         )
@@ -70,7 +302,48 @@ class WorkersProjectsService:
             return updated or worker
         updated = self._apply_runtime_info(worker["worker_id"], info, state="ready", last_error="")
         self.store.add_event(project_id, worker["worker_id"], None, "worker.ready", f"Worker ready on {info.gateway_url}")
+        self._emit_callback(updated or worker, "worker.ready", message="Worker ready")
         return updated or worker
+
+    def find_or_create_worker(
+        self,
+        project_id: str,
+        owner_id: str,
+        name: str,
+        role: str,
+        profile: str,
+        backend: str,
+        alias: str,
+        execution_mode: str = "docker",
+        workspace_root: str | None = None,
+        bootstrap_profile: str | None = None,
+        bootstrap_bundle: dict | None = None,
+    ) -> dict:
+        self._ensure_execution_allowed(execution_mode)
+        existing = self.store.find_worker_by_alias(project_id, owner_id, alias, execution_mode=execution_mode)
+        if existing and existing.get("state") != "terminated":
+            self.store.add_event(
+                project_id,
+                existing["worker_id"],
+                None,
+                "worker.resumed_by_alias",
+                f"Reusing worker alias {alias}",
+            )
+            self._emit_callback(existing, "worker.resumed_by_alias", message=f"Reusing worker alias {alias}")
+            return existing
+        return self.create_worker(
+            project_id=project_id,
+            owner_id=owner_id,
+            name=name,
+            role=role,
+            profile=profile,
+            backend=backend,
+            execution_mode=execution_mode,
+            alias=alias,
+            workspace_root=workspace_root,
+            bootstrap_profile=bootstrap_profile,
+            bootstrap_bundle=bootstrap_bundle,
+        )
 
     def duplicate_worker(
         self,
@@ -89,6 +362,9 @@ class WorkersProjectsService:
             role=role,
             profile=str(source_worker.get("profile") or "codex-cli"),
             backend=str(source_worker.get("backend") or "openclaw"),
+            execution_mode=str(source_worker.get("execution_mode") or "docker"),
+            alias=None,
+            workspace_root=str(source_worker.get("workspace_root") or "") or None,
             bootstrap_profile=str(source_worker.get("bootstrap_profile") or "") or None,
             bootstrap_bundle=bootstrap_bundle,
         )
@@ -115,10 +391,12 @@ class WorkersProjectsService:
 
     def assign_run(self, worker_id: str, instruction: str, event_type: str = "run.queued") -> dict:
         worker = self.require_worker(worker_id)
+        self._ensure_execution_allowed(worker)
         if worker["state"] == "paused":
             worker = self.resume_worker(worker_id)
         run = self.store.create_run(worker_id, worker["project_id"], instruction, state="queued")
         self.store.add_event(worker["project_id"], worker_id, run["run_id"], event_type, instruction)
+        self._emit_callback(worker, event_type, run=run, message=instruction)
         self._ensure_worker_processor(worker_id)
         return run
 
@@ -135,6 +413,7 @@ class WorkersProjectsService:
 
     def steer_worker(self, worker_id: str, message: str) -> dict:
         worker = self.require_worker(worker_id)
+        self._ensure_execution_allowed(worker)
         active_run = self.store.get_active_run(worker_id)
         if active_run:
             interrupted = self.interrupt_worker(worker_id)
@@ -158,6 +437,7 @@ class WorkersProjectsService:
         run_id: str | None = None,
     ) -> dict[str, object]:
         worker = self.require_worker(worker_id)
+        self._ensure_execution_allowed(worker)
         if not hasattr(self.runtime, "desktop_action"):
             raise RuntimeErrorBase("Desktop actions are not supported by the configured runtime")
         try:
@@ -181,6 +461,7 @@ class WorkersProjectsService:
         updated = self._apply_runtime_info(worker_id, info, state="paused", last_error=worker.get("last_error") or "")
         active_run = self.store.get_active_run(worker_id)
         self.store.add_event(worker["project_id"], worker_id, active_run["run_id"] if active_run else None, "worker.paused", "Worker paused")
+        self._emit_callback(worker, "worker.paused", run=active_run, message="Worker paused")
         return updated or worker
 
     def interrupt_worker(self, worker_id: str) -> dict:
@@ -201,10 +482,12 @@ class WorkersProjectsService:
                 error_text="Interrupted by operator",
             )
         self.store.add_event(worker["project_id"], worker_id, active_run["run_id"] if active_run else None, "worker.interrupted", "Worker interrupted")
+        self._emit_callback(worker, "worker.interrupted", run=active_run, message="Worker interrupted")
         return updated or worker
 
     def resume_worker(self, worker_id: str) -> dict:
         worker = self.require_worker(worker_id)
+        self._ensure_execution_allowed(worker)
         updated = self._start_worker_again(worker, event_type="worker.resumed", message="Worker resumed")
         active_run = self.store.get_active_run(worker_id)
         if active_run:
@@ -220,6 +503,7 @@ class WorkersProjectsService:
         self.store.cancel_pending_runs(worker_id, error_text="Worker terminated by operator", state="cancelled")
         updated = self._apply_runtime_info(worker_id, info, state="terminated", last_error="")
         self.store.add_event(worker["project_id"], worker_id, None, "worker.terminated", "Worker terminated")
+        self._emit_callback(worker, "worker.terminated", message="Worker terminated")
         return updated or worker
 
     def reconcile_all_workers(self) -> None:
@@ -230,6 +514,23 @@ class WorkersProjectsService:
             state = worker["state"]
             if state in {"running", "ready", "starting"}:
                 state = "ready" if info.pid else "paused"
+            if not info.pid:
+                active_run = self.store.get_active_run(worker["worker_id"])
+                if active_run:
+                    orphaned_run = self.store.finalize_run_if_state(
+                        active_run["run_id"],
+                        "running",
+                        "interrupted",
+                        error_text="Worker process was not running during reconcile",
+                    )
+                    if orphaned_run:
+                        self.store.add_event(
+                            worker["project_id"],
+                            worker["worker_id"],
+                            active_run["run_id"],
+                            "run.orphaned",
+                            "Active run interrupted because the worker process was not running",
+                        )
             self._apply_runtime_info(worker["worker_id"], info, state=state, last_error=worker.get("last_error") or "")
 
     def require_project(self, project_id: str) -> dict:
@@ -250,35 +551,49 @@ class WorkersProjectsService:
             raise KeyError("Run not found")
         return run
 
-    def heal_worker(self, worker_id: str) -> dict | None:
-        worker = self.store.get_worker(worker_id)
-        if not worker or worker.get("state") != "running":
-            return worker
-        active_run = self.store.get_active_run(worker_id)
-        if not active_run or not hasattr(self.runtime, "collect_completed_run"):
-            return worker
+    def _collect_completed_run(self, worker: dict, run: dict) -> dict[str, str] | None:
+        if not hasattr(self.runtime, "collect_completed_run"):
+            return None
         try:
-            recovered = self.runtime.collect_completed_run(worker, run_id=active_run["run_id"])
+            return self.runtime.collect_completed_run(worker, run_id=run["run_id"])
         except TypeError as exc:
             if "run_id" not in str(exc):
                 raise
-            recovered = self.runtime.collect_completed_run(worker)
-        if not recovered:
-            return worker
+            return self.runtime.collect_completed_run(worker)
+
+    def _apply_recovered_run(self, worker: dict, run: dict, recovered: dict[str, str]) -> dict | None:
+        worker_id = worker["worker_id"]
         state = str(recovered.get("state") or "failed")
         output_text = str(recovered.get("output_text") or "")
         error_text = str(recovered.get("error_text") or "")
         if state == "completed":
-            self.store.finalize_run(active_run["run_id"], state="completed", output_text=output_text)
-            self.store.update_worker(worker_id, state="ready", last_error="", last_run_id=active_run["run_id"])
+            self.store.finalize_run(run["run_id"], state="completed", output_text=output_text)
+            self.store.update_worker(worker_id, state="ready", last_error="", last_run_id=run["run_id"])
             preview = output_text.replace("\n", " ")[:240]
-            self.store.add_event(worker["project_id"], worker_id, active_run["run_id"], "run.completed", preview or "Run completed")
+            self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.completed", preview or "Run completed")
+            recovered_run = {**run, "state": "completed", "output_text": output_text}
+            self._emit_callback(worker, "run.completed", run=recovered_run, message=preview or "Run completed")
             self._refresh_runtime_info(worker_id, state="ready", last_error="")
         else:
-            self.store.finalize_run(active_run["run_id"], state="failed", error_text=error_text)
-            self.store.update_worker(worker_id, state="ready", last_error=error_text, last_run_id=active_run["run_id"])
-            self.store.add_event(worker["project_id"], worker_id, active_run["run_id"], "run.failed", error_text or "Run failed")
+            self.store.finalize_run(run["run_id"], state="failed", error_text=error_text)
+            self.store.update_worker(worker_id, state="ready", last_error=error_text, last_run_id=run["run_id"])
+            self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.failed", error_text or "Run failed")
+            recovered_run = {**run, "state": "failed", "error_text": error_text}
+            self._emit_callback(worker, "run.failed", run=recovered_run, message=error_text or "Run failed")
             self._refresh_runtime_info(worker_id, state="ready", last_error=error_text)
+        return self.store.get_worker(worker_id)
+
+    def heal_worker(self, worker_id: str) -> dict | None:
+        worker = self.store.get_worker(worker_id)
+        if not worker or worker.get("state") in {"paused"}:
+            return worker
+        active_run = self.store.get_active_run(worker_id)
+        if not active_run:
+            return worker
+        recovered = self._collect_completed_run(worker, active_run)
+        if not recovered:
+            return worker
+        self._apply_recovered_run(worker, active_run, recovered)
         with self._processors_lock:
             # Stale processors also check active membership before every state write,
             # so dropping membership here is enough to make an externally healed
@@ -420,6 +735,7 @@ class WorkersProjectsService:
                 worker = self.store.get_worker(worker_id) or worker
                 self.store.update_worker_state(worker_id, "running", last_error="")
                 self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.started", run["instruction"])
+                self._emit_callback(worker, "run.started", run=run, message=run["instruction"])
 
                 try:
                     try:
@@ -434,6 +750,7 @@ class WorkersProjectsService:
                     self.store.finalize_run(run["run_id"], state="paused", error_text=str(exc))
                     self.store.update_worker_state(worker_id, "paused", last_error="")
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.paused", str(exc))
+                    self._emit_callback(worker, "run.paused", run=run, message=str(exc))
                     return
                 except WorkerInterruptedError as exc:
                     if not self._processor_is_current(worker_id, generation):
@@ -441,13 +758,19 @@ class WorkersProjectsService:
                     self.store.finalize_run(run["run_id"], state="interrupted", error_text=str(exc))
                     self.store.update_worker_state(worker_id, "ready", last_error="")
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.interrupted", str(exc))
+                    self._emit_callback(worker, "run.interrupted", run=run, message=str(exc))
                     continue
                 except WorkerTerminatedError as exc:
                     if not self._processor_is_current(worker_id, generation):
                         return
+                    recovered = self._collect_completed_run(worker, run)
+                    if recovered:
+                        self._apply_recovered_run(worker, run, recovered)
+                        continue
                     self.store.finalize_run(run["run_id"], state="cancelled", error_text=str(exc))
                     self.store.update_worker_state(worker_id, "terminated", last_error=str(exc))
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.cancelled", str(exc))
+                    self._emit_callback(worker, "run.cancelled", run=run, message=str(exc))
                     return
                 except RuntimeErrorBase as exc:
                     if not self._processor_is_current(worker_id, generation):
@@ -461,6 +784,7 @@ class WorkersProjectsService:
                     self.store.finalize_run(run["run_id"], state=final_state, error_text=str(exc))
                     self.store.update_worker_state(worker_id, worker_state if worker_state in {"paused", "terminated"} else "ready", last_error=str(exc))
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], f"run.{final_state}", str(exc))
+                    self._emit_callback(worker, f"run.{final_state}", run=run, message=str(exc))
                     if worker_state in {"paused", "terminated"}:
                         return
                     continue
@@ -470,6 +794,7 @@ class WorkersProjectsService:
                     self.store.finalize_run(run["run_id"], state="failed", error_text=str(exc))
                     self.store.update_worker_state(worker_id, "ready", last_error=str(exc))
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.failed", str(exc))
+                    self._emit_callback(worker, "run.failed", run=run, message=str(exc))
                     continue
 
                 if not self._processor_is_current(worker_id, generation):
@@ -478,6 +803,8 @@ class WorkersProjectsService:
                 self.store.update_worker(worker_id, state="ready", last_error="", last_run_id=run["run_id"])
                 preview = output.replace("\n", " ")[:240]
                 self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.completed", preview or "Run completed")
+                completed_run = {**run, "state": "completed", "output_text": output}
+                self._emit_callback(worker, "run.completed", run=completed_run, message=preview or "Run completed")
                 self._refresh_runtime_info(worker_id, state="ready", last_error="")
         finally:
             if not self._release_processor(worker_id, generation):

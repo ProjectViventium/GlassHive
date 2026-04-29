@@ -17,6 +17,7 @@ WorkerState = Literal[
 ]
 RunState = Literal["queued", "running", "interrupted", "paused", "completed", "failed", "cancelled"]
 DesktopActionName = Literal["terminal", "files", "browser", "focus_browser", "codex", "claude", "openclaw"]
+ExecutionMode = Literal["docker", "host"]
 
 
 def utc_now() -> str:
@@ -48,6 +49,9 @@ class CreateWorkerRequest(BaseModel):
     role: str
     profile: str = "openclaw-general"
     backend: str = "openclaw"
+    execution_mode: ExecutionMode = "docker"
+    alias: str | None = None
+    workspace_root: str | None = None
     bootstrap_profile: str | None = None
     bootstrap_bundle: dict[str, object] | None = None
 
@@ -67,6 +71,8 @@ class WorkerResponse(BaseModel):
     role: str
     profile: str
     backend: str
+    execution_mode: ExecutionMode = "docker"
+    alias: str | None = None
     runtime: str = "openclaw"
     model: str = ""
     state: WorkerState
@@ -78,6 +84,7 @@ class WorkerResponse(BaseModel):
     session_key: str | None = None
     state_dir: str | None = None
     workspace_dir: str | None = None
+    workspace_root: str | None = None
     last_run_id: str | None = None
     last_error: str | None = None
     created_at: str

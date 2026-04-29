@@ -30,6 +30,22 @@ _PROVIDER_ENV_KEYS = [
 ]
 
 
+def _run_timeout_sec(timeout_sec: float | None = None) -> float | None:
+    raw = (
+        os.environ.get("GLASSHIVE_RUN_TIMEOUT_SEC", "").strip()
+        or os.environ.get("WPR_RUN_TIMEOUT_SEC", "").strip()
+    )
+    if not raw:
+        return timeout_sec if timeout_sec and timeout_sec > 0 else None
+    if raw.lower() in {"0", "none", "off", "false", "disabled"}:
+        return None
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return timeout_sec if timeout_sec and timeout_sec > 0 else None
+    return parsed if parsed > 0 else None
+
+
 @dataclass
 class RuntimeInfo:
     runtime: str
@@ -70,7 +86,7 @@ class WorkerRuntime(Protocol):
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo: ...
 
-    def run_task(self, worker: dict, instruction: str, timeout_sec: int = 300, run_id: str | None = None) -> str: ...
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str: ...
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo: ...
 
@@ -107,7 +123,7 @@ class StubRuntime:
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
         return self.ensure_worker_ready(worker)
 
-    def run_task(self, worker: dict, instruction: str, timeout_sec: int = 300, run_id: str | None = None) -> str:
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
         return f"STUB_OK: {instruction}"
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
@@ -223,7 +239,7 @@ class OpenClawRuntime:
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
         return self.pause_worker(worker)
 
-    def run_task(self, worker: dict, instruction: str, timeout_sec: int = 300, run_id: str | None = None) -> str:
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
         info = self.ensure_worker_ready(worker)
         headers = {
             "Authorization": f"Bearer {info.gateway_token}",
@@ -238,7 +254,7 @@ class OpenClawRuntime:
         }
 
         try:
-            with httpx.Client(timeout=timeout_sec) as client:
+            with httpx.Client(timeout=_run_timeout_sec(timeout_sec)) as client:
                 response = client.post(f"{info.gateway_url}/v1/responses", json=payload, headers=headers)
                 response.raise_for_status()
                 data = response.json()
@@ -252,7 +268,8 @@ class OpenClawRuntime:
         except httpx.HTTPStatusError as exc:
             raise RuntimeErrorBase(f"OpenClaw returned HTTP {exc.response.status_code}: {exc.response.text[:500]}") from exc
         except httpx.TimeoutException as exc:
-            raise RuntimeErrorBase(f"OpenClaw timed out after {timeout_sec}s") from exc
+            effective_timeout = _run_timeout_sec(timeout_sec)
+            raise RuntimeErrorBase(f"OpenClaw timed out after {effective_timeout}s") from exc
 
         output_parts: list[str] = []
         for item in data.get("output", []):

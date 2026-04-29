@@ -16,6 +16,7 @@ Future extensions that would clone browser-session state across workspaces are s
 - **Worker**: A background task runner that acts on the user's behalf.
 - **Worker Alias**: A memorable, stable name for a specific worker (e.g., `demo-linkedin-primary`), so the system knows exactly which worker to wake up.
 - **Sandbox**: The isolated, secure environment where the worker runs so it doesn't interfere with the main app.
+- **Host Worker**: A no-sandbox worker that uses the user's existing host browser/CLI/OS session.
 - **Parent System**: The main application (like LibreChat or the Telegram bot) that gives tasks to the GlassHive workers.
 
 ## The Actual Question
@@ -46,6 +47,11 @@ That means browser profile data written under the worker home persists for that 
 If you log into LinkedIn, Gmail, or another site inside a given worker sandbox, that browser session should remain available when that same worker is paused and resumed later.
 
 This is the correct product model for long-lived personal assistance.
+
+For host-native workers, browser/session persistence means the worker uses the user's real host
+browser and CLI login state. That gives the strongest "sees what I see" behavior, but it is not an
+isolated browser identity. Host-native workspaces must therefore be clearly labeled `Host computer`
+instead of `Sandbox`.
 
 ## What It Does Not Mean
 

@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import time
 from pathlib import Path
 from threading import Event
 
+import httpx
 from fastapi.testclient import TestClient
 
 from workers_projects_runtime.api import create_app
-from workers_projects_runtime.openclaw_runtime import RuntimeInfo, StubRuntime, WorkerInterruptedError, WorkerPausedError
+from workers_projects_runtime.openclaw_runtime import (
+    RuntimeInfo,
+    StubRuntime,
+    WorkerInterruptedError,
+    WorkerPausedError,
+    WorkerTerminatedError,
+)
 from workers_projects_runtime.service import WorkersProjectsService
 from workers_projects_runtime.store import Store
 
@@ -22,6 +32,15 @@ def wait_for_run(client: TestClient, run_id: str, timeout: float = 3.0) -> dict:
             return run
         time.sleep(0.05)
     raise AssertionError(f"Run {run_id} did not settle within {timeout}s")
+
+
+def wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(interval)
+    raise AssertionError("Condition did not become true before timeout")
 
 
 def test_project_worker_lifecycle_with_stub_runtime(tmp_path):
@@ -65,6 +84,7 @@ def test_project_worker_lifecycle_with_stub_runtime(tmp_path):
     worker_id = worker["worker_id"]
     assert worker["state"] == "ready"
     assert worker["runtime"] == "openclaw-stub"
+    assert worker["execution_mode"] == "docker"
     assert worker["session_key"].endswith(worker_id)
     assert worker["bootstrap_profile"] == "host-login"
 
@@ -111,6 +131,625 @@ def test_project_worker_lifecycle_with_stub_runtime(tmp_path):
     assert metrics["runs"] == 2
     assert metrics["queued_runs"] == 0
     assert metrics["events"] >= 7
+
+
+def test_callbacks_sign_utf8_canonical_json_for_unicode_messages(tmp_path, monkeypatch):
+    captured: dict[str, object] = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, *, content, headers, timeout):
+        captured["url"] = url
+        captured["content"] = content
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        project = store.create_project("owner", "Callbacks", "Verify callback signatures", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                    "surface": "telegram",
+                    "stream_id": "stream-123",
+                    "voice_call_session_id": "call-123",
+                    "telegram_chat_id": "chat-123",
+                }
+            },
+        )
+        run = store.create_run(worker["worker_id"], project["project_id"], "Open user's Chrome - no sandbox", state="running")
+
+        service._emit_callback(worker, "run.started", run=run, message="Open user's Chrome - no sandbox — verified")
+        wait_until(lambda: "content" in captured)
+    finally:
+        service.shutdown()
+
+    content = captured["content"]
+    assert isinstance(content, bytes)
+    payload_text = content.decode("utf-8")
+    assert "—" in payload_text
+    assert "\\u2014" not in payload_text
+
+    payload = json.loads(payload_text)
+    assert payload["surface"] == "telegram"
+    assert payload["stream_id"] == "stream-123"
+    assert payload["voice_call_session_id"] == "call-123"
+    assert payload["telegram_chat_id"] == "chat-123"
+    binding = f"{payload['worker_id']}:{payload['run_id']}".encode("utf-8")
+    derived_secret = hmac.new(b"callback-secret", binding, hashlib.sha256).hexdigest().encode("utf-8")
+    expected = "sha256=" + hmac.new(derived_secret, content, hashlib.sha256).hexdigest()
+    assert captured["headers"]["X-GlassHive-Signature"] == expected
+
+
+def test_callbacks_retry_transient_delivery_failures(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    class Response:
+        def __init__(self, status_code: int):
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                request = httpx.Request("POST", "http://callback.local/glasshive")
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError("server error", request=request, response=response)
+            return None
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        return Response(500 if len(attempts) == 1 else 200)
+
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    monkeypatch.setattr("workers_projects_runtime.service.time.sleep", lambda _seconds: None)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        project = store.create_project("owner", "Callbacks", "Verify callback retry", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                }
+            },
+        )
+        run = store.create_run(worker["worker_id"], project["project_id"], "Open Chrome", state="running")
+
+        service._emit_callback(worker, "run.completed", run=run, message="Done")
+        wait_until(lambda: len(attempts) == 2)
+    finally:
+        service.shutdown()
+
+    assert len(attempts) == 2
+    assert not [event for event in store.list_events(worker["worker_id"]) if event["event_type"] == "callback.failed"]
+
+
+def test_duplicate_callback_is_treated_as_delivered(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    class Response:
+        status_code = 409
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "http://callback.local/glasshive")
+            response = httpx.Response(409, request=request)
+            raise httpx.HTTPStatusError("duplicate callback", request=request, response=response)
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        return Response()
+
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        project = store.create_project("owner", "Callbacks", "Verify callback dedupe", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                }
+            },
+        )
+        run = store.create_run(worker["worker_id"], project["project_id"], "Open Chrome", state="running")
+
+        service._emit_callback(worker, "run.completed", run=run, message="Done")
+        wait_until(lambda: len(attempts) == 1)
+    finally:
+        service.shutdown()
+
+    assert len(attempts) == 1
+    assert not [event for event in store.list_events(worker["worker_id"]) if event["event_type"] == "callback.failed"]
+
+
+def test_failed_callback_stays_pending_and_replays_on_restart(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    class Response:
+        def __init__(self, status_code: int):
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                request = httpx.Request("POST", "http://callback.local/glasshive")
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError("server error", request=request, response=response)
+            return None
+
+    def failing_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(500)
+        return Response(500)
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", failing_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        project = store.create_project("owner", "Callbacks", "Verify callback outbox replay", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                }
+            },
+        )
+        run = store.create_run(worker["worker_id"], project["project_id"], "Open Chrome", state="running")
+
+        service._emit_callback(worker, "run.completed", run=run, message="Done")
+        wait_until(
+            lambda: bool(store.list_pending_callbacks())
+            and bool(
+                [
+                    event
+                    for event in store.list_events(worker["worker_id"])
+                    if event["event_type"] == "callback.failed"
+                ]
+            )
+        )
+    finally:
+        service.shutdown()
+
+    pending = store.list_pending_callbacks()
+    assert len(pending) == 1
+    callback_id = pending[0]["callback_id"]
+    assert [event for event in store.list_events(worker["worker_id"]) if event["event_type"] == "callback.failed"]
+
+    def succeeding_post(url, *, content, headers, timeout):
+        _ = url, headers, timeout
+        attempts.append(200)
+        payload = json.loads(content.decode("utf-8"))
+        assert payload["callback_id"] == callback_id
+        return Response(200)
+
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", succeeding_post)
+    replay_service = WorkersProjectsService(store, StubRuntime())
+    try:
+        deadline = time.time() + 2
+        while time.time() < deadline and store.list_pending_callbacks():
+            time.sleep(0.05)
+    finally:
+        replay_service.shutdown()
+
+    assert not store.list_pending_callbacks()
+    with store._connect() as conn:
+        row = conn.execute("SELECT status, attempts FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
+    assert row["status"] == "delivered"
+    assert row["attempts"] == 2
+    assert attempts == [500, 200]
+
+
+def test_pending_callback_replay_does_not_block_service_startup(tmp_path, monkeypatch):
+    class Response:
+        status_code = 500
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "http://callback.local/glasshive")
+            response = httpx.Response(500, request=request)
+            raise httpx.HTTPStatusError("server error", request=request, response=response)
+
+    entered_post = Event()
+    release_post = Event()
+
+    def blocking_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        entered_post.set()
+        release_post.wait(timeout=1)
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", blocking_post)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project("owner", "Callbacks", "Verify non-blocking callback replay", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Codex Host",
+        role="host worker",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="gpt-5.4",
+        bootstrap_bundle={
+            "callbacks": {
+                "events_webhook_url": "http://callback.local/glasshive",
+                "hmac_secret": "callback-secret",
+            }
+        },
+    )
+    run = store.create_run(worker["worker_id"], project["project_id"], "Open Chrome", state="completed")
+    payload = {
+        "callback_id": "cb_pending_startup",
+        "callback_ts": int(time.time()),
+        "event": "run.completed",
+        "project_id": project["project_id"],
+        "worker_id": worker["worker_id"],
+        "run_id": run["run_id"],
+        "run_state": "completed",
+        "message": "Done",
+    }
+    store.upsert_callback_outbox(
+        callback_id="cb_pending_startup",
+        project_id=project["project_id"],
+        worker_id=worker["worker_id"],
+        run_id=run["run_id"],
+        event_type="run.completed",
+        url="http://callback.local/glasshive",
+        payload_json=json.dumps(payload, ensure_ascii=False),
+    )
+
+    started_at = time.perf_counter()
+    service = WorkersProjectsService(store, StubRuntime())
+    elapsed = time.perf_counter() - started_at
+    try:
+        assert elapsed < 0.5
+        assert entered_post.wait(timeout=1)
+    finally:
+        release_post.set()
+        service.shutdown()
+
+
+def test_callbacks_retry_budget_is_configurable(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    class Response:
+        def __init__(self, status_code: int):
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                request = httpx.Request("POST", "http://callback.local/glasshive")
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError("server error", request=request, response=response)
+            return None
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        return Response(500 if len(attempts) < 4 else 200)
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "4")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        project = store.create_project("owner", "Callbacks", "Verify configurable callback retry", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                }
+            },
+        )
+        run = store.create_run(worker["worker_id"], project["project_id"], "Open Chrome", state="running")
+
+        service._emit_callback(worker, "run.completed", run=run, message="Done")
+        wait_until(lambda: len(attempts) == 4)
+    finally:
+        service.shutdown()
+
+    assert len(attempts) == 4
+    assert not [event for event in store.list_events(worker["worker_id"]) if event["event_type"] == "callback.failed"]
+
+
+def test_assign_run_does_not_block_on_callback_delivery(tmp_path, monkeypatch):
+    entered_post = Event()
+    release_post = Event()
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def blocking_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        entered_post.set()
+        release_post.wait(timeout=1)
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", blocking_post)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), max_workers=2)
+    try:
+        project = store.create_project("owner", "Callbacks", "Verify non-blocking run callback", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                }
+            },
+        )
+
+        started_at = time.perf_counter()
+        run = service.assign_run(worker["worker_id"], "Open Chrome")
+        elapsed = time.perf_counter() - started_at
+        assert run["state"] == "queued"
+        assert elapsed < 0.1
+        assert entered_post.wait(timeout=1)
+    finally:
+        release_post.set()
+        service.shutdown()
+
+
+def test_callback_config_recovers_runtime_env_url_and_secret(tmp_path, monkeypatch, caplog):
+    runtime_env = tmp_path / "runtime.env"
+    runtime_env.write_text(
+        "\n".join(
+            [
+                "VIVENTIUM_GLASSHIVE_CALLBACK_URL=http://callback.local/glasshive",
+                "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET=runtime-secret",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VIVENTIUM_ENV_FILE", str(runtime_env))
+    monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", raising=False)
+    monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", raising=False)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        project = store.create_project("owner", "Callbacks", "Recover callback env", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+            bootstrap_bundle={
+                "callbacks": {
+                    "conversation_id": "conv-1",
+                    "message_id": "assistant-1",
+                }
+            },
+        )
+
+        with caplog.at_level("WARNING"):
+            callbacks = service._callback_config_for(worker)
+    finally:
+        service.shutdown()
+
+    assert callbacks["events_webhook_url"] == "http://callback.local/glasshive"
+    assert callbacks["hmac_secret"] == "runtime-secret"
+    assert callbacks["conversation_id"] == "conv-1"
+    assert "Recovered GlassHive callback endpoint, secret" in caplog.text
+    assert "runtime-secret" not in caplog.text
+
+
+def test_reconcile_interrupts_active_run_when_worker_process_is_missing(tmp_path):
+    class MissingProcessRuntime(StubRuntime):
+        def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+            info = super().ensure_worker_ready(worker)
+            info.pid = None
+            return info
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, MissingProcessRuntime())
+    try:
+        project = store.create_project("owner", "Orphan Cleanup", "Clean up stale active runs", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+        run = store.create_run(worker["worker_id"], project["project_id"], "Long host task", state="running")
+
+        service.reconcile_all_workers()
+    finally:
+        service.shutdown()
+
+    reconciled_run = store.get_run(run["run_id"])
+    assert reconciled_run["state"] == "interrupted"
+    assert reconciled_run["ended_at"]
+    assert "process was not running" in reconciled_run["error_text"]
+    assert store.get_worker(worker["worker_id"])["state"] == "paused"
+    assert store.metrics()["active_runs"] == 0
+    assert any(event["event_type"] == "run.orphaned" for event in store.list_events(worker["worker_id"]))
+
+
+def test_reconcile_does_not_regress_completed_run_when_process_is_missing(tmp_path):
+    class MissingProcessRuntime(StubRuntime):
+        def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+            info = super().ensure_worker_ready(worker)
+            info.pid = None
+            return info
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, MissingProcessRuntime())
+    try:
+        project = store.create_project("owner", "Orphan Race", "Avoid regressing completed runs", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+        run = store.create_run(worker["worker_id"], project["project_id"], "Finishing host task", state="running")
+        store.finalize_run(run["run_id"], "completed", output_text="done")
+
+        service.reconcile_all_workers()
+    finally:
+        service.shutdown()
+
+    reconciled_run = store.get_run(run["run_id"])
+    assert reconciled_run["state"] == "completed"
+    assert reconciled_run["output_text"] == "done"
+    assert not any(event["event_type"] == "run.orphaned" for event in store.list_events(worker["worker_id"]))
+
+
+def test_worker_find_or_resume_reuses_alias_and_preserves_host_fields(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Host Workers",
+            "goal": "Reuse named host workers.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    payload = {
+        "owner_id": "demo-owner",
+        "name": "Codex Host",
+        "role": "coding",
+        "profile": "codex-cli",
+        "backend": "openclaw",
+        "execution_mode": "host",
+        "alias": "codex-main",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+
+    first = client.post(f"/v1/projects/{project['project_id']}/workers/find-or-resume", json=payload)
+    second = client.post(f"/v1/projects/{project['project_id']}/workers/find-or-resume", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["worker_id"] == first.json()["worker_id"]
+    assert second.json()["execution_mode"] == "host"
+    assert second.json()["alias"] == "codex-main"
+    assert second.json()["workspace_root"] == str(tmp_path / "workspaces")
+
+
+def test_host_worker_disabled_blocks_host_creation_and_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "false")
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Host Workers",
+            "goal": "Verify disabled host execution is enforced.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+
+    host_payload = {
+        "owner_id": "demo-owner",
+        "name": "Codex Host",
+        "role": "coding",
+        "profile": "codex-cli",
+        "backend": "openclaw",
+        "execution_mode": "host",
+    }
+    blocked = client.post(f"/v1/projects/{project['project_id']}/workers", json=host_payload)
+    assert blocked.status_code == 403
+    assert "host-native workers are disabled" in blocked.json()["detail"]
+
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
+    created = client.post(f"/v1/projects/{project['project_id']}/workers", json=host_payload)
+    assert created.status_code == 201
+    worker_id = created.json()["worker_id"]
+
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "false")
+    run = client.post(f"/v1/workers/{worker_id}/assign", json={"instruction": "Open Chrome"})
+    assert run.status_code == 403
+    assert "host-native workers are disabled" in run.json()["detail"]
 
 
 def test_duplicate_worker_copies_workspace_into_new_worker(tmp_path):
@@ -446,7 +1085,7 @@ class ControllableRuntime:
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         return self._info(worker, pid=None if self.paused.is_set() else 1234)
 
-    def run_task(self, worker: dict, instruction: str, timeout_sec: int = 300) -> str:
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None) -> str:
         self.running.set()
         deadline = time.time() + 5
         while time.time() < deadline:
@@ -472,7 +1111,7 @@ class SteerableControllableRuntime(ControllableRuntime):
             self.interrupted.clear()
         return info
 
-    def run_task(self, worker: dict, instruction: str, timeout_sec: int = 300) -> str:
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None) -> str:
         self.instructions.append(instruction)
         if instruction.startswith("Operator steer instruction"):
             return "STEER_REDIRECT_OK"
@@ -554,7 +1193,7 @@ class RaisingPauseRuntime:
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         return self._info(worker, pid=None if self.paused.is_set() else 2222)
 
-    def run_task(self, worker: dict, instruction: str, timeout_sec: int = 300) -> str:
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None) -> str:
         self.running.set()
         deadline = time.time() + 5
         while time.time() < deadline:
@@ -803,7 +1442,7 @@ class HealingRaceRuntime:
             "error_text": "",
         }
 
-    def run_task(self, worker: dict, instruction: str, timeout_sec: int = 300, run_id: str | None = None) -> str:
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
         if "initial" in instruction:
             self.initial_started.set()
             assert self.release_initial.wait(timeout=3)
@@ -867,6 +1506,56 @@ def test_heal_worker_replacement_processor_keeps_running_state_while_follow_up_e
     assert store.get_worker(worker["worker_id"])["last_run_id"] == queued["run_id"]
 
 
+class TerminatedButCompletedRuntime(StubRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.collect_run_ids: list[str | None] = []
+
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        raise WorkerTerminatedError("stale termination marker")
+
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, str] | None:
+        self.collect_run_ids.append(run_id)
+        return {
+            "state": "completed",
+            "output_text": "Recovered final answer",
+            "error_text": "",
+        }
+
+
+def test_worker_terminated_error_recovers_completed_artifacts(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    runtime = TerminatedButCompletedRuntime()
+    service = WorkersProjectsService(store, runtime)
+    try:
+        project = service.create_project("demo-owner", "Recovered Run", "Recover stdout.", "codex-cli")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="demo-owner",
+            name="Recovered Worker",
+            role="coder",
+            profile="codex-cli",
+            backend="openclaw",
+        )
+        run = service.assign_run(worker["worker_id"], "finish despite stale marker")
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            refreshed = store.get_run(run["run_id"])
+            if refreshed and refreshed["state"] == "completed":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("Run did not recover completed artifacts")
+
+        assert store.get_run(run["run_id"])["output_text"] == "Recovered final answer"
+        assert store.get_worker(worker["worker_id"])["state"] == "ready"
+        assert runtime.collect_run_ids == [run["run_id"]]
+    finally:
+        service.shutdown()
+
+
 class DesktopStubRuntime:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -907,7 +1596,7 @@ class DesktopStubRuntime:
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
         return self._info(worker, pid=None)
 
-    def run_task(self, worker: dict, instruction: str, timeout_sec: int = 300) -> str:
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None) -> str:
         return f"DESKTOP_OK: {instruction}"
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:

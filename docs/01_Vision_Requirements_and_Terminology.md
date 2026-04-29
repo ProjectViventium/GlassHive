@@ -9,7 +9,7 @@ It is meant to feel like this:
 
 - define a `Project`
 - choose or create a `Worker`
-- run it inside a persistent `Sandbox`
+- run it inside a persistent `Sandbox` or, when explicitly selected, on the `Host Computer`
 - watch what it is doing live
 - interrupt or take over when needed
 - resume later without losing the work surface
@@ -19,7 +19,7 @@ It is meant to feel like this:
 Glass Hive should provide:
 
 1. a project-first operator flow
-2. persistent sandbox state
+2. persistent sandbox or host workspace state
 3. fast warm resume
 4. controllable workers
 5. explicit human takeover
@@ -43,8 +43,12 @@ Glass Hive is not:
 ### Sandbox
 A persistent workstation-like execution environment that holds the worker's home directory, workspace, processes, and live control surfaces.
 
+### Host Computer
+A no-sandbox execution mode where the worker uses local CLIs and OS/browser/filesystem access on
+the user's main machine. This mode is intentionally powerful and must be selected explicitly.
+
 ### Worker
-The active AI runtime inside a sandbox.
+The active AI runtime inside a sandbox or host workspace.
 Examples:
 
 - `codex-cli`
@@ -55,7 +59,7 @@ Examples:
 The durable task definition around one or more workers, including goal, success criteria, continuity, and audit trail.
 
 ### Bootstrap Bundle
-A portable preset describing what should be projected into a worker sandbox when it starts or resumes.
+A portable preset describing what should be projected into a worker when it starts or resumes.
 
 ## Client Compatibility Goal
 

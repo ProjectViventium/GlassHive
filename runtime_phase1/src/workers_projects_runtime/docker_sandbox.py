@@ -181,6 +181,7 @@ class DockerSandboxManager:
 
     def terminal_attach_command(self, worker_id: str, runtime_name: str, session_name: str = "operator") -> list[str]:
         sandbox = self.ensure_ready({"worker_id": worker_id}, runtime_name=runtime_name)
+        self._ensure_screen_runtime_dir(sandbox.container_name)
         return [
             "docker",
             "exec",
@@ -202,6 +203,7 @@ class DockerSandboxManager:
     def list_screen_sessions(self, worker_id: str, runtime_name: str, *, worker: dict | None = None) -> list[str]:
         resolved_worker = worker or {"worker_id": worker_id}
         sandbox = self.ensure_ready(resolved_worker, runtime_name=runtime_name)
+        self._ensure_screen_runtime_dir(sandbox.container_name)
         result = self._docker_exec(
             sandbox.container_name,
             ["bash", "-lc", "screen -ls || true"],
@@ -236,6 +238,7 @@ class DockerSandboxManager:
     ) -> subprocess.CompletedProcess[str]:
         resolved_worker = worker or {"worker_id": worker_id}
         sandbox = self.ensure_ready(resolved_worker, runtime_name=runtime_name)
+        self._ensure_screen_runtime_dir(sandbox.container_name)
         merged_env = {
             "HOME": self.home_mount,
             "TERM": self.term_value,
@@ -526,11 +529,12 @@ class DockerSandboxManager:
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         detach: bool = False,
+        user: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         args = ["exec"]
         if detach:
             args.append("-d")
-        args.extend(["-u", self.user])
+        args.extend(["-u", user or self.user])
         if cwd:
             args.extend(["-w", cwd])
         for key, value in sorted((env or {}).items()):
@@ -538,6 +542,31 @@ class DockerSandboxManager:
         args.append(container_name)
         args.extend(command)
         return self._docker(args, check=False, capture_output=True)
+
+    def _ensure_screen_runtime_dir(self, container_name: str) -> None:
+        screen_user = self.user.split(":", 1)[0] or self.user
+        screen_dir = f"/run/screen/S-{screen_user}"
+        script = (
+            "set -e; "
+            "mkdir -p /run/screen "
+            f"{shlex.quote(screen_dir)}; "
+            "chmod 1777 /run/screen; "
+            f"chown {shlex.quote(self.user)} {shlex.quote(screen_dir)} 2>/dev/null || true; "
+            f"chmod 700 {shlex.quote(screen_dir)}"
+        )
+        result = self._docker_exec(
+            container_name,
+            ["bash", "-lc", script],
+            env={
+                "HOME": self.home_mount,
+                "TERM": self.term_value,
+            },
+            cwd=self.workspace_mount,
+            user="root",
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[-1200:]
+            raise RuntimeError(f"Failed to prepare screen runtime directory in {container_name}: {detail}")
 
     def _set_plain_background(self, container_name: str) -> None:
         self._docker_exec(
