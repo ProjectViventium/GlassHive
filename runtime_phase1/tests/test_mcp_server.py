@@ -170,7 +170,7 @@ def test_mcp_server_exposes_tools_and_resources():
     asyncio.run(scenario())
 
 
-def test_worker_tools_default_to_docker_even_when_host_default_configured(monkeypatch):
+def test_worker_tools_use_configured_default_execution_mode(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
     server = create_mcp_server(api_client=FakeApiClient())
 
@@ -188,7 +188,41 @@ def test_worker_tools_default_to_docker_even_when_host_default_configured(monkey
                 },
             )
             worker_payload = _tool_json(worker)
-            assert worker_payload["execution_mode"] == "docker"
+            assert worker_payload["execution_mode"] == "host"
+
+    asyncio.run(scenario())
+
+
+def test_worker_tool_schemas_advertise_host_native_execution(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    server = create_mcp_server(api_client=FakeApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            tools = {tool.name: tool.model_dump() for tool in await client.list_tools()}
+            worker_create = tools["worker_create"]
+            worker_resume = tools["worker_find_or_resume"]
+            desktop_action = tools["worker_desktop_action"]
+
+            for tool in (worker_create, worker_resume):
+                description = tool["description"]
+                assert "execution_mode='host'" in description
+                schema = tool["inputSchema"]["properties"]
+                execution_schema = schema["execution_mode"]
+                assert execution_schema["anyOf"][0]["enum"] == ["docker", "host"]
+                assert "real computer/session" in execution_schema["description"]
+                assert "codex-cli" in schema["profile"]["description"]
+
+            action_schema = desktop_action["inputSchema"]["properties"]["action"]
+            assert action_schema["enum"] == [
+                "terminal",
+                "files",
+                "browser",
+                "focus_browser",
+                "codex",
+                "claude",
+                "openclaw",
+            ]
 
     asyncio.run(scenario())
 

@@ -18,7 +18,7 @@ from workers_projects_runtime.openclaw_runtime import (
     WorkerPausedError,
     WorkerTerminatedError,
 )
-from workers_projects_runtime.service import WorkersProjectsService
+from workers_projects_runtime.service import WorkersProjectsService, terminal_callback_message
 from workers_projects_runtime.store import Store
 
 
@@ -41,6 +41,156 @@ def wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> None:
             return
         time.sleep(interval)
     raise AssertionError("Condition did not become true before timeout")
+
+
+def test_terminal_callback_message_prefers_final_report():
+    output = "\n".join(
+        [
+            "I am starting the browser.",
+            "I am still scrolling through results.",
+            "",
+            "FINAL REPORT:",
+            "Captured 42 rows.",
+            "",
+            "Created `results.md` and stopped on the target page.",
+        ]
+    )
+
+    assert terminal_callback_message(output) == (
+        "Captured 42 rows.\n\nCreated `results.md` and stopped on the target page."
+    )
+
+
+def test_terminal_callback_message_uses_line_anchored_final_report_marker():
+    output = "\n".join(
+        [
+            "Progress: the harness says to include FINAL REPORT: at the end.",
+            "",
+            "FINAL REPORT:",
+            "Captured 42 rows.",
+        ]
+    )
+
+    assert terminal_callback_message(output) == "Captured 42 rows."
+
+
+def test_terminal_callback_message_uses_tail_without_mid_word_fragment():
+    output = "\n\n".join(
+        [
+            "Opening the browser and trying the first path.",
+            "Still gathering rows from the page.",
+            "The useful result is ready.\nSaved the export and needs one approval.",
+        ]
+    )
+
+    message = terminal_callback_message(output, fallback="Done")
+
+    assert "The useful result is ready" in message
+    assert not message.startswith("ows ")
+
+
+def test_terminal_callback_message_prefers_concise_final_line_without_marker():
+    output = "\n".join(
+        [
+            "Progress " + ("still working " * 120),
+            "More progress " + ("checking browser state " * 80),
+            "Example Domain",
+        ]
+    )
+
+    assert terminal_callback_message(output, fallback="Done") == "Example Domain"
+
+
+def test_terminal_callback_message_respects_visible_budget_with_prefix():
+    output = "\n\n".join(
+        [
+            "Opening the browser and scrolling.",
+            "FINAL REPORT:",
+            "A" * 1500,
+            "B" * 1500,
+            "C" * 1500,
+        ]
+    )
+
+    message = terminal_callback_message(output)
+
+    assert len(message) <= 2400
+    assert message.startswith("...\n\n")
+
+
+def test_completed_callback_uses_final_report_message(tmp_path, monkeypatch):
+    class FinalReportRuntime(StubRuntime):
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            _ = worker, instruction, timeout_sec, run_id
+            return "\n".join(
+                [
+                    "Opening the browser and scrolling.",
+                    "Still collecting rows from the page.",
+                    "",
+                    "FINAL REPORT:",
+                    "Captured 42 rows.",
+                    "",
+                    "Created `recent-connections.md` and stopped on the target page.",
+                ]
+            )
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    payloads: list[dict] = []
+
+    def capture_post(url, *, content, headers, timeout):
+        _ = url, headers, timeout
+        payloads.append(json.loads(content.decode("utf-8")))
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", capture_post)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, FinalReportRuntime(), max_workers=2)
+    try:
+        project = store.create_project("owner", "Callbacks", "Verify final report callbacks", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Browser Worker",
+            role="browser worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                    "conversation_id": "conv-1",
+                    "parent_message_id": "msg-user",
+                    "message_id": "msg-assistant",
+                }
+            },
+        )
+
+        service.assign_run(worker["worker_id"], "Open the browser and extract the result")
+        wait_until(lambda: any(payload.get("event") == "run.completed" for payload in payloads))
+
+        completed = next(payload for payload in payloads if payload.get("event") == "run.completed")
+        assert completed["message"] == (
+            "Captured 42 rows.\n\nCreated `recent-connections.md` and stopped on the target page."
+        )
+        assert "Opening the browser" not in completed["message"]
+        assert completed["message_id"] == "msg-assistant"
+    finally:
+        service.shutdown()
 
 
 def test_project_worker_lifecycle_with_stub_runtime(tmp_path):

@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -27,6 +28,8 @@ from .store import Store
 
 
 logger = logging.getLogger(__name__)
+TERMINAL_CALLBACK_MESSAGE_LIMIT = 2400
+FINAL_REPORT_PATTERN = re.compile(r"(?m)^[ \t]*FINAL REPORT:[ \t]*(?:\n|$)")
 
 
 def _bounded_int_env(name: str, default: int, *, min_value: int, max_value: int) -> int:
@@ -52,6 +55,46 @@ class HostWorkersDisabledError(RuntimeError):
 def host_workers_enabled() -> bool:
     value = os.environ.get("GLASSHIVE_HOST_WORKERS_ENABLED", "true").strip().lower()
     return value not in {"0", "false", "no", "off", "disabled"}
+
+
+def terminal_callback_message(output_text: str, *, fallback: str = "Run completed") -> str:
+    text = str(output_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return fallback
+
+    marker_matches = list(FINAL_REPORT_PATTERN.finditer(text))
+    if marker_matches:
+        text = text[marker_matches[-1].end() :].strip()
+
+    if len(text) <= TERMINAL_CALLBACK_MESSAGE_LIMIT:
+        return text or fallback
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines and len(lines[-1]) <= min(1000, TERMINAL_CALLBACK_MESSAGE_LIMIT):
+        return lines[-1]
+
+    prefix = "...\n\n"
+    paragraph_budget = TERMINAL_CALLBACK_MESSAGE_LIMIT - len(prefix)
+    paragraphs = [paragraph.strip() for paragraph in text.split("\n\n") if paragraph.strip()]
+    selected: list[str] = []
+    current_len = 0
+    for paragraph in reversed(paragraphs):
+        next_len = current_len + len(paragraph) + (2 if selected else 0)
+        if selected and next_len > paragraph_budget:
+            break
+        selected.insert(0, paragraph)
+        current_len = next_len
+
+    if selected:
+        message = "\n\n".join(selected).strip()
+        if len(message) <= paragraph_budget:
+            return f"{prefix}{message}" if len(message) < len(text) else message
+
+    tail_prefix = "..."
+    tail = text[-(TERMINAL_CALLBACK_MESSAGE_LIMIT - len(tail_prefix)) :].lstrip()
+    if " " in tail[:120]:
+        tail = tail[tail.find(" ") + 1 :].lstrip()
+    return f"{tail_prefix}{tail}" if tail else fallback
 
 
 class WorkersProjectsService:
@@ -569,10 +612,10 @@ class WorkersProjectsService:
         if state == "completed":
             self.store.finalize_run(run["run_id"], state="completed", output_text=output_text)
             self.store.update_worker(worker_id, state="ready", last_error="", last_run_id=run["run_id"])
-            preview = output_text.replace("\n", " ")[:240]
-            self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.completed", preview or "Run completed")
+            message = terminal_callback_message(output_text)
+            self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.completed", message[:TERMINAL_CALLBACK_MESSAGE_LIMIT] or "Run completed")
             recovered_run = {**run, "state": "completed", "output_text": output_text}
-            self._emit_callback(worker, "run.completed", run=recovered_run, message=preview or "Run completed")
+            self._emit_callback(worker, "run.completed", run=recovered_run, message=message or "Run completed")
             self._refresh_runtime_info(worker_id, state="ready", last_error="")
         else:
             self.store.finalize_run(run["run_id"], state="failed", error_text=error_text)
@@ -801,10 +844,10 @@ class WorkersProjectsService:
                     return
                 self.store.finalize_run(run["run_id"], state="completed", output_text=output)
                 self.store.update_worker(worker_id, state="ready", last_error="", last_run_id=run["run_id"])
-                preview = output.replace("\n", " ")[:240]
-                self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.completed", preview or "Run completed")
+                message = terminal_callback_message(output)
+                self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.completed", message[:TERMINAL_CALLBACK_MESSAGE_LIMIT] or "Run completed")
                 completed_run = {**run, "state": "completed", "output_text": output}
-                self._emit_callback(worker, "run.completed", run=completed_run, message=preview or "Run completed")
+                self._emit_callback(worker, "run.completed", run=completed_run, message=message or "Run completed")
                 self._refresh_runtime_info(worker_id, state="ready", last_error="")
         finally:
             if not self._release_processor(worker_id, generation):

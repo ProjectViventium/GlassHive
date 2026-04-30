@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -214,6 +215,66 @@ def test_host_codex_runtime_materializes_required_workspace_files(tmp_path, monk
     assert xattr_calls[0][:3] == ["/usr/bin/xattr", "-d", "com.apple.quarantine"]
     assert (workspace_dir / "uploads" / "uploaded-brief.txt").read_text() == "Uploaded brief"
     assert (tmp_path / "data" / "host_codex_cli_runtime" / "workers" / "wrk_host" / "state" / "action-audit.jsonl").exists()
+
+
+def test_host_codex_runtime_default_prompts_require_final_report(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+
+    def fake_run(args, **_kwargs):
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
+    worker = {
+        "worker_id": "wrk_host_final_report",
+        "name": "Main Host Worker",
+        "role": "browser task",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+
+    info = runtime.ensure_worker_ready(worker)
+    workspace_dir = Path(info.workspace_dir)
+
+    for filename in ("harness-prompt.md", "agents.md", "AGENTS.md", "claude.md", "CLAUDE.md", "codex.md", "CODEX.md"):
+        content = (workspace_dir / filename).read_text()
+        assert "FINAL REPORT:" in content
+
+
+def test_host_runtime_live_description_refreshes_stale_prompt_files(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+
+    def fake_run(args, **_kwargs):
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
+    worker = {
+        "worker_id": "wrk_host_live_refresh",
+        "name": "Main Host Worker",
+        "role": "browser task",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+
+    info = runtime.ensure_worker_ready(worker)
+    workspace_dir = Path(info.workspace_dir)
+    (workspace_dir / "harness-prompt.md").write_text("old prompt without terminal report contract")
+    (workspace_dir / "AGENTS.md").write_text("old agent instructions")
+
+    details = runtime.describe_worker(worker)
+
+    assert details["prompt_paths"]["harness_prompt"] == str(workspace_dir / "harness-prompt.md")
+    assert "FINAL REPORT:" in (workspace_dir / "harness-prompt.md").read_text()
+    assert "FINAL REPORT:" in (workspace_dir / "AGENTS.md").read_text()
 
 
 def test_host_codex_runtime_rejects_untrusted_source_paths(tmp_path, monkeypatch):

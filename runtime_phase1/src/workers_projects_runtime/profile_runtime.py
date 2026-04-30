@@ -1225,6 +1225,8 @@ class HostNativeCliMixin:
                 "- Do not print credentials, tokens, cookies, personal data, or private local paths unless absolutely required for the local operator.",
                 "- When invoking local `.sh` helper scripts from mounted or downloaded tool folders, run them through `bash /path/to/script.sh ...` so macOS quarantine/provenance metadata cannot block direct execution.",
                 "- For screen evidence on macOS, prefer the workspace helper `glasshive-host-tools/capture-front-window.sh` and invoke it with `bash`.",
+                "- For host browser or desktop tasks, first use the user's existing local app/session when the task asks for the main computer, Chrome, browser profile, local files, or installed OS tools. Do not claim host control is unavailable until you have checked the available local shell/desktop/browser automation paths.",
+                "- End every run with a `FINAL REPORT:` section. Keep it concise and user-facing: outcome, key result, artifacts/files created, blocker if any, and the next decision needed. Do not end with progress chatter.",
                 "",
                 "Required context files in this workspace:",
                 "- project-definition.md",
@@ -1298,9 +1300,28 @@ class HostNativeCliMixin:
             )
         self._write_workspace_file(workspace, "harness-prompt.md", self._host_harness_prompt(worker), overwrite=True)
 
-        agents_md = str(bundle.get("agents_md") or "Follow AGENTS.md-style project instructions and keep `work-log.md` updated.\n")
-        claude_md = str(bundle.get("claude_md") or "Claude host worker context. Use bypass permission mode only for this GlassHive workspace.\n")
-        codex_md = str(bundle.get("codex_md") or "Codex host worker context. Use full-access/no-approval mode only for this GlassHive workspace.\n")
+        agents_md = str(
+            bundle.get("agents_md")
+            or (
+                "Follow AGENTS.md-style project instructions and keep `work-log.md` updated.\n"
+                "When the task involves the host browser, desktop, files, shell, or installed apps, operate on the real local machine session unless the project definition explicitly says sandbox.\n"
+                "End with `FINAL REPORT:` containing only the user-facing result, artifacts, blockers, and next decision.\n"
+            )
+        )
+        claude_md = str(
+            bundle.get("claude_md")
+            or (
+                "Claude host worker context. Use bypass permission mode only for this GlassHive workspace.\n"
+                "For host browser/desktop tasks, check local automation paths before reporting unavailable. End with `FINAL REPORT:`.\n"
+            )
+        )
+        codex_md = str(
+            bundle.get("codex_md")
+            or (
+                "Codex host worker context. Use full-access/no-approval mode only for this GlassHive workspace.\n"
+                "For host browser/desktop tasks, check local automation paths before reporting unavailable. End with `FINAL REPORT:`.\n"
+            )
+        )
         for name, content in (
             ("agents.md", agents_md),
             ("AGENTS.md", agents_md),
@@ -1732,6 +1753,7 @@ class HostNativeCliMixin:
         }
 
     def describe_worker(self, worker: dict) -> dict[str, object]:
+        self._materialize_workspace(worker, self._host_workspace_dir(worker))
         info = self.reconcile_worker(worker)
         return {
             "mode": "host-computer",

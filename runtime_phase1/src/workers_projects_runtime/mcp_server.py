@@ -7,10 +7,11 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from .runtime_env import load_viventium_runtime_env
 
@@ -45,6 +46,35 @@ HEADER_REQUEST_ATTACHMENTS = "x-viventium-request-attachments"
 HEADER_TOOL_RESOURCES = "x-viventium-tool-resources"
 HEADER_FILE_IDS = "x-viventium-file-ids"
 
+ExecutionModeParam = Annotated[
+    Literal["docker", "host"] | None,
+    Field(
+        description=(
+            "Execution surface. Use 'host' for the user's real computer/session: local browser profile, "
+            "desktop apps, local files/projects, installed CLIs, or OS tools. Use 'docker' for isolated "
+            "sandbox/disposable/risky work. Omit only when the configured default is correct."
+        )
+    ),
+]
+ProfileParam = Annotated[
+    str,
+    Field(
+        description=(
+            "Worker CLI profile. Prefer 'codex-cli' for host browser/desktop/file/code execution when "
+            "Codex is installed, 'claude-code' when Claude is explicitly requested, and "
+            "'openclaw-general' only when OpenClaw is installed or explicitly requested."
+        )
+    ),
+]
+BackendParam = Annotated[
+    str,
+    Field(description="Worker backend. Current GlassHive workers use 'openclaw'."),
+]
+DesktopActionParam = Annotated[
+    Literal["terminal", "files", "browser", "focus_browser", "codex", "claude", "openclaw"],
+    Field(description="Worker surface/action to open or focus for takeover/visibility."),
+]
+
 
 def _default_execution_mode() -> str:
     if not _host_workers_enabled():
@@ -61,7 +91,7 @@ def _host_workers_enabled() -> bool:
 def _resolve_execution_mode(value: str | None) -> str:
     mode = str(value or "").strip().lower()
     if not mode:
-        mode = "docker"
+        mode = _default_execution_mode()
     if mode not in {"docker", "host"}:
         raise ValueError("execution_mode must be either 'docker' or 'host'")
     if mode == "host" and not _host_workers_enabled():
@@ -458,7 +488,7 @@ def create_mcp_server(
 ) -> FastMCP:
     client = api_client or WorkersProjectsApiClient(base_url=base_url)
     host_instruction = (
-        "Set execution_mode='host' only when the user explicitly wants the worker to operate on the main computer. "
+        "Set execution_mode='host' when the task depends on the user's real computer/session: logged-in browser profile, desktop apps, local files/projects, installed CLIs, or OS/window control. "
         if _host_workers_enabled()
         else "Host-native workers are disabled by Viventium config; do not request execution_mode='host'. "
     )
@@ -466,8 +496,9 @@ def create_mcp_server(
         name="glass-hive",
         instructions=(
             "Use this server to manage persistent projects, resumable workers, workstation sandboxes, and host-native workers in Glass Hive. "
-            "When execution_mode is omitted, MCP worker tools use 'docker'. "
+            f"When execution_mode is omitted, MCP worker tools use the configured default '{_default_execution_mode()}'. "
             f"{host_instruction}"
+            "Prefer codex-cli for available host browser/desktop/file/code execution, claude-code when Claude is explicitly requested, and openclaw-general only when installed or explicitly requested. "
             "Read status before mutating when possible. Use worker_takeover or worker_desktop_action before risky browser "
             "or desktop actions so a human can intervene."
         ),
@@ -525,7 +556,8 @@ def create_mcp_server(
         title="Create Worker",
         description=(
             "Create a new worker in an existing project. Optionally pass bootstrap_profile and "
-            "bootstrap_bundle_json to seed auth, MCP config, instructions, env, and project files."
+            "bootstrap_bundle_json to seed auth, MCP config, instructions, env, and project files. "
+            "Use execution_mode='host' for the user's real computer/session and 'docker' for isolated work."
         ),
         structured_output=True,
     )
@@ -534,9 +566,9 @@ def create_mcp_server(
         name: str,
         role: str,
         owner_id: str | None = None,
-        profile: str = "openclaw-general",
-        backend: str = "openclaw",
-        execution_mode: str | None = None,
+        profile: ProfileParam = "openclaw-general",
+        backend: BackendParam = "openclaw",
+        execution_mode: ExecutionModeParam = None,
         alias: str | None = None,
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
@@ -566,7 +598,8 @@ def create_mcp_server(
         title="Find Or Resume Worker",
         description=(
             "Find an existing non-terminated worker by alias for a project/owner, or create one. "
-            "Use execution_mode='host' for host-native workers on the user's main computer only when host-native workers are enabled."
+            "Use execution_mode='host' for tasks on the user's real computer/session: signed-in browser profile, desktop apps, local files/projects, installed CLIs, or OS/window control. "
+            "Use execution_mode='docker' for isolated sandbox, disposable browser, or risky untrusted work."
         ),
         structured_output=True,
     )
@@ -576,9 +609,9 @@ def create_mcp_server(
         role: str,
         alias: str,
         owner_id: str | None = None,
-        profile: str = "openclaw-general",
-        backend: str = "openclaw",
-        execution_mode: str | None = None,
+        profile: ProfileParam = "openclaw-general",
+        backend: BackendParam = "openclaw",
+        execution_mode: ExecutionModeParam = None,
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
         bootstrap_bundle_json: str | None = None,
@@ -640,7 +673,7 @@ def create_mcp_server(
         description="Launch a worker surface such as terminal, files, browser, codex, claude, or openclaw inside a sandbox or on the host computer.",
         structured_output=True,
     )
-    def worker_desktop_action(worker_id: str, action: str, url: str | None = None) -> dict[str, Any]:
+    def worker_desktop_action(worker_id: str, action: DesktopActionParam, url: str | None = None) -> dict[str, Any]:
         return client.desktop_action(worker_id, action, url=url)
 
     @server.tool(
