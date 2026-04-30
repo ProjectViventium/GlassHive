@@ -1145,6 +1145,18 @@ class HostNativeCliMixin:
     execution_mode = "host"
     worker_root_name = "host_cli_runtime"
     _host_active_worker_id: str | None = None
+    _completion_contract = (
+        "GlassHive completion contract:\n"
+        "- Do the requested work before reporting completion.\n"
+        "- Your final assistant message MUST end with a separate section exactly named `FINAL REPORT:`.\n"
+        "- Put only the user-facing result after `FINAL REPORT:`. Include the concrete outcome, key facts, artifact/file names when useful, blockers, or the next decision needed.\n"
+        "- If the user requested a very short answer or an exact string, put only that answer after `FINAL REPORT:`.\n"
+        "- Do not put progress narration after `FINAL REPORT:`."
+    )
+
+    def _instruction_with_completion_contract(self, instruction: str) -> str:
+        body = str(instruction or "").strip()
+        return f"{body}\n\n{self._completion_contract}" if body else self._completion_contract
 
     def _agent_type(self) -> str:
         if self.runtime_name == "codex-cli":
@@ -1807,7 +1819,7 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
             command.append("--full-auto")
         if is_resume:
             command.append(existing_session)
-        command.append(instruction)
+        command.append(self._instruction_with_completion_contract(instruction))
         return command, self._host_env(worker)
 
 
@@ -1830,7 +1842,7 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
         ]
         if session_key and not session_key.startswith("claude-worker:"):
             command.extend(["--resume", session_key])
-        command.append(instruction)
+        command.append(self._instruction_with_completion_contract(instruction))
         env = self._host_env(worker)
         use_api_key = os.environ.get("WPR_CLAUDE_CODE_USE_API_KEY", "0").strip().lower() in {"1", "true", "yes", "on"}
         if not use_api_key:
@@ -1886,6 +1898,6 @@ class HostOpenClawRuntime(HostNativeCliMixin, OpenClawWorkstationRuntime):
             "--session-id",
             session_id,
             "-m",
-            instruction,
+            self._instruction_with_completion_contract(instruction),
             "--json",
         ], env

@@ -11,7 +11,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread
 
 import httpx
 
@@ -63,8 +63,17 @@ def terminal_callback_message(output_text: str, *, fallback: str = "Run complete
         return fallback
 
     marker_matches = list(FINAL_REPORT_PATTERN.finditer(text))
+    has_final_report = bool(marker_matches)
     if marker_matches:
         text = text[marker_matches[-1].end() :].strip()
+
+    if not has_final_report:
+        paragraphs = [paragraph.strip() for paragraph in text.split("\n\n") if paragraph.strip()]
+        if len(paragraphs) > 1 and len(paragraphs[-1]) <= TERMINAL_CALLBACK_MESSAGE_LIMIT:
+            return paragraphs[-1]
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) > 1 and len(lines[-1]) <= min(1000, TERMINAL_CALLBACK_MESSAGE_LIMIT):
+            return lines[-1]
 
     if len(text) <= TERMINAL_CALLBACK_MESSAGE_LIMIT:
         return text or fallback
@@ -102,13 +111,21 @@ class WorkersProjectsService:
         self.store = store
         self.runtime = runtime
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="wpr-runner")
+        self._shutdown_event = Event()
         self._processors_lock = Lock()
         self._active_processors: set[str] = set()
         self._processor_generations: dict[str, int] = {}
         self.reconcile_all_workers()
         self.executor.submit(self._replay_pending_callbacks)
+        self._callback_retry_thread = Thread(
+            target=self._callback_retry_loop,
+            name="wpr-callback-retry",
+            daemon=True,
+        )
+        self._callback_retry_thread.start()
 
     def shutdown(self) -> None:
+        self._shutdown_event.set()
         self.executor.shutdown(wait=False, cancel_futures=False)
 
     def _callback_config_for(self, worker: dict) -> dict:
@@ -240,6 +257,16 @@ class WorkersProjectsService:
                 continue
             callbacks = self._callback_config_for(worker)
             self._deliver_callback_record(worker, record, callbacks)
+
+    def _callback_retry_loop(self) -> None:
+        interval = _bounded_int_env(
+            "GLASSHIVE_CALLBACK_RETRY_INTERVAL_S",
+            30,
+            min_value=1,
+            max_value=3600,
+        )
+        while not self._shutdown_event.wait(interval):
+            self._replay_pending_callbacks()
 
     def _ensure_execution_allowed(self, worker_or_mode: dict | str) -> None:
         execution_mode = (

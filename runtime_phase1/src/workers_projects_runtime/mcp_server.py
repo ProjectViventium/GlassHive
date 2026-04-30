@@ -74,6 +74,17 @@ DesktopActionParam = Annotated[
     Literal["terminal", "files", "browser", "focus_browser", "codex", "claude", "openclaw"],
     Field(description="Worker surface/action to open or focus for takeover/visibility."),
 ]
+BootstrapBundleParam = Annotated[
+    str | dict[str, Any] | None,
+    Field(
+        description=(
+            "Optional bootstrap bundle as either a JSON string or structured object. Use it to seed "
+            "project_definition, prompt files, MCP config, env, and workspace files. For convenience, "
+            "files may be either a list of file entries or an object mapping relative paths to content, "
+            "for example {'project-definition.md': '# Task'}."
+        )
+    ),
+]
 
 
 def _default_execution_mode() -> str:
@@ -271,6 +282,84 @@ def _merge_bundle_files(existing: Any, projected: list[dict[str, Any]]) -> list[
     return files
 
 
+def _safe_text_content(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, indent=2, sort_keys=True) + "\n"
+    return str(value)
+
+
+def _coerce_bundle_file_entries(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, dict):
+        return []
+    if any(key in value for key in ("path", "content", "source_path", "local_path", "upload_path", "absolute_path", "filepath")):
+        return [value]
+    entries: list[dict[str, Any]] = []
+    for raw_path, raw_entry in value.items():
+        path = str(raw_path or "").strip().lstrip("/")
+        if not path:
+            continue
+        if isinstance(raw_entry, dict):
+            entry = dict(raw_entry)
+            entry.setdefault("scope", "workspace")
+            entry.setdefault("path", path)
+        else:
+            entry = {"scope": "workspace", "path": path, "content": _safe_text_content(raw_entry)}
+        entries.append(entry)
+    return entries
+
+
+def _normalize_bootstrap_bundle(value: Any) -> dict[str, Any] | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        parsed = json.loads(stripped)
+    elif isinstance(value, dict):
+        parsed = dict(value)
+    else:
+        raise ValueError("bootstrap_bundle_json must be a JSON object or JSON string")
+    if not isinstance(parsed, dict):
+        raise ValueError("bootstrap_bundle_json must decode to a JSON object")
+
+    files = _coerce_bundle_file_entries(parsed.get("files"))
+    if "files" in parsed:
+        parsed["files"] = files
+    if files:
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path") or "").strip().lstrip("/").lower()
+            if path in {"project-definition.md", "project_definition.md"} and "project_definition" not in parsed:
+                parsed["project_definition"] = _safe_text_content(entry.get("content"))
+                break
+    return parsed
+
+
+def _slugify_alias(*parts: str) -> str:
+    raw = "-".join(part for part in parts if str(part or "").strip())
+    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    return slug[:80] or "glasshive-task"
+
+
+def _default_project_definition(*, title: str, goal: str, instruction: str) -> str:
+    sections = [f"# {title.strip() or 'GlassHive Task'}"]
+    clean_goal = goal.strip()
+    clean_instruction = instruction.strip()
+    if clean_goal:
+        sections.extend(["", clean_goal])
+    if clean_instruction and clean_instruction != clean_goal:
+        sections.extend(["", "## Task", "", clean_instruction])
+    return "\n".join(sections).strip() + "\n"
+
+
 def _merge_request_context(bundle: dict[str, Any] | None) -> dict[str, Any] | None:
     load_viventium_runtime_env()
     headers = _request_headers()
@@ -319,6 +408,21 @@ def _merge_request_context(bundle: dict[str, Any] | None) -> dict[str, Any] | No
         if projected:
             merged["files"] = _merge_bundle_files(merged.get("files"), projected)
     return merged
+
+
+def _callback_missing_fields(bundle: dict[str, Any] | None) -> list[str]:
+    callbacks = bundle.get("callbacks") if isinstance(bundle, dict) else None
+    if not isinstance(callbacks, dict):
+        callbacks = {}
+    required = {
+        "events_webhook_url": callbacks.get("events_webhook_url") or callbacks.get("url"),
+        "hmac_secret": callbacks.get("hmac_secret") or callbacks.get("secret"),
+        "user_id": callbacks.get("user_id"),
+        "conversation_id": callbacks.get("conversation_id"),
+        "parent_message_id": callbacks.get("parent_message_id"),
+        "message_id": callbacks.get("message_id"),
+    }
+    return [key for key, value in required.items() if not str(value or "").strip()]
 
 
 @dataclass
@@ -498,7 +602,12 @@ def create_mcp_server(
             "Use this server to manage persistent projects, resumable workers, workstation sandboxes, and host-native workers in Glass Hive. "
             f"When execution_mode is omitted, MCP worker tools use the configured default '{_default_execution_mode()}'. "
             f"{host_instruction}"
+            "If the user asks to open, navigate, click, type, inspect, or read from a real browser/desktop/local app, dispatch the action through a worker instead of answering from memory or inference. "
             "Prefer codex-cli for available host browser/desktop/file/code execution, claude-code when Claude is explicitly requested, and openclaw-general only when installed or explicitly requested. "
+            "For fresh one-off host/browser/desktop/local tasks, prefer worker_delegate_once instead of manually listing projects and chaining low-level project/worker tools. "
+            "When worker_delegate_once returns callback_ready=true, do not immediately call worker_live or run_get in the same chat turn unless the user explicitly asked for diagnostics or live status; acknowledge briefly and let the callback deliver completion or blockers. "
+            "Preserve the user's success condition and output constraints in worker instructions; if the user asks for a short or exact answer, do not add screenshots, logs, IDs, artifact paths, or extra evidence to the user-visible final result unless needed to explain a blocker. "
+            "If acknowledging delegation to the user, use a short outcome-focused status and avoid worker/run/provider/queue jargon unless diagnostics were requested. "
             "Read status before mutating when possible. Use worker_takeover or worker_desktop_action before risky browser "
             "or desktop actions so a human can intervene."
         ),
@@ -510,7 +619,10 @@ def create_mcp_server(
     @server.tool(
         name="projects_list",
         title="List Projects",
-        description="List current projects from the standalone Workers & Projects runtime. Optionally filter by owner_id.",
+        description=(
+            "List current projects from the standalone Workers & Projects runtime. Use for explicit status, audit, or resume requests. "
+            "For a fresh delegation, prefer worker_delegate_once instead of listing every project or chaining low-level tools."
+        ),
         structured_output=True,
     )
     def projects_list(owner_id: str | None = None) -> list[dict[str, Any]]:
@@ -539,6 +651,121 @@ def create_mcp_server(
     def project_get(project_id: str) -> dict[str, Any]:
         return client.get_project(project_id)
 
+    @server.tool(
+        name="worker_delegate_once",
+        title="Delegate Task",
+        description=(
+            "One-call fresh-task delegation for GlassHive. Use this for new host/browser/desktop/local-file tasks "
+            "instead of manually listing projects and chaining project_create, worker_create, and worker_run. "
+            "It creates a human-named project when project_id is omitted, finds or resumes a worker by alias, "
+            "merges callback/upload context, queues the run, and returns one clean dispatch result. "
+            "When callback_ready=true, use the returned user_status and stop the chat turn; do not immediately call worker_live or run_get unless the user explicitly asked for diagnostics or live status. "
+            "Preserve the user's requested final-answer format in the instruction, especially short/exact-answer constraints. "
+            "Use execution_mode='host' for the user's real computer/session and 'docker' for isolated work. "
+            "Set expose_diagnostics=true only when the user explicitly asked for run/project/worker diagnostics."
+        ),
+        structured_output=True,
+    )
+    def worker_delegate_once(
+        title: str,
+        instruction: str,
+        goal: str | None = None,
+        project_id: str | None = None,
+        owner_id: str | None = None,
+        worker_name: str | None = None,
+        worker_role: str | None = None,
+        alias: str | None = None,
+        profile: ProfileParam = "codex-cli",
+        backend: BackendParam = "openclaw",
+        execution_mode: ExecutionModeParam = None,
+        workspace_root: str | None = None,
+        bootstrap_profile: str | None = None,
+        bootstrap_bundle_json: BootstrapBundleParam = None,
+        require_callback: bool = True,
+        expose_diagnostics: bool = False,
+    ) -> dict[str, Any]:
+        resolved_owner_id = _request_owner_id(owner_id)
+        resolved_execution_mode = _resolve_execution_mode(execution_mode)
+        clean_title = title.strip() or "GlassHive task"
+        clean_goal = (goal or instruction).strip()
+        clean_instruction = instruction.strip()
+        if not clean_instruction:
+            raise ValueError("instruction is required")
+
+        bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json) or {}
+        bundle.setdefault(
+            "project_definition",
+            _default_project_definition(title=clean_title, goal=clean_goal, instruction=clean_instruction),
+        )
+        bundle = _merge_request_context(bundle)
+        missing_callback_fields = _callback_missing_fields(bundle)
+        callback_ready = not missing_callback_fields
+        if require_callback and not callback_ready:
+            return {
+                "status": "blocked",
+                "user_status": (
+                    "I can't start that as background work yet because I do not have a reliable way "
+                    "to send the result back here."
+                ),
+                "execution_mode": resolved_execution_mode,
+                "profile": profile,
+                "alias": (alias or _slugify_alias(profile, clean_title)).strip(),
+                "callback_ready": False,
+                "missing_callback_fields": missing_callback_fields,
+            }
+
+        project = client.get_project(project_id) if project_id else client.create_project(
+            owner_id=resolved_owner_id,
+            title=clean_title,
+            goal=clean_goal,
+            default_worker_profile=profile,
+        )
+        resolved_project_id = str(project.get("project_id") or project_id or "").strip()
+        if not resolved_project_id:
+            raise ValueError("GlassHive project creation did not return project_id")
+
+        resolved_alias = (alias or _slugify_alias(profile, clean_title)).strip()
+        worker = client.find_or_resume_worker(
+            project_id=resolved_project_id,
+            owner_id=resolved_owner_id,
+            name=(worker_name or clean_title).strip(),
+            role=(worker_role or clean_goal or clean_instruction).strip(),
+            alias=resolved_alias,
+            profile=profile,
+            backend=backend,
+            execution_mode=resolved_execution_mode,
+            workspace_root=workspace_root,
+            bootstrap_profile=bootstrap_profile,
+            bootstrap_bundle=bundle,
+        )
+        worker_id = str(worker.get("worker_id") or "").strip()
+        if not worker_id:
+            raise ValueError("GlassHive worker create/resume did not return worker_id")
+
+        run = client.assign_run(worker_id, clean_instruction)
+        result: dict[str, Any] = {
+            "status": "dispatched",
+            "user_status": "On it - working on that now. I'll send the result here.",
+            "main_agent_next_action": (
+                "Send user_status and stop this chat turn. Do not call worker_live or run_get unless "
+                "the user explicitly asked for diagnostics/live status, or callback_ready is false."
+            ),
+            "callback_ready": callback_ready,
+        }
+        if expose_diagnostics:
+            result.update(
+                {
+                    "project_id": resolved_project_id,
+                    "worker_id": worker_id,
+                    "run_id": run.get("run_id"),
+                    "run_state": run.get("state"),
+                    "execution_mode": resolved_execution_mode,
+                    "profile": profile,
+                    "alias": resolved_alias,
+                }
+            )
+        return result
+
     @server.tool(name="project_runs", title="Project Runs", description="List recent runs for a project.", structured_output=True)
     def project_runs(project_id: str) -> list[dict[str, Any]]:
         return client.list_project_runs(project_id)
@@ -556,7 +783,7 @@ def create_mcp_server(
         title="Create Worker",
         description=(
             "Create a new worker in an existing project. Optionally pass bootstrap_profile and "
-            "bootstrap_bundle_json to seed auth, MCP config, instructions, env, and project files. "
+            "bootstrap_bundle_json as a JSON string or object to seed auth, MCP config, instructions, env, and project files. "
             "Use execution_mode='host' for the user's real computer/session and 'docker' for isolated work."
         ),
         structured_output=True,
@@ -572,11 +799,9 @@ def create_mcp_server(
         alias: str | None = None,
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
-        bootstrap_bundle_json: str | None = None,
+        bootstrap_bundle_json: BootstrapBundleParam = None,
     ) -> dict[str, Any]:
-        parsed_bundle: dict[str, Any] | None = None
-        if bootstrap_bundle_json:
-            parsed_bundle = json.loads(bootstrap_bundle_json)
+        parsed_bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json)
         parsed_bundle = _merge_request_context(parsed_bundle)
         resolved_execution_mode = _resolve_execution_mode(execution_mode)
         return client.create_worker(
@@ -599,7 +824,8 @@ def create_mcp_server(
         description=(
             "Find an existing non-terminated worker by alias for a project/owner, or create one. "
             "Use execution_mode='host' for tasks on the user's real computer/session: signed-in browser profile, desktop apps, local files/projects, installed CLIs, or OS/window control. "
-            "Use execution_mode='docker' for isolated sandbox, disposable browser, or risky untrusted work."
+            "Use execution_mode='docker' for isolated sandbox, disposable browser, or risky untrusted work. "
+            "bootstrap_bundle_json may be a JSON string or object."
         ),
         structured_output=True,
     )
@@ -614,11 +840,9 @@ def create_mcp_server(
         execution_mode: ExecutionModeParam = None,
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
-        bootstrap_bundle_json: str | None = None,
+        bootstrap_bundle_json: BootstrapBundleParam = None,
     ) -> dict[str, Any]:
-        parsed_bundle: dict[str, Any] | None = None
-        if bootstrap_bundle_json:
-            parsed_bundle = json.loads(bootstrap_bundle_json)
+        parsed_bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json)
         parsed_bundle = _merge_request_context(parsed_bundle)
         resolved_execution_mode = _resolve_execution_mode(execution_mode)
         return client.find_or_resume_worker(

@@ -101,6 +101,18 @@ def test_terminal_callback_message_prefers_concise_final_line_without_marker():
     assert terminal_callback_message(output, fallback="Done") == "Example Domain"
 
 
+def test_terminal_callback_message_prefers_final_line_for_short_markerless_progress():
+    output = "\n".join(
+        [
+            "Using the host browser and checking the page.",
+            "Chrome is loaded; updating the work log.",
+            "Viventium",
+        ]
+    )
+
+    assert terminal_callback_message(output, fallback="Done") == "Viventium"
+
+
 def test_terminal_callback_message_respects_visible_budget_with_prefix():
     output = "\n\n".join(
         [

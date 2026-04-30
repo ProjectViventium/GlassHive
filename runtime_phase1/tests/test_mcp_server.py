@@ -116,11 +116,43 @@ class FakeApiClient:
         return {"projects": 1, "workers": 1, "runs": 2, "queued_runs": 0, "active_runs": 0, "events": 3}
 
 
+class TrackingApiClient(FakeApiClient):
+    def __init__(self):
+        self.calls: list[str] = []
+        self.find_or_resume_payloads: list[dict] = []
+
+    def list_projects(self, owner_id: str | None = None):
+        self.calls.append("list_projects")
+        return super().list_projects(owner_id)
+
+    def create_project(self, **kwargs):
+        self.calls.append("create_project")
+        return super().create_project(**kwargs)
+
+    def find_or_resume_worker(self, **kwargs):
+        self.calls.append("find_or_resume_worker")
+        self.find_or_resume_payloads.append(kwargs)
+        return super().find_or_resume_worker(**kwargs)
+
+    def assign_run(self, worker_id: str, instruction: str):
+        self.calls.append("assign_run")
+        return super().assign_run(worker_id, instruction)
+
+
 def _tool_json(result) -> object:
     if result.structured_content is not None:
         return result.structured_content
     assert result.content, "Expected text content from MCP tool call"
     return json.loads(result.content[0].text)
+
+
+def _callback_headers() -> dict[str, str]:
+    return {
+        "X-Viventium-User-Id": "user_public_safe",
+        "X-Viventium-Conversation-Id": "conv_public_safe",
+        "X-Viventium-Parent-Message-Id": "user_msg_public_safe",
+        "X-Viventium-Message-Id": "assistant_msg_public_safe",
+    }
 
 
 def test_mcp_server_exposes_tools_and_resources():
@@ -131,6 +163,7 @@ def test_mcp_server_exposes_tools_and_resources():
             tools = await client.list_tools()
             tool_names = {tool.name for tool in tools}
             assert "project_create" in tool_names
+            assert "worker_delegate_once" in tool_names
             assert "worker_takeover" in tool_names
             assert "worker_find_or_resume" in tool_names
 
@@ -170,6 +203,152 @@ def test_mcp_server_exposes_tools_and_resources():
     asyncio.run(scenario())
 
 
+def test_worker_delegate_once_creates_resumes_and_runs_without_listing(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", "http://127.0.0.1:3180/api/viventium/glasshive/callback")
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "public-safe-test-secret")
+    monkeypatch.setattr(mcp_server, "get_http_headers", _callback_headers)
+    api_client = TrackingApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "owner_id": "demo-owner",
+                    "title": "Host Page Title QA",
+                    "goal": "Open a local page and report the title.",
+                    "instruction": "Open the local QA page and reply with the page title.",
+                    "profile": "codex-cli",
+                    "execution_mode": "host",
+                    "bootstrap_bundle_json": {
+                        "files": {
+                            "project-definition.md": "# Host Page Title QA\n\nReport the page title.\n",
+                        }
+                    },
+                },
+            )
+            payload = _tool_json(delegated)
+            assert payload["status"] == "dispatched"
+            assert payload["callback_ready"] is True
+            assert "Do not call worker_live" in payload["main_agent_next_action"]
+            assert "project_id" not in payload
+            assert "worker_id" not in payload
+            assert "run_id" not in payload
+            assert "alias" not in payload
+
+    asyncio.run(scenario())
+    assert api_client.calls == ["create_project", "find_or_resume_worker", "assign_run"]
+
+
+def test_worker_delegate_once_exposes_diagnostics_only_when_requested(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", "http://127.0.0.1:3180/api/viventium/glasshive/callback")
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "public-safe-test-secret")
+    monkeypatch.setattr(mcp_server, "get_http_headers", _callback_headers)
+    server = create_mcp_server(api_client=TrackingApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "owner_id": "demo-owner",
+                    "title": "Diagnostic host task",
+                    "instruction": "Run a diagnostic host task.",
+                    "profile": "codex-cli",
+                    "execution_mode": "host",
+                    "expose_diagnostics": True,
+                },
+            )
+            payload = _tool_json(delegated)
+            assert payload["project_id"] == "prj_new"
+            assert payload["worker_id"] == "wrk_resumed"
+            assert payload["run_id"] == "run_assign"
+            assert payload["execution_mode"] == "host"
+            assert payload["alias"] == "codex-cli-diagnostic-host-task"
+
+    asyncio.run(scenario())
+
+
+def test_worker_delegate_once_requires_callback_context_by_default(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", raising=False)
+    monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", raising=False)
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    api_client = TrackingApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "owner_id": "demo-owner",
+                    "title": "Host Page Title QA",
+                    "instruction": "Open the local QA page and reply with the page title.",
+                    "profile": "codex-cli",
+                    "execution_mode": "host",
+                },
+            )
+            payload = _tool_json(delegated)
+            assert payload["status"] == "blocked"
+            assert payload["callback_ready"] is False
+            assert "conversation_id" in payload["missing_callback_fields"]
+
+    asyncio.run(scenario())
+    assert api_client.calls == []
+
+
+def test_worker_delegate_once_merges_upload_headers(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", "http://127.0.0.1:3180/api/viventium/glasshive/callback")
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "public-safe-test-secret")
+    files = [
+        {
+            "file_id": "file-999",
+            "filename": "brief.txt",
+            "text": "Synthetic upload brief.",
+            "source": "local",
+            "context": "message_attachment",
+        }
+    ]
+    encoded_files = "b64:" + base64.b64encode(json.dumps(files).encode()).decode()
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            **_callback_headers(),
+            "X-Viventium-Request-Files": encoded_files,
+        },
+    )
+    api_client = TrackingApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "owner_id": "demo-owner",
+                    "title": "Host File QA",
+                    "instruction": "Read the attached brief and summarize it.",
+                    "profile": "codex-cli",
+                    "execution_mode": "host",
+                },
+            )
+            payload = _tool_json(delegated)
+            assert payload["status"] == "dispatched"
+
+    asyncio.run(scenario())
+    worker_payload = api_client.find_or_resume_payloads[0]
+    bundle = worker_payload["bootstrap_bundle"]
+    assert bundle["project_definition"].startswith("# Host File QA")
+    assert bundle["files"][0]["path"] == "uploads/brief.txt"
+    assert bundle["files"][0]["content"] == "Synthetic upload brief."
+
+
 def test_worker_tools_use_configured_default_execution_mode(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
     server = create_mcp_server(api_client=FakeApiClient())
@@ -193,6 +372,166 @@ def test_worker_tools_use_configured_default_execution_mode(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_worker_create_accepts_structured_bootstrap_bundle_files_mapping(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    server = create_mcp_server(api_client=FakeApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            worker = await client.call_tool(
+                "worker_create",
+                {
+                    "project_id": "prj_new",
+                    "owner_id": "demo-owner",
+                    "name": "Host Browser QA",
+                    "role": "Open a host browser and report the page title.",
+                    "profile": "codex-cli",
+                    "execution_mode": "host",
+                    "bootstrap_bundle_json": {
+                        "files": {
+                            "project-definition.md": "# Host Browser QA\n\nOpen a local page and report the title.\n",
+                            "notes/context.md": "Synthetic QA context.\n",
+                        }
+                    },
+                },
+            )
+            worker_payload = _tool_json(worker)
+            bundle = worker_payload["bootstrap_bundle"]
+            assert bundle["project_definition"] == "# Host Browser QA\n\nOpen a local page and report the title.\n"
+            assert bundle["files"] == [
+                {
+                    "scope": "workspace",
+                    "path": "project-definition.md",
+                    "content": "# Host Browser QA\n\nOpen a local page and report the title.\n",
+                },
+                {
+                    "scope": "workspace",
+                    "path": "notes/context.md",
+                    "content": "Synthetic QA context.\n",
+                },
+            ]
+
+    asyncio.run(scenario())
+
+
+def test_worker_create_merges_structured_bootstrap_bundle_with_upload_headers(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    files = [
+        {
+            "file_id": "file-789",
+            "filename": "brief.txt",
+            "text": "Synthetic upload brief.",
+            "source": "local",
+            "context": "message_attachment",
+        }
+    ]
+    encoded_files = "b64:" + base64.b64encode(json.dumps(files).encode()).decode()
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Request-Files": encoded_files,
+        },
+    )
+    server = create_mcp_server(api_client=FakeApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            worker = await client.call_tool(
+                "worker_create",
+                {
+                    "project_id": "prj_new",
+                    "owner_id": "demo-owner",
+                    "name": "Host File QA",
+                    "role": "Read the uploaded brief on the host worker.",
+                    "profile": "codex-cli",
+                    "execution_mode": "host",
+                    "bootstrap_bundle_json": {
+                        "files": {
+                            "project-definition.md": "# Host File QA\n\nRead the attached brief.\n",
+                        }
+                    },
+                },
+            )
+            worker_payload = _tool_json(worker)
+            bundle = worker_payload["bootstrap_bundle"]
+            assert bundle["project_definition"] == "# Host File QA\n\nRead the attached brief.\n"
+            paths = [item["path"] for item in bundle["files"]]
+            assert paths == ["project-definition.md", "uploads/brief.txt"]
+            assert bundle["files"][1]["content"] == "Synthetic upload brief."
+
+    asyncio.run(scenario())
+
+
+def test_worker_find_or_resume_keeps_json_string_bootstrap_bundle(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    server = create_mcp_server(api_client=FakeApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            worker = await client.call_tool(
+                "worker_find_or_resume",
+                {
+                    "project_id": "prj_new",
+                    "owner_id": "demo-owner",
+                    "name": "Host Browser QA",
+                    "role": "Open a host browser and report the page title.",
+                    "alias": "host-browser-qa",
+                    "profile": "codex-cli",
+                    "execution_mode": "host",
+                    "bootstrap_bundle_json": json.dumps(
+                        {
+                            "project_definition": "Open a local page and report the title.",
+                            "files": [{"scope": "workspace", "path": "notes/context.md", "content": "QA context.\n"}],
+                        }
+                    ),
+                },
+            )
+            worker_payload = _tool_json(worker)
+            bundle = worker_payload["bootstrap_bundle"]
+            assert bundle["project_definition"] == "Open a local page and report the title."
+            assert bundle["files"][0]["path"] == "notes/context.md"
+
+    asyncio.run(scenario())
+
+
+def test_worker_find_or_resume_accepts_structured_bootstrap_bundle(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    server = create_mcp_server(api_client=FakeApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            worker = await client.call_tool(
+                "worker_find_or_resume",
+                {
+                    "project_id": "prj_new",
+                    "owner_id": "demo-owner",
+                    "name": "Host Browser QA",
+                    "role": "Open a host browser and report the page title.",
+                    "alias": "host-browser-qa",
+                    "profile": "codex-cli",
+                    "execution_mode": "host",
+                    "bootstrap_bundle_json": {
+                        "files": {
+                            "project-definition.md": "# Host Browser QA\n\nReport the page title.\n",
+                        }
+                    },
+                },
+            )
+            worker_payload = _tool_json(worker)
+            bundle = worker_payload["bootstrap_bundle"]
+            assert bundle["project_definition"] == "# Host Browser QA\n\nReport the page title.\n"
+            assert bundle["files"][0]["path"] == "project-definition.md"
+
+    asyncio.run(scenario())
+
+
+def test_normalize_bootstrap_bundle_ignores_malformed_files_value():
+    bundle = mcp_server._normalize_bootstrap_bundle({"project_definition": "Do the work.", "files": "oops"})
+
+    assert bundle == {"project_definition": "Do the work.", "files": []}
+
+
 def test_worker_tool_schemas_advertise_host_native_execution(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
     server = create_mcp_server(api_client=FakeApiClient())
@@ -212,6 +551,13 @@ def test_worker_tool_schemas_advertise_host_native_execution(monkeypatch):
                 assert execution_schema["anyOf"][0]["enum"] == ["docker", "host"]
                 assert "real computer/session" in execution_schema["description"]
                 assert "codex-cli" in schema["profile"]["description"]
+                bootstrap_schema = schema["bootstrap_bundle_json"]
+                bootstrap_types = {
+                    variant.get("type")
+                    for variant in bootstrap_schema.get("anyOf", [])
+                    if isinstance(variant, dict)
+                }
+                assert {"string", "object", "null"}.issubset(bootstrap_types)
 
             action_schema = desktop_action["inputSchema"]["properties"]["action"]
             assert action_schema["enum"] == [

@@ -362,6 +362,9 @@ def test_host_codex_command_uses_host_workspace_and_dangerous_mode(tmp_path):
     assert str(info.workspace_dir) in command
     assert "danger-full-access" in command
     assert "--dangerously-bypass-approvals-and-sandbox" in command
+    assert command[-1].startswith("do the work")
+    assert "FINAL REPORT:" in command[-1]
+    assert "Put only the user-facing result" in command[-1]
     assert env["GLASSHIVE_EXECUTION_MODE"] == "host"
     assert env["GLASSHIVE_WORKSPACE_DIR"] == str(info.workspace_dir)
 
