@@ -1051,7 +1051,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
                 if text:
                     output_parts.append(text)
         if output_parts:
-            return session_key, "\n".join(output_parts)
+            return session_key, _select_user_facing_agent_output(output_parts)
         fallback = self._extract_plain_output(stdout, stderr)
         return session_key, fallback[-4000:]
 
@@ -1114,7 +1114,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             return info.session_key, raw[-4000:]
         session_key = str(payload.get("session_id") or info.session_key or "").strip() or None
         result = str(payload.get("result") or raw).strip()
-        return session_key, result
+        return session_key, _select_user_facing_agent_output([result]) or result
 
 
 _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -1125,6 +1125,19 @@ _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{256,}"), "[REDACTED_IMAGE_BASE64]"),
     (re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{512,}={0,2}(?![A-Za-z0-9+/=])"), "[REDACTED_LONG_BASE64]"),
 )
+_FINAL_REPORT_PATTERN = re.compile(r"(?m)^[ \t]*FINAL REPORT:\s*")
+
+
+def _select_user_facing_agent_output(output_parts: list[str]) -> str:
+    """Prefer an explicit final report; otherwise use the latest assistant result."""
+    cleaned = [part.strip() for part in output_parts if str(part or "").strip()]
+    if not cleaned:
+        return ""
+    for part in reversed(cleaned):
+        marker_matches = list(_FINAL_REPORT_PATTERN.finditer(part))
+        if marker_matches:
+            return part[marker_matches[-1].end() :].strip()
+    return cleaned[-1]
 
 
 def _redact_text(value: str, max_chars: int | None = None) -> str:
@@ -1707,7 +1720,7 @@ class HostNativeCliMixin:
         session_key, output = self._parse_output(worker, stdout, stderr, info)
         if session_key:
             self._write_session_key(worker["worker_id"], session_key)
-        redacted_output = _redact_text(output.strip(), max_chars=4000)
+        redacted_output = _redact_text(output.strip(), max_chars=16000)
         self._append_work_log(worker, f"Run {effective_run_id} completed.")
         return redacted_output
 

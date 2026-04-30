@@ -608,8 +608,7 @@ def create_mcp_server(
             "When worker_delegate_once returns callback_ready=true, do not immediately call worker_live or run_get in the same chat turn unless the user explicitly asked for diagnostics or live status; acknowledge briefly and let the callback deliver completion or blockers. "
             "Preserve the user's success condition and output constraints in worker instructions; if the user asks for a short or exact answer, do not add screenshots, logs, IDs, artifact paths, or extra evidence to the user-visible final result unless needed to explain a blocker. "
             "If acknowledging delegation to the user, use a short outcome-focused status and avoid worker/run/provider/queue jargon unless diagnostics were requested. "
-            "Read status before mutating when possible. Use worker_takeover or worker_desktop_action before risky browser "
-            "or desktop actions so a human can intervene."
+            "Use worker_takeover or worker_desktop_action for explicit diagnostics, explicit live takeover, or concrete checkpoint/approval moments; do not add them to routine worker_delegate_once handoffs."
         ),
         host=host,
         port=port,
@@ -784,6 +783,7 @@ def create_mcp_server(
         description=(
             "Create a new worker in an existing project. Optionally pass bootstrap_profile and "
             "bootstrap_bundle_json as a JSON string or object to seed auth, MCP config, instructions, env, and project files. "
+            "Use this lower-level tool for explicit orchestration or diagnostics; for a fresh one-off task, prefer worker_delegate_once. "
             "Use execution_mode='host' for the user's real computer/session and 'docker' for isolated work."
         ),
         structured_output=True,
@@ -863,11 +863,27 @@ def create_mcp_server(
     def worker_get(worker_id: str) -> dict[str, Any]:
         return client.get_worker(worker_id)
 
-    @server.tool(name="worker_live", title="Worker Live State", description="Fetch the rich live state for a worker, including runtime details, runs, logs, and artifacts.", structured_output=True)
+    @server.tool(
+        name="worker_live",
+        title="Worker Live State",
+        description=(
+            "Fetch rich live worker diagnostics, including runtime details, runs, logs, and artifacts. "
+            "Use only when the user asks for status/diagnostics or when callback_ready is false; do not poll immediately after worker_delegate_once."
+        ),
+        structured_output=True,
+    )
     def worker_live(worker_id: str) -> dict[str, Any]:
         return client.worker_live(worker_id)
 
-    @server.tool(name="worker_run", title="Queue Worker Run", description="Queue a new instruction for a worker.", structured_output=True)
+    @server.tool(
+        name="worker_run",
+        title="Queue Worker Run",
+        description=(
+            "Queue a new instruction for an existing worker. Use for explicit steering/resume/reuse. "
+            "For fresh one-off host/browser/desktop/local tasks, prefer worker_delegate_once."
+        ),
+        structured_output=True,
+    )
     def worker_run(worker_id: str, instruction: str) -> dict[str, Any]:
         return client.assign_run(worker_id, instruction)
 

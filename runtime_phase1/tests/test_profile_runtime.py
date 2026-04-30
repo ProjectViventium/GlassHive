@@ -71,6 +71,137 @@ def test_collect_completed_run_recovers_from_latest_run_artifacts(tmp_path):
     assert json.loads(runtime._session_meta_path(worker["worker_id"]).read_text())["session_key"] == "thread_123"
 
 
+def test_codex_parser_returns_latest_assistant_result_not_progress_chatter(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_progress",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "thread_progress"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "I am scrolling and checking the page."},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": "The page is loaded. The result is visible.",
+                    },
+                }
+            ),
+        ]
+    )
+
+    session_key, output = runtime._parse_output(worker, stdout, "", runtime._runtime_info(worker))
+
+    assert session_key == "thread_progress"
+    assert output == "The page is loaded. The result is visible."
+
+
+def test_codex_parser_prefers_final_report_section(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_final_report",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "Progress that should never reach chat."},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": "Done.\n\nFINAL REPORT:\nOnly this final result should be posted.",
+                    },
+                }
+            ),
+        ]
+    )
+
+    _, output = runtime._parse_output(worker, stdout, "", runtime._runtime_info(worker))
+
+    assert output == "Only this final result should be posted."
+
+
+def test_codex_parser_accepts_inline_final_report_section(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_inline_final_report",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    stdout = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "Done.\nFINAL REPORT: Only this inline result should be posted.",
+            },
+        }
+    )
+
+    _, output = runtime._parse_output(worker, stdout, "", runtime._runtime_info(worker))
+
+    assert output == "Only this inline result should be posted."
+
+
+def test_codex_parser_ignores_agent_message_after_final_report(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_trailing_after_final_report",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": "Done.\nFINAL REPORT:\nOnly the final answer.",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": "Late progress should not be posted.",
+                    },
+                }
+            ),
+        ]
+    )
+
+    _, output = runtime._parse_output(worker, stdout, "", runtime._runtime_info(worker))
+
+    assert output == "Only the final answer."
+
+
 def test_collect_completed_run_with_explicit_run_id_ignores_previous_finished_run(tmp_path):
     runtime = CodexCliRuntime(base_dir=str(tmp_path))
     worker = {

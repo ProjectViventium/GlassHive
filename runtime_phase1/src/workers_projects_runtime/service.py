@@ -29,7 +29,7 @@ from .store import Store
 
 logger = logging.getLogger(__name__)
 TERMINAL_CALLBACK_MESSAGE_LIMIT = 2400
-FINAL_REPORT_PATTERN = re.compile(r"(?m)^[ \t]*FINAL REPORT:[ \t]*(?:\n|$)")
+FINAL_REPORT_PATTERN = re.compile(r"(?m)^[ \t]*FINAL REPORT:\s*")
 
 
 def _bounded_int_env(name: str, default: int, *, min_value: int, max_value: int) -> int:
@@ -104,6 +104,48 @@ def terminal_callback_message(output_text: str, *, fallback: str = "Run complete
     if " " in tail[:120]:
         tail = tail[tail.find(" ") + 1 :].lstrip()
     return f"{tail_prefix}{tail}" if tail else fallback
+
+
+def _merge_file_entries(existing: object, incoming: object) -> object:
+    if not isinstance(existing, list):
+        return incoming
+    if not isinstance(incoming, list):
+        return existing
+    merged: list[object] = []
+    indexes_by_path: dict[str, int] = {}
+    for item in existing:
+        if isinstance(item, dict):
+            path = str(item.get("path") or "").strip()
+            if path:
+                indexes_by_path[path] = len(merged)
+        merged.append(item)
+    for item in incoming:
+        if isinstance(item, dict):
+            path = str(item.get("path") or "").strip()
+            if path and path in indexes_by_path:
+                merged[indexes_by_path[path]] = item
+                continue
+            if path:
+                indexes_by_path[path] = len(merged)
+        merged.append(item)
+    return merged
+
+
+def merge_bootstrap_bundle(existing: dict | None, incoming: dict | None) -> dict | None:
+    if incoming is None:
+        return existing
+    if existing is None:
+        return dict(incoming)
+    merged = dict(existing)
+    for key, value in incoming.items():
+        current = merged.get(key)
+        if key == "files":
+            merged[key] = _merge_file_entries(current, value)
+        elif isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = merge_bootstrap_bundle(current, value) or {}
+        else:
+            merged[key] = value
+    return merged
 
 
 class WorkersProjectsService:
@@ -392,6 +434,21 @@ class WorkersProjectsService:
         self._ensure_execution_allowed(execution_mode)
         existing = self.store.find_worker_by_alias(project_id, owner_id, alias, execution_mode=execution_mode)
         if existing and existing.get("state") != "terminated":
+            updates: dict[str, object] = {
+                "name": name,
+                "role": role,
+                "profile": profile,
+                "backend": backend,
+            }
+            if workspace_root is not None:
+                updates["workspace_root"] = workspace_root
+            if bootstrap_profile is not None:
+                updates["bootstrap_profile"] = bootstrap_profile
+            if bootstrap_bundle is not None:
+                updates["bootstrap_bundle_json"] = json.dumps(
+                    merge_bootstrap_bundle(self._bootstrap_bundle_for(existing), bootstrap_bundle)
+                )
+            existing = self.store.update_worker(existing["worker_id"], **updates) or existing
             self.store.add_event(
                 project_id,
                 existing["worker_id"],

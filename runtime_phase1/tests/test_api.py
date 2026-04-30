@@ -74,6 +74,12 @@ def test_terminal_callback_message_uses_line_anchored_final_report_marker():
     assert terminal_callback_message(output) == "Captured 42 rows."
 
 
+def test_terminal_callback_message_accepts_inline_final_report_marker():
+    output = "Progress that should not surface.\nFINAL REPORT: Captured 42 rows."
+
+    assert terminal_callback_message(output) == "Captured 42 rows."
+
+
 def test_terminal_callback_message_uses_tail_without_mid_word_fragment():
     output = "\n\n".join(
         [
@@ -875,6 +881,134 @@ def test_worker_find_or_resume_reuses_alias_and_preserves_host_fields(tmp_path):
     assert second.json()["execution_mode"] == "host"
     assert second.json()["alias"] == "codex-main"
     assert second.json()["workspace_root"] == str(tmp_path / "workspaces")
+
+
+def test_worker_find_or_resume_refreshes_callback_bundle_on_alias_reuse(tmp_path, monkeypatch):
+    payloads: list[dict] = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, headers, timeout
+        payloads.append(json.loads(content.decode("utf-8")))
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), max_workers=2)
+    try:
+        project = store.create_project("owner", "Host Workers", "Reuse named host workers.", "codex-cli")
+        original = service.find_or_create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="browser worker",
+            profile="codex-cli",
+            backend="openclaw",
+            alias="codex-main",
+            execution_mode="host",
+            workspace_root=str(tmp_path / "workspaces"),
+            bootstrap_bundle={
+                "mcp_config": {"servers": {"safe-tool": {"url": "http://safe-tool.local/mcp"}}},
+                "instructions_md": "Keep operator-seeded instructions.",
+                "env_overrides": {"SAFE_FLAG": "1"},
+                "files": [{"path": "seed.md", "content": "seed"}],
+                "callbacks": {
+                    "conversation_id": "old-conversation",
+                    "parent_message_id": "old-parent",
+                    "message_id": "old-assistant",
+                }
+            },
+        )
+
+        refreshed = service.find_or_create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="browser worker",
+            profile="codex-cli",
+            backend="openclaw",
+            alias="codex-main",
+            execution_mode="host",
+            workspace_root=str(tmp_path / "workspaces"),
+            bootstrap_bundle={
+                "files": [{"path": "current.md", "content": "current"}],
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                    "conversation_id": "new-conversation",
+                    "parent_message_id": "new-parent",
+                    "message_id": "new-assistant",
+                }
+            },
+        )
+
+        assert refreshed["worker_id"] == original["worker_id"]
+        stored_worker = store.get_worker(refreshed["worker_id"])
+        stored_bundle = json.loads(stored_worker["bootstrap_bundle_json"])
+        assert stored_bundle["callbacks"]["conversation_id"] == "new-conversation"
+        assert stored_bundle["callbacks"]["events_webhook_url"] == "http://callback.local/glasshive"
+        assert stored_bundle["mcp_config"]["servers"]["safe-tool"]["url"] == "http://safe-tool.local/mcp"
+        assert stored_bundle["instructions_md"] == "Keep operator-seeded instructions."
+        assert stored_bundle["env_overrides"]["SAFE_FLAG"] == "1"
+        assert {item["path"] for item in stored_bundle["files"]} == {"seed.md", "current.md"}
+
+        run = service.assign_run(refreshed["worker_id"], "Return the final result to the current chat")
+        wait_until(lambda: (store.get_run(run["run_id"]) or {}).get("state") == "completed")
+        wait_until(lambda: any(payload.get("event") == "run.completed" for payload in payloads))
+
+        completed = next(payload for payload in payloads if payload.get("event") == "run.completed")
+        assert completed["conversation_id"] == "new-conversation"
+        assert completed["parent_message_id"] == "new-parent"
+        assert completed["message_id"] == "new-assistant"
+    finally:
+        service.shutdown()
+
+
+def test_worker_find_or_resume_preserves_bundle_when_no_new_bundle_is_provided(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), max_workers=2)
+    try:
+        project = store.create_project("owner", "Host Workers", "Reuse named host workers.", "codex-cli")
+        original = service.find_or_create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="browser worker",
+            profile="codex-cli",
+            backend="openclaw",
+            alias="codex-main",
+            execution_mode="host",
+            workspace_root=str(tmp_path / "workspaces"),
+            bootstrap_bundle={
+                "mcp_config": {"servers": {"safe-tool": {"url": "http://safe-tool.local/mcp"}}},
+                "callbacks": {"conversation_id": "existing-conversation"},
+            },
+        )
+
+        resumed = service.find_or_create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="browser worker",
+            profile="codex-cli",
+            backend="openclaw",
+            alias="codex-main",
+            execution_mode="host",
+            workspace_root=str(tmp_path / "workspaces"),
+            bootstrap_bundle=None,
+        )
+
+        assert resumed["worker_id"] == original["worker_id"]
+        stored_bundle = json.loads(store.get_worker(resumed["worker_id"])["bootstrap_bundle_json"])
+        assert stored_bundle["mcp_config"]["servers"]["safe-tool"]["url"] == "http://safe-tool.local/mcp"
+        assert stored_bundle["callbacks"]["conversation_id"] == "existing-conversation"
+    finally:
+        service.shutdown()
 
 
 def test_host_worker_disabled_blocks_host_creation_and_run(tmp_path, monkeypatch):
