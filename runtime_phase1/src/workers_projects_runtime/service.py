@@ -57,6 +57,17 @@ def host_workers_enabled() -> bool:
     return value not in {"0", "false", "no", "off", "disabled"}
 
 
+def terminal_callback_full_message(output_text: str, *, fallback: str = "Run completed") -> str:
+    text = str(output_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return fallback
+
+    marker_matches = list(FINAL_REPORT_PATTERN.finditer(text))
+    if marker_matches:
+        text = text[marker_matches[-1].end() :].strip()
+    return text or fallback
+
+
 def terminal_callback_message(output_text: str, *, fallback: str = "Run completed") -> str:
     text = str(output_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
@@ -77,6 +88,9 @@ def terminal_callback_message(output_text: str, *, fallback: str = "Run complete
 
     if len(text) <= TERMINAL_CALLBACK_MESSAGE_LIMIT:
         return text or fallback
+
+    if has_final_report:
+        return f"{text[: TERMINAL_CALLBACK_MESSAGE_LIMIT - 3].rstrip()}..."
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if lines and len(lines[-1]) <= min(1000, TERMINAL_CALLBACK_MESSAGE_LIMIT):
@@ -328,6 +342,7 @@ class WorkersProjectsService:
         *,
         run: dict | None = None,
         message: str = "",
+        full_message: str = "",
     ) -> None:
         callbacks = self._callback_config_for(worker)
         url = str(callbacks.get("events_webhook_url") or callbacks.get("url") or "").strip()
@@ -342,6 +357,7 @@ class WorkersProjectsService:
             "run_id": (run or {}).get("run_id"),
             "run_state": (run or {}).get("state"),
             "message": message,
+            "full_message": full_message,
             "user_id": callbacks.get("user_id"),
             "agent_id": callbacks.get("agent_id"),
             "conversation_id": callbacks.get("conversation_id"),
@@ -697,9 +713,16 @@ class WorkersProjectsService:
             self.store.finalize_run(run["run_id"], state="completed", output_text=output_text)
             self.store.update_worker(worker_id, state="ready", last_error="", last_run_id=run["run_id"])
             message = terminal_callback_message(output_text)
+            full_message = terminal_callback_full_message(output_text)
             self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.completed", message[:TERMINAL_CALLBACK_MESSAGE_LIMIT] or "Run completed")
             recovered_run = {**run, "state": "completed", "output_text": output_text}
-            self._emit_callback(worker, "run.completed", run=recovered_run, message=message or "Run completed")
+            self._emit_callback(
+                worker,
+                "run.completed",
+                run=recovered_run,
+                message=message or "Run completed",
+                full_message=full_message if full_message != message else "",
+            )
             self._refresh_runtime_info(worker_id, state="ready", last_error="")
         else:
             self.store.finalize_run(run["run_id"], state="failed", error_text=error_text)
@@ -929,9 +952,16 @@ class WorkersProjectsService:
                 self.store.finalize_run(run["run_id"], state="completed", output_text=output)
                 self.store.update_worker(worker_id, state="ready", last_error="", last_run_id=run["run_id"])
                 message = terminal_callback_message(output)
+                full_message = terminal_callback_full_message(output)
                 self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.completed", message[:TERMINAL_CALLBACK_MESSAGE_LIMIT] or "Run completed")
                 completed_run = {**run, "state": "completed", "output_text": output}
-                self._emit_callback(worker, "run.completed", run=completed_run, message=message or "Run completed")
+                self._emit_callback(
+                    worker,
+                    "run.completed",
+                    run=completed_run,
+                    message=message or "Run completed",
+                    full_message=full_message if full_message != message else "",
+                )
                 self._refresh_runtime_info(worker_id, state="ready", last_error="")
         finally:
             if not self._release_processor(worker_id, generation):

@@ -18,7 +18,11 @@ from workers_projects_runtime.openclaw_runtime import (
     WorkerPausedError,
     WorkerTerminatedError,
 )
-from workers_projects_runtime.service import WorkersProjectsService, terminal_callback_message
+from workers_projects_runtime.service import (
+    WorkersProjectsService,
+    terminal_callback_full_message,
+    terminal_callback_message,
+)
 from workers_projects_runtime.store import Store
 
 
@@ -133,7 +137,15 @@ def test_terminal_callback_message_respects_visible_budget_with_prefix():
     message = terminal_callback_message(output)
 
     assert len(message) <= 2400
-    assert message.startswith("...\n\n")
+    assert message.startswith("A")
+    assert message.endswith("...")
+
+
+def test_terminal_callback_full_message_preserves_long_final_report():
+    final_report = "\n\n".join(["A" * 1500, "B" * 1500, "C" * 1500])
+    output = f"Progress that should not surface.\nFINAL REPORT:\n{final_report}"
+
+    assert terminal_callback_full_message(output) == final_report
 
 
 def test_completed_callback_uses_final_report_message(tmp_path, monkeypatch):
@@ -205,6 +217,7 @@ def test_completed_callback_uses_final_report_message(tmp_path, monkeypatch):
         assert completed["message"] == (
             "Captured 42 rows.\n\nCreated `recent-connections.md` and stopped on the target page."
         )
+        assert completed["full_message"] == ""
         assert "Opening the browser" not in completed["message"]
         assert completed["message_id"] == "msg-assistant"
     finally:

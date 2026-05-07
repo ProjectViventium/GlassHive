@@ -1126,6 +1126,7 @@ _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{512,}={0,2}(?![A-Za-z0-9+/=])"), "[REDACTED_LONG_BASE64]"),
 )
 _FINAL_REPORT_PATTERN = re.compile(r"(?m)^[ \t]*FINAL REPORT:\s*")
+_HOST_RUN_OUTPUT_MAX_CHARS = 64000
 
 
 def _select_user_facing_agent_output(output_parts: list[str]) -> str:
@@ -1720,7 +1721,11 @@ class HostNativeCliMixin:
         session_key, output = self._parse_output(worker, stdout, stderr, info)
         if session_key:
             self._write_session_key(worker["worker_id"], session_key)
-        redacted_output = _redact_text(output.strip(), max_chars=16000)
+        if _FINAL_REPORT_PATTERN.search(stdout) and not _FINAL_REPORT_PATTERN.search(output):
+            output = f"FINAL REPORT:\n{output.strip()}"
+        redacted_output = _redact_text(output.strip())
+        if len(redacted_output) > _HOST_RUN_OUTPUT_MAX_CHARS:
+            redacted_output = f"{redacted_output[: _HOST_RUN_OUTPUT_MAX_CHARS - 3].rstrip()}..."
         self._append_work_log(worker, f"Run {effective_run_id} completed.")
         return redacted_output
 
