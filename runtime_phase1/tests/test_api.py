@@ -8,6 +8,7 @@ from pathlib import Path
 from threading import Event
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from workers_projects_runtime.api import create_app
@@ -18,7 +19,11 @@ from workers_projects_runtime.openclaw_runtime import (
     WorkerPausedError,
     WorkerTerminatedError,
 )
-from workers_projects_runtime.service import WorkersProjectsService, terminal_callback_message
+from workers_projects_runtime.service import (
+    WorkersProjectsService,
+    terminal_callback_full_message,
+    terminal_callback_message,
+)
 from workers_projects_runtime.store import Store
 
 
@@ -133,7 +138,15 @@ def test_terminal_callback_message_respects_visible_budget_with_prefix():
     message = terminal_callback_message(output)
 
     assert len(message) <= 2400
-    assert message.startswith("...\n\n")
+    assert message.startswith("A")
+    assert message.endswith("...")
+
+
+def test_terminal_callback_full_message_preserves_long_final_report():
+    final_report = "\n\n".join(["A" * 1500, "B" * 1500, "C" * 1500])
+    output = f"Progress that should not surface.\nFINAL REPORT:\n{final_report}"
+
+    assert terminal_callback_full_message(output) == final_report
 
 
 def test_completed_callback_uses_final_report_message(tmp_path, monkeypatch):
@@ -205,6 +218,7 @@ def test_completed_callback_uses_final_report_message(tmp_path, monkeypatch):
         assert completed["message"] == (
             "Captured 42 rows.\n\nCreated `recent-connections.md` and stopped on the target page."
         )
+        assert completed["full_message"] == ""
         assert "Opening the browser" not in completed["message"]
         assert completed["message_id"] == "msg-assistant"
     finally:
@@ -1931,6 +1945,294 @@ class DesktopStubRuntime:
             "view_url": "http://127.0.0.1:57906/?autoconnect=1",
             "notes": f"{action} launched",
         }
+
+
+class DeliverableDesktopRuntime(DesktopStubRuntime):
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None) -> str:
+        workspace_dir = Path(str(worker["workspace_dir"]))
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        (workspace_dir / "index.html").write_text("<!doctype html><h1>Hello</h1>", encoding="utf-8")
+        return f"FINAL REPORT:\nCreated the page for: {instruction}"
+
+
+class UrlOnlyDesktopRuntime(DesktopStubRuntime):
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None) -> str:
+        return "\n".join(
+            [
+                "FINAL REPORT:",
+                "Preview is ready.",
+                "Local preview: http://localhost:5173/private-preview",
+                "External preview: https://example.com/public-preview",
+            ]
+        )
+
+
+def test_completed_docker_run_opens_workspace_html_in_sandbox_browser_once(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime = DeliverableDesktopRuntime(tmp_path / "desktop")
+    app = create_app(str(db_path), runtime_backend="stub", runtime=runtime)
+
+    with TestClient(app) as client:
+        project = client.post(
+            "/v1/projects",
+            json={"owner_id": "demo-owner", "title": "Deliverable Promotion", "goal": "Open generated pages."},
+        ).json()
+        worker = client.post(
+            f"/v1/projects/{project['project_id']}/workers",
+            json={
+                "owner_id": "demo-owner",
+                "name": "Page Worker",
+                "role": "builder",
+                "profile": "codex-cli",
+                "execution_mode": "docker",
+            },
+        ).json()
+        run = client.post(
+            f"/v1/workers/{worker['worker_id']}/assign",
+            json={"instruction": "Create an index page."},
+        ).json()
+
+        completed = wait_for_run(client, run["run_id"])
+        assert completed["state"] == "completed"
+        wait_until(lambda: runtime.last_desktop_action is not None)
+
+        assert runtime.last_desktop_action == {
+            "worker_id": worker["worker_id"],
+            "action": "browser",
+            "url": "file:///workspace/project/index.html",
+            "run_id": run["run_id"],
+        }
+
+        service = app.state.service
+        refreshed_worker = service.require_worker(worker["worker_id"])
+        deliverable = service._completion_deliverable(refreshed_worker, completed, completed["output_text"])
+        service._promote_completed_deliverable(refreshed_worker, completed, deliverable)
+        opened_events = [
+            event
+            for event in app.state.store.list_events(worker["worker_id"])
+            if event["event_type"] == "deliverable.opened"
+        ]
+        assert len(opened_events) == 1
+
+
+def test_completed_host_run_does_not_auto_open_real_desktop_browser(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime = DeliverableDesktopRuntime(tmp_path / "desktop")
+    app = create_app(str(db_path), runtime_backend="stub", runtime=runtime)
+
+    with TestClient(app) as client:
+        project = client.post(
+            "/v1/projects",
+            json={"owner_id": "demo-owner", "title": "Host Deliverable", "goal": "Do not auto-open host pages."},
+        ).json()
+        worker = client.post(
+            f"/v1/projects/{project['project_id']}/workers",
+            json={
+                "owner_id": "demo-owner",
+                "name": "Host Page Worker",
+                "role": "builder",
+                "profile": "codex-cli",
+                "execution_mode": "host",
+                "bootstrap_bundle": {
+                    "callbacks": {
+                        "events_webhook_url": "http://callback.local/glasshive",
+                        "hmac_secret": "public-safe-callback-secret",
+                        "user_id": "user-public-safe",
+                        "conversation_id": "conv-public-safe",
+                        "parent_message_id": "parent-public-safe",
+                        "message_id": "assistant-public-safe",
+                        "surface": "web",
+                    }
+                },
+            },
+        ).json()
+        run = client.post(
+            f"/v1/workers/{worker['worker_id']}/assign",
+            json={"instruction": "Create an index page."},
+        ).json()
+
+        completed = wait_for_run(client, run["run_id"])
+        assert completed["state"] == "completed"
+        assert runtime.last_desktop_action is None
+
+        def callback_payload() -> dict | None:
+            with app.state.store._connect() as conn:
+                row = conn.execute(
+                    "SELECT payload_json FROM callback_outbox WHERE run_id = ? AND event_type = 'run.completed'",
+                    (run["run_id"],),
+                ).fetchone()
+            return json.loads(row["payload_json"]) if row else None
+
+        wait_until(lambda: callback_payload() is not None)
+        payload = callback_payload()
+        assert payload is not None
+        assert payload["deliverable"]["kind"] == "webpage"
+        assert payload["deliverable"]["source"] == "workspace_html"
+        assert payload["deliverable"]["browser_url_available"] is False
+        assert "browser_url" not in payload["deliverable"]
+        assert "file://" not in json.dumps(payload)
+
+
+def test_completed_host_run_url_output_does_not_auto_open_or_leak_urls(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime = UrlOnlyDesktopRuntime(tmp_path / "desktop")
+    app = create_app(str(db_path), runtime_backend="stub", runtime=runtime)
+
+    with TestClient(app) as client:
+        project = client.post(
+            "/v1/projects",
+            json={"owner_id": "demo-owner", "title": "Host URL Deliverable", "goal": "Do not auto-open host URLs."},
+        ).json()
+        worker = client.post(
+            f"/v1/projects/{project['project_id']}/workers",
+            json={
+                "owner_id": "demo-owner",
+                "name": "Host URL Worker",
+                "role": "builder",
+                "profile": "codex-cli",
+                "execution_mode": "host",
+            },
+        ).json()
+        run = client.post(
+            f"/v1/workers/{worker['worker_id']}/assign",
+            json={"instruction": "Print a local preview URL."},
+        ).json()
+
+        completed = wait_for_run(client, run["run_id"])
+        assert completed["state"] == "completed"
+        assert runtime.last_desktop_action is None
+
+        service = app.state.service
+        refreshed_worker = service.require_worker(worker["worker_id"])
+        deliverable = service._completion_deliverable(refreshed_worker, completed, completed["output_text"])
+
+        assert deliverable is not None
+        assert deliverable["source"] == "run_url"
+        assert deliverable["browser_url_available"] is False
+        assert "browser_url" not in deliverable
+        serialized = json.dumps(deliverable)
+        assert "localhost" not in serialized
+        assert "127.0.0.1" not in serialized
+        assert "example.com" not in serialized
+
+
+@pytest.mark.parametrize("surface", ["telegram", "voice"])
+def test_completed_non_web_callback_omits_operator_url_but_keeps_deliverable(tmp_path, monkeypatch, surface):
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "http://127.0.0.1:8780")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0")
+    db_path = tmp_path / "runtime.db"
+    runtime = DeliverableDesktopRuntime(tmp_path / "desktop")
+    app = create_app(str(db_path), runtime_backend="stub", runtime=runtime)
+
+    with TestClient(app) as client:
+        project = client.post(
+            "/v1/projects",
+            json={"owner_id": "demo-owner", "title": "Non-web Callback", "goal": "Preserve safe callback metadata."},
+        ).json()
+        worker = client.post(
+            f"/v1/projects/{project['project_id']}/workers",
+            json={
+                "owner_id": "demo-owner",
+                "name": "Non-web Worker",
+                "role": "builder",
+                "profile": "codex-cli",
+                "execution_mode": "docker",
+                "bootstrap_bundle": {
+                    "callbacks": {
+                        "events_webhook_url": "http://callback.local/glasshive",
+                        "hmac_secret": "public-safe-callback-secret",
+                        "user_id": "user-public-safe",
+                        "conversation_id": "conv-public-safe",
+                        "parent_message_id": "parent-public-safe",
+                        "message_id": "assistant-public-safe",
+                        "surface": surface,
+                    }
+                },
+            },
+        ).json()
+        run = client.post(
+            f"/v1/workers/{worker['worker_id']}/assign",
+            json={"instruction": "Create an index page."},
+        ).json()
+        completed = wait_for_run(client, run["run_id"])
+        assert completed["state"] == "completed"
+
+        def callback_payload() -> dict | None:
+            with app.state.store._connect() as conn:
+                row = conn.execute(
+                    "SELECT payload_json FROM callback_outbox WHERE run_id = ? AND event_type = 'run.completed'",
+                    (run["run_id"],),
+                ).fetchone()
+            return json.loads(row["payload_json"]) if row else None
+
+        wait_until(lambda: callback_payload() is not None)
+        payload = callback_payload()
+        assert payload is not None
+        assert payload["surface"] == surface
+        assert "operator_url" not in payload
+        assert "watch_url" not in payload
+        assert payload["deliverable"]["kind"] == "webpage"
+        assert payload["deliverable"]["browser_url"] == "file:///workspace/project/index.html"
+
+
+def test_completed_web_callback_includes_operator_url_and_deliverable(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "http://127.0.0.1:8780")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0")
+    db_path = tmp_path / "runtime.db"
+    runtime = DeliverableDesktopRuntime(tmp_path / "desktop")
+    app = create_app(str(db_path), runtime_backend="stub", runtime=runtime)
+
+    with TestClient(app) as client:
+        project = client.post(
+            "/v1/projects",
+            json={"owner_id": "demo-owner", "title": "Web Callback", "goal": "Surface operator metadata."},
+        ).json()
+        worker = client.post(
+            f"/v1/projects/{project['project_id']}/workers",
+            json={
+                "owner_id": "demo-owner",
+                "name": "Web Worker",
+                "role": "builder",
+                "profile": "codex-cli",
+                "execution_mode": "docker",
+                "bootstrap_bundle": {
+                    "callbacks": {
+                        "events_webhook_url": "http://callback.local/glasshive",
+                        "hmac_secret": "public-safe-callback-secret",
+                        "user_id": "user-public-safe",
+                        "conversation_id": "conv-public-safe",
+                        "parent_message_id": "parent-public-safe",
+                        "message_id": "assistant-public-safe",
+                        "surface": "web",
+                    }
+                },
+            },
+        ).json()
+        run = client.post(
+            f"/v1/workers/{worker['worker_id']}/assign",
+            json={"instruction": "Create an index page."},
+        ).json()
+        completed = wait_for_run(client, run["run_id"])
+        assert completed["state"] == "completed"
+
+        def callback_payload() -> dict | None:
+            with app.state.store._connect() as conn:
+                row = conn.execute(
+                    "SELECT payload_json FROM callback_outbox WHERE run_id = ? AND event_type = 'run.completed'",
+                    (run["run_id"],),
+                ).fetchone()
+            return json.loads(row["payload_json"]) if row else None
+
+        wait_until(lambda: callback_payload() is not None)
+        payload = callback_payload()
+        assert payload is not None
+        expected_url = f"http://127.0.0.1:8780/watch/{worker['worker_id']}?surface=desktop&project_id={project['project_id']}"
+        assert payload["operator_url"] == expected_url
+        assert payload["watch_url"] == expected_url
+        assert payload["deliverable"]["kind"] == "webpage"
+        assert payload["deliverable"]["browser_url"] == "file:///workspace/project/index.html"
 
 
 def test_desktop_action_and_artifact_preview_surface_in_project_ui(tmp_path):

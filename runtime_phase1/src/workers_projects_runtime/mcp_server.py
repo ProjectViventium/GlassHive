@@ -13,6 +13,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
+from .operator_urls import surface_aware_watch_url, surface_can_open_operator_url
 from .runtime_env import load_viventium_runtime_env
 
 try:
@@ -97,6 +98,63 @@ def _default_execution_mode() -> str:
 def _host_workers_enabled() -> bool:
     value = os.environ.get("GLASSHIVE_HOST_WORKERS_ENABLED", "true").strip().lower()
     return value not in {"0", "false", "no", "off", "disabled"}
+
+
+def _host_worker_mentions() -> tuple[str, str, str]:
+    return (
+        os.environ.get("WPR_HOST_MENTION_CODEX", "@codex").strip() or "@codex",
+        os.environ.get("WPR_HOST_MENTION_CLAUDE", "@claude").strip() or "@claude",
+        os.environ.get("WPR_HOST_MENTION_OPENCLAW", "@openclaw").strip() or "@openclaw",
+    )
+
+
+def glasshive_workers_server_instructions() -> str:
+    if _host_workers_enabled():
+        if _default_execution_mode() == "host":
+            execution_instruction = (
+                "Default to host-native execution for the user's real Chrome/browser profile, "
+                "desktop apps, OS tools, host files, local projects, and installed CLIs."
+            )
+        else:
+            execution_instruction = (
+                f"When execution_mode is omitted, MCP worker tools use the configured default "
+                f"'{_default_execution_mode()}'. Set execution_mode='host' when the task depends "
+                "on the user's real computer/session: logged-in browser profile, desktop apps, "
+                "local files/projects, installed CLIs, or OS/window control."
+            )
+    else:
+        execution_instruction = (
+            "Host-native workers are disabled by Viventium config; configured default 'docker'; "
+            "do not request execution_mode='host'."
+        )
+
+    codex_mention, claude_mention, openclaw_mention = _host_worker_mentions()
+    return (
+        "GlassHive owns persistent projects, resumable workers, host-native workers for browser and desktop action, "
+        "local files/projects, installed CLIs, workstation sandboxes, and live operator takeover. "
+        "Use it when the user asks Viventium to act in a real browser, desktop app, local file, "
+        "local project, installed tool, or current computer session; the user does not need to say "
+        "GlassHive, Codex, Computer Use, or local machine. Do not answer from memory or inference when "
+        "real browser/desktop/local state must be inspected or changed. "
+        f"{execution_instruction} "
+        "Use Docker/workstation mode only for isolated sandbox, disposable browser, risky untrusted "
+        "browsing, or explicit sandbox requests. "
+        f"For configured mentions {codex_mention}, {claude_mention}, and {openclaw_mention}, create "
+        "or resume a host worker with the matching profile semantics; prefer codex-cli for available "
+        "host browser/desktop/file/code execution, claude-code when Claude is explicitly requested, "
+        "and openclaw-general only when installed or explicitly requested. Current request upload "
+        "metadata is projected through headers; preserve existing file references in "
+        "bootstrap_bundle_json instead of creating a separate upload path. For fresh one-off "
+        "host/browser/desktop/local tasks, prefer worker_delegate_once. It creates or resumes the "
+        "project/worker, includes callback/upload context, and queues the run in one call. After "
+        "worker_delegate_once returns callback_ready=true, do not call worker_live or run_get in the "
+        "same chat turn unless the user explicitly asks for diagnostics/live status; send one short "
+        "outcome-focused acknowledgement and let the same-chat callback deliver completion, blockers, "
+        "approvals, and artifacts. After lower-level worker_run, queued only means accepted; do not "
+        "report it as done. Preserve the user's success condition and response-format constraints in "
+        "worker instructions. User-facing responses should not expose worker/run/provider/queue "
+        "plumbing unless diagnostics were requested."
+    )
 
 
 def _resolve_execution_mode(value: str | None) -> str:
@@ -591,25 +649,9 @@ def create_mcp_server(
     api_client: WorkersProjectsApiClient | None = None,
 ) -> FastMCP:
     client = api_client or WorkersProjectsApiClient(base_url=base_url)
-    host_instruction = (
-        "Set execution_mode='host' when the task depends on the user's real computer/session: logged-in browser profile, desktop apps, local files/projects, installed CLIs, or OS/window control. "
-        if _host_workers_enabled()
-        else "Host-native workers are disabled by Viventium config; do not request execution_mode='host'. "
-    )
     server = FastMCP(
         name="glass-hive",
-        instructions=(
-            "Use this server to manage persistent projects, resumable workers, workstation sandboxes, and host-native workers in Glass Hive. "
-            f"When execution_mode is omitted, MCP worker tools use the configured default '{_default_execution_mode()}'. "
-            f"{host_instruction}"
-            "If the user asks to open, navigate, click, type, inspect, or read from a real browser/desktop/local app, dispatch the action through a worker instead of answering from memory or inference. "
-            "Prefer codex-cli for available host browser/desktop/file/code execution, claude-code when Claude is explicitly requested, and openclaw-general only when installed or explicitly requested. "
-            "For fresh one-off host/browser/desktop/local tasks, prefer worker_delegate_once instead of manually listing projects and chaining low-level project/worker tools. "
-            "When worker_delegate_once returns callback_ready=true, do not immediately call worker_live or run_get in the same chat turn unless the user explicitly asked for diagnostics or live status; acknowledge briefly and let the callback deliver completion or blockers. "
-            "Preserve the user's success condition and output constraints in worker instructions; if the user asks for a short or exact answer, do not add screenshots, logs, IDs, artifact paths, or extra evidence to the user-visible final result unless needed to explain a blocker. "
-            "If acknowledging delegation to the user, use a short outcome-focused status and avoid worker/run/provider/queue jargon unless diagnostics were requested. "
-            "Use worker_takeover or worker_desktop_action for explicit diagnostics, explicit live takeover, or concrete checkpoint/approval moments; do not add them to routine worker_delegate_once handoffs."
-        ),
+        instructions=glasshive_workers_server_instructions(),
         host=host,
         port=port,
         streamable_http_path="/mcp",
@@ -620,7 +662,8 @@ def create_mcp_server(
         title="List Projects",
         description=(
             "List current projects from the standalone Workers & Projects runtime. Use for explicit status, audit, or resume requests. "
-            "For a fresh delegation, prefer worker_delegate_once instead of listing every project or chaining low-level tools."
+            "For a fresh delegation, prefer worker_delegate_once instead of listing every project or chaining low-level tools. "
+            "Returns project records with project_id, owner, title, goal, and runtime metadata when available."
         ),
         structured_output=True,
     )
@@ -630,7 +673,11 @@ def create_mcp_server(
     @server.tool(
         name="project_create",
         title="Create Project",
-        description="Create a new project with a goal and default worker profile.",
+        description=(
+            "Create a GlassHive project with a goal and default worker profile. Use for explicit project setup or reusable workstreams; "
+            "for a fresh one-off browser/desktop/local task, prefer worker_delegate_once. Requires title and goal, optionally owner_id and default_worker_profile. "
+            "Returns the project record including project_id for later worker or run tools. If project creation fails, surface the blocker instead of inventing a project id."
+        ),
         structured_output=True,
     )
     def project_create(
@@ -646,7 +693,15 @@ def create_mcp_server(
             default_worker_profile=default_worker_profile,
         )
 
-    @server.tool(name="project_get", title="Get Project", description="Fetch a single project by project_id.", structured_output=True)
+    @server.tool(
+        name="project_get",
+        title="Get Project",
+        description=(
+            "Fetch a single GlassHive project by project_id. Use for explicit inspection, status, audit, or resume flows when the project id is already known. "
+            "Do not use as the first step for ordinary fresh delegation; prefer worker_delegate_once. Returns the project record and high-signal ownership/title/goal fields."
+        ),
+        structured_output=True,
+    )
     def project_get(project_id: str) -> dict[str, Any]:
         return client.get_project(project_id)
 
@@ -765,15 +820,39 @@ def create_mcp_server(
             )
         return result
 
-    @server.tool(name="project_runs", title="Project Runs", description="List recent runs for a project.", structured_output=True)
+    @server.tool(
+        name="project_runs",
+        title="Project Runs",
+        description=(
+            "List recent runs for a project. Use for diagnostics, audit, or explicit status requests about an existing project. "
+            "Do not poll immediately after worker_delegate_once when callback_ready=true; let the callback deliver completion or blockers. Returns run ids, states, and recent execution metadata."
+        ),
+        structured_output=True,
+    )
     def project_runs(project_id: str) -> list[dict[str, Any]]:
         return client.list_project_runs(project_id)
 
-    @server.tool(name="project_events", title="Project Events", description="List recent events for a project.", structured_output=True)
+    @server.tool(
+        name="project_events",
+        title="Project Events",
+        description=(
+            "List recent lifecycle events for a project. Use only for diagnostics, audit trails, or explicit investigation of what happened. "
+            "Do not include raw event logs in a normal user-facing answer unless they explain a blocker. Returns event ids, event types, and project-linked timestamps/details when available."
+        ),
+        structured_output=True,
+    )
     def project_events(project_id: str) -> list[dict[str, Any]]:
         return client.list_project_events(project_id)
 
-    @server.tool(name="workers_list", title="List Workers", description="List workers belonging to a project.", structured_output=True)
+    @server.tool(
+        name="workers_list",
+        title="List Workers",
+        description=(
+            "List workers belonging to a project. Use for explicit worker inventory, resume, or diagnostic requests on an existing project. "
+            "Do not list workers as boilerplate before a fresh task; prefer worker_delegate_once. Returns worker ids, states, profiles, aliases, and execution metadata when available."
+        ),
+        structured_output=True,
+    )
     def workers_list(project_id: str) -> list[dict[str, Any]]:
         return client.list_workers(project_id)
 
@@ -784,7 +863,8 @@ def create_mcp_server(
             "Create a new worker in an existing project. Optionally pass bootstrap_profile and "
             "bootstrap_bundle_json as a JSON string or object to seed auth, MCP config, instructions, env, and project files. "
             "Use this lower-level tool for explicit orchestration or diagnostics; for a fresh one-off task, prefer worker_delegate_once. "
-            "Use execution_mode='host' for the user's real computer/session and 'docker' for isolated work."
+            "Use execution_mode='host' for the user's real computer/session and 'docker' for isolated work. "
+            "Returns the worker record with worker_id, execution mode, profile, alias, and bootstrap result metadata."
         ),
         structured_output=True,
     )
@@ -825,7 +905,8 @@ def create_mcp_server(
             "Find an existing non-terminated worker by alias for a project/owner, or create one. "
             "Use execution_mode='host' for tasks on the user's real computer/session: signed-in browser profile, desktop apps, local files/projects, installed CLIs, or OS/window control. "
             "Use execution_mode='docker' for isolated sandbox, disposable browser, or risky untrusted work. "
-            "bootstrap_bundle_json may be a JSON string or object."
+            "Do not use for fresh one-off tasks when worker_delegate_once can create/resume and queue the run in one call. "
+            "bootstrap_bundle_json may be a JSON string or object. Returns the existing or newly created worker record."
         ),
         structured_output=True,
     )
@@ -859,7 +940,15 @@ def create_mcp_server(
             bootstrap_bundle=parsed_bundle,
         )
 
-    @server.tool(name="worker_get", title="Get Worker", description="Fetch a worker by worker_id.", structured_output=True)
+    @server.tool(
+        name="worker_get",
+        title="Get Worker",
+        description=(
+            "Fetch a worker by worker_id. Use for explicit worker inspection or when a previous tool result already supplied the id. "
+            "Do not expose worker ids to the user unless diagnostics were requested. Returns the worker record with project, state, profile, alias, and execution mode when available."
+        ),
+        structured_output=True,
+    )
     def worker_get(worker_id: str) -> dict[str, Any]:
         return client.get_worker(worker_id)
 
@@ -868,7 +957,8 @@ def create_mcp_server(
         title="Worker Live State",
         description=(
             "Fetch rich live worker diagnostics, including runtime details, runs, logs, and artifacts. "
-            "Use only when the user asks for status/diagnostics or when callback_ready is false; do not poll immediately after worker_delegate_once."
+            "Use only when the user asks for status/diagnostics or when callback_ready is false; do not poll immediately after worker_delegate_once. "
+            "Returns worker state, runtime details, recent runs, events, artifacts, and blocker evidence when available."
         ),
         structured_output=True,
     )
@@ -880,37 +970,82 @@ def create_mcp_server(
         title="Queue Worker Run",
         description=(
             "Queue a new instruction for an existing worker. Use for explicit steering/resume/reuse. "
-            "For fresh one-off host/browser/desktop/local tasks, prefer worker_delegate_once."
+            "For fresh one-off host/browser/desktop/local tasks, prefer worker_delegate_once. "
+            "Returns the queued run record with run_id/state and later completion delivered by callback when configured."
         ),
         structured_output=True,
     )
     def worker_run(worker_id: str, instruction: str) -> dict[str, Any]:
         return client.assign_run(worker_id, instruction)
 
-    @server.tool(name="worker_message", title="Send Worker Message", description="Send an operator message into the current worker session.", structured_output=True)
+    @server.tool(
+        name="worker_message",
+        title="Send Worker Message",
+        description=(
+            "Send an operator message into the current worker session. Use when the user gives follow-up guidance, approval, correction, or an answer to a worker blocker. "
+            "Do not use for a fresh task; prefer worker_delegate_once or worker_run depending on whether a reusable worker already exists. Returns the queued message/run state."
+        ),
+        structured_output=True,
+    )
     def worker_message(worker_id: str, message: str) -> dict[str, Any]:
         return client.send_message(worker_id, message)
 
-    @server.tool(name="worker_pause", title="Pause Worker", description="Pause a worker. Docker workers are frozen; host-native workers stop the active process.", structured_output=True)
+    @server.tool(
+        name="worker_pause",
+        title="Pause Worker",
+        description=(
+            "Pause a worker. Use only when the user asks to pause/hold work or when an explicit safety checkpoint requires stopping active execution. "
+            "Docker workers are frozen; host-native workers stop the active process. Returns the lifecycle state. Do not pause routine completed or callback-ready work."
+        ),
+        structured_output=True,
+    )
     def worker_pause(worker_id: str) -> dict[str, Any]:
         return client.lifecycle(worker_id, "pause")
 
-    @server.tool(name="worker_resume", title="Resume Worker", description="Resume a paused persistent worker.", structured_output=True)
+    @server.tool(
+        name="worker_resume",
+        title="Resume Worker",
+        description=(
+            "Resume a paused persistent worker. Use when the user explicitly wants held work to continue or after a confirmed checkpoint. "
+            "Do not create a new worker for the same task if a paused worker is the intended continuation. Returns the lifecycle state and any blocker from the runtime."
+        ),
+        structured_output=True,
+    )
     def worker_resume(worker_id: str) -> dict[str, Any]:
         return client.lifecycle(worker_id, "resume")
 
-    @server.tool(name="worker_interrupt", title="Interrupt Worker", description="Interrupt the active task while keeping the worker available.", structured_output=True)
+    @server.tool(
+        name="worker_interrupt",
+        title="Interrupt Worker",
+        description=(
+            "Interrupt the active task while keeping the worker available. Use when the user changes direction, cancels the current step, or requests immediate steering without destroying the worker. "
+            "Do not terminate persistent context unless the user asks. Returns lifecycle state and runtime blocker details when available."
+        ),
+        structured_output=True,
+    )
     def worker_interrupt(worker_id: str) -> dict[str, Any]:
         return client.lifecycle(worker_id, "interrupt")
 
-    @server.tool(name="worker_terminate", title="Terminate Worker", description="Terminate a worker and cancel any active or queued runs.", structured_output=True)
+    @server.tool(
+        name="worker_terminate",
+        title="Terminate Worker",
+        description=(
+            "Terminate a worker and cancel active or queued runs. Use only for explicit stop/shutdown/delete-style requests or unrecoverable diagnostics. "
+            "Do not terminate when pause, interrupt, or resume would preserve useful context. Returns the final lifecycle state."
+        ),
+        structured_output=True,
+    )
     def worker_terminate(worker_id: str) -> dict[str, Any]:
         return client.lifecycle(worker_id, "terminate")
 
     @server.tool(
         name="worker_desktop_action",
         title="Launch Worker Desktop Action",
-        description="Launch a worker surface such as terminal, files, browser, codex, claude, or openclaw inside a sandbox or on the host computer.",
+        description=(
+            "Launch or focus a worker surface such as terminal, files, browser, codex, claude, or openclaw inside a sandbox or on the host computer. "
+            "Use for explicit live viewing, steering, approval, browser opening, or workstation diagnostics. Do not add this to routine worker_delegate_once handoffs. "
+            "Returns surface URLs or launch state; raw desktop URLs are diagnostic and should not be user-facing unless a watch/takeover surface is requested."
+        ),
         structured_output=True,
     )
     def worker_desktop_action(worker_id: str, action: DesktopActionParam, url: str | None = None) -> dict[str, Any]:
@@ -919,26 +1054,74 @@ def create_mcp_server(
     @server.tool(
         name="worker_takeover",
         title="Get Worker Takeover URLs",
-        description="Return takeover URLs for the worker desktop and terminal surfaces so a human can watch or intervene.",
+        description=(
+            "Return human-facing GlassHive operator URLs for watch, steer, and takeover. "
+            "Use only when the user asks to watch, steer, approve, or take over live work; do not call for routine background delegation. "
+            "Use operator_url/watch_url when present; direct_desktop_url is raw diagnostic noVNC only."
+        ),
         structured_output=True,
     )
     def worker_takeover(worker_id: str) -> dict[str, Any]:
         live = client.worker_live(worker_id)
         takeover = client.takeover(worker_id)
         runtime_details = live.get("runtime_details", {})
+        worker = live.get("worker") if isinstance(live.get("worker"), dict) else {}
+        project_id = str((worker or {}).get("project_id") or "").strip()
+        request_surface = _sanitize_context_value(_request_headers().get(HEADER_SURFACE))
+        can_return_local_urls = surface_can_open_operator_url(request_surface)
+        operator_url = surface_aware_watch_url(
+            worker_id,
+            project_id,
+            request_surface=request_surface,
+            watch_surface="desktop",
+        )
+        runtime_takeover_url = takeover.get("url") if can_return_local_urls else None
+        direct_desktop_url = runtime_details.get("view_url") if can_return_local_urls else None
+        view_url = operator_url or runtime_takeover_url or direct_desktop_url
+        takeover_payload = (
+            takeover
+            if can_return_local_urls
+            else {
+                "supported": bool(takeover.get("supported")),
+                "mode": takeover.get("mode"),
+                "url_available": False,
+            }
+        )
         return {
-            "takeover": takeover,
-            "view_url": runtime_details.get("view_url") or takeover.get("url"),
-            "terminal_url": f"{base_url}/ui/workers/{worker_id}/terminal",
-            "worker_url": f"{base_url}/ui/workers/{worker_id}",
+            "takeover": takeover_payload,
+            "operator_url": operator_url,
+            "watch_url": operator_url,
+            "view_url": view_url,
+            "runtime_takeover_url": runtime_takeover_url,
+            "direct_desktop_url": direct_desktop_url,
+            "terminal_url": f"{base_url}/ui/workers/{worker_id}/terminal" if can_return_local_urls else None,
+            "worker_url": f"{base_url}/ui/workers/{worker_id}" if can_return_local_urls else None,
             "project_runs": live.get("project_runs", []),
+            "operator_url_available": bool(operator_url),
+            "operator_url_surface": request_surface or "web",
         }
 
-    @server.tool(name="run_get", title="Get Run", description="Fetch an individual run by run_id.", structured_output=True)
+    @server.tool(
+        name="run_get",
+        title="Get Run",
+        description=(
+            "Fetch an individual run by run_id. Use for explicit diagnostics, status, or result inspection when the run id came from a previous tool result. "
+            "Do not call immediately after worker_delegate_once when callback_ready=true unless the user asked for live status or diagnostics. Returns run state, output, and blocker/error details."
+        ),
+        structured_output=True,
+    )
     def run_get(run_id: str) -> dict[str, Any]:
         return client.get_run(run_id)
 
-    @server.tool(name="metrics_summary", title="Metrics Summary", description="Fetch runtime-level project, worker, run, and event counts.", structured_output=True)
+    @server.tool(
+        name="metrics_summary",
+        title="Metrics Summary",
+        description=(
+            "Fetch runtime-level project, worker, run, and event counts. Use for diagnostics, health checks, capacity checks, or admin-style visibility. "
+            "Do not use for ordinary task delegation or user-facing task completion. Returns aggregate counts only, not project content or worker outputs."
+        ),
+        structured_output=True,
+    )
     def metrics_summary() -> dict[str, Any]:
         return client.metrics()
 

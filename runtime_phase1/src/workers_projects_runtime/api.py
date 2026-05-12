@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import os
-import re
 import json
 from contextlib import asynccontextmanager
 from html import escape
 from pathlib import Path
-from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
+from .deliverables import deliverable_payload
 from .models import (
     AssignRunRequest,
     CreateProjectRequest,
@@ -37,7 +36,6 @@ from .terminal_takeover import TerminalTarget, bridge_terminal
 load_viventium_runtime_env()
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "runtime_phase1.db"
-SANDBOX_WORKSPACE_MOUNT = Path(os.environ.get("WPR_SANDBOX_WORKSPACE", "/workspace/project"))
 
 
 def _build_runtime(runtime_backend: str, db_path: str, runtime: WorkerRuntime | None) -> WorkerRuntime:
@@ -265,103 +263,6 @@ def create_app(
             return None
         return max(visible, key=lambda item: item.stat().st_mtime)
 
-    def _candidate_html_paths(worker: dict, max_entries: int = 20) -> list[Path]:
-        raw_root = str(worker.get("workspace_dir") or "").strip()
-        if not raw_root:
-            return []
-        root = Path(raw_root)
-        if not root.exists():
-            return []
-        candidates: list[Path] = []
-        for path in sorted(root.rglob("*.html")):
-            try:
-                rel = path.relative_to(root)
-            except ValueError:
-                continue
-            if any(part in {".git", "node_modules", ".venv"} for part in rel.parts):
-                continue
-            candidates.append(path)
-            if len(candidates) >= max_entries:
-                break
-        return candidates
-
-    def _workspace_browser_url(path: Path, worker: dict) -> str | None:
-        raw_root = str(worker.get("workspace_dir") or "").strip()
-        if not raw_root:
-            return None
-        root = Path(raw_root)
-        try:
-            rel = path.relative_to(root)
-        except ValueError:
-            return None
-        if str(worker.get("execution_mode") or "docker") == "host":
-            return path.resolve().as_uri()
-        container_path = (SANDBOX_WORKSPACE_MOUNT / rel.as_posix()).as_posix()
-        return f"file://{quote(container_path, safe='/:')}"
-
-    def _extract_urls(*texts: str) -> list[str]:
-        combined = "\n".join(texts)
-        seen: set[str] = set()
-        matches: list[str] = []
-        for raw in re.findall(r"https?://[^\s<>'\"`]+", combined):
-            cleaned = raw.rstrip(").,;")
-            if cleaned in seen:
-                continue
-            seen.add(cleaned)
-            matches.append(cleaned)
-        return matches
-
-    def _deliverable_payload(worker: dict, latest_run: dict | None, latest_output: str, stdout_text: str, stderr_text: str) -> dict[str, object] | None:
-        html_candidates = _candidate_html_paths(worker)
-        preferred_html = next((path for path in html_candidates if path.name.lower() == "index.html"), None)
-        if preferred_html is None and html_candidates:
-            preferred_html = html_candidates[0]
-
-        urls = _extract_urls(latest_output, stdout_text, stderr_text)
-        external_url = next(
-            (
-                url
-                for url in urls
-                if not re.search(r"://(?:127\.0\.0\.1|localhost|0\.0\.0\.0)(?:[:/]|$)", url, flags=re.IGNORECASE)
-            ),
-            None,
-        )
-        local_url = next(
-            (
-                url
-                for url in urls
-                if re.search(r"://(?:127\.0\.0\.1|localhost|0\.0\.0\.0)(?:[:/]|$)", url, flags=re.IGNORECASE)
-            ),
-            None,
-        )
-
-        if preferred_html is not None:
-            browser_url = _workspace_browser_url(preferred_html, worker)
-            if browser_url:
-                return {
-                    "kind": "webpage",
-                    "state": "ready" if latest_run else "available",
-                    "source": "workspace_html",
-                    "label": preferred_html.name,
-                    "browser_url": browser_url,
-                    "preferred_surface": "desktop",
-                    "workspace_path": preferred_html.name,
-                }
-
-        if local_url or external_url:
-            browser_url = local_url or external_url
-            return {
-                "kind": "webpage",
-                "state": "ready" if latest_run else "available",
-                "source": "run_url",
-                "label": browser_url,
-                "browser_url": browser_url,
-                "preferred_surface": "desktop",
-                "workspace_path": None,
-            }
-
-        return None
-
     def _sanitize_worker(worker: dict) -> dict[str, object]:
         safe = dict(worker)
         safe.pop("gateway_token", None)
@@ -383,7 +284,7 @@ def create_app(
         if latest_run:
             latest_output = str(latest_run.get("output_text") or latest_run.get("error_text") or "")
         latest_image = _latest_image_path(worker)
-        deliverable = _deliverable_payload(worker, latest_run, latest_output, stdout_text, stderr_text)
+        deliverable = deliverable_payload(worker, latest_run, latest_output, stdout_text, stderr_text)
         return {
             "worker": _sanitize_worker(worker),
             "latest_run": latest_run,
