@@ -15,6 +15,7 @@ from threading import Event, Lock, Thread
 
 import httpx
 
+from .deliverables import deliverable_payload
 from .openclaw_runtime import (
     RuntimeErrorBase,
     RuntimeInfo,
@@ -23,6 +24,7 @@ from .openclaw_runtime import (
     WorkerRuntime,
     WorkerTerminatedError,
 )
+from .operator_urls import surface_aware_watch_url
 from .runtime_env import load_viventium_runtime_env
 from .store import Store
 
@@ -343,11 +345,18 @@ class WorkersProjectsService:
         run: dict | None = None,
         message: str = "",
         full_message: str = "",
+        deliverable: dict[str, object] | None = None,
     ) -> None:
         callbacks = self._callback_config_for(worker)
         url = str(callbacks.get("events_webhook_url") or callbacks.get("url") or "").strip()
         if not url:
             return
+        operator_url = surface_aware_watch_url(
+            str(worker.get("worker_id") or ""),
+            str(worker.get("project_id") or ""),
+            request_surface=str(callbacks.get("surface") or ""),
+            watch_surface="desktop",
+        )
         payload = {
             "callback_id": f"cb_{uuid.uuid4().hex}",
             "callback_ts": int(time.time()),
@@ -372,6 +381,11 @@ class WorkersProjectsService:
             "telegram_user_id": callbacks.get("telegram_user_id"),
             "telegram_message_id": callbacks.get("telegram_message_id"),
         }
+        if deliverable:
+            payload["deliverable"] = deliverable
+        if operator_url:
+            payload["operator_url"] = operator_url
+            payload["watch_url"] = operator_url
         record = self.store.upsert_callback_outbox(
             callback_id=str(payload["callback_id"]),
             project_id=str(worker.get("project_id") or ""),
@@ -382,6 +396,43 @@ class WorkersProjectsService:
             payload_json=json.dumps(payload, ensure_ascii=False),
         )
         self.executor.submit(self._deliver_callback_record, dict(worker), record, callbacks)
+
+    def _completion_deliverable(self, worker: dict, run: dict, output_text: str, error_text: str = "") -> dict[str, object] | None:
+        return deliverable_payload(worker, run, output_text, output_text, error_text)
+
+    def _promote_completed_deliverable(
+        self,
+        worker: dict,
+        run: dict,
+        deliverable: dict[str, object] | None,
+    ) -> None:
+        if not deliverable:
+            return
+        if deliverable.get("kind") != "webpage" or deliverable.get("preferred_surface") != "desktop":
+            return
+        if str(worker.get("execution_mode") or "docker") == "host":
+            return
+        browser_url = str(deliverable.get("browser_url") or "").strip()
+        run_id = str(run.get("run_id") or "").strip()
+        worker_id = str(worker.get("worker_id") or "").strip()
+        project_id = str(worker.get("project_id") or "").strip()
+        if not browser_url or not run_id or not worker_id or not project_id:
+            return
+        promotion_key = f"{run_id}:{browser_url}"
+        existing_events = self.store.list_events(worker_id)
+        if any(
+            event.get("event_type") == "deliverable.opened"
+            and str(event.get("message") or "") == promotion_key
+            for event in existing_events
+        ):
+            return
+        if not hasattr(self.runtime, "desktop_action"):
+            return
+        try:
+            self.desktop_action(worker_id, "browser", url=browser_url, run_id=run_id)
+            self.store.add_event(project_id, worker_id, run_id, "deliverable.opened", promotion_key)
+        except Exception as exc:
+            logger.warning("Failed to promote GlassHive deliverable %s: %s", promotion_key, exc)
 
     def create_project(self, owner_id: str, title: str, goal: str, default_worker_profile: str) -> dict:
         return self.store.create_project(owner_id, title, goal, default_worker_profile)
@@ -716,12 +767,16 @@ class WorkersProjectsService:
             full_message = terminal_callback_full_message(output_text)
             self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.completed", message[:TERMINAL_CALLBACK_MESSAGE_LIMIT] or "Run completed")
             recovered_run = {**run, "state": "completed", "output_text": output_text}
+            refreshed_worker = self.store.get_worker(worker_id) or worker
+            deliverable = self._completion_deliverable(refreshed_worker, recovered_run, output_text, error_text)
+            self._promote_completed_deliverable(refreshed_worker, recovered_run, deliverable)
             self._emit_callback(
-                worker,
+                refreshed_worker,
                 "run.completed",
                 run=recovered_run,
                 message=message or "Run completed",
                 full_message=full_message if full_message != message else "",
+                deliverable=deliverable,
             )
             self._refresh_runtime_info(worker_id, state="ready", last_error="")
         else:
@@ -955,12 +1010,16 @@ class WorkersProjectsService:
                 full_message = terminal_callback_full_message(output)
                 self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.completed", message[:TERMINAL_CALLBACK_MESSAGE_LIMIT] or "Run completed")
                 completed_run = {**run, "state": "completed", "output_text": output}
+                refreshed_worker = self.store.get_worker(worker_id) or worker
+                deliverable = self._completion_deliverable(refreshed_worker, completed_run, output)
+                self._promote_completed_deliverable(refreshed_worker, completed_run, deliverable)
                 self._emit_callback(
-                    worker,
+                    refreshed_worker,
                     "run.completed",
                     run=completed_run,
                     message=message or "Run completed",
                     full_message=full_message if full_message != message else "",
+                    deliverable=deliverable,
                 )
                 self._refresh_runtime_info(worker_id, state="ready", last_error="")
         finally:

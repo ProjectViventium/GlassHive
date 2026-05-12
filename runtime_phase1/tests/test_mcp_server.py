@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 import pytest
@@ -83,7 +82,7 @@ class FakeApiClient:
 
     def worker_live(self, worker_id: str):
         return {
-            "worker": {"worker_id": worker_id, "state": "ready"},
+            "worker": {"worker_id": worker_id, "project_id": "prj_123", "state": "ready"},
             "runtime_details": {"view_url": "http://127.0.0.1:62310/?autoconnect=1"},
             "project_runs": [{"run_id": "run_123"}],
         }
@@ -155,7 +154,47 @@ def _callback_headers() -> dict[str, str]:
     }
 
 
-def test_mcp_server_exposes_tools_and_resources():
+def test_server_instructions_advertise_mcp_owned_usage_contract(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("WPR_HOST_MENTION_CODEX", "@codex")
+    monkeypatch.setenv("WPR_HOST_MENTION_CLAUDE", "@claude")
+    monkeypatch.setenv("WPR_HOST_MENTION_OPENCLAW", "@openclaw")
+    server = create_mcp_server(api_client=FakeApiClient())
+    instructions = server.instructions.lower()
+
+    for phrase in [
+        "persistent projects",
+        "resumable workers",
+        "workstation sandboxes",
+        "host-native workers",
+        "real browser",
+        "desktop",
+        "local files/projects",
+        "installed clis",
+        "worker_delegate_once",
+        "callback_ready=true",
+        "do not call worker_live",
+        "should not expose worker/run/provider/queue plumbing",
+        "@codex",
+        "@claude",
+        "@openclaw",
+    ]:
+        assert phrase in instructions
+
+
+def test_server_instructions_reflect_disabled_host_workers(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "false")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    server = create_mcp_server(api_client=FakeApiClient())
+    instructions = server.instructions.lower()
+
+    assert "host-native workers are disabled" in instructions
+    assert "configured default 'docker'" in instructions
+    assert "do not request execution_mode='host'" in instructions
+
+
+def test_mcp_server_exposes_tools_and_resources(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "http://127.0.0.1:8780")
     server = create_mcp_server(api_client=FakeApiClient())
 
     async def scenario():
@@ -193,12 +232,47 @@ def test_mcp_server_exposes_tools_and_resources():
             takeover = await client.call_tool("worker_takeover", {"worker_id": "wrk_123"})
             takeover_payload = _tool_json(takeover)
             assert takeover_payload["takeover"]["supported"] is True
-            assert takeover_payload["view_url"].startswith("http://127.0.0.1:")
+            assert takeover_payload["operator_url"] == (
+                "http://127.0.0.1:8780/watch/wrk_123?surface=desktop&project_id=prj_123"
+            )
+            assert takeover_payload["watch_url"] == takeover_payload["operator_url"]
+            assert takeover_payload["view_url"] == takeover_payload["operator_url"]
+            assert takeover_payload["direct_desktop_url"].startswith("http://127.0.0.1:")
+            assert takeover_payload["runtime_takeover_url"].endswith("/ui/workers/wrk_123/view")
 
             live_resource = await client.read_resource("wpr://workers/wrk_123/live")
             assert live_resource[0].text is not None
             live_payload = json.loads(live_resource[0].text)
             assert live_payload["worker"]["worker_id"] == "wrk_123"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("surface", ["telegram", "voice", "unknown-surface"])
+def test_worker_takeover_omits_operator_url_for_non_web_surface(monkeypatch, surface):
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "http://127.0.0.1:8780")
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {"X-Viventium-Surface": surface})
+    server = create_mcp_server(api_client=FakeApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            takeover = await client.call_tool("worker_takeover", {"worker_id": "wrk_123"})
+            payload = _tool_json(takeover)
+            assert payload["operator_url"] is None
+            assert payload["watch_url"] is None
+            assert payload["operator_url_available"] is False
+            assert payload["operator_url_surface"] == surface
+            assert payload["view_url"] is None
+            assert payload["runtime_takeover_url"] is None
+            assert payload["direct_desktop_url"] is None
+            assert payload["terminal_url"] is None
+            assert payload["worker_url"] is None
+            assert payload["takeover"]["url_available"] is False
+            assert "url" not in payload["takeover"]
+            serialized = json.dumps(payload)
+            assert "127.0.0.1" not in serialized
+            assert "localhost" not in serialized
+            assert "noVNC" not in serialized
 
     asyncio.run(scenario())
 
@@ -569,6 +643,57 @@ def test_worker_tool_schemas_advertise_host_native_execution(monkeypatch):
                 "claude",
                 "openclaw",
             ]
+
+    asyncio.run(scenario())
+
+
+def test_tool_descriptions_advertise_mcp_owned_usage_contract(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    server = create_mcp_server(api_client=FakeApiClient())
+
+    public_action_tools = {
+        "projects_list",
+        "project_create",
+        "project_get",
+        "worker_delegate_once",
+        "project_runs",
+        "project_events",
+        "workers_list",
+        "worker_create",
+        "worker_find_or_resume",
+        "worker_get",
+        "worker_live",
+        "worker_run",
+        "worker_message",
+        "worker_pause",
+        "worker_resume",
+        "worker_interrupt",
+        "worker_terminate",
+        "worker_desktop_action",
+        "worker_takeover",
+        "run_get",
+        "metrics_summary",
+    }
+
+    async def scenario():
+        async with Client(server) as client:
+            tools = {tool.name: tool.model_dump() for tool in await client.list_tools()}
+            assert public_action_tools.issubset(set(tools))
+
+            for tool_name in public_action_tools:
+                description = tools[tool_name]["description"]
+                normalized = description.lower()
+                assert "use" in normalized, tool_name
+                assert "return" in normalized, tool_name
+                assert any(marker in normalized for marker in ("do not", "prefer", "only when", "instead")), tool_name
+                assert len(description.split()) >= 20, tool_name
+
+            delegate_description = tools["worker_delegate_once"]["description"]
+            assert "callback_ready=true" in delegate_description
+            assert "do not immediately call worker_live or run_get" in delegate_description
+
+            desktop_description = tools["worker_desktop_action"]["description"]
+            assert "raw desktop URLs are diagnostic" in desktop_description
 
     asyncio.run(scenario())
 

@@ -27,6 +27,21 @@ from .openclaw_runtime import (
 from .terminal_takeover import TerminalTarget
 
 
+_COMPLETION_CONTRACT = (
+    "GlassHive completion contract:\n"
+    "- Do the requested work before reporting completion.\n"
+    "- Your final assistant message MUST end with a separate section exactly named `FINAL REPORT:`.\n"
+    "- Put only the user-facing result after `FINAL REPORT:`. Include the concrete outcome, key facts, artifact/file names when useful, blockers, or the next decision needed.\n"
+    "- If the user requested a very short answer or an exact string, put only that answer after `FINAL REPORT:`.\n"
+    "- Do not put progress narration after `FINAL REPORT:`."
+)
+
+
+def _instruction_with_completion_contract(instruction: str) -> str:
+    body = str(instruction or "").strip()
+    return f"{body}\n\n{_COMPLETION_CONTRACT}" if body else _COMPLETION_CONTRACT
+
+
 class ProfiledWorkerRuntime:
     def __init__(self, base_dir: str | None = None) -> None:
         self.openclaw = OpenClawWorkstationRuntime(base_dir=base_dir)
@@ -965,7 +980,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             command.append("--full-auto")
         if is_resume:
             command.append(existing_session)
-        command.append(instruction)
+        command.append(_instruction_with_completion_contract(instruction))
         env = self._container_env(
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
@@ -1053,7 +1068,8 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         if output_parts:
             return session_key, _select_user_facing_agent_output(output_parts)
         fallback = self._extract_plain_output(stdout, stderr)
-        return session_key, fallback[-4000:]
+        selected = _select_user_facing_agent_output([fallback])
+        return session_key, (selected or fallback)[-4000:]
 
 
 class ClaudeCodeRuntime(BaseCliWorkerRuntime):
@@ -1159,18 +1175,9 @@ class HostNativeCliMixin:
     execution_mode = "host"
     worker_root_name = "host_cli_runtime"
     _host_active_worker_id: str | None = None
-    _completion_contract = (
-        "GlassHive completion contract:\n"
-        "- Do the requested work before reporting completion.\n"
-        "- Your final assistant message MUST end with a separate section exactly named `FINAL REPORT:`.\n"
-        "- Put only the user-facing result after `FINAL REPORT:`. Include the concrete outcome, key facts, artifact/file names when useful, blockers, or the next decision needed.\n"
-        "- If the user requested a very short answer or an exact string, put only that answer after `FINAL REPORT:`.\n"
-        "- Do not put progress narration after `FINAL REPORT:`."
-    )
 
     def _instruction_with_completion_contract(self, instruction: str) -> str:
-        body = str(instruction or "").strip()
-        return f"{body}\n\n{self._completion_contract}" if body else self._completion_contract
+        return _instruction_with_completion_contract(instruction)
 
     def _agent_type(self) -> str:
         if self.runtime_name == "codex-cli":

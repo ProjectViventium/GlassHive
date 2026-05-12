@@ -165,6 +165,22 @@ def test_codex_parser_accepts_inline_final_report_section(tmp_path):
     assert output == "Only this inline result should be posted."
 
 
+def test_codex_parser_strips_plain_resume_final_report(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_plain_final_report",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    stdout = "Progress line that should not reach chat.\nFINAL REPORT:\nMade the background red."
+
+    _, output = runtime._parse_output(worker, stdout, "", runtime._runtime_info(worker))
+
+    assert output == "Made the background red."
+
+
 def test_codex_parser_ignores_agent_message_after_final_report(tmp_path):
     runtime = CodexCliRuntime(base_dir=str(tmp_path))
     worker = {
@@ -588,6 +604,22 @@ def test_docker_cli_runtime_uses_configured_run_timeout(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_RUN_TIMEOUT_SEC", "1200")
 
     assert runtime._run_timeout_sec() == 1200
+
+
+def test_docker_codex_command_appends_completion_contract(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_contract",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+
+    command, _ = runtime._build_command(worker, "Make the page red.", runtime._runtime_info(worker))
+
+    assert command[-1].startswith("Make the page red.")
+    assert "FINAL REPORT:" in command[-1]
 
 
 def test_host_env_strips_parent_secrets_and_keeps_minimal_runtime_context(tmp_path, monkeypatch):
