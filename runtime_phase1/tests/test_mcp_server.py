@@ -174,6 +174,7 @@ def test_server_instructions_advertise_mcp_owned_usage_contract(monkeypatch):
         "worker_delegate_once",
         "callback_ready=true",
         "do not call worker_live",
+        "own voice",
         "should not expose worker/run/provider/queue plumbing",
         "@codex",
         "@claude",
@@ -306,7 +307,12 @@ def test_worker_delegate_once_creates_resumes_and_runs_without_listing(monkeypat
             payload = _tool_json(delegated)
             assert payload["status"] == "dispatched"
             assert payload["callback_ready"] is True
+            assert "user_status" not in payload
+            assert "own voice" in payload["acknowledgement_guidance"]
+            assert "canned template" in payload["acknowledgement_guidance"]
             assert "Do not call worker_live" in payload["main_agent_next_action"]
+            assert payload["delegation_audit"]["title"] == "Host Page Title QA"
+            assert "Open the local QA page" in payload["delegation_audit"]["instruction_preview"]
             assert "project_id" not in payload
             assert "worker_id" not in payload
             assert "run_id" not in payload
@@ -342,6 +348,7 @@ def test_worker_delegate_once_exposes_diagnostics_only_when_requested(monkeypatc
             assert payload["run_id"] == "run_assign"
             assert payload["execution_mode"] == "host"
             assert payload["alias"] == "codex-cli-diagnostic-host-task"
+            assert payload["submitted_instruction"] == "Run a diagnostic host task."
 
     asyncio.run(scenario())
 
@@ -369,6 +376,9 @@ def test_worker_delegate_once_requires_callback_context_by_default(monkeypatch):
             payload = _tool_json(delegated)
             assert payload["status"] == "blocked"
             assert payload["callback_ready"] is False
+            assert "user_status" not in payload
+            assert "own voice" in payload["acknowledgement_guidance"]
+            assert "canned template" in payload["main_agent_next_action"]
             assert "conversation_id" in payload["missing_callback_fields"]
 
     asyncio.run(scenario())
@@ -691,6 +701,8 @@ def test_tool_descriptions_advertise_mcp_owned_usage_contract(monkeypatch):
             delegate_description = tools["worker_delegate_once"]["description"]
             assert "callback_ready=true" in delegate_description
             assert "do not immediately call worker_live or run_get" in delegate_description
+            assert "write your own short acknowledgement" in delegate_description
+            assert "delegation_audit" in delegate_description
 
             desktop_description = tools["worker_desktop_action"]["description"]
             assert "raw desktop URLs are diagnostic" in desktop_description

@@ -148,8 +148,9 @@ def glasshive_workers_server_instructions() -> str:
         "host/browser/desktop/local tasks, prefer worker_delegate_once. It creates or resumes the "
         "project/worker, includes callback/upload context, and queues the run in one call. After "
         "worker_delegate_once returns callback_ready=true, do not call worker_live or run_get in the "
-        "same chat turn unless the user explicitly asks for diagnostics/live status; send one short "
-        "outcome-focused acknowledgement and let the same-chat callback deliver completion, blockers, "
+        "same chat turn unless the user explicitly asks for diagnostics/live status; write one short "
+        "outcome-focused acknowledgement in the assistant's own voice and let the same-chat callback "
+        "deliver completion, blockers, "
         "approvals, and artifacts. After lower-level worker_run, queued only means accepted; do not "
         "report it as done. Preserve the user's success condition and response-format constraints in "
         "worker instructions. User-facing responses should not expose worker/run/provider/queue "
@@ -203,6 +204,26 @@ def _sanitize_context_value(value: str | None) -> str:
     if stripped.startswith("${") and stripped.endswith("}"):
         return ""
     return stripped
+
+
+def _audit_preview(value: str, *, max_chars: int = 700) -> str:
+    text = str(value or "")
+    text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}", r"\1[REDACTED]", text)
+    text = re.sub(
+        r"(?i)((?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s\"']{6,}",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "sk-[REDACTED]", text)
+    text = re.sub(
+        r"(?:~\/|\/Users\/|\/home\/|\/private\/var\/|\/var\/folders\/|[A-Za-z]:\\Users\\)[^\s`'\"<>]+",
+        "[local path]",
+        text,
+    )
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_chars:
+        return f"{text[: max_chars - 3].rstrip()}..."
+    return text
 
 
 def _decode_json_header(value: str | None) -> Any:
@@ -713,8 +734,9 @@ def create_mcp_server(
             "instead of manually listing projects and chaining project_create, worker_create, and worker_run. "
             "It creates a human-named project when project_id is omitted, finds or resumes a worker by alias, "
             "merges callback/upload context, queues the run, and returns one clean dispatch result. "
-            "When callback_ready=true, use the returned user_status and stop the chat turn; do not immediately call worker_live or run_get unless the user explicitly asked for diagnostics or live status. "
+            "When callback_ready=true, write your own short acknowledgement and stop the chat turn; do not immediately call worker_live or run_get unless the user explicitly asked for diagnostics or live status. "
             "Preserve the user's requested final-answer format in the instruction, especially short/exact-answer constraints. "
+            "Use delegation_audit to self-check the dispatched instruction, but do not expose it unless diagnostics were requested. "
             "Use execution_mode='host' for the user's real computer/session and 'docker' for isolated work. "
             "Set expose_diagnostics=true only when the user explicitly asked for run/project/worker diagnostics."
         ),
@@ -757,9 +779,14 @@ def create_mcp_server(
         if require_callback and not callback_ready:
             return {
                 "status": "blocked",
-                "user_status": (
-                    "I can't start that as background work yet because I do not have a reliable way "
-                    "to send the result back here."
+                "acknowledgement_guidance": (
+                    "Explain in your own voice that this cannot be background-dispatched yet, "
+                    "because the callback context is incomplete. Name the missing callback fields "
+                    "without exposing internal worker/run/project ids."
+                ),
+                "main_agent_next_action": (
+                    "Write one short blocked-status reply in your own voice using "
+                    "missing_callback_fields. Do not quote a canned template."
                 ),
                 "execution_mode": resolved_execution_mode,
                 "profile": profile,
@@ -799,12 +826,22 @@ def create_mcp_server(
         run = client.assign_run(worker_id, clean_instruction)
         result: dict[str, Any] = {
             "status": "dispatched",
-            "user_status": "On it - working on that now. I'll send the result here.",
+            "acknowledgement_guidance": (
+                "Write one short acknowledgement in your own voice that the task has started and "
+                "the result will return here. Do not quote a canned template."
+            ),
             "main_agent_next_action": (
-                "Send user_status and stop this chat turn. Do not call worker_live or run_get unless "
+                "Send one short acknowledgement in your own voice and stop this chat turn. Do not "
+                "call worker_live or run_get unless "
                 "the user explicitly asked for diagnostics/live status, or callback_ready is false."
             ),
             "callback_ready": callback_ready,
+            "delegation_audit": {
+                "title": _audit_preview(clean_title, max_chars=180),
+                "goal": _audit_preview(clean_goal, max_chars=360),
+                "instruction_preview": _audit_preview(clean_instruction),
+                "use_for": "self-check only; do not show the user unless diagnostics were requested",
+            },
         }
         if expose_diagnostics:
             result.update(
@@ -816,6 +853,7 @@ def create_mcp_server(
                     "execution_mode": resolved_execution_mode,
                     "profile": profile,
                     "alias": resolved_alias,
+                    "submitted_instruction": clean_instruction,
                 }
             )
         return result
