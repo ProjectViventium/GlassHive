@@ -3,38 +3,34 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="referrer" content="same-origin" />
     <title>GlassHive</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260417a" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260524a" />
   </head>
   <body class="watch-body">
     <div class="watch-app">
       <header class="watch-ribbon">
-        <div class="watch-brand">
-          <span class="brand-mark">GlassHive</span>
-          <div>
+        <span class="brand-mark">GlassHive</span>
+        <div class="watch-main">
+          <div class="watch-title-line">
             <h1 id="watch-title">Workspace live view</h1>
-            <p id="watch-subtitle">Connecting to workspace…</p>
-            <div class="watch-quick-links">
-              <button id="open-project-workspace" class="watch-link-chip" type="button" hidden>Open project workspace</button>
-            </div>
+            <button id="open-project-workspace" class="watch-link-chip" type="button" hidden>Project workspace</button>
           </div>
-        </div>
-        <div class="watch-summary">
-          <span id="status-label" class="meta-label">Live status</span>
-          <button id="result-toggle" class="result-toggle" type="button" aria-expanded="false">
-            <span id="latest-output-inline">No run output yet.</span>
-          </button>
+          <div class="watch-meta-line">
+            <p id="watch-subtitle">Connecting to workspace…</p>
+            <span id="status-label" class="meta-label">Live status</span>
+            <button id="result-toggle" class="result-toggle" type="button" aria-expanded="false">
+              <span id="latest-output-inline">No run output yet.</span>
+            </button>
+          </div>
         </div>
         <div class="watch-controls">
           <span id="watch-state" class="state-pill">starting</span>
-          <button data-action="pause" type="button">Pause</button>
-          <button data-action="resume" type="button">Play</button>
-          <button data-action="interrupt" type="button">Interrupt</button>
-          <button id="menu-toggle" class="menu-toggle" type="button" aria-expanded="false">☰</button>
+          <button id="menu-toggle" class="menu-toggle" type="button" aria-expanded="false" aria-haspopup="menu">☰</button>
         </div>
       </header>
       <section id="result-panel" class="result-panel" hidden>
@@ -47,20 +43,21 @@
         </div>
         <pre id="latest-output-full">No run output yet.</pre>
       </section>
-      <aside id="more-menu" class="more-menu" hidden>
-        <button id="open-project-workspace-menu" type="button">Open project workspace</button>
-        <button id="surface-terminal" type="button">Watch exact live session</button>
-        <button id="surface-desktop" type="button">Watch live desktop</button>
-        <button id="open-external" type="button">Open current view in new tab</button>
-        <button id="open-terminal-link" type="button">Open terminal page</button>
-        <button id="open-worker-console" type="button">Open worker details</button>
-        <button data-action="codex" type="button">Open Codex</button>
-        <button data-action="claude" type="button">Open Claude</button>
-        <button data-action="openclaw" type="button">Open OpenClaw</button>
-        <button data-action="terminal" type="button">Open terminal</button>
-        <button data-action="files" type="button">Open files</button>
-        <button data-action="browser" type="button">Open browser</button>
-        <button data-action="terminate" class="danger" type="button">Shut down and delete</button>
+      <aside id="more-menu" class="more-menu" role="menu" hidden>
+        <button id="open-project-workspace-menu" role="menuitem" type="button">Open project workspace</button>
+        <button id="surface-terminal" role="menuitem" type="button">Watch exact live session</button>
+        <button id="surface-desktop" role="menuitem" type="button">Watch live desktop</button>
+        <button id="open-external" role="menuitem" type="button">Open current view in new tab</button>
+        <button id="open-terminal-link" role="menuitem" type="button">Open terminal page</button>
+        <button id="open-worker-console" role="menuitem" type="button">Open worker details</button>
+        <button data-action="interrupt" role="menuitem" type="button">Interrupt current run</button>
+        <button data-action="codex" role="menuitem" type="button">Open Codex</button>
+        <button data-action="claude" role="menuitem" type="button">Open Claude</button>
+        <button data-action="openclaw" role="menuitem" type="button">Open OpenClaw</button>
+        <button data-action="terminal" role="menuitem" type="button">Open terminal</button>
+        <button data-action="files" role="menuitem" type="button">Open files</button>
+        <button data-action="browser" role="menuitem" type="button">Open browser</button>
+        <button data-action="terminate" role="menuitem" class="danger" type="button">Shut down and delete</button>
       </aside>
       <main class="watch-stage">
         <div id="stage-overlay" class="stage-overlay">
@@ -74,12 +71,20 @@
       </main>
       <footer class="watch-footer">
         <form id="steer-form" class="steer-form">
-          <input
+          <button
+            id="run-toggle"
+            class="run-toggle-button"
+            data-action="pause"
+            aria-label="Pause workspace"
+            aria-pressed="false"
+            type="button"
+          >Pause</button>
+          <textarea
             id="steer-input"
-            type="text"
+            rows="1"
             aria-describedby="steer-guidance"
-            placeholder="Steer the workspace from here. Redirect the plan, ask for a checkpoint, or tell it exactly what to do next. GlassHive will pivot to this direction now."
-          />
+            placeholder="Steer this workspace, ask for a checkpoint, or queue the next step."
+          ></textarea>
           <button
             id="send-button"
             type="submit"
@@ -92,6 +97,6 @@
         </div>
       </footer>
     </div>
-    <script src="/static/watch.js?v=20260417a" type="module"></script>
+    <script src="/static/watch.js?v=20260524a" type="module"></script>
   </body>
 </html>

@@ -1,5 +1,6 @@
 const workerId = window.location.pathname.split('/').filter(Boolean).at(-1);
-const runtimeBase = `${window.location.protocol}//${window.location.hostname}:8766`;
+const params = new URLSearchParams(window.location.search);
+const signedToken = params.get('gh_token') || '';
 
 const stage = document.getElementById('desktop-stage');
 const overlay = document.getElementById('desktop-overlay');
@@ -13,6 +14,12 @@ let currentPassword = '';
 let clipboardInterval = null;
 let lastLocalClipboard = '';
 let lastRemoteClipboard = '';
+let rfbImportAttempt = 0;
+
+function withAuth(url) {
+  if (!signedToken) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}gh_token=${encodeURIComponent(signedToken)}`;
+}
 
 function setStatus(title, detail, { hideOverlay = false } = {}) {
   statusEl.textContent = title;
@@ -88,26 +95,24 @@ function installClipboardSync() {
 }
 
 async function connectDesktop() {
-  const response = await fetch(`/api/worker/${workerId}/live`);
+  const response = await fetch(withAuth(`/api/worker/${workerId}/live`));
   if (!response.ok) {
     setStatus('Desktop unavailable', 'GlassHive could not load the worker runtime details for this sandbox.');
     return;
   }
   const data = await response.json();
   const runtime = data.runtime_details || {};
-  const viewUrl = String(runtime.view_url || '').trim();
+  const viewAvailable = Boolean(runtime.view_available || runtime.view_url);
   buildDesktopTitle(data.worker?.name, data.project_title);
 
-  if (!viewUrl) {
+  if (!viewAvailable) {
     setStatus('Desktop unavailable', 'This worker does not currently expose a live desktop surface.');
     return;
   }
 
-  const parsed = new URL(viewUrl);
-  const wsScheme = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsPath = parsed.searchParams.get('path') || 'websockify';
-  const wsUrl = `${wsScheme}//${parsed.host}/${wsPath}`;
-  const password = parsed.searchParams.get('password') || '';
+  const wsScheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${wsScheme}//${window.location.host}${withAuth(`/novnc/${workerId}/websockify`)}`;
+  const password = '';
 
   if (rfb && wsUrl === currentWsUrl && password === currentPassword) {
     return;
@@ -118,8 +123,19 @@ async function connectDesktop() {
 
   setStatus('Attaching live sandbox…', 'GlassHive is connecting directly to the worker desktop and enabling clipboard sync.');
 
-  const modulePath = `/novnc/${workerId}/core/rfb.js`;
-  const { default: RFB } = await import(modulePath);
+  const modulePath = withAuth(`/novnc/${workerId}/core/rfb.js?attempt=${rfbImportAttempt}`);
+  let RFB;
+  try {
+    ({ default: RFB } = await import(modulePath));
+  } catch (error) {
+    rfbImportAttempt += 1;
+    setStatus(
+      'Desktop reconnecting…',
+      'GlassHive is refreshing the live desktop client and will attach again automatically.',
+    );
+    console.debug('rfb import failed', error);
+    return;
+  }
 
   if (rfb) {
     try {

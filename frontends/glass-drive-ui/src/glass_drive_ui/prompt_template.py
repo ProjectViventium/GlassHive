@@ -34,7 +34,7 @@ def build_operator_brief(description: str, success_criteria: str, context: str |
         "- Do not rely on a background server surviving across separate tool calls unless you have verified that it stays alive.\n"
         "- When a success criterion requires visual or HTTP verification, perform the verification explicitly and include the concrete result in the final output.\n"
         "- If the deliverable is a webpage, landing page, app, or browser-visible result, open the final result inside the sandbox browser before declaring success and leave it visible for the operator.\n"
-        "- For simple static webpage deliverables, prefer opening the final HTML file directly in the sandbox browser instead of starting a temporary localhost preview server.\n"
+        "- For static webpage deliverables, verify through a localhost HTTP preview server when the browser/tooling does not support file:// URLs; shut down temporary servers unless the final result needs to remain visible.\n"
         "- If a local preview server is required for the final browser result, keep that preview server running in the sandbox at completion and report the URL you verified.\n"
         "- If you need irreversible external actions, risky writes, missing credentials, or human judgment, pause and surface the exact blocker.\n"
         "- Stay concise in progress reporting, but do the work thoroughly.\n"

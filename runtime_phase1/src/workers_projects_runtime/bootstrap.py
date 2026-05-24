@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import shlex
@@ -9,6 +12,78 @@ from typing import Any, Callable
 
 JsonDict = dict[str, Any]
 DEFAULT_BOOTSTRAP_SOURCE_MAX_BYTES = 25 * 1024 * 1024
+BOOTSTRAP_SOURCE_TOKEN_KEY = "source_path_token"
+DEFAULT_ENTERPRISE_WORKER_ENV_KEYS = {
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_URL",
+    "PORTKEY_API_KEY",
+    "PORTKEY_BASE_URL",
+    "PORTKEY_PROVIDER",
+    "PORTKEY_VIRTUAL_KEY",
+    "PORTKEY_CONFIG",
+    "WPR_CLAUDE_CODE_USE_API_KEY",
+}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on", "enabled"}
+
+
+def _enterprise_mode_enabled() -> bool:
+    return _env_flag("GLASSHIVE_ENTERPRISE_MODE") or _env_flag("WPR_ENTERPRISE_MODE")
+
+
+def _bootstrap_source_secret() -> str:
+    for name in ("GLASSHIVE_BOOTSTRAP_SOURCE_SECRET", "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "WPR_API_TOKEN"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _canonical_source_for_token(source: Path | str) -> str:
+    return os.fspath(Path(os.path.abspath(os.fspath(Path(source).expanduser()))))
+
+
+def sign_bootstrap_source_path(source: Path | str, *, tenant_id: str | None = None, owner_id: str | None = None) -> str:
+    secret = _bootstrap_source_secret()
+    if not secret:
+        return ""
+    message = "\0".join(
+        (
+            "v1",
+            _canonical_source_for_token(source),
+            str(tenant_id or ""),
+            str(owner_id or ""),
+        )
+    )
+    digest = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"v1:{digest}"
+
+
+def _source_token_is_valid(entry: dict[str, Any], source: Path | str, worker: dict[str, Any]) -> bool:
+    expected = sign_bootstrap_source_path(
+        source,
+        tenant_id=str(worker.get("tenant_id") or ""),
+        owner_id=str(worker.get("owner_id") or ""),
+    )
+    token = str(entry.get(BOOTSTRAP_SOURCE_TOKEN_KEY) or "").strip()
+    return bool(expected and token and hmac.compare_digest(token, expected))
+
+
+def _worker_env_allowlist() -> set[str]:
+    raw = os.environ.get("GLASSHIVE_WORKER_ENV_ALLOWLIST", "").strip()
+    if not raw:
+        return set(DEFAULT_ENTERPRISE_WORKER_ENV_KEYS)
+    values = {item.strip() for item in raw.split(",") if item.strip()}
+    return values | DEFAULT_ENTERPRISE_WORKER_ENV_KEYS
 
 
 def bootstrap_profile_for(worker: dict[str, Any], runtime_name: str) -> str:
@@ -38,13 +113,24 @@ def bootstrap_bundle_for(worker: dict[str, Any]) -> JsonDict:
 def bootstrap_env_for(worker: dict[str, Any]) -> dict[str, str]:
     bundle = bootstrap_bundle_for(worker)
     raw = bundle.get("env")
+    enterprise = _enterprise_mode_enabled()
+    allowed = _worker_env_allowlist() if enterprise else None
     if not isinstance(raw, dict):
-        return {}
-    env: dict[str, str] = {}
-    for key, value in raw.items():
-        if value is None:
-            continue
-        env[str(key)] = str(value)
+        env = {}
+    else:
+        env = {}
+        for key, value in raw.items():
+            if value is None:
+                continue
+            env_key = str(key)
+            if allowed is not None and env_key not in allowed:
+                continue
+            env[env_key] = str(value)
+    if _env_flag("GLASSHIVE_PROJECT_PROVIDER_ENV", default=enterprise):
+        for key in _worker_env_allowlist():
+            value = os.environ.get(key)
+            if value and key not in env:
+                env[key] = value
     return env
 
 
@@ -60,7 +146,7 @@ def apply_bootstrap(
     profile = bootstrap_profile_for(worker, runtime_name)
     bundle = bootstrap_bundle_for(worker)
 
-    if profile not in {"clean-room", "none"}:
+    if profile not in {"clean-room", "none"} and not _enterprise_mode_enabled():
         if profile in {"host-login", "full-local", "codex-host"} or runtime_name in {"codex-cli", "openclaw"}:
             copy_file(Path.home() / ".codex" / "auth.json", home_dir / ".codex" / "auth.json")
         if profile in {"host-login", "full-local", "claude-host"} or runtime_name in {"claude-code", "openclaw"}:
@@ -73,7 +159,7 @@ def apply_bootstrap(
             copy_file(Path.home() / ".gitconfig", home_dir / ".gitconfig")
 
     _write_runtime_env(home_dir, bootstrap_env_for(worker))
-    _write_project_files(home_dir, workspace_dir, bundle, copy_file, copy_tree)
+    _write_project_files(home_dir, workspace_dir, bundle, worker, copy_file, copy_tree)
     _write_claude_project_files(workspace_dir, bundle)
     _write_codex_config(home_dir, bundle)
     _write_manifest(home_dir, profile, bundle)
@@ -206,6 +292,7 @@ def _write_project_files(
     home_dir: Path,
     workspace_dir: Path,
     bundle: JsonDict,
+    worker: dict[str, Any],
     copy_file: Callable[[Path, Path], None],
     copy_tree: Callable[[Path, Path], None],
 ) -> None:
@@ -226,6 +313,13 @@ def _write_project_files(
         root = home_dir if scope == "home" else workspace_dir
         target = root / _safe_relative_path(rel_path)
         target.parent.mkdir(parents=True, exist_ok=True)
+        if str(entry.get("encoding") or "").strip().lower() == "base64" or "content_base64" in entry:
+            raw = str(entry.get("content_base64") or entry.get("content") or "")
+            try:
+                target.write_bytes(base64.b64decode(raw, validate=True))
+            except Exception as exc:
+                raise ValueError(f"Invalid base64 bootstrap content for {rel_path}") from exc
+            continue
         if "content" in entry:
             target.write_text(str(entry.get("content") or ""))
             continue
@@ -233,6 +327,8 @@ def _write_project_files(
         if source is None:
             target.write_text("")
             continue
+        if _enterprise_mode_enabled() and not _source_token_is_valid(entry, source, worker):
+            raise PermissionError("Bootstrap source_path is not authorized for this enterprise user")
         source = resolve_bootstrap_source_path(source)
         if not source.exists():
             raise FileNotFoundError(f"Bootstrap source file not found: {source}")

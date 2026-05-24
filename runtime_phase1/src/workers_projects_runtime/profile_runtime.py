@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import logging
 import os
 import re
 import secrets
@@ -26,6 +28,8 @@ from .openclaw_runtime import (
 )
 from .terminal_takeover import TerminalTarget
 
+
+logger = logging.getLogger(__name__)
 
 _COMPLETION_CONTRACT = (
     "GlassHive completion contract:\n"
@@ -70,8 +74,8 @@ class ProfiledWorkerRuntime:
             str(worker.get("execution_mode") or "docker"),
         )
 
-    def resolve_model(self, profile: str) -> str:
-        return self._runtime_for_profile(profile).resolve_model(profile)
+    def resolve_model(self, profile: str, execution_mode: str = "docker") -> str:
+        return self._runtime_for_profile(profile, execution_mode).resolve_model(profile)
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).ensure_worker_ready(worker)
@@ -173,6 +177,9 @@ class BaseCliWorkerRuntime:
 
     def _default_session_key(self, worker: dict) -> str | None:
         return worker.get("session_key") or f"worker:{worker['worker_id']}"
+
+    def _instruction_with_completion_contract(self, instruction: str) -> str:
+        return _instruction_with_completion_contract(instruction)
 
     def _worker_root(self, worker_id: str) -> Path:
         return self.sandbox.paths(worker_id)["worker_root"]
@@ -369,6 +376,7 @@ class BaseCliWorkerRuntime:
                 )
             except Exception:
                 pass
+            self._clear_active_session(worker_id)
         with self._process_lock:
             process = self._active_processes.get(worker_id)
         if not process or process.poll() is not None:
@@ -404,7 +412,8 @@ class BaseCliWorkerRuntime:
         )
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
-        sandbox = self.sandbox.ensure_ready(worker, self.runtime_name)
+        fast_sandbox = getattr(self.sandbox, "fast_sandbox_from_worker", lambda _worker: None)(worker)
+        sandbox = fast_sandbox or self.sandbox.ensure_ready(worker, self.runtime_name)
         return self._runtime_info(worker, pid=sandbox.pid)
 
     def pause_worker(self, worker: dict) -> RuntimeInfo:
@@ -445,16 +454,40 @@ class BaseCliWorkerRuntime:
         exit_path: Path,
         timeout_sec: float | None,
         run_id: str | None = None,
+        stdout_path: Path | None = None,
     ) -> int:
         deadline = time.monotonic() + float(timeout_sec) if timeout_sec and timeout_sec > 0 else None
+        completed_seen_at: float | None = None
+        early_grace_sec = self._early_completion_grace_sec()
+        raw_inspect_interval = os.environ.get("WPR_RUN_WAIT_INSPECT_INTERVAL_SEC", "10").strip()
+        try:
+            inspect_interval_sec = max(float(raw_inspect_interval), 0.0) if raw_inspect_interval else 10.0
+        except ValueError:
+            inspect_interval_sec = 10.0
+        next_inspect_at = 0.0
+        paused = False
         while True:
             if exit_path.exists():
                 try:
                     return int(exit_path.read_text().strip() or "0")
                 except ValueError:
                     return 1
-            sandbox = self.sandbox.inspect(worker_id)
-            if sandbox and sandbox.state == "paused":
+            if stdout_path and self._stdout_has_complete_response(stdout_path):
+                now = time.monotonic()
+                if completed_seen_at is None:
+                    completed_seen_at = now
+                elif now - completed_seen_at >= early_grace_sec:
+                    exit_path.write_text("0")
+                    self._stop_active_process(worker_id, run_id=run_id)
+                    return 0
+            else:
+                completed_seen_at = None
+            now = time.monotonic()
+            if inspect_interval_sec == 0 or now >= next_inspect_at:
+                sandbox = self.sandbox.inspect(worker_id)
+                paused = bool(sandbox and sandbox.state == "paused")
+                next_inspect_at = now + inspect_interval_sec
+            if paused:
                 time.sleep(0.25)
                 continue
             time.sleep(0.25)
@@ -463,6 +496,23 @@ class BaseCliWorkerRuntime:
         self._note_stop_reason(worker_id, "terminated", run_id=run_id)
         self._stop_active_process(worker_id, run_id=run_id)
         raise RuntimeErrorBase(f"{self.runtime_name} timed out after {timeout_sec}s")
+
+    def _early_completion_grace_sec(self) -> float:
+        raw = (
+            os.environ.get("GLASSHIVE_EARLY_COMPLETION_GRACE_SEC", "").strip()
+            or os.environ.get("WPR_EARLY_COMPLETION_GRACE_SEC", "").strip()
+        )
+        if not raw:
+            return 1.5
+        try:
+            parsed = float(raw)
+        except ValueError:
+            return 1.5
+        return max(parsed, 0.0)
+
+    def _stdout_has_complete_response(self, stdout_path: Path) -> bool:
+        _ = stdout_path
+        return False
 
     def _run_timeout_sec(self, timeout_sec: float | None = None) -> float | None:
         raw = (
@@ -519,7 +569,6 @@ class BaseCliWorkerRuntime:
         url: str | None = None,
         run_id: str | None = None,
     ) -> dict[str, object]:
-        self.ensure_worker_ready(worker)
         session_name = self._session_name_for_run_id(run_id) if action == "terminal" and run_id else None
         launched = self.sandbox.desktop_action(
             worker["worker_id"],
@@ -574,10 +623,16 @@ class BaseCliWorkerRuntime:
         if not active_session:
             return None
         exit_path = Path(str(active_session.get("exit_path") or "").strip())
-        if not exit_path.exists():
-            return None
         stdout_path = Path(str(active_session.get("stdout_path") or "").strip())
         stderr_path = Path(str(active_session.get("stderr_path") or "").strip())
+        if not exit_path.exists():
+            if not self._stdout_has_complete_response(stdout_path):
+                return None
+            try:
+                exit_path.write_text("0")
+            except OSError:
+                return None
+            self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
         stdout = stdout_path.read_text() if stdout_path.exists() else ""
         stderr = stderr_path.read_text() if stderr_path.exists() else ""
         try:
@@ -617,14 +672,19 @@ class BaseCliWorkerRuntime:
             raise WorkerTerminatedError("Worker was terminated while a run was active")
 
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
-        info = self.ensure_worker_ready(worker)
-        command, env = self._build_command(worker, instruction, info)
-        stdout_path, stderr_path = self._log_paths(worker["worker_id"])
+        effective_run_id = (run_id or secrets.token_hex(8)).strip()
+        worker_for_run = {
+            **worker,
+            "_active_run_id": effective_run_id,
+            "_glasshive_task_run": True,
+        }
+        info = self.ensure_worker_ready(worker_for_run)
+        command, env = self._build_command(worker_for_run, instruction, info)
+        stdout_path, stderr_path = self._log_paths(worker_for_run["worker_id"])
         with stderr_path.open("a") as handle:
             handle.write(f"$ {self.runtime_name} {shlex.join(command)}\n")
 
-        effective_run_id = (run_id or secrets.token_hex(8)).strip()
-        run_root = self._run_root(worker["worker_id"], effective_run_id)
+        run_root = self._run_root(worker_for_run["worker_id"], effective_run_id)
         run_root.mkdir(parents=True, exist_ok=True)
 
         host_stdout = run_root / "stdout.log"
@@ -646,12 +706,18 @@ class BaseCliWorkerRuntime:
                 f"mkdir -p {shlex.quote(container_run_root)}",
                 (
                     "write_exit() { "
+                    f"if [ ! -f {shlex.quote(container_exit)} ]; then "
                     f"printf '%s' \"$1\" > {shlex.quote(container_exit)}; "
+                    "fi; "
                     "}"
                 ),
                 "abort_run() { write_exit \"${1:-130}\"; exit \"${1:-130}\"; }",
                 "trap 'abort_run 130' HUP INT TERM",
                 f"cd {shlex.quote(self.sandbox.workspace_mount)} || exit 1",
+                f"export GLASSHIVE_ACTIVE_RUN_ID={shlex.quote(effective_run_id)}",
+                f"export GLASSHIVE_ACTIVE_WORKER_ID={shlex.quote(worker_for_run['worker_id'])}",
+                'if [ -f "$HOME/.glasshive/runtime.env" ]; then set -a; source "$HOME/.glasshive/runtime.env"; set +a; fi',
+                'if [ -f "$HOME/.wpr-openclaw/openclaw.env" ]; then set -a; source "$HOME/.wpr-openclaw/openclaw.env"; set +a; fi',
                 f"{shlex.join(command)} > >(tee -a {shlex.quote(container_stdout)}) 2> >(tee -a {shlex.quote(container_stderr)} >&2)",
                 "status=$?",
                 "write_exit \"$status\"",
@@ -661,22 +727,28 @@ class BaseCliWorkerRuntime:
         )
         host_script.write_text(script + "\n")
         host_script.chmod(0o755)
+        self.sandbox.ensure_container_writable_paths(
+            worker_for_run["worker_id"],
+            self.runtime_name,
+            [container_run_root],
+            worker=worker_for_run,
+        )
 
-        self._stop_active_process(worker["worker_id"])
+        self._stop_active_process(worker_for_run["worker_id"], worker=worker_for_run)
         start_result = self.sandbox.start_screen_session(
-            worker["worker_id"],
+            worker_for_run["worker_id"],
             self.runtime_name,
             session_name,
             ["bash", "--noprofile", "--norc", container_script],
             env=env,
-            worker=worker,
+            worker=worker_for_run,
         )
         if start_result.returncode != 0:
             detail = (start_result.stderr or start_result.stdout or "").strip()[-1600:]
             raise RuntimeErrorBase(f"Failed to start attached {self.runtime_name} session: {detail}")
 
         self._write_active_session(
-            worker["worker_id"],
+            worker_for_run["worker_id"],
             {
                 "session_name": session_name,
                 "run_id": effective_run_id,
@@ -687,10 +759,17 @@ class BaseCliWorkerRuntime:
         )
 
         exit_code = self._wait_for_exit_code(
-            worker["worker_id"],
+            worker_for_run["worker_id"],
             host_exit,
             self._run_timeout_sec(timeout_sec),
             run_id=effective_run_id,
+            stdout_path=host_stdout,
+        )
+        self.sandbox.ensure_container_writable_paths(
+            worker_for_run["worker_id"],
+            self.runtime_name,
+            [self.sandbox.workspace_mount, container_run_root],
+            worker=worker_for_run,
         )
         stdout = host_stdout.read_text() if host_stdout.exists() else ""
         stderr = host_stderr.read_text() if host_stderr.exists() else ""
@@ -706,15 +785,15 @@ class BaseCliWorkerRuntime:
                 if not stderr.endswith("\n"):
                     handle.write("\n")
 
-        self._finalize_stop_reason(worker["worker_id"], run_id=effective_run_id)
+        self._finalize_stop_reason(worker_for_run["worker_id"], run_id=effective_run_id)
 
         if exit_code != 0:
             detail = (stderr or stdout or "").strip()[-2000:]
             raise RuntimeErrorBase(f"{self.runtime_name} exited with code {exit_code}: {detail}")
 
-        session_key, output = self._parse_output(worker, stdout, stderr, info)
+        session_key, output = self._parse_output(worker_for_run, stdout, stderr, info)
         if session_key:
-            self._write_session_key(worker["worker_id"], session_key)
+            self._write_session_key(worker_for_run["worker_id"], session_key)
         return output.strip()
 
 
@@ -735,6 +814,11 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
         return defaults.get(profile, defaults["openclaw-general"])
 
     def _preferred_general_model(self) -> str:
+        if self._compatible_provider_base_url():
+            for env_name in ("OPENAI_MODELS", "WPR_MODEL_CODEX_CLI", "OTUC_LLM_MODEL"):
+                configured = str(os.environ.get(env_name, "")).strip()
+                if configured:
+                    return configured.split(",", 1)[0].strip()
         if os.environ.get("OPENAI_API_KEY", "").strip():
             return "openai/gpt-5.2"
         if os.environ.get("ANTHROPIC_API_KEY", "").strip():
@@ -746,7 +830,120 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
         return "openai/gpt-5.2"
 
     def _default_session_key(self, worker: dict) -> str | None:
-        return self._read_session_key(worker["worker_id"]) or worker.get("session_key") or f"agent:main:wpr:worker:{worker['worker_id']}"
+        scope = os.environ.get("WPR_OPENCLAW_SESSION_SCOPE", "worker").strip().lower()
+        run_id = str(worker.get("_active_run_id") or "").strip()
+        if scope in {"run", "per-run", "per_run"} and run_id:
+            return f"wpr-worker-{worker['worker_id']}-{run_id}"
+        candidate = str(self._read_session_key(worker["worker_id"]) or worker.get("session_key") or "").strip()
+        if candidate and re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", candidate):
+            return candidate
+        return f"wpr-worker-{worker['worker_id']}"
+
+    def _env_flag(self, name: str, default: bool = False) -> bool:
+        raw = str(os.environ.get(name, "")).strip().lower()
+        if not raw:
+            return default
+        return raw in {"1", "true", "yes", "on", "enabled"}
+
+    def _compatible_provider_base_url(self) -> str:
+        return (
+            os.environ.get("WPR_OPENCLAW_BASE_URL", "").strip()
+            or os.environ.get("OPENAI_BASE_URL", "").strip()
+            or os.environ.get("OPENAI_API_BASE", "").strip()
+            or os.environ.get("OPENAI_REVERSE_PROXY", "").strip()
+            or os.environ.get("PORTKEY_BASE_URL", "").strip()
+        ).rstrip("/")
+
+    def _compatible_provider_enabled(self) -> bool:
+        if self._env_flag("WPR_OPENCLAW_DISABLE_CUSTOM_PROVIDER", False):
+            return False
+        if self._env_flag("WPR_OPENCLAW_USE_CUSTOM_PROVIDER", False):
+            return True
+        return bool(self._compatible_provider_base_url())
+
+    def _compatible_provider_id(self) -> str:
+        default = "glasshive-portkey-compatible" if self._compatible_provider_env_key() == "PORTKEY_API_KEY" else "glasshive-openai-compatible"
+        raw = os.environ.get("WPR_OPENCLAW_MODEL_PROVIDER", default).strip()
+        provider_id = re.sub(r"[^a-zA-Z0-9_-]+", "-", raw).strip("-_").lower()
+        return provider_id or default
+
+    def _compatible_provider_env_key(self) -> str:
+        configured = os.environ.get("WPR_OPENCLAW_ENV_KEY", "").strip()
+        if configured:
+            return configured
+        if os.environ.get("PORTKEY_BASE_URL", "").strip() and not (
+            os.environ.get("OPENAI_BASE_URL", "").strip()
+            or os.environ.get("OPENAI_API_BASE", "").strip()
+            or os.environ.get("OPENAI_REVERSE_PROXY", "").strip()
+            or os.environ.get("WPR_OPENCLAW_BASE_URL", "").strip()
+        ):
+            return "PORTKEY_API_KEY"
+        return "OPENAI_API_KEY"
+
+    def _compatible_provider_wire_api(self) -> str:
+        return os.environ.get("WPR_OPENCLAW_WIRE_API", "openai-completions").strip() or "openai-completions"
+
+    def _compatible_model_local_id(self, model: str) -> str:
+        configured = os.environ.get("WPR_OPENCLAW_MODEL_ID", "").strip()
+        if configured:
+            return configured
+        provider_id = self._compatible_provider_id()
+        if model.startswith(f"{provider_id}/"):
+            return model[len(provider_id) + 1 :]
+        if self._compatible_provider_env_key() != "PORTKEY_API_KEY" and (
+            model.startswith("openai/") or model.startswith("openai-codex/")
+        ):
+            return model.split("/", 1)[1]
+        return model
+
+    def _openclaw_model_for_worker(self, worker: dict) -> str:
+        model = str(worker.get("model") or self.resolve_model(worker.get("profile", "openclaw-general"))).strip()
+        if not model or not self._compatible_provider_enabled() or not self._compatible_provider_base_url():
+            return model
+        provider_id = self._compatible_provider_id()
+        if model.startswith(f"{provider_id}/"):
+            return model
+        return f"{provider_id}/{self._compatible_model_local_id(model)}"
+
+    def _compatible_provider_config(self, model: str) -> dict[str, object] | None:
+        if not self._compatible_provider_enabled():
+            return None
+        base_url = self._compatible_provider_base_url()
+        if not base_url:
+            return None
+        local_model = self._compatible_model_local_id(model)
+        env_key = self._compatible_provider_env_key()
+        provider: dict[str, object] = {
+            "baseUrl": base_url,
+            "apiKey": {"source": "env", "provider": "default", "id": env_key},
+            "api": self._compatible_provider_wire_api(),
+            "authHeader": True,
+            "timeoutSeconds": int(os.environ.get("WPR_OPENCLAW_PROVIDER_TIMEOUT_SECONDS", "300")),
+            "models": [
+                {
+                    "id": local_model,
+                    "name": os.environ.get("WPR_OPENCLAW_MODEL_NAME", local_model).strip() or local_model,
+                    "api": self._compatible_provider_wire_api(),
+                    "reasoning": self._env_flag("WPR_OPENCLAW_MODEL_REASONING", False),
+                    "input": ["text", "image"] if self._env_flag("WPR_OPENCLAW_MODEL_IMAGE_INPUT", False) else ["text"],
+                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                    "contextWindow": int(os.environ.get("WPR_OPENCLAW_CONTEXT_WINDOW", "128000")),
+                    "maxTokens": int(os.environ.get("WPR_OPENCLAW_MAX_TOKENS", "32000")),
+                }
+            ],
+        }
+        headers: dict[str, object] = {}
+        if env_key == "PORTKEY_API_KEY":
+            for env_name, header_name in (
+                ("PORTKEY_VIRTUAL_KEY", "x-portkey-virtual-key"),
+                ("PORTKEY_CONFIG", "x-portkey-config"),
+                ("PORTKEY_PROVIDER", "x-portkey-provider"),
+            ):
+                if os.environ.get(env_name, "").strip():
+                    headers[header_name] = {"source": "env", "provider": "default", "id": env_name}
+        if headers:
+            provider["headers"] = headers
+        return provider
 
     def _openclaw_root(self, worker_id: str) -> Path:
         return self._home_dir(worker_id) / ".wpr-openclaw"
@@ -778,10 +975,18 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
     def _write_gateway_config(self, worker: dict, token: str) -> None:
         worker_id = worker["worker_id"]
         self._ensure_openclaw_dirs(worker_id)
-        model = worker.get("model") or self.resolve_model(worker.get("profile", "openclaw-general"))
+        model = self._openclaw_model_for_worker(worker)
         config = {
+            "gateway": {
+                "mode": "local",
+                "bind": "loopback",
+                "port": self.gateway_container_port,
+                "auth": {"mode": "none"},
+            },
             "agents": {
                 "defaults": {
+                    "workspace": self.sandbox.workspace_mount,
+                    "repoRoot": self.sandbox.workspace_mount,
                     "model": {"primary": model},
                     "cliBackends": {
                         "claude-cli": {"command": "claude"},
@@ -800,6 +1005,12 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
             },
             "plugins": {"enabled": True},
         }
+        provider_config = self._compatible_provider_config(model)
+        if provider_config:
+            config["models"] = {
+                "mode": "merge",
+                "providers": {self._compatible_provider_id(): provider_config},
+            }
         self._openclaw_config_path(worker_id).write_text(json.dumps(config, indent=2))
         env_lines = [
             f"export OPENCLAW_STATE_DIR={shlex.quote(self._container_openclaw_state_dir())}",
@@ -808,6 +1019,64 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
             f"export OPENCLAW_SESSION_ID={shlex.quote(self._default_session_key(worker) or worker_id)}",
         ]
         self._openclaw_env_path(worker_id).write_text("\n".join(env_lines) + "\n")
+
+    def _gateway_enabled(self) -> bool:
+        return self._env_flag("WPR_OPENCLAW_START_GATEWAY", False)
+
+    def _gateway_env(self, worker: dict) -> dict[str, str]:
+        env = self._sandbox_env()
+        env["OPENCLAW_STATE_DIR"] = self._container_openclaw_state_dir()
+        env["OPENCLAW_CONFIG_PATH"] = self._container_openclaw_config_path()
+        env["OPENCLAW_MODEL"] = self._openclaw_model_for_worker(worker)
+        env["OPENCLAW_SESSION_ID"] = self._default_session_key(worker) or worker["worker_id"]
+        return env
+
+    def _start_openclaw_gateway(self, worker: dict, sandbox: object) -> None:
+        if worker.get("_glasshive_task_run"):
+            return
+        if not self._gateway_enabled():
+            return
+        env = self._gateway_env(worker)
+        result = self.sandbox.start_screen_session(
+            worker["worker_id"],
+            self.runtime_name,
+            "openclaw-gateway",
+            [
+                "bash",
+                "-lc",
+                (
+                    f"openclaw gateway --port {self.gateway_container_port} --bind loopback "
+                    "--auth none --allow-unconfigured --force"
+                ),
+            ],
+            env=env,
+            worker=worker,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[-500:]
+            logger.warning("OpenClaw gateway screen session failed for %s: %s", worker.get("worker_id"), detail)
+            return
+        container_name = str(getattr(sandbox, "container_name", "") or "")
+        if not container_name:
+            return
+        wait_result = self.sandbox._docker_exec(
+            container_name,
+            [
+                "bash",
+                "-lc",
+                (
+                    f"for i in $(seq 1 20); do "
+                    f"(echo >/dev/tcp/127.0.0.1/{self.gateway_container_port}) >/dev/null 2>&1 && exit 0; "
+                    "sleep 0.25; "
+                    "done; exit 1"
+                ),
+            ],
+            env=env,
+            cwd=self.sandbox.workspace_mount,
+        )
+        if wait_result.returncode != 0:
+            detail = (wait_result.stderr or wait_result.stdout or "").strip()[-500:]
+            logger.warning("OpenClaw gateway did not become ready for %s: %s", worker.get("worker_id"), detail)
 
     def _sandbox_env(self) -> dict[str, str]:
         env = self._container_env(*_PROVIDER_ENV_KEYS)
@@ -822,7 +1091,7 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
             self._write_session_key(worker["worker_id"], session_key)
         return RuntimeInfo(
             runtime=self.runtime_name,
-            model=worker.get("model") or self.resolve_model(worker.get("profile", "openclaw-general")),
+            model=self._openclaw_model_for_worker(worker),
             gateway_url="",
             gateway_port=None,
             gateway_token=None,
@@ -832,9 +1101,46 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
             pid=pid,
         )
 
+    def _neutralize_default_openclaw_bootstrap(self, worker: dict) -> None:
+        bootstrap_path = self._workspace_dir(worker["worker_id"]) / "BOOTSTRAP.md"
+        task_mode_text = "\n".join(
+            [
+                "# GlassHive Task Mode",
+                "",
+                "This workspace is running an assigned GlassHive task.",
+                "Follow the latest runtime-provided instruction, success criteria, and AGENTS.md.",
+                "Do not start first-run identity onboarding unless the operator explicitly asks for it.",
+                "For local browser verification, prefer localhost HTTP URLs over file:// URLs because some worker browser tools block local file protocols.",
+                "",
+            ]
+        )
+        if not bootstrap_path.exists():
+            bootstrap_path.parent.mkdir(parents=True, exist_ok=True)
+            bootstrap_path.write_text(task_mode_text)
+            return
+        try:
+            text = bootstrap_path.read_text(errors="ignore")
+        except OSError:
+            return
+        default_markers = (
+            "# BOOTSTRAP.md - Hello, World",
+            "You just woke up. Time to figure out who you are.",
+            'Start with something like:\n\n> "Hey. I just came online. Who am I? Who are you?"',
+        )
+        if not all(marker in text for marker in default_markers):
+            return
+        archive_dir = bootstrap_path.parent / ".glasshive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = archive_dir / "archived-openclaw-default-bootstrap.md"
+        if not archive_path.exists():
+            archive_path.write_text(text)
+        bootstrap_path.write_text(task_mode_text)
+
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
-        sandbox = self.sandbox.ensure_ready(worker, self.runtime_name)
+        fast_sandbox = getattr(self.sandbox, "fast_sandbox_from_worker", lambda _worker: None)(worker)
+        sandbox = fast_sandbox or self.sandbox.ensure_ready(worker, self.runtime_name)
         self._write_gateway_config(worker, self._gateway_token(worker))
+        self._start_openclaw_gateway(worker, sandbox)
         return self._runtime_info(worker, pid=sandbox.pid)
 
     def pause_worker(self, worker: dict) -> RuntimeInfo:
@@ -865,10 +1171,11 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_id = info.session_key or self._default_session_key(worker) or f"agent:main:wpr:worker:{worker['worker_id']}"
+        self._neutralize_default_openclaw_bootstrap(worker)
         env = self._sandbox_env()
         env["OPENCLAW_STATE_DIR"] = self._container_openclaw_state_dir()
         env["OPENCLAW_CONFIG_PATH"] = self._container_openclaw_config_path()
-        env["OPENCLAW_MODEL"] = worker.get("model") or self.resolve_model(worker.get("profile", "openclaw-general"))
+        env["OPENCLAW_MODEL"] = self._openclaw_model_for_worker(worker)
         command = [
             "openclaw",
             "agent",
@@ -876,44 +1183,83 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
             "--session-id",
             session_id,
             "-m",
-            instruction,
+            self._instruction_with_completion_contract(instruction),
             "--json",
         ]
         return command, env
+
+    def _openclaw_json_payload(self, raw: str) -> dict[str, object]:
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start < 0 or end < start:
+                return {}
+            try:
+                value = json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                return {}
+        return value if isinstance(value, dict) else {}
+
+    def _openclaw_final_text(self, data: dict[str, object]) -> str:
+        direct = str(data.get("finalAssistantVisibleText") or data.get("finalAssistantRawText") or "").strip()
+        if direct:
+            return direct
+        meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+        return str(meta.get("finalAssistantVisibleText") or meta.get("finalAssistantRawText") or "").strip()
+
+    def _openclaw_stop_reason(self, data: dict[str, object]) -> str:
+        completion = data.get("completion") if isinstance(data.get("completion"), dict) else {}
+        direct = str(completion.get("stopReason") or data.get("stopReason") or "").strip()
+        if direct:
+            return direct
+        meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+        meta_completion = meta.get("completion") if isinstance(meta.get("completion"), dict) else {}
+        return str(meta_completion.get("stopReason") or meta.get("stopReason") or "").strip()
+
+    def _stdout_has_complete_response(self, stdout_path: Path) -> bool:
+        if not stdout_path.exists():
+            return False
+        try:
+            data = self._openclaw_json_payload(stdout_path.read_text(errors="ignore"))
+        except OSError:
+            return False
+        if not self._openclaw_final_text(data):
+            return False
+        return self._openclaw_stop_reason(data).lower() == "stop"
 
     def _parse_output(self, worker: dict, stdout: str, stderr: str, info: RuntimeInfo) -> tuple[str | None, str]:
         raw = stdout.strip()
         if not raw:
             detail = (stderr or "").strip()[-1000:]
             raise RuntimeErrorBase(f"OpenClaw returned no output{': ' + detail if detail else ''}")
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if start < 0 or end < start:
-                raise RuntimeErrorBase(f"OpenClaw returned non-JSON output: {raw[-800:]}")
-            try:
-                data = json.loads(raw[start : end + 1])
-            except json.JSONDecodeError as exc:
-                raise RuntimeErrorBase(f"OpenClaw returned invalid JSON: {raw[-800:]}") from exc
+        data = self._openclaw_json_payload(raw)
+        if not data:
+            raise RuntimeErrorBase(f"OpenClaw returned invalid JSON: {raw[-800:]}")
         output_parts: list[str] = []
-        for item in data.get("output", []):
-            if item.get("type") == "message":
-                for content in item.get("content", []):
-                    if content.get("type") == "output_text":
-                        text = str(content.get("text") or "").strip()
-                        if text:
-                            output_parts.append(text)
-            elif item.get("type") == "function_call":
-                name = str(item.get("name") or "function").strip()
-                output_parts.append(f"[Tool call: {name}]")
-        if not output_parts:
+        final_text = self._openclaw_final_text(data)
+        if final_text:
+            output_parts.append(final_text)
+        else:
+            for item in data.get("output", []):
+                if item.get("type") == "message":
+                    for content in item.get("content", []):
+                        if content.get("type") == "output_text":
+                            text = str(content.get("text") or "").strip()
+                            if text:
+                                output_parts.append(text)
+                elif item.get("type") == "function_call":
+                    name = str(item.get("name") or "function").strip()
+                    output_parts.append(f"[Tool call: {name}]")
             for payload in data.get("payloads", []):
                 text = str(payload.get("text") or "").strip()
                 if text:
                     output_parts.append(text)
-        output = "\n".join(output_parts).strip() or json.dumps(data, indent=2)
+        output = _select_user_facing_agent_output(output_parts) or json.dumps(data, indent=2)
         session_id = str(((data.get("meta") or {}).get("agentMeta") or {}).get("sessionId") or info.session_key or "").strip() or None
         return session_id, output
 
@@ -923,6 +1269,17 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
     worker_root_name = "codex_cli_runtime"
     binary_env_var = "WPR_CODEX_BIN"
     binary_name = "codex"
+    _default_compatible_provider_disabled_features = (
+        "apps",
+        "plugins",
+        "browser_use",
+        "computer_use",
+        "multi_agent",
+        "image_generation",
+        "workspace_dependencies",
+        "tool_suggest",
+        "hooks",
+    )
 
     def resolve_model(self, profile: str) -> str:
         if profile == "codex-cli":
@@ -957,6 +1314,81 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         self._ensure_git_workspace(info.workspace_dir)
         return info
 
+    def _env_flag(self, name: str, default: bool = False) -> bool:
+        raw = str(os.environ.get(name, "")).strip().lower()
+        if not raw:
+            return default
+        return raw in {"1", "true", "yes", "on", "enabled"}
+
+    def _compatible_provider_base_url(self) -> str:
+        return (
+            os.environ.get("WPR_CODEX_CLI_BASE_URL", "").strip()
+            or os.environ.get("OPENAI_BASE_URL", "").strip()
+            or os.environ.get("OPENAI_API_BASE", "").strip()
+            or os.environ.get("OPENAI_REVERSE_PROXY", "").strip()
+            or os.environ.get("PORTKEY_BASE_URL", "").strip()
+        ).rstrip("/")
+
+    def _compatible_provider_enabled(self) -> bool:
+        if self._env_flag("WPR_CODEX_CLI_DISABLE_CUSTOM_PROVIDER", False):
+            return False
+        if self._env_flag("WPR_CODEX_CLI_USE_CUSTOM_PROVIDER", False):
+            return True
+        return bool(self._compatible_provider_base_url())
+
+    def _compatible_provider_id(self) -> str:
+        raw = os.environ.get("WPR_CODEX_CLI_MODEL_PROVIDER", "glasshive_openai_compatible").strip()
+        return re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_") or "glasshive_openai_compatible"
+
+    def _compatible_provider_env_key(self) -> str:
+        configured = os.environ.get("WPR_CODEX_CLI_ENV_KEY", "").strip()
+        if configured:
+            return configured
+        if os.environ.get("PORTKEY_BASE_URL", "").strip() and not os.environ.get("OPENAI_BASE_URL", "").strip():
+            return "PORTKEY_API_KEY"
+        return "OPENAI_API_KEY"
+
+    def _compatible_provider_disabled_features(self) -> list[str]:
+        raw = os.environ.get("WPR_CODEX_CLI_DISABLE_FEATURES", "").strip()
+        if raw:
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        return list(self._default_compatible_provider_disabled_features)
+
+    def _append_codex_compatible_provider_config(self, command: list[str]) -> None:
+        if not self._compatible_provider_enabled():
+            return
+        base_url = self._compatible_provider_base_url()
+        if not base_url:
+            return
+        provider_id = self._compatible_provider_id()
+        provider_name = os.environ.get("WPR_CODEX_CLI_PROVIDER_NAME", "GlassHive OpenAI-compatible").strip()
+        wire_api = os.environ.get("WPR_CODEX_CLI_WIRE_API", "responses").strip() or "responses"
+        verbosity = os.environ.get("WPR_CODEX_CLI_MODEL_VERBOSITY", "medium").strip()
+        if self._env_flag("WPR_CODEX_CLI_IGNORE_USER_CONFIG", True):
+            command.append("--ignore-user-config")
+        for feature in self._compatible_provider_disabled_features():
+            command.extend(["--disable", feature])
+        command.extend(
+            [
+                "-c",
+                f'model_provider="{provider_id}"',
+                "-c",
+                f'model_providers.{provider_id}.name="{provider_name}"',
+                "-c",
+                f'model_providers.{provider_id}.base_url="{base_url}"',
+                "-c",
+                f'model_providers.{provider_id}.env_key="{self._compatible_provider_env_key()}"',
+                "-c",
+                f'model_providers.{provider_id}.wire_api="{wire_api}"',
+                "-c",
+                f"model_providers.{provider_id}.requires_openai_auth=false",
+                "-c",
+                f"model_providers.{provider_id}.supports_websockets=false",
+            ]
+        )
+        if verbosity:
+            command.extend(["-c", f'model_verbosity="{verbosity}"'])
+
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         existing_session = self._read_session_key(worker["worker_id"])
         model = worker.get("model") or self.resolve_model(worker.get("profile", "codex-cli"))
@@ -971,6 +1403,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
                 command.extend(["-c", f'model="{model}"'])
             else:
                 command.extend(["-m", model])
+        self._append_codex_compatible_provider_config(command)
         if dangerous_mode:
             if is_resume:
                 command.append("--dangerously-bypass-approvals-and-sandbox")
@@ -984,6 +1417,12 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         env = self._container_env(
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
+            "OPENAI_API_BASE",
+            "OPENAI_REVERSE_PROXY",
+            "PORTKEY_API_KEY",
+            "PORTKEY_BASE_URL",
+            "PORTKEY_VIRTUAL_KEY",
+            "PORTKEY_CONFIG",
             "HTTPS_PROXY",
             "HTTP_PROXY",
             "NO_PROXY",
@@ -1109,6 +1548,11 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         env = self._container_env(
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
             "HTTPS_PROXY",
             "HTTP_PROXY",
             "NO_PROXY",
@@ -1293,6 +1737,15 @@ class HostNativeCliMixin:
         if overwrite or not target.exists():
             target.write_text(content)
 
+    def _write_workspace_bytes(self, workspace: Path, relative_path: str, content: bytes, *, overwrite: bool = True) -> None:
+        relative = Path(relative_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeErrorBase(f"Unsafe bootstrap path: {relative_path}")
+        target = workspace / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if overwrite or not target.exists():
+            target.write_bytes(content)
+
     def _copy_workspace_source_file(self, workspace: Path, relative_path: str, source: Path) -> None:
         relative = Path(relative_path)
         if relative.is_absolute() or ".." in relative.parts:
@@ -1433,6 +1886,14 @@ class HostNativeCliMixin:
                 continue
             path = str(item.get("path") or "").strip()
             if not path:
+                continue
+            if str(item.get("encoding") or "").strip().lower() == "base64" or "content_base64" in item:
+                raw = str(item.get("content_base64") or item.get("content") or "")
+                try:
+                    decoded = base64.b64decode(raw, validate=True)
+                except Exception as exc:
+                    raise RuntimeErrorBase(f"Invalid base64 bootstrap content for {path}") from exc
+                self._write_workspace_bytes(workspace, path, decoded, overwrite=True)
                 continue
             if "content" in item:
                 self._write_workspace_file(workspace, path, str(item.get("content") or ""), overwrite=True)
@@ -1658,6 +2119,7 @@ class HostNativeCliMixin:
                 cwd=str(workspace),
                 env=env,
                 text=True,
+                stdin=subprocess.DEVNULL,
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 start_new_session=True,
@@ -1813,6 +2275,12 @@ class HostNativeCliMixin:
 
 class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
     worker_root_name = "host_codex_cli_runtime"
+
+    def resolve_model(self, profile: str) -> str:
+        host_model = os.environ.get("WPR_MODEL_HOST_CODEX_CLI", "").strip()
+        if profile == "codex-cli" and host_model:
+            return host_model
+        return super().resolve_model(profile)
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         info = HostNativeCliMixin.ensure_worker_ready(self, worker)

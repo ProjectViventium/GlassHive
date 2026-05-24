@@ -16,6 +16,7 @@ WorkerState = Literal[
     "terminated",
 ]
 RunState = Literal["queued", "running", "interrupted", "paused", "completed", "failed", "cancelled"]
+ScheduleState = Literal["pending", "running", "queued", "completed", "failed", "cancelled"]
 DesktopActionName = Literal["terminal", "files", "browser", "focus_browser", "codex", "claude", "openclaw"]
 ExecutionMode = Literal["docker", "host"]
 
@@ -33,6 +34,7 @@ class CreateProjectRequest(BaseModel):
 
 class ProjectResponse(BaseModel):
     project_id: str
+    tenant_id: str = "local"
     owner_id: str
     title: str
     goal: str
@@ -54,6 +56,7 @@ class CreateWorkerRequest(BaseModel):
     workspace_root: str | None = None
     bootstrap_profile: str | None = None
     bootstrap_bundle: dict[str, object] | None = None
+    start_synchronously: bool = True
 
 
 class DuplicateWorkerRequest(BaseModel):
@@ -66,6 +69,7 @@ class DuplicateWorkerRequest(BaseModel):
 class WorkerResponse(BaseModel):
     worker_id: str
     project_id: str
+    tenant_id: str = "local"
     owner_id: str
     name: str
     role: str
@@ -85,6 +89,7 @@ class WorkerResponse(BaseModel):
     state_dir: str | None = None
     workspace_dir: str | None = None
     workspace_root: str | None = None
+    favorite: bool = False
     last_run_id: str | None = None
     last_error: str | None = None
     created_at: str
@@ -97,6 +102,18 @@ class AssignRunRequest(BaseModel):
 
 class SendMessageRequest(BaseModel):
     message: str = Field(min_length=1)
+
+
+class ScheduleRunRequest(BaseModel):
+    instruction: str = Field(min_length=1)
+    run_at: str | None = None
+    schedule_text: str | None = None
+    delay_seconds: int | None = Field(default=None, ge=0)
+
+
+class UpdateWorkerMetadataRequest(BaseModel):
+    favorite: bool | None = None
+    name: str | None = None
 
 
 class DesktopActionRequest(BaseModel):
@@ -113,6 +130,7 @@ class RunResponse(BaseModel):
     run_id: str
     worker_id: str
     project_id: str
+    tenant_id: str = "local"
     instruction: str
     state: RunState
     queued_at: str
@@ -122,10 +140,27 @@ class RunResponse(BaseModel):
     error_text: str = ""
 
 
+class ScheduleResponse(BaseModel):
+    schedule_id: str
+    worker_id: str
+    project_id: str
+    tenant_id: str = "local"
+    owner_id: str
+    instruction: str
+    schedule_text: str = ""
+    run_at: str
+    state: ScheduleState
+    queued_run_id: str | None = None
+    last_error: str = ""
+    created_at: str
+    updated_at: str
+
+
 class EventResponse(BaseModel):
     event_id: str
     project_id: str
     worker_id: str
+    tenant_id: str = "local"
     run_id: str | None = None
     event_type: str
     message: str

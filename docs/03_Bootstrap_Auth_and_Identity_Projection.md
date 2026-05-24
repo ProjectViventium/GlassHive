@@ -68,8 +68,8 @@ Host-native workers also materialize visible prompt/context files in the host wo
 - `claude.md` / `CLAUDE.md`
 - `codex.md` / `CODEX.md`
 
-When Viventium passes existing upload metadata, GlassHive reuses the existing file path contract
-instead of adding a second upload route:
+When a trusted host client passes existing upload metadata, GlassHive reuses the existing file path
+contract instead of adding a second upload route:
 
 - virtual `/uploads/...` paths can map to `WPR_LIBRECHAT_UPLOADS_ROOT`
 - extracted text can be materialized directly
@@ -118,14 +118,15 @@ Best practice:
 - keep the env set explicit and minimal
 - never write raw secrets into committed docs or repo config
 
-### C. Connected-account projection from Viventium / LibreChat
+### C. Connected-account projection from LibreChat-compatible hosts
 
 This is the important one.
 
 Best practice:
 
 - Glass Hive should **not** directly consume LibreChat internal token storage as its product contract
-- instead, Viventium / LibreChat should act as an **optional auth broker**
+- instead, a host application such as LibreChat, Viventium, or another compatible client should act as an
+  **optional auth broker**
 - the broker should resolve the user's connected account and materialize a provider-specific projection for the sandbox
 - that projection can be:
   - ephemeral env

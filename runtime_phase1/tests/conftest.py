@@ -1,0 +1,45 @@
+from __future__ import annotations
+
+import os
+
+import pytest
+
+
+RUNTIME_ENV_KEYS = (
+    "GLASSHIVE_ENTERPRISE_MODE",
+    "GLASSHIVE_AUTH_MODE",
+    "GLASSHIVE_ENTERPRISE_TENANT_ID",
+    "GLASSHIVE_AUTH_USER_HEADER",
+    "GLASSHIVE_AUTH_EMAIL_HEADER",
+    "GLASSHIVE_AUTH_ROLE_HEADER",
+    "GLASSHIVE_AUTH_TENANT_HEADER",
+    "GLASSHIVE_HOST_WORKERS_ENABLED",
+    "GLASSHIVE_IDLE_TERMINATE_AFTER_S",
+    "GLASSHIVE_IDLE_REAPER_INTERVAL_S",
+    "GLASSHIVE_ARTIFACT_DOWNLOAD_MAX_BYTES",
+    "GLASSHIVE_ENABLE_ADMIN_API",
+    "GLASSHIVE_PROJECT_PROVIDER_ENV",
+    "GLASSHIVE_SIGNED_LINK_SECRET",
+    "GLASSHIVE_WORKER_ENV_ALLOWLIST",
+    "WPR_API_TOKEN",
+    "WPR_DB_PATH",
+    "WPR_DEFAULT_EXECUTION_MODE",
+    "WPR_ENTERPRISE_MODE",
+    "WPR_ENTERPRISE_TENANT_ID",
+    "WPR_LIBRECHAT_UPLOADS_ROOT",
+    "WPR_BOOTSTRAP_SOURCE_ROOTS",
+    "WPR_RUNTIME_BACKEND",
+    "VIVENTIUM_ENV_FILE",
+)
+
+
+os.environ.setdefault("VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV", "1")
+for key in RUNTIME_ENV_KEYS:
+    os.environ.pop(key, None)
+
+
+@pytest.fixture(autouse=True)
+def isolate_runtime_env(monkeypatch: pytest.MonkeyPatch):
+    for key in RUNTIME_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    yield

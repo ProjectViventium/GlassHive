@@ -31,13 +31,19 @@ Clipboard note:
 ```bash
 cd <workspace-root>/viventium_v0_4/GlassHive/frontends/glass-drive-ui
 uv sync
-uv run uvicorn glass_drive_ui.server:app --host 127.0.0.1 --port 8780
+uv run uvicorn glass_drive_ui.server:app --host 127.0.0.1 --port 8780 --no-access-log
 ```
 
 Env:
 
 - `GLASSHIVE_RUNTIME_BASE_URL` default: `http://127.0.0.1:8766`
 - `GLASSHIVE_DEFAULT_OWNER_ID` default: `demo-owner`
+- `WPR_API_TOKEN` optional: service token used by enterprise UI calls to the runtime
+- `GLASSHIVE_SIGNED_LINK_SECRET` optional: HMAC secret for short-lived `/watch/{worker}?gh_token=...`
+  links; defaults to `WPR_API_TOKEN` when omitted
+- Production service managers must disable raw HTTP access logs or use a sanitizer that redacts
+  `gh_token`, bearer tokens, service-token headers, and artifact signed-link paths before logs leave
+  the VM.
 
 ## Test
 

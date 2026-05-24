@@ -28,6 +28,7 @@ class Store:
 
                 CREATE TABLE IF NOT EXISTS projects (
                     project_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
                     owner_id TEXT NOT NULL,
                     title TEXT NOT NULL,
                     goal TEXT NOT NULL,
@@ -41,6 +42,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS workers (
                     worker_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
                     owner_id TEXT NOT NULL,
                     name TEXT NOT NULL,
                     role TEXT NOT NULL,
@@ -62,6 +64,7 @@ class Store:
                     state_dir TEXT,
                     workspace_dir TEXT,
                     workspace_root TEXT,
+                    favorite INTEGER NOT NULL DEFAULT 0,
                     pid INTEGER,
                     last_run_id TEXT,
                     last_error TEXT,
@@ -74,6 +77,7 @@ class Store:
                     run_id TEXT PRIMARY KEY,
                     worker_id TEXT NOT NULL,
                     project_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
                     instruction TEXT NOT NULL,
                     state TEXT NOT NULL,
                     queued_at TEXT NOT NULL,
@@ -89,6 +93,7 @@ class Store:
                     event_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,
                     worker_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
                     run_id TEXT,
                     event_type TEXT NOT NULL,
                     message TEXT NOT NULL,
@@ -101,6 +106,7 @@ class Store:
                     callback_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,
                     worker_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
                     run_id TEXT,
                     event_type TEXT NOT NULL,
                     url TEXT NOT NULL,
@@ -115,13 +121,37 @@ class Store:
                     FOREIGN KEY(project_id) REFERENCES projects(project_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS scheduled_runs (
+                    schedule_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
+                    owner_id TEXT NOT NULL,
+                    instruction TEXT NOT NULL,
+                    schedule_text TEXT NOT NULL DEFAULT '',
+                    run_at TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    queued_run_id TEXT,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(worker_id) REFERENCES workers(worker_id),
+                    FOREIGN KEY(project_id) REFERENCES projects(project_id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_workers_project_id ON workers(project_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_worker_state ON runs(worker_id, state, queued_at);
                 CREATE INDEX IF NOT EXISTS idx_events_worker_created ON events(worker_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_callback_outbox_status_updated ON callback_outbox(status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_scheduled_runs_state_run_at ON scheduled_runs(state, run_at);
                 """
             )
+            project_columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()}
+            if "tenant_id" not in project_columns:
+                conn.execute("ALTER TABLE projects ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
             worker_columns = {row["name"] for row in conn.execute("PRAGMA table_info(workers)").fetchall()}
+            if "tenant_id" not in worker_columns:
+                conn.execute("ALTER TABLE workers ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
             if "bootstrap_profile" not in worker_columns:
                 conn.execute("ALTER TABLE workers ADD COLUMN bootstrap_profile TEXT")
             if "bootstrap_bundle_json" not in worker_columns:
@@ -132,6 +162,25 @@ class Store:
                 conn.execute("ALTER TABLE workers ADD COLUMN alias TEXT")
             if "workspace_root" not in worker_columns:
                 conn.execute("ALTER TABLE workers ADD COLUMN workspace_root TEXT")
+            if "favorite" not in worker_columns:
+                conn.execute("ALTER TABLE workers ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0")
+            run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+            if "tenant_id" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
+            event_columns = {row["name"] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
+            if "tenant_id" not in event_columns:
+                conn.execute("ALTER TABLE events ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
+            callback_columns = {row["name"] for row in conn.execute("PRAGMA table_info(callback_outbox)").fetchall()}
+            if "tenant_id" not in callback_columns:
+                conn.execute("ALTER TABLE callback_outbox ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_tenant_owner ON projects(tenant_id, owner_id, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_workers_tenant_owner ON workers(tenant_id, owner_id, project_id, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_tenant_project ON runs(tenant_id, project_id, queued_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_tenant_project ON events(tenant_id, project_id, created_at)")
+            schedule_columns = {row["name"] for row in conn.execute("PRAGMA table_info(scheduled_runs)").fetchall()}
+            if "owner_id" not in schedule_columns:
+                conn.execute("ALTER TABLE scheduled_runs ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_runs_tenant_owner ON scheduled_runs(tenant_id, owner_id, run_at)")
 
     def _row(self, value: sqlite3.Row | None) -> dict[str, Any] | None:
         return dict(value) if value is not None else None
@@ -139,11 +188,19 @@ class Store:
     def _rows(self, values: list[sqlite3.Row]) -> list[dict[str, Any]]:
         return [dict(v) for v in values]
 
-    def create_project(self, owner_id: str, title: str, goal: str, default_worker_profile: str) -> dict[str, Any]:
+    def create_project(
+        self,
+        owner_id: str,
+        title: str,
+        goal: str,
+        default_worker_profile: str,
+        tenant_id: str = "local",
+    ) -> dict[str, Any]:
         project_id = f"prj_{uuid.uuid4().hex[:10]}"
         now = utc_now()
         data = {
             "project_id": project_id,
+            "tenant_id": tenant_id or "local",
             "owner_id": owner_id,
             "title": title,
             "goal": goal,
@@ -156,21 +213,46 @@ class Store:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO projects (project_id, owner_id, title, goal, status, summary, default_worker_profile, created_at, updated_at)
-                VALUES (:project_id, :owner_id, :title, :goal, :status, :summary, :default_worker_profile, :created_at, :updated_at)
+                INSERT INTO projects (project_id, tenant_id, owner_id, title, goal, status, summary, default_worker_profile, created_at, updated_at)
+                VALUES (:project_id, :tenant_id, :owner_id, :title, :goal, :status, :summary, :default_worker_profile, :created_at, :updated_at)
                 """,
                 data,
             )
         return data
 
-    def list_projects(self) -> list[dict[str, Any]]:
+    def list_projects(self, tenant_id: str | None = None, owner_id: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM projects"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if tenant_id:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        if owner_id:
+            clauses.append("owner_id = ?")
+            params.append(owner_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC"
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
+            rows = conn.execute(query, params).fetchall()
         return self._rows(rows)
 
-    def get_project(self, project_id: str) -> dict[str, Any] | None:
+    def get_project(
+        self,
+        project_id: str,
+        tenant_id: str | None = None,
+        owner_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        query = "SELECT * FROM projects WHERE project_id = ?"
+        params: list[Any] = [project_id]
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        if owner_id:
+            query += " AND owner_id = ?"
+            params.append(owner_id)
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+            row = conn.execute(query, params).fetchone()
         return self._row(row)
 
     def update_project(self, project_id: str, **fields: Any) -> dict[str, Any] | None:
@@ -199,12 +281,14 @@ class Store:
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
         bootstrap_bundle: dict[str, Any] | None = None,
+        tenant_id: str = "local",
     ) -> dict[str, Any]:
         worker_id = f"wrk_{uuid.uuid4().hex[:10]}"
         now = utc_now()
         data = {
             "worker_id": worker_id,
             "project_id": project_id,
+            "tenant_id": tenant_id or "local",
             "owner_id": owner_id,
             "name": name,
             "role": role,
@@ -226,6 +310,7 @@ class Store:
             "state_dir": None,
             "workspace_dir": None,
             "workspace_root": workspace_root,
+            "favorite": 0,
             "pid": None,
             "last_run_id": None,
             "last_error": None,
@@ -236,18 +321,18 @@ class Store:
             conn.execute(
                 """
                 INSERT INTO workers (
-                    worker_id, project_id, owner_id, name, role, profile, backend, execution_mode, alias, runtime, model, state,
+                    worker_id, project_id, tenant_id, owner_id, name, role, profile, backend, execution_mode, alias, runtime, model, state,
                     bootstrap_profile, bootstrap_bundle_json, gateway_url, takeover_url, control_url, gateway_port, gateway_token, session_key,
-                    state_dir, workspace_dir, workspace_root, pid, last_run_id, last_error, created_at, updated_at
+                    state_dir, workspace_dir, workspace_root, favorite, pid, last_run_id, last_error, created_at, updated_at
                 ) VALUES (
-                    :worker_id, :project_id, :owner_id, :name, :role, :profile, :backend, :execution_mode, :alias, :runtime, :model, :state,
+                    :worker_id, :project_id, :tenant_id, :owner_id, :name, :role, :profile, :backend, :execution_mode, :alias, :runtime, :model, :state,
                     :bootstrap_profile, :bootstrap_bundle_json, :gateway_url, :takeover_url, :control_url, :gateway_port, :gateway_token, :session_key,
-                    :state_dir, :workspace_dir, :workspace_root, :pid, :last_run_id, :last_error, :created_at, :updated_at
+                    :state_dir, :workspace_dir, :workspace_root, :favorite, :pid, :last_run_id, :last_error, :created_at, :updated_at
                 )
                 """,
                 data,
             )
-        self.add_event(project_id, worker_id, None, "worker.created", f"Worker {name} created")
+        self.add_event(project_id, worker_id, None, "worker.created", f"Worker {name} created", tenant_id=tenant_id)
         return data
 
     def list_all_workers(self) -> list[dict[str, Any]]:
@@ -255,22 +340,59 @@ class Store:
             rows = conn.execute("SELECT * FROM workers ORDER BY created_at DESC").fetchall()
         return self._rows(rows)
 
-    def list_workers(self, project_id: str) -> list[dict[str, Any]]:
+    def list_workers(
+        self,
+        project_id: str,
+        tenant_id: str | None = None,
+        owner_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM workers WHERE project_id = ?"
+        params: list[Any] = [project_id]
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        if owner_id:
+            query += " AND owner_id = ?"
+            params.append(owner_id)
+        query += " ORDER BY created_at DESC"
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM workers WHERE project_id = ? ORDER BY created_at DESC", (project_id,)).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return self._rows(rows)
 
-    def get_worker(self, worker_id: str) -> dict[str, Any] | None:
+    def get_worker(
+        self,
+        worker_id: str,
+        tenant_id: str | None = None,
+        owner_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        query = "SELECT * FROM workers WHERE worker_id = ?"
+        params: list[Any] = [worker_id]
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        if owner_id:
+            query += " AND owner_id = ?"
+            params.append(owner_id)
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM workers WHERE worker_id = ?", (worker_id,)).fetchone()
+            row = conn.execute(query, params).fetchone()
         return self._row(row)
 
-    def find_worker_by_alias(self, project_id: str, owner_id: str, alias: str, execution_mode: str | None = None) -> dict[str, Any] | None:
+    def find_worker_by_alias(
+        self,
+        project_id: str,
+        owner_id: str,
+        alias: str,
+        execution_mode: str | None = None,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any] | None:
         alias_value = alias.strip()
         if not alias_value:
             return None
         query = "SELECT * FROM workers WHERE project_id = ? AND owner_id = ? AND alias = ?"
         params: list[Any] = [project_id, owner_id, alias_value]
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
         if execution_mode:
             query += " AND execution_mode = ?"
             params.append(execution_mode)
@@ -296,13 +418,47 @@ class Store:
             fields["last_error"] = last_error
         return self.update_worker(worker_id, **fields)
 
+    def count_workers(
+        self,
+        *,
+        tenant_id: str | None = None,
+        owner_id: str | None = None,
+        states: set[str] | None = None,
+        exclude_states: set[str] | None = None,
+    ) -> int:
+        query = "SELECT COUNT(*) FROM workers"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if tenant_id:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        if owner_id:
+            clauses.append("owner_id = ?")
+            params.append(owner_id)
+        if states:
+            placeholders = ", ".join("?" for _ in states)
+            clauses.append(f"state IN ({placeholders})")
+            params.extend(sorted(states))
+        if exclude_states:
+            placeholders = ", ".join("?" for _ in exclude_states)
+            clauses.append(f"state NOT IN ({placeholders})")
+            params.extend(sorted(exclude_states))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        with self._connect() as conn:
+            return int(conn.execute(query, params).fetchone()[0])
+
     def create_run(self, worker_id: str, project_id: str, instruction: str, state: str = "queued") -> dict[str, Any]:
         run_id = f"run_{uuid.uuid4().hex[:10]}"
         queued_at = utc_now()
+        worker = self.get_worker(worker_id) or {}
+        project = self.get_project(project_id) or {}
+        tenant_id = str(worker.get("tenant_id") or project.get("tenant_id") or "local")
         data = {
             "run_id": run_id,
             "worker_id": worker_id,
             "project_id": project_id,
+            "tenant_id": tenant_id,
             "instruction": instruction,
             "state": state,
             "queued_at": queued_at,
@@ -314,33 +470,56 @@ class Store:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO runs (run_id, worker_id, project_id, instruction, state, queued_at, started_at, ended_at, output_text, error_text)
-                VALUES (:run_id, :worker_id, :project_id, :instruction, :state, :queued_at, :started_at, :ended_at, :output_text, :error_text)
+                INSERT INTO runs (run_id, worker_id, project_id, tenant_id, instruction, state, queued_at, started_at, ended_at, output_text, error_text)
+                VALUES (:run_id, :worker_id, :project_id, :tenant_id, :instruction, :state, :queued_at, :started_at, :ended_at, :output_text, :error_text)
                 """,
                 data,
             )
         self.update_worker(worker_id, last_run_id=run_id)
         return data
 
-    def list_runs_for_worker(self, worker_id: str, limit: int = 25) -> list[dict[str, Any]]:
+    def list_runs_for_worker(
+        self,
+        worker_id: str,
+        limit: int = 25,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM runs WHERE worker_id = ?"
+        params: list[Any] = [worker_id]
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        query += " ORDER BY queued_at DESC LIMIT ?"
+        params.append(limit)
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM runs WHERE worker_id = ? ORDER BY queued_at DESC LIMIT ?",
-                (worker_id, limit),
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return self._rows(rows)
 
-    def list_runs_for_project(self, project_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    def list_runs_for_project(
+        self,
+        project_id: str,
+        limit: int = 50,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM runs WHERE project_id = ?"
+        params: list[Any] = [project_id]
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        query += " ORDER BY queued_at DESC LIMIT ?"
+        params.append(limit)
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM runs WHERE project_id = ? ORDER BY queued_at DESC LIMIT ?",
-                (project_id, limit),
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return self._rows(rows)
 
-    def get_run(self, run_id: str) -> dict[str, Any] | None:
+    def get_run(self, run_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
+        query = "SELECT * FROM runs WHERE run_id = ?"
+        params: list[Any] = [run_id]
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            row = conn.execute(query, params).fetchone()
         return self._row(row)
 
     def update_run(self, run_id: str, **fields: Any) -> dict[str, Any] | None:
@@ -428,11 +607,180 @@ class Store:
             )
         return cur.rowcount
 
-    def add_event(self, project_id: str, worker_id: str, run_id: str | None, event_type: str, message: str) -> dict[str, Any]:
+    def create_scheduled_run(
+        self,
+        *,
+        worker_id: str,
+        project_id: str,
+        owner_id: str,
+        instruction: str,
+        run_at: str,
+        schedule_text: str = "",
+        tenant_id: str = "local",
+    ) -> dict[str, Any]:
+        now = utc_now()
+        data = {
+            "schedule_id": f"sch_{uuid.uuid4().hex[:10]}",
+            "project_id": project_id,
+            "worker_id": worker_id,
+            "tenant_id": tenant_id or "local",
+            "owner_id": owner_id,
+            "instruction": instruction,
+            "schedule_text": schedule_text,
+            "run_at": run_at,
+            "state": "pending",
+            "queued_run_id": None,
+            "last_error": "",
+            "created_at": now,
+            "updated_at": now,
+        }
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO scheduled_runs (
+                    schedule_id, project_id, worker_id, tenant_id, owner_id, instruction,
+                    schedule_text, run_at, state, queued_run_id, last_error, created_at, updated_at
+                )
+                VALUES (
+                    :schedule_id, :project_id, :worker_id, :tenant_id, :owner_id, :instruction,
+                    :schedule_text, :run_at, :state, :queued_run_id, :last_error, :created_at, :updated_at
+                )
+                """,
+                data,
+            )
+        return data
+
+    def get_schedule(
+        self,
+        schedule_id: str,
+        tenant_id: str | None = None,
+        owner_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        query = "SELECT * FROM scheduled_runs WHERE schedule_id = ?"
+        params: list[Any] = [schedule_id]
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        if owner_id:
+            query += " AND owner_id = ?"
+            params.append(owner_id)
+        with self._connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return self._row(row)
+
+    def list_schedules_for_worker(
+        self,
+        worker_id: str,
+        *,
+        tenant_id: str | None = None,
+        owner_id: str | None = None,
+        include_done: bool = False,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM scheduled_runs WHERE worker_id = ?"
+        params: list[Any] = [worker_id]
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        if owner_id:
+            query += " AND owner_id = ?"
+            params.append(owner_id)
+        if not include_done:
+            query += " AND state IN ('pending', 'queued', 'running')"
+        query += " ORDER BY run_at ASC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return self._rows(rows)
+
+    def list_due_schedules(self, now_iso: str, limit: int = 25) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM scheduled_runs
+                WHERE state = 'pending' AND run_at <= ?
+                ORDER BY run_at ASC
+                LIMIT ?
+                """,
+                (now_iso, limit),
+            ).fetchall()
+        return self._rows(rows)
+
+    def claim_schedule(self, schedule_id: str) -> dict[str, Any] | None:
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE scheduled_runs SET state = 'running', updated_at = ? WHERE schedule_id = ? AND state = 'pending'",
+                (now, schedule_id),
+            )
+            row = conn.execute("SELECT * FROM scheduled_runs WHERE schedule_id = ?", (schedule_id,)).fetchone()
+            conn.execute("COMMIT")
+        if cur.rowcount != 1:
+            return None
+        return self._row(row)
+
+    def finalize_schedule(
+        self,
+        schedule_id: str,
+        *,
+        state: str,
+        queued_run_id: str | None = None,
+        last_error: str = "",
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE scheduled_runs
+                SET state = ?, queued_run_id = ?, last_error = ?, updated_at = ?
+                WHERE schedule_id = ?
+                """,
+                (state, queued_run_id, last_error, utc_now(), schedule_id),
+            )
+            row = conn.execute("SELECT * FROM scheduled_runs WHERE schedule_id = ?", (schedule_id,)).fetchone()
+        return self._row(row)
+
+    def finalize_schedule_for_run(
+        self,
+        run_id: str,
+        *,
+        state: str,
+        last_error: str = "",
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE scheduled_runs
+                SET state = ?, last_error = ?, updated_at = ?
+                WHERE queued_run_id = ? AND state IN ('queued', 'running')
+                """,
+                (state, last_error, utc_now(), run_id),
+            )
+            row = conn.execute("SELECT * FROM scheduled_runs WHERE queued_run_id = ?", (run_id,)).fetchone()
+        return self._row(row)
+
+    def cancel_schedule(self, schedule_id: str) -> dict[str, Any] | None:
+        return self.finalize_schedule(schedule_id, state="cancelled", queued_run_id=None)
+
+    def add_event(
+        self,
+        project_id: str,
+        worker_id: str,
+        run_id: str | None,
+        event_type: str,
+        message: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not tenant_id:
+            worker = self.get_worker(worker_id) or {}
+            project = self.get_project(project_id) or {}
+            tenant_id = str(worker.get("tenant_id") or project.get("tenant_id") or "local")
         data = {
             "event_id": f"evt_{uuid.uuid4().hex[:10]}",
             "project_id": project_id,
             "worker_id": worker_id,
+            "tenant_id": tenant_id,
             "run_id": run_id,
             "event_type": event_type,
             "message": message,
@@ -440,19 +788,31 @@ class Store:
         }
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO events (event_id, project_id, worker_id, run_id, event_type, message, created_at) VALUES (:event_id, :project_id, :worker_id, :run_id, :event_type, :message, :created_at)",
+                "INSERT INTO events (event_id, project_id, worker_id, tenant_id, run_id, event_type, message, created_at) VALUES (:event_id, :project_id, :worker_id, :tenant_id, :run_id, :event_type, :message, :created_at)",
                 data,
             )
         return data
 
-    def list_events(self, worker_id: str) -> list[dict[str, Any]]:
+    def list_events(self, worker_id: str, tenant_id: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM events WHERE worker_id = ?"
+        params: list[Any] = [worker_id]
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        query += " ORDER BY created_at ASC"
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM events WHERE worker_id = ? ORDER BY created_at ASC", (worker_id,)).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return self._rows(rows)
 
-    def list_project_events(self, project_id: str) -> list[dict[str, Any]]:
+    def list_project_events(self, project_id: str, tenant_id: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM events WHERE project_id = ?"
+        params: list[Any] = [project_id]
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        query += " ORDER BY created_at ASC"
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM events WHERE project_id = ? ORDER BY created_at ASC", (project_id,)).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return self._rows(rows)
 
     def upsert_callback_outbox(
@@ -467,10 +827,14 @@ class Store:
         payload_json: str,
     ) -> dict[str, Any]:
         now = utc_now()
+        worker = self.get_worker(worker_id) or {}
+        project = self.get_project(project_id) or {}
+        tenant_id = str(worker.get("tenant_id") or project.get("tenant_id") or "local")
         data = {
             "callback_id": callback_id,
             "project_id": project_id,
             "worker_id": worker_id,
+            "tenant_id": tenant_id,
             "run_id": run_id,
             "event_type": event_type,
             "url": url,
@@ -486,16 +850,17 @@ class Store:
             conn.execute(
                 """
                 INSERT INTO callback_outbox (
-                    callback_id, project_id, worker_id, run_id, event_type, url, payload_json,
+                    callback_id, project_id, worker_id, tenant_id, run_id, event_type, url, payload_json,
                     status, attempts, last_error, created_at, updated_at, delivered_at
                 )
                 VALUES (
-                    :callback_id, :project_id, :worker_id, :run_id, :event_type, :url, :payload_json,
+                    :callback_id, :project_id, :worker_id, :tenant_id, :run_id, :event_type, :url, :payload_json,
                     :status, :attempts, :last_error, :created_at, :updated_at, :delivered_at
                 )
                 ON CONFLICT(callback_id) DO UPDATE SET
                     project_id = excluded.project_id,
                     worker_id = excluded.worker_id,
+                    tenant_id = excluded.tenant_id,
                     run_id = excluded.run_id,
                     event_type = excluded.event_type,
                     url = excluded.url,
@@ -527,6 +892,18 @@ class Store:
             )
             row = conn.execute("SELECT * FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
         return self._row(row)
+
+    def claim_pending_callback(self, callback_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE callback_outbox
+                SET status = 'delivering', updated_at = ?
+                WHERE callback_id = ? AND status = 'pending'
+                """,
+                (utc_now(), callback_id),
+            )
+        return cur.rowcount == 1
 
     def mark_callback_pending(
         self,
@@ -565,14 +942,65 @@ class Store:
             ).fetchall()
         return self._rows(rows)
 
-    def metrics(self) -> dict[str, int]:
+    def metrics(self, tenant_id: str | None = None, owner_id: str | None = None) -> dict[str, int]:
+        project_clause = ""
+        worker_clause = ""
+        project_params: list[Any] = []
+        worker_params: list[Any] = []
+        run_params: list[Any] = []
+        event_params: list[Any] = []
+        clauses: list[str] = []
+        if tenant_id:
+            clauses.append("tenant_id = ?")
+            project_params.append(tenant_id)
+            worker_params.append(tenant_id)
+        if owner_id:
+            clauses.append("owner_id = ?")
+            project_params.append(owner_id)
+            worker_params.append(owner_id)
+        if clauses:
+            project_clause = " WHERE " + " AND ".join(clauses)
+            worker_clause = " WHERE " + " AND ".join(clauses)
+        run_join = ""
+        run_clause = ""
+        event_join = ""
+        event_clause = ""
+        if tenant_id or owner_id:
+            run_join = " JOIN workers ON workers.worker_id = runs.worker_id"
+            event_join = " JOIN workers ON workers.worker_id = events.worker_id"
+            run_filters: list[str] = []
+            event_filters: list[str] = []
+            if tenant_id:
+                run_filters.append("runs.tenant_id = ?")
+                event_filters.append("events.tenant_id = ?")
+                run_params.append(tenant_id)
+                event_params.append(tenant_id)
+            if owner_id:
+                run_filters.append("workers.owner_id = ?")
+                event_filters.append("workers.owner_id = ?")
+                run_params.append(owner_id)
+                event_params.append(owner_id)
+            run_clause = " WHERE " + " AND ".join(run_filters)
+            event_clause = " WHERE " + " AND ".join(event_filters)
         with self._connect() as conn:
-            projects = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
-            workers = conn.execute("SELECT COUNT(*) FROM workers").fetchone()[0]
-            runs = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
-            queued_runs = conn.execute("SELECT COUNT(*) FROM runs WHERE state = 'queued'").fetchone()[0]
-            active_runs = conn.execute("SELECT COUNT(*) FROM runs WHERE state = 'running'").fetchone()[0]
-            events = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+            projects = conn.execute(f"SELECT COUNT(*) FROM projects{project_clause}", project_params).fetchone()[0]
+            workers = conn.execute(f"SELECT COUNT(*) FROM workers{worker_clause}", worker_params).fetchone()[0]
+            runs = conn.execute(f"SELECT COUNT(*) FROM runs{run_join}{run_clause}", run_params).fetchone()[0]
+            queued_runs_query = f"SELECT COUNT(*) FROM runs{run_join}"
+            active_runs_query = f"SELECT COUNT(*) FROM runs{run_join}"
+            queued_filters = ["runs.state = 'queued'"]
+            active_filters = ["runs.state = 'running'"]
+            queued_params = list(run_params)
+            active_params = list(run_params)
+            if run_clause:
+                extra = run_clause.removeprefix(" WHERE ")
+                queued_filters.append(extra)
+                active_filters.append(extra)
+            queued_runs_query += " WHERE " + " AND ".join(queued_filters)
+            active_runs_query += " WHERE " + " AND ".join(active_filters)
+            queued_runs = conn.execute(queued_runs_query, queued_params).fetchone()[0]
+            active_runs = conn.execute(active_runs_query, active_params).fetchone()[0]
+            events = conn.execute(f"SELECT COUNT(*) FROM events{event_join}{event_clause}", event_params).fetchone()[0]
         return {
             "projects": projects,
             "workers": workers,

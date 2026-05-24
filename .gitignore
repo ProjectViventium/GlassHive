@@ -1,5 +1,6 @@
 # Generated local runtime artifacts
 /data/*.db
+/runtime_phase1/*.db
 /runtime_phase1/data/
 /runtime_phase1/.runtime_logs/
 /runtime_phase1/.playwright-cli/
