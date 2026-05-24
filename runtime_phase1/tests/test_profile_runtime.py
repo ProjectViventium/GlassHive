@@ -1340,6 +1340,56 @@ def test_openclaw_projects_portkey_headers_as_secret_refs(tmp_path, monkeypatch)
     assert "virtual-key-secret" not in serialized
 
 
+@pytest.mark.parametrize("max_tokens_field", ["max_completion_tokens", "max_tokens"])
+def test_openclaw_projects_can_configure_openai_compat_max_token_field(tmp_path, monkeypatch, max_tokens_field):
+    monkeypatch.setenv("PORTKEY_BASE_URL", "https://api.portkey.example/v1")
+    monkeypatch.setenv("PORTKEY_API_KEY", "portkey-secret-test-value")
+    monkeypatch.setenv("WPR_OPENCLAW_MODEL_ID", "@example/gpt-deployment-chat")
+    monkeypatch.setenv("WPR_OPENCLAW_MODEL_NAME", "@example/gpt-deployment-chat")
+    monkeypatch.setenv("WPR_OPENCLAW_COMPAT_MAX_TOKENS_FIELD", max_tokens_field)
+    runtime = OpenClawWorkstationRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_openclaw_portkey_azure",
+        "name": "OpenClaw Worker",
+        "profile": "openclaw-general",
+        "model": "@example/gpt-deployment-chat",
+    }
+
+    runtime._write_gateway_config(worker, "token")
+    config = json.loads(runtime._openclaw_config_path(worker["worker_id"]).read_text())
+
+    assert config["agents"]["defaults"]["model"]["primary"] == (
+        "glasshive-portkey-compatible/@example/gpt-deployment-chat"
+    )
+    model_entry = config["models"]["providers"]["glasshive-portkey-compatible"]["models"][0]
+    assert model_entry["id"] == "@example/gpt-deployment-chat"
+    assert model_entry["name"] == "@example/gpt-deployment-chat"
+    assert model_entry["compat"]["maxTokensField"] == max_tokens_field
+    assert "portkey-secret-test-value" not in json.dumps(config)
+
+
+def test_openclaw_projects_ignore_unknown_compat_max_token_field(tmp_path, monkeypatch):
+    monkeypatch.setenv("PORTKEY_BASE_URL", "https://api.portkey.example/v1")
+    monkeypatch.setenv("PORTKEY_API_KEY", "portkey-secret-test-value")
+    monkeypatch.setenv("WPR_OPENCLAW_MODEL_ID", "@example/gpt-deployment-chat")
+    monkeypatch.setenv("WPR_OPENCLAW_MODEL_NAME", "@example/gpt-deployment-chat")
+    monkeypatch.setenv("WPR_OPENCLAW_COMPAT_MAX_TOKENS_FIELD", "bogus")
+    runtime = OpenClawWorkstationRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_openclaw_portkey_invalid_compat",
+        "name": "OpenClaw Worker",
+        "profile": "openclaw-general",
+        "model": "@example/gpt-deployment-chat",
+    }
+
+    runtime._write_gateway_config(worker, "token")
+    config = json.loads(runtime._openclaw_config_path(worker["worker_id"]).read_text())
+
+    model_entry = config["models"]["providers"]["glasshive-portkey-compatible"]["models"][0]
+    assert "compat" not in model_entry
+    assert "portkey-secret-test-value" not in json.dumps(config)
+
+
 def test_redact_text_masks_parent_visible_secret_shapes():
     synthetic_openai_token = "sk-" + "abc123456789xyz"
     redacted = _redact_text(f"Authorization: Bearer abcdefghijklmnopqrstuvwxyz token=super-secret-value {synthetic_openai_token}")

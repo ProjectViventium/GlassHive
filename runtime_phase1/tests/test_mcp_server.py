@@ -306,6 +306,7 @@ def test_server_instructions_reflect_disabled_host_workers(monkeypatch):
 
 def test_enterprise_mcp_http_auth_middleware_gates_transport_requests(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-token")
 
     async def ok(request):
@@ -314,16 +315,30 @@ def test_enterprise_mcp_http_auth_middleware_gates_transport_requests(monkeypatc
     app = Starlette(routes=[Route("/mcp", ok, methods=["POST"])])
     app.add_middleware(mcp_server.EnterpriseMcpHttpAuthMiddleware)
     client = TestClient(app)
+    good_headers = {
+        "X-GlassHive-Service-Token": "service-token",
+        "X-GlassHive-Tenant-Id": "tenant-alpha",
+        "X-GlassHive-User-Id": "user-a",
+    }
 
     assert client.post("/mcp").status_code == 401
     assert client.post("/mcp", headers={"X-WPR-Token": "wrong"}).status_code == 401
-    assert client.post("/mcp", headers={"X-WPR-Token": "service-token"}).status_code == 200
-    assert client.post("/mcp", headers={"X-GlassHive-Service-Token": "service-token"}).status_code == 200
-    assert client.post("/mcp", headers={"Authorization": "Bearer service-token"}).status_code == 200
+    assert client.post("/mcp", headers={"X-WPR-Token": "service-token"}).status_code == 401
+    assert client.post(
+        "/mcp",
+        headers={
+            "X-GlassHive-Service-Token": "service-token",
+            "X-GlassHive-Tenant-Id": "tenant-alpha",
+        },
+    ).status_code == 401
+    assert client.post("/mcp", headers={**good_headers, "X-GlassHive-Tenant-Id": "tenant-beta"}).status_code == 401
+    assert client.post("/mcp", headers=good_headers).status_code == 200
+    assert client.post("/mcp", headers={**good_headers, "Authorization": "Bearer service-token"}).status_code == 200
 
 
 def test_enterprise_mcp_requires_service_authentication(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
 
     with pytest.raises(PermissionError):
@@ -337,18 +352,41 @@ def test_enterprise_mcp_requires_service_authentication(monkeypatch):
     mcp_server._require_enterprise_mcp_service_auth(
         {
             "x-wpr-token": "service-token",
-            "x-viventium-tenant-id": "tenant",
+            "x-viventium-tenant-id": "tenant-alpha",
             "x-viventium-user-id": "user-a",
         }
     )
     mcp_server._require_enterprise_mcp_service_auth(
         {
             "x-glasshive-service-token": "service-token",
-            "x-glasshive-tenant-id": "tenant",
+            "x-glasshive-tenant-id": "tenant-alpha",
             "x-glasshive-user-id": "user-a",
         }
     )
     mcp_server._require_enterprise_mcp_service_auth({"authorization": "Bearer service-token"})
+
+    with pytest.raises(PermissionError, match="tenant assertion"):
+        mcp_server._require_enterprise_mcp_identity_assertion(
+            {
+                "x-wpr-token": "service-token",
+                "x-viventium-tenant-id": "tenant-beta",
+                "x-viventium-user-id": "user-a",
+            }
+        )
+    with pytest.raises(PermissionError, match="user assertion"):
+        mcp_server._require_enterprise_mcp_identity_assertion(
+            {
+                "x-wpr-token": "service-token",
+                "x-viventium-tenant-id": "tenant-alpha",
+            }
+        )
+    mcp_server._require_enterprise_mcp_identity_assertion(
+        {
+            "x-wpr-token": "service-token",
+            "x-viventium-tenant-id": "tenant-alpha",
+            "x-viventium-user-id": "user-a",
+        }
+    )
 
 
 def test_enterprise_owner_and_alias_accept_generic_glasshive_identity_headers(monkeypatch):
@@ -515,6 +553,60 @@ def test_workspace_artifact_download_rejects_traversal_before_signing(monkeypatc
                     )
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("surface", ["librechat", "glasshive"])
+def test_workspace_status_returns_view_steer_link_for_web_mcp_surfaces(monkeypatch, surface):
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive.example.test")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {"X-GlassHive-Surface": surface})
+    api_client = PollingApiClient(["completed"])
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            status = await client.call_tool(
+                "workspace_status",
+                {"run_id": "run_poll", "worker_id": "wrk_poll"},
+            )
+            payload = _tool_json(status)
+            assert payload["view_steer_url"].startswith(
+                "https://glasshive.example.test/watch/wrk_poll?surface=desktop&project_id=prj_poll"
+            )
+            assert "gh_token=" in payload["view_steer_url"]
+            assert payload["view_steer"]["include_in_response"] is True
+
+    asyncio.run(scenario())
+
+
+def test_enterprise_view_steer_url_does_not_fall_back_to_unsigned(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive.example.test")
+    monkeypatch.delenv("GLASSHIVE_SIGNED_LINK_SECRET", raising=False)
+    monkeypatch.delenv("WPR_API_TOKEN", raising=False)
+
+    url = mcp_server._signed_view_steer_url(
+        {
+            "worker_id": "wrk_local",
+            "project_id": "prj_local",
+            "tenant_id": "local",
+            "owner_id": "owner-a",
+        },
+        "prj_local",
+        "librechat",
+    )
+
+    assert url is None
+
+
+def test_enterprise_mcp_refuses_non_http_transport(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+
+    with pytest.raises(RuntimeError, match="streamable-http"):
+        mcp_server._require_enterprise_mcp_transport("stdio")
+    with pytest.raises(RuntimeError, match="streamable-http"):
+        mcp_server._require_enterprise_mcp_transport("sse")
+    mcp_server._require_enterprise_mcp_transport("streamable-http")
 
 
 @pytest.mark.parametrize("surface", ["telegram", "voice", "unknown-surface"])

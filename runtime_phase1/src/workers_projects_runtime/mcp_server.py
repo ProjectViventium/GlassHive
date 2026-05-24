@@ -362,6 +362,7 @@ def _request_owner_id(owner_id: str | None) -> str | None:
     if _enterprise_mode_enabled():
         headers = _request_headers()
         _require_enterprise_mcp_service_auth(headers)
+        _require_enterprise_mcp_identity_assertion(headers)
         return _header_value(headers, HEADER_USER_ID) or DEFAULT_OWNER_ID or None
     explicit = _sanitize_context_value(owner_id)
     if explicit:
@@ -375,10 +376,10 @@ def _request_scoped_alias(alias: str) -> str:
         return clean_alias
     headers = _request_headers()
     _require_enterprise_mcp_service_auth(headers)
+    _require_enterprise_mcp_identity_assertion(headers)
     tenant_id = (
         _header_value(headers, HEADER_TENANT_ID)
-        or _sanitize_context_value(os.environ.get("GLASSHIVE_ENTERPRISE_TENANT_ID"))
-        or _sanitize_context_value(os.environ.get("WPR_ENTERPRISE_TENANT_ID"))
+        or _configured_enterprise_tenant_id()
     )
     user_id = _header_value(headers, HEADER_USER_ID) or DEFAULT_OWNER_ID
     return scoped_alias(AuthContext(tenant_id=tenant_id, user_id=user_id, enterprise=True), clean_alias)
@@ -414,15 +415,41 @@ def _require_enterprise_mcp_service_auth(headers: dict[str, str]) -> None:
         raise PermissionError("GlassHive MCP service authentication is required")
 
 
+def _configured_enterprise_tenant_id() -> str:
+    return (
+        _sanitize_context_value(os.environ.get("GLASSHIVE_ENTERPRISE_TENANT_ID"))
+        or _sanitize_context_value(os.environ.get("WPR_ENTERPRISE_TENANT_ID"))
+    )
+
+
+def _require_enterprise_mcp_identity_assertion(headers: dict[str, str]) -> None:
+    if not _enterprise_mode_enabled():
+        return
+    configured_tenant = _configured_enterprise_tenant_id()
+    asserted_tenant = _header_value(headers, HEADER_TENANT_ID)
+    if not configured_tenant:
+        raise PermissionError("GlassHive MCP enterprise tenant is not configured")
+    if asserted_tenant and asserted_tenant != configured_tenant:
+        raise PermissionError("GlassHive MCP tenant assertion does not match this deployment")
+    if not _header_value(headers, HEADER_USER_ID):
+        raise PermissionError("GlassHive MCP requires an authenticated user assertion")
+
+
 class EnterpriseMcpHttpAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if _enterprise_mode_enabled():
             headers = {key.lower(): value for key, value in request.headers.items()}
             try:
                 _require_enterprise_mcp_service_auth(headers)
+                _require_enterprise_mcp_identity_assertion(headers)
             except PermissionError as exc:
                 return JSONResponse(status_code=401, content={"detail": str(exc)})
         return await call_next(request)
+
+
+def _require_enterprise_mcp_transport(transport: str) -> None:
+    if _enterprise_mode_enabled() and transport != "streamable-http":
+        raise RuntimeError("GlassHive MCP enterprise mode requires streamable-http transport")
 
 
 def _audit_preview(value: str, *, max_chars: int = 700) -> str:
@@ -535,6 +562,8 @@ def _signed_view_steer_url(worker: dict[str, Any], project_id: str | None, reque
     )
     if token:
         return append_signed_query(url, {"gh_token": token})
+    if _enterprise_mode_enabled():
+        return None
     if str(worker.get("tenant_id") or "") not in {"", "local"}:
         return None
     return url
@@ -2380,6 +2409,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
 
+    _require_enterprise_mcp_transport(args.transport)
     server = create_mcp_server(base_url=args.base_url.rstrip("/"), host=args.host, port=args.port)
     if args.transport == "streamable-http" and _enterprise_mode_enabled():
         import uvicorn

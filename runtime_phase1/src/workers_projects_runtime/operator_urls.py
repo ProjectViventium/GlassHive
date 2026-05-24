@@ -4,7 +4,7 @@ import os
 from urllib.parse import urlencode
 
 
-OPERATOR_URL_SURFACES = {"", "web", "browser", "desktop", "playground"}
+OPERATOR_URL_SURFACES = {"", "web", "browser", "desktop", "playground", "librechat", "glasshive"}
 
 
 def operator_base_url() -> str:

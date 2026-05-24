@@ -883,6 +883,18 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
     def _compatible_provider_wire_api(self) -> str:
         return os.environ.get("WPR_OPENCLAW_WIRE_API", "openai-completions").strip() or "openai-completions"
 
+    def _compatible_provider_model_compat(self) -> dict[str, object]:
+        compat: dict[str, object] = {}
+        max_tokens_field = (
+            os.environ.get("WPR_OPENCLAW_MAX_TOKENS_FIELD", "").strip()
+            or os.environ.get("WPR_OPENCLAW_COMPAT_MAX_TOKENS_FIELD", "").strip()
+        )
+        if max_tokens_field in {"max_completion_tokens", "max_tokens"}:
+            compat["maxTokensField"] = max_tokens_field
+        elif max_tokens_field:
+            logger.warning("Ignoring unsupported WPR_OPENCLAW_MAX_TOKENS_FIELD value: %s", max_tokens_field)
+        return compat
+
     def _compatible_model_local_id(self, model: str) -> str:
         configured = os.environ.get("WPR_OPENCLAW_MODEL_ID", "").strip()
         if configured:
@@ -913,24 +925,26 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
             return None
         local_model = self._compatible_model_local_id(model)
         env_key = self._compatible_provider_env_key()
+        model_entry: dict[str, object] = {
+            "id": local_model,
+            "name": os.environ.get("WPR_OPENCLAW_MODEL_NAME", local_model).strip() or local_model,
+            "api": self._compatible_provider_wire_api(),
+            "reasoning": self._env_flag("WPR_OPENCLAW_MODEL_REASONING", False),
+            "input": ["text", "image"] if self._env_flag("WPR_OPENCLAW_MODEL_IMAGE_INPUT", False) else ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": int(os.environ.get("WPR_OPENCLAW_CONTEXT_WINDOW", "128000")),
+            "maxTokens": int(os.environ.get("WPR_OPENCLAW_MAX_TOKENS", "32000")),
+        }
+        compat = self._compatible_provider_model_compat()
+        if compat:
+            model_entry["compat"] = compat
         provider: dict[str, object] = {
             "baseUrl": base_url,
             "apiKey": {"source": "env", "provider": "default", "id": env_key},
             "api": self._compatible_provider_wire_api(),
             "authHeader": True,
             "timeoutSeconds": int(os.environ.get("WPR_OPENCLAW_PROVIDER_TIMEOUT_SECONDS", "300")),
-            "models": [
-                {
-                    "id": local_model,
-                    "name": os.environ.get("WPR_OPENCLAW_MODEL_NAME", local_model).strip() or local_model,
-                    "api": self._compatible_provider_wire_api(),
-                    "reasoning": self._env_flag("WPR_OPENCLAW_MODEL_REASONING", False),
-                    "input": ["text", "image"] if self._env_flag("WPR_OPENCLAW_MODEL_IMAGE_INPUT", False) else ["text"],
-                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-                    "contextWindow": int(os.environ.get("WPR_OPENCLAW_CONTEXT_WINDOW", "128000")),
-                    "maxTokens": int(os.environ.get("WPR_OPENCLAW_MAX_TOKENS", "32000")),
-                }
-            ],
+            "models": [model_entry],
         }
         headers: dict[str, object] = {}
         if env_key == "PORTKEY_API_KEY":
