@@ -8,56 +8,101 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260416a" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260524a" />
   </head>
   <body class="launch-body">
     <main class="launch-shell">
       <div class="ambient ambient-a"></div>
       <div class="ambient ambient-b"></div>
-      <section class="composer-frame">
+      <section class="composer-frame" data-active-view="project">
         <div class="brand-row">
           <span class="brand-mark">GlassHive</span>
-          <span class="brand-mode">Workspaces</span>
+          <div class="view-tabs" role="tablist" aria-label="GlassHive views">
+            <button id="project-tab" class="view-tab" type="button" role="tab" aria-selected="true" aria-controls="project-view" data-view-tab="project">Run project</button>
+            <button id="workspaces-tab" class="view-tab" type="button" role="tab" aria-selected="false" aria-controls="workspace-view" data-view-tab="workspaces">Workspaces</button>
+          </div>
         </div>
-        <div class="composer-copy">
-          <h1>Define the project once. Watch the workspace do the rest.</h1>
-          <p>Describe the job. Set the success bar. Add context if it matters. Then choose whether to open, duplicate, or start a workspace before the live sandbox takes over the screen.</p>
-        </div>
-        <form id="launch-form" class="composer-form">
-          <label>
-            <span>Describe your project</span>
-            <textarea id="description" name="description" rows="6" placeholder="What should this workspace actually accomplish?" required></textarea>
-          </label>
-          <label>
-            <span>Success Criteria</span>
-            <textarea id="success_criteria" name="success_criteria" rows="4" placeholder="What must be true before the project is considered complete?" required></textarea>
-          </label>
-          <label>
-            <span>Context</span>
-            <textarea id="context" name="context" rows="3" placeholder="Optional background, links, constraints, files, or access notes."></textarea>
-          </label>
-          <details class="advanced-panel">
-            <summary>Advanced</summary>
-            <div class="advanced-grid">
-              <label class="advanced-field">
-                <span>Initial watch surface</span>
-                <select id="launch-surface" name="launch_surface"></select>
-                <small>Desktop is the default. When live terminal-in-desktop is enabled, the active run still stays visible there.</small>
+        <section id="project-view" class="project-view" role="tabpanel" aria-labelledby="project-tab">
+          <div class="composer-copy">
+            <h1>Define the project once. Watch the worker deliver.</h1>
+            <p>Give GlassHive the work, criteria, and context. It keeps the workspace visible while the worker runs.</p>
+          </div>
+          <form id="launch-form" class="composer-form">
+            <div class="project-fields">
+              <label class="project-field project-field-main">
+                <span>Describe your project</span>
+                <textarea id="description" name="description" rows="4" placeholder="What should this workspace actually accomplish?" required></textarea>
+              </label>
+              <label class="project-field">
+                <span>Success Criteria</span>
+                <textarea id="success_criteria" name="success_criteria" rows="3" placeholder="What must be true before the project is considered complete?" required></textarea>
+              </label>
+              <label class="project-field">
+                <span>Context</span>
+                <textarea id="context" name="context" rows="3" placeholder="Optional background, links, constraints, files, or access notes."></textarea>
               </label>
             </div>
-          </details>
-          <div class="worker-row">
-            <label class="worker-picker">
-              <span>Workspace</span>
-              <select id="workspace-option" name="workspace_option"></select>
-              <small id="workspace-help" class="field-help"></small>
-            </label>
-            <button id="launch-button" type="submit" class="primary-button">Launch project</button>
+            <details class="advanced-panel">
+              <summary>Advanced</summary>
+              <div class="advanced-grid">
+                <label class="advanced-field">
+                  <span>Workspace Type</span>
+                  <select id="workspace-type" name="workspace_type"></select>
+                  <small id="workspace-type-help">Runs on managed GlassHive workspace compute.</small>
+                  <input id="launch-surface" name="launch_surface" type="hidden" value="desktop" />
+                </label>
+                <label class="advanced-field">
+                  <span>Schedule</span>
+                  <input id="schedule-text" name="schedule_text" type="text" placeholder="in 20 minutes, on Mondays, or leave blank" />
+                </label>
+                <label class="advanced-field">
+                  <span>Files</span>
+                  <input id="project-files" name="files" type="file" multiple />
+                  <small id="file-help">No files selected.</small>
+                </label>
+              </div>
+            </details>
+            <div class="worker-row">
+              <label class="worker-picker">
+                <span>Workspace</span>
+                <select id="workspace-option" name="workspace_option"></select>
+                <small id="workspace-help" class="field-help"></small>
+              </label>
+              <div class="launch-actions">
+                <button id="launch-button" type="submit" class="primary-button" value="launch">Run Project</button>
+                <button id="schedule-button" type="submit" class="secondary-button" value="schedule">Schedule</button>
+              </div>
+            </div>
+            <p id="launch-status" class="launch-status" aria-live="polite"></p>
+          </form>
+        </section>
+        <section id="workspace-view" class="workspace-hive" role="tabpanel" aria-labelledby="workspaces-tab" hidden>
+          <div class="workspace-hive-head">
+            <div>
+              <h1>Workspaces</h1>
+              <p id="workspace-hive-summary">Loading workspaces…</p>
+            </div>
+            <div class="workspace-view-controls" aria-label="Workspace view options">
+              <span>View</span>
+              <label class="workspace-view-toggle">
+                <input id="show-inactive-workspaces" type="checkbox" />
+                <span>Inactive Workspaces</span>
+              </label>
+              <label class="workspace-view-toggle">
+                <input id="show-workspace-watch" type="checkbox" checked />
+                <span>Watch</span>
+              </label>
+              <label class="workspace-view-toggle">
+                <input id="show-workspace-status" type="checkbox" checked />
+                <span>Status Report</span>
+              </label>
+            </div>
           </div>
-          <p id="launch-status" class="launch-status" aria-live="polite"></p>
-        </form>
+          <div id="workspace-hive-grid" class="workspace-hive-grid" aria-live="polite"></div>
+          <p id="workspace-hive-empty" class="workspace-hive-empty" hidden>No active workspaces right now.</p>
+        </section>
       </section>
     </main>
-    <script src="/static/app.js?v=20260416a" type="module"></script>
+    <script src="/static/app.js?v=20260524b" type="module"></script>
   </body>
 </html>

@@ -1,9 +1,10 @@
 const params = new URLSearchParams(window.location.search);
 const workerId = window.location.pathname.split('/').filter(Boolean).at(-1);
 const projectId = params.get('project_id');
+const signedToken = params.get('gh_token') || '';
 const requestedSurface = params.get('surface') === 'desktop' ? 'desktop' : 'terminal';
-const runtimeBase = `${window.location.protocol}//${window.location.hostname}:8766`;
 const uiBase = `${window.location.protocol}//${window.location.host}`;
+const runtimeBase = uiBase;
 const isApplePlatform = /Mac|iPhone|iPad|iPod/i.test(
   navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || ''
 );
@@ -12,6 +13,8 @@ const LONG_PRESS_MS = 550;
 
 const frame = document.getElementById('desktop-frame');
 const overlay = document.getElementById('stage-overlay');
+const stage = document.querySelector('.watch-stage');
+const overlayLabel = document.querySelector('#stage-overlay .overlay-label');
 const overlayTitle = document.getElementById('overlay-title');
 const overlayDetail = document.getElementById('overlay-detail');
 const title = document.getElementById('watch-title');
@@ -36,12 +39,13 @@ const openProjectWorkspaceMenu = document.getElementById('open-project-workspace
 const steerForm = document.getElementById('steer-form');
 const steerInput = document.getElementById('steer-input');
 const sendButton = document.getElementById('send-button');
+const runToggleButton = document.getElementById('run-toggle');
 const guidancePrimary = document.getElementById('steer-guidance-primary');
 const guidanceQueue = document.getElementById('steer-guidance-queue');
 
 let activeSurface = requestedSurface;
-let currentDesktopUrl = `${uiBase}/desktop/${workerId}`;
-let currentTerminalUrl = `${runtimeBase}/ui/workers/${workerId}/terminal`;
+let currentDesktopUrl = withAuth(`${uiBase}/desktop/${workerId}`);
+let currentTerminalUrl = withAuth(`${runtimeBase}/ui/workers/${workerId}/terminal`);
 let lastAttachedUrl = '';
 let attachStartedAt = 0;
 let retryTimers = [];
@@ -51,6 +55,7 @@ let currentSummary = 'No run output yet.';
 let currentFullOutput = 'No run output yet.';
 let currentProjectTitle = projectId || 'Project';
 let currentDeliverable = null;
+let currentDesktopAvailable = false;
 let lastPromotedDeliverableKey = '';
 let deliverablePromotionPending = false;
 let queueModifierActive = false;
@@ -58,10 +63,33 @@ let longPressTimer = 0;
 let longPressArmed = false;
 let suppressNextClick = false;
 
+function withAuth(url) {
+  if (!signedToken) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}gh_token=${encodeURIComponent(signedToken)}`;
+}
+
 function syncDocumentTitle(workerName, projectTitle) {
   const safeProjectTitle = String(projectTitle || 'Workspace').trim() || 'Workspace';
   const safeWorkerName = String(workerName || 'Workspace').trim() || 'Workspace';
   document.title = `GlassHive | ${safeProjectTitle} - ${safeWorkerName}`;
+}
+
+function displayStateForLive(data) {
+  const workerState = String(data?.worker?.state || '').trim().toLowerCase();
+  const runState = String(data?.latest_run?.state || '').trim().toLowerCase();
+  if (runState === 'completed') return 'completed';
+  if (['queued', 'running'].includes(runState)) return runState;
+  if (['paused', 'idle', 'idle_terminated', 'stopped', 'ready'].includes(workerState)) {
+    return workerState === 'ready' ? 'completed' : workerState;
+  }
+  return workerState || 'starting';
+}
+
+function displayStateLabel(state) {
+  const normalized = String(state || '').trim().toLowerCase();
+  if (normalized === 'completed') return 'Completed';
+  if (normalized === 'idle_terminated') return 'Idle stopped';
+  return normalized || 'starting';
 }
 
 function clearRetryTimers() {
@@ -121,9 +149,19 @@ function currentSurfaceUrl() {
   return currentTerminalUrl || currentDesktopUrl;
 }
 
+function clearAttachedView() {
+  clearRetryTimers();
+  lastAttachedUrl = '';
+  attachStartedAt = 0;
+  frameReady = false;
+  if (frame.src !== 'about:blank') {
+    frame.src = 'about:blank';
+  }
+}
+
 function projectWorkspaceUrl() {
   if (!projectId) return '';
-  return `${runtimeBase}/ui/projects/${projectId}?worker_id=${workerId}`;
+  return withAuth(`${runtimeBase}/ui/projects/${projectId}?worker_id=${workerId}`);
 }
 
 function syncProjectWorkspaceLinks() {
@@ -147,6 +185,29 @@ function syncSendAffordance() {
     guidanceQueue.textContent = `Hold Send or ${queueShortcutLabel} to queue instead`;
   }
   sendButton.title = `Send redirects now. Hold Send or use ${queueShortcutLabel} to queue a follow-up without interrupting current work.`;
+}
+
+function syncRunToggle(state) {
+  if (!runToggleButton) return;
+  const normalized = String(state || '').trim().toLowerCase();
+  const shouldResume = normalized === 'paused' || normalized === 'idle' || normalized === 'idle_terminated' || normalized === 'stopped' || normalized === 'completed';
+  const disabled = ['created', 'starting', 'failed', 'terminated'].includes(normalized);
+  runToggleButton.dataset.action = shouldResume ? 'resume' : 'pause';
+  runToggleButton.textContent = normalized === 'completed' ? 'Continue' : shouldResume ? 'Resume' : 'Pause';
+  runToggleButton.setAttribute('aria-label', normalized === 'completed' ? 'Continue workspace' : shouldResume ? 'Resume workspace' : 'Pause workspace');
+  runToggleButton.setAttribute('aria-pressed', String(!shouldResume && !disabled));
+  runToggleButton.title = normalized === 'completed'
+    ? 'Continue this completed workspace'
+    : shouldResume
+    ? 'Resume this workspace'
+    : 'Pause this workspace';
+  runToggleButton.disabled = disabled;
+}
+
+function autoResizeSteerInput() {
+  if (!steerInput) return;
+  steerInput.style.height = 'auto';
+  steerInput.style.height = `${Math.min(Math.max(steerInput.scrollHeight, 52), 156)}px`;
 }
 
 function clearLongPress() {
@@ -174,11 +235,32 @@ function syncMenuLabels() {
 function setSurface(surface, { force = false } = {}) {
   activeSurface = surface === 'desktop' ? 'desktop' : 'terminal';
   syncMenuLabels();
+  const state = String(statePill.textContent || 'starting').trim().toLowerCase();
+  if (['created', 'starting', 'paused', 'idle', 'idle_terminated', 'stopped', 'failed', 'terminated'].includes(state)) {
+    clearAttachedView();
+    setOverlay(state);
+    return;
+  }
+  if (activeSurface === 'desktop' && !currentDesktopAvailable) {
+    clearAttachedView();
+    overlay.hidden = false;
+    if (stage) {
+      stage.dataset.overlayActive = 'true';
+    }
+    if (overlayLabel) {
+      overlayLabel.textContent = state === 'ready' || state === 'idle' || state === 'completed' ? 'Workspace complete' : 'GlassHive desktop';
+    }
+    overlayTitle.textContent = state === 'idle' ? 'Worker idle' : state === 'completed' ? 'Worker completed' : state === 'ready' ? 'Workspace ready' : 'Desktop unavailable';
+    overlayDetail.textContent = state === 'ready' || state === 'idle' || state === 'completed'
+      ? 'The worker is ready for a follow-up. Compute may be stopped to save resources; GlassHive resumes it automatically when you send work.'
+      : 'This workspace does not currently expose a live desktop surface.';
+    return;
+  }
   const url = currentSurfaceUrl();
   if (force || lastAttachedUrl !== url || frame.src !== url) {
     attachView(url);
   }
-  setOverlay(statePill.textContent || 'starting');
+  setOverlay(state || 'starting');
 }
 
 function summarizeOutput(data) {
@@ -238,15 +320,16 @@ function summarizeOutput(data) {
 
   if (deliverable && runState === 'completed') {
     const label = String(deliverable.label || deliverable.workspace_path || deliverable.browser_url || 'Delivered result');
+    const deliverableLabel = deliverable.kind === 'file' ? 'Delivered file ready' : 'Delivered page ready';
     const full = [
-      `Delivered page ready · ${label}`,
+      `${deliverableLabel} · ${label}`,
       deliverable.browser_url ? `Browser target: ${deliverable.browser_url}` : '',
       raw,
     ].filter(Boolean).join('\n\n');
     return {
       label: 'Latest result',
       panelTitle: 'Delivered result',
-      summary: `Delivered page ready · ${label}`,
+      summary: `${deliverableLabel} · ${label}`,
       full,
     };
   }
@@ -311,7 +394,7 @@ function renderOutput(data) {
 }
 
 async function postAction(action, payload) {
-  const response = await fetch(`/api/worker/${workerId}/${action.startsWith('action:') ? 'action/' + action.split(':', 2)[1] : action}`, {
+  const response = await fetch(withAuth(`/api/worker/${workerId}/${action.startsWith('action:') ? 'action/' + action.split(':', 2)[1] : action}`), {
     method: 'POST',
     headers: payload ? { 'Content-Type': 'application/json' } : {},
     body: payload ? JSON.stringify(payload) : undefined,
@@ -327,7 +410,7 @@ async function submitFooterInstruction(mode) {
   if (!message) return;
   const path = mode === 'queue' ? 'message' : 'steer';
   try {
-    const response = await fetch(`/api/worker/${workerId}/${path}`, {
+    const response = await fetch(withAuth(`/api/worker/${workerId}/${path}`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message }),
@@ -336,6 +419,7 @@ async function submitFooterInstruction(mode) {
       throw new Error(await response.text());
     }
     steerInput.value = '';
+    autoResizeSteerInput();
     closeResultPanel();
     if (mode === 'queue') {
       statusLabel.textContent = 'Queued follow-up';
@@ -360,19 +444,37 @@ async function submitFooterInstruction(mode) {
 
 function setOverlay(state, detail) {
   const connecting = attachStartedAt && !frameReady && Date.now() - attachStartedAt < 12000;
-  const waiting = state === 'starting' || state === 'paused' || connecting;
+  const waiting = state === 'starting' || state === 'paused' || state === 'idle' || state === 'idle_terminated' || state === 'stopped' || connecting;
   overlay.hidden = !waiting;
+  if (stage) {
+    stage.dataset.overlayActive = String(waiting);
+  }
   if (!waiting) return;
 
   if (state === 'paused') {
-    overlayTitle.textContent = 'Workspace paused';
+    if (overlayLabel) {
+      overlayLabel.textContent = 'Workspace resuming';
+    }
+    overlayTitle.textContent = 'Workspace resuming…';
     overlayDetail.textContent = activeSurface === 'desktop'
-      ? 'The workspace is frozen. Press Play to continue, or open the desktop in a new tab and steer directly.'
-      : 'The exact live session is frozen. Press Play to continue the same workspace run, or steer it directly from this session.';
+      ? 'The worker is already moving. The desktop will attach automatically when the workspace is ready.'
+      : 'The worker is already moving. The exact live session will attach automatically when the workspace is ready.';
+    return;
+  }
+
+  if (state === 'idle' || state === 'idle_terminated' || state === 'stopped') {
+    if (overlayLabel) {
+      overlayLabel.textContent = 'Workspace idle';
+    }
+    overlayTitle.textContent = 'Worker idle';
+    overlayDetail.textContent = 'The last run is complete and compute is stopped to save resources. Send follow-up work and GlassHive will resume this workspace automatically.';
     return;
   }
 
   if (connecting) {
+    if (overlayLabel) {
+      overlayLabel.textContent = 'Workspace attaching';
+    }
     overlayTitle.textContent = activeSurface === 'desktop' ? 'Attaching live workspace…' : 'Attaching exact live session…';
     overlayDetail.textContent = activeSurface === 'desktop'
       ? 'The desktop is waking up. If it takes more than a few seconds, open the current desktop in a new tab.'
@@ -380,6 +482,9 @@ function setOverlay(state, detail) {
     return;
   }
 
+  if (overlayLabel) {
+    overlayLabel.textContent = 'Workspace warming up';
+  }
   overlayTitle.textContent = activeSurface === 'desktop' ? 'Preparing live workspace…' : 'Preparing exact live session…';
   overlayDetail.textContent = detail || (activeSurface === 'desktop'
     ? 'The desktop will attach automatically when the workspace is ready.'
@@ -387,34 +492,39 @@ function setOverlay(state, detail) {
 }
 
 async function refresh() {
-  const response = await fetch(`/api/worker/${workerId}/live`);
+  const response = await fetch(withAuth(`/api/worker/${workerId}/live`));
   if (!response.ok) return;
   const data = await response.json();
   const worker = data.worker;
   const runtime = data.runtime_details || {};
+  const displayState = displayStateForLive(data);
   currentProjectTitle = String(data.project_title || worker.project_id || projectId || 'Project');
   currentDeliverable = data.deliverable || null;
 
   title.textContent = currentProjectTitle || 'Workspace live view';
-  subtitle.textContent = `${worker.profile || 'worker'} workspace · ${worker.state || 'starting'}`;
+  subtitle.textContent = `${worker.profile || 'worker'} workspace · ${displayStateLabel(displayState)}`;
   syncDocumentTitle(currentProjectTitle, worker.name);
-  statePill.textContent = worker.state;
+  statePill.textContent = displayStateLabel(displayState);
+  syncRunToggle(displayState);
 
-  currentDesktopUrl = `${uiBase}/desktop/${workerId}`;
-  currentTerminalUrl = `${runtimeBase}/ui/workers/${workerId}/terminal`;
+  currentDesktopAvailable = Boolean(runtime.view_available || runtime.view_url);
+  currentDesktopUrl = currentDesktopAvailable ? withAuth(`${uiBase}/desktop/${workerId}`) : '';
+  currentTerminalUrl = withAuth(`${runtimeBase}/ui/workers/${workerId}/terminal`);
 
   renderOutput(data);
   await maybePromoteDeliverable(data);
   syncMenuLabels();
   setSurface(activeSurface, { force: false });
-  setOverlay(
-    worker.state,
-    worker.state === 'paused'
-      ? 'Use Play to continue the same workspace.'
-      : activeSurface === 'desktop'
-        ? 'The desktop will attach automatically when the workspace is ready.'
-        : 'The exact workspace session will attach automatically when the workspace is ready.'
-  );
+  if (!(activeSurface === 'desktop' && !currentDesktopAvailable)) {
+    setOverlay(
+      displayState,
+      displayState === 'paused'
+        ? 'Use Resume to continue the same workspace.'
+        : activeSurface === 'desktop'
+          ? 'The desktop will attach automatically when the workspace is ready.'
+          : 'The exact workspace session will attach automatically when the workspace is ready.'
+    );
+  }
 }
 
 for (const button of document.querySelectorAll('[data-action]')) {
@@ -451,8 +561,11 @@ frame.addEventListener('load', () => {
   if (!frame.src || frame.src === 'about:blank') return;
   frameReady = true;
   attachStartedAt = 0;
-  if (statePill.textContent !== 'paused') {
+  if (!['paused', 'idle', 'idle stopped'].includes(String(statePill.textContent || '').trim().toLowerCase())) {
     overlay.hidden = true;
+    if (stage) {
+      stage.dataset.overlayActive = 'false';
+    }
   }
 });
 
@@ -460,6 +573,12 @@ menuToggle.addEventListener('click', () => {
   const open = menu.hidden;
   menu.hidden = !open;
   menuToggle.setAttribute('aria-expanded', String(open));
+  if (open) {
+    const firstMenuItem = menu.querySelector('button:not([hidden])');
+    if (firstMenuItem instanceof HTMLElement) {
+      firstMenuItem.focus();
+    }
+  }
 });
 
 resultToggle.addEventListener('click', () => {
@@ -523,14 +642,20 @@ openTerminalLink.addEventListener('click', () => {
 
 openWorkerConsole.addEventListener('click', () => {
   closeMenu();
-  window.open(`${runtimeBase}/ui/workers/${workerId}`, '_blank', 'noopener,noreferrer');
+  window.open(withAuth(`${runtimeBase}/ui/workers/${workerId}`), '_blank', 'noopener,noreferrer');
 });
 
+steerInput.addEventListener('input', autoResizeSteerInput);
+
 steerInput.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+  if (event.key !== 'Enter' || event.shiftKey) return;
+  if (event.metaKey || event.ctrlKey) {
     event.preventDefault();
     submitFooterInstruction('queue');
+    return;
   }
+  event.preventDefault();
+  submitFooterInstruction('steer');
 });
 
 sendButton.addEventListener('pointerdown', (event) => {
@@ -581,5 +706,7 @@ steerForm.addEventListener('submit', async (event) => {
 syncMenuLabels();
 syncProjectWorkspaceLinks();
 syncSendAffordance();
+syncRunToggle('starting');
+autoResizeSteerInput();
 refresh();
 setInterval(refresh, 2000);

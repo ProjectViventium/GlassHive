@@ -27,6 +27,12 @@ Current implementation:
 - SQLite store
 - project-first web UI
 
+Enterprise VM mode adds an `AuthContext` before API/MCP handlers. When
+`GLASSHIVE_ENTERPRISE_MODE=true`, the control plane requires a service-authenticated LibreChat user
+assertion, derives `tenant_id` and `owner_id` server-side, and scopes project, worker, run, event,
+UI, watch, and artifact queries by tenant plus user. The deployment tenant is pinned by server
+configuration; a mismatched inbound tenant assertion fails closed.
+
 ## 2. Worker Runtime
 
 This layer decides how a worker actually executes tasks.
@@ -63,6 +69,11 @@ Current honest boundary:
 
 - good owner-controlled local isolation
 - not yet a hostile multi-tenant boundary
+
+Azure enterprise v1 keeps this Docker substrate on one tenant VM. It provides application-level
+per-user ownership separation and idle compute reaping, not hostile cross-tenant sandboxing.
+Enterprise worker bootstrap is clean-room with respect to the VM account's host Codex, Claude, and
+git auth files; provider access is projected through explicit allowlisted environment variables.
 
 ## 4. Client Adapters
 

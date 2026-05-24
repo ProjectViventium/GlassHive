@@ -17,7 +17,7 @@ def test_build_operator_brief_includes_required_sections():
     assert "already fully authorized inside this sandbox" in brief
     assert "Never block the whole run on a foreground dev server" in brief
     assert "prefer one self-contained script or process" in brief
-    assert "prefer opening the final HTML file directly" in brief
+    assert "when the browser/tooling does not support file:// URLs" in brief
 
 
 def test_build_project_title_is_short_and_stable():

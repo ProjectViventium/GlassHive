@@ -22,22 +22,46 @@ Current official guidance from Claude Code and modern MCP tooling points in the 
 
 ## Client Strategy
 
-### Viventium / LibreChat
-Use Glass Hive as an external MCP server.
+### LibreChat / Viventium / Standalone-Compatible Clients
+Use Glass Hive as an external MCP server. The default enterprise path is config-only and does not
+require LibreChat application-code changes.
 
-For host-native worker delegation, Viventium injects request context headers into the MCP call:
+For enterprise worker delegation, the host application injects a service-authenticated user
+assertion and request context into the MCP call. The neutral standalone header set is:
 
-- user id
-- agent id
-- conversation id
-- parent message id
-- current message id
-- request files, attachments, tool resources, and file ids as encoded metadata headers
+- `X-GlassHive-Service-Token`
+- `X-GlassHive-Tenant-Id`
+- `X-GlassHive-User-Id`
+- `X-GlassHive-User-Email`
+- `X-GlassHive-User-Role`
+- optional request context: `X-GlassHive-Agent-Id`, `X-GlassHive-Conversation-Id`,
+  `X-GlassHive-Parent-Message-Id`, `X-GlassHive-Message-Id`, `X-GlassHive-Surface`,
+  and `X-GlassHive-Input-Mode`
+- optional upload context: `X-GlassHive-Request-Files`,
+  `X-GlassHive-Request-Attachments`, `X-GlassHive-Tool-Resources`, and
+  `X-GlassHive-File-Ids`
 
-The MCP adapter folds those values into `bootstrap_bundle.callbacks` so GlassHive can report
-completion or blockers back to the same conversation without reading LibreChat internals. Upload
-metadata is projected into `bootstrap_bundle.files` only when a local path or extracted text is
-available, reusing the parent upload path.
+Viventium-prefixed headers and `X-WPR-Token` remain supported aliases for existing local
+integrations, but new non-Viventium clients should use the neutral GlassHive names. The MCP adapter
+folds request context into `bootstrap_bundle` without reading LibreChat internals. Upload metadata
+is projected into `bootstrap_bundle.files` when a local path or extracted text is available; when the
+chat model cannot see an uploaded file body, it should still launch the worker with the file
+reference and requested outcome so GlassHive can use the trusted upload metadata supplied by the
+host.
+
+Callbacks are optional. Viventium can use signed callbacks for durable completion delivery, but
+standalone/plain LibreChat deployments must still work without them by using:
+
+- `workspace_status` for non-blocking follow-up checks
+- `workspace_wait` for explicit blocking waits
+- `workspace_artifacts` and `workspace_artifact_download` for generated files and signed downloads
+- the returned View / Steer URL for operator visibility and takeover
+
+The MCP descriptions must make this non-callback path obvious to connected LLMs. A model should
+launch work with `workspace_launch`, include `uploaded_files` when the user attached files, return
+the View / Steer URL promptly, and use status/wait/artifact tools for follow-up and delivery. It
+must not fall back to pasting whole generated files into chat or writing its own inferior local
+code path when GlassHive has already produced a signed artifact link.
 
 ### Claude / Claude Code
 Support:
@@ -63,6 +87,14 @@ For broader publication:
 - do not duplicate runtime logic inside the MCP layer
 - `execution_mode=host` must be an explicit tool argument; the MCP server should not infer host
   execution from natural-language phrasing
+
+For Azure enterprise VM mode, the default LibreChat integration remains config-only: LibreChat sends
+the neutral `X-GlassHive-*` service, identity, request, and upload headers to the remote GlassHive
+MCP endpoint over a locked-down channel. GlassHive trusts identity headers only after service-token
+validation and ignores model/tool-supplied `owner_id`. Optional MCP OAuth/OIDC can be enabled for
+enterprises that want a second consent flow, but it is not the seamless default. Until server-side
+token validation is present, GlassHive runtime authorization stays `first_party_assertion` and
+OAuth/OIDC auth modes fail closed by default.
 
 ## Compatibility Alias
 

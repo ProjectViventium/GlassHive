@@ -45,7 +45,7 @@ Current behavior:
 ```bash
 cd <workspace-root>/viventium_v0_4/GlassHive/runtime_phase1
 uv sync
-uv run uvicorn workers_projects_runtime.api:app --reload --port 8766
+uv run uvicorn workers_projects_runtime.api:app --reload --port 8766 --no-access-log
 ```
 
 Open:

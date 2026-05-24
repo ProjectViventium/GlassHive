@@ -5,12 +5,26 @@ import os
 import shlex
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from urllib.parse import quote, urlencode
 
-from .bootstrap import apply_bootstrap, bootstrap_env_for
+from .bootstrap import apply_bootstrap
+
+
+SAFE_DOCKER_EXEC_ENV_KEYS = {
+    "PATH",
+    "SHELL",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "PYTHONIOENCODING",
+}
 
 
 @dataclass
@@ -25,6 +39,14 @@ class SandboxInfo:
     novnc_port: int | None = None
     selenium_port: int | None = None
     openclaw_port: int | None = None
+
+
+def _safe_docker_exec_env(env: dict[str, str] | None) -> dict[str, str]:
+    return {
+        key: str(value)
+        for key, value in (env or {}).items()
+        if value is not None and (key in SAFE_DOCKER_EXEC_ENV_KEYS or key.startswith("LC_"))
+    }
 
 
 class DockerSandboxManager:
@@ -48,6 +70,21 @@ class DockerSandboxManager:
         self.openclaw_container_port = int(os.environ.get("WPR_SANDBOX_OPENCLAW_PORT", "18789"))
         self.vnc_password = os.environ.get("WPR_SANDBOX_VNC_PASSWORD", "secret")
         self.vnc_no_password = os.environ.get("WPR_SANDBOX_VNC_NO_PASSWORD", "1").strip().lower() in {"1", "true", "yes", "on"}
+        self.memory_limit = os.environ.get("WPR_SANDBOX_MEMORY", "3g").strip()
+        self.memory_swap_limit = os.environ.get("WPR_SANDBOX_MEMORY_SWAP", self.memory_limit).strip()
+        self.cpu_limit = os.environ.get("WPR_SANDBOX_CPUS", "2").strip()
+        self.pids_limit = os.environ.get("WPR_SANDBOX_PIDS_LIMIT", "4096").strip()
+        self.inspect_timeout_sec = float(os.environ.get("WPR_DOCKER_INSPECT_TIMEOUT_SEC", "5") or "5")
+        self.inspect_cache_ttl_sec = float(os.environ.get("WPR_DOCKER_INSPECT_CACHE_TTL_SEC", "5") or "5")
+        self.inspect_stale_ttl_sec = float(os.environ.get("WPR_DOCKER_INSPECT_STALE_TTL_SEC", "60") or "60")
+        self._inspect_cache: dict[str, tuple[float, SandboxInfo]] = {}
+        self.image_inspect_timeout_sec = float(os.environ.get("WPR_DOCKER_IMAGE_INSPECT_TIMEOUT_SEC", "15") or "15")
+        self.image_build_timeout_sec = float(os.environ.get("WPR_DOCKER_IMAGE_BUILD_TIMEOUT_SEC", "900") or "900")
+        self.image_check_ttl_sec = float(os.environ.get("WPR_DOCKER_IMAGE_CHECK_TTL_SEC", "300") or "300")
+        self._image_checked_at: float = 0.0
+
+    def _invalidate_inspect_cache(self, worker_id: str) -> None:
+        self._inspect_cache.pop(worker_id, None)
 
     def _env_flag(self, name: str, default: bool) -> bool:
         raw = str(os.environ.get(name, "")).strip().lower()
@@ -55,45 +92,82 @@ class DockerSandboxManager:
             return default
         return raw in {"1", "true", "yes", "on"}
 
-    def ensure_ready(self, worker: dict, runtime_name: str, *, start_if_paused: bool = True) -> SandboxInfo:
+    def ensure_ready(
+        self,
+        worker: dict,
+        runtime_name: str,
+        *,
+        start_if_paused: bool = True,
+        repair_paths: bool = True,
+    ) -> SandboxInfo:
         self._require_docker()
-        self._ensure_image()
         paths = self._paths(worker["worker_id"])
         self._ensure_host_dirs(paths)
         self._seed_bootstrap(paths["home_dir"], paths["workspace_dir"], runtime_name, worker)
         container_name = self._container_name(worker["worker_id"])
         sandbox = self.inspect(worker["worker_id"])
         needs_idle_prime = False
+        needs_path_repair = False
         if sandbox is None:
+            fast_sandbox = self.fast_sandbox_from_worker(worker)
+            if fast_sandbox is not None:
+                return fast_sandbox
+            self._ensure_image()
+            self._invalidate_inspect_cache(worker["worker_id"])
             self._create_container(container_name, paths)
+            self._invalidate_inspect_cache(worker["worker_id"])
             sandbox = self.inspect(worker["worker_id"])
             needs_idle_prime = True
+            needs_path_repair = True
         if sandbox is None:
             raise RuntimeError("Failed to create worker sandbox")
         if sandbox.state == "paused" and start_if_paused:
+            self._invalidate_inspect_cache(worker["worker_id"])
             self._docker(["unpause", container_name])
+            self._invalidate_inspect_cache(worker["worker_id"])
             sandbox = self.inspect(worker["worker_id"])
         elif sandbox.state in {"created", "exited", "dead"}:
+            self._invalidate_inspect_cache(worker["worker_id"])
             self._docker(["start", container_name])
+            self._invalidate_inspect_cache(worker["worker_id"])
             sandbox = self.inspect(worker["worker_id"])
             needs_idle_prime = True
+            needs_path_repair = True
         if sandbox is None:
             raise RuntimeError("Failed to start worker sandbox")
-        self._set_plain_background(sandbox.container_name)
+        if needs_path_repair or (repair_paths and self._env_flag("WPR_REPAIR_RUNNING_CONTAINER_ROOTS", False)):
+            self._ensure_container_writable_paths(sandbox.container_name, [self.workspace_mount, self.home_mount])
+        if needs_idle_prime:
+            self._set_plain_background(sandbox.container_name)
         if needs_idle_prime and self._env_flag("WPR_IDLE_DESKTOP_PRIME_BROWSER", True):
             self._prime_idle_desktop(sandbox.container_name)
         return sandbox
 
     def inspect(self, worker_id: str) -> SandboxInfo | None:
+        now = time.monotonic()
+        cached = self._inspect_cache.get(worker_id)
+        if cached and cached[0] + self.inspect_cache_ttl_sec > now:
+            return cached[1]
         container_name = self._container_name(worker_id)
-        result = self._docker(["inspect", container_name], check=False, capture_output=True)
+        result = self._docker(
+            ["inspect", container_name],
+            check=False,
+            capture_output=True,
+            timeout_sec=self.inspect_timeout_sec,
+        )
         if result.returncode != 0:
+            if cached and cached[0] + self.inspect_stale_ttl_sec > now:
+                return cached[1]
             return None
         try:
             payload = json.loads(result.stdout or "[]")
         except json.JSONDecodeError:
+            if cached and cached[0] + self.inspect_stale_ttl_sec > now:
+                return cached[1]
             return None
         if not payload:
+            if cached and cached[0] + self.inspect_stale_ttl_sec > now:
+                return cached[1]
             return None
         entry = payload[0]
         state = entry.get("State") or {}
@@ -102,7 +176,7 @@ class DockerSandboxManager:
             status = "paused"
         pid = state.get("Pid")
         ports = entry.get("NetworkSettings", {}).get("Ports") or {}
-        return SandboxInfo(
+        sandbox = SandboxInfo(
             container_name=container_name,
             container_id=str(entry.get("Id") or "").strip() or None,
             state=status,
@@ -114,6 +188,8 @@ class DockerSandboxManager:
             selenium_port=self._host_port_for(ports, self.selenium_container_port),
             openclaw_port=self._host_port_for(ports, self.openclaw_container_port),
         )
+        self._inspect_cache[worker_id] = (now, sandbox)
+        return sandbox
 
     def pause(self, worker_id: str) -> SandboxInfo:
         sandbox = self.inspect(worker_id)
@@ -130,12 +206,14 @@ class DockerSandboxManager:
             )
         if sandbox.state == "running":
             self._docker(["pause", sandbox.container_name], check=False)
+            self._invalidate_inspect_cache(worker_id)
         return self.inspect(worker_id) or sandbox
 
     def terminate(self, worker_id: str) -> SandboxInfo:
         sandbox = self.inspect(worker_id)
         if sandbox is not None:
             self._docker(["rm", "-f", sandbox.container_name], check=False)
+            self._invalidate_inspect_cache(worker_id)
         return SandboxInfo(
             container_name=self._container_name(worker_id),
             container_id=None,
@@ -156,7 +234,7 @@ class DockerSandboxManager:
         worker: dict | None = None,
     ) -> list[str]:
         resolved_worker = worker or {"worker_id": worker_id}
-        sandbox = self.ensure_ready(resolved_worker, runtime_name=runtime_name)
+        sandbox = self.ensure_ready(resolved_worker, runtime_name=runtime_name, repair_paths=False)
         docker_command = [
             "docker",
             "exec",
@@ -170,7 +248,7 @@ class DockerSandboxManager:
             "-e",
             f"TERM={self.term_value}",
         ]
-        merged_env = {**bootstrap_env_for(resolved_worker), **(env or {})}
+        merged_env = _safe_docker_exec_env(env)
         for key, value in sorted(merged_env.items()):
             if value is None:
                 continue
@@ -202,11 +280,11 @@ class DockerSandboxManager:
 
     def list_screen_sessions(self, worker_id: str, runtime_name: str, *, worker: dict | None = None) -> list[str]:
         resolved_worker = worker or {"worker_id": worker_id}
-        sandbox = self.ensure_ready(resolved_worker, runtime_name=runtime_name)
+        sandbox = self.ensure_ready(resolved_worker, runtime_name=runtime_name, repair_paths=False)
         self._ensure_screen_runtime_dir(sandbox.container_name)
         result = self._docker_exec(
             sandbox.container_name,
-            ["bash", "-lc", "screen -ls || true"],
+            ["bash", "-c", "screen -ls || true"],
             env={
                 "HOME": self.home_mount,
                 "TERM": self.term_value,
@@ -237,14 +315,13 @@ class DockerSandboxManager:
         worker: dict | None = None,
     ) -> subprocess.CompletedProcess[str]:
         resolved_worker = worker or {"worker_id": worker_id}
-        sandbox = self.ensure_ready(resolved_worker, runtime_name=runtime_name)
+        sandbox = self.fast_sandbox_from_worker(resolved_worker) or self.ensure_ready(resolved_worker, runtime_name=runtime_name)
         self._ensure_screen_runtime_dir(sandbox.container_name)
         merged_env = {
             "HOME": self.home_mount,
             "TERM": self.term_value,
             "DISPLAY": self.display_value,
-            **bootstrap_env_for(resolved_worker),
-            **(env or {}),
+            **_safe_docker_exec_env(env),
         }
         self.stop_screen_session(worker_id, runtime_name, session_name, worker=resolved_worker, missing_ok=True)
         return self._docker_exec(
@@ -252,7 +329,26 @@ class DockerSandboxManager:
             ["screen", "-DmS", session_name, *command],
             env=merged_env,
             cwd=self.workspace_mount,
+            detach=True,
         )
+
+    def ensure_container_writable_paths(
+        self,
+        worker_id: str,
+        runtime_name: str,
+        container_paths: list[str],
+        *,
+        worker: dict | None = None,
+    ) -> None:
+        if not container_paths:
+            return
+        resolved_worker = worker or {"worker_id": worker_id}
+        sandbox = (
+            self.fast_sandbox_from_worker(resolved_worker)
+            or self.inspect(worker_id)
+            or self.ensure_ready(resolved_worker, runtime_name=runtime_name)
+        )
+        self._ensure_container_writable_paths(sandbox.container_name, container_paths)
 
     def stop_screen_session(
         self,
@@ -264,10 +360,36 @@ class DockerSandboxManager:
         missing_ok: bool = False,
     ) -> None:
         resolved_worker = worker or {"worker_id": worker_id}
-        sandbox = self.ensure_ready(resolved_worker, runtime_name=runtime_name)
+        container_name = self._container_name(worker_id)
+        if not self._worker_state_allows_fast_exec(resolved_worker):
+            sandbox = self.inspect(worker_id)
+            if sandbox is None:
+                if missing_ok:
+                    return
+                raise RuntimeError(f"Worker sandbox {container_name} is not running")
+            container_name = sandbox.container_name
+        script = "\n".join(
+            [
+                "target=$1",
+                "sockets=$(screen -ls | awk -v target=\"$target\" '",
+                "  /^[[:space:]]*[0-9]+[.]/ {",
+                "    socket=$1;",
+                "    name=socket;",
+                "    sub(/^[0-9]+[.]/, \"\", name);",
+                "    if (name == target) print socket;",
+                "  }",
+                "')",
+                "if [ -z \"$sockets\" ]; then exit 42; fi",
+                "status=0",
+                "for socket in $sockets; do",
+                "  screen -S \"$socket\" -X quit >/dev/null 2>&1 || status=$?",
+                "done",
+                "exit \"$status\"",
+            ]
+        )
         result = self._docker_exec(
-            sandbox.container_name,
-            ["bash", "-c", f"screen -S {shlex.quote(session_name)} -X quit >/dev/null 2>&1 || true"],
+            container_name,
+            ["bash", "-c", script, "glasshive-stop-screen", session_name],
             env={
                 "HOME": self.home_mount,
                 "TERM": self.term_value,
@@ -275,7 +397,7 @@ class DockerSandboxManager:
             },
             cwd=self.workspace_mount,
         )
-        if result.returncode != 0 and not missing_ok:
+        if result.returncode != 0 and not (missing_ok and result.returncode == 42):
             detail = (result.stderr or result.stdout or "").strip()[-1200:]
             raise RuntimeError(f"Failed to stop screen session {session_name}: {detail}")
 
@@ -288,19 +410,40 @@ class DockerSandboxManager:
         worker: dict | None = None,
     ) -> None:
         resolved_worker = worker or {"worker_id": worker_id}
-        sandbox = self.ensure_ready(resolved_worker, runtime_name=runtime_name)
+        container_name = self._container_name(worker_id)
+        if not self._worker_state_allows_fast_exec(resolved_worker):
+            sandbox = self.inspect(worker_id)
+            if sandbox is None:
+                raise RuntimeError(f"Worker sandbox {container_name} is not running")
+            container_name = sandbox.container_name
         run_root = f"{self.home_mount}/.glasshive-runs/{run_id}"
-        script = (
-            f"needle={shlex.quote(run_root)}; "
-            "pids=$(ps -eo pid=,ppid=,args= | awk -v needle=\"$needle\" 'index($0, needle) > 0 { print $1 }'); "
-            "if [ -z \"$pids\" ]; then exit 0; fi; "
-            "for pid in $pids; do pkill -TERM -P \"$pid\" >/dev/null 2>&1 || true; kill -TERM \"$pid\" >/dev/null 2>&1 || true; done; "
-            "sleep 1; "
-            "for pid in $pids; do pkill -KILL -P \"$pid\" >/dev/null 2>&1 || true; kill -KILL \"$pid\" >/dev/null 2>&1 || true; done"
+        script = "\n".join(
+            [
+                f"needle={shlex.quote(run_root)}",
+                f"run_id={shlex.quote(run_id)}",
+                "arg_pids=$(ps -eo pid=,ppid=,args= | awk -v needle=\"$needle\" 'index($0, needle) > 0 { print $1 }')",
+                "env_pids=$(for env in /proc/[0-9]*/environ; do "
+                "pid=${env#/proc/}; pid=${pid%%/*}; "
+                "tr '\\0' '\\n' < \"$env\" 2>/dev/null | grep -Fxq \"GLASSHIVE_ACTIVE_RUN_ID=$run_id\" && printf '%s\\n' \"$pid\"; "
+                "done)",
+                "pids=$(printf '%s\\n%s\\n' \"$arg_pids\" \"$env_pids\" | awk 'NF' | sort -u)",
+                "if [ -z \"$pids\" ]; then exit 0; fi",
+                "descendants() { "
+                "for parent in \"$@\"; do "
+                "children=$(ps -eo pid=,ppid= | awk -v p=\"$parent\" '$2 == p { print $1 }'); "
+                "if [ -n \"$children\" ]; then descendants $children; fi; "
+                "printf '%s\\n' \"$parent\"; "
+                "done; "
+                "}",
+                "targets=$(descendants $pids | awk 'NF' | sort -u)",
+                "for pid in $targets; do kill -TERM \"$pid\" >/dev/null 2>&1 || true; done",
+                "sleep 1",
+                "for pid in $targets; do kill -KILL \"$pid\" >/dev/null 2>&1 || true; done",
+            ]
         )
         self._docker_exec(
-            sandbox.container_name,
-            ["bash", "-lc", script],
+            container_name,
+            ["bash", "-c", script],
             env={
                 "HOME": self.home_mount,
                 "TERM": self.term_value,
@@ -320,7 +463,11 @@ class DockerSandboxManager:
         worker: dict | None = None,
     ) -> dict[str, object]:
         resolved_worker = worker or {"worker_id": worker_id}
-        sandbox = self.ensure_ready(resolved_worker, runtime_name=runtime_name)
+        sandbox = self.fast_sandbox_from_worker(resolved_worker) or self.ensure_ready(
+            resolved_worker,
+            runtime_name=runtime_name,
+            repair_paths=False,
+        )
         normalized = action.strip().lower().replace("-", "_")
         command = self._desktop_action_command(normalized, url=url, session_name=session_name)
         if not command:
@@ -329,7 +476,6 @@ class DockerSandboxManager:
             "HOME": self.home_mount,
             "TERM": self.term_value,
             "DISPLAY": self.display_value,
-            **bootstrap_env_for(resolved_worker),
         }
         result = self._docker_exec(
             sandbox.container_name,
@@ -337,6 +483,7 @@ class DockerSandboxManager:
             env=merged_env,
             cwd=self.workspace_mount,
             detach=True,
+            fire_and_forget=True,
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()[-1200:]
@@ -344,7 +491,7 @@ class DockerSandboxManager:
         return {
             "action": normalized,
             "container_name": sandbox.container_name,
-            "view_url": self.view_url(worker_id),
+            "view_url": self._view_url_from_sandbox(sandbox),
             "status": "launched",
         }
 
@@ -368,6 +515,9 @@ class DockerSandboxManager:
 
     def view_url(self, worker_id: str) -> str | None:
         sandbox = self.inspect(worker_id)
+        return self._view_url_from_sandbox(sandbox)
+
+    def _view_url_from_sandbox(self, sandbox: SandboxInfo | None) -> str | None:
         if sandbox is None or sandbox.novnc_port is None:
             return None
         query = urlencode(
@@ -401,6 +551,34 @@ class DockerSandboxManager:
     def _container_name(self, worker_id: str) -> str:
         token = worker_id.replace("_", "-").lower()
         return f"wpr-{token}"
+
+    @staticmethod
+    def _worker_state_allows_fast_exec(worker: dict | None) -> bool:
+        state = str((worker or {}).get("state") or "").strip().lower()
+        return state in {"ready", "running", "failed", "cancelled", "interrupted"}
+
+    def fast_sandbox_from_worker(self, worker: dict | None) -> SandboxInfo | None:
+        if not worker or not self._worker_state_allows_fast_exec(worker):
+            return None
+        worker_id = str(worker.get("worker_id") or "").strip()
+        if not worker_id:
+            return None
+        if not (worker.get("state_dir") or worker.get("workspace_dir")):
+            return None
+        state = str(worker.get("state") or "running").strip().lower() or "running"
+        paths = self._paths(worker_id)
+        return SandboxInfo(
+            container_name=self._container_name(worker_id),
+            container_id=None,
+            state=state,
+            workspace_dir=str(paths["workspace_dir"]),
+            home_dir=str(paths["home_dir"]),
+            pid=None,
+            image=self.image,
+            novnc_port=None,
+            selenium_port=None,
+            openclaw_port=None,
+        )
 
     def paths(self, worker_id: str) -> dict[str, Path]:
         worker_root = self.runtime_root / "workers" / worker_id
@@ -447,10 +625,18 @@ class DockerSandboxManager:
             raise RuntimeError("Docker CLI is required for sandboxed workers but was not found on PATH")
 
     def _ensure_image(self) -> None:
-        if self._docker(["image", "inspect", self.image], check=False).returncode == 0:
+        now = time.monotonic()
+        if self._image_checked_at and self._image_checked_at + self.image_check_ttl_sec > now:
+            return
+        if self._docker(["image", "inspect", self.image], check=False, timeout_sec=self.image_inspect_timeout_sec).returncode == 0:
+            self._image_checked_at = now
             return
         with self._build_lock:
-            if self._docker(["image", "inspect", self.image], check=False).returncode == 0:
+            now = time.monotonic()
+            if self._image_checked_at and self._image_checked_at + self.image_check_ttl_sec > now:
+                return
+            if self._docker(["image", "inspect", self.image], check=False, timeout_sec=self.image_inspect_timeout_sec).returncode == 0:
+                self._image_checked_at = now
                 return
             dockerfile = self.build_root / "Dockerfile"
             dockerfile.write_text(
@@ -473,9 +659,15 @@ class DockerSandboxManager:
                     ]
                 )
             )
-            result = self._docker(["build", "-t", self.image, str(self.build_root)], check=False, capture_output=True)
+            result = self._docker(
+                ["build", "-t", self.image, str(self.build_root)],
+                check=False,
+                capture_output=True,
+                timeout_sec=self.image_build_timeout_sec,
+            )
             if result.returncode != 0:
                 raise RuntimeError(f"Failed to build sandbox image {self.image}: {(result.stderr or result.stdout or '').strip()[-2000:]}")
+            self._image_checked_at = time.monotonic()
 
     def _create_container(self, container_name: str, paths: dict[str, Path]) -> None:
         command = [
@@ -501,25 +693,65 @@ class DockerSandboxManager:
             "-p",
             f"127.0.0.1::{self.openclaw_container_port}",
             "--shm-size",
-            os.environ.get("WPR_SANDBOX_SHM_SIZE", "2g"),
+            os.environ.get("WPR_SANDBOX_SHM_SIZE", "1g"),
             "-v",
             f"{paths['workspace_dir']}:{self.workspace_mount}",
             "-v",
             f"{paths['home_dir']}:{self.home_mount}",
             self.image,
         ]
+        self._insert_resource_limits(command)
         result = self._docker(command, check=False, capture_output=True)
         if result.returncode != 0:
             raise RuntimeError(f"Failed to create worker sandbox {container_name}: {(result.stderr or result.stdout or '').strip()[-2000:]}")
 
-    def _docker(self, args: list[str], *, check: bool = True, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["docker", *args],
-            check=check,
-            text=True,
-            stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
-            stderr=subprocess.PIPE if capture_output else subprocess.DEVNULL,
-        )
+    def _insert_resource_limits(self, command: list[str]) -> None:
+        resource_args: list[str] = []
+        if self.memory_limit:
+            resource_args.extend(["--memory", self.memory_limit])
+        if self.memory_swap_limit:
+            resource_args.extend(["--memory-swap", self.memory_swap_limit])
+        if self.cpu_limit:
+            resource_args.extend(["--cpus", self.cpu_limit])
+        if self.pids_limit:
+            resource_args.extend(["--pids-limit", self.pids_limit])
+        if not resource_args:
+            return
+        image_index = len(command) - 1
+        command[image_index:image_index] = resource_args
+
+    def _docker(
+        self,
+        args: list[str],
+        *,
+        check: bool = True,
+        capture_output: bool = False,
+        timeout_sec: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        command = ["docker", *args]
+        raw_timeout = os.environ.get("WPR_DOCKER_COMMAND_TIMEOUT_SEC", "60").strip()
+        if timeout_sec is None:
+            try:
+                timeout_sec = float(raw_timeout)
+            except ValueError:
+                timeout_sec = 60.0
+        timeout_sec = timeout_sec if timeout_sec and timeout_sec > 0 else None
+        try:
+            return subprocess.run(
+                command,
+                check=check,
+                text=True,
+                stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
+                stderr=subprocess.PIPE if capture_output else subprocess.DEVNULL,
+                timeout=timeout_sec,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            stderr = (stderr + f"\nDocker command timed out after {timeout_sec:g}s").strip()
+            if check:
+                raise RuntimeError(stderr) from exc
+            return subprocess.CompletedProcess(command, returncode=124, stdout=stdout, stderr=stderr)
 
     def _docker_exec(
         self,
@@ -529,6 +761,7 @@ class DockerSandboxManager:
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         detach: bool = False,
+        fire_and_forget: bool = False,
         user: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         args = ["exec"]
@@ -541,7 +774,58 @@ class DockerSandboxManager:
             args.extend(["-e", f"{key}={value}"])
         args.append(container_name)
         args.extend(command)
-        return self._docker(args, check=False, capture_output=True)
+        raw_timeout = os.environ.get("WPR_DOCKER_EXEC_TIMEOUT_SEC", "15").strip()
+        try:
+            timeout_sec = float(raw_timeout) if raw_timeout else None
+        except ValueError:
+            timeout_sec = None
+        if detach and fire_and_forget:
+            full_command = ["docker", *args]
+            self._spawn_detached_docker_exec(full_command)
+            return subprocess.CompletedProcess(full_command, returncode=0, stdout="", stderr="")
+        return self._docker(args, check=False, capture_output=True, timeout_sec=timeout_sec)
+
+    @staticmethod
+    def _spawn_detached_docker_exec(full_command: list[str]) -> None:
+        # Start a tiny shell trampoline instead of invoking the Docker CLI inside
+        # the request path. Docker Desktop can take seconds to accept an
+        # interactive exec; the HTTP/UI path must return immediately.
+        launch = ["sh", "-lc", f"sleep 0.1; exec {shlex.join(full_command)}"]
+        try:
+            subprocess.Popen(launch, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            return
+
+    def _ensure_container_writable_paths(self, container_name: str, container_paths: list[str]) -> None:
+        safe_paths = [path for path in container_paths if path and path.startswith("/")]
+        if not safe_paths:
+            return
+        quoted_paths = " ".join(shlex.quote(path) for path in safe_paths)
+        container_user = shlex.quote(self.user.split(":", 1)[0] or self.user)
+        host_uid = shlex.quote(str(os.getuid()))
+        script = (
+            "set -e; "
+            f"mkdir -p {quoted_paths}; "
+            "if command -v setfacl >/dev/null 2>&1 "
+            f"&& setfacl -R -m u:{container_user}:rwX,u:{host_uid}:rwX {quoted_paths} 2>/dev/null; then "
+            f"find {quoted_paths} -type d -exec setfacl -m d:u:{container_user}:rwX,d:u:{host_uid}:rwX {{}} + 2>/dev/null || true; "
+            "else "
+            f"chmod -R a+rwX {quoted_paths} 2>/dev/null || true; "
+            "fi"
+        )
+        result = self._docker_exec(
+            container_name,
+            ["bash", "-c", script],
+            env={
+                "HOME": self.home_mount,
+                "TERM": self.term_value,
+            },
+            cwd=self.workspace_mount,
+            user="root",
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[-1200:]
+            raise RuntimeError(f"Failed to prepare writable sandbox paths in {container_name}: {detail}")
 
     def _ensure_screen_runtime_dir(self, container_name: str) -> None:
         screen_user = self.user.split(":", 1)[0] or self.user
@@ -556,7 +840,7 @@ class DockerSandboxManager:
         )
         result = self._docker_exec(
             container_name,
-            ["bash", "-lc", script],
+            ["bash", "-c", script],
             env={
                 "HOME": self.home_mount,
                 "TERM": self.term_value,
@@ -571,13 +855,15 @@ class DockerSandboxManager:
     def _set_plain_background(self, container_name: str) -> None:
         self._docker_exec(
             container_name,
-            ["bash", "-c", "xsetroot -solid black >/dev/null 2>&1 || true"],
+            ["bash", "-c", "timeout 2s xsetroot -solid black >/dev/null 2>&1 || true"],
             env={
                 "HOME": self.home_mount,
                 "TERM": self.term_value,
                 "DISPLAY": self.display_value,
             },
             cwd=self.workspace_mount,
+            detach=True,
+            fire_and_forget=True,
         )
 
     def _prime_idle_desktop(self, container_name: str) -> None:
@@ -586,7 +872,7 @@ class DockerSandboxManager:
             container_name,
             [
                 "bash",
-                "-lc",
+                "-c",
                 (
                     f"(chromium --no-sandbox --disable-dev-shm-usage --new-window {safe_url} >/dev/null 2>&1 &) ; "
                     "sleep 1; "

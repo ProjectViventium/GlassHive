@@ -3,6 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="referrer" content="same-origin" />
     <title>GlassHive Desktop</title>
     <style>
       html, body {
@@ -32,14 +33,14 @@
         place-items: center;
         text-align: center;
         padding: 24px;
-        background: linear-gradient(180deg, rgba(0,0,0,0.42), rgba(0,0,0,0.78));
+        background: #000;
         z-index: 2;
       }
       #desktop-overlay[hidden] {
         display: none;
       }
       .overlay-copy {
-        max-width: 720px;
+        max-width: min(620px, calc(100vw - 48px));
       }
       .overlay-label {
         margin: 0 0 10px;
@@ -50,13 +51,15 @@
       }
       #desktop-status {
         margin: 0;
-        font-size: clamp(26px, 4vw, 44px);
-        letter-spacing: -0.04em;
+        font-size: clamp(22px, 3vw, 34px);
+        line-height: 1.08;
+        letter-spacing: 0;
       }
       #desktop-detail {
         margin: 14px 0 0;
         color: rgba(238, 242, 246, 0.78);
         line-height: 1.55;
+        font-size: clamp(14px, 1.45vw, 16px);
       }
       #clipboard-status {
         position: absolute;
@@ -71,6 +74,10 @@
         font-size: 12px;
         letter-spacing: 0.06em;
         text-transform: uppercase;
+        max-width: calc(100vw - 36px);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
       #desktop-stage canvas {
         outline: none;
@@ -89,6 +96,6 @@
       </div>
       <div id="clipboard-status">Clipboard sync: starting…</div>
     </main>
-    <script src="/static/desktop.js?v=20260326a" type="module"></script>
+    <script src="/static/desktop.js?v=20260523c" type="module"></script>
   </body>
 </html>
