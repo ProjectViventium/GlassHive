@@ -512,6 +512,35 @@ def test_profiled_runtime_resolves_host_codex_model_by_execution_mode(tmp_path, 
     assert runtime.resolve_model("codex-cli", execution_mode="host") == "gpt-5.4"
 
 
+def test_codex_cli_provider_config_honors_reasoning_effort_env(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "xhigh")
+
+    command: list[str] = []
+    runtime._append_codex_compatible_provider_config(command, {"worker_id": "wrk_effort"})
+
+    joined = "\n".join(command)
+    assert 'model_reasoning_effort="xhigh"' in joined
+
+
+def test_codex_cli_provider_config_honors_per_run_reasoning_effort(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "medium")
+    worker = {
+        "worker_id": "wrk_effort",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "xhigh"}}),
+    }
+
+    command: list[str] = []
+    runtime._append_codex_compatible_provider_config(command, worker)
+
+    joined = "\n".join(command)
+    assert 'model_reasoning_effort="xhigh"' in joined
+    assert 'model_reasoning_effort="medium"' not in joined
+
+
 def test_host_cli_run_closes_stdin_for_noninteractive_workers(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"

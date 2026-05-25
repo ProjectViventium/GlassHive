@@ -118,6 +118,7 @@ def test_terminate_invalidates_inspect_cache_before_idle_resume(tmp_path):
     manager._ensure_image = lambda: calls.append("image")  # type: ignore[method-assign]
     manager._create_container = fake_create_container  # type: ignore[method-assign]
     manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("repair")  # type: ignore[method-assign]
+    manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
     manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
     manager._prime_idle_desktop = lambda container_name: calls.append("prime")  # type: ignore[method-assign]
 
@@ -202,6 +203,33 @@ def test_docker_exec_detach_confirms_docker_accepts_command(tmp_path):
     assert calls[0][1]["capture_output"] is True
     assert calls[0][1]["check"] is False
     assert "job-run_123" in calls[0][0]
+
+
+def test_plain_background_retries_while_desktop_starts(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    captured: dict[str, object] = {}
+
+    def fake_docker_exec(container_name, command, **kwargs):
+        captured["container_name"] = container_name
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(["docker", "exec"], returncode=0, stdout="", stderr="")
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+
+    manager._set_plain_background("wpr-test")
+
+    assert captured["container_name"] == "wpr-test"
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert command[:2] == ["bash", "-c"]
+    assert "seq 1 60" in command[2]
+    assert "xsetroot -solid black" in command[2]
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["detach"] is True
+    assert kwargs["fire_and_forget"] is True
+    assert kwargs["env"]["DISPLAY"] == manager.display_value
 
 
 def test_seed_bootstrap_writes_project_scope_files(tmp_path, monkeypatch):
@@ -291,6 +319,7 @@ def test_desktop_action_skips_heavy_path_repair_for_running_container(tmp_path):
     manager._ensure_host_dirs = lambda paths: None  # type: ignore[method-assign]
     manager._seed_bootstrap = lambda *args, **kwargs: None  # type: ignore[method-assign]
     manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("writable")  # type: ignore[method-assign]
+    manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
     manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
     manager.inspect = lambda worker_id: FakeSandbox()  # type: ignore[method-assign]
 
@@ -304,7 +333,7 @@ def test_desktop_action_skips_heavy_path_repair_for_running_container(tmp_path):
 
     assert launched["status"] == "launched"
     assert "writable" not in calls
-    assert calls == ["exec:True:True:bash"]
+    assert calls == ["harden", "exec:True:True:bash"]
 
 
 def test_desktop_action_uses_ready_worker_fast_path_without_inspect(tmp_path):
@@ -568,7 +597,8 @@ def test_ensure_ready_repairs_bind_mount_ownership_before_prime(tmp_path):
     assert calls[1].startswith("root:")
     assert "setfacl -R -m u:seluser:rwX" in calls[1]
     assert "find /workspace/project /workspace/.wpr-home -type d -exec setfacl" in calls[1]
-    assert calls[2:] == ["background", "prime"]
+    assert calls[2].startswith("root:set -e; for file in /workspace/.wpr-home/.glasshive/secret-runtime.env")
+    assert calls[3:] == ["background", "prime"]
 
 
 def test_ensure_container_writable_paths_repairs_specific_run_dir(tmp_path):

@@ -25,11 +25,12 @@ from workers_projects_runtime.openclaw_runtime import (
     WorkerTerminatedError,
 )
 from workers_projects_runtime.service import (
+    GlassHiveQuotaExceededError,
     WorkersProjectsService,
     terminal_callback_full_message,
     terminal_callback_message,
 )
-from workers_projects_runtime.signed_links import sign_link_params, sign_link_token
+from workers_projects_runtime.signed_links import sign_link_params, sign_link_token, verify_signed_link_token
 from workers_projects_runtime.store import Store
 
 
@@ -70,6 +71,46 @@ def test_terminal_callback_message_prefers_final_report():
     assert terminal_callback_message(output) == (
         "Captured 42 rows.\n\nCreated `results.md` and stopped on the target page."
     )
+
+
+def test_user_preferences_are_scoped_and_validate_profile_allowlist(tmp_path, monkeypatch):
+    monkeypatch.setenv("WPR_API_TOKEN", "service-token")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,openclaw-general")
+    client = TestClient(create_app(db_path=str(tmp_path / "runtime.db"), runtime_backend="stub"))
+
+    user_a = {
+        "Authorization": "Bearer service-token",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+    }
+    user_b = {
+        "Authorization": "Bearer service-token",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-b",
+    }
+
+    saved = client.patch(
+        "/v1/preferences",
+        headers=user_a,
+        json={"default_worker_profile": "openclaw-general", "codex_reasoning_effort": "high"},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["owner_id"] == "user-a"
+    assert saved.json()["default_worker_profile"] == "openclaw-general"
+    assert saved.json()["codex_reasoning_effort"] == "high"
+
+    other = client.get("/v1/preferences", headers=user_b)
+    assert other.status_code == 200
+    assert other.json()["owner_id"] == "user-b"
+    assert other.json()["default_worker_profile"] == ""
+
+    rejected = client.patch("/v1/preferences", headers=user_a, json={"default_worker_profile": "claude-code"})
+    assert rejected.status_code == 400
+    assert "not allowed" in rejected.text
 
 
 def test_terminal_callback_message_uses_line_anchored_final_report_marker():
@@ -718,6 +759,24 @@ def test_enterprise_opaque_signed_links_reject_tamper_expiry_and_mismatch(tmp_pa
     assert client.get(f"/v1/signed-links/{mismatched_owner}").status_code == 401
 
 
+def test_worker_view_signed_links_are_capped_by_watch_session_duration(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_TTL_S", "3600")
+    monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "120")
+
+    now = int(time.time())
+    token = sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_publicsafe",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    payload = verify_signed_link_token(token)
+
+    assert payload is not None
+    assert int(payload["exp"]) - now <= 121
+
+
 def test_enterprise_member_ui_redacts_runtime_internals(tmp_path, monkeypatch):
     class DesktopStubRuntime(StubRuntime):
         def describe_worker(self, worker: dict) -> dict[str, object]:
@@ -1096,6 +1155,222 @@ def test_idle_reaper_stops_compute_but_preserves_worker(tmp_path, monkeypatch):
         assert runtime.terminated == [worker["worker_id"]]
     finally:
         service.shutdown()
+
+
+def test_idle_reaper_preserves_completed_worker_state(tmp_path, monkeypatch):
+    class ReaperRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminated: list[str] = []
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated.append(worker["worker_id"])
+            return RuntimeInfo(
+                runtime=str(worker.get("runtime") or "openclaw-stub"),
+                model=str(worker.get("model") or "stub-model"),
+                gateway_url="",
+                gateway_port=None,
+                gateway_token=None,
+                session_key=str(worker.get("session_key") or ""),
+                state_dir=str(worker.get("state_dir") or ""),
+                workspace_dir=str(worker.get("workspace_dir") or ""),
+                pid=None,
+            )
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = ReaperRuntime()
+    service = WorkersProjectsService(store, runtime)
+    try:
+        project = service.create_project("owner", "Completed", "Preserve completed label", "openclaw-general")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Completed Worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+        )
+        store.update_worker_state(worker["worker_id"], "completed")
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+                ((datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(), worker["worker_id"]),
+            )
+
+        reaped = service.reap_idle_workers_once()
+
+        assert reaped and reaped[0]["state"] == "completed"
+        assert runtime.terminated == [worker["worker_id"]]
+        refreshed = store.get_worker(worker["worker_id"])
+        assert refreshed is not None
+        assert refreshed["state"] == "completed"
+        assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.idle_terminated"
+    finally:
+        service.shutdown()
+
+
+def test_paused_reaper_stops_paused_compute_without_deleting_workspace(tmp_path, monkeypatch):
+    class ReaperRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminated: list[str] = []
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated.append(worker["worker_id"])
+            return RuntimeInfo(
+                runtime=str(worker.get("runtime") or "openclaw-stub"),
+                model=str(worker.get("model") or "stub-model"),
+                gateway_url="",
+                gateway_port=None,
+                gateway_token=None,
+                session_key=str(worker.get("session_key") or ""),
+                state_dir=str(worker.get("state_dir") or ""),
+                workspace_dir=str(worker.get("workspace_dir") or ""),
+                pid=None,
+            )
+
+    monkeypatch.setenv("GLASSHIVE_PAUSED_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = ReaperRuntime()
+    service = WorkersProjectsService(store, runtime)
+    try:
+        project = service.create_project("owner", "Paused", "Stop paused compute", "openclaw-general")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Paused Worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+        )
+        store.update_worker_state(worker["worker_id"], "paused")
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+                ((datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(), worker["worker_id"]),
+            )
+
+        reaped = service.reap_paused_workers_once()
+
+        assert reaped and reaped[0]["worker_id"] == worker["worker_id"]
+        assert runtime.terminated == [worker["worker_id"]]
+        refreshed = store.get_worker(worker["worker_id"])
+        assert refreshed is not None
+        assert refreshed["state"] == "paused"
+        assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.paused_compute_terminated"
+    finally:
+        service.shutdown()
+
+
+def test_max_run_duration_cancels_expired_run_and_releases_compute(tmp_path, monkeypatch):
+    class ReaperRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminated: list[str] = []
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated.append(worker["worker_id"])
+            return RuntimeInfo(
+                runtime=str(worker.get("runtime") or "openclaw-stub"),
+                model=str(worker.get("model") or "stub-model"),
+                gateway_url="",
+                gateway_port=None,
+                gateway_token=None,
+                session_key=str(worker.get("session_key") or ""),
+                state_dir=str(worker.get("state_dir") or ""),
+                workspace_dir=str(worker.get("workspace_dir") or ""),
+                pid=None,
+            )
+
+    monkeypatch.setenv("GLASSHIVE_MAX_RUN_DURATION_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = ReaperRuntime()
+    service = WorkersProjectsService(store, runtime)
+    try:
+        project = service.create_project("owner", "Expired", "Stop long run", "openclaw-general")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Expired Worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+        )
+        run = store.create_run(worker["worker_id"], project["project_id"], "sleep forever", state="running")
+        store.update_worker_state(worker["worker_id"], "running")
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE runs SET started_at = ? WHERE run_id = ?",
+                ((datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(), run["run_id"]),
+            )
+
+        reaped = service.reap_expired_runs_once()
+
+        assert reaped and reaped[0]["run_id"] == run["run_id"]
+        assert runtime.terminated == [worker["worker_id"]]
+        refreshed_run = store.get_run(run["run_id"])
+        refreshed_worker = store.get_worker(worker["worker_id"])
+        assert refreshed_run is not None and refreshed_run["state"] == "cancelled"
+        assert "GLASSHIVE_MAX_RUN_DURATION_S=1" in refreshed_run["error_text"]
+        assert refreshed_worker is not None and refreshed_worker["state"] == "paused"
+        assert store.list_events(worker["worker_id"])[-1]["event_type"] == "run.duration_exceeded"
+    finally:
+        service.shutdown()
+
+
+def test_max_run_duration_treats_malformed_run_timestamp_as_expired(tmp_path, monkeypatch):
+    class ReaperRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminated: list[str] = []
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated.append(worker["worker_id"])
+            return RuntimeInfo(
+                runtime=str(worker.get("runtime") or "openclaw-stub"),
+                model=str(worker.get("model") or "stub-model"),
+                gateway_url="",
+                gateway_port=None,
+                gateway_token=None,
+                session_key=str(worker.get("session_key") or ""),
+                state_dir=str(worker.get("state_dir") or ""),
+                workspace_dir=str(worker.get("workspace_dir") or ""),
+                pid=None,
+            )
+
+    monkeypatch.setenv("GLASSHIVE_MAX_RUN_DURATION_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = ReaperRuntime()
+    service = WorkersProjectsService(store, runtime)
+    try:
+        project = service.create_project("owner", "Expired", "Stop malformed long run", "openclaw-general")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Malformed Timestamp Worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+        )
+        run = store.create_run(worker["worker_id"], project["project_id"], "sleep forever", state="running")
+        store.update_worker_state(worker["worker_id"], "running")
+        with store._connect() as conn:
+            conn.execute("UPDATE runs SET started_at = ? WHERE run_id = ?", ("not-a-date", run["run_id"]))
+
+        reaped = service.reap_expired_runs_once()
+
+        assert reaped and reaped[0]["run_id"] == run["run_id"]
+        assert runtime.terminated == [worker["worker_id"]]
+        refreshed_run = store.get_run(run["run_id"])
+        assert refreshed_run is not None and refreshed_run["state"] == "cancelled"
+    finally:
+        service.shutdown()
+
 
 def test_callbacks_sign_utf8_canonical_json_for_unicode_messages(tmp_path, monkeypatch):
     captured: dict[str, object] = {}
@@ -3591,6 +3866,39 @@ def test_worker_quota_enforced_per_user(tmp_path, monkeypatch):
     assert first.status_code == 201
     assert second.status_code == 429
     assert "GLASSHIVE_MAX_WORKSPACES_PER_USER=1" in second.json()["detail"]
+
+
+def test_active_worker_quota_counts_resuming_workers(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_MAX_ACTIVE_WORKERS_PER_USER", "1")
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        project = service.create_project("owner", "Active Quota", "Limit active workspaces.", "codex-cli")
+        first = service.create_worker(
+            project["project_id"],
+            "owner",
+            "First",
+            "operator",
+            "codex-cli",
+            "stub",
+            start_synchronously=False,
+        )
+        store.update_worker_state(first["worker_id"], "resuming")
+
+        with pytest.raises(GlassHiveQuotaExceededError) as exc:
+            service.create_worker(
+                project["project_id"],
+                "owner",
+                "Second",
+                "operator",
+                "codex-cli",
+                "stub",
+                start_synchronously=False,
+            )
+
+        assert "GLASSHIVE_MAX_ACTIVE_WORKERS_PER_USER=1" in str(exc.value)
+    finally:
+        service.shutdown()
 
 
 def test_allowed_worker_profiles_guardrail_blocks_disallowed_profile(tmp_path, monkeypatch):

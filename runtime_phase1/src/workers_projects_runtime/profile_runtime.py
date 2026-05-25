@@ -517,6 +517,7 @@ class BaseCliWorkerRuntime:
     def _run_timeout_sec(self, timeout_sec: float | None = None) -> float | None:
         raw = (
             os.environ.get("GLASSHIVE_RUN_TIMEOUT_SEC", "").strip()
+            or os.environ.get("GLASSHIVE_MAX_RUN_DURATION_S", "").strip()
             or os.environ.get("WPR_RUN_TIMEOUT_SEC", "").strip()
         )
         if not raw:
@@ -717,9 +718,13 @@ class BaseCliWorkerRuntime:
                 f"export GLASSHIVE_ACTIVE_RUN_ID={shlex.quote(effective_run_id)}",
                 f"export GLASSHIVE_ACTIVE_WORKER_ID={shlex.quote(worker_for_run['worker_id'])}",
                 'if [ -f "$HOME/.glasshive/runtime.env" ]; then set -a; source "$HOME/.glasshive/runtime.env"; set +a; fi',
+                'GLASSHIVE_SECRET_ENV_KEYS_FILE="$HOME/.glasshive/secret-runtime.keys"',
+                'GLASSHIVE_SECRET_ENV_FILE="$HOME/.glasshive/secret-runtime.env"',
+                'if [ -f "$GLASSHIVE_SECRET_ENV_FILE" ]; then set -a; source "$GLASSHIVE_SECRET_ENV_FILE"; set +a; rm -f "$GLASSHIVE_SECRET_ENV_FILE"; fi',
                 'if [ -f "$HOME/.wpr-openclaw/openclaw.env" ]; then set -a; source "$HOME/.wpr-openclaw/openclaw.env"; set +a; fi',
                 f"{shlex.join(command)} > >(tee -a {shlex.quote(container_stdout)}) 2> >(tee -a {shlex.quote(container_stderr)} >&2)",
                 "status=$?",
+                'if [ -f "$GLASSHIVE_SECRET_ENV_KEYS_FILE" ]; then while IFS= read -r key; do [ -n "$key" ] && unset "$key"; done < "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; rm -f "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; fi',
                 "write_exit \"$status\"",
                 "printf '\\n[glasshive] run finished with exit code %s. Interactive shell remains open for takeover.\\n' \"$status\"",
                 "exec bash --noprofile --norc",
@@ -1368,7 +1373,19 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             return [item.strip() for item in raw.split(",") if item.strip()]
         return list(self._default_compatible_provider_disabled_features)
 
-    def _append_codex_compatible_provider_config(self, command: list[str]) -> None:
+    def _bootstrap_env_value(self, worker: dict, name: str) -> str:
+        try:
+            bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
+        except json.JSONDecodeError:
+            return ""
+        if not isinstance(bundle, dict):
+            return ""
+        env = bundle.get("env")
+        if not isinstance(env, dict):
+            return ""
+        return str(env.get(name) or "").strip()
+
+    def _append_codex_compatible_provider_config(self, command: list[str], worker: dict) -> None:
         if not self._compatible_provider_enabled():
             return
         base_url = self._compatible_provider_base_url()
@@ -1378,6 +1395,10 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         provider_name = os.environ.get("WPR_CODEX_CLI_PROVIDER_NAME", "GlassHive OpenAI-compatible").strip()
         wire_api = os.environ.get("WPR_CODEX_CLI_WIRE_API", "responses").strip() or "responses"
         verbosity = os.environ.get("WPR_CODEX_CLI_MODEL_VERBOSITY", "medium").strip()
+        reasoning_effort = (
+            self._bootstrap_env_value(worker, "WPR_CODEX_CLI_REASONING_EFFORT")
+            or os.environ.get("WPR_CODEX_CLI_REASONING_EFFORT", "")
+        ).strip().lower()
         if self._env_flag("WPR_CODEX_CLI_IGNORE_USER_CONFIG", True):
             command.append("--ignore-user-config")
         for feature in self._compatible_provider_disabled_features():
@@ -1402,6 +1423,8 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         )
         if verbosity:
             command.extend(["-c", f'model_verbosity="{verbosity}"'])
+        if reasoning_effort in {"minimal", "low", "medium", "high", "xhigh"}:
+            command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         existing_session = self._read_session_key(worker["worker_id"])
@@ -1417,7 +1440,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
                 command.extend(["-c", f'model="{model}"'])
             else:
                 command.extend(["-m", model])
-        self._append_codex_compatible_provider_config(command)
+        self._append_codex_compatible_provider_config(command, worker)
         if dangerous_mode:
             if is_resume:
                 command.append("--dangerously-bypass-approvals-and-sandbox")
@@ -2078,6 +2101,7 @@ class HostNativeCliMixin:
             os.environ.get("GLASSHIVE_HOST_RUN_TIMEOUT_SEC", "").strip()
             or os.environ.get("WPR_HOST_RUN_TIMEOUT_SEC", "").strip()
             or os.environ.get("GLASSHIVE_RUN_TIMEOUT_SEC", "").strip()
+            or os.environ.get("GLASSHIVE_MAX_RUN_DURATION_S", "").strip()
             or os.environ.get("WPR_RUN_TIMEOUT_SEC", "").strip()
         )
         if not raw:

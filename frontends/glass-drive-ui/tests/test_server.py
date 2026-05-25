@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hmac
 import json
@@ -8,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 import glass_drive_ui.server as server_module
 from glass_drive_ui.server import create_app
@@ -28,7 +30,11 @@ def clear_glasshive_ui_env(monkeypatch):
         "GLASSHIVE_COOKIE_SECURE",
         "GLASSHIVE_SIGNED_LINK_SECRET",
         "GLASSHIVE_HOST_WORKERS_ENABLED",
+        "GLASSHIVE_DEFAULT_WORKER_PROFILE",
+        "GLASSHIVE_ALLOWED_WORKER_PROFILES",
+        "GLASSHIVE_WATCH_SESSION_STATE_PATH",
         "WPR_DEFAULT_EXECUTION_MODE",
+        "WPR_ALLOWED_WORKER_PROFILES",
         "VIVENTIUM_ENV_FILE",
         "VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV",
     ):
@@ -50,6 +56,7 @@ class FakeRuntimeClient:
         self.create_worker_requests = []
         self.assign_requests = []
         self.schedule_requests = []
+        self.preference_requests = []
         self.metadata_requests = []
         self.get_worker_requests = []
         self.message_requests = []
@@ -79,6 +86,29 @@ class FakeRuntimeClient:
 
     def get_project(self, project_id: str):
         return {"project_id": project_id, "title": "Alpha"}
+
+    def get_preferences(self):
+        return {
+            "tenant_id": "local",
+            "owner_id": "demo-owner",
+            "default_worker_profile": "",
+            "codex_reasoning_effort": "",
+            "claude_effort": "",
+            "openclaw_effort": "",
+            "updated_at": "",
+        }
+
+    def update_preferences(self, payload: dict):
+        self.preference_requests.append(payload)
+        return {
+            "tenant_id": "local",
+            "owner_id": "demo-owner",
+            "default_worker_profile": payload.get("default_worker_profile", ""),
+            "codex_reasoning_effort": payload.get("codex_reasoning_effort", ""),
+            "claude_effort": payload.get("claude_effort", ""),
+            "openclaw_effort": payload.get("openclaw_effort", ""),
+            "updated_at": "2026-05-24T00:00:00+00:00",
+        }
 
     def worker_live(self, worker_id: str):
         self.worker_live_requests.append(worker_id)
@@ -269,6 +299,22 @@ def test_bootstrap_and_launch_flow():
     assert fake.create_worker_requests[-1]['start_synchronously'] is True
 
 
+def test_launch_applies_codex_effort_to_new_workspace_bootstrap():
+    fake = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=fake))
+
+    launch = client.post('/api/launch', json={
+        'description': 'Create a report',
+        'success_criteria': 'Report exists',
+        'workspace_option': 'new:codex-cli',
+        'effort': 'xhigh',
+    })
+
+    assert launch.status_code == 200
+    bundle = fake.create_worker_requests[-1]['bootstrap_bundle']
+    assert bundle["env"]["WPR_CODEX_CLI_REASONING_EFFORT"] == "xhigh"
+
+
 def test_launch_honors_available_host_workspace_type(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
@@ -364,6 +410,76 @@ def test_bootstrap_filters_worker_profiles_from_guardrail_env(monkeypatch):
     ]
 
 
+def test_bootstrap_uses_configured_default_worker_profile(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,claude-code")
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", "claude-code")
+    fake = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=fake))
+
+    boot = client.get("/api/bootstrap")
+
+    assert boot.status_code == 200
+    assert boot.json()["default_workspace_option"] == "new:claude-code"
+    assert boot.json()["deployment_default_workspace_option"] == "new:claude-code"
+
+
+def test_bootstrap_uses_saved_user_default_worker_profile():
+    class PreferenceRuntime(FakeRuntimeClient):
+        def get_preferences(self):
+            return {
+                "tenant_id": "local",
+                "owner_id": "demo-owner",
+                "default_worker_profile": "openclaw-general",
+                "codex_reasoning_effort": "high",
+                "claude_effort": "max",
+                "openclaw_effort": "",
+                "updated_at": "2026-05-24T00:00:00+00:00",
+            }
+
+    client = TestClient(create_app(runtime_client=PreferenceRuntime()))
+
+    boot = client.get("/api/bootstrap")
+
+    assert boot.status_code == 200
+    assert boot.json()["default_workspace_option"] == "new:openclaw-general"
+    assert boot.json()["user_preferences"]["codex_reasoning_effort"] == "high"
+
+
+def test_preference_endpoint_proxies_saved_defaults():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.patch(
+        "/api/preferences",
+        json={"default_worker_profile": "codex-cli", "codex_reasoning_effort": "xhigh"},
+    )
+
+    assert response.status_code == 200
+    assert runtime.preference_requests == [
+        {"default_worker_profile": "codex-cli", "codex_reasoning_effort": "xhigh"}
+    ]
+    assert response.json()["default_worker_profile"] == "codex-cli"
+
+
+def test_bootstrap_fails_loud_for_default_worker_profile_outside_allowlist(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "openclaw-general")
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", "claude-code")
+    fake = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=fake))
+
+    with pytest.raises(RuntimeError, match="GLASSHIVE_DEFAULT_WORKER_PROFILE"):
+        client.get("/api/bootstrap")
+
+
+def test_bootstrap_fails_loud_for_allowed_profile_list_with_no_supported_profiles(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "not-a-real-worker")
+    fake = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=fake))
+
+    with pytest.raises(RuntimeError, match="GLASSHIVE_ALLOWED_WORKER_PROFILES"):
+        client.get("/api/bootstrap")
+
+
 def test_bootstrap_dedupes_workspace_rows_by_worker_id():
     class DuplicateRuntime(FakeRuntimeClient):
         def list_projects(self):
@@ -451,6 +567,151 @@ def test_watch_assets_render():
     assert live.json()['project_title'] == 'Alpha'
 
 
+def test_worker_view_signed_token_respects_watch_session_cap(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_TTL_S", "3600")
+    monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "120")
+
+    token = server_module.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    payload = server_module.verify_signed_link_token(token)
+
+    assert payload is not None
+    assert 1 <= int(payload["exp"]) - int(time.time()) <= 120
+
+
+def test_signed_workspace_links_reuse_persisted_watch_session_deadline(tmp_path, monkeypatch):
+    signed_secret = "ui-signed-link-secret"
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", signed_secret)
+    monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "60")
+    monkeypatch.setenv("GLASSHIVE_WATCH_SESSION_STATE_PATH", str(tmp_path / "watch-sessions.sqlite3"))
+    identity = {"tenant_id": "tenant-alpha", "user_id": "user-a"}
+    now = {"value": 1_000}
+
+    monkeypatch.setattr(server_module.time, "time", lambda: now["value"])
+    monkeypatch.setattr(server_module.sign_link_token.__globals__["time"], "time", lambda: now["value"])
+
+    first_url = server_module._append_signed_worker_token("/watch/wrk_1", "wrk_1", identity)
+    first_payload = server_module.verify_signed_link_token(first_url.split("gh_token=", 1)[1])
+    assert first_payload is not None
+    assert first_payload["exp"] == 1_060
+
+    now["value"] = 1_020
+    second_url = server_module._append_signed_worker_token("/watch/wrk_1", "wrk_1", identity)
+    second_payload = server_module.verify_signed_link_token(second_url.split("gh_token=", 1)[1])
+    assert second_payload is not None
+    assert second_payload["exp"] == 1_060
+
+    now["value"] = 1_061
+    third_url = server_module._append_signed_worker_token("/watch/wrk_1", "wrk_1", identity)
+    third_payload = server_module.verify_signed_link_token(third_url.split("gh_token=", 1)[1])
+    assert third_payload is not None
+    assert third_payload["exp"] == 1_121
+
+
+def test_runtime_minted_watch_tokens_can_reopen_after_expired_session_deadline(tmp_path, monkeypatch):
+    secret = "ui-signed-link-secret"
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
+    monkeypatch.setenv("WPR_API_TOKEN", "service-token")
+    monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "60")
+    monkeypatch.setenv("GLASSHIVE_WATCH_SESSION_STATE_PATH", str(tmp_path / "watch-sessions.sqlite3"))
+    now = {"value": 1_000}
+
+    monkeypatch.setattr(server_module.time, "time", lambda: now["value"])
+    monkeypatch.setattr(server_module.sign_link_token.__globals__["time"], "time", lambda: now["value"])
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    first_token = server_module.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    assert client.get(f"/watch/wrk_1?gh_token={first_token}").status_code == 200
+
+    now["value"] = 1_020
+    fresh_callback_token = server_module.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    assert client.get(f"/watch/wrk_1?gh_token={fresh_callback_token}").status_code == 200
+
+    now["value"] = 1_061
+    expired_original_response = client.get(f"/watch/wrk_1?gh_token={first_token}")
+    assert expired_original_response.status_code == 401
+
+    expired_session_callback_token = server_module.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    reopened_response = client.get(f"/watch/wrk_1?gh_token={expired_session_callback_token}")
+    assert reopened_response.status_code == 200
+
+    main_ui_url = server_module._append_signed_worker_token(
+        "/watch/wrk_1",
+        "wrk_1",
+        {"tenant_id": "tenant-alpha", "user_id": "user-a"},
+    )
+    assert client.get(main_ui_url).status_code == 200
+
+
+def test_active_novnc_websocket_closes_at_watch_session_cap(tmp_path, monkeypatch):
+    secret = "signed-link-secret"
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
+    monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "1")
+    monkeypatch.setenv("GLASSHIVE_WATCH_SESSION_STATE_PATH", str(tmp_path / "watch-sessions.sqlite3"))
+    token = signed_worker_token(secret)
+    upstreams = []
+
+    class FakeUpstream:
+        def __init__(self):
+            self.closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.closed = True
+            return False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(30)
+            raise StopAsyncIteration
+
+        async def send(self, message):
+            _ = message
+
+        async def close(self):
+            self.closed = True
+
+    def fake_connect(*args, **kwargs):
+        _ = args, kwargs
+        upstream = FakeUpstream()
+        upstreams.append(upstream)
+        return upstream
+
+    monkeypatch.setattr(server_module.websockets, "connect", fake_connect)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    with client.websocket_connect(f"/novnc/wrk_1/websockify?gh_token={token}") as websocket:
+        with pytest.raises(WebSocketDisconnect) as exc:
+            websocket.receive_text()
+
+    assert exc.value.code == 1008
+    assert upstreams and upstreams[0].closed is True
+
+
 def test_launcher_workspace_hive_static_controls():
     static_dir = Path(server_module.__file__).parent / "static"
     app_js = (static_dir / "app.js").read_text(encoding="utf-8")
@@ -469,6 +730,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "workerApiUrl(workerId, `/action/${encodeURIComponent(action)}`)" in app_js
     assert "workerApiUrl(workerId, '/metadata')" in app_js
     assert "appendUrlPath" in app_js
+    assert "deployment_default_workspace_option" in app_js
     assert "dataset.watchVisible !== 'false'" in app_js
     assert "dataset.watchVisible === 'true' || tile.dataset.statusVisible === 'true'" in app_js
     assert "Full watch" in app_js

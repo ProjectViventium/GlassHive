@@ -27,6 +27,19 @@ DEFAULT_ENTERPRISE_WORKER_ENV_KEYS = {
     "PORTKEY_CONFIG",
     "WPR_CLAUDE_CODE_USE_API_KEY",
 }
+DEFAULT_SECRET_ENV_MARKERS = (
+    "API_KEY",
+    "AUTH_TOKEN",
+    "BEARER",
+    "CLIENT_SECRET",
+    "CUSTOM_HEADERS",
+    "HMAC",
+    "PASSWORD",
+    "PRIVATE_KEY",
+    "SECRET",
+    "TOKEN",
+    "VIRTUAL_KEY",
+)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -84,6 +97,24 @@ def _worker_env_allowlist() -> set[str]:
         return set(DEFAULT_ENTERPRISE_WORKER_ENV_KEYS)
     values = {item.strip() for item in raw.split(",") if item.strip()}
     return values | DEFAULT_ENTERPRISE_WORKER_ENV_KEYS
+
+
+def _worker_secret_env_keys(env: dict[str, str]) -> set[str]:
+    raw = os.environ.get("GLASSHIVE_WORKER_SECRET_ENV_KEYS", "").strip()
+    configured = {item.strip() for item in raw.split(",") if item.strip()}
+    detected = {
+        key
+        for key in env
+        if any(marker in key.upper() for marker in DEFAULT_SECRET_ENV_MARKERS)
+    }
+    return configured | detected
+
+
+def _worker_secret_env_exposure_mode() -> str:
+    raw = os.environ.get("GLASSHIVE_WORKER_SECRET_ENV_EXPOSURE", "").strip().lower()
+    if raw in {"shell", "runtime", "legacy"}:
+        return "shell"
+    return "run-only"
 
 
 def bootstrap_profile_for(worker: dict[str, Any], runtime_name: str) -> str:
@@ -165,13 +196,35 @@ def apply_bootstrap(
     _write_manifest(home_dir, profile, bundle)
 
 
+def _write_env_file(path: Path, env: dict[str, str], *, mode: int = 0o644) -> None:
+    if env:
+        lines = [f"export {key}={shlex.quote(value)}" for key, value in sorted(env.items())]
+        path.write_text("\n".join(lines) + "\n")
+        path.chmod(mode)
+        return
+    if path.exists():
+        path.unlink()
+
+
 def _write_runtime_env(home_dir: Path, env: dict[str, str]) -> None:
     glasshive_dir = home_dir / ".glasshive"
     glasshive_dir.mkdir(parents=True, exist_ok=True)
     runtime_env = glasshive_dir / "runtime.env"
-    if env:
-        lines = [f"export {key}={shlex.quote(value)}" for key, value in sorted(env.items())]
-        runtime_env.write_text("\n".join(lines) + "\n")
+    secret_env = glasshive_dir / "secret-runtime.env"
+    secret_keys_path = glasshive_dir / "secret-runtime.keys"
+    secret_env_values: dict[str, str] = {}
+    shell_env_values = dict(env)
+    if _enterprise_mode_enabled() and _worker_secret_env_exposure_mode() == "run-only":
+        secret_keys = _worker_secret_env_keys(env)
+        secret_env_values = {key: value for key, value in env.items() if key in secret_keys}
+        shell_env_values = {key: value for key, value in env.items() if key not in secret_keys}
+    _write_env_file(runtime_env, shell_env_values)
+    _write_env_file(secret_env, secret_env_values, mode=0o600)
+    if secret_env_values:
+        secret_keys_path.write_text("\n".join(sorted(secret_env_values)) + "\n")
+        secret_keys_path.chmod(0o600)
+    elif secret_keys_path.exists():
+        secret_keys_path.unlink()
     bashrc = home_dir / ".bashrc"
     source_line = 'if [ -f "$HOME/.glasshive/runtime.env" ]; then source "$HOME/.glasshive/runtime.env"; fi'
     existing = bashrc.read_text() if bashrc.exists() else ""

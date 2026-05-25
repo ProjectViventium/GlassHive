@@ -55,6 +55,8 @@ standalone/plain LibreChat deployments must still work without them by using:
 - `workspace_status` for non-blocking follow-up checks
 - `workspace_wait` for explicit blocking waits
 - `workspace_artifacts` and `workspace_artifact_download` for generated files and signed downloads
+- `workspace_preferences_get` and `workspace_preferences_set` for per-user worker and effort
+  defaults
 - the returned View / Steer URL for operator visibility and takeover
 
 The MCP descriptions must make this non-callback path obvious to connected LLMs. A model should
@@ -62,6 +64,24 @@ launch work with `workspace_launch`, include `uploaded_files` when the user atta
 the View / Steer URL promptly, and use status/wait/artifact tools for follow-up and delivery. It
 must not fall back to pasting whole generated files into chat or writing its own inferior local
 code path when GlassHive has already produced a signed artifact link.
+
+`workspace_launch` is intentionally non-blocking. If the user asks to "wait", the model should call
+`workspace_wait` with the returned follow-up context. If the requested run is older than the
+worker's latest run, status/wait responses preserve both the requested run outcome and the latest
+effective run so the model can say, for example, "the run you asked about failed, but the same
+workspace later completed and produced these artifacts" instead of falsely reporting failure.
+
+When no `profile` is supplied, MCP tools must use the authenticated user's saved preference first
+and then the deployment default from `GLASSHIVE_DEFAULT_WORKER_PROFILE`. Enterprise deployments
+should keep Codex (`codex-cli`) as the default once its Responses-compatible route is validated.
+OpenClaw and Claude Code remain selectable only when present in `GLASSHIVE_ALLOWED_WORKER_PROFILES`
+and proven by the worker matrix.
+
+For upload byte transfer, the host should provide every supported file/request header, including
+`X-GlassHive-Request-Files`, `X-GlassHive-Request-Attachments`, `X-GlassHive-Tool-Resources`, and
+`X-GlassHive-File-Ids`. In enterprise shared-storage deployments, file metadata should point to
+owner-scoped virtual paths such as `/uploads/<authenticated-user-id>/<file>` so GlassHive can copy
+the bytes into the worker workspace under `uploads/<safe-filename>`.
 
 ### Claude / Claude Code
 Support:

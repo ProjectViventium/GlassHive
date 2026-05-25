@@ -8,6 +8,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal
 from urllib.parse import quote, urlparse
@@ -39,6 +40,25 @@ DEFAULT_PORT = int(os.environ.get("WPR_MCP_PORT", "8767"))
 DEFAULT_TIMEOUT_SEC = float(os.environ.get("WPR_MCP_TIMEOUT_SEC", "120"))
 DEFAULT_OWNER_ID = os.environ.get("WPR_DEFAULT_OWNER_ID", "").strip()
 DEFAULT_API_TOKEN = os.environ.get("WPR_API_TOKEN", "").strip()
+
+
+def _configured_default_worker_profile() -> str:
+    raw_configured = os.environ.get("GLASSHIVE_DEFAULT_WORKER_PROFILE", "").strip()
+    configured = raw_configured or "codex-cli"
+    raw_allowed = (
+        os.environ.get("GLASSHIVE_ALLOWED_WORKER_PROFILES", "").strip()
+        or os.environ.get("WPR_ALLOWED_WORKER_PROFILES", "").strip()
+    )
+    allowed = [item.strip() for item in raw_allowed.split(",") if item.strip()]
+    if not allowed or configured in allowed:
+        return configured
+    if raw_configured:
+        raise RuntimeError(
+            "GLASSHIVE_DEFAULT_WORKER_PROFILE must be included in GLASSHIVE_ALLOWED_WORKER_PROFILES"
+        )
+    return allowed[0]
+
+
 HEADER_USER_ID = "x-viventium-user-id"
 HEADER_TENANT_ID = "x-viventium-tenant-id"
 HEADER_USER_EMAIL = "x-viventium-user-email"
@@ -144,6 +164,85 @@ def _default_execution_mode() -> str:
         return "docker"
     mode = os.environ.get("WPR_DEFAULT_EXECUTION_MODE", "docker").strip().lower()
     return mode if mode in {"docker", "host"} else "docker"
+
+
+def _allowed_worker_profiles() -> set[str]:
+    raw = (
+        os.environ.get("GLASSHIVE_ALLOWED_WORKER_PROFILES", "").strip()
+        or os.environ.get("WPR_ALLOWED_WORKER_PROFILES", "").strip()
+    )
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _profile_allowed(profile: str) -> bool:
+    allowed = _allowed_worker_profiles()
+    return bool(profile and (not allowed or profile in allowed))
+
+
+def _normalize_preferences(raw: dict[str, Any] | None) -> dict[str, str]:
+    data = raw or {}
+    return {
+        "default_worker_profile": str(data.get("default_worker_profile") or "").strip(),
+        "codex_reasoning_effort": str(data.get("codex_reasoning_effort") or "").strip().lower(),
+        "claude_effort": str(data.get("claude_effort") or "").strip().lower(),
+        "openclaw_effort": str(data.get("openclaw_effort") or "").strip().lower(),
+    }
+
+
+def _resolve_profile_from_preferences(profile: str | None, preferences: dict[str, str] | None) -> str:
+    requested = str(profile or "").strip()
+    if requested:
+        return requested
+    preferred = str((preferences or {}).get("default_worker_profile") or "").strip()
+    if _profile_allowed(preferred):
+        return preferred
+    return _configured_default_worker_profile()
+
+
+def _resolve_effort_for_profile(
+    profile: str,
+    effort: str | None,
+    preferences: dict[str, str] | None,
+) -> str:
+    requested = str(effort or "").strip().lower()
+    if requested:
+        return requested
+    prefs = preferences or {}
+    if profile == "codex-cli":
+        return prefs.get("codex_reasoning_effort", "")
+    if profile == "claude-code":
+        return prefs.get("claude_effort", "")
+    if profile == "openclaw-general":
+        return prefs.get("openclaw_effort", "")
+    return ""
+
+
+def _apply_effort_to_bundle(bundle: dict[str, Any], *, profile: str, effort: str) -> dict[str, Any]:
+    clean_effort = str(effort or "").strip().lower()
+    if not clean_effort:
+        return bundle
+    next_bundle = dict(bundle or {})
+    if profile == "codex-cli":
+        if clean_effort not in {"minimal", "low", "medium", "high", "xhigh"}:
+            raise ValueError("Codex effort must be minimal, low, medium, high, or xhigh")
+        env = dict(next_bundle.get("env") or {})
+        env["WPR_CODEX_CLI_REASONING_EFFORT"] = clean_effort
+        next_bundle["env"] = env
+        return next_bundle
+    if profile == "claude-code":
+        if clean_effort not in {"default", "max"}:
+            raise ValueError("Claude effort must be default or max")
+    elif profile == "openclaw-general":
+        if clean_effort not in {"default", "high", "max"}:
+            raise ValueError("OpenClaw effort must be default, high, or max")
+    else:
+        return next_bundle
+    if clean_effort == "default":
+        return next_bundle
+    current = str(next_bundle.get("system_instructions") or "").strip()
+    addition = f"Worker effort preference for this run: {clean_effort}."
+    next_bundle["system_instructions"] = f"{current}\n\n{addition}".strip()
+    return next_bundle
 
 
 def _host_workers_enabled() -> bool:
@@ -301,6 +400,9 @@ def glasshive_workers_server_instructions() -> str:
         "model context lacks file contents. For fresh one-off "
         "host/browser/desktop/local tasks, prefer workspace_launch, whose fields mirror the "
         "documented GlassHive UI: description, required success_criteria, and optional context. "
+        "When the user asks to make a worker or effort the default, use workspace_preferences_set; "
+        "when profile or effort is omitted, workspace_launch and worker_delegate_once honor the "
+        "authenticated user's saved defaults before falling back to deployment defaults. "
         "worker_delegate_once is the lower-level one-call fallback when the caller already has a "
         "precise instruction/title. These high-level tools create or resume the "
         "project/worker, includes optional callback/upload context, queues the run in one call, and "
@@ -522,7 +624,7 @@ def _upload_root_candidates() -> list[Path]:
     return deduped
 
 
-def _trusted_virtual_upload_source(value: str) -> str:
+def _trusted_virtual_upload_source(value: str, *, owner_id: str | None = None) -> str:
     roots = _upload_root_candidates()
     if not roots or not value.startswith("/uploads/"):
         return ""
@@ -535,10 +637,56 @@ def _trusted_virtual_upload_source(value: str) -> str:
         return ""
     if ".." in relative_path.split(os.path.sep):
         return ""
+    if _enterprise_mode_enabled():
+        clean_owner = _safe_owner_path_component(owner_id)
+        first_part = relative_path.split(os.path.sep, 1)[0]
+        if not clean_owner or first_part != clean_owner:
+            return ""
     candidates = [root / relative_path for root in roots]
     for candidate in candidates:
         if candidate.exists():
             return os.fspath(candidate)
+    return ""
+
+
+def _normalized_upload_filename_key(value: object) -> str:
+    name = str(value or "").replace("\\", "/").rsplit("/", 1)[-1].strip().lower()
+    if "__" in name:
+        name = name.split("__", 1)[1]
+    return re.sub(r"[^a-z0-9]+", "", name)
+
+
+def _safe_owner_path_component(value: object) -> str:
+    clean = str(value or "").strip()
+    if not clean or clean in {".", ".."}:
+        return ""
+    if "\x00" in clean or "/" in clean or "\\" in clean or ".." in clean:
+        return ""
+    return clean
+
+
+def _owner_scoped_upload_source_for_filename(filename: str, *, owner_id: str | None = None) -> str:
+    roots = _upload_root_candidates()
+    clean_owner = _safe_owner_path_component(owner_id)
+    target_key = _normalized_upload_filename_key(filename)
+    if not roots or not clean_owner or not target_key:
+        return ""
+    candidates: list[Path] = []
+    for root in roots:
+        owner_root = root / clean_owner
+        if not owner_root.exists() or not owner_root.is_dir():
+            continue
+        try:
+            for candidate in owner_root.rglob("*"):
+                if not candidate.is_file():
+                    continue
+                if _normalized_upload_filename_key(candidate.name) == target_key:
+                    candidates.append(candidate)
+        except OSError:
+            continue
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item: (item.stat().st_mtime_ns, os.fspath(item)), reverse=True)
     return os.fspath(candidates[0])
 
 
@@ -723,7 +871,9 @@ def _project_upload_file_entry(
             break
     if source_ref:
         metadata["source_ref"] = source_ref
-    trusted_source = _trusted_virtual_upload_source(source_ref)
+    trusted_source = _trusted_virtual_upload_source(source_ref, owner_id=owner_id)
+    if not trusted_source:
+        trusted_source = _owner_scoped_upload_source_for_filename(filename, owner_id=owner_id)
     if trusted_source:
         token = sign_bootstrap_source_path(trusted_source, tenant_id=tenant_id, owner_id=owner_id)
         return {
@@ -735,12 +885,22 @@ def _project_upload_file_entry(
         }
     text = file_obj.get("text")
     if isinstance(text, str) and text.strip():
-        text_filename = filename if filename.lower().endswith((".txt", ".md", ".csv", ".json")) else f"{filename}.txt"
-        return {
-            "scope": "workspace",
-            "path": f"uploads/{text_filename}",
-            "content": text,
+        if filename.lower().endswith((".txt", ".md", ".csv", ".json", ".jsonl", ".tsv", ".yaml", ".yml", ".xml", ".html", ".htm", ".log")):
+            return {
+                "scope": "workspace",
+                "path": f"uploads/{filename}",
+                "content": text,
+                **metadata,
+            }
+        metadata = {
             **metadata,
+            "filename": metadata.get("filename") or filename,
+            "source_status": "original_bytes_unavailable",
+            "blocker": (
+                "Original uploaded file bytes were not safely available to GlassHive. "
+                "Do not substitute extracted text for this file unless the user explicitly asked for text extraction."
+            ),
+            "extracted_text_available": True,
         }
     if not metadata:
         return None
@@ -749,6 +909,7 @@ def _project_upload_file_entry(
         "scope": "workspace",
         "path": f"uploads/{manifest_name}",
         "content": json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        **({"upload_blocker": metadata.get("blocker")} if metadata.get("blocker") else {}),
         **{key: value for key, value in metadata.items() if key != "source_ref"},
     }
 
@@ -804,12 +965,15 @@ def _append_materialized_uploads_instruction(
     projected: list[dict[str, Any]],
 ) -> None:
     paths = []
+    blocker_paths = []
     for entry in projected:
         if not isinstance(entry, dict):
             continue
         path = str(entry.get("path") or "").strip().lstrip("/")
         if path and path not in paths:
             paths.append(path)
+        if path and entry.get("upload_blocker") and path not in blocker_paths:
+            blocker_paths.append(path)
     if not paths:
         return
 
@@ -820,10 +984,18 @@ def _append_materialized_uploads_instruction(
         "",
         "## Attached workspace files",
         "",
-        "GlassHive has already materialized the uploaded/attached files before this worker starts.",
-        "Read them directly from these workspace-relative paths. When files were supplied through model context, treat their contents as user-provided text rather than independently verified host uploads. Do not ask the user to re-attach them or claim the attachment is unavailable unless a listed file is missing, unreadable, or inconsistent with the user's request.",
+        "GlassHive has already prepared the uploaded/attached file records before this worker starts.",
+        "Read materialized files directly from these workspace-relative paths. Metadata manifests mean the original bytes were not safely available; treat those as blockers for file-preserving work and report that plainly instead of substituting extracted text. Do not ask the user to re-attach unless a listed file is missing, unreadable, or inconsistent with the user's request.",
     ]
     lines.extend(f"- `{path}`" for path in paths)
+    if blocker_paths:
+        lines.extend(
+            [
+                "",
+                "The following attachment records are metadata/blocker manifests, not source files:",
+            ]
+        )
+        lines.extend(f"- `{path}`" for path in blocker_paths)
     bundle["project_definition"] = (existing + "\n".join(lines) + "\n").lstrip()
 
 
@@ -972,6 +1144,7 @@ def _merge_request_context(bundle: dict[str, Any] | None) -> dict[str, Any] | No
         )
         if projected:
             merged["files"] = _merge_bundle_files(merged.get("files"), projected)
+            _append_materialized_uploads_instruction(merged, projected)
     return merged
 
 
@@ -1064,6 +1237,12 @@ class WorkersProjectsApiClient:
 
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/health")
+
+    def get_preferences(self) -> dict[str, Any]:
+        return self._request("GET", "/v1/preferences")
+
+    def update_preferences(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("PATCH", "/v1/preferences", json_body=payload)
 
     def list_projects(self, owner_id: str | None = None) -> list[dict[str, Any]]:
         projects = self._request("GET", "/v1/projects").get("items", [])
@@ -1296,14 +1475,67 @@ def create_mcp_server(
         title: str,
         goal: str,
         owner_id: str | None = None,
-        default_worker_profile: str = "openclaw-general",
+        default_worker_profile: str = "",
     ) -> dict[str, Any]:
         return client.create_project(
             owner_id=_request_owner_id(owner_id),
             title=title,
             goal=goal,
-            default_worker_profile=default_worker_profile,
+            default_worker_profile=default_worker_profile.strip() or _configured_default_worker_profile(),
         )
+
+    @server.tool(
+        name="workspace_preferences_get",
+        title="Get GlassHive Preferences",
+        description=(
+            "Return the authenticated user's saved GlassHive defaults: preferred worker profile and "
+            "per-profile effort settings. Use before changing defaults or when a user asks what worker "
+            "GlassHive will use."
+        ),
+        structured_output=True,
+    )
+    def workspace_preferences_get() -> dict[str, Any]:
+        return client.get_preferences()
+
+    @server.tool(
+        name="workspace_preferences_set",
+        title="Set GlassHive Preferences",
+        description=(
+            "Save the authenticated user's default GlassHive worker and effort preferences. Use this "
+            "when the user says to make Codex, Claude Code, or OpenClaw their default, or asks future "
+            "GlassHive runs to use a specific effort. Allowed Codex efforts: minimal, low, medium, "
+            "high, xhigh. Claude: max. OpenClaw: high or max."
+        ),
+        structured_output=True,
+    )
+    def workspace_preferences_set(
+        default_worker_profile: Annotated[
+            str | None,
+            Field(description="Optional default worker profile: codex-cli, claude-code, or openclaw-general. Empty clears the saved default."),
+        ] = None,
+        codex_reasoning_effort: Annotated[
+            str | None,
+            Field(description="Optional Codex default effort: minimal, low, medium, high, xhigh, or empty to use deployment default."),
+        ] = None,
+        claude_effort: Annotated[
+            str | None,
+            Field(description="Optional Claude Code default effort: max, or empty/default to use deployment default."),
+        ] = None,
+        openclaw_effort: Annotated[
+            str | None,
+            Field(description="Optional OpenClaw default effort: high, max, or empty/default to use deployment default."),
+        ] = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if default_worker_profile is not None:
+            payload["default_worker_profile"] = default_worker_profile
+        if codex_reasoning_effort is not None:
+            payload["codex_reasoning_effort"] = codex_reasoning_effort
+        if claude_effort is not None:
+            payload["claude_effort"] = claude_effort
+        if openclaw_effort is not None:
+            payload["openclaw_effort"] = openclaw_effort
+        return client.update_preferences(payload)
 
     @server.tool(
         name="project_get",
@@ -1345,18 +1577,33 @@ def create_mcp_server(
         worker_name: str | None = None,
         worker_role: str | None = None,
         alias: str | None = None,
-        profile: ProfileParam = "codex-cli",
+        profile: ProfileParam = "",
         backend: BackendParam = "openclaw",
         execution_mode: ExecutionModeParam = None,
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
         bootstrap_bundle_json: BootstrapBundleParam = None,
         uploaded_files: UploadedFilesParam = None,
+        effort: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional per-run effort override. Codex accepts minimal/low/medium/high/xhigh; "
+                    "Claude Code accepts max; OpenClaw accepts high/max. Omit to use the user's saved default."
+                )
+            ),
+        ] = None,
         require_callback: bool = False,
         expose_diagnostics: bool = False,
     ) -> dict[str, Any]:
         resolved_owner_id = _request_owner_id(owner_id)
         resolved_execution_mode = _resolve_execution_mode(execution_mode)
+        try:
+            preferences = _normalize_preferences(client.get_preferences())
+        except Exception:
+            preferences = {}
+        resolved_profile = _resolve_profile_from_preferences(profile, preferences)
+        resolved_effort = _resolve_effort_for_profile(resolved_profile, effort, preferences)
         clean_title = title.strip() or "GlassHive task"
         clean_goal = (goal or instruction).strip()
         clean_instruction = instruction.strip()
@@ -1378,6 +1625,7 @@ def create_mcp_server(
             tenant_id=context_tenant_id,
             owner_id=context_owner_id or resolved_owner_id,
         )
+        bundle = _apply_effort_to_bundle(bundle, profile=resolved_profile, effort=resolved_effort)
         callback_ready, missing_callback_fields = _callback_state(bundle, required=require_callback)
         if require_callback and not callback_ready:
             return {
@@ -1392,14 +1640,15 @@ def create_mcp_server(
                     "missing_callback_fields. Do not quote a canned template."
                 ),
                 "execution_mode": resolved_execution_mode,
-                "profile": profile,
-                "alias": (alias or _slugify_alias(profile, clean_title)).strip(),
+                "profile": resolved_profile,
+                "effort": resolved_effort,
+                "alias": (alias or _slugify_alias(resolved_profile, clean_title)).strip(),
                 "callback_ready": False,
                 "missing_callback_fields": missing_callback_fields,
             }
 
         existing_workspace = None
-        resolved_alias = (alias or _slugify_alias(profile, clean_title)).strip()
+        resolved_alias = (alias or _slugify_alias(resolved_profile, clean_title)).strip()
         if not project_id and alias:
             existing_workspace = client.find_worker_by_alias_across_projects(
                 owner_id=resolved_owner_id,
@@ -1415,7 +1664,7 @@ def create_mcp_server(
                 owner_id=resolved_owner_id,
                 title=clean_title,
                 goal=clean_goal,
-                default_worker_profile=profile,
+                default_worker_profile=resolved_profile,
             )
         )
         resolved_project_id = str(project.get("project_id") or project_id or "").strip()
@@ -1428,7 +1677,7 @@ def create_mcp_server(
             name=(worker_name or clean_title).strip(),
             role=(worker_role or clean_goal or clean_instruction).strip(),
             alias=resolved_alias,
-            profile=profile,
+            profile=resolved_profile,
             backend=backend,
             execution_mode=resolved_execution_mode,
             workspace_root=workspace_root,
@@ -1484,7 +1733,8 @@ def create_mcp_server(
                     "run_id": run.get("run_id"),
                     "run_state": run.get("state"),
                     "execution_mode": resolved_execution_mode,
-                    "profile": profile,
+                    "profile": resolved_profile,
+                    "effort": resolved_effort,
                     "alias": resolved_alias,
                     "submitted_instruction": clean_instruction,
                 }
@@ -1521,10 +1771,19 @@ def create_mcp_server(
             str | None,
             Field(description="Optional stable workspace alias to resume. Omit for a new one-off workspace."),
         ] = None,
-        profile: ProfileParam = "codex-cli",
+        profile: ProfileParam = "",
         execution_mode: ExecutionModeParam = None,
         bootstrap_bundle_json: BootstrapBundleParam = None,
         uploaded_files: UploadedFilesParam = None,
+        effort: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional per-run effort override. Codex accepts minimal/low/medium/high/xhigh; "
+                    "Claude Code accepts max; OpenClaw accepts high/max. Omit to use saved user preferences or deployment default."
+                )
+            ),
+        ] = None,
         require_callback: bool = False,
         expose_diagnostics: bool = False,
     ) -> dict[str, Any]:
@@ -1565,6 +1824,7 @@ def create_mcp_server(
             execution_mode=execution_mode,
             bootstrap_bundle_json=bootstrap_bundle_json,
             uploaded_files=uploaded_files,
+            effort=effort,
             require_callback=require_callback,
             expose_diagnostics=expose_diagnostics,
         )
@@ -1604,10 +1864,14 @@ def create_mcp_server(
             str | None,
             Field(description="Optional stable workspace alias to resume. Omit for a new one-off scheduled workspace."),
         ] = None,
-        profile: ProfileParam = "codex-cli",
+        profile: ProfileParam = "",
         execution_mode: ExecutionModeParam = None,
         bootstrap_bundle_json: BootstrapBundleParam = None,
         uploaded_files: UploadedFilesParam = None,
+        effort: Annotated[
+            str | None,
+            Field(description="Optional per-run effort override for the scheduled workspace."),
+        ] = None,
         require_callback: bool = False,
         expose_diagnostics: bool = False,
     ) -> dict[str, Any]:
@@ -1640,6 +1904,12 @@ def create_mcp_server(
 
         resolved_owner_id = _request_owner_id(None)
         resolved_execution_mode = _resolve_execution_mode(execution_mode)
+        try:
+            preferences = _normalize_preferences(client.get_preferences())
+        except Exception:
+            preferences = {}
+        resolved_profile = _resolve_profile_from_preferences(profile, preferences)
+        resolved_effort = _resolve_effort_for_profile(resolved_profile, effort, preferences)
         title = clean_description.splitlines()[0].strip()[:120] or "GlassHive scheduled workspace"
         bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json) or {}
         bundle.setdefault(
@@ -1656,6 +1926,7 @@ def create_mcp_server(
             tenant_id=context_tenant_id,
             owner_id=context_owner_id or resolved_owner_id,
         )
+        bundle = _apply_effort_to_bundle(bundle, profile=resolved_profile, effort=resolved_effort)
         callback_ready, missing_callback_fields = _callback_state(bundle, required=require_callback)
         if require_callback and not callback_ready:
             return {
@@ -1668,7 +1939,7 @@ def create_mcp_server(
                 ),
             }
 
-        resolved_alias = (workspace_alias or _slugify_alias(profile, title)).strip()
+        resolved_alias = (workspace_alias or _slugify_alias(resolved_profile, title)).strip()
         existing_workspace = None
         if workspace_alias:
             existing_workspace = client.find_worker_by_alias_across_projects(
@@ -1680,7 +1951,7 @@ def create_mcp_server(
             owner_id=resolved_owner_id,
             title=title,
             goal=clean_success_criteria,
-            default_worker_profile=profile,
+            default_worker_profile=resolved_profile,
         )
         project_id = str(project.get("project_id") or "")
         worker = client.find_or_resume_worker(
@@ -1689,7 +1960,7 @@ def create_mcp_server(
             name=title,
             role=clean_success_criteria,
             alias=resolved_alias,
-            profile=profile,
+            profile=resolved_profile,
             backend="openclaw",
             execution_mode=resolved_execution_mode,
             bootstrap_bundle=bundle,
@@ -1731,7 +2002,8 @@ def create_mcp_server(
                     "worker_id": worker_id,
                     "schedule_id": schedule.get("schedule_id"),
                     "execution_mode": resolved_execution_mode,
-                    "profile": profile,
+                    "profile": resolved_profile,
+                    "effort": resolved_effort,
                 }
             )
         return result
@@ -1790,7 +2062,7 @@ def create_mcp_server(
         name: str,
         role: str,
         owner_id: str | None = None,
-        profile: ProfileParam = "openclaw-general",
+        profile: ProfileParam = "",
         backend: BackendParam = "openclaw",
         execution_mode: ExecutionModeParam = None,
         alias: str | None = None,
@@ -1806,7 +2078,7 @@ def create_mcp_server(
             owner_id=_request_owner_id(owner_id),
             name=name,
             role=role,
-            profile=profile,
+            profile=profile.strip() or _configured_default_worker_profile(),
             backend=backend,
             execution_mode=resolved_execution_mode,
             alias=alias,
@@ -1833,7 +2105,7 @@ def create_mcp_server(
         role: str,
         alias: str,
         owner_id: str | None = None,
-        profile: ProfileParam = "openclaw-general",
+        profile: ProfileParam = "",
         backend: BackendParam = "openclaw",
         execution_mode: ExecutionModeParam = None,
         workspace_root: str | None = None,
@@ -1849,7 +2121,7 @@ def create_mcp_server(
             name=name,
             role=role,
             alias=alias,
-            profile=profile,
+            profile=profile.strip() or _configured_default_worker_profile(),
             backend=backend,
             execution_mode=resolved_execution_mode,
             workspace_root=workspace_root,
@@ -2075,6 +2347,65 @@ def create_mcp_server(
             "timeout",
         }
 
+    def _run_order_key(run: dict[str, Any] | None) -> tuple[float, str]:
+        if not run:
+            return (0.0, "")
+        for key in ("queued_at", "started_at", "ended_at", "created_at", "updated_at"):
+            value = str(run.get(key) or "").strip()
+            if value:
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    return (parsed.astimezone(timezone.utc).timestamp(), str(run.get("run_id") or "").strip())
+                except ValueError:
+                    continue
+        return (0.0, str(run.get("run_id") or "").strip())
+
+    def _run_is_newer(candidate: dict[str, Any] | None, requested_run: dict[str, Any] | None) -> bool:
+        if not candidate:
+            return False
+        if not requested_run:
+            return True
+        candidate_id = str(candidate.get("run_id") or "").strip()
+        requested_id = str(requested_run.get("run_id") or "").strip()
+        return bool(candidate_id and candidate_id != requested_id and _run_order_key(candidate) > _run_order_key(requested_run))
+
+    def _newer_worker_run(
+        *,
+        requested_run: dict[str, Any] | None,
+        worker: dict[str, Any],
+        live: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        latest_run_id = str((worker or {}).get("last_run_id") or "").strip()
+        if latest_run_id and latest_run_id != str((requested_run or {}).get("run_id") or "").strip():
+            try:
+                latest = client.get_run(latest_run_id)
+            except Exception:
+                latest = None
+            if _run_is_newer(latest, requested_run):
+                return latest
+
+        for key in ("runs", "project_runs"):
+            raw_runs = (live or {}).get(key) if isinstance(live, dict) else None
+            if not isinstance(raw_runs, list):
+                continue
+            for item in raw_runs:
+                if not isinstance(item, dict):
+                    continue
+                candidate_id = str(item.get("run_id") or "").strip()
+                if not candidate_id:
+                    continue
+                if candidate_id == str((requested_run or {}).get("run_id") or "").strip():
+                    continue
+                try:
+                    candidate = client.get_run(candidate_id)
+                except Exception:
+                    candidate = item
+                if _run_is_newer(candidate, requested_run):
+                    return candidate
+        return None
+
     def _workspace_status_payload(
         *,
         run_id: str | None = None,
@@ -2092,7 +2423,17 @@ def create_mcp_server(
         if include_live and clean_worker_id:
             live = client.worker_live(clean_worker_id)
         worker = live.get("worker") if isinstance(live, dict) and isinstance(live.get("worker"), dict) else {}
-        project_id = str((worker or {}).get("project_id") or (run or {}).get("project_id") or "").strip()
+        newer_run = _newer_worker_run(requested_run=run, worker=worker, live=live) if clean_worker_id else None
+        requested_run_stale = bool(run and _run_is_newer(newer_run, run))
+        if run and _terminal_run_state(run) and newer_run and not _terminal_run_state(newer_run):
+            effective_run = run
+        elif newer_run and (not run or _run_is_newer(newer_run, run)):
+            effective_run = newer_run
+        else:
+            effective_run = run
+        if effective_run and not clean_worker_id:
+            clean_worker_id = str(effective_run.get("worker_id") or "").strip()
+        project_id = str((worker or {}).get("project_id") or (effective_run or run or {}).get("project_id") or "").strip()
         view_steer_url = None
         if clean_worker_id:
             worker_for_link = worker if worker else {"worker_id": clean_worker_id}
@@ -2101,9 +2442,9 @@ def create_mcp_server(
                 project_id or None,
                 _header_value(_request_headers(), HEADER_SURFACE),
             )
-        run_state = str((run or {}).get("state") or "").strip() or None
+        run_state = str((effective_run or {}).get("state") or "").strip() or None
         worker_state = str((worker or {}).get("state") or "").strip() or None
-        terminal = bool(run and _terminal_run_state(run))
+        terminal = bool(effective_run and _terminal_run_state(effective_run))
         artifact_links: dict[str, Any] | None = None
         if terminal and clean_worker_id:
             try:
@@ -2120,13 +2461,18 @@ def create_mcp_server(
             "status": "ok",
             "mode": "non_blocking",
             "terminal": terminal,
-            "run_id": clean_run_id or None,
+            "run_id": str((effective_run or {}).get("run_id") or clean_run_id or "").strip() or None,
+            "requested_run_id": clean_run_id or None,
+            "requested_run_state": str((run or {}).get("state") or "").strip() or None,
+            "requested_run_stale": requested_run_stale,
+            "latest_run_id": str((newer_run or effective_run or {}).get("run_id") or "").strip() or None,
+            "latest_run_state": str((newer_run or effective_run or {}).get("state") or "").strip() or None,
             "worker_id": clean_worker_id or None,
             "project_id": project_id or None,
             "run_state": run_state,
             "worker_state": worker_state,
-            "output_text": (run or {}).get("output_text") if run else None,
-            "error_text": (run or {}).get("error_text") if run else None,
+            "output_text": (effective_run or {}).get("output_text") if effective_run else None,
+            "error_text": (effective_run or {}).get("error_text") if effective_run else None,
             "view_steer_url": view_steer_url,
             "view_steer": {
                 "label": "View / Steer GlassHive workspace",
@@ -2134,9 +2480,12 @@ def create_mcp_server(
                 "include_in_response": bool(view_steer_url),
             },
             "artifact_links": artifact_links,
-            "run": run,
+            "run": effective_run,
+            "requested_run": run,
+            "latest_run": newer_run or effective_run,
             "worker_live": live,
             "next_action_guidance": (
+                "If requested_run_stale is true, acknowledge the requested run outcome first, then answer from the effective/latest run fields. "
                 "If terminal is true, answer from output_text/error_text and include relevant "
                 "artifact_links signed_download_url values when present, plus the "
                 "View / Steer link when useful. If terminal is false and the user wants you to wait, "

@@ -75,6 +75,61 @@ def test_enterprise_bootstrap_does_not_copy_host_auth_or_identity_files(tmp_path
     assert copied_trees == []
 
 
+def test_enterprise_bootstrap_keeps_provider_secrets_out_of_interactive_runtime_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    worker = {
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "env": {
+                    "OPENAI_API_KEY": "synthetic-openai-key-not-for-shell",
+                    "PORTKEY_VIRTUAL_KEY": "pk-test-not-for-shell",
+                    "OPENAI_BASE_URL": "https://provider.example.com/v1",
+                }
+            }
+        )
+    }
+
+    apply_bootstrap(
+        home_dir=tmp_path / "home",
+        workspace_dir=tmp_path / "workspace",
+        runtime_name="codex-cli",
+        worker=worker,
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+    )
+
+    runtime_env = (tmp_path / "home" / ".glasshive" / "runtime.env").read_text()
+    secret_env = (tmp_path / "home" / ".glasshive" / "secret-runtime.env").read_text()
+    secret_keys = (tmp_path / "home" / ".glasshive" / "secret-runtime.keys").read_text().splitlines()
+
+    assert "OPENAI_BASE_URL" in runtime_env
+    assert "OPENAI_API_KEY" not in runtime_env
+    assert "PORTKEY_VIRTUAL_KEY" not in runtime_env
+    assert "OPENAI_API_KEY" in secret_env
+    assert "PORTKEY_VIRTUAL_KEY" in secret_env
+    assert set(secret_keys) == {"OPENAI_API_KEY", "PORTKEY_VIRTUAL_KEY"}
+    assert oct((tmp_path / "home" / ".glasshive" / "secret-runtime.env").stat().st_mode & 0o777) == "0o600"
+    assert oct((tmp_path / "home" / ".glasshive" / "secret-runtime.keys").stat().st_mode & 0o777) == "0o600"
+
+
+def test_local_bootstrap_keeps_legacy_interactive_runtime_env_behavior(tmp_path, monkeypatch):
+    monkeypatch.delenv("GLASSHIVE_ENTERPRISE_MODE", raising=False)
+    worker = {"bootstrap_bundle_json": json.dumps({"env": {"OPENAI_API_KEY": "local-dev-key"}})}
+
+    apply_bootstrap(
+        home_dir=tmp_path / "home",
+        workspace_dir=tmp_path / "workspace",
+        runtime_name="codex-cli",
+        worker=worker,
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+    )
+
+    runtime_env = (tmp_path / "home" / ".glasshive" / "runtime.env").read_text()
+    assert "OPENAI_API_KEY" in runtime_env
+    assert not (tmp_path / "home" / ".glasshive" / "secret-runtime.env").exists()
+
+
 def test_enterprise_bootstrap_rejects_unsigned_source_path(tmp_path, monkeypatch):
     uploads_root = tmp_path / "uploads"
     other_user_file = uploads_root / "user-b" / "brief.txt"

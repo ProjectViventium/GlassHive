@@ -39,6 +39,28 @@ class FakeApiClient:
     def get_project(self, project_id: str):
         return {"project_id": project_id, "owner_id": "demo-owner", "title": "Inbox Zero", "goal": "Triage open loops"}
 
+    def get_preferences(self):
+        return {
+            "tenant_id": "local",
+            "owner_id": "demo-owner",
+            "default_worker_profile": "",
+            "codex_reasoning_effort": "",
+            "claude_effort": "",
+            "openclaw_effort": "",
+            "updated_at": "",
+        }
+
+    def update_preferences(self, payload: dict):
+        return {
+            "tenant_id": "local",
+            "owner_id": "demo-owner",
+            "default_worker_profile": payload.get("default_worker_profile", ""),
+            "codex_reasoning_effort": payload.get("codex_reasoning_effort", ""),
+            "claude_effort": payload.get("claude_effort", ""),
+            "openclaw_effort": payload.get("openclaw_effort", ""),
+            "updated_at": "2026-05-24T00:00:00+00:00",
+        }
+
     def list_project_runs(self, project_id: str):
         return [{"run_id": "run_123", "project_id": project_id, "state": "completed"}]
 
@@ -187,6 +209,7 @@ class FakeApiClient:
 class TrackingApiClient(FakeApiClient):
     def __init__(self):
         self.calls: list[str] = []
+        self.create_project_payloads: list[dict] = []
         self.find_or_resume_payloads: list[dict] = []
 
     def list_projects(self, owner_id: str | None = None):
@@ -199,6 +222,7 @@ class TrackingApiClient(FakeApiClient):
 
     def create_project(self, **kwargs):
         self.calls.append("create_project")
+        self.create_project_payloads.append(kwargs)
         return super().create_project(**kwargs)
 
     def find_or_resume_worker(self, **kwargs):
@@ -209,6 +233,27 @@ class TrackingApiClient(FakeApiClient):
     def assign_run(self, worker_id: str, instruction: str):
         self.calls.append("assign_run")
         return super().assign_run(worker_id, instruction)
+
+
+class PreferenceApiClient(TrackingApiClient):
+    def __init__(self):
+        super().__init__()
+        self.preference_payloads: list[dict] = []
+
+    def get_preferences(self):
+        return {
+            "tenant_id": "local",
+            "owner_id": "demo-owner",
+            "default_worker_profile": "codex-cli",
+            "codex_reasoning_effort": "xhigh",
+            "claude_effort": "",
+            "openclaw_effort": "",
+            "updated_at": "2026-05-24T00:00:00+00:00",
+        }
+
+    def update_preferences(self, payload: dict):
+        self.preference_payloads.append(payload)
+        return {**self.get_preferences(), **payload}
 
 
 class PollingApiClient(FakeApiClient):
@@ -239,6 +284,222 @@ class PollingApiClient(FakeApiClient):
             "runtime_details": {"view_url": "http://127.0.0.1:62310/?autoconnect=1"},
             "project_runs": [],
         }
+
+
+class StaleRequestedRunApiClient(FakeApiClient):
+    def get_run(self, run_id: str):
+        if run_id == "run_old_failed":
+            return {
+                "run_id": "run_old_failed",
+                "worker_id": "wrk_stale",
+                "project_id": "prj_stale",
+                "state": "failed",
+                "queued_at": "2026-05-24T10:00:00+00:00",
+                "output_text": "",
+                "error_text": "Older failed run",
+            }
+        return {
+            "run_id": "run_new_completed",
+            "worker_id": "wrk_stale",
+            "project_id": "prj_stale",
+            "state": "completed",
+            "queued_at": "2026-05-24T10:05:00+00:00",
+            "output_text": "Latest artifact is ready",
+            "error_text": "",
+        }
+
+    def worker_live(self, worker_id: str):
+        return {
+            "worker": {
+                "worker_id": worker_id,
+                "project_id": "prj_stale",
+                "tenant_id": "tenant-alpha",
+                "owner_id": "demo-owner",
+                "state": "ready",
+                "last_run_id": "run_new_completed",
+            },
+            "runs": [
+                {
+                    "run_id": "run_new_completed",
+                    "worker_id": worker_id,
+                    "project_id": "prj_stale",
+                    "state": "completed",
+                    "queued_at": "2026-05-24T10:05:00+00:00",
+                },
+                {
+                    "run_id": "run_old_failed",
+                    "worker_id": worker_id,
+                    "project_id": "prj_stale",
+                    "state": "failed",
+                    "queued_at": "2026-05-24T10:00:00+00:00",
+                },
+            ],
+            "runtime_details": {},
+        }
+
+
+class OlderLastRunApiClient(StaleRequestedRunApiClient):
+    def get_run(self, run_id: str):
+        if run_id == "run_new_completed":
+            return {
+                "run_id": "run_new_completed",
+                "worker_id": "wrk_stale",
+                "project_id": "prj_stale",
+                "state": "completed",
+                "queued_at": "2026-05-24T10:05:00+00:00",
+                "output_text": "Requested run is the newest result",
+                "error_text": "",
+            }
+        return {
+            "run_id": "run_old_failed",
+            "worker_id": "wrk_stale",
+            "project_id": "prj_stale",
+            "state": "failed",
+            "queued_at": "2026-05-24T10:00:00+00:00",
+            "output_text": "",
+            "error_text": "Older failed run",
+        }
+
+    def worker_live(self, worker_id: str):
+        return {
+            "worker": {
+                "worker_id": worker_id,
+                "project_id": "prj_stale",
+                "tenant_id": "tenant-alpha",
+                "owner_id": "demo-owner",
+                "state": "ready",
+                "last_run_id": "run_old_failed",
+            },
+            "runs": [
+                {
+                    "run_id": "run_new_completed",
+                    "worker_id": worker_id,
+                    "project_id": "prj_stale",
+                    "state": "completed",
+                    "queued_at": "2026-05-24T10:05:00+00:00",
+                },
+                {
+                    "run_id": "run_old_failed",
+                    "worker_id": worker_id,
+                    "project_id": "prj_stale",
+                    "state": "failed",
+                    "queued_at": "2026-05-24T10:00:00+00:00",
+                },
+            ],
+            "runtime_details": {},
+        }
+
+
+class TerminalRequestedNewerRunningApiClient(StaleRequestedRunApiClient):
+    def get_run(self, run_id: str):
+        if run_id == "run_old_failed":
+            return {
+                "run_id": "run_old_failed",
+                "worker_id": "wrk_stale",
+                "project_id": "prj_stale",
+                "state": "failed",
+                "queued_at": "2026-05-24T10:00:00+00:00",
+                "output_text": "",
+                "error_text": "Requested run failed",
+            }
+        return {
+            "run_id": "run_new_running",
+            "worker_id": "wrk_stale",
+            "project_id": "prj_stale",
+            "state": "running",
+            "queued_at": "2026-05-24T10:05:00+00:00",
+            "output_text": "",
+            "error_text": "",
+        }
+
+    def worker_live(self, worker_id: str):
+        return {
+            "worker": {
+                "worker_id": worker_id,
+                "project_id": "prj_stale",
+                "tenant_id": "tenant-alpha",
+                "owner_id": "demo-owner",
+                "state": "running",
+                "last_run_id": "run_new_running",
+            },
+            "runs": [
+                {
+                    "run_id": "run_new_running",
+                    "worker_id": worker_id,
+                    "project_id": "prj_stale",
+                    "state": "running",
+                    "queued_at": "2026-05-24T10:05:00+00:00",
+                },
+                {
+                    "run_id": "run_old_failed",
+                    "worker_id": worker_id,
+                    "project_id": "prj_stale",
+                    "state": "failed",
+                    "queued_at": "2026-05-24T10:00:00+00:00",
+                },
+            ],
+            "runtime_details": {},
+        }
+
+
+class MixedTimezoneRunOrderApiClient(StaleRequestedRunApiClient):
+    def get_run(self, run_id: str):
+        if run_id == "run_old_failed":
+            return {
+                "run_id": "run_old_failed",
+                "worker_id": "wrk_stale",
+                "project_id": "prj_stale",
+                "state": "failed",
+                "queued_at": "2026-05-24T09:30:00+02:00",
+                "output_text": "",
+                "error_text": "Older failed run",
+            }
+        return {
+            "run_id": "run_new_completed",
+            "worker_id": "wrk_stale",
+            "project_id": "prj_stale",
+            "state": "completed",
+            "queued_at": "2026-05-24T08:00:00+00:00",
+            "output_text": "Newer mixed-timezone artifact is ready",
+            "error_text": "",
+        }
+
+    def worker_live(self, worker_id: str):
+        payload = super().worker_live(worker_id)
+        for item in payload["runs"]:
+            if item["run_id"] == "run_old_failed":
+                item["queued_at"] = "2026-05-24T09:30:00+02:00"
+            else:
+                item["queued_at"] = "2026-05-24T08:00:00+00:00"
+        return payload
+
+
+def test_configured_default_worker_profile_fails_loud_when_not_allowed(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", "claude-code")
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "openclaw-general")
+
+    with pytest.raises(RuntimeError, match="GLASSHIVE_DEFAULT_WORKER_PROFILE"):
+        mcp_server._configured_default_worker_profile()
+
+
+def test_project_create_reads_default_worker_profile_at_call_time(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", "claude-code")
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,claude-code")
+    api = TrackingApiClient()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            await client.call_tool(
+                "project_create",
+                {
+                    "title": "Use deployment default",
+                    "goal": "Project should use the current default worker.",
+                },
+            )
+
+    asyncio.run(scenario())
+    assert api.create_project_payloads[-1]["default_worker_profile"] == "claude-code"
 
 
 def _tool_json(result) -> object:
@@ -466,6 +727,8 @@ def test_mcp_server_exposes_tools_and_resources(monkeypatch):
             assert "workspace_artifacts" in tool_names
             assert "workspace_artifact_download" in tool_names
             assert "worker_find_or_resume" in tool_names
+            assert "workspace_preferences_get" in tool_names
+            assert "workspace_preferences_set" in tool_names
 
             created = await client.call_tool(
                 "project_create",
@@ -538,6 +801,35 @@ def test_workspace_artifacts_returns_signed_download_links(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_workspace_launch_uses_saved_profile_and_effort_preferences(monkeypatch):
+    api = PreferenceApiClient()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            saved = await client.call_tool(
+                "workspace_preferences_set",
+                {"default_worker_profile": "codex-cli", "codex_reasoning_effort": "xhigh"},
+            )
+            assert _tool_json(saved)["default_worker_profile"] == "codex-cli"
+
+            launched = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Create a synthetic QA marker",
+                    "success_criteria": "Marker exists",
+                    "expose_diagnostics": True,
+                },
+            )
+            payload = _tool_json(launched)
+            assert payload["profile"] == "codex-cli"
+            assert payload["effort"] == "xhigh"
+            bundle = api.find_or_resume_payloads[-1]["bootstrap_bundle"]
+            assert bundle["env"]["WPR_CODEX_CLI_REASONING_EFFORT"] == "xhigh"
+
+    asyncio.run(scenario())
+
+
 def test_workspace_artifact_download_rejects_traversal_before_signing(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ARTIFACT_BASE_URL", "https://glasshive.example.test")
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
@@ -575,6 +867,113 @@ def test_workspace_status_returns_view_steer_link_for_web_mcp_surfaces(monkeypat
             )
             assert "gh_token=" in payload["view_steer_url"]
             assert payload["view_steer"]["include_in_response"] is True
+
+    asyncio.run(scenario())
+
+
+def test_workspace_wait_prefers_newer_worker_run_over_stale_failed_run(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive.example.test")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    server = create_mcp_server(api_client=StaleRequestedRunApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            waited = await client.call_tool(
+                "workspace_wait",
+                {
+                    "run_id": "run_old_failed",
+                    "worker_id": "wrk_stale",
+                    "timeout_seconds": 0,
+                },
+            )
+            payload = _tool_json(waited)
+            assert payload["status"] == "completed"
+            assert payload["requested_run_stale"] is True
+            assert payload["requested_run_id"] == "run_old_failed"
+            assert payload["requested_run_state"] == "failed"
+            assert payload["run_id"] == "run_new_completed"
+            assert payload["latest_run_id"] == "run_new_completed"
+            assert payload["run_state"] == "completed"
+            assert payload["output_text"] == "Latest artifact is ready"
+            assert payload["artifact_links"]["items"][0]["signed_download_url"].startswith(
+                "https://glasshive.example.test/v1/signed-links/"
+            )
+            assert "acknowledge the requested run outcome first" in payload["next_action_guidance"]
+
+    asyncio.run(scenario())
+
+
+def test_workspace_wait_compares_mixed_timezone_run_timestamps(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive.example.test")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    server = create_mcp_server(api_client=MixedTimezoneRunOrderApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            waited = await client.call_tool(
+                "workspace_wait",
+                {
+                    "run_id": "run_old_failed",
+                    "worker_id": "wrk_stale",
+                    "timeout_seconds": 0,
+                },
+            )
+            payload = _tool_json(waited)
+            assert payload["requested_run_stale"] is True
+            assert payload["run_id"] == "run_new_completed"
+            assert payload["output_text"] == "Newer mixed-timezone artifact is ready"
+
+    asyncio.run(scenario())
+
+
+def test_workspace_status_does_not_mark_requested_run_stale_when_last_run_id_is_older(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive.example.test")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    server = create_mcp_server(api_client=OlderLastRunApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            status = await client.call_tool(
+                "workspace_status",
+                {"run_id": "run_new_completed", "worker_id": "wrk_stale"},
+            )
+            payload = _tool_json(status)
+            assert payload["requested_run_stale"] is False
+            assert payload["run_id"] == "run_new_completed"
+            assert payload["latest_run_id"] == "run_new_completed"
+            assert payload["run_state"] == "completed"
+            assert payload["output_text"] == "Requested run is the newest result"
+
+    asyncio.run(scenario())
+
+
+def test_workspace_wait_returns_terminal_requested_run_when_newer_run_is_still_running(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive.example.test")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    server = create_mcp_server(api_client=TerminalRequestedNewerRunningApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            waited = await client.call_tool(
+                "workspace_wait",
+                {
+                    "run_id": "run_old_failed",
+                    "worker_id": "wrk_stale",
+                    "timeout_seconds": 30,
+                    "poll_interval_seconds": 1,
+                },
+            )
+            payload = _tool_json(waited)
+            assert payload["status"] == "terminal"
+            assert payload["timed_out"] is False
+            assert payload["attempts"] == 1
+            assert payload["requested_run_stale"] is True
+            assert payload["run_id"] == "run_old_failed"
+            assert payload["run_state"] == "failed"
+            assert payload["error_text"] == "Requested run failed"
+            assert payload["latest_run_id"] == "run_new_running"
+            assert payload["latest_run_state"] == "running"
+            assert "acknowledge the requested run outcome first" in payload["next_action_guidance"]
 
     asyncio.run(scenario())
 
@@ -952,6 +1351,7 @@ def test_worker_delegate_once_materializes_explicit_uploaded_files(monkeypatch):
         lambda: {
             "X-GlassHive-Tenant-Id": "tenant-alpha",
             "X-GlassHive-User-Id": "user-123",
+            "X-WPR-Token": "service-secret",
         },
     )
     api_client = TrackingApiClient()
@@ -990,6 +1390,180 @@ def test_worker_delegate_once_materializes_explicit_uploaded_files(monkeypatch):
     assert "## Attached workspace files" in bundle["project_definition"]
     assert "`uploads/client_upload.txt`" in bundle["project_definition"]
     assert "Do not ask the user to re-attach" in bundle["project_definition"]
+
+
+def test_uploaded_file_text_prefers_owner_scoped_binary_when_available(monkeypatch, tmp_path):
+    uploads_root = tmp_path / "uploads"
+    upload_path = (
+        uploads_root
+        / "user-123"
+        / "f3e753c4-44d9-48b5-8e0b-934b7e5f2c4a__Synthetic_Client_Brief_Source.pdf"
+    )
+    upload_path.parent.mkdir(parents=True)
+    upload_path.write_bytes(b"%PDF-1.7\nsynthetic pdf bytes\n")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
+    monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", str(uploads_root))
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-GlassHive-Tenant-Id": "tenant-alpha",
+            "X-GlassHive-User-Id": "user-123",
+            "X-WPR-Token": "service-secret",
+        },
+    )
+    api_client = TrackingApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "title": "PDF redaction QA",
+                    "instruction": "Redact the attached PDF and return a PDF.",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                    "uploaded_files": [
+                        {
+                            "filename": "Synthetic Client Brief Source.pdf",
+                            "text": "extracted text is not a substitute for the original PDF",
+                        }
+                    ],
+                },
+            )
+            assert _tool_json(delegated)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+    bundle = api_client.find_or_resume_payloads[0]["bootstrap_bundle"]
+    projected = bundle["files"][0]
+    assert projected["path"] == "uploads/Synthetic-Client-Brief-Source.pdf"
+    assert projected["source_path"] == str(upload_path)
+    assert "content" not in projected
+    assert projected["source_path_token"] == sign_bootstrap_source_path(
+        upload_path,
+        tenant_id="tenant-alpha",
+        owner_id="user-123",
+    )
+
+
+def test_uploaded_file_text_does_not_cross_owner_boundary(monkeypatch, tmp_path):
+    uploads_root = tmp_path / "uploads"
+    other_upload = uploads_root / "other-user" / "uuid__same-name.pdf"
+    other_upload.parent.mkdir(parents=True)
+    other_upload.write_bytes(b"%PDF-1.7\nother user's file\n")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
+    monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", str(uploads_root))
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-GlassHive-Tenant-Id": "tenant-alpha",
+            "X-GlassHive-User-Id": "user-123",
+            "X-WPR-Token": "service-secret",
+        },
+    )
+    api_client = TrackingApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "title": "Cross-owner upload QA",
+                    "instruction": "Use the attached file.",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                    "uploaded_files": [{"filename": "same name.pdf", "text": "visible model text only"}],
+                },
+            )
+            assert _tool_json(delegated)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+    bundle = api_client.find_or_resume_payloads[0]["bootstrap_bundle"]
+    projected = bundle["files"][0]
+    assert projected["path"] == "uploads/same-name.pdf.metadata.json"
+    manifest = json.loads(projected["content"])
+    assert manifest["source_status"] == "original_bytes_unavailable"
+    assert manifest["extracted_text_available"] is True
+    assert "visible model text only" not in projected["content"]
+    assert "source_path" not in projected
+    assert "substituting extracted text" in bundle["project_definition"]
+
+
+def test_binary_upload_text_without_source_reports_blocker(monkeypatch, tmp_path):
+    uploads_root = tmp_path / "uploads"
+    (uploads_root / "user-123").mkdir(parents=True)
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
+    monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", str(uploads_root))
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-GlassHive-Tenant-Id": "tenant-alpha",
+            "X-GlassHive-User-Id": "user-123",
+            "X-WPR-Token": "service-secret",
+        },
+    )
+    api_client = TrackingApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "title": "Missing PDF bytes QA",
+                    "instruction": "Redact the uploaded PDF and return a PDF.",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                    "uploaded_files": [{"filename": "missing source.pdf", "text": "extracted text only"}],
+                },
+            )
+            assert _tool_json(delegated)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+    bundle = api_client.find_or_resume_payloads[0]["bootstrap_bundle"]
+    projected = bundle["files"][0]
+    assert projected["path"] == "uploads/missing-source.pdf.metadata.json"
+    assert "source_path" not in projected
+    assert "missing source.pdf.txt" not in json.dumps(bundle)
+    manifest = json.loads(projected["content"])
+    assert manifest["source_status"] == "original_bytes_unavailable"
+    assert manifest["extracted_text_available"] is True
+    assert "extracted text only" not in projected["content"]
+    assert "metadata/blocker manifests" in bundle["project_definition"]
+
+
+def test_upload_owner_id_with_path_separators_is_rejected(monkeypatch, tmp_path):
+    uploads_root = tmp_path / "uploads"
+    escaped_file = uploads_root / "other-user" / "brief.pdf"
+    escaped_file.parent.mkdir(parents=True)
+    escaped_file.write_bytes(b"%PDF-1.7\nother user's file\n")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
+    monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", str(uploads_root))
+
+    entry = mcp_server._project_upload_file_entry(
+        {"filename": "brief.pdf", "text": "visible model text only"},
+        1,
+        tenant_id="tenant-alpha",
+        owner_id="../other-user",
+    )
+
+    assert entry is not None
+    assert entry["path"] == "uploads/brief.pdf.metadata.json"
+    assert "source_path" not in entry
 
 
 def test_worker_tools_use_configured_default_execution_mode(monkeypatch):
@@ -1098,7 +1672,9 @@ def test_worker_create_merges_structured_bootstrap_bundle_with_upload_headers(mo
             )
             worker_payload = _tool_json(worker)
             bundle = worker_payload["bootstrap_bundle"]
-            assert bundle["project_definition"] == "# Host File QA\n\nRead the attached brief.\n"
+            assert bundle["project_definition"].startswith("# Host File QA\n\nRead the attached brief.\n")
+            assert "## Attached workspace files" in bundle["project_definition"]
+            assert "`uploads/brief.txt`" in bundle["project_definition"]
             paths = [item["path"] for item in bundle["files"]]
             assert paths == ["project-definition.md", "uploads/brief.txt"]
             assert bundle["files"][1]["content"] == "Synthetic upload brief."
@@ -1673,16 +2249,17 @@ def test_merge_request_context_accepts_generic_glasshive_headers(monkeypatch):
 
 def test_merge_request_context_maps_virtual_uploads_to_trusted_local_source(monkeypatch, tmp_path):
     uploads_root = tmp_path / "uploads"
-    upload_path = uploads_root / "user-123" / "brief.txt"
+    upload_path = uploads_root / "user-123" / "brief with spaces.txt"
     upload_path.parent.mkdir(parents=True)
     upload_path.write_text("Use this brief.")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
     monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
     files = [
         {
             "file_id": "file-123",
-            "filename": "brief.txt",
-            "filepath": "/uploads/user-123/brief.txt",
+            "filename": "brief with spaces.txt",
+            "filepath": "/uploads/user-123/brief with spaces.txt",
             "source": "local",
             "context": "message_attachment",
         }
@@ -1701,8 +2278,11 @@ def test_merge_request_context_maps_virtual_uploads_to_trusted_local_source(monk
     bundle = mcp_server._merge_request_context({"project_definition": "Read the attachment."})
 
     assert bundle is not None
-    assert bundle["files"][0]["path"] == "uploads/brief.txt"
+    assert bundle["files"][0]["path"] == "uploads/brief-with-spaces.txt"
     assert bundle["files"][0]["source_path"] == str(upload_path)
+    assert "## Attached workspace files" in bundle["project_definition"]
+    assert "`uploads/brief-with-spaces.txt`" in bundle["project_definition"]
+    assert "Do not ask the user to re-attach" in bundle["project_definition"]
     assert bundle["files"][0]["source_path_token"] == sign_bootstrap_source_path(
         upload_path,
         tenant_id="tenant-alpha",
@@ -1716,6 +2296,7 @@ def test_merge_request_context_uses_existing_source_root_when_upload_root_is_sta
     upload_path = fallback_root / "user-123" / "brief.txt"
     upload_path.parent.mkdir(parents=True)
     upload_path.write_text("Use this brief.")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
     monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(stale_root))
     monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", os.pathsep.join([str(stale_root), str(fallback_root)]))
@@ -1748,6 +2329,80 @@ def test_merge_request_context_uses_existing_source_root_when_upload_root_is_sta
         tenant_id="tenant-alpha",
         owner_id="user-123",
     )
+
+
+def test_merge_request_context_uses_metadata_manifest_when_upload_file_is_missing(monkeypatch, tmp_path):
+    missing_root = tmp_path / "missing-uploads"
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(missing_root))
+    files = [
+        {
+            "file_id": "file-123",
+            "filename": "brief.txt",
+            "filepath": "/uploads/user-123/brief.txt",
+            "source": "local",
+            "context": "message_attachment",
+        }
+    ]
+    encoded_files = "b64:" + base64.b64encode(json.dumps(files).encode()).decode()
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "user-123",
+            "X-Viventium-Request-Files": encoded_files,
+        },
+    )
+
+    bundle = mcp_server._merge_request_context({"project_definition": "Read the attachment."})
+
+    assert bundle is not None
+    assert bundle["files"][0]["path"] == "uploads/brief.txt.metadata.json"
+    assert "source_path" not in bundle["files"][0]
+    assert "source_path_token" not in bundle["files"][0]
+    manifest = json.loads(bundle["files"][0]["content"])
+    assert manifest["source_ref"] == "/uploads/user-123/brief.txt"
+
+
+def test_enterprise_request_context_does_not_copy_cross_user_virtual_upload(monkeypatch, tmp_path):
+    uploads_root = tmp_path / "uploads"
+    other_user_file = uploads_root / "other-user" / "brief.txt"
+    other_user_file.parent.mkdir(parents=True)
+    other_user_file.write_text("other user's data")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
+    files = [
+        {
+            "file_id": "file-other",
+            "filename": "brief.txt",
+            "filepath": "/uploads/other-user/brief.txt",
+            "source": "local",
+            "context": "message_attachment",
+        }
+    ]
+    encoded_files = "b64:" + base64.b64encode(json.dumps(files).encode()).decode()
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "user-123",
+            "X-Viventium-Request-Files": encoded_files,
+        },
+    )
+
+    bundle = mcp_server._merge_request_context({"project_definition": "Read the attachment."})
+
+    assert bundle is not None
+    assert bundle["files"][0]["path"] == "uploads/brief.txt.metadata.json"
+    assert "source_path" not in bundle["files"][0]
+    manifest = json.loads(bundle["files"][0]["content"])
+    assert manifest["source_ref"] == "/uploads/other-user/brief.txt"
+    assert "## Attached workspace files" in bundle["project_definition"]
+    assert "`uploads/brief.txt.metadata.json`" in bundle["project_definition"]
 
 
 def test_runtime_env_repairs_missing_upload_root_to_local_checkout(monkeypatch, tmp_path):

@@ -43,6 +43,7 @@ _PROVIDER_ENV_KEYS = [
 def _run_timeout_sec(timeout_sec: float | None = None) -> float | None:
     raw = (
         os.environ.get("GLASSHIVE_RUN_TIMEOUT_SEC", "").strip()
+        or os.environ.get("GLASSHIVE_MAX_RUN_DURATION_S", "").strip()
         or os.environ.get("WPR_RUN_TIMEOUT_SEC", "").strip()
     )
     if not raw:

@@ -42,6 +42,12 @@ class RuntimeClient:
     def get_project(self, project_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/projects/{project_id}")
 
+    def get_preferences(self) -> dict[str, Any]:
+        return self._request("GET", "/v1/preferences")
+
+    def update_preferences(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("PATCH", "/v1/preferences", json_body=payload)
+
     def list_workers(self, project_id: str) -> list[dict[str, Any]]:
         return self._request("GET", f"/v1/projects/{project_id}/workers").get("items", [])
 
