@@ -72,11 +72,39 @@ When a trusted host client passes existing upload metadata, GlassHive reuses the
 contract instead of adding a second upload route:
 
 - virtual `/uploads/...` paths can map to `WPR_LIBRECHAT_UPLOADS_ROOT`
+- owner-scoped uploaded bytes can be resolved by original filename when the host model exposes only
+  filename/text context
 - extracted text can be materialized directly
 - metadata-only attachments become an `uploads/*.metadata.json` manifest
 
 Any actual `source_path` copy is still gated by `WPR_BOOTSTRAP_SOURCE_ROOTS`, symlink rejection, and
 the bootstrap size limit. Request-derived metadata must never become an arbitrary host-file read.
+GlassHive must be file-type agnostic: PDF, DOCX, XLSX, PPTX, media, archives, and unknown extensions
+are treated as user artifacts for the wrapped worker to reason about. Extracted text is a convenience
+input, not a replacement for the original bytes when the user asks for layout-preserving redaction,
+editing, analysis, conversion, or returned downloadable files. If the original bytes cannot be
+projected safely, GlassHive should emit a metadata/blocker manifest and report the blocker rather
+than silently converting the problem into a `.txt` task.
+
+Enterprise LibreChat deployments that use the normal LibreChat upload/file-transfer flow should
+mount the same upload storage read-only into the GlassHive VM and point both
+`WPR_LIBRECHAT_UPLOADS_ROOT` and `WPR_BOOTSTRAP_SOURCE_ROOTS` at that mount. For Azure Container
+Apps plus VM deployments, this usually means mounting the LibreChat Azure Files `uploads` share at
+the GlassHive upload root. LibreChat can then stay config-only: it passes
+`{{LIBRECHAT_BODY_FILES_JSON_B64}}` metadata to GlassHive, GlassHive resolves the virtual
+`/uploads/<user>/<file>` path against the trusted mounted share, and the worker receives a copied
+workspace file before launch. GlassHive also amends the project instructions with the canonical
+`uploads/<safe-filename>` paths so a worker does not depend on user-visible filenames that contain
+spaces or unsafe characters.
+
+In enterprise mode, GlassHive treats the first segment after `/uploads/` as the authenticated
+owner/user id. That is the cross-user safety boundary for shared upload storage. If a LibreChat
+deployment stores upload metadata as `/uploads/<conversation-id>/...`, `/uploads/<file-id>/...`, or
+any other layout where the first segment is not the authenticated user id, GlassHive will not copy
+the bytes and will fall back to a metadata manifest until the deployment provides an owner-scoped
+upload projection. When only model-visible attachment text is available, GlassHive may search only
+the authenticated owner's mounted upload directory for a normalized original filename match and use
+the newest matching file; it must never search other users' directories or the whole host filesystem.
 
 ## Source-Specific Best Practice
 

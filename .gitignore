@@ -1,4 +1,6 @@
 # Generated local runtime artifacts
+.DS_Store
+**/.DS_Store
 /data/*.db
 /runtime_phase1/*.db
 /runtime_phase1/data/

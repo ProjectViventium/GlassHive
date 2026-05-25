@@ -26,6 +26,19 @@ def signed_link_ttl_seconds() -> int:
     return max(60, min(value, 24 * 3600))
 
 
+def signed_link_ttl_for_kind(kind: str, ttl_seconds: int | None = None) -> int:
+    base = int(ttl_seconds or signed_link_ttl_seconds())
+    if str(kind or "") == "worker_view":
+        raw = os.environ.get("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "").strip()
+        try:
+            session_cap = int(raw) if raw else 0
+        except ValueError:
+            session_cap = 0
+        if session_cap > 0:
+            base = min(base, session_cap)
+    return max(1, min(base, 24 * 3600))
+
+
 def _signature(secret: str, message: str) -> str:
     return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), sha256).hexdigest()
 
@@ -58,7 +71,8 @@ def sign_link_token(
         "tenant_id": str(tenant_id or ""),
         "owner_id": str(owner_id or ""),
         "path": str(path or ""),
-        "exp": int(time.time()) + int(ttl_seconds or signed_link_ttl_seconds()),
+        "iat": int(time.time()),
+        "exp": int(time.time()) + signed_link_ttl_for_kind(kind, ttl_seconds),
     }
     encoded = _base64url_encode(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     return f"{encoded}.{_signature(secret, encoded)}"

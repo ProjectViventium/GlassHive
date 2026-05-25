@@ -28,6 +28,22 @@ def signed_link_ttl_seconds() -> int:
     return max(60, min(value, 24 * 3600))
 
 
+def signed_link_ttl_for_kind(kind: str, ttl_seconds: int | None = None) -> int:
+    explicit = ttl_seconds is not None
+    ttl = int(ttl_seconds) if explicit else signed_link_ttl_seconds()
+    if explicit and ttl <= 0:
+        return ttl
+    if kind == "worker_view":
+        raw = os.environ.get("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "").strip()
+        try:
+            watch_ttl = int(raw) if raw else 0
+        except ValueError:
+            watch_ttl = 0
+        if watch_ttl > 0:
+            ttl = min(ttl, watch_ttl)
+    return min(ttl, 24 * 3600) if explicit else max(60, min(ttl, 24 * 3600))
+
+
 def _message(
     *,
     kind: str,
@@ -67,7 +83,7 @@ def sign_link_params(
     secret = signed_link_secret()
     if not secret:
         return {}
-    resolved_expires_at = int(expires_at) if expires_at else int(time.time()) + int(ttl_seconds or signed_link_ttl_seconds())
+    resolved_expires_at = int(expires_at) if expires_at else int(time.time()) + signed_link_ttl_for_kind(kind, ttl_seconds)
     message = _message(
         kind=kind,
         worker_id=worker_id,
@@ -150,7 +166,8 @@ def sign_link_token(
         "tenant_id": str(tenant_id or ""),
         "owner_id": str(owner_id or ""),
         "path": str(path or ""),
-        "exp": int(time.time()) + int(ttl_seconds or signed_link_ttl_seconds()),
+        "iat": int(time.time()),
+        "exp": int(time.time()) + signed_link_ttl_for_kind(kind, ttl_seconds),
     }
     encoded = _base64url_encode(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     return f"{encoded}.{_signature(secret, encoded)}"

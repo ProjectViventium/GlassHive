@@ -53,6 +53,16 @@ async function postJson(url, payload) {
   return response.json();
 }
 
+async function patchJson(url, payload) {
+  const response = await fetch(withAuth(url), {
+    method: 'PATCH',
+    headers: payload ? { 'Content-Type': 'application/json' } : {},
+    body: payload ? JSON.stringify(payload) : undefined,
+  });
+  if (!response.ok) throw new Error(await responseMessage(response, 'Request failed'));
+  return response.json();
+}
+
 function fileToPayload(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -100,6 +110,33 @@ function renderWorkspaceTypeOptions(select, help, data) {
     const selected = select.selectedOptions?.[0];
     help.textContent = selected?.dataset.description || 'Runs on managed GlassHive workspace compute.';
   }
+}
+
+function renderDefaultWorkerOptions(select, data) {
+  if (!select) return;
+  const current = String(data?.user_preferences?.default_worker_profile || '');
+  const options = [];
+  const deploymentDefault = document.createElement('option');
+  deploymentDefault.value = '';
+  deploymentDefault.textContent = 'Deployment default';
+  options.push(deploymentDefault);
+  for (const item of data.new_workspace_options || []) {
+    const option = document.createElement('option');
+    const profile = String(item.profile || String(item.value || '').split(':', 2)[1] || '');
+    option.value = profile;
+    option.textContent = String(item.label || profile || 'Worker');
+    options.push(option);
+  }
+  select.replaceChildren(...options);
+  select.value = Array.from(select.options).some((option) => option.value === current) ? current : '';
+}
+
+function syncPreferenceControls(data, controls) {
+  const prefs = data?.user_preferences || {};
+  renderDefaultWorkerOptions(controls.defaultWorker, data);
+  if (controls.codexEffort) controls.codexEffort.value = String(prefs.codex_reasoning_effort || '');
+  if (controls.claudeEffort) controls.claudeEffort.value = String(prefs.claude_effort || '');
+  if (controls.openclawEffort) controls.openclawEffort.value = String(prefs.openclaw_effort || '');
 }
 
 function renderWorkspaceOptions(select, data, selectedValue = '') {
@@ -667,6 +704,16 @@ function workspaceMeta(selectValue, data) {
   };
 }
 
+function selectedWorkerEffort(selectValue, controls) {
+  const profile = (selectValue || '').startsWith('new:')
+    ? String(selectValue).split(':', 2)[1] || ''
+    : '';
+  if (profile === 'codex-cli') return controls.codexEffort?.value || '';
+  if (profile === 'claude-code') return controls.claudeEffort?.value || '';
+  if (profile === 'openclaw-general') return controls.openclawEffort?.value || '';
+  return '';
+}
+
 function syncWorkspaceUI(select, data, button, help) {
   const meta = workspaceMeta(select.value, data);
   button.textContent = meta.buttonText;
@@ -691,6 +738,12 @@ async function main() {
   const scheduleText = document.getElementById('schedule-text');
   const fileInput = document.getElementById('project-files');
   const fileHelp = document.getElementById('file-help');
+  const defaultWorker = document.getElementById('default-worker-profile');
+  const codexEffort = document.getElementById('codex-effort');
+  const claudeEffort = document.getElementById('claude-effort');
+  const openclawEffort = document.getElementById('openclaw-effort');
+  const savePreferences = document.getElementById('save-preferences');
+  const preferencesStatus = document.getElementById('preferences-status');
   const inactiveToggle = document.getElementById('show-inactive-workspaces');
   const watchToggle = document.getElementById('show-workspace-watch');
   const statusToggle = document.getElementById('show-workspace-status');
@@ -707,6 +760,7 @@ async function main() {
     const selectedValue = select.value;
     bootstrap = await loadBootstrap();
     renderWorkspaceOptions(select, bootstrap, selectedValue);
+    syncPreferenceControls(bootstrap, { defaultWorker, codexEffort, claudeEffort, openclawEffort });
     renderWorkspaceHive(bootstrap, refreshBootstrap, hivePrefs());
     syncWorkspaceUI(select, bootstrap, button, help);
     return bootstrap;
@@ -750,6 +804,7 @@ async function main() {
   try {
     bootstrap = await loadBootstrap();
     renderWorkspaceOptions(select, bootstrap);
+    syncPreferenceControls(bootstrap, { defaultWorker, codexEffort, claudeEffort, openclawEffort });
     if (launchSurface) launchSurface.value = String(bootstrap.default_launch_surface || 'desktop');
     if (workspaceType) renderWorkspaceTypeOptions(workspaceType, workspaceTypeHelp, bootstrap);
     renderWorkspaceHive(bootstrap, refreshBootstrap, hivePrefs());
@@ -819,6 +874,31 @@ async function main() {
     fileHelp.textContent = `${files.length} file${files.length === 1 ? '' : 's'} selected · ${(total / 1024 / 1024).toFixed(2)} MB`;
   });
 
+  savePreferences?.addEventListener('click', async () => {
+    if (!bootstrap) return;
+    savePreferences.disabled = true;
+    if (preferencesStatus) preferencesStatus.textContent = 'Saving defaults...';
+    try {
+      const updated = await patchJson('/api/preferences', {
+        default_worker_profile: defaultWorker?.value || '',
+        codex_reasoning_effort: codexEffort?.value || '',
+        claude_effort: claudeEffort?.value || '',
+        openclaw_effort: openclawEffort?.value || '',
+      });
+      bootstrap.user_preferences = updated;
+      bootstrap.default_workspace_option = updated.default_worker_profile
+        ? `new:${updated.default_worker_profile}`
+        : String(bootstrap.deployment_default_workspace_option || 'new:codex-cli');
+      renderWorkspaceOptions(select, bootstrap, select.value);
+      syncWorkspaceUI(select, bootstrap, button, help);
+      if (preferencesStatus) preferencesStatus.textContent = 'Defaults saved.';
+    } catch (error) {
+      if (preferencesStatus) preferencesStatus.textContent = error.message;
+    } finally {
+      savePreferences.disabled = false;
+    }
+  });
+
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     if (!bootstrap) {
@@ -854,6 +934,7 @@ async function main() {
       workspace_type: workspaceType?.value || 'sandboxed',
       launch_surface: launchSurface?.value || 'desktop',
       schedule_text: wantsSchedule ? scheduleValue : '',
+      effort: selectedWorkerEffort(select.value, { codexEffort, claudeEffort, openclawEffort }),
       files,
     };
     try {

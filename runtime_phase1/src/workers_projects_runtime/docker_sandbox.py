@@ -137,6 +137,7 @@ class DockerSandboxManager:
             raise RuntimeError("Failed to start worker sandbox")
         if needs_path_repair or (repair_paths and self._env_flag("WPR_REPAIR_RUNNING_CONTAINER_ROOTS", False)):
             self._ensure_container_writable_paths(sandbox.container_name, [self.workspace_mount, self.home_mount])
+        self._harden_secret_runtime_files(sandbox.container_name)
         if needs_idle_prime:
             self._set_plain_background(sandbox.container_name)
         if needs_idle_prime and self._env_flag("WPR_IDLE_DESKTOP_PRIME_BROWSER", True):
@@ -827,6 +828,28 @@ class DockerSandboxManager:
             detail = (result.stderr or result.stdout or "").strip()[-1200:]
             raise RuntimeError(f"Failed to prepare writable sandbox paths in {container_name}: {detail}")
 
+    def _harden_secret_runtime_files(self, container_name: str) -> None:
+        user = shlex.quote(self.user)
+        secret_dir = shlex.quote(f"{self.home_mount}/.glasshive")
+        script = (
+            "set -e; "
+            f"for file in {secret_dir}/secret-runtime.env {secret_dir}/secret-runtime.keys; do "
+            '[ -e "$file" ] || continue; '
+            f"chown {user} \"$file\" 2>/dev/null || true; "
+            'chmod 600 "$file" 2>/dev/null || true; '
+            "done"
+        )
+        self._docker_exec(
+            container_name,
+            ["bash", "-c", script],
+            env={
+                "HOME": self.home_mount,
+                "TERM": self.term_value,
+            },
+            cwd=self.workspace_mount,
+            user="root",
+        )
+
     def _ensure_screen_runtime_dir(self, container_name: str) -> None:
         screen_user = self.user.split(":", 1)[0] or self.user
         screen_dir = f"/run/screen/S-{screen_user}"
@@ -853,9 +876,15 @@ class DockerSandboxManager:
             raise RuntimeError(f"Failed to prepare screen runtime directory in {container_name}: {detail}")
 
     def _set_plain_background(self, container_name: str) -> None:
+        script = (
+            "for i in $(seq 1 60); do "
+            f"DISPLAY={shlex.quote(self.display_value)} timeout 2s xsetroot -solid black >/dev/null 2>&1 || true; "
+            "sleep 0.5; "
+            "done"
+        )
         self._docker_exec(
             container_name,
-            ["bash", "-c", "timeout 2s xsetroot -solid black >/dev/null 2>&1 || true"],
+            ["bash", "-c", script],
             env={
                 "HOME": self.home_mount,
                 "TERM": self.term_value,

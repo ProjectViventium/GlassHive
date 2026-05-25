@@ -235,6 +235,7 @@ class WorkersProjectsService:
         self._processors_lock = Lock()
         self._active_processors: set[str] = set()
         self._processor_generations: dict[str, int] = {}
+        self._worker_create_lock = Lock()
         self._deliverable_promotions_lock = Lock()
         self._deliverable_promotions: set[str] = set()
         self.reconcile_all_workers()
@@ -246,7 +247,7 @@ class WorkersProjectsService:
         )
         self._callback_retry_thread.start()
         self._idle_reaper_thread: Thread | None = None
-        if self._idle_terminate_after_s() > 0:
+        if self._lifecycle_reaper_enabled():
             self._idle_reaper_thread = Thread(
                 target=self._idle_reaper_loop,
                 name="wpr-idle-reaper",
@@ -694,8 +695,21 @@ class WorkersProjectsService:
     def _idle_terminate_after_s(self) -> int:
         return _bounded_int_env("GLASSHIVE_IDLE_TERMINATE_AFTER_S", 0, min_value=0, max_value=30 * 24 * 3600)
 
+    def _paused_terminate_after_s(self) -> int:
+        return _bounded_int_env("GLASSHIVE_PAUSED_TERMINATE_AFTER_S", 0, min_value=0, max_value=30 * 24 * 3600)
+
+    def _max_run_duration_s(self) -> int:
+        return _bounded_int_env("GLASSHIVE_MAX_RUN_DURATION_S", 0, min_value=0, max_value=30 * 24 * 3600)
+
     def _idle_reaper_interval_s(self) -> int:
         return _bounded_int_env("GLASSHIVE_IDLE_REAPER_INTERVAL_S", 60, min_value=1, max_value=3600)
+
+    def _lifecycle_reaper_enabled(self) -> bool:
+        return (
+            self._idle_terminate_after_s() > 0
+            or self._paused_terminate_after_s() > 0
+            or self._max_run_duration_s() > 0
+        )
 
     def _worker_idle_seconds(self, worker: dict) -> float:
         raw = str(worker.get("updated_at") or "")
@@ -711,6 +725,7 @@ class WorkersProjectsService:
         threshold = self._idle_terminate_after_s()
         if threshold <= 0:
             return []
+        terminal_states = {"completed", "failed", "cancelled", "interrupted"}
         reaped: list[dict[str, object]] = []
         for worker in self.store.list_all_workers():
             worker_id = str(worker.get("worker_id") or "")
@@ -723,7 +738,9 @@ class WorkersProjectsService:
                 continue
             try:
                 info = self.runtime.terminate_worker(worker)
-                updated = self._apply_runtime_info(worker_id, info, state="paused", last_error="")
+                current_state = str(worker.get("state") or "")
+                next_state = current_state if current_state in terminal_states else "paused"
+                updated = self._apply_runtime_info(worker_id, info, state=next_state, last_error="")
                 self.store.add_event(
                     str(worker.get("project_id") or ""),
                     worker_id,
@@ -745,10 +762,121 @@ class WorkersProjectsService:
                 logger.warning("Failed to reap idle GlassHive worker %s: %s", worker_id, exc)
         return reaped
 
+    def reap_paused_workers_once(self) -> list[dict[str, object]]:
+        threshold = self._paused_terminate_after_s()
+        if threshold <= 0:
+            return []
+        reaped: list[dict[str, object]] = []
+        for worker in self.store.list_all_workers():
+            worker_id = str(worker.get("worker_id") or "")
+            if not worker_id or worker.get("state") != "paused":
+                continue
+            if self.store.get_active_run(worker_id) or self.store.has_queued_runs(worker_id):
+                continue
+            idle_seconds = self._worker_idle_seconds(worker)
+            if idle_seconds < threshold:
+                continue
+            try:
+                info = self.runtime.terminate_worker(worker)
+                updated = self._apply_runtime_info(worker_id, info, state="paused", last_error="")
+                self.store.add_event(
+                    str(worker.get("project_id") or ""),
+                    worker_id,
+                    None,
+                    "worker.paused_compute_terminated",
+                    f"Paused worker compute stopped after {int(idle_seconds)} seconds; workspace state preserved.",
+                )
+                reaped.append(
+                    {
+                        "worker_id": worker_id,
+                        "project_id": worker.get("project_id"),
+                        "tenant_id": worker.get("tenant_id"),
+                        "owner_id": worker.get("owner_id"),
+                        "state": (updated or worker).get("state"),
+                        "idle_seconds": int(idle_seconds),
+                    }
+                )
+            except Exception as exc:
+                logger.warning("Failed to stop paused GlassHive worker compute %s: %s", worker_id, exc)
+        return reaped
+
+    def _invalidate_worker_processor(self, worker_id: str) -> None:
+        with self._processors_lock:
+            self._processor_generations[worker_id] = self._processor_generations.get(worker_id, 0) + 1
+            self._active_processors.discard(worker_id)
+
+    def _run_age_seconds(self, run: dict) -> float:
+        raw = str(run.get("started_at") or run.get("queued_at") or "")
+        try:
+            started = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            logger.warning(
+                "GlassHive run %s has an unparseable timestamp for max-duration reaping; treating it as expired.",
+                run.get("run_id") or "",
+            )
+            return float("inf")
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return max(0.0, datetime.now(timezone.utc).timestamp() - started.astimezone(timezone.utc).timestamp())
+
+    def reap_expired_runs_once(self) -> list[dict[str, object]]:
+        threshold = self._max_run_duration_s()
+        if threshold <= 0:
+            return []
+        reaped: list[dict[str, object]] = []
+        for run in self.store.list_runs_by_state("running"):
+            run_id = str(run.get("run_id") or "")
+            worker_id = str(run.get("worker_id") or "")
+            if not run_id or not worker_id:
+                continue
+            age_seconds = self._run_age_seconds(run)
+            if age_seconds < threshold:
+                continue
+            worker = self.store.get_worker(worker_id)
+            if not worker:
+                continue
+            error_text = f"Run exceeded GLASSHIVE_MAX_RUN_DURATION_S={threshold}; compute was stopped and workspace state was preserved."
+            try:
+                self._invalidate_worker_processor(worker_id)
+                info = self.runtime.terminate_worker(worker)
+                finalized = self.store.finalize_run_if_state(run_id, "running", "cancelled", error_text=error_text)
+                self.store.finalize_schedule_for_run(run_id, state="cancelled", last_error=error_text)
+                updated = self._apply_runtime_info(worker_id, info, state="paused", last_error=error_text)
+                self.store.add_event(
+                    str(worker.get("project_id") or run.get("project_id") or ""),
+                    worker_id,
+                    run_id,
+                    "run.duration_exceeded",
+                    error_text,
+                )
+                if finalized:
+                    self._emit_callback(
+                        worker,
+                        "run.cancelled",
+                        run={**run, "state": "cancelled", "error_text": error_text},
+                        message=error_text,
+                    )
+                reaped.append(
+                    {
+                        "worker_id": worker_id,
+                        "project_id": worker.get("project_id"),
+                        "tenant_id": worker.get("tenant_id"),
+                        "owner_id": worker.get("owner_id"),
+                        "run_id": run_id,
+                        "state": (updated or worker).get("state"),
+                        "run_age_seconds": threshold if age_seconds == float("inf") else int(age_seconds),
+                    }
+                )
+            except Exception as exc:
+                logger.warning("Failed to stop expired GlassHive run %s for worker %s: %s", run_id, worker_id, exc)
+        return reaped
+
     def _idle_reaper_loop(self) -> None:
         interval = self._idle_reaper_interval_s()
         while not self._shutdown_event.wait(interval):
             self.reap_idle_workers_once()
+            self.reap_paused_workers_once()
+            self.reap_expired_runs_once()
 
     def _scheduler_interval_s(self) -> int:
         return _bounded_int_env("GLASSHIVE_SCHEDULER_INTERVAL_S", 5, min_value=1, max_value=3600)
@@ -759,7 +887,7 @@ class WorkersProjectsService:
             self.process_due_schedules_once()
 
     def _active_worker_states(self) -> set[str]:
-        return {"created", "starting", "ready", "running"}
+        return {"created", "starting", "ready", "running", "resuming", "interrupting"}
 
     def _limit_env(self, name: str) -> int:
         return _bounded_int_env(name, 0, min_value=0, max_value=100000)
@@ -877,24 +1005,25 @@ class WorkersProjectsService:
     ) -> dict:
         self._ensure_execution_allowed(execution_mode)
         self._ensure_profile_allowed(profile)
-        self._enforce_worker_limits(tenant_id=tenant_id or "local", owner_id=owner_id)
         model = self._resolve_worker_model(profile, execution_mode)
-        worker = self.store.create_worker(
-            project_id=project_id,
-            tenant_id=tenant_id,
-            owner_id=owner_id,
-            name=name,
-            role=role,
-            profile=profile,
-            backend=backend,
-            runtime="openclaw",
-            model=model,
-            execution_mode=execution_mode,
-            alias=alias,
-            workspace_root=workspace_root,
-            bootstrap_profile=bootstrap_profile,
-            bootstrap_bundle=bootstrap_bundle,
-        )
+        with self._worker_create_lock:
+            self._enforce_worker_limits(tenant_id=tenant_id or "local", owner_id=owner_id)
+            worker = self.store.create_worker(
+                project_id=project_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                name=name,
+                role=role,
+                profile=profile,
+                backend=backend,
+                runtime="openclaw",
+                model=model,
+                execution_mode=execution_mode,
+                alias=alias,
+                workspace_root=workspace_root,
+                bootstrap_profile=bootstrap_profile,
+                bootstrap_bundle=bootstrap_bundle,
+            )
         if not start_synchronously:
             prepared = self.store.update_worker_state(worker["worker_id"], "paused", last_error="")
             self.store.add_event(

@@ -139,6 +139,17 @@ class Store:
                     FOREIGN KEY(project_id) REFERENCES projects(project_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
+                    owner_id TEXT NOT NULL,
+                    default_worker_profile TEXT NOT NULL DEFAULT '',
+                    codex_reasoning_effort TEXT NOT NULL DEFAULT '',
+                    claude_effort TEXT NOT NULL DEFAULT '',
+                    openclaw_effort TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, owner_id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_workers_project_id ON workers(project_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_worker_state ON runs(worker_id, state, queued_at);
                 CREATE INDEX IF NOT EXISTS idx_events_worker_created ON events(worker_id, created_at);
@@ -181,12 +192,78 @@ class Store:
             if "owner_id" not in schedule_columns:
                 conn.execute("ALTER TABLE scheduled_runs ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_runs_tenant_owner ON scheduled_runs(tenant_id, owner_id, run_at)")
+            preferences_columns = {row["name"] for row in conn.execute("PRAGMA table_info(user_preferences)").fetchall()}
+            if "codex_reasoning_effort" not in preferences_columns:
+                conn.execute("ALTER TABLE user_preferences ADD COLUMN codex_reasoning_effort TEXT NOT NULL DEFAULT ''")
+            if "claude_effort" not in preferences_columns:
+                conn.execute("ALTER TABLE user_preferences ADD COLUMN claude_effort TEXT NOT NULL DEFAULT ''")
+            if "openclaw_effort" not in preferences_columns:
+                conn.execute("ALTER TABLE user_preferences ADD COLUMN openclaw_effort TEXT NOT NULL DEFAULT ''")
 
     def _row(self, value: sqlite3.Row | None) -> dict[str, Any] | None:
         return dict(value) if value is not None else None
 
     def _rows(self, values: list[sqlite3.Row]) -> list[dict[str, Any]]:
         return [dict(v) for v in values]
+
+    def get_user_preferences(self, tenant_id: str, owner_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM user_preferences WHERE tenant_id = ? AND owner_id = ?",
+                (tenant_id or "local", owner_id),
+            ).fetchone()
+        return self._row(row)
+
+    def upsert_user_preferences(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        default_worker_profile: str | None = None,
+        codex_reasoning_effort: str | None = None,
+        claude_effort: str | None = None,
+        openclaw_effort: str | None = None,
+    ) -> dict[str, Any]:
+        existing = self.get_user_preferences(tenant_id, owner_id) or {}
+        now = utc_now()
+        data = {
+            "tenant_id": tenant_id or "local",
+            "owner_id": owner_id,
+            "default_worker_profile": (
+                existing.get("default_worker_profile", "") if default_worker_profile is None else default_worker_profile
+            ),
+            "codex_reasoning_effort": (
+                existing.get("codex_reasoning_effort", "") if codex_reasoning_effort is None else codex_reasoning_effort
+            ),
+            "claude_effort": existing.get("claude_effort", "") if claude_effort is None else claude_effort,
+            "openclaw_effort": existing.get("openclaw_effort", "") if openclaw_effort is None else openclaw_effort,
+            "updated_at": now,
+        }
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_preferences (
+                    tenant_id, owner_id, default_worker_profile, codex_reasoning_effort,
+                    claude_effort, openclaw_effort, updated_at
+                )
+                VALUES (
+                    :tenant_id, :owner_id, :default_worker_profile, :codex_reasoning_effort,
+                    :claude_effort, :openclaw_effort, :updated_at
+                )
+                ON CONFLICT(tenant_id, owner_id) DO UPDATE SET
+                    default_worker_profile = excluded.default_worker_profile,
+                    codex_reasoning_effort = excluded.codex_reasoning_effort,
+                    claude_effort = excluded.claude_effort,
+                    openclaw_effort = excluded.openclaw_effort,
+                    updated_at = excluded.updated_at
+                """,
+                data,
+            )
+            row = conn.execute(
+                "SELECT * FROM user_preferences WHERE tenant_id = ? AND owner_id = ?",
+                (data["tenant_id"], data["owner_id"]),
+            ).fetchone()
+        return dict(row)
 
     def create_project(
         self,
@@ -558,6 +635,14 @@ class Store:
                 (worker_id,),
             ).fetchone()
         return self._row(row)
+
+    def list_runs_by_state(self, state: str, limit: int = 1000) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM runs WHERE state = ? ORDER BY started_at ASC LIMIT ?",
+                (state, max(1, int(limit))),
+            ).fetchall()
+        return self._rows(rows)
 
     def has_queued_runs(self, worker_id: str) -> bool:
         with self._connect() as conn:

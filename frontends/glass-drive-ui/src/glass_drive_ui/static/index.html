@@ -52,6 +52,40 @@
                   <input id="launch-surface" name="launch_surface" type="hidden" value="desktop" />
                 </label>
                 <label class="advanced-field">
+                  <span>Default Worker</span>
+                  <select id="default-worker-profile" name="default_worker_profile"></select>
+                  <small>Saved per user. MCP launches use this when no worker is specified.</small>
+                </label>
+                <label class="advanced-field">
+                  <span>Codex Effort</span>
+                  <select id="codex-effort" name="codex_reasoning_effort">
+                    <option value="">Deployment default</option>
+                    <option value="minimal">Minimal</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="xhigh">X-High</option>
+                  </select>
+                  <small>Applied to new Codex workspaces and MCP runs.</small>
+                </label>
+                <label class="advanced-field">
+                  <span>Claude Effort</span>
+                  <select id="claude-effort" name="claude_effort">
+                    <option value="">Deployment default</option>
+                    <option value="max">Max</option>
+                  </select>
+                  <small>For Claude Code profiles that support deeper work.</small>
+                </label>
+                <label class="advanced-field">
+                  <span>OpenClaw Effort</span>
+                  <select id="openclaw-effort" name="openclaw_effort">
+                    <option value="">Deployment default</option>
+                    <option value="high">High</option>
+                    <option value="max">Max</option>
+                  </select>
+                  <small>Passed as a run preference for OpenClaw workers.</small>
+                </label>
+                <label class="advanced-field">
                   <span>Schedule</span>
                   <input id="schedule-text" name="schedule_text" type="text" placeholder="in 20 minutes, on Mondays, or leave blank" />
                 </label>
@@ -60,6 +94,10 @@
                   <input id="project-files" name="files" type="file" multiple />
                   <small id="file-help">No files selected.</small>
                 </label>
+              </div>
+              <div class="advanced-actions">
+                <button id="save-preferences" type="button">Save defaults</button>
+                <small id="preferences-status" aria-live="polite"></small>
               </div>
             </details>
             <div class="worker-row">

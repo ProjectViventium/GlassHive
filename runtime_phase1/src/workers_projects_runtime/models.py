@@ -116,6 +116,23 @@ class UpdateWorkerMetadataRequest(BaseModel):
     name: str | None = None
 
 
+class UserPreferencesResponse(BaseModel):
+    tenant_id: str = "local"
+    owner_id: str
+    default_worker_profile: str = ""
+    codex_reasoning_effort: str = ""
+    claude_effort: str = ""
+    openclaw_effort: str = ""
+    updated_at: str
+
+
+class UpdateUserPreferencesRequest(BaseModel):
+    default_worker_profile: str | None = None
+    codex_reasoning_effort: str | None = None
+    claude_effort: str | None = None
+    openclaw_effort: str | None = None
+
+
 class DesktopActionRequest(BaseModel):
     action: DesktopActionName
     url: str | None = None

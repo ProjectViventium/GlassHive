@@ -4,6 +4,7 @@ import os
 import re
 import asyncio
 import shlex
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,125 @@ RUNTIME_ENV_KEYS = {
 _NOVNC_VIEW_URL_CACHE: dict[str, tuple[float, str]] = {}
 _NOVNC_ASSET_CACHE: dict[str, tuple[float, int, bytes, str]] = {}
 _NOVNC_HTTP_CLIENT: httpx.Client | None = None
+
+
+def _watch_session_cap_seconds() -> int:
+    raw = os.environ.get("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "").strip()
+    try:
+        value = int(raw) if raw else 0
+    except ValueError:
+        value = 0
+    return max(0, min(value, 24 * 3600))
+
+
+def _watch_session_state_path() -> Path:
+    raw = str(os.environ.get("GLASSHIVE_WATCH_SESSION_STATE_PATH") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    state_root = (
+        Path(os.environ["XDG_STATE_HOME"]).expanduser()
+        if os.environ.get("XDG_STATE_HOME")
+        else Path.home() / ".local" / "state"
+    )
+    return state_root / "glasshive" / "watch_sessions.sqlite3"
+
+
+def _watch_session_conn() -> sqlite3.Connection:
+    db_path = _watch_session_state_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS watch_sessions (
+            tenant_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            started_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, owner_id, worker_id)
+        )
+        """
+    )
+    return conn
+
+
+def _watch_session_expires_at(worker_id: str, identity: dict[str, str] | None) -> int | None:
+    cap_seconds = _watch_session_cap_seconds()
+    if cap_seconds <= 0 or not identity:
+        return None
+    tenant_id = str(identity.get("tenant_id") or "").strip()
+    owner_id = str(identity.get("user_id") or "").strip()
+    if not tenant_id or not owner_id:
+        return None
+    now = int(time.time())
+    with _watch_session_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM watch_sessions WHERE expires_at < ?", (now - 24 * 3600,))
+        row = conn.execute(
+            """
+            SELECT expires_at FROM watch_sessions
+            WHERE tenant_id = ? AND owner_id = ? AND worker_id = ?
+            """,
+            (tenant_id, owner_id, worker_id),
+        ).fetchone()
+        if row is not None and int(row[0]) > now:
+            expires_at = int(row[0])
+            conn.execute(
+                """
+                UPDATE watch_sessions
+                SET updated_at = ?
+                WHERE tenant_id = ? AND owner_id = ? AND worker_id = ?
+                """,
+                (now, tenant_id, owner_id, worker_id),
+            )
+            return expires_at
+        expires_at = now + cap_seconds
+        conn.execute(
+            """
+            INSERT INTO watch_sessions (tenant_id, owner_id, worker_id, started_at, expires_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id, owner_id, worker_id) DO UPDATE SET
+                started_at = excluded.started_at,
+                expires_at = excluded.expires_at,
+                updated_at = excluded.updated_at
+            """,
+            (tenant_id, owner_id, worker_id, now, expires_at, now),
+        )
+        return expires_at
+
+
+def _existing_watch_session_expires_at(worker_id: str, identity: dict[str, str] | None) -> int | None:
+    if _watch_session_cap_seconds() <= 0 or not identity:
+        return None
+    tenant_id = str(identity.get("tenant_id") or "").strip()
+    owner_id = str(identity.get("user_id") or "").strip()
+    if not tenant_id or not owner_id:
+        return None
+    with _watch_session_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT expires_at FROM watch_sessions
+            WHERE tenant_id = ? AND owner_id = ? AND worker_id = ?
+            """,
+            (tenant_id, owner_id, worker_id),
+        ).fetchone()
+    return int(row[0]) if row is not None else None
+
+
+def _ensure_signed_worker_watch_session(worker_id: str, payload: dict[str, object]) -> None:
+    if str(payload.get("kind") or "") != "worker_view":
+        return
+    identity = {
+        "tenant_id": str(payload.get("tenant_id") or "").strip(),
+        "user_id": str(payload.get("owner_id") or "").strip(),
+    }
+    existing = _existing_watch_session_expires_at(worker_id, identity)
+    now = int(time.time())
+    if existing is not None and existing > now:
+        return
+    _watch_session_expires_at(worker_id, identity)
 
 
 def _load_viventium_runtime_env() -> None:
@@ -115,7 +235,15 @@ class LaunchRequest(BaseModel):
     worker_option: str | None = None
     launch_surface: str | None = None
     schedule_text: str | None = None
+    effort: str | None = None
     files: list[UploadedFileRequest] = Field(default_factory=list)
+
+
+class PreferencesRequest(BaseModel):
+    default_worker_profile: str | None = None
+    codex_reasoning_effort: str | None = None
+    claude_effort: str | None = None
+    openclaw_effort: str | None = None
 
 
 class MessageRequest(BaseModel):
@@ -134,11 +262,16 @@ class MetadataRequest(BaseModel):
 def _append_signed_worker_token(url: str, worker_id: str, identity: dict[str, str] | None) -> str:
     if not identity:
         return url
+    ttl_seconds = None
+    expires_at = _watch_session_expires_at(worker_id, identity)
+    if expires_at is not None:
+        ttl_seconds = max(1, expires_at - int(time.time()))
     token = sign_link_token(
         kind="worker_view",
         worker_id=worker_id,
         tenant_id=str(identity.get("tenant_id") or ""),
         owner_id=str(identity.get("user_id") or ""),
+        ttl_seconds=ttl_seconds,
     )
     if not token:
         return url
@@ -308,7 +441,78 @@ def _new_workspace_options() -> list[dict[str, str]]:
     if not raw:
         return options
     allowed = {item.strip() for item in raw.split(",") if item.strip()}
-    return [item for item in options if item["profile"] in allowed]
+    filtered = [item for item in options if item["profile"] in allowed]
+    if filtered:
+        return filtered
+    raise RuntimeError("GLASSHIVE_ALLOWED_WORKER_PROFILES must include at least one supported worker profile")
+
+
+def _default_worker_profile() -> str:
+    configured = str(os.environ.get("GLASSHIVE_DEFAULT_WORKER_PROFILE") or "").strip()
+    profile = configured or "codex-cli"
+    options = _new_workspace_options()
+    available = {item["profile"] for item in options}
+    if profile in available:
+        return profile
+    if configured:
+        raise RuntimeError(
+            "GLASSHIVE_DEFAULT_WORKER_PROFILE must be included in GLASSHIVE_ALLOWED_WORKER_PROFILES"
+        )
+    return str(options[0]["profile"]) if options else "codex-cli"
+
+
+def _profile_allowed(profile: str) -> bool:
+    if not profile:
+        return False
+    return profile in {item["profile"] for item in _new_workspace_options()}
+
+
+def _default_workspace_option(preferences: dict[str, Any] | None = None) -> str:
+    preferred = str((preferences or {}).get("default_worker_profile") or "").strip()
+    profile = preferred if _profile_allowed(preferred) else _default_worker_profile()
+    return f"new:{profile}"
+
+
+def _effort_for_profile(profile: str, explicit_effort: str | None, preferences: dict[str, Any] | None) -> str:
+    explicit = str(explicit_effort or "").strip().lower()
+    if explicit:
+        return explicit
+    prefs = preferences or {}
+    if profile == "codex-cli":
+        return str(prefs.get("codex_reasoning_effort") or "").strip().lower()
+    if profile == "claude-code":
+        return str(prefs.get("claude_effort") or "").strip().lower()
+    if profile == "openclaw-general":
+        return str(prefs.get("openclaw_effort") or "").strip().lower()
+    return ""
+
+
+def _bootstrap_bundle_with_effort(bundle: dict[str, Any] | None, profile: str, effort: str) -> dict[str, Any] | None:
+    clean_effort = str(effort or "").strip().lower()
+    if not clean_effort:
+        return bundle
+    next_bundle: dict[str, Any] = dict(bundle or {})
+    if profile == "codex-cli":
+        if clean_effort not in {"minimal", "low", "medium", "high", "xhigh"}:
+            raise HTTPException(status_code=400, detail="Codex effort must be minimal, low, medium, high, or xhigh")
+        env = dict(next_bundle.get("env") or {})
+        env["WPR_CODEX_CLI_REASONING_EFFORT"] = clean_effort
+        next_bundle["env"] = env
+        return next_bundle
+    if profile == "claude-code":
+        if clean_effort not in {"default", "max"}:
+            raise HTTPException(status_code=400, detail="Claude effort must be default or max")
+    elif profile == "openclaw-general":
+        if clean_effort not in {"default", "high", "max"}:
+            raise HTTPException(status_code=400, detail="OpenClaw effort must be default, high, or max")
+    else:
+        return next_bundle
+    if clean_effort == "default":
+        return next_bundle
+    current = str(next_bundle.get("system_instructions") or "").strip()
+    addition = f"Worker effort preference for this run: {clean_effort}."
+    next_bundle["system_instructions"] = f"{current}\n\n{addition}".strip()
+    return next_bundle
 
 
 def _execution_mode_from_workspace_type(workspace_type: str | None) -> str:
@@ -469,10 +673,14 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             and str(payload.get("kind") or "") == "worker_view"
             and str(payload.get("worker_id") or "").strip() == str(worker_id or "").strip()
         ):
+            try:
+                cookie_max_age = max(1, min(30 * 60, int(payload.get("exp") or 0) - int(time.time())))
+            except (TypeError, ValueError):
+                cookie_max_age = 30 * 60
             response.set_cookie(
                 _worker_cookie_name(worker_id),
                 token,
-                max_age=30 * 60,
+                max_age=cookie_max_age,
                 httponly=True,
                 samesite="lax",
                 secure=_request_uses_https(request),
@@ -484,13 +692,13 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         _set_signed_worker_cookie(response, request, worker_id)
         return response
 
-    def _allowed_signed_link_kinds(request: Request) -> set[str]:
+    def _allowed_signed_link_kinds(request: Request | WebSocket) -> set[str]:
         path = str(request.url.path or "")
         if path.startswith("/v1/signed-links/"):
             return {"artifact_download"}
         return {"worker_view"}
 
-    def _signed_link_identity(request: Request, worker_id: str | None = None) -> dict[str, str] | None:
+    def _signed_link_payload(request: Request | WebSocket, worker_id: str | None = None) -> dict[str, object] | None:
         token = _signed_token_from_request(request)
         if not token:
             return None
@@ -506,12 +714,49 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         deployment_tenant_id = _enterprise_tenant_id()
         if _enterprise_mode_enabled() and deployment_tenant_id and token_tenant_id != deployment_tenant_id:
             raise HTTPException(status_code=401, detail="GlassHive workspace link is for a different tenant")
+        if str(payload.get("kind") or "") == "worker_view" and token_worker_id:
+            _ensure_signed_worker_watch_session(token_worker_id, payload)
+        return payload
+
+    def _signed_link_identity(request: Request | WebSocket, worker_id: str | None = None) -> dict[str, str] | None:
+        payload = _signed_link_payload(request, worker_id)
+        if not payload:
+            return None
+        token_tenant_id = str(payload.get("tenant_id") or "").strip()
         return {
             "tenant_id": token_tenant_id,
             "user_id": str(payload.get("owner_id") or "").strip(),
             "email": "",
             "role": "member",
         }
+
+    def _watch_session_timeout_seconds(request: Request | WebSocket, worker_id: str) -> float:
+        raw = os.environ.get("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "").strip()
+        try:
+            configured = int(raw) if raw else 0
+        except ValueError:
+            configured = 0
+        payload = _signed_link_payload(request, worker_id)
+        now = int(time.time())
+        signed_remaining = 0
+        if payload:
+            try:
+                signed_remaining = int(payload.get("exp") or 0) - now
+            except (TypeError, ValueError):
+                signed_remaining = 0
+        persisted_remaining = 0
+        if payload and str(payload.get("kind") or "") == "worker_view":
+            persisted = _existing_watch_session_expires_at(
+                worker_id,
+                {
+                    "tenant_id": str(payload.get("tenant_id") or "").strip(),
+                    "user_id": str(payload.get("owner_id") or "").strip(),
+                },
+            )
+            if persisted is not None:
+                persisted_remaining = persisted - now
+        values = [value for value in (configured, signed_remaining, persisted_remaining) if value > 0]
+        return float(max(1, min(values))) if values else 0.0
 
     def _request_identity(request: Request, worker_id: str | None = None) -> dict[str, str]:
         signed_identity = _signed_link_identity(request, worker_id)
@@ -768,10 +1013,16 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         active_client = _client_for_request(request)
         identity = _request_identity(request)
         owner_id = identity["user_id"] or os.environ.get("GLASSHIVE_DEFAULT_OWNER_ID", "demo-owner")
+        try:
+            preferences = active_client.get_preferences()
+        except Exception:
+            preferences = {}
         existing_workspaces = flatten_workspaces(active_client, identity=identity)
         return {
             "owner_id": owner_id,
-            "default_workspace_option": "new:codex-cli",
+            "user_preferences": preferences,
+            "default_workspace_option": _default_workspace_option(preferences),
+            "deployment_default_workspace_option": f"new:{_default_worker_profile()}",
             "default_launch_surface": _default_launch_surface(),
             "launch_surface_options": _launch_surface_options(),
             "default_workspace_type": _default_workspace_type(),
@@ -780,13 +1031,26 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             "existing_workspaces": existing_workspaces,
         }
 
+    @app.patch("/api/preferences")
+    def update_preferences(request: Request, payload: PreferencesRequest) -> dict[str, Any]:
+        payload_dict = (
+            payload.model_dump(exclude_none=True)
+            if hasattr(payload, "model_dump")
+            else payload.dict(exclude_none=True)
+        )
+        return _client_for_request(request).update_preferences(payload_dict)
+
     @app.post("/api/launch")
     def launch(request: Request, payload: LaunchRequest) -> dict[str, Any]:
         active_client = _client_for_request(request)
         identity = _request_identity(request)
         owner_id = identity["user_id"] or os.environ.get("GLASSHIVE_DEFAULT_OWNER_ID", "demo-owner")
         brief = build_operator_brief(payload.description, payload.success_criteria, payload.context)
-        workspace_option = payload.workspace_option or payload.worker_option or "new:codex-cli"
+        try:
+            preferences = active_client.get_preferences()
+        except Exception:
+            preferences = {}
+        workspace_option = payload.workspace_option or payload.worker_option or _default_workspace_option(preferences)
         schedule_text = str(payload.schedule_text or "").strip()
         bootstrap_bundle = _bootstrap_bundle_for_uploads(payload.files)
         execution_mode = _execution_mode_from_workspace_type(payload.workspace_type)
@@ -811,7 +1075,12 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 worker_id = str(worker["worker_id"])
                 created_new_worker = True
             else:
-                profile = workspace_option.split(":", 1)[1] if ":" in workspace_option else "codex-cli"
+                profile = workspace_option.split(":", 1)[1] if ":" in workspace_option else _default_worker_profile()
+                bootstrap_bundle = _bootstrap_bundle_with_effort(
+                    bootstrap_bundle,
+                    profile,
+                    _effort_for_profile(profile, payload.effort, preferences),
+                )
                 project = active_client.create_project(owner_id, build_project_title(payload.description), payload.description.strip(), profile)
                 project_id = str(project["project_id"])
                 worker = active_client.create_worker(
@@ -918,6 +1187,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             ws_path = _validated_novnc_ws_path((query.get("path") or ["websockify"])[0])
             ws_scheme = "wss" if parsed.scheme == "https" else "ws"
             upstream_url = f"{ws_scheme}://{parsed.netloc}/{ws_path}"
+            session_timeout = _watch_session_timeout_seconds(websocket, worker_id)
         except HTTPException:
             await websocket.close(code=1008)
             return
@@ -944,10 +1214,17 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                         else:
                             await websocket.send_text(str(message))
 
+                async def enforce_session_timeout() -> None:
+                    await asyncio.sleep(session_timeout)
+                    await upstream.close()
+                    await websocket.close(code=1008, reason="GlassHive watch session expired")
+
                 tasks = {
                     asyncio.create_task(browser_to_sandbox()),
                     asyncio.create_task(sandbox_to_browser()),
                 }
+                if session_timeout > 0:
+                    tasks.add(asyncio.create_task(enforce_session_timeout()))
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for task in pending:
                     task.cancel()

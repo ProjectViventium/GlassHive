@@ -29,13 +29,21 @@ from .models import (
     ScheduleRunRequest,
     SendMessageRequest,
     TakeoverInfo,
+    UpdateUserPreferencesRequest,
     UpdateWorkerMetadataRequest,
+    UserPreferencesResponse,
     WorkerResponse,
 )
 from .openclaw_runtime import StubRuntime, WorkerRuntime
 from .profile_runtime import ProfiledWorkerRuntime, _redact_text
 from .runtime_env import load_viventium_runtime_env
-from .service import GlassHiveProfileNotAllowedError, GlassHiveQuotaExceededError, HostWorkersDisabledError, WorkersProjectsService
+from .service import (
+    GlassHiveProfileNotAllowedError,
+    GlassHiveQuotaExceededError,
+    HostWorkersDisabledError,
+    WorkersProjectsService,
+    allowed_worker_profiles,
+)
 from .signed_links import append_signed_query, sign_link_params, verify_signed_link, verify_signed_link_token
 from .store import Store
 from .terminal_takeover import TerminalTarget, bridge_terminal
@@ -212,6 +220,50 @@ def create_app(
 
     def _request_owner(ctx: AuthContext, requested: str) -> str:
         return ctx.owner_id if ctx.enterprise else requested
+
+    def _preference_owner(ctx: AuthContext) -> str:
+        if ctx.enterprise:
+            return ctx.owner_id
+        return os.environ.get("WPR_DEFAULT_OWNER_ID", "").strip() or "demo-owner"
+
+    def _blank_preferences(tenant_id: str, owner_id: str) -> dict:
+        return {
+            "tenant_id": tenant_id or "local",
+            "owner_id": owner_id,
+            "default_worker_profile": "",
+            "codex_reasoning_effort": "",
+            "claude_effort": "",
+            "openclaw_effort": "",
+            "updated_at": "",
+        }
+
+    def _normalize_preference_payload(payload: UpdateUserPreferencesRequest) -> dict[str, str | None]:
+        normalized: dict[str, str | None] = {}
+        if payload.default_worker_profile is not None:
+            profile = payload.default_worker_profile.strip()
+            allowed = allowed_worker_profiles()
+            if profile and allowed and profile not in allowed:
+                raise HTTPException(
+                    status_code=400,
+                    detail="default_worker_profile is not allowed by GLASSHIVE_ALLOWED_WORKER_PROFILES",
+                )
+            normalized["default_worker_profile"] = profile
+        if payload.codex_reasoning_effort is not None:
+            effort = payload.codex_reasoning_effort.strip().lower()
+            if effort and effort not in {"minimal", "low", "medium", "high", "xhigh"}:
+                raise HTTPException(status_code=400, detail="codex_reasoning_effort must be minimal, low, medium, high, or xhigh")
+            normalized["codex_reasoning_effort"] = effort
+        if payload.claude_effort is not None:
+            effort = payload.claude_effort.strip().lower()
+            if effort and effort not in {"default", "max"}:
+                raise HTTPException(status_code=400, detail="claude_effort must be default or max")
+            normalized["claude_effort"] = "" if effort == "default" else effort
+        if payload.openclaw_effort is not None:
+            effort = payload.openclaw_effort.strip().lower()
+            if effort and effort not in {"default", "high", "max"}:
+                raise HTTPException(status_code=400, detail="openclaw_effort must be default, high, or max")
+            normalized["openclaw_effort"] = "" if effort == "default" else effort
+        return normalized
 
     def _token_matches(candidate: str, expected: str) -> bool:
         return bool(candidate and expected and hmac.compare_digest(candidate, expected))
@@ -558,6 +610,27 @@ def create_app(
     @app.get("/favicon.ico")
     def favicon() -> Response:
         return Response(status_code=204)
+
+    @app.get("/v1/preferences", response_model=UserPreferencesResponse)
+    def get_preferences(request: Request) -> UserPreferencesResponse:
+        ctx = _auth_context(request)
+        tenant_id = ctx.tenant_id if ctx.enterprise else "local"
+        owner_id = _preference_owner(ctx)
+        if ctx.enterprise and not owner_id:
+            raise HTTPException(status_code=401, detail="Missing authenticated user assertion")
+        prefs = store.get_user_preferences(tenant_id, owner_id) or _blank_preferences(tenant_id, owner_id)
+        return UserPreferencesResponse(**prefs)
+
+    @app.patch("/v1/preferences", response_model=UserPreferencesResponse)
+    def update_preferences(payload: UpdateUserPreferencesRequest, request: Request) -> UserPreferencesResponse:
+        ctx = _auth_context(request)
+        tenant_id = ctx.tenant_id if ctx.enterprise else "local"
+        owner_id = _preference_owner(ctx)
+        if ctx.enterprise and not owner_id:
+            raise HTTPException(status_code=401, detail="Missing authenticated user assertion")
+        normalized = _normalize_preference_payload(payload)
+        prefs = store.upsert_user_preferences(tenant_id=tenant_id, owner_id=owner_id, **normalized)
+        return UserPreferencesResponse(**prefs)
 
     @app.post("/v1/projects", response_model=ProjectResponse, status_code=201)
     def create_project(payload: CreateProjectRequest, request: Request) -> ProjectResponse:
