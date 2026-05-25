@@ -112,6 +112,43 @@ def test_enterprise_bootstrap_keeps_provider_secrets_out_of_interactive_runtime_
     assert oct((tmp_path / "home" / ".glasshive" / "secret-runtime.keys").stat().st_mode & 0o777) == "0o600"
 
 
+def test_enterprise_bootstrap_replaces_persisted_sandbox_owned_secret_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    home_dir = tmp_path / "home"
+    glasshive_dir = home_dir / ".glasshive"
+    glasshive_dir.mkdir(parents=True)
+    stale_secret = glasshive_dir / "secret-runtime.env"
+    stale_secret.write_text("stale")
+    stale_secret.chmod(0o400)
+    stale_keys = glasshive_dir / "secret-runtime.keys"
+    stale_keys.write_text("STALE_KEY\n")
+    stale_keys.chmod(0o400)
+    worker = {
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "env": {
+                    "OPENAI_API_KEY": "replacement-key",
+                    "OPENAI_BASE_URL": "https://provider.example.com/v1",
+                }
+            }
+        )
+    }
+
+    apply_bootstrap(
+        home_dir=home_dir,
+        workspace_dir=tmp_path / "workspace",
+        runtime_name="codex-cli",
+        worker=worker,
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+    )
+
+    assert "replacement-key" in stale_secret.read_text()
+    assert stale_keys.read_text().splitlines() == ["OPENAI_API_KEY"]
+    assert oct(stale_secret.stat().st_mode & 0o777) == "0o600"
+    assert oct(stale_keys.stat().st_mode & 0o777) == "0o600"
+
+
 def test_local_bootstrap_keeps_legacy_interactive_runtime_env_behavior(tmp_path, monkeypatch):
     monkeypatch.delenv("GLASSHIVE_ENTERPRISE_MODE", raising=False)
     worker = {"bootstrap_bundle_json": json.dumps({"env": {"OPENAI_API_KEY": "local-dev-key"}})}

@@ -196,11 +196,17 @@ def apply_bootstrap(
     _write_manifest(home_dir, profile, bundle)
 
 
+def _atomic_write_text(path: Path, text: str, *, mode: int = 0o644) -> None:
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.write_text(text)
+    tmp_path.chmod(mode)
+    tmp_path.replace(path)
+
+
 def _write_env_file(path: Path, env: dict[str, str], *, mode: int = 0o644) -> None:
     if env:
         lines = [f"export {key}={shlex.quote(value)}" for key, value in sorted(env.items())]
-        path.write_text("\n".join(lines) + "\n")
-        path.chmod(mode)
+        _atomic_write_text(path, "\n".join(lines) + "\n", mode=mode)
         return
     if path.exists():
         path.unlink()
@@ -221,8 +227,7 @@ def _write_runtime_env(home_dir: Path, env: dict[str, str]) -> None:
     _write_env_file(runtime_env, shell_env_values)
     _write_env_file(secret_env, secret_env_values, mode=0o600)
     if secret_env_values:
-        secret_keys_path.write_text("\n".join(sorted(secret_env_values)) + "\n")
-        secret_keys_path.chmod(0o600)
+        _atomic_write_text(secret_keys_path, "\n".join(sorted(secret_env_values)) + "\n", mode=0o600)
     elif secret_keys_path.exists():
         secret_keys_path.unlink()
     bashrc = home_dir / ".bashrc"
