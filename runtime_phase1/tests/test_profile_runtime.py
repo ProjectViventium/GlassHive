@@ -541,6 +541,76 @@ def test_codex_cli_provider_config_honors_per_run_reasoning_effort(tmp_path, mon
     assert 'model_reasoning_effort="medium"' not in joined
 
 
+def test_codex_cli_provider_config_disables_web_search_for_minimal_effort(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
+    worker = {
+        "worker_id": "wrk_effort",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "minimal"}}),
+    }
+
+    command: list[str] = []
+    runtime._append_codex_compatible_provider_config(command, worker)
+
+    joined = "\n".join(command)
+    assert 'model_reasoning_effort="minimal"' in joined
+    assert 'web_search="disabled"' in joined
+    assert "--disable\nimage_generation" in joined
+    assert "--disable\nweb_search" not in joined
+
+
+def test_codex_cli_provider_config_coerces_unsupported_reasoning_effort(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_ALLOWED_REASONING_EFFORTS", "medium")
+    worker = {
+        "worker_id": "wrk_effort",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "minimal"}}),
+    }
+
+    command: list[str] = []
+    runtime._append_codex_compatible_provider_config(command, worker)
+
+    joined = "\n".join(command)
+    assert 'model_reasoning_effort="medium"' in joined
+    assert 'model_reasoning_effort="minimal"' not in joined
+    assert 'web_search="disabled"' not in joined
+
+
+def test_codex_cli_provider_config_honors_reasoning_effort_fallback(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_ALLOWED_REASONING_EFFORTS", "medium,high")
+    monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT_FALLBACK", "high")
+    worker = {
+        "worker_id": "wrk_effort",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "minimal"}}),
+    }
+
+    command: list[str] = []
+    runtime._append_codex_compatible_provider_config(command, worker)
+
+    joined = "\n".join(command)
+    assert 'model_reasoning_effort="high"' in joined
+    assert 'model_reasoning_effort="minimal"' not in joined
+
+
+def test_codex_cli_provider_config_ignores_invalid_allowed_reasoning_efforts(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_ALLOWED_REASONING_EFFORTS", "banana")
+    worker = {
+        "worker_id": "wrk_effort",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "low"}}),
+    }
+
+    command: list[str] = []
+    runtime._append_codex_compatible_provider_config(command, worker)
+
+    joined = "\n".join(command)
+    assert 'model_reasoning_effort="low"' in joined
+
+
 def test_host_cli_run_closes_stdin_for_noninteractive_workers(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"

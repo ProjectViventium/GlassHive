@@ -1373,6 +1373,22 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             return [item.strip() for item in raw.split(",") if item.strip()]
         return list(self._default_compatible_provider_disabled_features)
 
+    def _compatible_provider_allowed_reasoning_efforts(self) -> set[str]:
+        raw = os.environ.get("WPR_CODEX_CLI_ALLOWED_REASONING_EFFORTS", "").strip()
+        valid = {"minimal", "low", "medium", "high", "xhigh"}
+        if not raw:
+            return set(valid)
+        configured = {item.strip().lower() for item in raw.split(",") if item.strip()}
+        return configured & valid or set(valid)
+
+    def _compatible_provider_reasoning_effort_fallback(self, allowed: set[str]) -> str:
+        configured = os.environ.get("WPR_CODEX_CLI_REASONING_EFFORT_FALLBACK", "medium").strip().lower()
+        if configured in allowed:
+            return configured
+        if "medium" in allowed:
+            return "medium"
+        return sorted(allowed)[0] if allowed else ""
+
     def _bootstrap_env_value(self, worker: dict, name: str) -> str:
         try:
             bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
@@ -1399,6 +1415,9 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             self._bootstrap_env_value(worker, "WPR_CODEX_CLI_REASONING_EFFORT")
             or os.environ.get("WPR_CODEX_CLI_REASONING_EFFORT", "")
         ).strip().lower()
+        allowed_efforts = self._compatible_provider_allowed_reasoning_efforts()
+        if reasoning_effort and reasoning_effort not in allowed_efforts:
+            reasoning_effort = self._compatible_provider_reasoning_effort_fallback(allowed_efforts)
         if self._env_flag("WPR_CODEX_CLI_IGNORE_USER_CONFIG", True):
             command.append("--ignore-user-config")
         for feature in self._compatible_provider_disabled_features():
@@ -1425,6 +1444,9 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             command.extend(["-c", f'model_verbosity="{verbosity}"'])
         if reasoning_effort in {"minimal", "low", "medium", "high", "xhigh"}:
             command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
+        if reasoning_effort == "minimal":
+            command.extend(["-c", 'web_search="disabled"'])
+            command.extend(["--disable", "image_generation"])
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         existing_session = self._read_session_key(worker["worker_id"])
