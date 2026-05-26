@@ -87,6 +87,24 @@ def classify_cli_failure(
             ),
             diagnostic_summary=diagnostic_summary,
         )
+    if (
+        "stdin is closed" in lowered
+        or "write_stdin failed" in lowered
+        or "rerun exec_command with tty=true" in lowered
+    ):
+        return FailureClassification(
+            failure_class="runtime_io_failed",
+            retryable=True,
+            user_message=(
+                "The worker made progress, but its command session closed before GlassHive could "
+                "capture the final turn cleanly."
+            ),
+            recommended_recovery=(
+                "Use workspace_continue to resume from the same workspace and ask the worker to "
+                "verify or finish from the current files."
+            ),
+            diagnostic_summary=diagnostic_summary,
+        )
 
     suffix = f" exited with code {exit_code}" if exit_code is not None else " failed"
     return FailureClassification(
@@ -151,6 +169,24 @@ def classify_runtime_error(
             recommended_recovery=(
                 "Wait for the active worker to finish, use workspace_status/workspace_wait to check it, "
                 "or launch the task in a sandbox/workstation workspace."
+            ),
+            diagnostic_summary=message,
+        )
+    if (
+        "stdin is closed" in lowered
+        or "write_stdin failed" in lowered
+        or "rerun exec_command with tty=true" in lowered
+    ):
+        return FailureClassification(
+            failure_class="runtime_io_failed",
+            retryable=True,
+            user_message=(
+                f"The {runtime_label} worker made progress, but its command session closed before "
+                "GlassHive could capture the final turn cleanly."
+            ),
+            recommended_recovery=(
+                "Use workspace_continue to resume from the same workspace and ask the worker to "
+                "verify or finish from the current files."
             ),
             diagnostic_summary=message,
         )

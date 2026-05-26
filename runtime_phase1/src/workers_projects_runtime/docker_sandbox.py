@@ -24,6 +24,28 @@ SAFE_DOCKER_EXEC_ENV_KEYS = {
     "LC_CTYPE",
     "LC_MESSAGES",
     "PYTHONIOENCODING",
+    # Provider keys are run-scoped: the worker launch script unsets them before
+    # handing control to the post-run interactive shell.
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "OPENAI_REVERSE_PROXY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "PORTKEY_API_KEY",
+    "PORTKEY_BASE_URL",
+    "PORTKEY_VIRTUAL_KEY",
+    "PORTKEY_CONFIG",
+    "WPR_CODEX_CLI_BASE_URL",
+    "WPR_CODEX_CLI_ENV_KEY",
+    "WPR_CODEX_CLI_MODEL_PROVIDER",
+    "WPR_CODEX_CLI_USE_CUSTOM_PROVIDER",
+    "WPR_CODEX_CLI_WIRE_API",
+    "WPR_OPENCLAW_BASE_URL",
+    "WPR_OPENCLAW_ENV_KEY",
+    "WPR_OPENCLAW_MODEL_PROVIDER",
+    "WPR_OPENCLAW_USE_CUSTOM_PROVIDER",
+    "WPR_OPENCLAW_WIRE_API",
 }
 
 

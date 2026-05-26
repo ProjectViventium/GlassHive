@@ -277,6 +277,20 @@ def create_app(
     def _request_owner(ctx: AuthContext, requested: str) -> str:
         return ctx.owner_id if ctx.enterprise else requested
 
+    def _configured_default_worker_profile() -> str:
+        configured = os.environ.get("GLASSHIVE_DEFAULT_WORKER_PROFILE", "").strip()
+        allowed = allowed_worker_profiles()
+        if configured:
+            if allowed and configured not in allowed:
+                raise HTTPException(
+                    status_code=500,
+                    detail="GLASSHIVE_DEFAULT_WORKER_PROFILE must be included in GLASSHIVE_ALLOWED_WORKER_PROFILES",
+                )
+            return configured
+        if allowed:
+            return "codex-cli" if "codex-cli" in allowed else sorted(allowed)[0]
+        return "codex-cli"
+
     def _preference_owner(ctx: AuthContext) -> str:
         if ctx.enterprise:
             return ctx.owner_id
@@ -306,8 +320,8 @@ def create_app(
             normalized["default_worker_profile"] = profile
         if payload.codex_reasoning_effort is not None:
             effort = payload.codex_reasoning_effort.strip().lower()
-            if effort and effort not in {"minimal", "low", "medium", "high", "xhigh"}:
-                raise HTTPException(status_code=400, detail="codex_reasoning_effort must be minimal, low, medium, high, or xhigh")
+            if effort and effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+                raise HTTPException(status_code=400, detail="codex_reasoning_effort must be none, minimal, low, medium, high, or xhigh")
             normalized["codex_reasoning_effort"] = effort
         if payload.claude_effort is not None:
             effort = payload.claude_effort.strip().lower()
@@ -320,6 +334,29 @@ def create_app(
                 raise HTTPException(status_code=400, detail="openclaw_effort must be default, high, or max")
             normalized["openclaw_effort"] = "" if effort == "default" else effort
         return normalized
+
+    def _assign_effort_bundle(worker: dict, effort_value: str | None) -> dict | None:
+        effort = str(effort_value or "").strip().lower()
+        if not effort:
+            return None
+        profile = str(worker.get("profile") or "").strip()
+        if profile == "codex-cli":
+            if effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+                raise HTTPException(status_code=400, detail="Codex effort must be none, minimal, low, medium, high, or xhigh")
+            return {"env": {"WPR_CODEX_CLI_REASONING_EFFORT": effort}}
+        if profile == "claude-code":
+            if effort not in {"default", "max"}:
+                raise HTTPException(status_code=400, detail="Claude effort must be default or max")
+            if effort == "default":
+                return None
+        elif profile == "openclaw-general":
+            if effort not in {"default", "high", "max"}:
+                raise HTTPException(status_code=400, detail="OpenClaw effort must be default, high, or max")
+            if effort == "default":
+                return None
+        else:
+            raise HTTPException(status_code=400, detail="effort override is not supported for this worker profile")
+        return {"system_instructions": f"Worker effort preference for this run: {effort}."}
 
     def _token_matches(candidate: str, expected: str) -> bool:
         return bool(candidate and expected and hmac.compare_digest(candidate, expected))
@@ -785,6 +822,8 @@ def create_app(
             "status": "ok",
             "version": app.version,
             "runtime_backend": resolved_runtime_backend,
+            "default_worker_profile": _configured_default_worker_profile(),
+            "allowed_worker_profiles": allowed_worker_profiles(),
         }
         if not auth_settings.enterprise:
             payload["metrics"] = store.metrics()
@@ -820,7 +859,8 @@ def create_app(
         ctx = _auth_context(request)
         owner_id = _request_owner(ctx, payload.owner_id)
         tenant_id = ctx.tenant_id if ctx.enterprise else "local"
-        return ProjectResponse(**service.create_project(owner_id, payload.title, payload.goal, payload.default_worker_profile, tenant_id=tenant_id))
+        profile = payload.default_worker_profile.strip() or _configured_default_worker_profile()
+        return ProjectResponse(**service.create_project(owner_id, payload.title, payload.goal, profile, tenant_id=tenant_id))
 
     @app.get("/v1/projects")
     def list_projects(request: Request) -> dict[str, list[ProjectResponse]]:
@@ -979,8 +1019,12 @@ def create_app(
 
     @app.post("/v1/workers/{worker_id}/assign", response_model=RunResponse, status_code=202)
     def assign(worker_id: str, payload: AssignRunRequest, request: Request) -> RunResponse:
-        require_worker(worker_id, request)
-        run = service.assign_run(worker_id, payload.instruction)
+        worker = require_worker(worker_id, request)
+        run = service.assign_run(
+            worker_id,
+            payload.instruction,
+            runtime_bundle=_assign_effort_bundle(worker, payload.effort),
+        )
         return RunResponse(**run)
 
     @app.post("/v1/workers/{worker_id}/message", response_model=RunResponse, status_code=202)
@@ -1167,6 +1211,18 @@ def create_app(
         ctx = _auth_context(request)
         show_internal = _can_show_internal_details(ctx)
         projects = store.list_projects(_tenant_filter(ctx), _owner_filter(ctx))
+        default_profile = _configured_default_worker_profile()
+        allowed_profiles = set(allowed_worker_profiles() or ["codex-cli", "claude-code", "openclaw-general"])
+        profile_labels = {
+            "codex-cli": "Codex CLI",
+            "claude-code": "Claude Code",
+            "openclaw-general": "OpenClaw",
+        }
+        profile_options = "".join(
+            f"<option value='{escape(profile)}'{' selected' if profile == default_profile else ''}>{escape(profile_labels.get(profile, profile))}</option>"
+            for profile in ("codex-cli", "claude-code", "openclaw-general")
+            if profile in allowed_profiles or profile == default_profile
+        )
         project_items = []
         for project in projects:
             workers = store.list_workers(project["project_id"], _tenant_filter(ctx), _owner_filter(ctx))
@@ -1193,7 +1249,7 @@ def create_app(
             "input,textarea,button{font:inherit;padding:.55rem;}"
             "</style></head><body>"
             "<h1>Workers Projects Runtime</h1>"
-            "<p>Phase 1 standalone OpenClaw-backed control plane.</p>"
+            f"<p>Phase 1 standalone worker control plane. Default worker: {escape(default_profile)}.</p>"
             f"{docs_link}"
             "<section>"
             "<h2>Create project</h2>"
@@ -1201,9 +1257,7 @@ def create_app(
             "<p><input id='project-title' placeholder='Project title' value='New Project'/></p>"
             "<p><textarea id='project-goal' placeholder='Project goal' style='width:100%;min-height:90px;'>Describe the goal for this worker project.</textarea></p>"
             "<p><select id='project-profile'>"
-            "<option value='openclaw-general' selected>OpenClaw</option>"
-            "<option value='claude-code'>Claude Code</option>"
-            "<option value='codex-cli'>Codex CLI</option>"
+            f"{profile_options}"
             "</select></p>"
             "<p><button onclick='createProject()'>Create project</button></p>"
             "</section>"
@@ -1213,7 +1267,7 @@ def create_app(
             "const owner_id=document.getElementById('project-owner').value.trim();"
             "const title=document.getElementById('project-title').value.trim();"
             "const goal=document.getElementById('project-goal').value.trim();"
-            "const default_worker_profile=document.getElementById('project-profile').value.trim()||'openclaw-general';"
+            f"const default_worker_profile=document.getElementById('project-profile').value.trim()||'{escape(default_profile)}';"
             "if(!owner_id||!title||!goal){alert('owner, title, and goal are required');return;}"
             "const res=await fetch('/v1/projects',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({owner_id,title,goal,default_worker_profile})});"
             "if(!res.ok){alert(await res.text());return;}"

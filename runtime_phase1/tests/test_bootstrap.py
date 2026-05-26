@@ -4,7 +4,25 @@ import json
 
 import pytest
 
-from workers_projects_runtime.bootstrap import apply_bootstrap, bootstrap_env_for, sign_bootstrap_source_path
+from workers_projects_runtime.bootstrap import (
+    apply_bootstrap,
+    bootstrap_env_for,
+    refresh_runtime_env_for_worker,
+    sign_bootstrap_source_path,
+)
+
+
+def _clear_ambient_provider_env(monkeypatch):
+    for key in (
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "PORTKEY_API_KEY",
+        "PORTKEY_BASE_URL",
+        "PORTKEY_PROVIDER",
+        "PORTKEY_VIRTUAL_KEY",
+        "PORTKEY_CONFIG",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
 
 def test_enterprise_bootstrap_filters_worker_env_and_projects_provider_env(monkeypatch):
@@ -77,6 +95,7 @@ def test_enterprise_bootstrap_does_not_copy_host_auth_or_identity_files(tmp_path
 
 def test_enterprise_bootstrap_keeps_provider_secrets_out_of_interactive_runtime_env(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _clear_ambient_provider_env(monkeypatch)
     worker = {
         "bootstrap_bundle_json": json.dumps(
             {
@@ -114,6 +133,7 @@ def test_enterprise_bootstrap_keeps_provider_secrets_out_of_interactive_runtime_
 
 def test_enterprise_bootstrap_replaces_persisted_sandbox_owned_secret_file(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _clear_ambient_provider_env(monkeypatch)
     home_dir = tmp_path / "home"
     glasshive_dir = home_dir / ".glasshive"
     glasshive_dir.mkdir(parents=True)
@@ -147,6 +167,67 @@ def test_enterprise_bootstrap_replaces_persisted_sandbox_owned_secret_file(tmp_p
     assert stale_keys.read_text().splitlines() == ["OPENAI_API_KEY"]
     assert oct(stale_secret.stat().st_mode & 0o777) == "0o600"
     assert oct(stale_keys.stat().st_mode & 0o777) == "0o600"
+
+
+def test_enterprise_run_only_secrets_are_refreshed_for_each_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _clear_ambient_provider_env(monkeypatch)
+    worker = {
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "env": {
+                    "OPENAI_API_KEY": "synthetic-openai-key-not-for-shell",
+                    "OPENAI_BASE_URL": "https://provider.example.com/v1",
+                }
+            }
+        )
+    }
+    home_dir = tmp_path / "home"
+
+    apply_bootstrap(
+        home_dir=home_dir,
+        workspace_dir=tmp_path / "workspace",
+        runtime_name="codex-cli",
+        worker=worker,
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+    )
+    secret_env = home_dir / ".glasshive" / "secret-runtime.env"
+    runtime_env = home_dir / ".glasshive" / "runtime.env"
+    assert "OPENAI_API_KEY" in secret_env.read_text()
+    assert "OPENAI_API_KEY" not in runtime_env.read_text()
+
+    secret_env.unlink()
+    refresh_runtime_env_for_worker(home_dir, worker)
+
+    assert "OPENAI_API_KEY" in secret_env.read_text()
+    assert "OPENAI_API_KEY" not in runtime_env.read_text()
+    assert oct(secret_env.stat().st_mode & 0o777) == "0o600"
+
+
+def test_enterprise_ambient_provider_keys_are_run_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _clear_ambient_provider_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-ambient-key-not-for-shell")
+
+    home_dir = tmp_path / "home"
+    apply_bootstrap(
+        home_dir=home_dir,
+        workspace_dir=tmp_path / "workspace",
+        runtime_name="codex-cli",
+        worker={"bootstrap_bundle_json": json.dumps({"env": {}})},
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+    )
+
+    glasshive_dir = home_dir / ".glasshive"
+    runtime_env = glasshive_dir / "runtime.env"
+    secret_env = glasshive_dir / "secret-runtime.env"
+    secret_keys = glasshive_dir / "secret-runtime.keys"
+
+    assert "OPENAI_API_KEY" in secret_env.read_text()
+    assert "OPENAI_API_KEY" in secret_keys.read_text()
+    assert not runtime_env.exists() or "OPENAI_API_KEY" not in runtime_env.read_text()
 
 
 def test_local_bootstrap_keeps_legacy_interactive_runtime_env_behavior(tmp_path, monkeypatch):

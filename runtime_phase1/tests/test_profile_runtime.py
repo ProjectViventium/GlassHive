@@ -111,6 +111,73 @@ def test_collect_completed_run_classifies_and_redacts_provider_rate_limit(tmp_pa
     assert "PUBLIC_FAKE_TOKEN_VALUE" not in recovered["error_text"]
 
 
+def test_collect_completed_run_prefers_stdout_provider_failure_over_stale_stderr(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_response_failed",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+
+    run_id = "run_response_failed"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread_response_failed"}),
+                "I wrote partial reports before the provider stream disconnected.",
+                json.dumps({"type": "response.failed", "error": {"message": "stream disconnected before completion"}}),
+                json.dumps({"type": "turn.failed", "error": {"message": "response.failed event received"}}),
+            ]
+        )
+        + "\n"
+    )
+    (run_root / "stderr.log").write_text(
+        "write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true\n"
+    )
+    (run_root / "exit_code").write_text("1")
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+
+    assert recovered is not None
+    assert recovered["state"] == "failed"
+    assert recovered["failure_class"] == "provider_response_failed"
+    assert recovered["failure_retryable"] == 1
+    assert "response.failed" in recovered["failure_diagnostic_summary"]
+    assert "workspace_continue" in recovered["failure_recommended_recovery"]
+
+
+def test_collect_completed_run_classifies_stdin_closed_as_retryable_runtime_io(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_stdin_closed",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+
+    run_id = "run_stdin_closed"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text("The worker wrote useful files before the session closed.\n")
+    (run_root / "stderr.log").write_text(
+        "write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true\n"
+    )
+    (run_root / "exit_code").write_text("1")
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+
+    assert recovered is not None
+    assert recovered["state"] == "failed"
+    assert recovered["failure_class"] == "runtime_io_failed"
+    assert recovered["failure_retryable"] == 1
+    assert "workspace_continue" in recovered["failure_recommended_recovery"]
+
+
 def test_collect_completed_run_classifies_content_filter_as_not_retryable(tmp_path):
     runtime = CodexCliRuntime(base_dir=str(tmp_path))
     worker = {
@@ -663,6 +730,22 @@ def test_codex_cli_provider_config_disables_web_search_for_minimal_effort(tmp_pa
     assert 'web_search="disabled"' in joined
     assert "--disable\nimage_generation" in joined
     assert "--disable\nweb_search" not in joined
+
+
+def test_codex_cli_provider_config_supports_none_reasoning_effort(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
+    worker = {
+        "worker_id": "wrk_effort",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "none"}}),
+    }
+
+    command: list[str] = []
+    runtime._append_codex_compatible_provider_config(command, worker)
+
+    joined = "\n".join(command)
+    assert 'model_reasoning_effort="none"' in joined
+    assert 'web_search="disabled"' not in joined
 
 
 def test_codex_cli_provider_config_coerces_unsupported_reasoning_effort(tmp_path, monkeypatch):

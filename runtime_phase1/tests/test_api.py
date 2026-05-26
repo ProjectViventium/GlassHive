@@ -20,6 +20,7 @@ from starlette.websockets import WebSocketDisconnect
 from workers_projects_runtime.api import create_app
 from workers_projects_runtime.deliverables import deliverable_payload, is_deliverable_url
 from workers_projects_runtime.openclaw_runtime import (
+    RuntimeErrorBase,
     RuntimeInfo,
     StubRuntime,
     WorkerInterruptedError,
@@ -455,6 +456,7 @@ def test_project_worker_lifecycle_with_stub_runtime(tmp_path):
     assert health.status_code == 200
     assert health.json()["status"] == "ok"
     assert health.json()["runtime_backend"] == "stub"
+    assert health.json()["default_worker_profile"]
 
     project_resp = client.post(
         "/v1/projects",
@@ -535,6 +537,28 @@ def test_project_worker_lifecycle_with_stub_runtime(tmp_path):
     assert metrics["runs"] == 2
     assert metrics["queued_runs"] == 0
     assert metrics["events"] >= 7
+
+
+def test_api_uses_configured_default_worker_profile_when_project_omits_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,openclaw-general")
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", "codex-cli")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+
+    health = client.get("/health").json()
+    assert health["default_worker_profile"] == "codex-cli"
+    assert "codex-cli" in health["allowed_worker_profiles"]
+
+    project_resp = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Configured Default",
+            "goal": "Use the deployment default worker profile.",
+        },
+    )
+
+    assert project_resp.status_code == 201
+    assert project_resp.json()["default_worker_profile"] == "codex-cli"
 
 
 def test_enterprise_mode_scopes_projects_workers_and_artifacts(tmp_path, monkeypatch):
@@ -2260,6 +2284,49 @@ def test_host_worker_disabled_blocks_host_creation_and_run(tmp_path, monkeypatch
     assert "host-native workers are disabled" in run.json()["detail"]
 
 
+def test_assign_run_effort_updates_codex_worker_bootstrap_bundle(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub"))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Codex effort",
+            "goal": "Verify per-run effort handoff.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Codex Worker",
+            "role": "coding",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+            "start_synchronously": False,
+        },
+    ).json()
+
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Continue with a lower effort pass.", "effort": "medium"},
+    )
+    assert run.status_code == 202
+    assert run.json()["state"] == "queued"
+
+    stored_worker = Store(str(db_path)).get_worker(worker["worker_id"])
+    bundle = json.loads(stored_worker["bootstrap_bundle_json"])
+    assert bundle["env"]["WPR_CODEX_CLI_REASONING_EFFORT"] == "medium"
+
+    rejected = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Invalid effort should fail.", "effort": "max"},
+    )
+    assert rejected.status_code == 400
+    assert "Codex effort" in rejected.json()["detail"]
+
+
 def test_missing_host_cli_blocks_creation_before_worker_row(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
     monkeypatch.setenv("WPR_CODEX_BIN", str(tmp_path / "missing-codex"))
@@ -2474,8 +2541,10 @@ def test_nonblocking_worker_create_defers_runtime_start_to_run_queue(tmp_path):
         def __init__(self) -> None:
             self.ready_started = Event()
             self.ready_calls = 0
+            self.events: list[str] = []
 
         def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+            self.events.append("ready")
             self.ready_started.set()
             self.ready_calls += 1
             time.sleep(0.75)
@@ -2489,6 +2558,7 @@ def test_nonblocking_worker_create_defers_runtime_start_to_run_queue(tmp_path):
             run_id: str | None = None,
         ) -> str:
             _ = instruction, timeout_sec, run_id
+            self.events.append("run_task")
             self.ensure_worker_ready(worker)
             return "BACKGROUND_START_OK"
 
@@ -2539,6 +2609,7 @@ def test_nonblocking_worker_create_defers_runtime_start_to_run_queue(tmp_path):
     settled = wait_for_run(client, assign_resp.json()["run_id"], timeout=3.0)
     assert settled["state"] == "completed"
     assert settled["output_text"] == "BACKGROUND_START_OK"
+    assert runtime.events[0] == "run_task"
 
 
 def test_openclaw_worker_exposes_operator_control_surface(tmp_path):
@@ -3314,6 +3385,253 @@ class TerminatedButCompletedRuntime(StubRuntime):
             "output_text": "Recovered final answer",
             "error_text": "",
         }
+
+
+class RuntimeErrorWithPartialArtifactsRuntime(StubRuntime):
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root = root
+        self.collect_run_ids: list[str | None] = []
+
+    def _worker_paths(self, worker_id: str) -> tuple[Path, Path]:
+        state_dir = self.root / worker_id / "state"
+        workspace_dir = state_dir / "workspace"
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        return state_dir, workspace_dir
+
+    def _info(self, worker: dict) -> RuntimeInfo:
+        state_dir, workspace_dir = self._worker_paths(worker["worker_id"])
+        return RuntimeInfo(
+            runtime="codex-cli",
+            model=str(worker.get("model") or "stub/codex-cli"),
+            gateway_url="",
+            gateway_port=None,
+            gateway_token=None,
+            session_key=str(worker.get("session_key") or f"codex:{worker['worker_id']}"),
+            state_dir=str(state_dir),
+            workspace_dir=str(workspace_dir),
+            pid=4242,
+        )
+
+    def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker)
+
+    def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker)
+
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        _, workspace_dir = self._worker_paths(worker["worker_id"])
+        reports_dir = workspace_dir / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        (reports_dir / "partial_result.csv").write_text("firm,fit\nExample Capital,high\n")
+        raise RuntimeErrorBase(
+            "codex-cli exited with code 1: write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true"
+        )
+
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
+        self.collect_run_ids.append(run_id)
+        return {
+            "state": "failed",
+            "output_text": "",
+            "error_text": "codex-cli exited with code 1: response.failed event received",
+            "failure_class": "provider_response_failed",
+            "failure_retryable": 1,
+            "failure_user_message": "The model provider ended the worker turn unexpectedly before the task finished.",
+            "failure_recommended_recovery": (
+                "Use workspace_continue to resume from the same workspace and ask the worker to continue "
+                "from the current files and notes."
+            ),
+            "failure_diagnostic_summary": "response.failed event received",
+        }
+
+
+class RuntimeErrorWithDeliverableArtifactRuntime(RuntimeErrorWithPartialArtifactsRuntime):
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        _, workspace_dir = self._worker_paths(worker["worker_id"])
+        artifacts_dir = workspace_dir / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (artifacts_dir / "finished_report.md").write_text("# Finished report\n\nGenerated before provider disconnect.\n")
+        raise RuntimeErrorBase("codex-cli exited with code 1: response.failed event received")
+
+
+class RuntimeErrorWithNestedIndexRuntime(RuntimeErrorWithPartialArtifactsRuntime):
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        _, workspace_dir = self._worker_paths(worker["worker_id"])
+        html_dir = workspace_dir / "site"
+        html_dir.mkdir(parents=True, exist_ok=True)
+        (html_dir / "index.html").write_text("<!doctype html><title>Generated report</title>")
+        raise RuntimeErrorBase("codex-cli exited with code 1: response.failed event received")
+
+
+class RuntimeErrorWithStaleDeliverableArtifactRuntime(RuntimeErrorWithPartialArtifactsRuntime):
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        _, workspace_dir = self._worker_paths(worker["worker_id"])
+        artifacts_dir = workspace_dir / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        stale = artifacts_dir / "stale_report.md"
+        stale.write_text("# Stale report\n\nThis existed before the failed run.\n")
+        old_time = time.time() - 3600
+        os.utime(stale, (old_time, old_time))
+        raise RuntimeErrorBase("codex-cli exited with code 1: response.failed event received")
+
+
+class RuntimeIoFailureWithDeliverableArtifactRuntime(RuntimeErrorWithDeliverableArtifactRuntime):
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
+        self.collect_run_ids.append(run_id)
+        return {
+            "state": "failed",
+            "output_text": "",
+            "error_text": "codex-cli exited with code 1: write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true",
+            "failure_class": "runtime_io_failed",
+            "failure_retryable": 1,
+            "failure_user_message": "The worker command session closed before GlassHive captured the final turn cleanly.",
+            "failure_recommended_recovery": "Use workspace_continue to resume from the same workspace.",
+            "failure_diagnostic_summary": "write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true",
+        }
+
+
+def test_runtime_error_recovers_codex_failure_metadata_and_artifacts(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    db_path = tmp_path / "runtime.db"
+    runtime = RuntimeErrorWithPartialArtifactsRuntime(tmp_path / "workers")
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Recovered failure", "goal": "Keep partial artifacts visible."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Codex Worker", "role": "research", "profile": "codex-cli"},
+    ).json()
+
+    run = client.post(f"/v1/workers/{worker['worker_id']}/assign", json={"instruction": "research and build report"}).json()
+    failed = wait_for_run(client, run["run_id"])
+
+    assert failed["state"] == "failed"
+    assert failed["failure_class"] == "provider_response_failed"
+    assert failed["failure_retryable"] == 1
+    assert runtime.collect_run_ids == [run["run_id"]]
+    refreshed_worker = client.get(f"/v1/workers/{worker['worker_id']}").json()
+    assert refreshed_worker["runtime"] == "codex-cli"
+    assert refreshed_worker["workspace_dir"]
+    artifacts = client.get(f"/v1/workers/{worker['worker_id']}/artifacts").json()
+    assert any(item["path"] == "reports/partial_result.csv" for item in artifacts["items"])
+
+
+def test_provider_failure_after_fresh_artifact_is_delivered_as_completed(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    db_path = tmp_path / "runtime.db"
+    runtime = RuntimeErrorWithDeliverableArtifactRuntime(tmp_path / "workers")
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Recovered deliverable", "goal": "Promote real artifacts."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Codex Worker", "role": "research", "profile": "codex-cli"},
+    ).json()
+
+    run = client.post(f"/v1/workers/{worker['worker_id']}/assign", json={"instruction": "research and build report"}).json()
+    completed = wait_for_run(client, run["run_id"])
+
+    assert completed["state"] == "completed"
+    assert completed["failure_class"] == ""
+    assert "finished_report.md" in completed["output_text"]
+    wait_until(
+        lambda: any(
+            item["event_type"] == "run.completed"
+            for item in client.get(f"/v1/workers/{worker['worker_id']}/events").json()["items"]
+        )
+    )
+    events = client.get(f"/v1/workers/{worker['worker_id']}/events").json()["items"]
+    assert any(item["event_type"] == "run.completed" for item in events)
+    artifacts = client.get(f"/v1/workers/{worker['worker_id']}/artifacts").json()
+    assert any(item["path"] == "artifacts/finished_report.md" for item in artifacts["items"])
+
+
+def test_provider_failure_after_fresh_nested_index_is_delivered_as_completed(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    db_path = tmp_path / "runtime.db"
+    runtime = RuntimeErrorWithNestedIndexRuntime(tmp_path / "workers")
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Nested HTML", "goal": "Promote generated HTML."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Codex Worker", "role": "research", "profile": "codex-cli"},
+    ).json()
+
+    run = client.post(f"/v1/workers/{worker['worker_id']}/assign", json={"instruction": "build the HTML report"}).json()
+    completed = wait_for_run(client, run["run_id"])
+
+    assert completed["state"] == "completed"
+    assert "site/index.html" in completed["output_text"]
+
+
+def test_provider_failure_does_not_complete_for_stale_artifact(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    db_path = tmp_path / "runtime.db"
+    runtime = RuntimeErrorWithStaleDeliverableArtifactRuntime(tmp_path / "workers")
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Stale artifact", "goal": "Do not promote stale files."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Codex Worker", "role": "research", "profile": "codex-cli"},
+    ).json()
+
+    run = client.post(f"/v1/workers/{worker['worker_id']}/assign", json={"instruction": "build a fresh report"}).json()
+    failed = wait_for_run(client, run["run_id"])
+
+    assert failed["state"] == "failed"
+    assert failed["failure_class"] == "provider_response_failed"
+
+
+def test_runtime_io_failure_after_fresh_artifact_is_delivered_as_completed(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    db_path = tmp_path / "runtime.db"
+    runtime = RuntimeIoFailureWithDeliverableArtifactRuntime(tmp_path / "workers")
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Runtime I/O deliverable", "goal": "Promote completed user files."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Codex Worker", "role": "research", "profile": "codex-cli"},
+    ).json()
+
+    run = client.post(f"/v1/workers/{worker['worker_id']}/assign", json={"instruction": "create a report"}).json()
+    completed = wait_for_run(client, run["run_id"])
+
+    assert completed["state"] == "completed"
+    assert completed["failure_class"] == ""
+    assert "finished_report.md" in completed["output_text"]
+
+
+def test_prepared_codex_worker_uses_codex_runtime_label(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, RuntimeErrorWithPartialArtifactsRuntime(tmp_path / "workers"))
+    try:
+        project = service.create_project("owner", "Prepared Codex", "Check initial runtime label.", "codex-cli")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Prepared Codex Worker",
+            role="research",
+            profile="codex-cli",
+            backend="stub",
+            start_synchronously=False,
+        )
+
+        assert worker["runtime"] == "codex-cli"
+    finally:
+        service.shutdown()
 
 
 def test_worker_terminated_error_recovers_completed_artifacts(tmp_path):

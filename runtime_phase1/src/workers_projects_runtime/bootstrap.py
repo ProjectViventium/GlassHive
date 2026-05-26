@@ -196,6 +196,11 @@ def apply_bootstrap(
     _write_manifest(home_dir, profile, bundle)
 
 
+def refresh_runtime_env_for_worker(home_dir: Path, worker: dict[str, Any]) -> None:
+    """Refresh per-run environment projection without rewriting project files."""
+    _write_runtime_env(home_dir, bootstrap_env_for(worker))
+
+
 def _atomic_write_text(path: Path, text: str, *, mode: int = 0o644) -> None:
     tmp_path = path.with_name(f".{path.name}.tmp")
     tmp_path.write_text(text)
