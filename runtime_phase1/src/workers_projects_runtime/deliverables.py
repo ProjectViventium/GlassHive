@@ -146,13 +146,18 @@ def deliverable_payload(
 
     if preferred_html is not None:
         browser_url = workspace_browser_url(preferred_html, worker)
+        raw_root = str(worker.get("workspace_dir") or "").strip()
+        try:
+            workspace_path = preferred_html.relative_to(Path(raw_root)).as_posix() if raw_root else preferred_html.name
+        except ValueError:
+            workspace_path = preferred_html.name
         payload: dict[str, object] = {
             "kind": "webpage",
             "state": "ready" if latest_run else "available",
             "source": "workspace_html",
             "label": preferred_html.name,
             "preferred_surface": "desktop",
-            "workspace_path": preferred_html.name,
+            "workspace_path": workspace_path,
         }
         if browser_url:
             payload["browser_url"] = browser_url

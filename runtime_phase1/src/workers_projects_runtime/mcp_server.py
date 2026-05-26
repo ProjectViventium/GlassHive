@@ -107,7 +107,7 @@ def _configured_default_worker_profile() -> str:
         raise RuntimeError(
             "GLASSHIVE_DEFAULT_WORKER_PROFILE must be included in GLASSHIVE_ALLOWED_WORKER_PROFILES"
         )
-    return allowed[0]
+    return "codex-cli" if "codex-cli" in allowed else sorted(allowed)[0]
 
 
 def _host_profile_binary(profile: str) -> str:
@@ -334,8 +334,8 @@ def _apply_effort_to_bundle(bundle: dict[str, Any], *, profile: str, effort: str
         return bundle
     next_bundle = dict(bundle or {})
     if profile == "codex-cli":
-        if clean_effort not in {"minimal", "low", "medium", "high", "xhigh"}:
-            raise ValueError("Codex effort must be minimal, low, medium, high, or xhigh")
+        if clean_effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+            raise ValueError("Codex effort must be none, minimal, low, medium, high, or xhigh")
         env = dict(next_bundle.get("env") or {})
         env["WPR_CODEX_CLI_REASONING_EFFORT"] = clean_effort
         next_bundle["env"] = env
@@ -1638,8 +1638,11 @@ class WorkersProjectsApiClient:
     def worker_events(self, worker_id: str) -> list[dict[str, Any]]:
         return self._request("GET", f"/v1/workers/{worker_id}/events").get("items", [])
 
-    def assign_run(self, worker_id: str, instruction: str) -> dict[str, Any]:
-        return self._request("POST", f"/v1/workers/{worker_id}/assign", json_body={"instruction": instruction})
+    def assign_run(self, worker_id: str, instruction: str, *, effort: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"instruction": instruction}
+        if effort:
+            payload["effort"] = effort
+        return self._request("POST", f"/v1/workers/{worker_id}/assign", json_body=payload)
 
     def send_message(self, worker_id: str, message: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/workers/{worker_id}/message", json_body={"message": message})
@@ -1861,7 +1864,7 @@ def create_mcp_server(
         description=(
             "Save the authenticated user's default GlassHive worker and effort preferences. Use this "
             "when the user says to make Codex, Claude Code, or OpenClaw their default, or asks future "
-            "GlassHive runs to use a specific effort. Allowed Codex efforts: minimal, low, medium, "
+            "GlassHive runs to use a specific effort. Allowed Codex efforts: none, minimal, low, medium, "
             "high, xhigh. Claude: max. OpenClaw: high or max."
         ),
         structured_output=True,
@@ -1873,7 +1876,7 @@ def create_mcp_server(
         ] = None,
         codex_reasoning_effort: Annotated[
             str | None,
-            Field(description="Optional Codex default effort: minimal, low, medium, high, xhigh, or empty to use deployment default."),
+            Field(description="Optional Codex default effort: none, minimal, low, medium, high, xhigh, or empty to use deployment default."),
         ] = None,
         claude_effort: Annotated[
             str | None,
@@ -1949,7 +1952,7 @@ def create_mcp_server(
             str | None,
             Field(
                 description=(
-                    "Optional per-run effort override. Codex accepts minimal/low/medium/high/xhigh; "
+                    "Optional per-run effort override. Codex accepts none/minimal/low/medium/high/xhigh; "
                     "Claude Code accepts max; OpenClaw accepts high/max. Omit to use the user's saved default."
                 )
             ),
@@ -2191,7 +2194,7 @@ def create_mcp_server(
             str | None,
             Field(
                 description=(
-                    "Optional per-run effort override. Codex accepts minimal/low/medium/high/xhigh; "
+                    "Optional per-run effort override. Codex accepts none/minimal/low/medium/high/xhigh; "
                     "Claude Code accepts max; OpenClaw accepts high/max. Omit to use saved user preferences or deployment default."
                 )
             ),
@@ -2981,6 +2984,7 @@ def create_mcp_server(
                 "If requested_run_stale is true, acknowledge the requested run outcome first, then answer from the effective/latest run fields. "
                 "If terminal is true and run_state is failed, answer from failure_user_message, "
                 "failure_class, and failure_recommended_recovery before using error_text as diagnostics; "
+                "if artifact_links contains items, tell the user partial or final workspace files are available and include the relevant signed_open_url links instead of saying no artifacts were produced; "
                 "if failure_retryable is true and the user asks to continue or retry, call workspace_continue "
                 "instead of relaunching from scratch. If terminal is true and completed, answer from output_text "
                 "and include relevant artifact_links signed_open_url values as the default file links when present; "
@@ -3120,7 +3124,27 @@ def create_mcp_server(
         previous_run: dict[str, Any],
         continuation_goal: str | None,
     ) -> str:
-        original_instruction = str(previous_run.get("instruction") or "").strip()
+        def base_instruction(value: str) -> str:
+            text = str(value or "").strip()
+            for _ in range(8):
+                if not text.startswith("Continue this GlassHive workspace"):
+                    break
+                marker = "Original task:\n"
+                if marker not in text:
+                    break
+                text = text.split(marker, 1)[1].strip()
+                for stop_marker in (
+                    "\n\nPrevious failure classification:",
+                    "\n\nContinuation request:",
+                    "\n\nGlassHive completion contract:",
+                ):
+                    index = text.find(stop_marker)
+                    if index >= 0:
+                        text = text[:index].strip()
+                        break
+            return text
+
+        original_instruction = base_instruction(str(previous_run.get("instruction") or ""))
         failure_payload = _run_failure_payload(previous_run)
         chunks = [
             "Continue this GlassHive workspace from its current files, browser state, notes, and partial outputs.",
@@ -3167,6 +3191,15 @@ def create_mcp_server(
             str | None,
             Field(description="Optional extra instruction from the user, such as 'continue but avoid web search loops'."),
         ] = None,
+        effort: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional effort override for this continuation. Codex accepts none/minimal/low/medium/high/xhigh; "
+                    "Claude Code accepts max; OpenClaw accepts high/max. Omit to use the user's saved default."
+                )
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         clean_run_id = str(run_id or "").strip()
         if not clean_run_id:
@@ -3192,8 +3225,14 @@ def create_mcp_server(
             tenant_id, owner_id = _enterprise_request_scope()
             _require_enterprise_payload_scope(previous_run, label="previous run", tenant_id=tenant_id)
             _require_enterprise_payload_scope(worker, label="worker", tenant_id=tenant_id, owner_id=owner_id)
+        try:
+            preferences = _normalize_preferences(client.get_preferences())
+        except Exception:
+            preferences = {}
+        worker_profile = str(worker.get("profile") or "").strip()
+        resolved_effort = _resolve_effort_for_profile(worker_profile, effort, preferences)
         instruction = _continuation_instruction(previous_run=previous_run, continuation_goal=continuation_goal)
-        new_run = client.assign_run(clean_worker_id, instruction)
+        new_run = client.assign_run(clean_worker_id, instruction, effort=resolved_effort or None)
         if _enterprise_mode_enabled():
             _require_enterprise_payload_scope(new_run, label="continued run", tenant_id=tenant_id)
         request_surface = _header_value(_request_headers(), HEADER_SURFACE)
@@ -3213,6 +3252,7 @@ def create_mcp_server(
             "previous_run_id": clean_run_id,
             "previous_run_state": previous_state,
             "previous_failure_class": str(previous_run.get("failure_class") or "") or None,
+            "effort": resolved_effort,
             "run": new_run,
             "continuation_instruction_preview": _audit_preview(instruction, max_chars=900),
             "acknowledgement_guidance": (

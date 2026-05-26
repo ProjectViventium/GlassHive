@@ -29,7 +29,7 @@ class CreateProjectRequest(BaseModel):
     owner_id: str
     title: str
     goal: str
-    default_worker_profile: str = "openclaw-general"
+    default_worker_profile: str = ""
 
 
 class ProjectResponse(BaseModel):
@@ -98,6 +98,7 @@ class WorkerResponse(BaseModel):
 
 class AssignRunRequest(BaseModel):
     instruction: str = Field(min_length=1)
+    effort: str | None = None
 
 
 class SendMessageRequest(BaseModel):

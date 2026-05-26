@@ -168,8 +168,8 @@ class FakeApiClient:
     def worker_events(self, worker_id: str):
         return [{"event_id": "evt_123", "worker_id": worker_id, "event_type": "worker.ready"}]
 
-    def assign_run(self, worker_id: str, instruction: str):
-        return {"run_id": "run_assign", "worker_id": worker_id, "instruction": instruction, "state": "queued"}
+    def assign_run(self, worker_id: str, instruction: str, *, effort: str | None = None):
+        return {"run_id": "run_assign", "worker_id": worker_id, "instruction": instruction, "effort": effort or "", "state": "queued"}
 
     def send_message(self, worker_id: str, message: str):
         return {"run_id": "run_msg", "worker_id": worker_id, "instruction": message, "state": "queued"}
@@ -233,10 +233,10 @@ class TrackingApiClient(FakeApiClient):
         self.find_or_resume_payloads.append(kwargs)
         return super().find_or_resume_worker(**kwargs)
 
-    def assign_run(self, worker_id: str, instruction: str):
+    def assign_run(self, worker_id: str, instruction: str, *, effort: str | None = None):
         self.calls.append("assign_run")
-        self.assign_run_payloads.append({"worker_id": worker_id, "instruction": instruction})
-        return super().assign_run(worker_id, instruction)
+        self.assign_run_payloads.append({"worker_id": worker_id, "instruction": instruction, "effort": effort or ""})
+        return super().assign_run(worker_id, instruction, effort=effort)
 
 
 class PreferenceApiClient(TrackingApiClient):
@@ -310,8 +310,8 @@ class RememberedDispatchApiClient(TrackingApiClient):
         self.workers[payload["worker_id"]] = payload
         return payload
 
-    def assign_run(self, worker_id: str, instruction: str):
-        payload = super().assign_run(worker_id, instruction)
+    def assign_run(self, worker_id: str, instruction: str, *, effort: str | None = None):
+        payload = super().assign_run(worker_id, instruction, effort=effort)
         payload.update(
             {
                 "tenant_id": self.tenant_id,
@@ -381,7 +381,7 @@ class RetryableFailureApiClient(FakeApiClient):
 
     def get_worker(self, worker_id: str):
         payload = super().get_worker(worker_id)
-        payload.update({"worker_id": worker_id, "project_id": "prj_retry", "tenant_id": "local", "state": "ready"})
+        payload.update({"worker_id": worker_id, "project_id": "prj_retry", "tenant_id": "local", "profile": "codex-cli", "state": "ready"})
         return payload
 
     def worker_live(self, worker_id: str):
@@ -397,8 +397,8 @@ class RetryableFailureApiClient(FakeApiClient):
             "project_runs": [],
         }
 
-    def assign_run(self, worker_id: str, instruction: str):
-        self.assigned.append({"worker_id": worker_id, "instruction": instruction})
+    def assign_run(self, worker_id: str, instruction: str, *, effort: str | None = None):
+        self.assigned.append({"worker_id": worker_id, "instruction": instruction, "effort": effort or ""})
         return {
             "run_id": "run_continued",
             "worker_id": worker_id,
@@ -406,6 +406,7 @@ class RetryableFailureApiClient(FakeApiClient):
             "tenant_id": "local",
             "state": "queued",
             "instruction": instruction,
+            "effort": effort or "",
         }
 
 
@@ -443,8 +444,8 @@ class EnterpriseRetryableFailureApiClient(RetryableFailureApiClient):
         )
         return payload
 
-    def assign_run(self, worker_id: str, instruction: str):
-        payload = super().assign_run(worker_id, instruction)
+    def assign_run(self, worker_id: str, instruction: str, *, effort: str | None = None):
+        payload = super().assign_run(worker_id, instruction, effort=effort)
         payload["tenant_id"] = self.new_run_tenant_id
         return payload
 
@@ -643,6 +644,13 @@ def test_configured_default_worker_profile_fails_loud_when_not_allowed(monkeypat
 
     with pytest.raises(RuntimeError, match="GLASSHIVE_DEFAULT_WORKER_PROFILE"):
         mcp_server._configured_default_worker_profile()
+
+
+def test_configured_default_worker_profile_prefers_codex_when_allowed(monkeypatch):
+    monkeypatch.delenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", raising=False)
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "openclaw-general,codex-cli")
+
+    assert mcp_server._configured_default_worker_profile() == "codex-cli"
 
 
 def test_project_create_reads_default_worker_profile_at_call_time(monkeypatch):
@@ -1092,6 +1100,34 @@ def test_workspace_wait_prefers_newer_worker_run_over_stale_failed_run(monkeypat
                 "https://glasshive.example.test/v1/signed-links/"
             )
             assert "acknowledge the requested run outcome first" in payload["next_action_guidance"]
+
+    asyncio.run(scenario())
+
+
+def test_workspace_status_failed_run_surfaces_partial_artifact_links(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive.example.test")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    server = create_mcp_server(api_client=RetryableFailureApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            checked = await client.call_tool(
+                "workspace_status",
+                {
+                    "run_id": "run_retryable_failed",
+                    "worker_id": "wrk_retry",
+                    "include_live": False,
+                },
+            )
+            payload = _tool_json(checked)
+            assert payload["terminal"] is True
+            assert payload["run_state"] == "failed"
+            assert payload["failure_class"] == "provider_rate_limited"
+            assert payload["artifact_links"]["items"][0]["signed_open_url"].startswith(
+                "https://glasshive.example.test/v1/signed-links/"
+            )
+            assert "partial or final workspace files are available" in payload["next_action_guidance"]
+            assert "workspace_continue" in payload["next_action_guidance"]
 
     asyncio.run(scenario())
 
@@ -1783,12 +1819,14 @@ def test_workspace_continue_queues_same_workspace_recovery(monkeypatch):
                 {
                     "run_id": "run_retryable_failed",
                     "continuation_goal": "Continue and finish the workbook from current partial files.",
+                    "effort": "medium",
                 },
             )
             payload = _tool_json(continued)
             assert payload["status"] == "queued"
             assert payload["previous_run_id"] == "run_retryable_failed"
             assert payload["previous_failure_class"] == "provider_rate_limited"
+            assert payload["effort"] == "medium"
             assert payload["follow_up_context"]["run_id"] == "run_continued"
             assert payload["view_steer_url"].startswith("http://127.0.0.1:8780/watch/wrk_retry")
 
@@ -1800,6 +1838,45 @@ def test_workspace_continue_queues_same_workspace_recovery(monkeypatch):
     assert "Previous failure classification:" in instruction
     assert "provider_rate_limited" in instruction
     assert "current files" in instruction
+    assert api_client.assigned[0]["effort"] == "medium"
+
+
+def test_workspace_continue_does_not_nest_previous_continue_wrappers(monkeypatch):
+    class NestedContinuationApiClient(RetryableFailureApiClient):
+        def get_run(self, run_id: str):
+            payload = super().get_run(run_id)
+            if run_id == "run_retryable_failed":
+                payload["instruction"] = (
+                    "Continue this GlassHive workspace from its current files, browser state, notes, and partial outputs.\n\n"
+                    "Preserve the original user request, success criteria, response format, and any files already available in the workspace.\n\n"
+                    "Original task:\nBuild the requested research workbook and report.\n\n"
+                    "Previous failure classification:\n- class: provider_response_failed\n"
+                    "- retryable: True\n\n"
+                    "Continuation request:\nResume the original task from current files."
+                )
+            return payload
+
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "http://127.0.0.1:8780")
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {"X-Viventium-Surface": "web"})
+    api_client = NestedContinuationApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            await client.call_tool(
+                "workspace_continue",
+                {
+                    "run_id": "run_retryable_failed",
+                    "continuation_goal": "Finish from the existing files.",
+                },
+            )
+
+    asyncio.run(scenario())
+    instruction = api_client.assigned[0]["instruction"]
+    assert instruction.count("Original task:") == 1
+    assert "Build the requested research workbook and report." in instruction
+    assert "Resume the original task from current files." not in instruction
+    assert "Finish from the existing files." in instruction
 
 
 def test_workspace_continue_rejects_mismatched_worker_id(monkeypatch):
@@ -2028,6 +2105,16 @@ def test_workspace_wait_uses_configured_default_timeout_when_omitted(monkeypatch
 
     asyncio.run(scenario())
     assert api_client.get_run_calls == 1
+
+
+def test_workspace_wait_long_task_timeout_env_is_capped(monkeypatch):
+    monkeypatch.setenv("WPR_MCP_BLOCKING_WAIT_DEFAULT_SEC", "2700")
+    monkeypatch.setenv("WPR_MCP_BLOCKING_WAIT_MAX_SEC", "3600")
+    assert mcp_server._blocking_wait_default_seconds() == 2700
+    assert mcp_server._blocking_wait_max_seconds() == 3600
+
+    monkeypatch.setenv("WPR_MCP_BLOCKING_WAIT_DEFAULT_SEC", "5000")
+    assert mcp_server._blocking_wait_default_seconds() == 3600
 
 
 def test_worker_delegate_once_merges_upload_headers(monkeypatch):

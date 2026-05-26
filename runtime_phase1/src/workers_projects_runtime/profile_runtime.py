@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from threading import Lock
 
-from .bootstrap import resolve_bootstrap_source_path
+from .bootstrap import refresh_runtime_env_for_worker, resolve_bootstrap_source_path
 from .docker_sandbox import DockerSandboxManager
 from .failure_classification import classify_cli_failure
 from .openclaw_runtime import (
@@ -697,6 +697,7 @@ class BaseCliWorkerRuntime:
             "_glasshive_task_run": True,
         }
         info = self.ensure_worker_ready(worker_for_run)
+        refresh_runtime_env_for_worker(self._home_dir(worker_for_run["worker_id"]), worker_for_run)
         command, env = self._build_command(worker_for_run, instruction, info)
         stdout_path, stderr_path = self._log_paths(worker_for_run["worker_id"])
         with stderr_path.open("a") as handle:
@@ -1392,7 +1393,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
 
     def _compatible_provider_allowed_reasoning_efforts(self) -> set[str]:
         raw = os.environ.get("WPR_CODEX_CLI_ALLOWED_REASONING_EFFORTS", "").strip()
-        valid = {"minimal", "low", "medium", "high", "xhigh"}
+        valid = {"none", "minimal", "low", "medium", "high", "xhigh"}
         if not raw:
             return set(valid)
         configured = {item.strip().lower() for item in raw.split(",") if item.strip()}
@@ -1459,7 +1460,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         )
         if verbosity:
             command.extend(["-c", f'model_verbosity="{verbosity}"'])
-        if reasoning_effort in {"minimal", "low", "medium", "high", "xhigh"}:
+        if reasoning_effort in {"none", "minimal", "low", "medium", "high", "xhigh"}:
             command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
         if reasoning_effort == "minimal":
             command.extend(["-c", 'web_search="disabled"'])

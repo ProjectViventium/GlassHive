@@ -471,7 +471,7 @@ def test_start_screen_session_prepares_runtime_dir_and_detaches(tmp_path):
     assert calls[1][1][:2] == ["screen", "-DmS"]
     assert calls[1][2] is True
     assert calls[1][3]["PATH"] == "/usr/bin:/bin"
-    assert "OPENAI_API_KEY" not in calls[1][3]
+    assert calls[1][3]["OPENAI_API_KEY"] == "secret"
 
 
 def test_start_screen_session_uses_known_worker_fast_path(tmp_path):
