@@ -1486,6 +1486,30 @@ def test_enterprise_signed_artifact_link_cannot_open_workspace_shell(monkeypatch
     assert runtime.header_contexts == []
 
 
+def test_enterprise_signed_worker_link_cannot_proxy_signed_artifact_endpoint(monkeypatch):
+    signed_secret = "ui-signed-link-secret"
+    set_enterprise_ui_env(monkeypatch, signed_secret=signed_secret)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    token = signed_worker_token(signed_secret)
+
+    assert client.get(f"/v1/signed-links/{token}").status_code == 403
+    assert runtime.header_contexts == []
+
+
+def test_enterprise_signed_artifact_link_cannot_proxy_raw_runtime_routes(monkeypatch):
+    signed_secret = "ui-signed-link-secret"
+    set_enterprise_ui_env(monkeypatch, signed_secret=signed_secret)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    token = signed_artifact_token(signed_secret, kind="artifact_open")
+
+    assert client.get(f"/v1/workers/wrk_1/artifacts/open?gh_token={token}&path=workspace/report.txt").status_code == 403
+    assert runtime.header_contexts == []
+
+
 def test_signed_watch_rejects_unsafe_worker_cookie_name(monkeypatch):
     secret = "ui-signed-link-secret"
     monkeypatch.setenv("WPR_API_TOKEN", secret)

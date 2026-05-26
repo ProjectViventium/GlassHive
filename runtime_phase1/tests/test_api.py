@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 import pytest
@@ -652,6 +652,16 @@ def test_enterprise_mode_scopes_projects_workers_and_artifacts(tmp_path, monkeyp
     )
     assert signed_open_page.status_code == 200
     assert "user-a result" in signed_open_page.text
+    cross_kind_download = client.get(
+        f"/v1/workers/{worker_a_payload['worker_id']}/artifacts/download",
+        params={"path": "result.txt", **signed_open},
+    )
+    assert cross_kind_download.status_code == 401
+    cross_kind_open = client.get(
+        f"/v1/workers/{worker_a_payload['worker_id']}/artifacts/open",
+        params={"path": "result.txt", **signed},
+    )
+    assert cross_kind_open.status_code == 401
     signed_token = sign_link_token(
         kind="artifact_download",
         worker_id=worker_a_payload["worker_id"],
@@ -669,10 +679,14 @@ def test_enterprise_mode_scopes_projects_workers_and_artifacts(tmp_path, monkeyp
         owner_id="user-a",
     )
     opaque_watch = client.get(f"/v1/signed-links/{watch_token}", follow_redirects=False)
-    assert opaque_watch.status_code == 302
-    assert f"/ui/workers/{worker_a_payload['worker_id']}" in opaque_watch.headers["location"]
-    assert "gh_sig=" in opaque_watch.headers["location"]
-    signed_watch_query = urlsplit(opaque_watch.headers["location"]).query
+    assert opaque_watch.status_code == 400
+    signed_watch = sign_link_params(
+        kind="worker_view",
+        worker_id=worker_a_payload["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    signed_watch_query = urlencode(signed_watch)
     signed_live = client.get(f"/v1/workers/{worker_a_payload['worker_id']}/live?{signed_watch_query}")
     assert signed_live.status_code == 200
     assert signed_live.json()["worker"]["owner_id"] == "user-a"

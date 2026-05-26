@@ -1108,17 +1108,6 @@ def create_app(
                 return _artifact_open_page(worker, target, path, request)
             store.add_event(worker["project_id"], worker_id, None, "worker.artifact_downloaded", target.name)
             return FileResponse(target, filename=target.name, headers=ARTIFACT_DOWNLOAD_SECURITY_HEADERS)
-        if kind == "worker_view":
-            expires_at = int(payload.get("exp") or 0)
-            signed = sign_link_params(
-                kind="worker_view",
-                worker_id=worker_id,
-                tenant_id=str(worker.get("tenant_id") or ""),
-                owner_id=str(worker.get("owner_id") or ""),
-                expires_at=expires_at,
-            )
-            url = f"/ui/workers/{quote(worker_id)}?surface=desktop&project_id={quote(str(worker.get('project_id') or ''))}"
-            return RedirectResponse(append_signed_query(url, signed), status_code=302)
         raise HTTPException(status_code=400, detail="Signed link kind is not supported")
 
     @app.get("/v1/workers/{worker_id}/artifacts")
