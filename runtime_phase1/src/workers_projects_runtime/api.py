@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import os
+import base64
 import json
+import mimetypes
+import os
 import hmac
 from contextlib import asynccontextmanager
 from html import escape
@@ -13,6 +15,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 
 from .auth import AuthContext, EnterpriseAuthSettings, GlassHiveAuthError, scoped_alias
 from .deliverables import deliverable_payload
+from .failure_classification import classify_runtime_error
 from .models import (
     AssignRunRequest,
     CreateProjectRequest,
@@ -34,7 +37,7 @@ from .models import (
     UserPreferencesResponse,
     WorkerResponse,
 )
-from .openclaw_runtime import StubRuntime, WorkerRuntime
+from .openclaw_runtime import RuntimeDependencyMissingError, StubRuntime, WorkerRuntime
 from .profile_runtime import ProfiledWorkerRuntime, _redact_text
 from .runtime_env import load_viventium_runtime_env
 from .service import (
@@ -44,13 +47,47 @@ from .service import (
     WorkersProjectsService,
     allowed_worker_profiles,
 )
-from .signed_links import append_signed_query, sign_link_params, verify_signed_link, verify_signed_link_token
+from .signed_links import append_signed_query, sign_link_params, sign_link_token, verify_signed_link, verify_signed_link_token
 from .store import Store
 from .terminal_takeover import TerminalTarget, bridge_terminal
 
 load_viventium_runtime_env()
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "runtime_phase1.db"
+TEXT_ARTIFACT_PREVIEW_EXTENSIONS = {
+    ".css",
+    ".csv",
+    ".htm",
+    ".html",
+    ".ini",
+    ".js",
+    ".json",
+    ".log",
+    ".md",
+    ".markdown",
+    ".py",
+    ".sh",
+    ".sql",
+    ".toml",
+    ".ts",
+    ".tsv",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+ARTIFACT_OPEN_SECURITY_HEADERS = {
+    "Cache-Control": "no-store, no-cache, private, max-age=0",
+    "Content-Security-Policy": "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+    "Pragma": "no-cache",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+}
+ARTIFACT_DOWNLOAD_SECURITY_HEADERS = {
+    "Cache-Control": "no-store, no-cache, private, max-age=0",
+    "Pragma": "no-cache",
+    "X-Content-Type-Options": "nosniff",
+}
 
 
 def _build_runtime(runtime_backend: str, db_path: str, runtime: WorkerRuntime | None) -> WorkerRuntime:
@@ -104,6 +141,22 @@ def create_app(
         _ = request
         return JSONResponse(status_code=403, content={"detail": str(exc)})
 
+    @app.exception_handler(RuntimeDependencyMissingError)
+    async def runtime_dependency_missing_handler(request: Request, exc: RuntimeDependencyMissingError) -> JSONResponse:
+        _ = request
+        failure = classify_runtime_error(
+            exc,
+            runtime_name=str(getattr(exc, "runtime_name", "") or "worker"),
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "status": "blocked",
+                "detail": failure.user_message,
+                **failure.as_store_fields(),
+            },
+        )
+
     api_token = os.environ.get("WPR_API_TOKEN", "").strip()
     auth_settings = EnterpriseAuthSettings()
     auth_settings.validate_startup(api_token=api_token)
@@ -133,7 +186,10 @@ def create_app(
         artifact_path = ""
         if len(path_parts) >= 3 and path_parts[0] == "v1" and path_parts[1] == "workers":
             worker_id = path_parts[2]
-            if kind == "artifact_download" and request.method.upper() == "GET" and path_parts[3:] == ["artifacts", "download"]:
+            if kind in {"artifact_download", "artifact_open"} and request.method.upper() == "GET":
+                expected_action = "download" if kind == "artifact_download" else "open"
+                if path_parts[3:] != ["artifacts", expected_action]:
+                    return None
                 artifact_path = str(request.query_params.get("path") or "").strip().lstrip("/")
             elif kind == "worker_view" and path_parts[3:] and path_parts[3] in {
                 "assign",
@@ -483,6 +539,133 @@ def create_app(
         if max_bytes >= 0 and target.stat().st_size > max_bytes:
             raise HTTPException(status_code=413, detail="Artifact is larger than the configured download limit")
         return target
+
+    def _artifact_query_url(worker_id: str, action: str, relative_path: str) -> str:
+        return f"/v1/workers/{quote(worker_id)}/artifacts/{action}?path={quote(str(relative_path or ''), safe='')}"
+
+    def _signed_artifact_action_url(worker: dict, relative_path: str, *, kind: str, fallback_action: str) -> str:
+        worker_id = str(worker.get("worker_id") or "")
+        token = sign_link_token(
+            kind=kind,
+            worker_id=worker_id,
+            tenant_id=str(worker.get("tenant_id") or ""),
+            owner_id=str(worker.get("owner_id") or ""),
+            path=str(relative_path or "").strip().lstrip("/"),
+        )
+        if token:
+            return f"/v1/signed-links/{quote(token, safe='')}"
+        return _artifact_query_url(worker_id, fallback_action, relative_path)
+
+    def _signed_watch_action_url(worker: dict) -> str:
+        worker_id = str(worker.get("worker_id") or "")
+        project_id = str(worker.get("project_id") or "")
+        watch_url = f"/watch/{quote(worker_id)}?surface=desktop&project_id={quote(project_id)}"
+        token = sign_link_token(
+            kind="worker_view",
+            worker_id=worker_id,
+            tenant_id=str(worker.get("tenant_id") or ""),
+            owner_id=str(worker.get("owner_id") or ""),
+        )
+        if token:
+            return append_signed_query(watch_url, {"gh_token": token})
+        return watch_url
+
+    def _artifact_mime_type(target: Path) -> str:
+        guessed, _ = mimetypes.guess_type(target.name)
+        if guessed:
+            return guessed
+        if target.suffix.lower() in TEXT_ARTIFACT_PREVIEW_EXTENSIONS:
+            return "text/plain"
+        return "application/octet-stream"
+
+    def _is_text_preview_artifact(target: Path, media_type: str) -> bool:
+        suffix = target.suffix.lower()
+        return (
+            suffix in TEXT_ARTIFACT_PREVIEW_EXTENSIONS
+            or media_type.startswith("text/")
+            or media_type in {"application/json", "application/xml", "application/x-yaml"}
+        )
+
+    def _read_artifact_text_preview(target: Path) -> tuple[str, bool]:
+        max_bytes = int(os.environ.get("GLASSHIVE_ARTIFACT_PREVIEW_MAX_BYTES", str(512 * 1024)))
+        max_bytes = max(4096, min(max_bytes, 5 * 1024 * 1024))
+        with target.open("rb") as handle:
+            visible = handle.read(max_bytes)
+            truncated = bool(handle.read(1))
+        return visible.decode("utf-8", errors="replace"), truncated
+
+    def _artifact_open_page(worker: dict, target: Path, relative_path: str, request: Request) -> HTMLResponse:
+        worker_id = str(worker.get("worker_id") or "")
+        download_url = _signed_artifact_action_url(
+            worker,
+            relative_path,
+            kind="artifact_download",
+            fallback_action="download",
+        )
+        workspace_url = _signed_watch_action_url(worker)
+        media_type = _artifact_mime_type(target)
+        size = target.stat().st_size
+        preview = ""
+        if _is_text_preview_artifact(target, media_type):
+            text, truncated = _read_artifact_text_preview(target)
+            truncated_note = (
+                "<p class=\"notice\">Preview is truncated. Use Download file for the complete artifact.</p>"
+                if truncated
+                else ""
+            )
+            preview = f"""
+              {truncated_note}
+              <pre class="artifact-preview">{escape(text)}</pre>
+            """
+        elif media_type.startswith("image/") and media_type != "image/svg+xml" and size <= 2 * 1024 * 1024:
+            raw = target.read_bytes()
+            encoded = base64.b64encode(raw).decode("ascii")
+            preview = f'<img class="image-preview" src="data:{escape(media_type, quote=True)};base64,{encoded}" alt="{escape(target.name, quote=True)}" />'
+        else:
+            preview = (
+                "<div class=\"no-preview\">"
+                "<h2>File is ready</h2>"
+                "<p>This artifact type is best opened by downloading it with the button above.</p>"
+                "</div>"
+            )
+        html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GlassHive file - {escape(target.name)}</title>
+  <style>
+    :root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    body {{ margin: 0; background: #07090d; color: #eef2f7; }}
+    .shell {{ min-height: 100vh; padding: 32px; box-sizing: border-box; }}
+    .topbar {{ display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 24px; }}
+    .brand {{ border: 1px solid rgba(255,255,255,0.18); border-radius: 999px; padding: 8px 14px; letter-spacing: 0.16em; font-size: 12px; text-transform: uppercase; }}
+    .actions {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+    a.button {{ color: #0b0d11; background: #f5f7fb; text-decoration: none; border-radius: 999px; padding: 10px 14px; font-weight: 700; }}
+    a.secondary {{ color: #eef2f7; background: #171b22; border: 1px solid rgba(255,255,255,0.16); }}
+    h1 {{ margin: 0 0 8px; font-size: clamp(28px, 5vw, 56px); line-height: 1; overflow-wrap: anywhere; }}
+    .meta {{ color: #a9b2c0; margin-bottom: 24px; }}
+    .artifact-preview {{ margin: 0; padding: 24px; border: 1px solid rgba(255,255,255,0.14); border-radius: 14px; background: #10141b; color: #eef2f7; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; font-size: 14px; }}
+    .notice, .no-preview {{ border: 1px solid rgba(255,255,255,0.14); border-radius: 14px; background: #10141b; padding: 18px; color: #cbd3df; }}
+    .image-preview {{ max-width: 100%; border-radius: 14px; border: 1px solid rgba(255,255,255,0.14); background: #10141b; }}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="topbar">
+      <div class="brand">GlassHive</div>
+      <div class="actions">
+        <a class="button" href="{escape(download_url, quote=True)}">Download file</a>
+        <a class="button secondary" href="{escape(workspace_url, quote=True)}">View workspace</a>
+      </div>
+    </div>
+    <h1>{escape(target.name)}</h1>
+    <div class="meta">{escape(media_type)} &middot; {size:,} bytes</div>
+    {preview}
+  </main>
+</body>
+</html>"""
+        return HTMLResponse(html, headers=ARTIFACT_OPEN_SECURITY_HEADERS)
 
     def _sanitize_worker(worker: dict) -> dict[str, object]:
         safe = dict(worker)
@@ -917,11 +1100,14 @@ def create_app(
             enterprise=auth_settings.enterprise,
         )
         kind = str(payload.get("kind") or "")
-        if kind == "artifact_download":
+        if kind in {"artifact_download", "artifact_open"}:
             path = str(payload.get("path") or "").strip().lstrip("/")
             target = _artifact_path(worker, path)
+            if kind == "artifact_open":
+                store.add_event(worker["project_id"], worker_id, None, "worker.artifact_opened", target.name)
+                return _artifact_open_page(worker, target, path, request)
             store.add_event(worker["project_id"], worker_id, None, "worker.artifact_downloaded", target.name)
-            return FileResponse(target, filename=target.name)
+            return FileResponse(target, filename=target.name, headers=ARTIFACT_DOWNLOAD_SECURITY_HEADERS)
         if kind == "worker_view":
             expires_at = int(payload.get("exp") or 0)
             signed = sign_link_params(
@@ -941,7 +1127,8 @@ def create_app(
         items = [
             {
                 **item,
-                "download_url": f"/v1/workers/{worker_id}/artifacts/download?path={quote(str(item['path']))}",
+                "open_url": _artifact_query_url(worker_id, "open", str(item["path"])),
+                "download_url": _artifact_query_url(worker_id, "download", str(item["path"])),
             }
             for item in _workspace_items(worker, max_entries=500, max_depth=8)
             if not item.get("is_dir")
@@ -949,12 +1136,19 @@ def create_app(
         store.add_event(worker["project_id"], worker_id, None, "worker.artifacts_listed", "Workspace artifacts listed")
         return {"items": items}
 
+    @app.get("/v1/workers/{worker_id}/artifacts/open")
+    def open_worker_artifact(worker_id: str, path: str, request: Request) -> HTMLResponse:
+        worker = require_worker(worker_id, request)
+        target = _artifact_path(worker, path)
+        store.add_event(worker["project_id"], worker_id, None, "worker.artifact_opened", target.name)
+        return _artifact_open_page(worker, target, path, request)
+
     @app.get("/v1/workers/{worker_id}/artifacts/download")
     def download_worker_artifact(worker_id: str, path: str, request: Request) -> FileResponse:
         worker = require_worker(worker_id, request)
         target = _artifact_path(worker, path)
         store.add_event(worker["project_id"], worker_id, None, "worker.artifact_downloaded", target.name)
-        return FileResponse(target, filename=target.name)
+        return FileResponse(target, filename=target.name, headers=ARTIFACT_DOWNLOAD_SECURITY_HEADERS)
 
     @app.get("/v1/metrics/summary", response_model=MetricsSummary)
     def metrics(request: Request) -> MetricsSummary:

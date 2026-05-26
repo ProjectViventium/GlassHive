@@ -17,8 +17,10 @@ from threading import Lock
 
 from .bootstrap import resolve_bootstrap_source_path
 from .docker_sandbox import DockerSandboxManager
+from .failure_classification import classify_cli_failure
 from .openclaw_runtime import (
     RuntimeErrorBase,
+    RuntimeDependencyMissingError,
     RuntimeInfo,
     WorkerInterruptedError,
     WorkerPausedError,
@@ -77,6 +79,11 @@ class ProfiledWorkerRuntime:
     def resolve_model(self, profile: str, execution_mode: str = "docker") -> str:
         return self._runtime_for_profile(profile, execution_mode).resolve_model(profile)
 
+    def preflight_worker_profile(self, profile: str, execution_mode: str = "docker") -> None:
+        runtime = self._runtime_for_profile(profile, execution_mode)
+        if hasattr(runtime, "preflight_worker_profile"):
+            runtime.preflight_worker_profile(profile, execution_mode)
+
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).ensure_worker_ready(worker)
 
@@ -127,7 +134,7 @@ class ProfiledWorkerRuntime:
             "state_dir": str(worker.get("state_dir") or ""),
         }
 
-    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, str] | None:
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
         runtime = self._runtime_for_worker(worker)
         if hasattr(runtime, "collect_completed_run"):
             try:
@@ -174,6 +181,9 @@ class BaseCliWorkerRuntime:
 
     def resolve_model(self, profile: str) -> str:
         raise NotImplementedError
+
+    def preflight_worker_profile(self, profile: str, execution_mode: str = "docker") -> None:
+        return None
 
     def _default_session_key(self, worker: dict) -> str | None:
         return worker.get("session_key") or f"worker:{worker['worker_id']}"
@@ -619,7 +629,7 @@ class BaseCliWorkerRuntime:
             "pid": sandbox["pid"],
         }
 
-    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, str] | None:
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
         active_session = self._latest_completed_run_payload(worker["worker_id"], run_id=run_id)
         if not active_session:
             return None
@@ -641,11 +651,18 @@ class BaseCliWorkerRuntime:
         except ValueError:
             exit_code = 1
         if exit_code != 0:
-            detail = (stderr or stdout or "").strip()[-2000:]
+            classification = classify_cli_failure(
+                stdout=stdout,
+                stderr=stderr,
+                runtime_name=self.runtime_name,
+                exit_code=exit_code,
+            )
+            detail = _redact_text((stderr or stdout or "").strip(), max_chars=2000)
             return {
                 "state": "failed",
                 "output_text": "",
-                "error_text": f"{self.runtime_name} exited with code {exit_code}: {detail}",
+                "error_text": _redact_text(f"{self.runtime_name} exited with code {exit_code}: {detail}"),
+                **classification.as_store_fields(),
             }
         try:
             session_key, output = self._parse_output(worker, stdout, stderr, self.reconcile_worker(worker))
@@ -2028,9 +2045,21 @@ class HostNativeCliMixin:
             pid=pid,
         )
 
-    def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+    def preflight_worker_profile(self, profile: str, execution_mode: str = "host") -> None:
         if shutil.which(self.binary) is None:
-            raise RuntimeErrorBase(f"{self.binary} CLI is not installed or not on PATH for host-native {self.runtime_name}")
+            raise RuntimeDependencyMissingError(
+                f"{self.binary} CLI is not installed or not on PATH for host-native {self.runtime_name}",
+                binary=self.binary,
+                runtime_name=self.runtime_name,
+                profile=profile,
+                execution_mode=execution_mode,
+            )
+
+    def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+        self.preflight_worker_profile(
+            str(worker.get("profile") or ""),
+            str(worker.get("execution_mode") or "host"),
+        )
         worker_id = worker["worker_id"]
         self._state_dir(worker_id).mkdir(parents=True, exist_ok=True)
         self._home_dir(worker_id).mkdir(parents=True, exist_ok=True)
@@ -2337,10 +2366,21 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
     worker_root_name = "host_codex_cli_runtime"
 
     def resolve_model(self, profile: str) -> str:
+        if profile != "codex-cli":
+            return super().resolve_model(profile)
         host_model = os.environ.get("WPR_MODEL_HOST_CODEX_CLI", "").strip()
-        if profile == "codex-cli" and host_model:
+        if host_model:
             return host_model
-        return super().resolve_model(profile)
+        codex_model = os.environ.get("CODEX_MODEL", "").strip()
+        if codex_model:
+            return codex_model
+        inherit_provider_model = os.environ.get(
+            "GLASSHIVE_HOST_CODEX_INHERIT_PROVIDER_MODEL",
+            os.environ.get("WPR_HOST_CODEX_INHERIT_PROVIDER_MODEL", ""),
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if inherit_provider_model:
+            return os.environ.get("WPR_MODEL_CODEX_CLI", "").strip()
+        return ""
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         info = HostNativeCliMixin.ensure_worker_ready(self, worker)

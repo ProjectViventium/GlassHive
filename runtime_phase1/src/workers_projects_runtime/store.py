@@ -9,6 +9,28 @@ from typing import Any
 from .models import utc_now
 
 
+_FAILURE_FIELD_NAMES = {
+    "failure_class",
+    "failure_retryable",
+    "failure_user_message",
+    "failure_recommended_recovery",
+    "failure_diagnostic_summary",
+}
+
+
+def _normalized_failure_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for key in _FAILURE_FIELD_NAMES:
+        if key not in fields:
+            continue
+        value = fields.get(key)
+        if key == "failure_retryable":
+            normalized[key] = 1 if bool(value) else 0
+        else:
+            normalized[key] = str(value or "")
+    return normalized
+
+
 class Store:
     def __init__(self, db_path: str) -> None:
         self.db_path = Path(db_path)
@@ -85,6 +107,11 @@ class Store:
                     ended_at TEXT,
                     output_text TEXT NOT NULL,
                     error_text TEXT NOT NULL,
+                    failure_class TEXT NOT NULL DEFAULT '',
+                    failure_retryable INTEGER NOT NULL DEFAULT 0,
+                    failure_user_message TEXT NOT NULL DEFAULT '',
+                    failure_recommended_recovery TEXT NOT NULL DEFAULT '',
+                    failure_diagnostic_summary TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(worker_id) REFERENCES workers(worker_id),
                     FOREIGN KEY(project_id) REFERENCES projects(project_id)
                 );
@@ -178,6 +205,16 @@ class Store:
             run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
             if "tenant_id" not in run_columns:
                 conn.execute("ALTER TABLE runs ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
+            if "failure_class" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN failure_class TEXT NOT NULL DEFAULT ''")
+            if "failure_retryable" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN failure_retryable INTEGER NOT NULL DEFAULT 0")
+            if "failure_user_message" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN failure_user_message TEXT NOT NULL DEFAULT ''")
+            if "failure_recommended_recovery" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN failure_recommended_recovery TEXT NOT NULL DEFAULT ''")
+            if "failure_diagnostic_summary" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN failure_diagnostic_summary TEXT NOT NULL DEFAULT ''")
             event_columns = {row["name"] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
             if "tenant_id" not in event_columns:
                 conn.execute("ALTER TABLE events ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
@@ -543,12 +580,27 @@ class Store:
             "ended_at": None,
             "output_text": "",
             "error_text": "",
+            "failure_class": "",
+            "failure_retryable": 0,
+            "failure_user_message": "",
+            "failure_recommended_recovery": "",
+            "failure_diagnostic_summary": "",
         }
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO runs (run_id, worker_id, project_id, tenant_id, instruction, state, queued_at, started_at, ended_at, output_text, error_text)
-                VALUES (:run_id, :worker_id, :project_id, :tenant_id, :instruction, :state, :queued_at, :started_at, :ended_at, :output_text, :error_text)
+                INSERT INTO runs (
+                    run_id, worker_id, project_id, tenant_id, instruction, state, queued_at,
+                    started_at, ended_at, output_text, error_text, failure_class,
+                    failure_retryable, failure_user_message, failure_recommended_recovery,
+                    failure_diagnostic_summary
+                )
+                VALUES (
+                    :run_id, :worker_id, :project_id, :tenant_id, :instruction, :state,
+                    :queued_at, :started_at, :ended_at, :output_text, :error_text,
+                    :failure_class, :failure_retryable, :failure_user_message,
+                    :failure_recommended_recovery, :failure_diagnostic_summary
+                )
                 """,
                 data,
             )
@@ -652,14 +704,22 @@ class Store:
             ).fetchone()
         return row is not None
 
-    def finalize_run(self, run_id: str, state: str, output_text: str = "", error_text: str = "") -> dict[str, Any] | None:
-        return self.update_run(
-            run_id,
-            state=state,
-            ended_at=utc_now(),
-            output_text=output_text,
-            error_text=error_text,
-        )
+    def finalize_run(
+        self,
+        run_id: str,
+        state: str,
+        output_text: str = "",
+        error_text: str = "",
+        **failure_fields: Any,
+    ) -> dict[str, Any] | None:
+        fields = {
+            "state": state,
+            "ended_at": utc_now(),
+            "output_text": output_text,
+            "error_text": error_text,
+        }
+        fields.update(_normalized_failure_fields(failure_fields))
+        return self.update_run(run_id, **fields)
 
     def finalize_run_if_state(
         self,
@@ -668,15 +728,27 @@ class Store:
         state: str,
         output_text: str = "",
         error_text: str = "",
+        **failure_fields: Any,
     ) -> dict[str, Any] | None:
+        normalized_failure_fields = _normalized_failure_fields(failure_fields)
+        update_fields = {
+            "state": state,
+            "ended_at": utc_now(),
+            "output_text": output_text,
+            "error_text": error_text,
+            **normalized_failure_fields,
+            "run_id": run_id,
+            "expected_state": expected_state,
+        }
+        failure_assignments = "".join(f", {key} = :{key}" for key in normalized_failure_fields.keys())
         with self._connect() as conn:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE runs
-                SET state = ?, ended_at = ?, output_text = ?, error_text = ?
-                WHERE run_id = ? AND state = ?
+                SET state = :state, ended_at = :ended_at, output_text = :output_text, error_text = :error_text{failure_assignments}
+                WHERE run_id = :run_id AND state = :expected_state
                 """,
-                (state, utc_now(), output_text, error_text, run_id, expected_state),
+                update_fields,
             )
             row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         updated = self._row(row)

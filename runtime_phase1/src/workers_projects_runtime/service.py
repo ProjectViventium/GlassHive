@@ -18,6 +18,7 @@ from urllib.parse import quote, urlencode
 import httpx
 
 from .deliverables import deliverable_payload
+from .failure_classification import classify_runtime_error
 from .openclaw_runtime import (
     RuntimeErrorBase,
     RuntimeInfo,
@@ -435,6 +436,10 @@ class WorkersProjectsService:
                 f"GlassHive worker profile '{profile}' is not allowed by GLASSHIVE_ALLOWED_WORKER_PROFILES"
             )
 
+    def _ensure_runtime_available(self, profile: str, execution_mode: str) -> None:
+        if hasattr(self.runtime, "preflight_worker_profile"):
+            self.runtime.preflight_worker_profile(profile, execution_mode)
+
     def _resolve_worker_model(self, profile: str, execution_mode: str = "docker") -> str:
         try:
             return str(self.runtime.resolve_model(profile, execution_mode=execution_mode) or "")
@@ -491,14 +496,14 @@ class WorkersProjectsService:
             path=path,
         )
 
-    def _signed_artifact_download_url(self, worker: dict, workspace_path: str) -> str:
+    def _signed_artifact_url(self, worker: dict, workspace_path: str, *, kind: str, action: str) -> str:
         base_url = self._artifact_base_url()
         worker_id = str(worker.get("worker_id") or "")
         path = str(workspace_path or "").strip().lstrip("/")
         if not base_url or not worker_id or not path:
             return ""
         token = sign_link_token(
-            kind="artifact_download",
+            kind=kind,
             worker_id=worker_id,
             tenant_id=str(worker.get("tenant_id") or ""),
             owner_id=str(worker.get("owner_id") or ""),
@@ -508,7 +513,13 @@ class WorkersProjectsService:
             return f"{base_url}/v1/signed-links/{quote(token)}"
         if str(worker.get("tenant_id") or "") not in {"", "local"}:
             return ""
-        return f"{base_url}/v1/workers/{worker_id}/artifacts/download?{urlencode({'path': path})}"
+        return f"{base_url}/v1/workers/{worker_id}/artifacts/{action}?{urlencode({'path': path})}"
+
+    def _signed_artifact_open_url(self, worker: dict, workspace_path: str) -> str:
+        return self._signed_artifact_url(worker, workspace_path, kind="artifact_open", action="open")
+
+    def _signed_artifact_download_url(self, worker: dict, workspace_path: str) -> str:
+        return self._signed_artifact_url(worker, workspace_path, kind="artifact_download", action="download")
 
     def _signed_watch_url(self, worker: dict, callbacks: dict[str, object] | None = None) -> str:
         callbacks = callbacks or {}
@@ -559,9 +570,12 @@ class WorkersProjectsService:
         links: list[str] = []
         workspace_path = str((deliverable or {}).get("workspace_path") or "").strip()
         if deliverable and workspace_path:
+            open_url = self._signed_artifact_open_url(worker, workspace_path)
             download_url = self._signed_artifact_download_url(worker, workspace_path)
+            if open_url:
+                links.append(f"File: [Open GlassHive file]({open_url})")
             if download_url:
-                links.append(f"Download: [Download artifact]({download_url})")
+                links.append(f"Download: [Download file]({download_url})")
         watch_url = self._signed_watch_url(worker, callbacks)
         if watch_url:
             links.append(f"View / Steer: [Open GlassHive workspace]({watch_url})")
@@ -1005,6 +1019,7 @@ class WorkersProjectsService:
     ) -> dict:
         self._ensure_execution_allowed(execution_mode)
         self._ensure_profile_allowed(profile)
+        self._ensure_runtime_available(profile, execution_mode)
         model = self._resolve_worker_model(profile, execution_mode)
         with self._worker_create_lock:
             self._enforce_worker_limits(tenant_id=tenant_id or "local", owner_id=owner_id)
@@ -1068,6 +1083,7 @@ class WorkersProjectsService:
     ) -> dict:
         self._ensure_execution_allowed(execution_mode)
         self._ensure_profile_allowed(profile)
+        self._ensure_runtime_available(profile, execution_mode)
         existing = self.store.find_worker_by_alias(
             project_id,
             owner_id,
@@ -1244,6 +1260,10 @@ class WorkersProjectsService:
     def assign_run(self, worker_id: str, instruction: str, event_type: str = "run.queued") -> dict:
         worker = self.require_worker(worker_id)
         self._ensure_execution_allowed(worker)
+        self._ensure_runtime_available(
+            str(worker.get("profile") or ""),
+            str(worker.get("execution_mode") or "docker"),
+        )
         worker = self._refresh_worker_model_for_profile(worker)
         if worker["state"] == "paused":
             self.store.update_worker_state(worker_id, "starting", last_error="")
@@ -1439,7 +1459,7 @@ class WorkersProjectsService:
             raise KeyError("Run not found")
         return run
 
-    def _collect_completed_run(self, worker: dict, run: dict) -> dict[str, str] | None:
+    def _collect_completed_run(self, worker: dict, run: dict) -> dict[str, object] | None:
         if not hasattr(self.runtime, "collect_completed_run"):
             return None
         try:
@@ -1454,6 +1474,17 @@ class WorkersProjectsService:
         state = str(recovered.get("state") or "failed")
         output_text = str(recovered.get("output_text") or "")
         error_text = str(recovered.get("error_text") or "")
+        failure_fields = {
+            key: recovered.get(key)
+            for key in (
+                "failure_class",
+                "failure_retryable",
+                "failure_user_message",
+                "failure_recommended_recovery",
+                "failure_diagnostic_summary",
+            )
+            if key in recovered
+        }
         if state == "completed":
             self.store.finalize_run(run["run_id"], state="completed", output_text=output_text)
             self.store.finalize_schedule_for_run(run["run_id"], state="completed")
@@ -1474,11 +1505,11 @@ class WorkersProjectsService:
                 deliverable=deliverable,
             )
         else:
-            self.store.finalize_run(run["run_id"], state="failed", error_text=error_text)
+            self.store.finalize_run(run["run_id"], state="failed", error_text=error_text, **failure_fields)
             self.store.finalize_schedule_for_run(run["run_id"], state="failed", last_error=error_text)
             self.store.update_worker(worker_id, state="ready", last_error=error_text, last_run_id=run["run_id"])
             self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.failed", error_text or "Run failed")
-            recovered_run = {**run, "state": "failed", "error_text": error_text}
+            recovered_run = {**run, "state": "failed", "error_text": error_text, **failure_fields}
             self._emit_callback(worker, "run.failed", run=recovered_run, message=error_text or "Run failed")
             self._refresh_runtime_info(worker_id, state="ready", last_error=error_text)
         return self.store.get_worker(worker_id)
@@ -1688,7 +1719,20 @@ class WorkersProjectsService:
                         final_state = "interrupted"
                     elif worker_state == "terminated":
                         final_state = "cancelled"
-                    self.store.finalize_run(run["run_id"], state=final_state, error_text=str(exc))
+                    failure_fields = (
+                        classify_runtime_error(
+                            exc,
+                            runtime_name=str(worker.get("runtime") or worker.get("profile") or "worker"),
+                        ).as_store_fields()
+                        if final_state == "failed"
+                        else {}
+                    )
+                    self.store.finalize_run(
+                        run["run_id"],
+                        state=final_state,
+                        error_text=str(exc),
+                        **failure_fields,
+                    )
                     self.store.finalize_schedule_for_run(
                         run["run_id"],
                         state="cancelled" if final_state == "cancelled" else "failed",
@@ -1696,7 +1740,12 @@ class WorkersProjectsService:
                     )
                     self.store.update_worker_state(worker_id, worker_state if worker_state in {"paused", "terminated"} else "ready", last_error=str(exc))
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], f"run.{final_state}", str(exc))
-                    self._emit_callback(worker, f"run.{final_state}", run={**run, "state": final_state, "error_text": str(exc)}, message=str(exc))
+                    self._emit_callback(
+                        worker,
+                        f"run.{final_state}",
+                        run={**run, "state": final_state, "error_text": str(exc), **failure_fields},
+                        message=str(exc),
+                    )
                     if worker_state in {"paused", "terminated"}:
                         return
                     continue

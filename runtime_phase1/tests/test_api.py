@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -53,6 +55,12 @@ def wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> None:
             return
         time.sleep(interval)
     raise AssertionError("Condition did not become true before timeout")
+
+
+def href_for_link_text(html: str, label: str) -> str:
+    match = re.search(r'<a\b[^>]*href="([^"]+)"[^>]*>\s*' + re.escape(label) + r"\s*</a>", html)
+    assert match, f"Expected link labeled {label!r}"
+    return match.group(1)
 
 
 def test_terminal_callback_message_prefers_final_report():
@@ -281,7 +289,7 @@ def test_completed_callback_uses_final_report_message(tmp_path, monkeypatch):
         service.shutdown()
 
 
-def test_completed_file_callback_adds_signed_download_and_watch_links(tmp_path, monkeypatch):
+def test_completed_file_callback_adds_signed_open_download_and_watch_links(tmp_path, monkeypatch):
     class FileRuntime(StubRuntime):
         def run_task(
             self,
@@ -347,11 +355,14 @@ def test_completed_file_callback_adds_signed_download_and_watch_links(tmp_path, 
         completed = next(payload for payload in payloads if payload.get("event") == "run.completed")
         assert completed["deliverable"]["kind"] == "file"
         assert completed["deliverable"]["workspace_path"] == "answer.txt"
-        assert "Download: [Download artifact](https://glasshive-api.example.test/v1/signed-links/" in completed["message"]
+        assert "File: [Open GlassHive file](https://glasshive-api.example.test/v1/signed-links/" in completed["message"]
+        assert "Download: [Download file](https://glasshive-api.example.test/v1/signed-links/" in completed["message"]
+        assert completed["message"].index("File: [Open GlassHive file]") < completed["message"].index("Download: [Download file]")
         assert (
             f"View / Steer: [Open GlassHive workspace](https://glasshive-ui.example.test/watch/{worker['worker_id']}?"
             in completed["message"]
         )
+        assert completed["message"].index("Download: [Download file]") < completed["message"].index("View / Steer:")
         assert "surface=desktop" in completed["message"]
         assert f"project_id={project['project_id']}" in completed["message"]
         assert "gh_token=" in completed["message"]
@@ -628,6 +639,19 @@ def test_enterprise_mode_scopes_projects_workers_and_artifacts(tmp_path, monkeyp
     )
     assert signed_download.status_code == 200
     assert signed_download.text == "user-a result"
+    signed_open = sign_link_params(
+        kind="artifact_open",
+        worker_id=worker_a_payload["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="result.txt",
+    )
+    signed_open_page = client.get(
+        f"/v1/workers/{worker_a_payload['worker_id']}/artifacts/open",
+        params={"path": "result.txt", **signed_open},
+    )
+    assert signed_open_page.status_code == 200
+    assert "user-a result" in signed_open_page.text
     signed_token = sign_link_token(
         kind="artifact_download",
         worker_id=worker_a_payload["worker_id"],
@@ -2222,6 +2246,44 @@ def test_host_worker_disabled_blocks_host_creation_and_run(tmp_path, monkeypatch
     assert "host-native workers are disabled" in run.json()["detail"]
 
 
+def test_missing_host_cli_blocks_creation_before_worker_row(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
+    monkeypatch.setenv("WPR_CODEX_BIN", str(tmp_path / "missing-codex"))
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="profiled"))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Host Missing CLI",
+            "goal": "Fail closed before worker creation when a selected host CLI is unavailable.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+
+    blocked = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Codex Host",
+            "role": "coding",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+            "execution_mode": "host",
+            "start_synchronously": False,
+        },
+    )
+
+    assert blocked.status_code == 409
+    body = blocked.json()
+    assert body["status"] == "blocked"
+    assert body["failure_class"] == "runtime_dependency_missing"
+    assert body["failure_retryable"] == 0
+    assert "missing-codex" in body["detail"]
+    workers = client.get(f"/v1/projects/{project['project_id']}/workers").json()["items"]
+    assert workers == []
+
+
 def test_duplicate_worker_copies_workspace_into_new_worker(tmp_path):
     db_path = tmp_path / "runtime.db"
     client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
@@ -3682,8 +3744,200 @@ def test_completed_web_callback_includes_operator_url_and_deliverable(tmp_path, 
         assert "gh_token=" in payload["watch_url"]
         assert payload["deliverable"]["kind"] == "webpage"
         assert payload["deliverable"]["browser_url"] == "file:///workspace/project/index.html"
-        assert "Download: [Download artifact](http://127.0.0.1:8780/v1/signed-links/" in payload["message"]
+        assert "File: [Open GlassHive file](http://127.0.0.1:8780/v1/signed-links/" in payload["message"]
+        assert "Download: [Download file](http://127.0.0.1:8780/v1/signed-links/" in payload["message"]
+        assert payload["message"].index("File: [Open GlassHive file]") < payload["message"].index("Download: [Download file]")
         assert "View / Steer: [Open GlassHive workspace]" in payload["message"]
+        assert payload["message"].index("Download: [Download file]") < payload["message"].index("View / Steer:")
+
+
+def test_artifact_open_page_previews_text_without_forcing_download(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+
+    db_path = tmp_path / "runtime.db"
+    runtime = DeliverableDesktopRuntime(tmp_path / "desktop")
+    app = create_app(str(db_path), runtime_backend="stub", runtime=runtime)
+
+    with TestClient(app) as client:
+        project = client.post(
+            "/v1/projects",
+            json={"owner_id": "demo-owner", "title": "File Preview", "goal": "Open artifacts without surprise downloads."},
+        ).json()
+        worker = client.post(
+            f"/v1/projects/{project['project_id']}/workers",
+            json={"owner_id": "demo-owner", "name": "Preview Worker", "role": "writer", "profile": "codex-cli"},
+        ).json()
+        workspace = Path(worker["workspace_dir"])
+        artifact = workspace / "answer.md"
+        artifact.write_text("# Result\n\nGlassHive preview works.", encoding="utf-8")
+
+        listed = client.get(f"/v1/workers/{worker['worker_id']}/artifacts").json()
+        assert listed["items"][0]["open_url"].endswith("/artifacts/open?path=answer.md")
+        assert listed["items"][0]["download_url"].endswith("/artifacts/download?path=answer.md")
+
+        opened = client.get(f"/v1/workers/{worker['worker_id']}/artifacts/open?path=answer.md")
+        assert opened.status_code == 200
+        assert "text/html" in opened.headers["content-type"]
+        assert "content-disposition" not in opened.headers
+        assert "no-store" in opened.headers["cache-control"]
+        assert opened.headers["pragma"] == "no-cache"
+        assert opened.headers["x-content-type-options"] == "nosniff"
+        assert "default-src 'none'" in opened.headers["content-security-policy"]
+        assert "GlassHive preview works." in opened.text
+        assert "Download file" in opened.text
+        assert 'href="/v1/signed-links/' in opened.text
+        assert "gh_token=" in opened.text
+        opened_download_href = href_for_link_text(opened.text, "Download file")
+        opened_download = client.get(opened_download_href)
+        assert opened_download.status_code == 200
+        assert "attachment" in opened_download.headers["content-disposition"]
+        assert "no-store" in opened_download.headers["cache-control"]
+        assert opened_download.headers["x-content-type-options"] == "nosniff"
+
+        downloaded = client.get(f"/v1/workers/{worker['worker_id']}/artifacts/download?path=answer.md")
+        assert downloaded.status_code == 200
+        assert "attachment" in downloaded.headers["content-disposition"]
+        assert "no-store" in downloaded.headers["cache-control"]
+        assert downloaded.headers["x-content-type-options"] == "nosniff"
+
+        binary_artifact = workspace / "report.pdf"
+        binary_artifact.write_bytes(b"%PDF-1.4\n% synthetic public-safe fixture\n")
+        opened_binary = client.get(f"/v1/workers/{worker['worker_id']}/artifacts/open?path=report.pdf")
+        assert opened_binary.status_code == 200
+        assert "text/html" in opened_binary.headers["content-type"]
+        assert "content-disposition" not in opened_binary.headers
+        assert "File is ready" in opened_binary.text
+        assert "Download file" in opened_binary.text
+
+        image_artifact = workspace / "pixel.png"
+        image_artifact.write_bytes(
+            base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axm+2sAAAAASUVORK5CYII="
+            )
+        )
+        opened_image = client.get(f"/v1/workers/{worker['worker_id']}/artifacts/open?path=pixel.png")
+        assert opened_image.status_code == 200
+        assert "content-disposition" not in opened_image.headers
+        assert 'class="image-preview"' in opened_image.text
+        assert "data:image/png;base64," in opened_image.text
+
+        svg_artifact = workspace / "unsafe.svg"
+        svg_artifact.write_text('<svg><script>alert("x")</script></svg>', encoding="utf-8")
+        opened_svg = client.get(f"/v1/workers/{worker['worker_id']}/artifacts/open?path=unsafe.svg")
+        assert opened_svg.status_code == 200
+        assert "File is ready" in opened_svg.text
+        assert 'class="image-preview"' not in opened_svg.text
+        assert "<script>" not in opened_svg.text
+
+        html_artifact = workspace / "unsafe.html"
+        html_artifact.write_text("</pre><script>alert('x')</script>", encoding="utf-8")
+        opened_html = client.get(f"/v1/workers/{worker['worker_id']}/artifacts/open?path=unsafe.html")
+        assert opened_html.status_code == 200
+        assert "</pre><script>" not in opened_html.text
+        assert "&lt;/pre&gt;&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;" in opened_html.text
+
+        open_token = sign_link_token(
+            kind="artifact_open",
+            worker_id=worker["worker_id"],
+            tenant_id=worker["tenant_id"],
+            owner_id=worker["owner_id"],
+            path="answer.md",
+        )
+        signed_open = client.get(f"/v1/signed-links/{open_token}")
+        assert signed_open.status_code == 200
+        assert "text/html" in signed_open.headers["content-type"]
+        assert "content-disposition" not in signed_open.headers
+        assert "no-store" in signed_open.headers["cache-control"]
+        assert "GlassHive preview works." in signed_open.text
+        assert 'href="/v1/signed-links/' in signed_open.text
+        signed_open_download_href = href_for_link_text(signed_open.text, "Download file")
+        assert signed_open_download_href.startswith("/v1/signed-links/")
+        signed_open_download = client.get(signed_open_download_href)
+        assert signed_open_download.status_code == 200
+        assert "attachment" in signed_open_download.headers["content-disposition"]
+        assert signed_open_download.text == "# Result\n\nGlassHive preview works."
+
+        download_token = sign_link_token(
+            kind="artifact_download",
+            worker_id=worker["worker_id"],
+            tenant_id=worker["tenant_id"],
+            owner_id=worker["owner_id"],
+            path="answer.md",
+        )
+        signed_download = client.get(f"/v1/signed-links/{download_token}")
+        assert signed_download.status_code == 200
+        assert "attachment" in signed_download.headers["content-disposition"]
+        assert "no-store" in signed_download.headers["cache-control"]
+        assert signed_download.headers["x-content-type-options"] == "nosniff"
+
+        encoded_payload, signature = open_token.split(".", 1)
+        decoded = base64.urlsafe_b64decode(f"{encoded_payload}{'=' * (-len(encoded_payload) % 4)}")
+        payload = json.loads(decoded.decode("utf-8"))
+        payload["kind"] = "artifact_download"
+        tampered_payload = base64.urlsafe_b64encode(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        assert client.get(f"/v1/signed-links/{tampered_payload}.{signature}").status_code == 401
+
+
+def test_enterprise_signed_artifact_open_page_actions_remain_signed(tmp_path, monkeypatch):
+    monkeypatch.setenv("WPR_API_TOKEN", "service-token")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+
+    headers = {
+        "Authorization": "Bearer service-token",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+    }
+    client = TestClient(create_app(db_path=str(tmp_path / "runtime.db"), runtime_backend="stub"))
+
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={"owner_id": "ignored", "title": "Enterprise Artifact Links", "goal": "Verify signed preview click-through."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={"owner_id": "ignored", "name": "Artifact Worker", "role": "writer", "profile": "codex-cli"},
+    ).json()
+    workspace = Path(worker["workspace_dir"])
+    workspace.mkdir(parents=True, exist_ok=True)
+    artifact = workspace / "enterprise-result.txt"
+    artifact.write_text("enterprise preview roundtrip", encoding="utf-8")
+
+    assert client.get(f"/v1/workers/{worker['worker_id']}/artifacts/open", params={"path": "enterprise-result.txt"}).status_code == 401
+    assert (
+        client.get(f"/v1/workers/{worker['worker_id']}/artifacts/download", params={"path": "enterprise-result.txt"}).status_code
+        == 401
+    )
+
+    open_token = sign_link_token(
+        kind="artifact_open",
+        worker_id=worker["worker_id"],
+        tenant_id=worker["tenant_id"],
+        owner_id=worker["owner_id"],
+        path="enterprise-result.txt",
+    )
+    opened = client.get(f"/v1/signed-links/{open_token}")
+    assert opened.status_code == 200
+    assert "enterprise preview roundtrip" in opened.text
+    assert "no-store" in opened.headers["cache-control"]
+
+    download_href = href_for_link_text(opened.text, "Download file")
+    workspace_href = href_for_link_text(opened.text, "View workspace")
+    assert download_href.startswith("/v1/signed-links/")
+    assert "gh_token=" in workspace_href
+
+    downloaded = client.get(download_href)
+    assert downloaded.status_code == 200
+    assert downloaded.text == "enterprise preview roundtrip"
+    assert "attachment" in downloaded.headers["content-disposition"]
+    assert "no-store" in downloaded.headers["cache-control"]
+    assert downloaded.headers["x-content-type-options"] == "nosniff"
 
 
 def test_desktop_action_and_artifact_preview_surface_in_project_ui(tmp_path):

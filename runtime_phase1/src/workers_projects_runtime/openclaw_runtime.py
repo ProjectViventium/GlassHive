@@ -74,6 +74,23 @@ class RuntimeErrorBase(RuntimeError):
     pass
 
 
+class RuntimeDependencyMissingError(RuntimeErrorBase):
+    def __init__(
+        self,
+        message: str,
+        *,
+        binary: str = "",
+        runtime_name: str = "",
+        profile: str = "",
+        execution_mode: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.binary = binary
+        self.runtime_name = runtime_name
+        self.profile = profile
+        self.execution_mode = execution_mode
+
+
 class WorkerPausedError(RuntimeErrorBase):
     pass
 
@@ -88,6 +105,8 @@ class WorkerInterruptedError(RuntimeErrorBase):
 
 class WorkerRuntime(Protocol):
     def resolve_model(self, profile: str) -> str: ...
+
+    def preflight_worker_profile(self, profile: str, execution_mode: str = "docker") -> None: ...
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo: ...
 
@@ -110,6 +129,9 @@ class StubRuntime:
             "codex-cli": "stub/codex-cli",
             "claude-code": "stub/claude-code",
         }.get(profile, "stub/general")
+
+    def preflight_worker_profile(self, profile: str, execution_mode: str = "docker") -> None:
+        return None
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         worker_id = worker["worker_id"]

@@ -695,7 +695,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     def _allowed_signed_link_kinds(request: Request | WebSocket) -> set[str]:
         path = str(request.url.path or "")
         if path.startswith("/v1/signed-links/"):
-            return {"artifact_download"}
+            return {"artifact_download", "artifact_open"}
         return {"worker_view"}
 
     def _signed_link_payload(request: Request | WebSocket, worker_id: str | None = None) -> dict[str, object] | None:

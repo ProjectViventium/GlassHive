@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from workers_projects_runtime.openclaw_runtime import RuntimeErrorBase, WorkerTerminatedError
+from workers_projects_runtime.failure_classification import classify_runtime_error
+from workers_projects_runtime.openclaw_runtime import RuntimeDependencyMissingError, RuntimeErrorBase, WorkerTerminatedError
 from workers_projects_runtime.profile_runtime import BaseCliWorkerRuntime, ClaudeCodeRuntime, CodexCliRuntime, HostCodexCliRuntime, HostOpenClawRuntime, OpenClawWorkstationRuntime, ProfiledWorkerRuntime, _redact_text
 
 
@@ -70,6 +71,72 @@ def test_collect_completed_run_recovers_from_latest_run_artifacts(tmp_path):
     assert recovered["state"] == "completed"
     assert recovered["output_text"] == "HELLO WORLD"
     assert json.loads(runtime._session_meta_path(worker["worker_id"]).read_text())["session_key"] == "thread_123"
+
+
+def test_collect_completed_run_classifies_and_redacts_provider_rate_limit(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_rate_limit",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+
+    run_id = "run_rate12345"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread_rate"}),
+                json.dumps({"type": "response.failed", "error": {"message": "Too Many Requests"}}),
+                json.dumps({"type": "turn.failed", "error": {"message": "response.failed event received"}}),
+            ]
+        )
+        + "\n"
+    )
+    (run_root / "stderr.log").write_text("api_key=PUBLIC_FAKE_API_KEY_VALUE token=PUBLIC_FAKE_TOKEN_VALUE\n")
+    (run_root / "exit_code").write_text("1")
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+
+    assert recovered is not None
+    assert recovered["state"] == "failed"
+    assert recovered["failure_class"] == "provider_rate_limited"
+    assert recovered["failure_retryable"] == 1
+    assert "workspace_continue" in recovered["failure_recommended_recovery"]
+    assert "Too Many Requests" in recovered["failure_diagnostic_summary"]
+    assert "PUBLIC_FAKE_API_KEY_VALUE" not in recovered["error_text"]
+    assert "PUBLIC_FAKE_TOKEN_VALUE" not in recovered["error_text"]
+
+
+def test_collect_completed_run_classifies_content_filter_as_not_retryable(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_filter",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+
+    run_id = "run_filter123"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text(
+        json.dumps({"type": "turn.failed", "error": {"message": "content_filter"}}) + "\n"
+    )
+    (run_root / "stderr.log").write_text("")
+    (run_root / "exit_code").write_text("1")
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+
+    assert recovered is not None
+    assert recovered["state"] == "failed"
+    assert recovered["failure_class"] == "provider_content_filter"
+    assert recovered["failure_retryable"] == 0
+    assert "safety filter" in recovered["failure_user_message"]
 
 
 def test_codex_parser_returns_latest_assistant_result_not_progress_chatter(tmp_path):
@@ -501,6 +568,45 @@ def test_host_codex_model_can_differ_from_docker_provider_model(tmp_path, monkey
     monkeypatch.setenv("WPR_MODEL_HOST_CODEX_CLI", "gpt-5.4")
 
     assert runtime.resolve_model("codex-cli") == "gpt-5.4"
+
+
+def test_host_codex_defaults_to_local_codex_config_instead_of_provider_model(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_MODEL_CODEX_CLI", "gpt-5.4")
+    monkeypatch.delenv("WPR_MODEL_HOST_CODEX_CLI", raising=False)
+    monkeypatch.delenv("CODEX_MODEL", raising=False)
+    monkeypatch.delenv("GLASSHIVE_HOST_CODEX_INHERIT_PROVIDER_MODEL", raising=False)
+    worker = {
+        "worker_id": "wrk_host_model_default",
+        "name": "Main Host Worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+
+    command, _env = runtime._build_command(worker, "create the marker", runtime._host_runtime_info(worker))
+
+    assert runtime.resolve_model("codex-cli") == ""
+    assert "-m" not in command
+
+
+def test_host_codex_can_explicitly_inherit_provider_model_when_configured(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_MODEL_CODEX_CLI", "gpt-5.4")
+    monkeypatch.setenv("GLASSHIVE_HOST_CODEX_INHERIT_PROVIDER_MODEL", "true")
+    monkeypatch.delenv("WPR_MODEL_HOST_CODEX_CLI", raising=False)
+    monkeypatch.delenv("CODEX_MODEL", raising=False)
+
+    assert runtime.resolve_model("codex-cli") == "gpt-5.4"
+
+
+def test_host_codex_honors_codex_model_env_before_local_config(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_MODEL_CODEX_CLI", "gpt-5.4")
+    monkeypatch.setenv("CODEX_MODEL", "gpt-5.5")
+    monkeypatch.delenv("WPR_MODEL_HOST_CODEX_CLI", raising=False)
+
+    assert runtime.resolve_model("codex-cli") == "gpt-5.5"
 
 
 def test_profiled_runtime_resolves_host_codex_model_by_execution_mode(tmp_path, monkeypatch):
@@ -1097,8 +1203,30 @@ def test_host_openclaw_missing_cli_reports_named_binary(tmp_path):
         "workspace_root": str(tmp_path / "workspaces"),
     }
 
-    with pytest.raises(RuntimeErrorBase, match="definitely-missing-openclaw CLI is not installed"):
+    with pytest.raises(RuntimeDependencyMissingError, match="definitely-missing-openclaw CLI is not installed") as captured:
         runtime.ensure_worker_ready(worker)
+    assert captured.value.binary == "definitely-missing-openclaw"
+    assert captured.value.profile == "openclaw-general"
+    assert captured.value.execution_mode == "host"
+
+
+def test_runtime_dependency_missing_classification_is_structured_and_sanitized():
+    failure = classify_runtime_error(
+        RuntimeDependencyMissingError(
+            "codex CLI is not installed or not on PATH for host-native codex-cli",
+            binary="/private/tmp/secret-path/codex",
+            runtime_name="codex-cli",
+            profile="codex-cli",
+            execution_mode="host",
+        ),
+        runtime_name="codex-cli",
+    )
+
+    assert failure.failure_class == "runtime_dependency_missing"
+    assert failure.retryable is False
+    assert "`codex`" in failure.user_message
+    assert "/private/tmp" not in failure.user_message
+    assert "sandbox/workstation" in failure.recommended_recovery
 
 
 def test_openclaw_session_id_is_cli_safe_when_worker_session_key_uses_glasshive_colons(tmp_path):
