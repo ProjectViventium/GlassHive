@@ -4,6 +4,9 @@ const INTERRUPTIBLE_STATES = new Set(['queued', 'running', 'resuming']);
 const RESUME_STATES = new Set(['ready', 'paused', 'idle', 'idle_terminated', 'stopped', 'completed', 'retained']);
 const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'failed', 'terminated']);
 const MAX_LIVE_TILE_IFRAMES = 4;
+const ACTIVE_TILE_REFRESH_MS = 7000;
+const RETAINED_TILE_REFRESH_MS = 60000;
+const GLASSHIVE_UI_REV = '20260525c';
 let workspaceRefreshInFlight = false;
 const pageParams = new URLSearchParams(window.location.search);
 const signedToken = pageParams.get('gh_token') || '';
@@ -27,6 +30,15 @@ function withAuth(url) {
   const base = hashIndex >= 0 ? value.slice(0, hashIndex) : value;
   const hash = hashIndex >= 0 ? value.slice(hashIndex) : '';
   return `${base}${base.includes('?') ? '&' : '?'}gh_token=${encodeURIComponent(signedToken)}${hash}`;
+}
+
+function withUiRev(url) {
+  const value = String(url || '');
+  if (!value || /(?:^|[?&])gh_ui_rev=/.test(value)) return value;
+  const hashIndex = value.indexOf('#');
+  const base = hashIndex >= 0 ? value.slice(0, hashIndex) : value;
+  const hash = hashIndex >= 0 ? value.slice(hashIndex) : '';
+  return `${base}${base.includes('?') ? '&' : '?'}gh_ui_rev=${encodeURIComponent(GLASSHIVE_UI_REV)}${hash}`;
 }
 
 async function responseMessage(response, fallback) {
@@ -248,7 +260,7 @@ function workerActionForState(state) {
 }
 
 function workerDesktopUrl(workerId, signedUrl = '') {
-  return signedUrl || withAuth(`/desktop/${encodeURIComponent(String(workerId || ''))}`);
+  return withUiRev(signedUrl || withAuth(`/desktop/${encodeURIComponent(String(workerId || ''))}`));
 }
 
 function appendUrlPath(url, path) {
@@ -318,7 +330,7 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
   const normalized = String(state || '').trim().toLowerCase();
   const alreadyHasFrame = Boolean(pane.querySelector('.workspace-live-frame'));
   const canMountLiveFrame = alreadyHasFrame || document.querySelectorAll('.workspace-live-frame').length < MAX_LIVE_TILE_IFRAMES;
-  if ((ACTIVE_STATES.has(normalized) || normalized === 'running' || normalized === 'queued' || normalized === 'completed') && hasLiveDesktop && canMountLiveFrame) {
+  if ((ACTIVE_STATES.has(normalized) || normalized === 'running' || normalized === 'queued') && hasLiveDesktop && canMountLiveFrame) {
     let frame = pane.querySelector('.workspace-live-frame');
     if (!frame) {
       frame = document.createElement('iframe');
@@ -368,6 +380,10 @@ async function refreshWorkspaceTile(workerId, refreshBootstrap) {
   const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);
   if (!tile) return;
   const output = tile.querySelector('[data-worker-output]');
+  const markNextRefresh = (delayMs) => {
+    tile.dataset.liveLoaded = 'true';
+    tile.dataset.nextLiveRefreshAt = String(Date.now() + delayMs);
+  };
   try {
     const response = await fetch(withAuth(workerApiUrl(workerId, '/live')));
     if (!response.ok) throw new Error(await responseMessage(response, 'Live status unavailable'));
@@ -380,6 +396,7 @@ async function refreshWorkspaceTile(workerId, refreshBootstrap) {
       : RESUME_STATES.has(rawState) || state === 'completed'
         ? 'resumable'
         : 'inactive';
+    markNextRefresh(tile.dataset.state === 'active' ? ACTIVE_TILE_REFRESH_MS : RETAINED_TILE_REFRESH_MS);
     updateTileControlLabels(tile, state);
     const glass = tile.querySelector('.workspace-tile-glass');
     if (glass) setGlassPane(glass, workerId, state, Boolean(data?.runtime_details?.view_available || data?.runtime_details?.view_url), refreshBootstrap);
@@ -395,14 +412,22 @@ async function refreshWorkspaceTile(workerId, refreshBootstrap) {
     }
     if (output) output.textContent = summarizeLive(data);
   } catch (error) {
+    markNextRefresh(ACTIVE_TILE_REFRESH_MS);
     if (output) output.textContent = error.message;
   }
 }
 
-async function refreshVisibleWorkspaceTiles(refreshBootstrap) {
+async function refreshVisibleWorkspaceTiles(refreshBootstrap, { force = false } = {}) {
   if (document.hidden || workspaceRefreshInFlight) return;
+  const now = Date.now();
   const workerIds = Array.from(document.querySelectorAll('.workspace-tile'))
     .filter((tile) => tile.dataset.watchVisible === 'true' || tile.dataset.statusVisible === 'true')
+    .filter((tile) => {
+      if (force) return true;
+      if (tile.dataset.liveLoaded !== 'true') return true;
+      const nextRefreshAt = Number(tile.dataset.nextLiveRefreshAt || 0);
+      return !nextRefreshAt || now >= nextRefreshAt;
+    })
     .map((tile) => tile.dataset.workerId)
     .filter(Boolean);
   if (!workerIds.length) return;
@@ -442,6 +467,8 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   tile.dataset.apiUrl = String(workspace.api_url || '');
   tile.dataset.watchVisible = String(Boolean(viewPrefs.showWatch));
   tile.dataset.statusVisible = String(Boolean(viewPrefs.showStatus));
+  tile.dataset.liveLoaded = 'false';
+  tile.dataset.nextLiveRefreshAt = '0';
 
   const glass = document.createElement('div');
   glass.className = 'workspace-tile-glass';
@@ -661,7 +688,7 @@ function renderWorkspaceHive(data, refreshBootstrap, viewPrefs = defaultHivePref
     return renderWorkspaceTile(workspace, refreshBootstrap, drafts.get(workerId) || '', prefs);
   });
   grid.replaceChildren(...tiles);
-  refreshVisibleWorkspaceTiles(refreshBootstrap).catch(() => {});
+  refreshVisibleWorkspaceTiles(refreshBootstrap, { force: true }).catch(() => {});
 }
 
 function findWorkspace(existing, workerId) {
@@ -776,7 +803,7 @@ async function main() {
     stopHivePolling();
     hivePollTimer = window.setInterval(() => {
       if (activeView === 'workspaces') refreshVisibleWorkspaceTiles(refreshBootstrap).catch(() => {});
-    }, 7000);
+    }, ACTIVE_TILE_REFRESH_MS);
   }
 
   function setActiveView(view, { updateHash = true } = {}) {

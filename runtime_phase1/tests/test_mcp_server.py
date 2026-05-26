@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+from urllib.parse import urlsplit
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 import pytest
@@ -15,6 +16,7 @@ from starlette.testclient import TestClient
 from workers_projects_runtime import mcp_server, runtime_env
 from workers_projects_runtime.bootstrap import sign_bootstrap_source_path
 from workers_projects_runtime.mcp_server import create_mcp_server
+from workers_projects_runtime.signed_links import verify_signed_link_token
 
 
 class FakeApiClient:
@@ -211,6 +213,7 @@ class TrackingApiClient(FakeApiClient):
         self.calls: list[str] = []
         self.create_project_payloads: list[dict] = []
         self.find_or_resume_payloads: list[dict] = []
+        self.assign_run_payloads: list[dict] = []
 
     def list_projects(self, owner_id: str | None = None):
         self.calls.append("list_projects")
@@ -232,6 +235,7 @@ class TrackingApiClient(FakeApiClient):
 
     def assign_run(self, worker_id: str, instruction: str):
         self.calls.append("assign_run")
+        self.assign_run_payloads.append({"worker_id": worker_id, "instruction": instruction})
         return super().assign_run(worker_id, instruction)
 
 
@@ -284,6 +288,165 @@ class PollingApiClient(FakeApiClient):
             "runtime_details": {"view_url": "http://127.0.0.1:62310/?autoconnect=1"},
             "project_runs": [],
         }
+
+
+class RememberedDispatchApiClient(TrackingApiClient):
+    def __init__(self, *, tenant_id: str = "local"):
+        super().__init__()
+        self.tenant_id = tenant_id
+        self.workers: dict[str, dict] = {}
+        self.runs: dict[str, dict] = {}
+
+    def find_or_resume_worker(self, **kwargs):
+        payload = super().find_or_resume_worker(**kwargs)
+        payload.update(
+            {
+                "tenant_id": self.tenant_id,
+                "owner_id": kwargs.get("owner_id"),
+                "project_id": kwargs.get("project_id"),
+                "last_run_id": "",
+            }
+        )
+        self.workers[payload["worker_id"]] = payload
+        return payload
+
+    def assign_run(self, worker_id: str, instruction: str):
+        payload = super().assign_run(worker_id, instruction)
+        payload.update(
+            {
+                "tenant_id": self.tenant_id,
+                "project_id": self.workers.get(worker_id, {}).get("project_id") or "prj_new",
+                "state": "completed",
+                "output_text": "remembered dispatch completed",
+                "error_text": "",
+            }
+        )
+        self.runs[payload["run_id"]] = payload
+        if worker_id in self.workers:
+            self.workers[worker_id]["last_run_id"] = payload["run_id"]
+        return payload
+
+    def get_run(self, run_id: str):
+        return self.runs[run_id]
+
+    def get_worker(self, worker_id: str):
+        return self.workers[worker_id]
+
+    def worker_live(self, worker_id: str):
+        worker = self.get_worker(worker_id)
+        run_id = str(worker.get("last_run_id") or "")
+        run = self.runs.get(run_id)
+        runs = [run] if run else []
+        return {
+            "worker": worker,
+            "runtime_details": {"view_url": "http://127.0.0.1:62310/?autoconnect=1"},
+            "runs": runs,
+            "project_runs": runs,
+        }
+
+
+class RetryableFailureApiClient(FakeApiClient):
+    def __init__(self):
+        self.assigned: list[dict[str, str]] = []
+
+    def get_run(self, run_id: str):
+        if run_id == "run_retryable_failed":
+            return {
+                "run_id": "run_retryable_failed",
+                "worker_id": "wrk_retry",
+                "project_id": "prj_retry",
+                "tenant_id": "local",
+                "state": "failed",
+                "queued_at": "2026-05-25T10:00:00+00:00",
+                "instruction": "Build the requested research workbook and report.",
+                "output_text": "",
+                "error_text": "codex-cli exited with code 1: provider failed",
+                "failure_class": "provider_rate_limited",
+                "failure_retryable": True,
+                "failure_user_message": "The provider rate-limited the worker before it finished.",
+                "failure_recommended_recovery": "Use workspace_continue to resume the same workspace.",
+                "failure_diagnostic_summary": "response.failed: Too Many Requests",
+            }
+        return {
+            "run_id": run_id,
+            "worker_id": "wrk_retry",
+            "project_id": "prj_retry",
+            "tenant_id": "local",
+            "state": "queued",
+            "queued_at": "2026-05-25T10:05:00+00:00",
+            "instruction": self.assigned[-1]["instruction"] if self.assigned else "",
+            "output_text": "",
+            "error_text": "",
+        }
+
+    def get_worker(self, worker_id: str):
+        payload = super().get_worker(worker_id)
+        payload.update({"worker_id": worker_id, "project_id": "prj_retry", "tenant_id": "local", "state": "ready"})
+        return payload
+
+    def worker_live(self, worker_id: str):
+        return {
+            "worker": {
+                "worker_id": worker_id,
+                "project_id": "prj_retry",
+                "state": "ready",
+                "owner_id": "demo-owner",
+                "last_run_id": "run_retryable_failed",
+            },
+            "runtime_details": {},
+            "project_runs": [],
+        }
+
+    def assign_run(self, worker_id: str, instruction: str):
+        self.assigned.append({"worker_id": worker_id, "instruction": instruction})
+        return {
+            "run_id": "run_continued",
+            "worker_id": worker_id,
+            "project_id": "prj_retry",
+            "tenant_id": "local",
+            "state": "queued",
+            "instruction": instruction,
+        }
+
+
+class EnterpriseRetryableFailureApiClient(RetryableFailureApiClient):
+    def __init__(
+        self,
+        *,
+        run_tenant_id: str = "tenant-alpha",
+        worker_tenant_id: str = "tenant-alpha",
+        worker_owner_id: str = "user-a",
+        new_run_tenant_id: str = "tenant-alpha",
+        previous_state: str = "failed",
+    ):
+        super().__init__()
+        self.run_tenant_id = run_tenant_id
+        self.worker_tenant_id = worker_tenant_id
+        self.worker_owner_id = worker_owner_id
+        self.new_run_tenant_id = new_run_tenant_id
+        self.previous_state = previous_state
+
+    def get_run(self, run_id: str):
+        payload = super().get_run(run_id)
+        if run_id == "run_retryable_failed":
+            payload["tenant_id"] = self.run_tenant_id
+            payload["state"] = self.previous_state
+        return payload
+
+    def get_worker(self, worker_id: str):
+        payload = super().get_worker(worker_id)
+        payload.update(
+            {
+                "tenant_id": self.worker_tenant_id,
+                "owner_id": self.worker_owner_id,
+            }
+        )
+        return payload
+
+    def assign_run(self, worker_id: str, instruction: str):
+        payload = super().assign_run(worker_id, instruction)
+        payload["tenant_id"] = self.new_run_tenant_id
+        return payload
 
 
 class StaleRequestedRunApiClient(FakeApiClient):
@@ -543,6 +706,16 @@ def test_server_instructions_advertise_mcp_owned_usage_contract(monkeypatch):
         "do not refuse solely because your own model context lacks file contents",
         "workspace_status",
         "workspace_wait",
+        "omits ids",
+        "workspace_continue",
+        "sandboxed workspace",
+        "codex workspace",
+        "execution_mode='docker'",
+        "runtime_dependency_missing",
+        "high/xhigh",
+        "deep research",
+        "do not shorten",
+        "full picture",
         "view / steer",
         "follow_up_context",
         "own voice",
@@ -782,10 +955,19 @@ def test_workspace_artifacts_returns_signed_download_links(monkeypatch):
             payload = _tool_json(listed)
             assert payload["status"] == "ok"
             assert payload["items"][0]["path"] == "index.html"
+            assert payload["items"][0]["signed_open_url"].startswith(
+                "https://glasshive.example.test/v1/signed-links/"
+            )
             assert payload["items"][0]["signed_download_url"].startswith(
                 "https://glasshive.example.test/v1/signed-links/"
             )
+            assert "127.0.0.1" not in payload["items"][0]["signed_open_url"]
             assert "127.0.0.1" not in payload["items"][0]["signed_download_url"]
+            assert "signed_open_url as the default" in payload["next_action_guidance"]
+            open_token = urlsplit(payload["items"][0]["signed_open_url"]).path.rsplit("/", 1)[-1]
+            download_token = urlsplit(payload["items"][0]["signed_download_url"]).path.rsplit("/", 1)[-1]
+            assert verify_signed_link_token(open_token)["kind"] == "artifact_open"
+            assert verify_signed_link_token(download_token)["kind"] == "artifact_download"
 
             download = await client.call_tool(
                 "workspace_artifact_download",
@@ -793,10 +975,18 @@ def test_workspace_artifacts_returns_signed_download_links(monkeypatch):
             )
             download_payload = _tool_json(download)
             assert download_payload["status"] == "ok"
+            assert download_payload["signed_open_url"].startswith(
+                "https://glasshive.example.test/v1/signed-links/"
+            )
             assert download_payload["signed_download_url"].startswith(
                 "https://glasshive.example.test/v1/signed-links/"
             )
             assert download_payload["path"] == "index.html"
+            assert "signed_open_url as the default" in download_payload["next_action_guidance"]
+            open_token = urlsplit(download_payload["signed_open_url"]).path.rsplit("/", 1)[-1]
+            download_token = urlsplit(download_payload["signed_download_url"]).path.rsplit("/", 1)[-1]
+            assert verify_signed_link_token(open_token)["kind"] == "artifact_open"
+            assert verify_signed_link_token(download_token)["kind"] == "artifact_download"
 
     asyncio.run(scenario())
 
@@ -895,6 +1085,9 @@ def test_workspace_wait_prefers_newer_worker_run_over_stale_failed_run(monkeypat
             assert payload["latest_run_id"] == "run_new_completed"
             assert payload["run_state"] == "completed"
             assert payload["output_text"] == "Latest artifact is ready"
+            assert payload["artifact_links"]["items"][0]["signed_open_url"].startswith(
+                "https://glasshive.example.test/v1/signed-links/"
+            )
             assert payload["artifact_links"]["items"][0]["signed_download_url"].startswith(
                 "https://glasshive.example.test/v1/signed-links/"
             )
@@ -1039,6 +1232,7 @@ def test_worker_takeover_omits_operator_url_for_non_web_surface(monkeypatch, sur
 
 def test_worker_delegate_once_creates_resumes_and_runs_without_listing(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("WPR_CODEX_BIN", "/bin/sh")
     monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", "http://127.0.0.1:3180/api/viventium/glasshive/callback")
     monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "public-safe-test-secret")
     monkeypatch.setattr(mcp_server, "get_http_headers", _callback_headers)
@@ -1070,6 +1264,8 @@ def test_worker_delegate_once_creates_resumes_and_runs_without_listing(monkeypat
                 "http://127.0.0.1:8780/watch/wrk_resumed?surface=desktop&project_id=prj_new"
             )
             assert payload["view_steer"]["include_in_acknowledgement"] is True
+            assert payload["pre_wait_user_update"]["use_before_blocking_wait_when_possible"] is True
+            assert payload["pre_wait_user_update"]["view_steer_url"] == payload["view_steer_url"]
             assert payload["follow_up_context"]["worker_id"] == "wrk_resumed"
             assert payload["follow_up_context"]["run_id"] == "run_assign"
             assert payload["follow_up_context"]["project_id"] == "prj_new"
@@ -1088,6 +1284,45 @@ def test_worker_delegate_once_creates_resumes_and_runs_without_listing(monkeypat
             assert "alias" not in payload
 
     asyncio.run(scenario())
+
+    assigned_instruction = api_client.assign_run_payloads[-1]["instruction"]
+    assert "Open the local QA page and reply with the page title." in assigned_instruction
+    assert "host-side responsibilities" in assigned_instruction
+    assert "do not mark the workspace blocked" in assigned_instruction
+    assert "report only blockers observable from inside this worker workspace" in assigned_instruction
+    assert assigned_instruction.count("Host-side GlassHive orchestration checks") == 1
+
+
+def test_worker_delegate_once_blocks_missing_host_cli_before_api_calls(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("WPR_CODEX_BIN", "/tmp/glasshive-missing-codex")
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    api_client = TrackingApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "owner_id": "demo-owner",
+                    "title": "Unavailable host Codex",
+                    "instruction": "Run a host Codex task.",
+                    "profile": "codex-cli",
+                    "execution_mode": "host",
+                },
+            )
+            payload = _tool_json(delegated)
+            assert payload["status"] == "blocked"
+            assert payload["failure_class"] == "runtime_dependency_missing"
+            assert payload["failure_retryable"] is False
+            assert "did not start" in payload["acknowledgement_guidance"]
+            assert payload["view_steer_url"] is None
+            assert payload["view_steer"]["include_in_acknowledgement"] is False
+
+    asyncio.run(scenario())
+    assert api_client.calls == []
 
 
 def test_worker_schedule_and_workspace_schedule_are_glasshive_native(monkeypatch):
@@ -1134,6 +1369,7 @@ def test_worker_schedule_and_workspace_schedule_are_glasshive_native(monkeypatch
 
 def test_worker_delegate_once_exposes_diagnostics_only_when_requested(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("WPR_CODEX_BIN", "/bin/sh")
     monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", "http://127.0.0.1:3180/api/viventium/glasshive/callback")
     monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "public-safe-test-secret")
     monkeypatch.setattr(mcp_server, "get_http_headers", _callback_headers)
@@ -1158,13 +1394,16 @@ def test_worker_delegate_once_exposes_diagnostics_only_when_requested(monkeypatc
             assert payload["run_id"] == "run_assign"
             assert payload["execution_mode"] == "host"
             assert payload["alias"] == "codex-cli-diagnostic-host-task"
-            assert payload["submitted_instruction"] == "Run a diagnostic host task."
+            assert payload["submitted_instruction"].startswith("Run a diagnostic host task.")
+            assert "host-side responsibilities" in payload["submitted_instruction"]
+            assert "report only blockers observable from inside this worker workspace" in payload["submitted_instruction"]
 
     asyncio.run(scenario())
 
 
 def test_worker_delegate_once_dispatches_without_callback_by_default(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("WPR_CODEX_BIN", "/bin/sh")
     monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", raising=False)
     monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", raising=False)
     monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
@@ -1200,6 +1439,7 @@ def test_worker_delegate_once_dispatches_without_callback_by_default(monkeypatch
 
 def test_worker_delegate_once_can_require_callback_for_host_apps(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("WPR_CODEX_BIN", "/bin/sh")
     monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", raising=False)
     monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", raising=False)
     monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
@@ -1230,6 +1470,7 @@ def test_worker_delegate_once_can_require_callback_for_host_apps(monkeypatch):
 
 def test_workspace_status_and_wait_are_standalone_mcp_followup_tools(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "http://127.0.0.1:8780")
+    monkeypatch.setenv("WPR_MCP_BLOCKING_WAIT_POLL_INTERVAL_SEC", "1")
     monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {"X-Viventium-Surface": "web"})
     api_client = PollingApiClient(["queued", "running", "completed"])
     server = create_mcp_server(api_client=api_client)
@@ -1269,6 +1510,473 @@ def test_workspace_status_and_wait_are_standalone_mcp_followup_tools(monkeypatch
     assert api_client.get_run_calls == 3
 
 
+def test_workspace_wait_enforces_configured_poll_interval_floor(monkeypatch):
+    monkeypatch.setenv("WPR_MCP_BLOCKING_WAIT_POLL_INTERVAL_SEC", "7")
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {"X-Viventium-Surface": "web"})
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(mcp_server.asyncio, "sleep", fake_sleep)
+    api_client = PollingApiClient(["running", "completed"])
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            waited = await client.call_tool(
+                "workspace_wait",
+                {
+                    "run_id": "run_poll",
+                    "worker_id": "wrk_poll",
+                    "timeout_seconds": 30,
+                    "poll_interval_seconds": 0.01,
+                    "include_live": False,
+                },
+            )
+            waited_payload = _tool_json(waited)
+            assert waited_payload["status"] == "completed"
+            assert waited_payload["attempts"] == 2
+
+    asyncio.run(scenario())
+    assert sleep_calls == [7.0]
+
+
+def test_workspace_wait_rejects_non_finite_timing_inputs(monkeypatch):
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {"X-Viventium-Surface": "web"})
+    api_client = PollingApiClient(["running"])
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="poll_interval_seconds must be a finite number"):
+                await client.call_tool(
+                    "workspace_wait",
+                    {
+                        "run_id": "run_poll",
+                        "worker_id": "wrk_poll",
+                        "timeout_seconds": 0,
+                        "poll_interval_seconds": "NaN",
+                    },
+                )
+
+            with pytest.raises(ToolError, match="timeout_seconds must be a finite number"):
+                await client.call_tool(
+                    "workspace_wait",
+                    {
+                        "run_id": "run_poll",
+                        "worker_id": "wrk_poll",
+                        "timeout_seconds": "Infinity",
+                    },
+                )
+
+            with pytest.raises(ToolError, match="poll_interval_seconds must be greater than 0"):
+                await client.call_tool(
+                    "workspace_wait",
+                    {
+                        "run_id": "run_poll",
+                        "worker_id": "wrk_poll",
+                        "timeout_seconds": 0,
+                        "poll_interval_seconds": 0,
+                    },
+                )
+
+    asyncio.run(scenario())
+
+
+def test_workspace_wait_resolves_same_conversation_recent_launch_when_ids_are_omitted(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "http://127.0.0.1:8780")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Surface": "web",
+            "X-Viventium-User-Id": "qa-user",
+            "X-Viventium-Conversation-Id": "conv-recent-dispatch",
+        },
+    )
+    api_client = RememberedDispatchApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            launched = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Create a public-safe marker file.",
+                    "success_criteria": "The marker file exists.",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                },
+            )
+            launch_payload = _tool_json(launched)
+            assert launch_payload["status"] == "dispatched"
+            assert launch_payload["follow_up_context"]["run_id"] == "run_assign"
+
+            waited = await client.call_tool(
+                "workspace_wait",
+                {
+                    "timeout_seconds": 0,
+                    "poll_interval_seconds": 0.01,
+                },
+            )
+            waited_payload = _tool_json(waited)
+            assert waited_payload["status"] == "completed"
+            assert waited_payload["run_id"] == "run_assign"
+            assert waited_payload["worker_id"] == "wrk_resumed"
+            assert waited_payload["resolved_from_recent_dispatch"] is True
+            assert waited_payload["output_text"] == "remembered dispatch completed"
+
+            status = await client.call_tool("workspace_status", {})
+            status_payload = _tool_json(status)
+            assert status_payload["run_id"] == "run_assign"
+            assert status_payload["resolved_from_recent_dispatch"] is True
+
+    asyncio.run(scenario())
+
+
+def test_enterprise_launch_without_conversation_id_is_not_remembered(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-token")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-GlassHive-Service-Token": "service-token",
+            "X-GlassHive-Tenant-Id": "tenant-alpha",
+            "X-GlassHive-User-Id": "user-a",
+            "X-GlassHive-Surface": "web",
+        },
+    )
+    api_client = RememberedDispatchApiClient(tenant_id="tenant-alpha")
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            launched = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Enterprise scoped marker.",
+                    "success_criteria": "The marker exists.",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                },
+            )
+            launch_payload = _tool_json(launched)
+            assert launch_payload["status"] == "dispatched"
+
+            with pytest.raises(ToolError, match="recent GlassHive launch"):
+                await client.call_tool("workspace_wait", {"timeout_seconds": 0})
+
+            explicit_status = await client.call_tool(
+                "workspace_status",
+                {
+                    "run_id": launch_payload["follow_up_context"]["run_id"],
+                    "worker_id": launch_payload["follow_up_context"]["worker_id"],
+                },
+            )
+            assert _tool_json(explicit_status)["run_id"] == "run_assign"
+
+    asyncio.run(scenario())
+
+
+def test_enterprise_recent_launch_fallback_is_scoped_by_user_and_conversation(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-token")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    current_headers = {
+        "X-GlassHive-Service-Token": "service-token",
+        "X-GlassHive-Tenant-Id": "tenant-alpha",
+        "X-GlassHive-User-Id": "user-a",
+        "X-GlassHive-Conversation-Id": "conv-a",
+        "X-GlassHive-Surface": "web",
+    }
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: current_headers)
+    api_client = RememberedDispatchApiClient(tenant_id="tenant-alpha")
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        nonlocal current_headers
+        async with Client(server) as client:
+            launched = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Enterprise scoped marker.",
+                    "success_criteria": "The marker exists.",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                },
+            )
+            assert _tool_json(launched)["status"] == "dispatched"
+
+            same_user = await client.call_tool(
+                "workspace_wait",
+                {"timeout_seconds": 0, "poll_interval_seconds": 0.01},
+            )
+            assert _tool_json(same_user)["resolved_from_recent_dispatch"] is True
+
+            current_headers = {
+                **current_headers,
+                "X-GlassHive-User-Id": "user-b",
+            }
+            with pytest.raises(ToolError, match="recent GlassHive launch"):
+                await client.call_tool("workspace_wait", {"timeout_seconds": 0})
+
+            current_headers = {
+                **current_headers,
+                "X-GlassHive-User-Id": "user-a",
+                "X-GlassHive-Conversation-Id": "conv-b",
+            }
+            with pytest.raises(ToolError, match="recent GlassHive launch"):
+                await client.call_tool("workspace_status", {})
+
+            current_headers = {
+                key: value
+                for key, value in current_headers.items()
+                if key != "X-GlassHive-Conversation-Id"
+            }
+            with pytest.raises(ToolError, match="recent GlassHive launch"):
+                await client.call_tool("workspace_wait", {"timeout_seconds": 0})
+
+    asyncio.run(scenario())
+
+
+def test_workspace_status_surfaces_retryable_failure_metadata(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "http://127.0.0.1:8780")
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {"X-Viventium-Surface": "web"})
+    server = create_mcp_server(api_client=RetryableFailureApiClient())
+
+    async def scenario():
+        async with Client(server) as client:
+            status = await client.call_tool(
+                "workspace_status",
+                {"run_id": "run_retryable_failed", "worker_id": "wrk_retry"},
+            )
+            payload = _tool_json(status)
+            assert payload["terminal"] is True
+            assert payload["run_state"] == "failed"
+            assert payload["failure_class"] == "provider_rate_limited"
+            assert payload["failure_retryable"] is True
+            assert "rate-limited" in payload["failure_user_message"]
+            assert "workspace_continue" in payload["failure_recommended_recovery"]
+            assert "workspace_continue" in payload["next_action_guidance"]
+
+    asyncio.run(scenario())
+
+
+def test_workspace_continue_queues_same_workspace_recovery(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "http://127.0.0.1:8780")
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {"X-Viventium-Surface": "web"})
+    api_client = RetryableFailureApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            continued = await client.call_tool(
+                "workspace_continue",
+                {
+                    "run_id": "run_retryable_failed",
+                    "continuation_goal": "Continue and finish the workbook from current partial files.",
+                },
+            )
+            payload = _tool_json(continued)
+            assert payload["status"] == "queued"
+            assert payload["previous_run_id"] == "run_retryable_failed"
+            assert payload["previous_failure_class"] == "provider_rate_limited"
+            assert payload["follow_up_context"]["run_id"] == "run_continued"
+            assert payload["view_steer_url"].startswith("http://127.0.0.1:8780/watch/wrk_retry")
+
+    asyncio.run(scenario())
+    assert len(api_client.assigned) == 1
+    instruction = api_client.assigned[0]["instruction"]
+    assert "Original task:" in instruction
+    assert "Build the requested research workbook and report." in instruction
+    assert "Previous failure classification:" in instruction
+    assert "provider_rate_limited" in instruction
+    assert "current files" in instruction
+
+
+def test_workspace_continue_rejects_mismatched_worker_id(monkeypatch):
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    api_client = RetryableFailureApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="worker_id must match"):
+                await client.call_tool(
+                    "workspace_continue",
+                    {"run_id": "run_retryable_failed", "worker_id": "wrk_other"},
+                )
+
+    asyncio.run(scenario())
+    assert api_client.assigned == []
+
+
+def test_workspace_continue_rejects_active_previous_run(monkeypatch):
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    api_client = EnterpriseRetryableFailureApiClient(previous_state="running")
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="only for terminal"):
+                await client.call_tool(
+                    "workspace_continue",
+                    {"run_id": "run_retryable_failed"},
+                )
+
+    asyncio.run(scenario())
+    assert api_client.assigned == []
+
+
+def test_enterprise_workspace_continue_rechecks_tenant_and_owner_scope(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-GlassHive-Service-Token": "service-token",
+            "X-GlassHive-Tenant-Id": "tenant-alpha",
+            "X-GlassHive-User-Id": "user-a",
+            "X-GlassHive-Surface": "web",
+        },
+    )
+    api_client = EnterpriseRetryableFailureApiClient(worker_owner_id="user-b")
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="authenticated user"):
+                await client.call_tool(
+                    "workspace_continue",
+                    {"run_id": "run_retryable_failed"},
+                )
+
+    asyncio.run(scenario())
+    assert api_client.assigned == []
+
+
+def test_enterprise_workspace_continue_rejects_cross_tenant_previous_run(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-GlassHive-Service-Token": "service-token",
+            "X-GlassHive-Tenant-Id": "tenant-alpha",
+            "X-GlassHive-User-Id": "user-a",
+            "X-GlassHive-Surface": "web",
+        },
+    )
+    api_client = EnterpriseRetryableFailureApiClient(run_tenant_id="tenant-beta")
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="authenticated tenant"):
+                await client.call_tool(
+                    "workspace_continue",
+                    {"run_id": "run_retryable_failed"},
+                )
+
+    asyncio.run(scenario())
+    assert api_client.assigned == []
+
+
+def test_enterprise_workspace_status_rechecks_tenant_and_owner_scope(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-GlassHive-Service-Token": "service-token",
+            "X-GlassHive-Tenant-Id": "tenant-alpha",
+            "X-GlassHive-User-Id": "user-a",
+            "X-GlassHive-Surface": "web",
+        },
+    )
+    api_client = EnterpriseRetryableFailureApiClient(worker_owner_id="user-b")
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="authenticated user"):
+                await client.call_tool(
+                    "workspace_status",
+                    {"run_id": "run_retryable_failed", "worker_id": "wrk_retry"},
+                )
+
+    asyncio.run(scenario())
+
+
+def test_enterprise_workspace_artifacts_rechecks_owner_scope(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-GlassHive-Service-Token": "service-token",
+            "X-GlassHive-Tenant-Id": "tenant-alpha",
+            "X-GlassHive-User-Id": "user-a",
+        },
+    )
+    api_client = EnterpriseRetryableFailureApiClient(worker_owner_id="user-b")
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="authenticated user"):
+                await client.call_tool("workspace_artifacts", {"worker_id": "wrk_retry"})
+            with pytest.raises(ToolError, match="authenticated user"):
+                await client.call_tool(
+                    "workspace_artifact_download",
+                    {"worker_id": "wrk_retry", "path": "index.html"},
+                )
+
+    asyncio.run(scenario())
+
+
+def test_workspace_continue_rejects_previous_run_without_worker_scope(monkeypatch):
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    api_client = RetryableFailureApiClient()
+
+    def get_run_without_worker(run_id: str):
+        payload = RetryableFailureApiClient.get_run(api_client, run_id)
+        if run_id == "run_retryable_failed":
+            payload["worker_id"] = ""
+        return payload
+
+    api_client.get_run = get_run_without_worker  # type: ignore[method-assign]
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="previous run to include a worker_id"):
+                await client.call_tool(
+                    "workspace_continue",
+                    {"run_id": "run_retryable_failed", "worker_id": "wrk_retry"},
+                )
+
+    asyncio.run(scenario())
+    assert api_client.assigned == []
+
+
 def test_workspace_wait_returns_timeout_without_callback(monkeypatch):
     monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
     api_client = PollingApiClient(["running"])
@@ -1290,6 +1998,33 @@ def test_workspace_wait_returns_timeout_without_callback(monkeypatch):
             assert payload["timed_out"] is True
             assert payload["terminal"] is False
             assert "workspace_status" in payload["next_action_guidance"]
+
+    asyncio.run(scenario())
+    assert api_client.get_run_calls == 1
+
+
+def test_workspace_wait_uses_configured_default_timeout_when_omitted(monkeypatch):
+    monkeypatch.setenv("WPR_MCP_BLOCKING_WAIT_DEFAULT_SEC", "0")
+    monkeypatch.setenv("WPR_MCP_BLOCKING_WAIT_MAX_SEC", "900")
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    api_client = PollingApiClient(["running"])
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            waited = await client.call_tool(
+                "workspace_wait",
+                {
+                    "run_id": "run_poll",
+                    "worker_id": "wrk_poll",
+                    "poll_interval_seconds": 0.01,
+                    "include_live": False,
+                },
+            )
+            payload = _tool_json(waited)
+            assert payload["status"] == "timeout"
+            assert payload["timed_out"] is True
+            assert payload["terminal"] is False
 
     asyncio.run(scenario())
     assert api_client.get_run_calls == 1
@@ -1810,7 +2545,10 @@ def test_workspace_launch_uses_documented_ui_fields_without_low_level_chain(monk
                 "workspace_launch",
                 {
                     "description": "Build a small evidence file from the uploaded report.",
-                    "success_criteria": "The workspace creates summary.txt and reports where it is.",
+                    "success_criteria": (
+                        "The workspace creates summary.txt and reports where it is. "
+                        "The host chat verifies View / Steer link visibility and wait/status polling cadence."
+                    ),
                     "context": "Use the attached file and keep the workspace resumable.",
                     "profile": "codex-cli",
                     "require_callback": False,
@@ -1823,6 +2561,11 @@ def test_workspace_launch_uses_documented_ui_fields_without_low_level_chain(monk
 
     assert api.calls == ["create_project", "find_or_resume_worker", "assign_run"]
     assert api.find_or_resume_payloads[-1]["profile"] == "codex-cli"
+    assigned_instruction = api.assign_run_payloads[-1]["instruction"]
+    assert "The host chat verifies View / Steer link visibility" in assigned_instruction
+    assert "host-side responsibilities" in assigned_instruction
+    assert "do not mark the workspace blocked" in assigned_instruction
+    assert "report only blockers observable from inside this worker workspace" in assigned_instruction
 
 
 def test_workspace_launch_reuses_existing_workspace_alias_across_projects(monkeypatch):
@@ -1942,6 +2685,12 @@ def test_workspace_launch_reuses_enterprise_scoped_workspace_alias(monkeypatch):
 def test_tool_descriptions_advertise_mcp_owned_usage_contract(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
     server = create_mcp_server(api_client=FakeApiClient())
+    instructions = mcp_server.glasshive_workers_server_instructions()
+    assert "exact GlassHive tool id exposed by the host application" in instructions
+    assert "workspace_launch_mcp_glasshive-workers-projects" in instructions
+    assert "not in the available tool list" in instructions
+    assert "Preserve host-side GlassHive orchestration requirements as context" in instructions
+    assert "not by the worker running inside the workspace" in instructions
 
     public_action_tools = {
         "projects_list",
@@ -1967,6 +2716,7 @@ def test_tool_descriptions_advertise_mcp_owned_usage_contract(monkeypatch):
         "run_get",
         "workspace_status",
         "workspace_wait",
+        "workspace_continue",
         "workspace_artifacts",
         "workspace_artifact_download",
         "metrics_summary",
@@ -1992,16 +2742,25 @@ def test_tool_descriptions_advertise_mcp_owned_usage_contract(monkeypatch):
             assert "optional context" in workspace_description
             assert "Do not chain project_create" in workspace_description
             assert "uploaded-file requests" in workspace_description
+            assert "Do not shorten" in workspace_description
+            assert "full available background" in workspace_description
+            assert "View / Steer link" in workspace_description
+            assert "workspace-internal deliverable blockers" in workspace_description
 
             assert "callbacks are optional" in delegate_description.lower()
             assert "uploaded-file tasks" in delegate_description
             assert "workspace_status" in delegate_description
             assert "workspace_wait" in delegate_description
             assert "write your own short acknowledgement" in delegate_description.lower()
+            assert "sandbox" in delegate_description.lower()
+            assert "blocked" in delegate_description.lower()
             assert "delegation_audit" in delegate_description
             assert "View / Steer link" in delegate_description
             assert "follow_up_context" in delegate_description
             assert "worker_id/run_id" in delegate_description
+            assert "Do not shorten" in delegate_description
+            assert "full available brief" in delegate_description
+            assert "workspace-internal deliverable blockers" in delegate_description
 
             desktop_description = tools["worker_desktop_action"]["description"]
             assert "raw desktop URLs are diagnostic" in desktop_description

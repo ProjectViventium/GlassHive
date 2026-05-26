@@ -155,6 +155,11 @@ class RunResponse(BaseModel):
     ended_at: str | None = None
     output_text: str = ""
     error_text: str = ""
+    failure_class: str = ""
+    failure_retryable: bool = False
+    failure_user_message: str = ""
+    failure_recommended_recovery: str = ""
+    failure_diagnostic_summary: str = ""
 
 
 class ScheduleResponse(BaseModel):

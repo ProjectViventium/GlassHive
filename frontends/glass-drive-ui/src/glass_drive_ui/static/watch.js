@@ -10,6 +10,9 @@ const isApplePlatform = /Mac|iPhone|iPad|iPod/i.test(
 );
 const queueShortcutLabel = isApplePlatform ? '⌘+Enter' : 'Ctrl+Enter';
 const LONG_PRESS_MS = 550;
+const ACTIVE_REFRESH_MS = 2000;
+const IDLE_REFRESH_MS = 10000;
+const GLASSHIVE_UI_REV = '20260525c';
 
 const frame = document.getElementById('desktop-frame');
 const overlay = document.getElementById('stage-overlay');
@@ -44,7 +47,7 @@ const guidancePrimary = document.getElementById('steer-guidance-primary');
 const guidanceQueue = document.getElementById('steer-guidance-queue');
 
 let activeSurface = requestedSurface;
-let currentDesktopUrl = withAuth(`${uiBase}/desktop/${workerId}`);
+let currentDesktopUrl = withUiRev(withAuth(`${uiBase}/desktop/${workerId}`));
 let currentTerminalUrl = withAuth(`${runtimeBase}/ui/workers/${workerId}/terminal`);
 let lastAttachedUrl = '';
 let attachStartedAt = 0;
@@ -62,10 +65,18 @@ let queueModifierActive = false;
 let longPressTimer = 0;
 let longPressArmed = false;
 let suppressNextClick = false;
+let refreshTimer = 0;
+let refreshInFlight = false;
 
 function withAuth(url) {
   if (!signedToken) return url;
   return `${url}${url.includes('?') ? '&' : '?'}gh_token=${encodeURIComponent(signedToken)}`;
+}
+
+function withUiRev(url) {
+  const value = String(url || '');
+  if (!value || /(?:^|[?&])gh_ui_rev=/.test(value)) return value;
+  return `${value}${value.includes('?') ? '&' : '?'}gh_ui_rev=${encodeURIComponent(GLASSHIVE_UI_REV)}`;
 }
 
 function syncDocumentTitle(workerName, projectTitle) {
@@ -224,6 +235,21 @@ function setQueueModifierActive(active) {
   if (queueModifierActive === active) return;
   queueModifierActive = active;
   syncSendAffordance();
+}
+
+function refreshDelayForState() {
+  if (document.hidden) return IDLE_REFRESH_MS;
+  const state = String(currentRunState || '').trim().toLowerCase();
+  return ['created', 'starting', 'queued', 'running', 'resuming'].includes(state)
+    ? ACTIVE_REFRESH_MS
+    : IDLE_REFRESH_MS;
+}
+
+function scheduleRefresh(delayMs = refreshDelayForState()) {
+  if (refreshTimer) window.clearTimeout(refreshTimer);
+  refreshTimer = window.setTimeout(() => {
+    refresh().catch(() => {});
+  }, delayMs);
 }
 
 function syncMenuLabels() {
@@ -492,38 +518,48 @@ function setOverlay(state, detail) {
 }
 
 async function refresh() {
-  const response = await fetch(withAuth(`/api/worker/${workerId}/live`));
-  if (!response.ok) return;
-  const data = await response.json();
-  const worker = data.worker;
-  const runtime = data.runtime_details || {};
-  const displayState = displayStateForLive(data);
-  currentProjectTitle = String(data.project_title || worker.project_id || projectId || 'Project');
-  currentDeliverable = data.deliverable || null;
+  if (refreshInFlight) {
+    scheduleRefresh(ACTIVE_REFRESH_MS);
+    return;
+  }
+  refreshInFlight = true;
+  try {
+    const response = await fetch(withAuth(`/api/worker/${workerId}/live`));
+    if (!response.ok) return;
+    const data = await response.json();
+    const worker = data.worker;
+    const runtime = data.runtime_details || {};
+    const displayState = displayStateForLive(data);
+    currentProjectTitle = String(data.project_title || worker.project_id || projectId || 'Project');
+    currentDeliverable = data.deliverable || null;
 
-  title.textContent = currentProjectTitle || 'Workspace live view';
-  subtitle.textContent = `${worker.profile || 'worker'} workspace · ${displayStateLabel(displayState)}`;
-  syncDocumentTitle(currentProjectTitle, worker.name);
-  statePill.textContent = displayStateLabel(displayState);
-  syncRunToggle(displayState);
+    title.textContent = currentProjectTitle || 'Workspace live view';
+    subtitle.textContent = `${worker.profile || 'worker'} workspace · ${displayStateLabel(displayState)}`;
+    syncDocumentTitle(currentProjectTitle, worker.name);
+    statePill.textContent = displayStateLabel(displayState);
+    syncRunToggle(displayState);
 
-  currentDesktopAvailable = Boolean(runtime.view_available || runtime.view_url);
-  currentDesktopUrl = currentDesktopAvailable ? withAuth(`${uiBase}/desktop/${workerId}`) : '';
-  currentTerminalUrl = withAuth(`${runtimeBase}/ui/workers/${workerId}/terminal`);
+    currentDesktopAvailable = Boolean(runtime.view_available || runtime.view_url);
+  currentDesktopUrl = currentDesktopAvailable ? withUiRev(withAuth(`${uiBase}/desktop/${workerId}`)) : '';
+    currentTerminalUrl = withAuth(`${runtimeBase}/ui/workers/${workerId}/terminal`);
 
-  renderOutput(data);
-  await maybePromoteDeliverable(data);
-  syncMenuLabels();
-  setSurface(activeSurface, { force: false });
-  if (!(activeSurface === 'desktop' && !currentDesktopAvailable)) {
-    setOverlay(
-      displayState,
-      displayState === 'paused'
-        ? 'Use Resume to continue the same workspace.'
-        : activeSurface === 'desktop'
-          ? 'The desktop will attach automatically when the workspace is ready.'
-          : 'The exact workspace session will attach automatically when the workspace is ready.'
-    );
+    renderOutput(data);
+    await maybePromoteDeliverable(data);
+    syncMenuLabels();
+    setSurface(activeSurface, { force: false });
+    if (!(activeSurface === 'desktop' && !currentDesktopAvailable)) {
+      setOverlay(
+        displayState,
+        displayState === 'paused'
+          ? 'Use Resume to continue the same workspace.'
+          : activeSurface === 'desktop'
+            ? 'The desktop will attach automatically when the workspace is ready.'
+            : 'The exact workspace session will attach automatically when the workspace is ready.'
+      );
+    }
+  } finally {
+    refreshInFlight = false;
+    scheduleRefresh();
   }
 }
 
@@ -674,6 +710,10 @@ for (const eventName of ['pointercancel', 'pointerleave']) {
   });
 }
 
+document.addEventListener('visibilitychange', () => {
+  scheduleRefresh(0);
+});
+
 sendButton.addEventListener('pointerup', (event) => {
   if (!longPressArmed) {
     clearLongPress();
@@ -708,5 +748,4 @@ syncProjectWorkspaceLinks();
 syncSendAffordance();
 syncRunToggle('starting');
 autoResizeSteerInput();
-refresh();
-setInterval(refresh, 2000);
+refresh().catch(() => {});

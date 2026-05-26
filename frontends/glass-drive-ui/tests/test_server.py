@@ -200,6 +200,7 @@ def signed_worker_token(secret: str, *, worker_id: str = "wrk_1", tenant_id: str
 def signed_artifact_token(
     secret: str,
     *,
+    kind: str = "artifact_download",
     worker_id: str = "wrk_1",
     tenant_id: str = "tenant-alpha",
     owner_id: str = "user-a",
@@ -207,7 +208,7 @@ def signed_artifact_token(
 ) -> str:
     payload = {
         "v": 1,
-        "kind": "artifact_download",
+        "kind": kind,
         "worker_id": worker_id,
         "tenant_id": tenant_id,
         "owner_id": owner_id,
@@ -721,6 +722,8 @@ def test_launcher_workspace_hive_static_controls():
     watch_js = (static_dir / "watch.js").read_text(encoding="utf-8")
     assert "workspace-live-frame" in app_js
     assert "MAX_LIVE_TILE_IFRAMES" in app_js
+    assert "RETAINED_TILE_REFRESH_MS" in app_js
+    assert "dataset.nextLiveRefreshAt" in app_js
     assert "document.hidden" in app_js
     assert "workspaceRefreshInFlight" in app_js
     assert "withAuth('/api/bootstrap')" in app_js
@@ -740,6 +743,9 @@ def test_launcher_workspace_hive_static_controls():
     assert "Duplicate selected workspace" in app_js
     assert "/novnc/${workerId}/websockify" in desktop_js
     assert "runtime.view_available" in desktop_js
+    assert "desktopRefreshInFlight" in desktop_js
+    assert "scheduleDesktopRefresh" in desktop_js
+    assert "}, 5000);" not in desktop_js
     assert 'id="project-files"' in index_html
     assert 'id="schedule-text"' in index_html
     assert 'id="schedule-button"' in index_html
@@ -751,6 +757,9 @@ def test_launcher_workspace_hive_static_controls():
     assert "resumable" in app_js
     assert "Worker completed" in watch_js
     assert "Workspace resuming" in watch_js
+    assert "IDLE_REFRESH_MS" in watch_js
+    assert "refreshInFlight" in watch_js
+    assert "setInterval(refresh" not in watch_js
     assert "Workspace paused" not in watch_js
     assert 'grid-template-areas:' in styles_css
     assert '"brand controls"' in styles_css
@@ -1383,6 +1392,52 @@ def test_enterprise_signed_artifact_link_proxies_without_user_assertion(monkeypa
     assert captured["headers"]["X-Viventium-User-Role"] == "member"
 
 
+def test_enterprise_signed_artifact_open_link_proxies_without_user_assertion(monkeypatch):
+    service_secret = "ui-service-secret"
+    signed_secret = "ui-signed-link-secret"
+    set_enterprise_ui_env(monkeypatch, service_secret=service_secret, signed_secret=signed_secret)
+    monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
+    token = signed_artifact_token(signed_secret, kind="artifact_open")
+    captured = {}
+
+    class FakeUpstreamResponse:
+        status_code = 200
+        content = b"<html><body>artifact preview</body></html>"
+        headers = {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store, no-cache, private, max-age=0",
+        }
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            captured.update({"method": method, "url": url, "headers": headers or {}, "content": content})
+            return FakeUpstreamResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get(f"/v1/signed-links/{token}")
+
+    assert response.status_code == 200
+    assert b"artifact preview" in response.content
+    assert response.headers["content-type"] == "text/html; charset=utf-8"
+    assert response.headers["cache-control"] == "no-store, no-cache, private, max-age=0"
+    assert captured["url"] == f"http://runtime.test/v1/signed-links/{token}"
+    assert captured["headers"]["X-WPR-Token"] == service_secret
+    assert captured["headers"]["X-Viventium-Tenant-Id"] == "tenant-alpha"
+    assert captured["headers"]["X-Viventium-User-Id"] == "user-a"
+    assert captured["headers"]["X-Viventium-User-Role"] == "member"
+
+
 def test_signed_runtime_proxy_sets_worker_scoped_cookie(monkeypatch):
     service_secret = "ui-service-secret"
     signed_secret = "ui-signed-link-secret"
@@ -1422,10 +1477,12 @@ def test_enterprise_signed_artifact_link_cannot_open_workspace_shell(monkeypatch
     runtime = FakeRuntimeClient()
     client = TestClient(create_app(runtime_client=runtime))
 
-    token = signed_artifact_token(signed_secret)
-
-    assert client.get(f"/watch/wrk_1?gh_token={token}").status_code == 403
-    assert client.get(f"/desktop/wrk_1?gh_token={token}").status_code == 403
+    for token in (
+        signed_artifact_token(signed_secret, kind="artifact_download"),
+        signed_artifact_token(signed_secret, kind="artifact_open"),
+    ):
+        assert client.get(f"/watch/wrk_1?gh_token={token}").status_code == 403
+        assert client.get(f"/desktop/wrk_1?gh_token={token}").status_code == 403
     assert runtime.header_contexts == []
 
 
