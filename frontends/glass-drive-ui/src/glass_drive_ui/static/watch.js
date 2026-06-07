@@ -12,7 +12,7 @@ const queueShortcutLabel = isApplePlatform ? '⌘+Enter' : 'Ctrl+Enter';
 const LONG_PRESS_MS = 550;
 const ACTIVE_REFRESH_MS = 2000;
 const IDLE_REFRESH_MS = 10000;
-const GLASSHIVE_UI_REV = '20260525c';
+const GLASSHIVE_UI_REV = '20260531b';
 
 const frame = document.getElementById('desktop-frame');
 const overlay = document.getElementById('stage-overlay');
@@ -24,6 +24,8 @@ const title = document.getElementById('watch-title');
 const subtitle = document.getElementById('watch-subtitle');
 const latestOutputInline = document.getElementById('latest-output-inline');
 const latestOutputFull = document.getElementById('latest-output-full');
+const resultActions = document.getElementById('result-actions');
+const artifactList = document.getElementById('artifact-list');
 const statusLabel = document.getElementById('status-label');
 const statePill = document.getElementById('watch-state');
 const menu = document.getElementById('more-menu');
@@ -60,6 +62,10 @@ let currentProjectTitle = projectId || 'Project';
 let currentDeliverable = null;
 let currentDesktopAvailable = false;
 let lastPromotedDeliverableKey = '';
+let lastAttachedFilePreviewKey = '';
+let currentFilePreviewKey = '';
+let currentFilePreviewUrl = '';
+let currentFileDownloadUrl = '';
 let deliverablePromotionPending = false;
 let queueModifierActive = false;
 let longPressTimer = 0;
@@ -147,14 +153,37 @@ function attachView(url) {
   if (!url) return;
   if (lastAttachedUrl === url && frame.src === url) return;
   lastAttachedUrl = url;
+  lastAttachedFilePreviewKey = isFilePreviewUrl(url) ? currentFilePreviewKey : '';
   attachStartedAt = Date.now();
   frameReady = false;
   frame.src = url;
-  scheduleReconnects(url);
+  if (!isFilePreviewUrl(url)) {
+    scheduleReconnects(url);
+  }
+}
+
+function filePreviewUrl() {
+  return currentRunState === 'completed' && currentDeliverable?.kind === 'file'
+    ? String(currentFilePreviewUrl || currentDeliverable.open_url || currentDeliverable.browser_url || '')
+    : '';
+}
+
+function fileDeliverableKey(deliverable, runId) {
+  if (!deliverable || deliverable.kind !== 'file') return '';
+  const stablePath = String(deliverable.workspace_path || deliverable.label || '').trim();
+  if (!stablePath) return '';
+  return `${String(runId || '').trim()}:${stablePath}`;
+}
+
+function isFilePreviewUrl(url) {
+  const previewUrl = filePreviewUrl();
+  return Boolean(previewUrl) && String(url || '') === previewUrl;
 }
 
 function currentSurfaceUrl() {
   if (activeSurface === 'desktop') {
+    const previewUrl = filePreviewUrl();
+    if (previewUrl) return previewUrl;
     return currentDesktopUrl || currentTerminalUrl;
   }
   return currentTerminalUrl || currentDesktopUrl;
@@ -163,6 +192,7 @@ function currentSurfaceUrl() {
 function clearAttachedView() {
   clearRetryTimers();
   lastAttachedUrl = '';
+  lastAttachedFilePreviewKey = '';
   attachStartedAt = 0;
   frameReady = false;
   if (frame.src !== 'about:blank') {
@@ -255,7 +285,12 @@ function scheduleRefresh(delayMs = refreshDelayForState()) {
 function syncMenuLabels() {
   surfaceTerminalButton.dataset.active = String(activeSurface === 'terminal');
   surfaceDesktopButton.dataset.active = String(activeSurface === 'desktop');
-  openExternal.textContent = activeSurface === 'desktop' ? 'Open current desktop in new tab' : 'Open current session in new tab';
+  const filePreviewActive = activeSurface === 'desktop' && Boolean(filePreviewUrl());
+  openExternal.textContent = filePreviewActive
+    ? 'Open delivered file in new tab'
+    : activeSurface === 'desktop'
+      ? 'Open current desktop in new tab'
+      : 'Open current session in new tab';
 }
 
 function setSurface(surface, { force = false } = {}) {
@@ -267,7 +302,10 @@ function setSurface(surface, { force = false } = {}) {
     setOverlay(state);
     return;
   }
-  if (activeSurface === 'desktop' && !currentDesktopAvailable) {
+  const filePreviewAvailable = activeSurface === 'desktop'
+    && currentDeliverable?.kind === 'file'
+    && (currentDeliverable.open_url || currentDeliverable.browser_url);
+  if (activeSurface === 'desktop' && !currentDesktopAvailable && !filePreviewAvailable) {
     clearAttachedView();
     overlay.hidden = false;
     if (stage) {
@@ -283,7 +321,20 @@ function setSurface(surface, { force = false } = {}) {
     return;
   }
   const url = currentSurfaceUrl();
-  if (force || lastAttachedUrl !== url || frame.src !== url) {
+  const filePreviewKey = activeSurface === 'desktop' ? currentFilePreviewKey : '';
+  const sameFilePreviewAttached = Boolean(
+    filePreviewKey
+      && lastAttachedFilePreviewKey === filePreviewKey
+      && lastAttachedUrl
+      && !force
+  );
+  const stalledFilePreviewAttach = sameFilePreviewAttached
+    && !frameReady
+    && attachStartedAt
+    && Date.now() - attachStartedAt > 12000;
+  if (sameFilePreviewAttached && !stalledFilePreviewAttach && !force) {
+    // Keep the completed file preview stable while signed URLs rotate in live payloads.
+  } else if (force || lastAttachedUrl !== url || frame.src !== url) {
     attachView(url);
   }
   setOverlay(state || 'starting');
@@ -380,10 +431,118 @@ function summarizeOutput(data) {
   };
 }
 
+function syncResultActions(deliverable) {
+  if (!resultActions) return;
+  resultActions.replaceChildren();
+  const actions = [];
+  if (deliverable?.kind === 'file') {
+    const openUrl = String(deliverable.open_url || deliverable.browser_url || '');
+    const downloadUrl = String(deliverable.download_url || '');
+    if (openUrl) actions.push({ label: 'Open file', url: openUrl, primary: true });
+    if (downloadUrl) actions.push({ label: 'Download file', url: downloadUrl, primary: false });
+  }
+  resultActions.hidden = actions.length === 0;
+  for (const action of actions) {
+    const link = document.createElement('a');
+    link.className = `result-action${action.primary ? ' primary' : ''}`;
+    link.href = action.url;
+    link.textContent = action.label;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    resultActions.appendChild(link);
+  }
+}
+
+function formatArtifactSize(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return '';
+  if (value < 1024) return `${value} bytes`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function syncArtifactList(items) {
+  if (!artifactList) return;
+  artifactList.replaceChildren();
+  const files = Array.isArray(items)
+    ? items.filter((item) => item && !item.is_dir && (item.open_url || item.download_url || item.path))
+    : [];
+  artifactList.hidden = files.length === 0;
+  if (!files.length) return;
+
+  const heading = document.createElement('div');
+  heading.className = 'artifact-list-heading';
+  heading.textContent = files.length === 1 ? 'Workspace file' : `Workspace files (${files.length})`;
+  artifactList.appendChild(heading);
+
+  const visibleFiles = files.slice(0, 20);
+  for (const file of visibleFiles) {
+    const row = document.createElement('div');
+    row.className = 'artifact-row';
+
+    const label = document.createElement('span');
+    label.className = 'artifact-label';
+    label.textContent = String(file.path || file.name || 'artifact');
+    row.appendChild(label);
+
+    const meta = document.createElement('span');
+    meta.className = 'artifact-meta';
+    const size = formatArtifactSize(file.size);
+    meta.textContent = size || 'file';
+    row.appendChild(meta);
+
+    if (file.open_url) {
+      const open = document.createElement('a');
+      open.className = 'artifact-link';
+      open.href = String(file.open_url);
+      open.target = '_blank';
+      open.rel = 'noopener noreferrer';
+      open.textContent = 'Open';
+      row.appendChild(open);
+    }
+    if (file.download_url) {
+      const download = document.createElement('a');
+      download.className = 'artifact-link';
+      download.href = String(file.download_url);
+      download.target = '_blank';
+      download.rel = 'noopener noreferrer';
+      download.textContent = 'Download';
+      row.appendChild(download);
+    }
+
+    artifactList.appendChild(row);
+  }
+  if (files.length > visibleFiles.length) {
+    const more = document.createElement('div');
+    more.className = 'artifact-list-more';
+    more.textContent = `${files.length - visibleFiles.length} more files`;
+    artifactList.appendChild(more);
+  }
+}
+
 async function maybePromoteDeliverable(data) {
   const deliverable = data.deliverable || null;
   const runState = String(data.latest_run?.state || '').trim();
   const runId = String(data.latest_run?.run_id || '').trim();
+  if (deliverable?.kind === 'file' && (deliverable.open_url || deliverable.browser_url) && runState === 'completed') {
+    const fileUrl = String(deliverable.open_url || deliverable.browser_url || '').trim();
+    const promotionKey = fileDeliverableKey(deliverable, runId) || `${runId}:${fileUrl}`;
+    currentFilePreviewKey = promotionKey;
+    currentFilePreviewUrl = fileUrl;
+    currentFileDownloadUrl = String(deliverable.download_url || '');
+    currentDeliverable = {
+      ...deliverable,
+      open_url: currentFilePreviewUrl,
+      download_url: currentFileDownloadUrl,
+    };
+    syncResultActions(currentDeliverable);
+    if (promotionKey && promotionKey !== lastPromotedDeliverableKey) {
+      lastPromotedDeliverableKey = promotionKey;
+      activeSurface = 'desktop';
+      setSurface('desktop', { force: true });
+    }
+    return;
+  }
   if (!deliverable || !deliverable.browser_url || deliverable.preferred_surface !== 'desktop') return;
   if (!['running', 'completed'].includes(runState)) return;
   const promotionKey = `${runId}:${deliverable.browser_url}`;
@@ -411,6 +570,8 @@ function renderOutput(data) {
   resultPanelTitle.textContent = output.panelTitle;
   latestOutputInline.textContent = output.summary;
   latestOutputFull.textContent = output.full;
+  syncResultActions(data.deliverable || null);
+  syncArtifactList(data.artifacts?.items || []);
   currentSummary = output.summary;
   currentFullOutput = output.full;
   resultToggle.hidden = !output.full.trim();
@@ -470,6 +631,7 @@ async function submitFooterInstruction(mode) {
 
 function setOverlay(state, detail) {
   const connecting = attachStartedAt && !frameReady && Date.now() - attachStartedAt < 12000;
+  const filePreviewActive = activeSurface === 'desktop' && Boolean(filePreviewUrl());
   const waiting = state === 'starting' || state === 'paused' || state === 'idle' || state === 'idle_terminated' || state === 'stopped' || connecting;
   overlay.hidden = !waiting;
   if (stage) {
@@ -499,11 +661,17 @@ function setOverlay(state, detail) {
 
   if (connecting) {
     if (overlayLabel) {
-      overlayLabel.textContent = 'Workspace attaching';
+      overlayLabel.textContent = filePreviewActive ? 'Delivered file' : 'Workspace attaching';
     }
-    overlayTitle.textContent = activeSurface === 'desktop' ? 'Attaching live workspace…' : 'Attaching exact live session…';
-    overlayDetail.textContent = activeSurface === 'desktop'
-      ? 'The desktop is waking up. If it takes more than a few seconds, open the current desktop in a new tab.'
+    overlayTitle.textContent = filePreviewActive
+      ? 'Opening delivered file…'
+      : activeSurface === 'desktop'
+        ? 'Attaching live workspace…'
+        : 'Attaching exact live session…';
+    overlayDetail.textContent = filePreviewActive
+      ? 'The completed file preview is loading. Use Open delivered file in new tab if this takes more than a few seconds.'
+      : activeSurface === 'desktop'
+        ? 'The desktop is waking up. If it takes more than a few seconds, open the current desktop in a new tab.'
       : 'We are connecting to the exact running session. If it takes more than a few seconds, open the current session in a new tab.';
     return;
   }
@@ -511,9 +679,15 @@ function setOverlay(state, detail) {
   if (overlayLabel) {
     overlayLabel.textContent = 'Workspace warming up';
   }
-  overlayTitle.textContent = activeSurface === 'desktop' ? 'Preparing live workspace…' : 'Preparing exact live session…';
-  overlayDetail.textContent = detail || (activeSurface === 'desktop'
-    ? 'The desktop will attach automatically when the workspace is ready.'
+  overlayTitle.textContent = filePreviewActive
+    ? 'Opening delivered file…'
+    : activeSurface === 'desktop'
+      ? 'Preparing live workspace…'
+      : 'Preparing exact live session…';
+  overlayDetail.textContent = detail || (filePreviewActive
+    ? 'The completed file preview will appear here automatically.'
+    : activeSurface === 'desktop'
+      ? 'The desktop will attach automatically when the workspace is ready.'
     : 'The exact workspace session will appear here as soon as the workspace is ready.');
 }
 

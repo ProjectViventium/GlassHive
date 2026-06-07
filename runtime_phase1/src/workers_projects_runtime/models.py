@@ -90,6 +90,7 @@ class WorkerResponse(BaseModel):
     workspace_dir: str | None = None
     workspace_root: str | None = None
     favorite: bool = False
+    compute_released_at: str | None = None
     last_run_id: str | None = None
     last_error: str | None = None
     created_at: str
@@ -99,6 +100,7 @@ class WorkerResponse(BaseModel):
 class AssignRunRequest(BaseModel):
     instruction: str = Field(min_length=1)
     effort: str | None = None
+    bootstrap_bundle: dict[str, object] | None = None
 
 
 class SendMessageRequest(BaseModel):
@@ -110,6 +112,7 @@ class ScheduleRunRequest(BaseModel):
     run_at: str | None = None
     schedule_text: str | None = None
     delay_seconds: int | None = Field(default=None, ge=0)
+    bootstrap_bundle: dict[str, object] | None = None
 
 
 class UpdateWorkerMetadataRequest(BaseModel):
@@ -213,3 +216,8 @@ class MetricsSummary(BaseModel):
     queued_runs: int
     active_runs: int
     events: int
+    callback_pending: int = 0
+    callback_delivering: int = 0
+    callback_dead_lettered: int = 0
+    callback_max_attempts: int = 0
+    callback_oldest_pending_age_seconds: int = 0

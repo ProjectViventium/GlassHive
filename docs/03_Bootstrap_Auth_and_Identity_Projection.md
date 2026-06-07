@@ -64,9 +64,21 @@ Host-native workers also materialize visible prompt/context files in the host wo
 - `project-definition.md`
 - `work-log.md`
 - `harness-prompt.md`
-- `agents.md` / `AGENTS.md`
-- `claude.md` / `CLAUDE.md`
-- `codex.md` / `CODEX.md`
+- `AGENTS.md` as the canonical Codex-style project instruction file
+- `agents.md` as a compatibility mirror
+- `claude.md` / `CLAUDE.md` as Claude Code compatibility files that import or mirror `AGENTS.md`
+- `codex.md` / `CODEX.md` as legacy compatibility mirrors only
+
+Bootstrap-projected instructions must include a general completion self-check. Before a worker writes
+its final user-facing report, it should inspect the concrete result it produced, compare that result
+with the user's request, success criteria, constraints, and relevant files/artifacts/tool output, and
+continue or repair when it can. This must stay universal: the bootstrap should not hardcode one
+LibreChat prompt, one QA case, one provider, or one file type.
+
+The projection contract is sparse by design. The host may advertise MCP/tool capability, broker
+grants, uploads, and retrieved context, but it must not invent goals, success criteria, tool results,
+downloadable artifacts, or provider-specific workflows. The worker receives real capability context
+and decides the best path.
 
 When a trusted host client passes existing upload metadata, GlassHive reuses the existing file path
 contract instead of adding a second upload route:
@@ -164,6 +176,19 @@ Best practice:
 
 This keeps Glass Hive independent and publishable outside the Viventium stack.
 
+2026-05 preferred connected-account projection for LibreChat-compatible hosts:
+
+- the host projects a single `glasshive-user-capabilities` broker MCP through `bootstrap_bundle`
+- provider OAuth/API tokens stay in the host and are never copied into the GlassHive workspace
+- the worker receives only a short-lived broker grant scoped to user/conversation/worker/run and
+  source-of-truth-approved server names
+- the broker dynamically re-exports native typed tools where possible, so the worker can decide
+  which connected-account tool to call without the host chat model choosing for it
+- grant-bearing MCP config, Claude local settings, and Codex config files are written with
+  owner-only permissions in both host-native and sandbox materialization paths
+- `context` may mention the broker compactly, but large schemas, token material, and provider
+  credential state belong in bootstrap/tool results, not prompt text
+
 ## Why This Does Not Break Stable LibreChat
 
 Glass Hive remains a separate service.
@@ -180,6 +205,7 @@ The current Glass Hive runtime now supports:
 - worker-level `bootstrap_bundle`
 - sandbox seeding of Claude project MCP config via `.mcp.json`
 - sandbox seeding of Claude local settings via `.claude/settings.local.json`
+- host-native seeding of project MCP config and local settings from the same bootstrap fields
 - workspace instructions via `CLAUDE.md` and `AGENTS.md`
 - generic file seeding
 - runtime env projection into shells and task runs

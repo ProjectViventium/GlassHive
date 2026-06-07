@@ -15,7 +15,19 @@ from datetime import datetime
 from pathlib import Path
 from threading import Lock
 
-from .bootstrap import refresh_runtime_env_for_worker, resolve_bootstrap_source_path
+from .bootstrap import (
+    GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
+    GLASSHIVE_SAFETY_CHECKPOINT_RULE,
+    GLASSHIVE_WORKER_COMPLETION_CONTRACT,
+    bootstrap_env_for,
+    claude_project_mcp_payload_for_bundle,
+    glasshive_project_claude_md,
+    glasshive_project_codex_md,
+    merge_glasshive_worker_instructions,
+    refresh_project_runtime_files_for_worker,
+    refresh_runtime_env_for_worker,
+    resolve_bootstrap_source_path,
+)
 from .docker_sandbox import DockerSandboxManager
 from .failure_classification import classify_cli_failure
 from .openclaw_runtime import (
@@ -28,18 +40,62 @@ from .openclaw_runtime import (
     WorkerTerminatedError,
     _PROVIDER_ENV_KEYS,
 )
+from .runtime_requirements import host_runtime_requirement_issue
 from .terminal_takeover import TerminalTarget
 
 
 logger = logging.getLogger(__name__)
 
-_COMPLETION_CONTRACT = (
-    "GlassHive completion contract:\n"
-    "- Do the requested work before reporting completion.\n"
-    "- Your final assistant message MUST end with a separate section exactly named `FINAL REPORT:`.\n"
-    "- Put only the user-facing result after `FINAL REPORT:`. Include the concrete outcome, key facts, artifact/file names when useful, blockers, or the next decision needed.\n"
-    "- If the user requested a very short answer or an exact string, put only that answer after `FINAL REPORT:`.\n"
-    "- Do not put progress narration after `FINAL REPORT:`."
+# Keep prompt templates near the top. Host-native workers read these through real files in their
+# workspace (`harness-prompt.md`, `AGENTS.md`, `CLAUDE.md`, `CODEX.md`) and through the command-line
+# instruction wrapper. The constants live here so future edits do not require spelunking through the
+# host runtime implementation.
+_COMPLETION_CONTRACT = GLASSHIVE_WORKER_COMPLETION_CONTRACT
+HOST_NATIVE_HARNESS_PROMPT = f"""# GlassHive Host-Native Harness
+
+You are running directly on the user's main computer, not inside a sandbox.
+You may use the local browser, filesystem, shell, and installed OS tools.
+Default execution is no-approval/full-access for this worker class.
+
+{GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS}
+
+Operational requirements:
+- Treat the workspace directory as the primary project root.
+- Keep `work-log.md` current with concise progress, blockers, and completion notes.
+- Write files for the task inside the workspace unless the project definition explicitly requires another path.
+- Before destructive host changes, stop and emit a clear checkpoint request instead of guessing.
+- Destructive host changes include writes outside the workspace, git push, global installs, launch agents, cron, SSH/keychain/browser credentials, killing unrelated processes, and broad network exfiltration.
+- Do not print credentials, tokens, cookies, personal data, or private local paths unless absolutely required for the local operator.
+- When invoking local `.sh` helper scripts from mounted or downloaded tool folders, run them through `bash /path/to/script.sh ...` so macOS quarantine/provenance metadata cannot block direct execution.
+- For screen evidence on macOS, prefer the workspace helper `glasshive-host-tools/capture-front-window.sh` and invoke it with `bash`.
+- For host browser or desktop tasks, first use the user's existing local app/session when the task asks for the main computer, Chrome, browser profile, local files, or installed OS tools. Do not claim host control is unavailable until you have checked the available local shell/desktop/browser automation paths.
+
+{GLASSHIVE_WORKER_COMPLETION_CONTRACT}
+
+{GLASSHIVE_SAFETY_CHECKPOINT_RULE}
+
+Required context files in this workspace:
+- project-definition.md
+- work-log.md
+- harness-prompt.md
+- AGENTS.md (canonical project instructions for Codex-style workers)
+- agents.md (compatibility mirror)
+- CLAUDE.md / claude.md (Claude Code compatibility; should import or mirror AGENTS.md when possible)
+- CODEX.md / codex.md (legacy compatibility mirror only)
+"""
+HOST_DEFAULT_AGENTS_MD = (
+    "Follow these AGENTS.md project instructions and keep `work-log.md` updated.\n"
+    "When the task involves the host browser, desktop, files, shell, or installed apps, operate on the real local machine session unless the project definition explicitly says sandbox.\n"
+    "Before `FINAL REPORT:`, inspect the concrete output, files/artifacts, tool results, or visible state you produced; compare it with the user's request and success criteria; then continue, fix, or report the exact blocker.\n"
+    "End with `FINAL REPORT:` containing the user-facing result in the user's requested form; mention artifacts only when you intentionally created user-facing files and blockers only when they remain.\n"
+)
+HOST_DEFAULT_CLAUDE_MD = (
+    "Claude host worker context. Treat AGENTS.md as the canonical project instruction source and use bypass permission mode only for this GlassHive workspace.\n"
+    "For host browser/desktop tasks, check local automation paths before reporting unavailable. Before `FINAL REPORT:`, inspect the result against the user's request and success criteria. End with `FINAL REPORT:`."
+)
+HOST_DEFAULT_CODEX_MD = (
+    "Codex host worker context. AGENTS.md is the canonical project instruction source; this file is a compatibility mirror.\n"
+    "For host browser/desktop tasks, check local automation paths before reporting unavailable. Before `FINAL REPORT:`, inspect the result against the user's request and success criteria. End with `FINAL REPORT:`."
 )
 
 
@@ -106,6 +162,13 @@ class ProfiledWorkerRuntime:
 
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
         return self._runtime_for_worker(worker).run_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
+
+    def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
+        runtime = self._runtime_for_worker(worker)
+        checker = getattr(runtime, "worker_capacity_error", None)
+        if callable(checker):
+            return checker(worker)
+        return None
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).reconcile_worker(worker)
@@ -698,6 +761,11 @@ class BaseCliWorkerRuntime:
         }
         info = self.ensure_worker_ready(worker_for_run)
         refresh_runtime_env_for_worker(self._home_dir(worker_for_run["worker_id"]), worker_for_run)
+        refresh_project_runtime_files_for_worker(
+            self._home_dir(worker_for_run["worker_id"]),
+            Path(str(info.workspace_dir or self._workspace_dir(worker_for_run["worker_id"]))),
+            worker_for_run,
+        )
         command, env = self._build_command(worker_for_run, instruction, info)
         stdout_path, stderr_path = self._log_paths(worker_for_run["worker_id"])
         with stderr_path.open("a") as handle:
@@ -1762,37 +1830,10 @@ class HostNativeCliMixin:
     def _host_harness_prompt(self, worker: dict) -> str:
         bundle = self._bootstrap_bundle_for_worker(worker)
         extra = str(bundle.get("system_instructions") or "").strip()
-        return "\n".join(
-            [
-                "# GlassHive Host-Native Harness",
-                "",
-                "You are running directly on the user's main computer, not inside a sandbox.",
-                "You may use the local browser, filesystem, shell, and installed OS tools.",
-                "Default execution is no-approval/full-access for this worker class.",
-                "",
-                "Operational requirements:",
-                "- Treat the workspace directory as the primary project root.",
-                "- Keep `work-log.md` current with concise progress, blockers, and completion notes.",
-                "- Write files for the task inside the workspace unless the project definition explicitly requires another path.",
-                "- Before destructive host changes, stop and emit a clear checkpoint request instead of guessing.",
-                "- Destructive host changes include writes outside the workspace, git push, global installs, launch agents, cron, SSH/keychain/browser credentials, killing unrelated processes, and broad network exfiltration.",
-                "- Do not print credentials, tokens, cookies, personal data, or private local paths unless absolutely required for the local operator.",
-                "- When invoking local `.sh` helper scripts from mounted or downloaded tool folders, run them through `bash /path/to/script.sh ...` so macOS quarantine/provenance metadata cannot block direct execution.",
-                "- For screen evidence on macOS, prefer the workspace helper `glasshive-host-tools/capture-front-window.sh` and invoke it with `bash`.",
-                "- For host browser or desktop tasks, first use the user's existing local app/session when the task asks for the main computer, Chrome, browser profile, local files, or installed OS tools. Do not claim host control is unavailable until you have checked the available local shell/desktop/browser automation paths.",
-                "- End every run with a `FINAL REPORT:` section. Keep it concise and user-facing: outcome, key result, artifacts/files created, blocker if any, and the next decision needed. Do not end with progress chatter.",
-                "",
-                "Required context files in this workspace:",
-                "- project-definition.md",
-                "- work-log.md",
-                "- harness-prompt.md",
-                "- agents.md / AGENTS.md",
-                "- claude.md / CLAUDE.md",
-                "- codex.md / CODEX.md",
-                "",
-                extra,
-            ]
-        ).strip() + "\n"
+        prompt = HOST_NATIVE_HARNESS_PROMPT.rstrip()
+        if extra:
+            prompt += "\n\nHost-provided instructions:\n" + extra
+        return prompt.strip() + "\n"
 
     def _bootstrap_bundle_for_worker(self, worker: dict) -> dict[str, object]:
         raw = worker.get("bootstrap_bundle_json")
@@ -1846,6 +1887,60 @@ class HostNativeCliMixin:
                 return Path(value).expanduser()
         return None
 
+    def _host_codex_home(self, worker: dict) -> Path:
+        return self._home_dir(worker["worker_id"]) / ".codex"
+
+    def _copy_host_codex_auth(self, target_codex_home: Path) -> None:
+        source_codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+        source_auth = source_codex_home / "auth.json"
+        if not source_auth.exists() or not source_auth.is_file():
+            return
+        target_codex_home.mkdir(parents=True, exist_ok=True)
+        target_auth = target_codex_home / "auth.json"
+        shutil.copy2(source_auth, target_auth)
+        target_auth.chmod(0o600)
+
+    def _write_host_project_mcp_files(self, worker: dict, workspace: Path, bundle: dict[str, object]) -> None:
+        """Project scoped MCP/client config for host-native workers.
+
+        Example broker projection:
+
+            {
+                "claude_project_mcp": {"glasshive-user-capabilities": {"url": "..."}},
+                "codex_config_append": "[mcp_servers.glasshive-user-capabilities]...",
+                "env": {"GLASSHIVE_CAPABILITY_BROKER_TOKEN": "..."}
+            }
+
+        Files are owner-only because they can contain scoped broker grants or local CLI config.
+        """
+        project_mcp = bundle.get("claude_project_mcp")
+        if isinstance(project_mcp, dict):
+            payload = claude_project_mcp_payload_for_bundle(bundle, project_mcp)
+            target = workspace / ".mcp.json"
+            target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            target.chmod(0o600)
+
+        settings_local = bundle.get("claude_settings_local")
+        if isinstance(settings_local, dict):
+            target = workspace / ".claude" / "settings.local.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(settings_local, indent=2, sort_keys=True) + "\n")
+            target.chmod(0o600)
+
+        codex_config_append = str(bundle.get("codex_config_append") or "").strip()
+        if codex_config_append:
+            target = workspace / ".codex" / "config.toml"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(codex_config_append + "\n")
+            target.chmod(0o600)
+            codex_home = self._host_codex_home(worker)
+            codex_home.mkdir(parents=True, exist_ok=True)
+            codex_home.chmod(0o700)
+            codex_target = codex_home / "config.toml"
+            codex_target.write_text(codex_config_append + "\n")
+            codex_target.chmod(0o600)
+            self._copy_host_codex_auth(codex_home)
+
     def _materialize_workspace(self, worker: dict, workspace: Path) -> None:
         root = self._host_workspace_root(worker)
         root.mkdir(parents=True, exist_ok=True)
@@ -1863,28 +1958,15 @@ class HostNativeCliMixin:
             )
         self._write_workspace_file(workspace, "harness-prompt.md", self._host_harness_prompt(worker), overwrite=True)
 
-        agents_md = str(
-            bundle.get("agents_md")
-            or (
-                "Follow AGENTS.md-style project instructions and keep `work-log.md` updated.\n"
-                "When the task involves the host browser, desktop, files, shell, or installed apps, operate on the real local machine session unless the project definition explicitly says sandbox.\n"
-                "End with `FINAL REPORT:` containing only the user-facing result, artifacts, blockers, and next decision.\n"
-            )
-        )
-        claude_md = str(
-            bundle.get("claude_md")
-            or (
-                "Claude host worker context. Use bypass permission mode only for this GlassHive workspace.\n"
-                "For host browser/desktop tasks, check local automation paths before reporting unavailable. End with `FINAL REPORT:`.\n"
-            )
-        )
-        codex_md = str(
-            bundle.get("codex_md")
-            or (
-                "Codex host worker context. Use full-access/no-approval mode only for this GlassHive workspace.\n"
-                "For host browser/desktop tasks, check local automation paths before reporting unavailable. End with `FINAL REPORT:`.\n"
-            )
-        )
+        agents_md = merge_glasshive_worker_instructions(HOST_DEFAULT_AGENTS_MD, bundle.get("agents_md"))
+        claude_bundle = dict(bundle)
+        if not str(claude_bundle.get("claude_md") or "").strip():
+            claude_bundle["claude_md"] = HOST_DEFAULT_CLAUDE_MD
+        claude_md = glasshive_project_claude_md(claude_bundle)
+        codex_bundle = dict(bundle)
+        if not str(codex_bundle.get("codex_md") or "").strip():
+            codex_bundle["codex_md"] = HOST_DEFAULT_CODEX_MD
+        codex_md = glasshive_project_codex_md(codex_bundle)
         for name, content in (
             ("agents.md", agents_md),
             ("AGENTS.md", agents_md),
@@ -1894,6 +1976,7 @@ class HostNativeCliMixin:
             ("CODEX.md", codex_md),
         ):
             self._write_workspace_file(workspace, name, content, overwrite=True)
+        self._write_host_project_mcp_files(worker, workspace, bundle)
 
         self._write_workspace_file(
             workspace,
@@ -2009,7 +2092,10 @@ class HostNativeCliMixin:
 
     def _host_env(self, worker: dict, run_id: str | None = None) -> dict[str, str]:
         env: dict[str, str] = {}
-        for key in ("HOME", "PATH", "SHELL", "TERM", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"):
+        # USER/LOGNAME are required for macOS Keychain-backed CLIs (e.g. claude-code's
+        # subscription auth resolves the keychain item by user); without them the worker
+        # reports "Not logged in". Codex is unaffected because it uses a copied auth.json.
+        for key in ("HOME", "PATH", "SHELL", "TERM", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME"):
             value = os.environ.get(key)
             if value:
                 env[key] = value
@@ -2019,6 +2105,7 @@ class HostNativeCliMixin:
         env.setdefault("HOME", str(Path.home()))
         env.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
         env.setdefault("SHELL", os.environ.get("SHELL", "/bin/zsh"))
+        env.update(bootstrap_env_for(worker))
         workspace = self._host_workspace_dir(worker)
         env["GLASSHIVE_WORKER_ID"] = str(worker.get("worker_id") or "")
         env["GLASSHIVE_WORKER_RUNTIME"] = self.runtime_name
@@ -2054,6 +2141,19 @@ class HostNativeCliMixin:
                 runtime_name=self.runtime_name,
                 profile=profile,
                 execution_mode=execution_mode,
+            )
+        issue = host_runtime_requirement_issue(profile, self.runtime_name)
+        if issue is not None:
+            raise RuntimeDependencyMissingError(
+                issue.user_message,
+                binary=issue.binary,
+                runtime_name=self.runtime_name,
+                profile=profile,
+                execution_mode=execution_mode,
+                required_version=issue.required_version,
+                actual_version=issue.actual_version,
+                dependency_label=issue.label,
+                recovery_hint=issue.recommended_recovery,
             )
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
@@ -2131,14 +2231,26 @@ class HostNativeCliMixin:
             return
         worker_id = worker["worker_id"]
         with self._process_lock:
-            active = self._host_active_worker_id
-            active_process = self._active_processes.get(active or "")
-            if active and active != worker_id and (active_process is None or active_process.poll() is None):
-                raise RuntimeErrorBase(
-                    f"Host-native {self.runtime_name} already has an active worker ({active}); "
-                    "v1 allows one active host worker per CLI family."
-                )
+            error = self._host_capacity_error_locked(worker_id)
+            if error is not None:
+                raise error
             self._host_active_worker_id = worker_id
+
+    def _host_capacity_error_locked(self, worker_id: str) -> RuntimeErrorBase | None:
+        active = self._host_active_worker_id
+        active_process = self._active_processes.get(active or "")
+        if active and active != worker_id and (active_process is None or active_process.poll() is None):
+            return RuntimeErrorBase(
+                f"Host-native {self.runtime_name} already has an active worker ({active}); "
+                "v1 allows one active host worker per CLI family."
+            )
+        return None
+
+    def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
+        if os.environ.get("WPR_HOST_ALLOW_CONCURRENT_SAME_CLI", "").strip().lower() in {"1", "true", "yes", "on"}:
+            return None
+        with self._process_lock:
+            return self._host_capacity_error_locked(str(worker["worker_id"]))
 
     def _release_host_slot(self, worker_id: str) -> None:
         with self._process_lock:
@@ -2414,7 +2526,11 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
         if is_resume:
             command.append(existing_session)
         command.append(self._instruction_with_completion_contract(instruction))
-        return command, self._host_env(worker)
+        env = self._host_env(worker)
+        codex_home = self._host_codex_home(worker)
+        if (codex_home / "config.toml").exists():
+            env["CODEX_HOME"] = str(codex_home)
+        return command, env
 
 
 class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):

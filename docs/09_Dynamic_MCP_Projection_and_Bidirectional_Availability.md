@@ -32,10 +32,18 @@ The real requirement is not abstract “bidirectional capability.” It is three
 Path of least resistance:
 
 1. keep GlassHive unchanged as the standalone runtime that consumes the startup package (bootstrap)
-2. implement MCP projection (tool sharing) in the Viventium / LibreChat adapter layer
+2. implement MCP projection (tool sharing) in the Viventium / LibreChat adapter layer as a host-owned
+   capability broker MCP
 3. use the `bootstrap_bundle` (startup package) as the only way to pass data into the worker
 4. use callback webhooks for outbound v1 worker reporting
 5. keep Telegram routing in the Telegram bot / Viventium layer, not in GlassHive core
+
+2026-05 update: for LibreChat-managed connected accounts such as Google Workspace and Microsoft
+365, the preferred v1 projection is **not** raw token projection and not direct GlassHive reads from
+LibreChat storage. Viventium/LibreChat exposes one run-scoped `glasshive-user-capabilities` broker
+MCP through the bootstrap bundle. The broker keeps provider credentials server-side, dynamically
+re-exports reviewed user-authorized MCP tools with typed schemas where possible, and leaves the
+GlassHive worker responsible for deciding which capability to use.
 
 ## Why This Is The Right Boundary
 
@@ -195,31 +203,40 @@ Support three simple projection modes:
 2. `inherit_agent_context`: project the MCP servers already available to the requesting agent
 3. `all_user_enabled`: project every server available to that user
 
-Do not build a more complex policy engine for v1.
+For autonomous GlassHive workers launched from Viventium/LibreChat, the default is
+`all_user_enabled` filtered by a server-managed `viventiumGlassHive` policy block. User-created DB
+MCP configs remain projection-off unless a reviewed server-side policy explicitly allows them.
 
 #### 3. Auth Resolution Rules
 
 For each selected server:
 
-1. API-key or static-header servers:
-   - resolve concrete URL, headers, and env-backed values
-   - emit into bootstrap bundle as either `.mcp.json` or environment variables
-2. OAuth-backed MCP servers:
-   - resolve the user’s token material from the parent system
-   - do not make GlassHive read Mongo directly
-   - parent resolves the token-bearing or proxy-ready form and passes it in the bundle
+1. API-key, static-header, and OAuth-backed servers:
+   - remain hosted by the parent application
+   - are invoked by the broker as the authenticated user
+   - are never emitted to the GlassHive workspace with raw provider tokens, client secrets, refresh
+     tokens, or user-created placeholder expansion
+2. The bootstrap bundle emits only:
+   - one broker MCP endpoint
+   - one short-lived broker grant scoped to user/conversation/worker/run and allowed server names
+   - content-read scope when reviewed server-side policy authorizes read-only worker access
+   - compact policy/omission metadata
+   - project MCP configuration such as `.mcp.json` / Codex MCP config for the broker itself
+
+The worker must not self-authorize connected-account reads by setting a prompt or tool flag. In the
+Viventium/LibreChat adapter, read-only broker scope is structural: it comes from the reviewed
+`viventiumGlassHive` policy on the projected MCP server (`contentReadPolicy:
+require_broker_grant`). Compatibility hints such as
+`connected_account_content_intent` may help a host ask GlassHive to warn about a missing broker, but
+they are not authorization switches and should not be required for ordinary Gmail/MS365 read access.
 
 ### OAuth Detail
 
 For LibreChat-managed OAuth MCPs, the parent-side adapter should be responsible for reading the user’s current connection state.
 
-This is the likely source of truth in local Viventium:
-
-- LibreChat Mongo token docs keyed under patterns like `mcp:<server>` and related refresh/client records, as documented in [07_MCPs.md](<workspace-root>/docs/requirements_and_learnings/07_MCPs.md)
-
-GlassHive should not know that schema.
-
-The adapter resolves it and emits a portable result.
+LibreChat remains the OAuth/token source of truth. GlassHive must not know the token schema. The
+broker checks current auth on list/describe/invoke and returns explicit omissions such as
+`oauth_required`, `policy_not_authorized`, or `discovery_failed`.
 
 ### User Availability Rules
 
@@ -264,8 +281,17 @@ Use a versioned bundle.
 Inside GlassHive, the existing bootstrap system should continue to materialize:
 
 1. `.mcp.json` for Claude-oriented workers
+   - `claude_project_mcp` may be supplied either as `{ "mcpServers": { ... } }` or as a server map;
+     the runtime writes the Claude-compatible `mcpServers` envelope.
+   - Files that carry broker grants must be written with owner-only permissions in both sandbox and
+     host-native workers.
 2. environment variables for API-key or tool-specific workers
 3. `CLAUDE.md` and `AGENTS.md` for instructions
+   - `AGENTS.md` is canonical for Codex-style project instructions.
+   - `CLAUDE.md` should import or mirror `AGENTS.md` for Claude Code compatibility.
+   - Instructions describe available MCP/tool capability and exact user context; they do not invent
+     worker goals, success criteria, downloadable artifacts, or claim a tool was used without
+     structured evidence.
 4. seeded files for project context and callback config
 
 ## B. Outbound From Sandbox Back To Viventium
@@ -373,12 +399,13 @@ That is enough.
 
 Do these in order:
 
-1. add a LibreChat-side `glasshiveProjectionService`
-2. implement `explicit_list` and `inherit_agent_context` projection modes
-3. resolve static/API-key MCPs first
-4. resolve OAuth-backed MCPs next using parent-side token lookup
-5. pass callback URLs through `bootstrap_bundle`
-6. add Telegram-side user-to-worker alias resolution
+1. add LibreChat-side `GlassHiveCapability*` broker services
+2. add a server-managed `viventiumGlassHive` MCP policy block, omitted from user-created MCP input
+3. re-export policy-approved native MCP tools through one broker MCP with namespaced tool names
+4. inject the broker MCP into GlassHive launch/create/run/schedule `bootstrap_bundle_json` paths
+5. keep provider tokens server-side and issue only short-lived broker grants
+6. add host-native `.mcp.json` / `.claude/settings.local.json` / Codex config parity
+7. run shadow QA before retiring any Google/MS365/background-agent path
 
 Do not start with generic “bidirectional MCP federation.”
 
@@ -469,7 +496,7 @@ This proposal does not approve:
 
 Before implementation approval, decide:
 
-1. should v1 project all user-enabled MCPs or only explicit / agent-context selections?
-2. should OAuth-based projection pass tokens, proxy URLs, or both?
+1. which first-party MCP servers are opted into `viventiumGlassHive` policy for shadow mode?
+2. what numeric parity gate retires the existing background productivity agents?
 3. should parent callbacks be required for browser workers, or optional?
 4. what exact worker aliasing rule should Telegram use by default?

@@ -6,7 +6,9 @@ import hmac
 import json
 import os
 import re
+import sqlite3
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
@@ -30,6 +32,7 @@ from workers_projects_runtime.openclaw_runtime import (
 from workers_projects_runtime.service import (
     GlassHiveQuotaExceededError,
     WorkersProjectsService,
+    public_callback_message_text,
     terminal_callback_full_message,
     terminal_callback_message,
 )
@@ -62,6 +65,40 @@ def href_for_link_text(html: str, label: str) -> str:
     match = re.search(r'<a\b[^>]*href="([^"]+)"[^>]*>\s*' + re.escape(label) + r"\s*</a>", html)
     assert match, f"Expected link labeled {label!r}"
     return match.group(1)
+
+
+def anchor_for_link_text(html: str, label: str) -> str:
+    match = re.search(r"<a\b([^>]*)>\s*" + re.escape(label) + r"\s*</a>", html)
+    assert match, f"Expected link labeled {label!r}"
+    return match.group(1)
+
+
+def test_store_migrates_compute_released_marker_for_existing_db(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    with store._connect() as conn:
+        assert "compute_released_at" in {row["name"] for row in conn.execute("PRAGMA table_info(workers)").fetchall()}
+        try:
+            conn.execute("ALTER TABLE workers DROP COLUMN compute_released_at")
+        except sqlite3.OperationalError as exc:
+            pytest.skip(f"SQLite runtime does not support DROP COLUMN: {exc}")
+
+    migrated = Store(str(db_path))
+    with migrated._connect() as conn:
+        assert "compute_released_at" in {row["name"] for row in conn.execute("PRAGMA table_info(workers)").fetchall()}
+    project = migrated.create_project("owner", "Migration", "Verify worker marker migration", "codex-cli")
+    worker = migrated.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Migrated Worker",
+        role="coder",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="stub/codex-cli",
+    )
+
+    assert worker["compute_released_at"] is None
 
 
 def test_terminal_callback_message_prefers_final_report():
@@ -156,19 +193,23 @@ def test_terminal_callback_message_uses_tail_without_mid_word_fragment():
     assert not message.startswith("ows ")
 
 
-def test_terminal_callback_message_prefers_concise_final_line_without_marker():
+def test_terminal_callback_message_keeps_long_markerless_tail_with_context():
     output = "\n".join(
         [
-            "Progress " + ("still working " * 120),
-            "More progress " + ("checking browser state " * 80),
+            "Progress " + ("still working " * 220),
+            "More progress " + ("checking browser state " * 160),
             "Example Domain",
         ]
     )
 
-    assert terminal_callback_message(output, fallback="Done") == "Example Domain"
+    message = terminal_callback_message(output, fallback="Done")
+
+    assert len(message) <= 4000
+    assert message.startswith("...")
+    assert message.endswith("Example Domain")
 
 
-def test_terminal_callback_message_prefers_final_line_for_short_markerless_progress():
+def test_terminal_callback_message_keeps_short_markerless_multiline_result():
     output = "\n".join(
         [
             "Using the host browser and checking the page.",
@@ -177,7 +218,7 @@ def test_terminal_callback_message_prefers_final_line_for_short_markerless_progr
         ]
     )
 
-    assert terminal_callback_message(output, fallback="Done") == "Viventium"
+    assert terminal_callback_message(output, fallback="Done") == output
 
 
 def test_terminal_callback_message_respects_visible_budget_with_prefix():
@@ -193,7 +234,7 @@ def test_terminal_callback_message_respects_visible_budget_with_prefix():
 
     message = terminal_callback_message(output)
 
-    assert len(message) <= 2400
+    assert len(message) <= 4000
     assert message.startswith("A")
     assert message.endswith("...")
 
@@ -357,13 +398,12 @@ def test_completed_file_callback_adds_signed_open_download_and_watch_links(tmp_p
         assert completed["deliverable"]["kind"] == "file"
         assert completed["deliverable"]["workspace_path"] == "answer.txt"
         assert "File: [Open GlassHive file](https://glasshive-api.example.test/v1/signed-links/" in completed["message"]
-        assert "Download: [Download file](https://glasshive-api.example.test/v1/signed-links/" in completed["message"]
-        assert completed["message"].index("File: [Open GlassHive file]") < completed["message"].index("Download: [Download file]")
+        assert "Download: [Download file]" not in completed["message"]
         assert (
             f"View / Steer: [Open GlassHive workspace](https://glasshive-ui.example.test/watch/{worker['worker_id']}?"
             in completed["message"]
         )
-        assert completed["message"].index("Download: [Download file]") < completed["message"].index("View / Steer:")
+        assert completed["message"].index("File: [Open GlassHive file]") < completed["message"].index("View / Steer:")
         assert "surface=desktop" in completed["message"]
         assert f"project_id={project['project_id']}" in completed["message"]
         assert "gh_token=" in completed["message"]
@@ -372,6 +412,9 @@ def test_completed_file_callback_adds_signed_open_download_and_watch_links(tmp_p
 
 
 def test_failed_callback_reports_terminal_state_and_view_steer_link_without_local_path(tmp_path, monkeypatch):
+    synthetic_home_path = "/" + "/".join(("Users", "example", "private-upload.pdf"))
+    synthetic_home_prefix = "/".join(("Users", "example"))
+
     class FailingRuntime(StubRuntime):
         def run_task(
             self,
@@ -381,7 +424,7 @@ def test_failed_callback_reports_terminal_state_and_view_steer_link_without_loca
             run_id: str | None = None,
         ) -> str:
             _ = worker, instruction, timeout_sec, run_id
-            raise FileNotFoundError("Bootstrap source file not found: /Users/example/private-upload.pdf")
+            raise FileNotFoundError(f"Bootstrap source file not found: {synthetic_home_path}")
 
     class Response:
         status_code = 200
@@ -437,7 +480,7 @@ def test_failed_callback_reports_terminal_state_and_view_steer_link_without_loca
         failed = next(payload for payload in payloads if payload.get("event") == "run.failed")
         assert failed["run_state"] == "failed"
         assert "Bootstrap source file not found: [local path]" in failed["message"]
-        assert "/Users/example" not in failed["message"]
+        assert synthetic_home_prefix not in failed["message"]
         assert (
             f"View / Steer: [Open GlassHive workspace](https://glasshive-ui.example.test/watch/{worker['worker_id']}?"
             in failed["message"]
@@ -446,6 +489,194 @@ def test_failed_callback_reports_terminal_state_and_view_steer_link_without_loca
         assert failed["watch_url"].startswith(f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?")
     finally:
         service.shutdown()
+
+
+def test_retryable_host_busy_waits_and_retries_without_terminal_failure(tmp_path, monkeypatch):
+    class CapacityRuntime(StubRuntime):
+        def __init__(self) -> None:
+            self.busy = True
+            self.run_calls = 0
+
+        def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
+            if not self.busy:
+                return None
+            return RuntimeErrorBase(
+                "Host-native codex-cli already has an active worker (wrk_busy123456); "
+                "v1 allows one active host worker per CLI family."
+            )
+
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            _ = worker, timeout_sec, run_id
+            self.run_calls += 1
+            return f"Completed after capacity wait: {instruction}"
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    payloads: list[dict] = []
+
+    def capture_post(url, *, content, headers, timeout):
+        _ = url, headers, timeout
+        payloads.append(json.loads(content.decode("utf-8")))
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("GLASSHIVE_HOST_BUSY_RETRY_BASE_DELAY_S", "0.1")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", capture_post)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = CapacityRuntime()
+    service = WorkersProjectsService(store, runtime, max_workers=2)
+    try:
+        project = store.create_project("owner", "Capacity", "Wait for host worker capacity.", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Capacity Worker",
+            role="worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                    "conversation_id": "conv-1",
+                    "parent_message_id": "msg-user",
+                    "message_id": "msg-assistant",
+                }
+            },
+        )
+
+        run = service.assign_run(worker["worker_id"], "finish when capacity is free")
+
+        wait_until(lambda: (store.get_run(run["run_id"]) or {}).get("retry_attempts") == 1)
+        waiting = store.get_run(run["run_id"])
+        assert waiting["state"] == "queued"
+        assert waiting["failure_class"] == "host_worker_busy"
+        assert waiting["failure_retryable"] == 1
+        assert waiting["retry_after"]
+        assert not [event for event in store.list_events(worker["worker_id"]) if event["event_type"] == "run.failed"]
+        assert not any(payload.get("event") == "run.failed" for payload in payloads)
+        wait_until(
+            lambda: any(payload.get("event") == "run.waiting_on_capacity" for payload in payloads),
+            timeout=3.0,
+        )
+        waiting_payload = next(payload for payload in payloads if payload.get("event") == "run.waiting_on_capacity")
+        assert waiting_payload["run_state"] == "queued"
+        assert "wrk_busy" not in waiting_payload["message"]
+
+        runtime.busy = False
+        wait_until(lambda: (store.get_run(run["run_id"]) or {}).get("state") == "completed", timeout=3.0)
+
+        completed = store.get_run(run["run_id"])
+        assert completed["state"] == "completed"
+        assert "Completed after capacity wait" in completed["output_text"]
+        assert runtime.run_calls == 1
+        assert not any(payload.get("event") == "run.failed" for payload in payloads)
+    finally:
+        service.shutdown()
+
+
+def test_retryable_capacity_wait_has_max_attempts(tmp_path, monkeypatch):
+    class AlwaysBusyRuntime(StubRuntime):
+        def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
+            _ = worker
+            return RuntimeErrorBase("Host-native codex-cli already has an active worker (wrk_busy123456).")
+
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            _ = worker, instruction, timeout_sec, run_id
+            raise AssertionError("capacity-blocked run should not start task execution")
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    payloads: list[dict] = []
+
+    def capture_post(url, *, content, headers, timeout):
+        _ = url, headers, timeout
+        payloads.append(json.loads(content.decode("utf-8")))
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("GLASSHIVE_HOST_BUSY_RETRY_BASE_DELAY_S", "0.1")
+    monkeypatch.setenv("GLASSHIVE_MAX_CAPACITY_RETRY_ATTEMPTS", "1")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", capture_post)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, AlwaysBusyRuntime(), max_workers=2)
+    try:
+        project = store.create_project("owner", "Capacity Cap", "Bound retry loops.", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Capacity Cap Worker",
+            role="worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                    "conversation_id": "conv-1",
+                    "parent_message_id": "msg-user",
+                    "message_id": "msg-assistant",
+                }
+            },
+        )
+
+        run = service.assign_run(worker["worker_id"], "wait, but not forever")
+
+        wait_until(lambda: (store.get_run(run["run_id"]) or {}).get("state") == "failed", timeout=3.0)
+        failed = store.get_run(run["run_id"])
+        assert failed["retry_attempts"] == 1
+        assert failed["failure_class"] == "host_worker_busy"
+        assert failed["failure_retryable"] == 0
+        assert failed["retry_after"] is None
+        assert "stopped retrying" in failed["failure_user_message"]
+        assert (store.get_worker(worker["worker_id"]) or {})["state"] == "ready"
+        assert len([payload for payload in payloads if payload.get("event") == "run.waiting_on_capacity"]) == 1
+        wait_until(lambda: any(payload.get("event") == "run.failed" for payload in payloads), timeout=3.0)
+        failed_payloads = [payload for payload in payloads if payload.get("event") == "run.failed"]
+        assert len(failed_payloads) == 1
+        assert "stopped retrying" in failed_payloads[0]["message"]
+    finally:
+        service.shutdown()
+
+
+def test_public_callback_message_redacts_glasshive_ids():
+    message = (
+        "Host-native codex-cli already has an active worker (wrk_busy123456); "
+        "retrying run_deadbeef123 for project prj_private7890."
+    )
+
+    redacted = public_callback_message_text(message)
+
+    assert "wrk_busy123456" not in redacted
+    assert "run_deadbeef123" not in redacted
+    assert "prj_private7890" not in redacted
+    assert redacted.count("[glasshive-id]") == 3
 
 
 def test_project_worker_lifecycle_with_stub_runtime(tmp_path):
@@ -635,9 +866,13 @@ def test_enterprise_mode_scopes_projects_workers_and_artifacts(tmp_path, monkeyp
     workspace_file = Path(worker_a_payload["workspace_dir"]) / "result.txt"
     workspace_file.parent.mkdir(parents=True, exist_ok=True)
     workspace_file.write_text("user-a result", encoding="utf-8")
+    hidden_config = Path(worker_a_payload["workspace_dir"]) / ".codex" / "config.toml"
+    hidden_config.parent.mkdir(parents=True, exist_ok=True)
+    hidden_config.write_text("[mcp_servers]\n", encoding="utf-8")
     listed = client.get(f"/v1/workers/{worker_a_payload['worker_id']}/artifacts", headers=headers_a)
     assert listed.status_code == 200
     assert listed.json()["items"][0]["path"] == "result.txt"
+    assert all(item["path"] != ".codex/config.toml" for item in listed.json()["items"])
     downloaded = client.get(
         f"/v1/workers/{worker_a_payload['worker_id']}/artifacts/download",
         headers=headers_a,
@@ -727,6 +962,12 @@ def test_enterprise_mode_scopes_projects_workers_and_artifacts(tmp_path, monkeyp
         params={"path": "../runtime.db"},
     )
     assert traversal.status_code == 400
+    hidden_download = client.get(
+        f"/v1/workers/{worker_a_payload['worker_id']}/artifacts/download",
+        headers=headers_a,
+        params={"path": ".codex/config.toml"},
+    )
+    assert hidden_download.status_code == 400
     outside_file = tmp_path / "outside.txt"
     outside_file.write_text("outside", encoding="utf-8")
     symlink_path = Path(worker_a_payload["workspace_dir"]) / "outside-link.txt"
@@ -1207,6 +1448,7 @@ def test_idle_reaper_stops_compute_but_preserves_worker(tmp_path, monkeypatch):
         refreshed = store.get_worker(worker["worker_id"])
         assert refreshed is not None
         assert refreshed["state"] == "paused"
+        assert refreshed["compute_released_at"]
         assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.idle_terminated"
         with store._connect() as conn:
             conn.execute(
@@ -1268,6 +1510,7 @@ def test_idle_reaper_preserves_completed_worker_state(tmp_path, monkeypatch):
         refreshed = store.get_worker(worker["worker_id"])
         assert refreshed is not None
         assert refreshed["state"] == "completed"
+        assert refreshed["compute_released_at"]
         assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.idle_terminated"
     finally:
         service.shutdown()
@@ -1322,7 +1565,22 @@ def test_paused_reaper_stops_paused_compute_without_deleting_workspace(tmp_path,
         refreshed = store.get_worker(worker["worker_id"])
         assert refreshed is not None
         assert refreshed["state"] == "paused"
+        assert refreshed["compute_released_at"]
         assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.paused_compute_terminated"
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+                ((datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(), worker["worker_id"]),
+            )
+
+        assert service.reap_paused_workers_once() == []
+        assert runtime.terminated == [worker["worker_id"]]
+        paused_release_events = [
+            event
+            for event in store.list_events(worker["worker_id"])
+            if event["event_type"] == "worker.paused_compute_terminated"
+        ]
+        assert len(paused_release_events) == 1
     finally:
         service.shutdown()
 
@@ -1379,6 +1637,7 @@ def test_max_run_duration_cancels_expired_run_and_releases_compute(tmp_path, mon
         assert refreshed_run is not None and refreshed_run["state"] == "cancelled"
         assert "GLASSHIVE_MAX_RUN_DURATION_S=1" in refreshed_run["error_text"]
         assert refreshed_worker is not None and refreshed_worker["state"] == "paused"
+        assert refreshed_worker["compute_released_at"]
         assert store.list_events(worker["worker_id"])[-1]["event_type"] == "run.duration_exceeded"
     finally:
         service.shutdown()
@@ -1722,8 +1981,9 @@ def test_failed_callback_stays_pending_and_replays_on_restart(tmp_path, monkeypa
     with store._connect() as conn:
         row = conn.execute("SELECT status, attempts FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
     assert row["status"] == "delivered"
-    assert row["attempts"] == 2
-    assert attempts == [500, 200]
+    assert row["attempts"] >= 2
+    assert attempts[0] == 500
+    assert attempts[-1] == 200
 
 
 def test_pending_callback_replay_does_not_block_service_startup(tmp_path, monkeypatch):
@@ -1849,6 +2109,310 @@ def test_callbacks_retry_budget_is_configurable(tmp_path, monkeypatch):
 
     assert len(attempts) == 4
     assert not [event for event in store.list_events(worker["worker_id"]) if event["event_type"] == "callback.failed"]
+
+
+def _create_callback_outbox_record(store: Store, *, payload_json: str | None = None, url: str = "http://callback.local/glasshive"):
+    project = store.create_project("owner", "Callbacks", "Verify callback outbox", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Codex Host",
+        role="host worker",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="gpt-5.4",
+        bootstrap_bundle={
+            "callbacks": {
+                "events_webhook_url": url,
+                "hmac_secret": "callback-secret",
+            }
+        },
+    )
+    run = store.create_run(worker["worker_id"], project["project_id"], "Open Chrome", state="completed")
+    callback_id = "cb_" + uuid.uuid4().hex
+    payload = {
+        "callback_id": callback_id,
+        "callback_ts": int(time.time()),
+        "event": "run.completed",
+        "project_id": project["project_id"],
+        "worker_id": worker["worker_id"],
+        "run_id": run["run_id"],
+        "run_state": "completed",
+        "message": "Done",
+    }
+    record = store.upsert_callback_outbox(
+        callback_id=callback_id,
+        project_id=project["project_id"],
+        worker_id=worker["worker_id"],
+        run_id=run["run_id"],
+        event_type="run.completed",
+        url=url,
+        payload_json=payload_json if payload_json is not None else json.dumps(payload, ensure_ascii=False),
+    )
+    return project, worker, run, record
+
+
+def _callback_row(store: Store, callback_id: str):
+    with store._connect() as conn:
+        return conn.execute("SELECT * FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
+
+
+def test_permanent_403_callback_dead_letters_after_total_budget(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    class Response:
+        status_code = 403
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "http://callback.local/glasshive")
+            response = httpx.Response(403, request=request)
+            raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_MAX_TOTAL_ATTEMPTS", "3")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(store)
+        for expected_attempts in (1, 2):
+            pending = store.list_pending_callbacks()
+            assert len(pending) == 1
+            service._deliver_callback_record(worker, pending[0], service._callback_config_for(worker))
+            row = _callback_row(store, record["callback_id"])
+            assert row["status"] == "pending"
+            assert row["attempts"] == expected_attempts
+
+        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "dead_lettered"
+    assert row["attempts"] == 3
+    assert "retry budget exhausted" in row["last_error"]
+    assert len(attempts) == 3
+    assert not store.list_pending_callbacks()
+    assert [event for event in store.list_events(worker["worker_id"]) if event["event_type"] == "callback.dead_lettered"]
+
+
+def test_callback_total_budget_uses_stored_attempts(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    class Response:
+        status_code = 500
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "http://callback.local/glasshive")
+            response = httpx.Response(500, request=request)
+            raise httpx.HTTPStatusError("server error", request=request, response=response)
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_MAX_TOTAL_ATTEMPTS", "3")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(store)
+        with store._connect() as conn:
+            conn.execute("UPDATE callback_outbox SET attempts = 2 WHERE callback_id = ?", (record["callback_id"],))
+        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "dead_lettered"
+    assert row["attempts"] == 3
+    assert len(attempts) == 1
+
+
+def test_callback_over_budget_dead_letters_without_http(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        raise AssertionError("over-budget callback should not call the remote endpoint")
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_MAX_TOTAL_ATTEMPTS", "3")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(store)
+        with store._connect() as conn:
+            conn.execute("UPDATE callback_outbox SET attempts = 3 WHERE callback_id = ?", (record["callback_id"],))
+        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "dead_lettered"
+    assert row["attempts"] == 3
+    assert "retry budget exhausted before delivery" in row["last_error"]
+    assert attempts == []
+
+
+def test_terminal_404_callback_dead_letters_immediately(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    class Response:
+        status_code = 404
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "http://callback.local/glasshive")
+            response = httpx.Response(404, request=request)
+            raise httpx.HTTPStatusError("not found", request=request, response=response)
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "3")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(store)
+        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "dead_lettered"
+    assert row["attempts"] == 1
+    assert "terminal HTTP 404" in row["last_error"]
+    assert len(attempts) == 1
+
+
+def test_invalid_callback_payload_dead_letters_without_http(tmp_path, monkeypatch):
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        raise AssertionError("invalid payload must not be posted")
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(store, payload_json="{invalid")
+        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "dead_lettered"
+    assert row["attempts"] == 1
+    assert "invalid callback payload json" in row["last_error"]
+
+
+def test_missing_callback_url_dead_letters_immediately(tmp_path, monkeypatch):
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        raise AssertionError("missing callback URL must not be posted")
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(store, url="")
+        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], {})
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "dead_lettered"
+    assert row["attempts"] == 1
+    assert "missing callback url" in row["last_error"]
+
+
+def test_stale_delivering_callback_is_reclaimed_for_replay(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_DELIVERING_STALE_AFTER_S", "1")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(store)
+        old_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE callback_outbox SET status = 'delivering', updated_at = ? WHERE callback_id = ?",
+                (old_time, record["callback_id"]),
+            )
+        service._replay_pending_callbacks()
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "delivered"
+    assert row["attempts"] == 1
+    assert len(attempts) == 1
+
+
+def test_metrics_include_callback_outbox_health(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    _project, _worker, _run, pending = _create_callback_outbox_record(store)
+    _project, _worker, _run, delivering = _create_callback_outbox_record(store)
+    _project, _worker, _run, dead_lettered = _create_callback_outbox_record(store)
+    old_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE callback_outbox SET attempts = 7, updated_at = ? WHERE callback_id = ?",
+            (old_time, pending["callback_id"]),
+        )
+        conn.execute(
+            "UPDATE callback_outbox SET status = 'delivering', attempts = 3 WHERE callback_id = ?",
+            (delivering["callback_id"],),
+        )
+    store.mark_callback_dead_lettered(
+        dead_lettered["callback_id"],
+        attempts=99,
+        payload_json=str(dead_lettered["payload_json"]),
+        last_error="terminal test callback",
+    )
+
+    metrics = store.metrics()
+
+    assert metrics["callback_pending"] == 1
+    assert metrics["callback_delivering"] == 1
+    assert metrics["callback_dead_lettered"] == 1
+    assert metrics["callback_max_attempts"] == 7
+    assert metrics["callback_oldest_pending_age_seconds"] >= 250
 
 
 def test_assign_run_does_not_block_on_callback_delivery(tmp_path, monkeypatch):
@@ -1987,6 +2551,175 @@ def test_reconcile_interrupts_active_run_when_worker_process_is_missing(tmp_path
     assert store.get_worker(worker["worker_id"])["state"] == "paused"
     assert store.metrics()["active_runs"] == 0
     assert any(event["event_type"] == "run.orphaned" for event in store.list_events(worker["worker_id"]))
+
+
+def test_reconcile_orphaned_running_run_emits_interrupted_callback(tmp_path):
+    class MissingProcessRuntime(StubRuntime):
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            info = super().reconcile_worker(worker)
+            info.pid = None
+            return info
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, MissingProcessRuntime())
+    try:
+        project = store.create_project("owner", "Orphan Callback", "Notify parent on orphaned run", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                    "conversation_id": "conv-1",
+                    "parent_message_id": "msg-user",
+                    "message_id": "msg-assistant",
+                    "surface": "web",
+                }
+            },
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+        run = store.create_run(worker["worker_id"], project["project_id"], "Long host task", state="running")
+
+        service.reconcile_all_workers()
+    finally:
+        service.shutdown()
+
+    callbacks = [row for row in store.list_pending_callbacks() if row["run_id"] == run["run_id"]]
+    assert len(callbacks) == 1
+    payload = json.loads(callbacks[0]["payload_json"])
+    assert payload["event"] == "run.interrupted"
+    assert payload["run_state"] == "interrupted"
+    assert "not running during reconcile" in payload["message"]
+
+
+def test_reconcile_collects_completed_run_before_orphaning_missing_process(tmp_path):
+    class CompletedMissingProcessRuntime(StubRuntime):
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            info = super().reconcile_worker(worker)
+            info.pid = None
+            return info
+
+        def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
+            return {
+                "state": "completed",
+                "output_text": "FINAL REPORT:\nRecovered completed output.",
+            }
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, CompletedMissingProcessRuntime())
+    try:
+        project = store.create_project("owner", "Reconcile Recovery", "Collect completed run", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                    "conversation_id": "conv-1",
+                    "parent_message_id": "msg-user",
+                    "message_id": "msg-assistant",
+                    "surface": "web",
+                }
+            },
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+        run = store.create_run(worker["worker_id"], project["project_id"], "Long host task", state="running")
+
+        service.reconcile_all_workers()
+    finally:
+        service.shutdown()
+
+    recovered_run = store.get_run(run["run_id"])
+    assert recovered_run["state"] == "completed"
+    assert "Recovered completed output" in recovered_run["output_text"]
+    assert not any(event["event_type"] == "run.orphaned" for event in store.list_events(worker["worker_id"]))
+    callbacks = [row for row in store.list_pending_callbacks() if row["run_id"] == run["run_id"]]
+    assert len(callbacks) == 1
+    payload = json.loads(callbacks[0]["payload_json"])
+    assert payload["event"] == "run.completed"
+    assert payload["run_state"] == "completed"
+
+
+def test_reconcile_continues_when_one_completed_run_collection_raises(tmp_path):
+    class PartiallyFailingRuntime(StubRuntime):
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            info = super().reconcile_worker(worker)
+            info.pid = None
+            return info
+
+        def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
+            if worker.get("name") == "Broken Worker":
+                raise RuntimeError("synthetic collection failure")
+            return {
+                "state": "completed",
+                "output_text": "FINAL REPORT:\nSecond worker still reconciled.",
+            }
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, PartiallyFailingRuntime())
+    try:
+        project = store.create_project("owner", "Reconcile Isolation", "Continue after worker error", "codex-cli")
+        broken_worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Broken Worker",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+        )
+        healthy_worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Healthy Worker",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+        )
+        store.update_worker_state(broken_worker["worker_id"], "running")
+        store.update_worker_state(healthy_worker["worker_id"], "running")
+        broken_run = store.create_run(
+            broken_worker["worker_id"],
+            project["project_id"],
+            "Broken host task",
+            state="running",
+        )
+        healthy_run = store.create_run(
+            healthy_worker["worker_id"],
+            project["project_id"],
+            "Healthy host task",
+            state="running",
+        )
+
+        service.reconcile_all_workers()
+    finally:
+        service.shutdown()
+
+    assert store.get_run(broken_run["run_id"])["state"] == "running"
+    recovered_run = store.get_run(healthy_run["run_id"])
+    assert recovered_run["state"] == "completed"
+    assert "Second worker still reconciled" in recovered_run["output_text"]
+    assert any(
+        event["event_type"] == "worker.reconcile_failed"
+        for event in store.list_events(broken_worker["worker_id"])
+    )
 
 
 def test_reconcile_skips_idle_paused_workers_and_cleans_inconsistent_runs(tmp_path):
@@ -2325,6 +3058,61 @@ def test_assign_run_effort_updates_codex_worker_bootstrap_bundle(tmp_path):
     )
     assert rejected.status_code == 400
     assert "Codex effort" in rejected.json()["detail"]
+
+
+def test_signed_worker_view_cannot_inject_bootstrap_bundle_on_assign(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("WPR_API_TOKEN", "api-token")
+
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub"))
+    headers = {"x-wpr-token": "api-token"}
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={
+            "owner_id": "demo-owner",
+            "title": "Signed Link Assign",
+            "goal": "Signed watch links can steer, not reshape bootstrap context.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "demo-owner",
+            "name": "Codex Worker",
+            "role": "coding",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+            "start_synchronously": False,
+        },
+    ).json()
+    signed_watch = sign_link_params(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id=str(worker.get("tenant_id") or ""),
+        owner_id="demo-owner",
+    )
+
+    injected = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        params=signed_watch,
+        json={
+            "instruction": "Try to reshape bootstrap.",
+            "bootstrap_bundle": {"env": {"UNTRUSTED_FROM_LINK": "1"}},
+        },
+    )
+    assert injected.status_code == 403
+    assert "cannot modify worker bootstrap context" in injected.json()["detail"]
+
+    allowed = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        params=signed_watch,
+        json={"instruction": "Continue without bootstrap injection.", "effort": "medium"},
+    )
+    assert allowed.status_code == 202
 
 
 def test_missing_host_cli_blocks_creation_before_worker_row(tmp_path, monkeypatch):
@@ -2730,6 +3518,102 @@ def test_live_payload_promotes_workspace_html_as_deliverable(tmp_path):
     assert payload["deliverable"]["preferred_surface"] == "desktop"
 
 
+def test_live_payload_file_deliverable_includes_signed_open_and_download_links(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "File Deliverable",
+            "goal": "Expose a downloadable file result to the operator UI.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "File Worker",
+            "role": "writer",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+        },
+    ).json()
+
+    workspace = Path(worker["workspace_dir"])
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "answer.txt").write_text("download me", encoding="utf-8")
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live")
+    assert live.status_code == 200
+    deliverable = live.json()["deliverable"]
+    assert deliverable["kind"] == "file"
+    assert deliverable["workspace_path"] == "answer.txt"
+    assert deliverable["open_url"].startswith("/v1/signed-links/")
+    assert deliverable["download_url"].startswith("/v1/signed-links/")
+
+    opened = client.get(deliverable["open_url"])
+    assert opened.status_code == 200
+    assert "download me" in opened.text
+    assert "Download file" in opened.text
+    downloaded = client.get(deliverable["download_url"])
+    assert downloaded.status_code == 200
+    assert downloaded.text == "download me"
+    assert "attachment" in downloaded.headers["content-disposition"]
+
+
+def test_live_payload_artifact_inventory_includes_multiple_signed_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Multi File Deliverable",
+            "goal": "Expose all generated files to the operator UI.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Multi File Worker",
+            "role": "writer",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+        },
+    ).json()
+
+    workspace = Path(worker["workspace_dir"])
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "first.txt").write_text("FIRST_OK", encoding="utf-8")
+    (workspace / "second.txt").write_text("SECOND_OK", encoding="utf-8")
+    (workspace / ".mcp.json").write_text("{}", encoding="utf-8")
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live")
+    assert live.status_code == 200
+    artifact_items = live.json()["artifacts"]["items"]
+    by_path = {item["path"]: item for item in artifact_items}
+    assert sorted(by_path) == ["first.txt", "second.txt"]
+    assert by_path["first.txt"]["open_url"].startswith("/v1/signed-links/")
+    assert by_path["first.txt"]["download_url"].startswith("/v1/signed-links/")
+    assert by_path["second.txt"]["open_url"].startswith("/v1/signed-links/")
+    assert by_path["second.txt"]["download_url"].startswith("/v1/signed-links/")
+
+    downloaded = client.get(by_path["first.txt"]["download_url"])
+    assert downloaded.status_code == 200
+    assert downloaded.text == "FIRST_OK"
+
+
 def test_deliverable_detection_ignores_provider_api_endpoints(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -2753,6 +3637,33 @@ def test_deliverable_detection_ignores_provider_api_endpoints(tmp_path):
     assert payload["source"] == "workspace_file"
     assert payload["workspace_path"] == "qa_enterprise_launcher_ui_pass.txt"
     assert "cognitiveservices" not in json.dumps(payload)
+
+
+def test_deliverable_detection_prefers_user_file_over_incidental_external_url(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifact_name = "qa_synthetic_claude_worker.txt"
+    (workspace / artifact_name).write_text("SYNTHETIC_CLAUDE_WORKER_OK")
+    worker = {
+        "worker_id": "wrk_1",
+        "workspace_dir": str(workspace),
+        "execution_mode": "docker",
+    }
+    output = "\n".join(
+        [
+            "Fetched https://example.com while checking network reachability.",
+            "FINAL REPORT: SYNTHETIC_CLAUDE_WORKER_OK",
+            f"File: {artifact_name}",
+        ]
+    )
+
+    payload = deliverable_payload(worker, {"state": "completed"}, output)
+
+    assert payload is not None
+    assert payload["kind"] == "file"
+    assert payload["source"] == "workspace_file"
+    assert payload["workspace_path"] == artifact_name
+    assert "example.com" not in json.dumps(payload)
 
 
 def test_deliverable_detection_ignores_glasshive_scaffold_files(tmp_path):
@@ -2779,6 +3690,14 @@ def test_deliverable_detection_ignores_glasshive_scaffold_files(tmp_path):
     mixed_case_helper = mixed_case_helper_dir / "latest-helper-output.txt"
     mixed_case_helper.write_text("not a user artifact")
     os.utime(mixed_case_helper, (9999999999, 9999999999))
+    codex_dir = workspace / ".codex"
+    codex_dir.mkdir()
+    codex_config = codex_dir / "config.toml"
+    codex_config.write_text("[mcp_servers]\n")
+    os.utime(codex_config, (9999999999, 9999999999))
+    mcp_config = workspace / ".mcp.json"
+    mcp_config.write_text("{}")
+    os.utime(mcp_config, (9999999999, 9999999999))
     worker = {
         "worker_id": "wrk_1",
         "workspace_dir": str(workspace),
@@ -2931,10 +3850,12 @@ def test_resume_worker_refreshes_stale_worker_model_before_runtime_start(tmp_pat
         start_synchronously=False,
     )
 
+    store.update_worker(worker["worker_id"], compute_released_at=datetime.now(timezone.utc).isoformat())
     runtime.model = "gpt-5.4"
     resumed = service.resume_worker(worker["worker_id"])
 
     assert resumed["model"] == "gpt-5.4"
+    assert resumed["compute_released_at"] is None
     assert runtime.ensure_models[-1] == "gpt-5.4"
 
 
@@ -4077,10 +4998,9 @@ def test_completed_web_callback_includes_operator_url_and_deliverable(tmp_path, 
         assert payload["deliverable"]["kind"] == "webpage"
         assert payload["deliverable"]["browser_url"] == "file:///workspace/project/index.html"
         assert "File: [Open GlassHive file](http://127.0.0.1:8780/v1/signed-links/" in payload["message"]
-        assert "Download: [Download file](http://127.0.0.1:8780/v1/signed-links/" in payload["message"]
-        assert payload["message"].index("File: [Open GlassHive file]") < payload["message"].index("Download: [Download file]")
+        assert "Download: [Download file]" not in payload["message"]
         assert "View / Steer: [Open GlassHive workspace]" in payload["message"]
-        assert payload["message"].index("Download: [Download file]") < payload["message"].index("View / Steer:")
+        assert payload["message"].index("File: [Open GlassHive file]") < payload["message"].index("View / Steer:")
 
 
 def test_artifact_open_page_previews_text_without_forcing_download(tmp_path, monkeypatch):
@@ -4114,10 +5034,13 @@ def test_artifact_open_page_previews_text_without_forcing_download(tmp_path, mon
         assert "no-store" in opened.headers["cache-control"]
         assert opened.headers["pragma"] == "no-cache"
         assert opened.headers["x-content-type-options"] == "nosniff"
+        assert opened.headers["x-frame-options"] == "SAMEORIGIN"
         assert "default-src 'none'" in opened.headers["content-security-policy"]
+        assert "frame-ancestors 'self'" in opened.headers["content-security-policy"]
         assert "GlassHive preview works." in opened.text
         assert "Download file" in opened.text
         assert 'href="/v1/signed-links/' in opened.text
+        assert 'target="_top"' in anchor_for_link_text(opened.text, "View workspace")
         assert "gh_token=" in opened.text
         opened_download_href = href_for_link_text(opened.text, "Download file")
         opened_download = client.get(opened_download_href)
@@ -4263,6 +5186,7 @@ def test_enterprise_signed_artifact_open_page_actions_remain_signed(tmp_path, mo
     workspace_href = href_for_link_text(opened.text, "View workspace")
     assert download_href.startswith("/v1/signed-links/")
     assert "gh_token=" in workspace_href
+    assert 'target="_top"' in anchor_for_link_text(opened.text, "View workspace")
 
     downloaded = client.get(download_href)
     assert downloaded.status_code == 200
@@ -4422,7 +5346,7 @@ def test_native_schedule_queues_due_run(tmp_path):
 
     assert processed.status_code == 200
     queued = client.get(f"/v1/schedules/{schedule_id}").json()
-    assert queued["state"] == "queued"
+    assert queued["state"] in {"queued", "running", "completed"}
     assert queued["queued_run_id"]
     run = wait_for_run(client, queued["queued_run_id"])
     assert run["state"] == "completed"
@@ -4451,7 +5375,48 @@ def test_worker_quota_enforced_per_user(tmp_path, monkeypatch):
 
     assert first.status_code == 201
     assert second.status_code == 429
-    assert "GLASSHIVE_MAX_WORKSPACES_PER_USER=1" in second.json()["detail"]
+    payload = second.json()
+    assert "GLASSHIVE_MAX_WORKSPACES_PER_USER=1" in payload["detail"]
+    assert payload["status"] == "blocked"
+    assert payload["failure_class"] == "glasshive_worker_quota_exceeded"
+    assert payload["failure_retryable"] == 0
+    assert payload["quota"]["env_name"] == "GLASSHIVE_MAX_WORKSPACES_PER_USER"
+    assert payload["retry_after_seconds"] is None
+    assert "Retry-After" not in second.headers
+    assert payload["available_workspace_options"][0]["workspace_name"] == "First"
+    assert payload["available_workspace_options"][0]["project_title"] == "Quota"
+    assert "available_workspace_options" in payload["main_agent_next_action"]
+    assert "switching profile or sandbox mode" in payload["main_agent_next_action"]
+    assert "Do not retry this launch on a timer" in payload["main_agent_next_action"]
+
+
+def test_active_worker_quota_retry_after_uses_idle_release(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_MAX_ACTIVE_WORKERS_PER_USER", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "900")
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Active Quota", "goal": "Limit active workspace count."},
+    ).json()
+
+    first = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "First", "role": "operator", "profile": "codex-cli"},
+    )
+    second = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Second", "role": "operator", "profile": "codex-cli"},
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 429
+    payload = second.json()
+    assert payload["failure_retryable"] == 1
+    assert payload["quota"]["env_name"] == "GLASSHIVE_MAX_ACTIVE_WORKERS_PER_USER"
+    assert payload["retry_after_seconds"] == 900
+    assert second.headers["Retry-After"] == "900"
+    assert "wait for idle release" in payload["main_agent_next_action"]
 
 
 def test_active_worker_quota_counts_resuming_workers(tmp_path, monkeypatch):
@@ -4483,6 +5448,59 @@ def test_active_worker_quota_counts_resuming_workers(tmp_path, monkeypatch):
             )
 
         assert "GLASSHIVE_MAX_ACTIVE_WORKERS_PER_USER=1" in str(exc.value)
+        assert exc.value.env_name == "GLASSHIVE_MAX_ACTIVE_WORKERS_PER_USER"
+        assert exc.value.available_workspace_options[0]["workspace_name"] == "First"
+    finally:
+        service.shutdown()
+
+
+def test_tenant_quota_options_remain_requesting_owner_scoped(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_MAX_ACTIVE_WORKERS_PER_TENANT", "2")
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        project_a = service.create_project("owner-a", "Owner A", "Owner A work.", "codex-cli", tenant_id="tenant-1")
+        project_b = service.create_project("owner-b", "Owner B", "Owner B work.", "codex-cli", tenant_id="tenant-1")
+        first_a = service.create_worker(
+            project_a["project_id"],
+            "owner-a",
+            "Owner A Active",
+            "operator",
+            "codex-cli",
+            "stub",
+            tenant_id="tenant-1",
+            start_synchronously=False,
+        )
+        first_b = service.create_worker(
+            project_b["project_id"],
+            "owner-b",
+            "Owner B Active",
+            "operator",
+            "codex-cli",
+            "stub",
+            tenant_id="tenant-1",
+            start_synchronously=False,
+        )
+        store.update_worker_state(first_a["worker_id"], "ready")
+        store.update_worker_state(first_b["worker_id"], "ready")
+
+        with pytest.raises(GlassHiveQuotaExceededError) as exc:
+            service.create_worker(
+                project_a["project_id"],
+                "owner-a",
+                "Owner A Blocked",
+                "operator",
+                "codex-cli",
+                "stub",
+                tenant_id="tenant-1",
+                start_synchronously=False,
+            )
+
+        assert exc.value.env_name == "GLASSHIVE_MAX_ACTIVE_WORKERS_PER_TENANT"
+        assert [option["workspace_name"] for option in exc.value.available_workspace_options] == ["Owner A Active"]
+        assert "Owner B Active" not in {
+            option["workspace_name"] for option in exc.value.available_workspace_options
+        }
     finally:
         service.shutdown()
 

@@ -87,6 +87,22 @@ def classify_cli_failure(
             ),
             diagnostic_summary=diagnostic_summary,
         )
+    if _looks_like_runtime_dependency_or_version_failure(lowered):
+        return FailureClassification(
+            failure_class="runtime_dependency_missing",
+            retryable=False,
+            user_message=(
+                "GlassHive could not complete the run because the selected worker runtime has a "
+                "missing, incompatible, or too-old local prerequisite."
+            ),
+            recommended_recovery=(
+                "Use a configured managed dependency, choose another available worker profile, or "
+                "use sandbox/workstation execution when that still satisfies the user's request. "
+                "Ask the operator to change the host service runtime only when no configured "
+                "recovery path is available."
+            ),
+            diagnostic_summary=diagnostic_summary,
+        )
     if (
         "stdin is closed" in lowered
         or "write_stdin failed" in lowered
@@ -130,21 +146,33 @@ def classify_runtime_error(
     runtime_label = str(getattr(exc, "runtime_name", "") or runtime_name or "worker").strip()
     profile = str(getattr(exc, "profile", "") or "").strip()
     binary = str(getattr(exc, "binary", "") or "").strip()
-    binary_label = binary.replace("\\", "/").rstrip("/").split("/")[-1] or binary
+    dependency_label = str(getattr(exc, "dependency_label", "") or "").strip()
+    binary_label = dependency_label or binary.replace("\\", "/").rstrip("/").split("/")[-1] or binary
+    required_version = str(getattr(exc, "required_version", "") or "").strip()
+    actual_version = str(getattr(exc, "actual_version", "") or "").strip()
+    recovery_hint = str(getattr(exc, "recovery_hint", "") or "").strip()
 
-    if "not installed" in lowered or "not on path" in lowered:
+    if required_version or "not installed" in lowered or "not on path" in lowered or _looks_like_runtime_dependency_or_version_failure(lowered):
         binary_hint = f" (`{binary_label}`)" if binary_label else ""
         profile_hint = f" for `{profile}`" if profile else ""
+        version_hint = ""
+        if required_version:
+            version_hint = f" The required version is >= {required_version}."
+            if actual_version:
+                version_hint += f" Current version: {actual_version}."
         return FailureClassification(
             failure_class="runtime_dependency_missing",
             retryable=False,
             user_message=(
                 f"GlassHive could not start the selected worker{profile_hint} because the required "
-                f"host CLI{binary_hint} is not installed or not available to the GlassHive service."
+                f"host runtime dependency{binary_hint} is missing, unavailable, or incompatible."
+                f"{version_hint}"
             ),
             recommended_recovery=(
-                "Choose an available worker profile or sandbox/workstation execution mode, or ask the "
-                "operator to install/configure the missing CLI on the GlassHive service PATH."
+                recovery_hint
+                or "Use a configured managed dependency, choose another available worker profile, or use "
+                "sandbox/workstation execution when that still satisfies the user's request. Ask the "
+                "operator to change the host service runtime only when no configured recovery path is available."
             ),
             diagnostic_summary=message,
         )
@@ -245,6 +273,20 @@ def _looks_failure_field(key: str) -> bool:
     return lowered in {"error", "error_code", "message", "failure", "status_code", "detail"}
 
 
+def _looks_like_runtime_dependency_or_version_failure(lowered: str) -> bool:
+    return (
+        "requires node" in lowered
+        or "needs node" in lowered
+        or "node.js v" in lowered
+        or "node v" in lowered
+        or "unsupported engine" in lowered
+        or "minimum node" in lowered
+        or "minimum version" in lowered
+        or "version mismatch" in lowered
+        or "too old" in lowered
+    )
+
+
 def _looks_failure_related(value: str) -> bool:
     lowered = value.lower()
     markers = (
@@ -271,6 +313,7 @@ _FAILURE_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)((?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s\"']{6,}"), r"\1[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
+    (re.compile(r"\b(?:wrk|run|prj)_[A-Za-z0-9_-]{6,}\b"), "[glasshive-id]"),
     (re.compile(r"\b[A-Za-z0-9_]{8,}:[A-Za-z0-9_./+=-]{20,}\b"), "[REDACTED_CREDENTIAL]"),
     (re.compile(r"(?i)data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{256,}"), "[REDACTED_IMAGE_BASE64]"),
     (re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{512,}={0,2}(?![A-Za-z0-9+/=])"), "[REDACTED_LONG_BASE64]"),

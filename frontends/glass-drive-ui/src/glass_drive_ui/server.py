@@ -570,7 +570,9 @@ def _bootstrap_bundle_for_uploads(files: list[UploadedFileRequest]) -> dict[str,
         "system_instructions": (
             "The user attached files for this run. They are available inside the workspace under:\n"
             f"{upload_list}\n\n"
-            "Use those files directly when they are relevant, and mention created/downloadable artifacts in the FINAL REPORT."
+            "Use those files directly when they are relevant. Mention user-facing artifacts/files only "
+            "when you intentionally create them, they are needed, or the user asked for them; do not "
+            "force a downloadable file when a concise chat result satisfies the request."
         ),
     }
 

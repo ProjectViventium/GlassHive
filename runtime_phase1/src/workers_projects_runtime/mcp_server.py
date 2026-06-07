@@ -26,8 +26,14 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from .auth import AuthContext, scoped_alias
-from .bootstrap import BOOTSTRAP_SOURCE_TOKEN_KEY, sign_bootstrap_source_path
+from .bootstrap import (
+    BOOTSTRAP_SOURCE_TOKEN_KEY,
+    GLASSHIVE_CAPABILITY_BROKER_TOKEN_ENV,
+    sign_bootstrap_source_path,
+)
+from .deliverables import is_user_deliverable_relative_path
 from .operator_urls import surface_aware_watch_url, surface_can_open_operator_url
+from .runtime_requirements import host_runtime_requirement_issue
 from .runtime_env import load_viventium_runtime_env
 from .signed_links import append_signed_query, sign_link_token, signed_link_ttl_seconds
 
@@ -62,6 +68,22 @@ WORKER_HOST_SIDE_ORCHESTRATION_RULE = (
     "worker workspace."
 )
 
+CONNECTED_ACCOUNT_NO_BROKER_NOTE = (
+    "Connected-account content intent was requested, but this workspace did not receive a complete "
+    "host-signed `glasshive-user-capabilities` broker grant/config in its bootstrap bundle. Do not "
+    "claim brokered MCP access, brokered provider reachability, or brokered results. Use only tools "
+    "that are actually available inside this worker session and label them accurately; if the needed "
+    "provider, content, or auth scope is unavailable, report the blocker instead of filling gaps."
+)
+CAPABILITY_BROKER_NAME = "glasshive-user-capabilities"
+CAPABILITY_BROKER_CONTENT_READ_SCOPE = "content_read"
+HIGH_EFFORT_SELECTION_GUIDANCE = (
+    "For complex multi-source research, deep research, critical analysis, large file transformation, "
+    "coding, comparison, or executive-quality deliverables, choose a higher effort setting: Codex "
+    "high/xhigh, Claude max, OpenClaw high/max, or the configured equivalent, unless the user clearly "
+    "asks for a quick/cheap pass. Use medium only for ordinary bounded tasks."
+)
+
 
 class GlassHiveBlockedError(RuntimeError):
     def __init__(self, payload: dict[str, Any]) -> None:
@@ -84,6 +106,16 @@ def _blocking_wait_default_poll_interval_seconds() -> float:
     except ValueError:
         configured = 5.0
     return max(1.0, min(configured, 30.0))
+
+
+def _blocking_wait_sleep_interval_seconds(*, attempts: int, base_interval: float, adaptive: bool) -> float:
+    if not adaptive:
+        return base_interval
+    # Keep early waits responsive, then back off to protect the API/control plane during long runs.
+    # With the default 5s base this yields roughly 5s -> 10s -> 20s -> 30s.
+    growth_steps = max(0, (max(1, attempts) - 1) // 6)
+    multiplier = min(8, 2**growth_steps)
+    return min(30.0, max(base_interval, base_interval * multiplier))
 
 
 def _finite_tool_float(value: float | int | str, *, field_name: str) -> float:
@@ -119,31 +151,63 @@ def _host_profile_binary(profile: str) -> str:
     return os.environ.get("WPR_OPENCLAW_BIN", "").strip() or "openclaw"
 
 
+def _host_profile_runtime_name(profile: str) -> str:
+    clean = str(profile or "").strip()
+    if clean == "codex-cli":
+        return "codex-cli"
+    if clean == "claude-code":
+        return "claude-code"
+    return "openclaw"
+
+
 def _host_profile_available(profile: str) -> bool:
-    return shutil.which(_host_profile_binary(profile)) is not None
+    requirement_checker = globals().get("host_runtime_requirement_issue")
+    return (
+        shutil.which(_host_profile_binary(profile)) is not None
+        and (
+            not callable(requirement_checker)
+            or requirement_checker(profile, _host_profile_runtime_name(profile)) is None
+        )
+    )
 
 
 def _runtime_dependency_blocked_payload(*, profile: str, execution_mode: str) -> dict[str, Any] | None:
     if execution_mode != "host":
         return None
     binary = _host_profile_binary(profile)
-    if shutil.which(binary) is not None:
+    if shutil.which(binary) is None:
+        label = binary.replace("\\", "/").rstrip("/").split("/")[-1] or binary
+        profile_hint = f" for `{profile}`" if profile else ""
+        return {
+            "status": "blocked",
+            "failure_class": "runtime_dependency_missing",
+            "failure_retryable": False,
+            "failure_user_message": (
+                f"GlassHive cannot start the selected host worker{profile_hint} because the required "
+                f"CLI `{label}` is not installed or not available to the GlassHive service."
+            ),
+            "failure_recommended_recovery": (
+                "Use a configured managed dependency, choose another available worker profile, or use "
+                "sandbox/workstation execution when that still satisfies the user's request. Ask the "
+                "operator to change the host service runtime only when no configured recovery path is available."
+            ),
+            "failure_diagnostic_summary": f"Missing host CLI for profile={profile} execution_mode={execution_mode}",
+            "profile": profile,
+            "execution_mode": execution_mode,
+        }
+    issue = host_runtime_requirement_issue(profile, _host_profile_runtime_name(profile))
+    if issue is None:
         return None
-    label = binary.replace("\\", "/").rstrip("/").split("/")[-1] or binary
     profile_hint = f" for `{profile}`" if profile else ""
     return {
         "status": "blocked",
         "failure_class": "runtime_dependency_missing",
         "failure_retryable": False,
-        "failure_user_message": (
-            f"GlassHive cannot start the selected host worker{profile_hint} because the required "
-            f"CLI `{label}` is not installed or not available to the GlassHive service."
-        ),
-        "failure_recommended_recovery": (
-            "Use a sandbox/workstation workspace, choose another available worker profile, or ask "
-            "the operator to install/configure the missing CLI on the GlassHive service PATH."
-        ),
-        "failure_diagnostic_summary": f"Missing host CLI for profile={profile} execution_mode={execution_mode}",
+        "failure_user_message": issue.user_message.replace("selected host worker", f"selected host worker{profile_hint}", 1)
+        if profile_hint and "selected host worker for" not in issue.user_message
+        else issue.user_message,
+        "failure_recommended_recovery": issue.recommended_recovery,
+        "failure_diagnostic_summary": issue.diagnostic_summary,
         "profile": profile,
         "execution_mode": execution_mode,
     }
@@ -486,6 +550,15 @@ def glasshive_workers_server_instructions() -> str:
     return (
         "GlassHive owns persistent projects, resumable workers, host-native workers for browser and desktop action, "
         "local files/projects, installed CLIs, workstation sandboxes, and live operator takeover. "
+        "GlassHive workers are general intelligent workers; less is more. Give them faithful goals, "
+        "constraints, files, MCP/tool capability context, and user-visible success conditions, then trust "
+        "the worker to choose the path. The host assistant must not invent tool results, claim MCP access "
+        "was used without returned evidence, or turn its own orchestration preferences into worker goals. "
+        "Pass MCP/tool availability as context, not as a made-up success criterion. "
+        "Data in and data out must be exact: pass real file/upload references, broker grants/capabilities, "
+        "and retrieved context when available, and report unavailable data as a blocker instead of filling gaps. "
+        "When reporting exact filenames, paths, markers, IDs, or exact content in Markdown, wrap them in "
+        "backticks or escape Markdown-sensitive characters so underscores and other literals survive rendering. "
         "Use it when the user asks the host assistant to act in a real browser, desktop app, local file, "
         "local project, installed tool, or current computer session; the user does not need to say "
         "GlassHive, Codex, Computer Use, or local machine. Do not answer from memory or inference when "
@@ -494,11 +567,29 @@ def glasshive_workers_server_instructions() -> str:
         "tools, so action names like workspace_launch may be displayed as suffixed callable ids such "
         "as workspace_launch_mcp_glasshive-workers-projects; use the callable id, not a bare action "
         "name that is not in the available tool list. "
-        f"{_worker_capability_summary()} {execution_instruction} "
+        f"{_worker_capability_summary()}\n\n"
+        "For connected-account facts or actions, MCP/tools are preferred when they can satisfy the task, "
+        "and broker capability belongs in context as an available option, not as an invented project goal. "
+        "Do not make tool choice a workspace success criterion unless the user explicitly asked for that. "
+        "Do not invent project goals, success criteria, provider lists, output schemas, artifacts, ranking "
+        "rules, or workflow steps that the user did not specify. For vague user adjectives like urgent "
+        "or important, pass the adjective through instead of defining a rubric unless the user defines it. "
+        "Do not add memory-derived priorities, active-thread/contact/deal lists, or guessed urgency rubrics to description, success_criteria, "
+        "or context unless the user explicitly asked to use memory/prior context; trust the GlassHive worker to find the "
+        "best path from the user's request and available context. If the user did not specify acceptance "
+        "criteria, use a minimal criterion such as: Satisfy the user's request as stated, preserving explicit "
+        "constraints. Put extra background in context, not as hard gates. Browser or computer use remains "
+        "available when MCP/tools are missing, unavailable, auth-blocked, explicitly required, or genuinely "
+        "the better visual/manual QA route.\n\n"
+        "If GlassHive injects `glasshive-user-capabilities` and another host connector also exposes the "
+        "same connected account, describe the brokered capability as the preferred scoped option; "
+        "non-broker host connectors are fallback after broker omission, unavailability, auth block, "
+        "or explicit user request. "
+        f"{execution_instruction} "
         "Use Docker/workstation mode for isolated sandbox, disposable browser, risky untrusted "
         "browsing, explicit sandbox requests, or when the user says sandboxed workspace, sandbox, "
         "Codex Workspace, or workstation. In those cases set execution_mode='docker' even if this "
-        "deployment's default execution mode is host. "
+        "deployment's default execution mode is host.\n\n"
         f"For configured mentions {codex_mention}, {claude_mention}, and {openclaw_mention}, create "
         "or resume a host worker with the matching profile semantics; prefer codex-cli for available "
         "host browser/desktop/file/code execution, claude-code when Claude is explicitly requested, "
@@ -514,29 +605,31 @@ def glasshive_workers_server_instructions() -> str:
         "content. Preserve existing file references in bootstrap_bundle_json. If the user refers "
         "to an attached or uploaded file and your model context cannot read the file body directly, "
         "still call workspace_launch or worker_delegate_once; do not refuse solely because your own "
-        "model context lacks file contents. For fresh one-off "
+        "model context lacks file contents.\n\nFor fresh one-off "
         "host/browser/desktop/local tasks, prefer workspace_launch, whose fields mirror the "
-        "documented GlassHive UI: description, required success_criteria, and optional context. "
+        "documented GlassHive UI: description, optional success_criteria, and optional context. "
+        "Use success_criteria for explicit user requirements only; if the user gave no distinct acceptance "
+        "criteria, omit it or keep it minimal instead of manufacturing a plan for the worker. "
+        "Connected-account read authorization comes from the host-signed broker grant when reviewed "
+        "host policy projects content-read scope; connected_account_content_intent is only a compatibility "
+        "hint for hosts that want an extra missing-broker warning, not a required authorization switch. "
         "When the user asks to make a worker or effort the default, use workspace_preferences_set; "
         "when profile or effort is omitted, workspace_launch and worker_delegate_once honor the "
-        "authenticated user's saved defaults before falling back to deployment defaults. "
-        "For complex multi-source research, large file transformation, coding, comparison, or "
-        "executive-quality deliverables, choose a higher effort setting: Codex high/xhigh, "
-        "Claude max, or the configured equivalent, unless the user clearly asks for a quick/cheap "
-        "pass. Use medium only for ordinary bounded tasks and xhigh/max for deep research or "
-        "hard, ambiguous work. Do not shorten, summarize, paraphrase, or water down the user's "
+        "authenticated user's saved defaults before falling back to deployment defaults.\n\n"
+        f"{HIGH_EFFORT_SELECTION_GUIDANCE} "
+        "Use xhigh/max for deep research or hard, ambiguous work. Do not shorten, summarize, paraphrase, or water down the user's "
         "request before handing it to GlassHive. Preserve the full user request, success criteria, "
         "constraints, examples, links, file references, exclusions, and available background in "
         "workspace_launch description/success_criteria/context or worker_delegate_once instruction. "
         "Use the context field for the full picture when the description would otherwise become a "
-        "thin summary. "
+        "thin summary.\n\n"
         f"{HOST_SIDE_ORCHESTRATION_GUIDANCE} "
         "worker_delegate_once is the lower-level one-call fallback when the caller already has a "
         "precise instruction/title. These high-level tools create or resume the "
-        "project/worker, includes optional callback/upload context, queues the run in one call, and "
-        "returns a View / Steer link plus follow_up_context for later status/result questions. "
+        "project/worker, include optional callback/upload context, queue the run in one call, and "
+        "return a View / Steer link plus follow_up_context for later status/result questions. "
         "GlassHive must work standalone: callbacks are an optional host-app delivery enhancement, "
-        "not a requirement. After workspace_launch or worker_delegate_once, write one short "
+        "not a requirement.\n\nAfter workspace_launch or worker_delegate_once, write one short "
         "outcome-focused acknowledgement in the assistant's own voice and include the View / Steer "
         "link when present on web/browser surfaces. If callback_ready=false, say the work is running "
         "and can be checked with the standalone MCP status tools. If the user asks whether it is "
@@ -728,12 +821,26 @@ def _require_enterprise_mcp_transport(transport: str) -> None:
 def _audit_preview(value: str, *, max_chars: int = 700) -> str:
     text = str(value or "")
     text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}", r"\1[REDACTED]", text)
+    secret_fields = r"api[_-]?key|token|secret|password|passwd|pwd|auth|credential|session[_-]?token|bearer|signature"
     text = re.sub(
-        r"(?i)((?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s\"']{6,}",
+        rf"(?i)([\"']?(?:{secret_fields})[\"']?\s*:\s*\")[^\"]+(\")",
+        r"\1[REDACTED]\2",
+        text,
+    )
+    text = re.sub(
+        rf"(?i)([\"']?(?:{secret_fields})[\"']?\s*:\s*')[^']+(')",
+        r"\1[REDACTED]\2",
+        text,
+    )
+    text = re.sub(
+        rf"(?i)((?:{secret_fields})\s*[:=]\s*)[^\s\"']+",
         r"\1[REDACTED]",
         text,
     )
     text = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "sk-[REDACTED]", text)
+    text = re.sub(r"\b[A-Za-z0-9_]{8,}:[A-Za-z0-9_./+=-]{20,}\b", "[REDACTED_CREDENTIAL]", text)
+    text = re.sub(r"(?i)data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{256,}", "[REDACTED_IMAGE_BASE64]", text)
+    text = re.sub(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{512,}={0,2}(?![A-Za-z0-9+/=])", "[REDACTED_LONG_BASE64]", text)
     text = re.sub(
         r"(?:~\/|\/Users\/|\/home\/|\/private\/var\/|\/var\/folders\/|[A-Za-z]:\\Users\\)[^\s`'\"<>]+",
         "[local path]",
@@ -909,6 +1016,8 @@ def _clean_artifact_relative_path(path: str) -> str:
         return ""
     if any(part in {"", ".", "..", ".git"} for part in relative.parts):
         return ""
+    if not is_user_deliverable_relative_path(relative):
+        return ""
     return relative.as_posix()
 
 
@@ -944,6 +1053,7 @@ def _artifact_listing_payload(
     *,
     worker: dict[str, Any],
     artifacts: dict[str, Any],
+    include_open_links: bool = True,
     include_download_links: bool = True,
 ) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
@@ -953,20 +1063,26 @@ def _artifact_listing_payload(
             continue
         item = dict(raw)
         path = _clean_artifact_relative_path(str(item.get("path") or ""))
-        if include_download_links and path:
+        if not path:
+            continue
+        if include_open_links:
             item["signed_open_url"] = _signed_artifact_open_url(worker, path)
+        if include_download_links:
             item["signed_download_url"] = _signed_artifact_download_url(worker, path)
         items.append(item)
     return {
         "status": "ok",
         "worker_id": str(worker.get("worker_id") or "").strip() or None,
         "items": items,
+        "open_links_signed": bool(include_open_links),
         "download_links_signed": bool(include_download_links),
         "download_link_ttl_seconds": signed_link_ttl_seconds(),
         "next_action_guidance": (
-            "Return the relevant signed_open_url as the default user-facing file link when present; "
-            "label signed_download_url explicitly as a raw Download file action. Do not paste whole "
-            "generated files into chat when GlassHive provides scoped file links."
+            "Use relevant signed_open_url values as user-facing file links only when the user asked "
+            "for files/artifacts or the worker output references user-facing files. Use "
+            "signed_download_url only when the user explicitly asked for a raw download. Do not "
+            "invent file links, and do not paste whole generated files into chat when GlassHive "
+            "provides scoped file links."
         ),
     }
 
@@ -1018,7 +1134,8 @@ def _dispatch_follow_up_context(
             "message_guidance": (
                 "If you are about to call workspace_wait for a long wait and this chat protocol "
                 "allows assistant text before the next tool call, first tell the user the work has "
-                "started and include this View / Steer link. If the protocol does not allow an "
+                "started and include this as a labeled [View / Steer](view_steer_url) link rather "
+                "than a bare URL. If the protocol does not allow an "
                 "intermediate assistant message, include the View / Steer link in the final answer."
             ),
             "view_steer_url": view_steer_url,
@@ -1067,6 +1184,24 @@ def _blocked_dispatch_result(
         },
         **payload,
     }
+
+
+def _can_recover_blocked_host_dispatch_to_docker(
+    blocked: dict[str, Any] | None,
+    *,
+    requested_execution_mode: str | None,
+    resolved_execution_mode: str,
+    workspace_root: str | None,
+) -> bool:
+    if not blocked or blocked.get("failure_class") != "runtime_dependency_missing":
+        return False
+    if resolved_execution_mode != "host":
+        return False
+    if str(requested_execution_mode or "").strip():
+        return False
+    if str(workspace_root or "").strip():
+        return False
+    return True
 
 
 def _iter_upload_file_objects(value: Any):
@@ -1326,6 +1461,111 @@ def _with_worker_host_side_orchestration_rule(instruction: str) -> str:
     if "Execution rules:" in clean:
         return "\n".join([clean, WORKER_HOST_SIDE_ORCHESTRATION_RULE])
     return "\n\n".join([clean, "Execution rules:", WORKER_HOST_SIDE_ORCHESTRATION_RULE])
+
+
+def _append_worker_instruction_note(instruction: str, note: str) -> str:
+    clean = str(instruction or "").strip()
+    clean_note = str(note or "").strip()
+    if not clean_note or clean_note in clean:
+        return clean
+    if "Execution rules:" in clean:
+        return "\n".join([clean, f"- {clean_note}"])
+    return "\n\n".join(part for part in (clean, clean_note) if part)
+
+
+def _strip_worker_instruction_note(instruction: str, note: str) -> str:
+    clean = str(instruction or "")
+    clean_note = str(note or "").strip()
+    if not clean_note:
+        return clean.strip()
+    return re.sub(r"\n{0,2}" + re.escape(clean_note), "", clean).strip()
+
+
+def _append_bundle_system_instruction(bundle: dict[str, Any], note: str) -> None:
+    clean_note = str(note or "").strip()
+    if not clean_note:
+        return
+    current = str(bundle.get("system_instructions") or "").strip()
+    if clean_note in current:
+        return
+    bundle["system_instructions"] = "\n\n".join(part for part in (current, clean_note) if part)
+
+
+def _truthy_bundle_flag(value: Any) -> bool:
+    if value is True:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    return False
+
+
+def _broker_has_content_read_scope(broker: dict[str, Any]) -> bool:
+    scopes = broker.get("scopes")
+    if not isinstance(scopes, dict):
+        return False
+    return _truthy_bundle_flag(scopes.get(CAPABILITY_BROKER_CONTENT_READ_SCOPE)) or _truthy_bundle_flag(
+        scopes.get("contentRead")
+    )
+
+
+def _has_complete_capability_broker_bundle(bundle: dict[str, Any] | None) -> bool:
+    if not isinstance(bundle, dict):
+        return False
+    broker = bundle.get("glasshive_capability_broker")
+    if not isinstance(broker, dict):
+        return False
+    try:
+        if int(broker.get("version")) != 1:
+            return False
+    except (TypeError, ValueError):
+        return False
+    if str(broker.get("name") or "").strip() != CAPABILITY_BROKER_NAME:
+        return False
+    if not str(broker.get("url") or "").strip():
+        return False
+    expires_at = broker.get("grant_expires_at") or broker.get("grantExpiresAt")
+    if expires_at not in (None, ""):
+        try:
+            if float(expires_at) <= time.time():
+                return False
+        except (TypeError, ValueError):
+            return False
+    if not _broker_has_content_read_scope(broker):
+        return False
+
+    env = bundle.get("env")
+    token_env_present = isinstance(env, dict) and bool(str(env.get(GLASSHIVE_CAPABILITY_BROKER_TOKEN_ENV) or "").strip())
+    codex_config = str(bundle.get("codex_config_append") or "")
+    codex_config_present = (
+        f"[mcp_servers.{CAPABILITY_BROKER_NAME}]" in codex_config
+        and "bearer_token_env_var" in codex_config
+        and GLASSHIVE_CAPABILITY_BROKER_TOKEN_ENV in codex_config
+    )
+    claude_mcp = bundle.get("claude_project_mcp")
+    claude_config = claude_mcp.get(CAPABILITY_BROKER_NAME) if isinstance(claude_mcp, dict) else None
+    claude_headers = claude_config.get("headers") if isinstance(claude_config, dict) else None
+    claude_config_present = isinstance(claude_headers, dict) and bool(
+        str(claude_headers.get("Authorization") or "").strip()
+    )
+    return bool(token_env_present and (codex_config_present or claude_config_present))
+
+
+def _apply_connected_account_intent_guard(
+    bundle: dict[str, Any] | None,
+    instruction: str | None = None,
+    *,
+    connected_account_content_intent: bool = False,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not connected_account_content_intent or _has_complete_capability_broker_bundle(bundle):
+        return bundle, instruction
+    guarded_bundle: dict[str, Any] = dict(bundle or {})
+    _append_bundle_system_instruction(guarded_bundle, CONNECTED_ACCOUNT_NO_BROKER_NOTE)
+    guarded_instruction = (
+        _append_worker_instruction_note(instruction, CONNECTED_ACCOUNT_NO_BROKER_NOTE)
+        if instruction is not None
+        else instruction
+    )
+    return guarded_bundle, guarded_instruction
 
 
 def _merge_request_context(bundle: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1638,10 +1878,19 @@ class WorkersProjectsApiClient:
     def worker_events(self, worker_id: str) -> list[dict[str, Any]]:
         return self._request("GET", f"/v1/workers/{worker_id}/events").get("items", [])
 
-    def assign_run(self, worker_id: str, instruction: str, *, effort: str | None = None) -> dict[str, Any]:
+    def assign_run(
+        self,
+        worker_id: str,
+        instruction: str,
+        *,
+        effort: str | None = None,
+        bootstrap_bundle: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {"instruction": instruction}
         if effort:
             payload["effort"] = effort
+        if bootstrap_bundle is not None:
+            payload["bootstrap_bundle"] = bootstrap_bundle
         return self._request("POST", f"/v1/workers/{worker_id}/assign", json_body=payload)
 
     def send_message(self, worker_id: str, message: str) -> dict[str, Any]:
@@ -1655,6 +1904,7 @@ class WorkersProjectsApiClient:
         run_at: str | None = None,
         schedule_text: str | None = None,
         delay_seconds: int | None = None,
+        bootstrap_bundle: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"instruction": instruction}
         if run_at:
@@ -1663,6 +1913,8 @@ class WorkersProjectsApiClient:
             payload["schedule_text"] = schedule_text
         if delay_seconds is not None:
             payload["delay_seconds"] = delay_seconds
+        if bootstrap_bundle is not None:
+            payload["bootstrap_bundle"] = bootstrap_bundle
         return self._request("POST", f"/v1/workers/{worker_id}/schedule", json_body=payload)
 
     def worker_schedules(self, worker_id: str, include_done: bool = False) -> list[dict[str, Any]]:
@@ -1923,6 +2175,9 @@ def create_mcp_server(
             "If the chat model cannot read the file body, still call this with file names/references and requested transformation so GlassHive can use request upload metadata supplied by the host or return an honest blocker. "
             "Write your own short acknowledgement, include the View / Steer link when view_steer_url is present, and keep follow_up_context for later user status/result questions; it contains the worker_id/run_id needed to poll without exposing raw IDs to the user. "
             "Do not shorten, summarize, paraphrase, or water down the user's request: pass the full available brief, background, constraints, examples, links, file references, exclusions, and success criteria through instruction/goal/bootstrap context so the worker receives the full picture. "
+            "For connected-account facts or actions, prefer MCP/tools over browser or computer UI when available. Connected-account read authorization comes from the host-signed broker grant; connected_account_content_intent is only a compatibility hint for missing-broker warnings, not a required authorization switch. "
+            "Pass MCP/tool availability as context, not as a made-up project goal or success criterion, unless the user explicitly asked to prove tool usage. "
+            f"{HIGH_EFFORT_SELECTION_GUIDANCE} "
             f"{HOST_SIDE_ORCHESTRATION_GUIDANCE} "
             "Preserve the user's requested final-answer format in the instruction, especially short/exact-answer constraints. "
             "Use delegation_audit to self-check the dispatched instruction, but do not expose it unless diagnostics were requested. "
@@ -1946,6 +2201,17 @@ def create_mcp_server(
         execution_mode: ExecutionModeParam = None,
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
+        connected_account_content_intent: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Optional compatibility hint for hosts that want GlassHive to warn when "
+                    "connected-account content was requested but no complete broker grant/config "
+                    "was supplied. Authorization comes only from a host-signed broker grant with "
+                    "content-read scope; this flag alone does not unlock reads or writes."
+                )
+            ),
+        ] = False,
         bootstrap_bundle_json: BootstrapBundleParam = None,
         uploaded_files: UploadedFilesParam = None,
         effort: Annotated[
@@ -1953,7 +2219,8 @@ def create_mcp_server(
             Field(
                 description=(
                     "Optional per-run effort override. Codex accepts none/minimal/low/medium/high/xhigh; "
-                    "Claude Code accepts max; OpenClaw accepts high/max. Omit to use the user's saved default."
+                    "Claude Code accepts max; OpenClaw accepts high/max. Omit to use the user's saved default. "
+                    + HIGH_EFFORT_SELECTION_GUIDANCE
                 )
             ),
         ] = None,
@@ -1961,6 +2228,7 @@ def create_mcp_server(
         expose_diagnostics: bool = False,
     ) -> dict[str, Any]:
         resolved_owner_id = _request_owner_id(owner_id)
+        requested_execution_mode = str(execution_mode or "").strip()
         resolved_execution_mode = _resolve_execution_mode(execution_mode)
         try:
             preferences = _normalize_preferences(client.get_preferences())
@@ -1973,12 +2241,37 @@ def create_mcp_server(
         clean_instruction = instruction.strip()
         if not clean_instruction:
             raise ValueError("instruction is required")
-        worker_instruction = _with_worker_host_side_orchestration_rule(clean_instruction)
+        explicit_goal = str(goal or "").strip()
+        worker_instruction_body = clean_instruction
+        if explicit_goal and explicit_goal != clean_instruction:
+            worker_instruction_body = (
+                f"{clean_instruction}\n\n"
+                f"User-visible success condition:\n{explicit_goal}"
+            )
+        worker_instruction = _with_worker_host_side_orchestration_rule(worker_instruction_body)
         resolved_alias = (alias or _slugify_alias(resolved_profile, clean_title)).strip()
         blocked = _runtime_dependency_blocked_payload(
             profile=resolved_profile,
             execution_mode=resolved_execution_mode,
         )
+        runtime_recovery: dict[str, Any] | None = None
+        if _can_recover_blocked_host_dispatch_to_docker(
+            blocked,
+            requested_execution_mode=requested_execution_mode,
+            resolved_execution_mode=resolved_execution_mode,
+            workspace_root=workspace_root,
+        ):
+            runtime_recovery = {
+                "from_execution_mode": "host",
+                "to_execution_mode": "docker",
+                "reason_class": blocked.get("failure_class"),
+                "reason_summary": blocked.get("failure_user_message"),
+            }
+            resolved_execution_mode = "docker"
+            blocked = _runtime_dependency_blocked_payload(
+                profile=resolved_profile,
+                execution_mode=resolved_execution_mode,
+            )
         if blocked:
             return _blocked_dispatch_result(
                 blocked,
@@ -2004,6 +2297,12 @@ def create_mcp_server(
             owner_id=context_owner_id or resolved_owner_id,
         )
         bundle = _apply_effort_to_bundle(bundle, profile=resolved_profile, effort=resolved_effort)
+        bundle, worker_instruction = _apply_connected_account_intent_guard(
+            bundle,
+            worker_instruction,
+            connected_account_content_intent=connected_account_content_intent,
+        )
+        worker_instruction = worker_instruction or clean_instruction
         callback_ready, missing_callback_fields = _callback_state(bundle, required=require_callback)
         if require_callback and not callback_ready:
             return {
@@ -2101,21 +2400,25 @@ def create_mcp_server(
             "status": "dispatched",
             "acknowledgement_guidance": (
                 "Write one short acknowledgement in your own voice that the task has started. "
-                "Include the View / Steer link when view_steer_url is present. If callback_ready is "
+                "Include view_steer_url as a labeled [View / Steer](view_steer_url) link when present; "
+                "do not paste the bare URL. If callback_ready is "
                 "false, say the user can ask for status and you will check GlassHive through MCP; do "
-                "not claim an automatic chat callback is required. Do not quote a canned template or "
+                "not claim an automatic chat callback is required. If runtime_recovery is present, you may "
+                "briefly say GlassHive used an available sandbox/workstation path because the default host "
+                "runtime was unavailable; do not ask the user to install global software. Do not quote a canned template or "
                 "expose raw worker/run IDs."
             ),
             "main_agent_next_action": (
-            "Send one short acknowledgement in your own voice, include view_steer_url when "
-            "available, and stop this chat turn unless the user explicitly asked you to wait. "
+            "Send one short acknowledgement in your own voice, include view_steer_url as a labeled "
+            "[View / Steer](view_steer_url) link when available, and stop this chat turn unless the user explicitly asked you to wait. "
             "Do not call workspace_status, worker_live, run_get, or workspace_wait in the same "
             "turn unless the user asked for diagnostics/live status/blocking completion. On later "
             "follow-up status/result questions, use follow_up_context.run_id/worker_id with "
             "workspace_status for non-blocking status or workspace_wait for a blocking wait before answering. "
             "When the user asks you to wait for results, pass timeout_seconds from "
-            "follow_up_context.completion_wait_timeout_seconds and call workspace_wait immediately "
-            "in this same turn instead of asking the user to confirm waiting."
+            "follow_up_context.completion_wait_timeout_seconds; first surface the View / Steer link "
+            "when the chat protocol supports assistant text before another tool call, then call "
+            "workspace_wait immediately in this same turn instead of asking the user to confirm waiting."
         ),
             "callback_ready": callback_ready,
             "callback_delivery": "optional" if callback_ready else "not_configured_standalone_polling_available",
@@ -2128,6 +2431,8 @@ def create_mcp_server(
                 "use_for": "self-check only; do not show the user unless diagnostics were requested",
             },
         }
+        if runtime_recovery:
+            result["runtime_recovery"] = runtime_recovery
         if expose_diagnostics:
             result.update(
                 {
@@ -2149,8 +2454,13 @@ def create_mcp_server(
         title="Launch GlassHive Workspace",
         description=(
             "Primary user-facing GlassHive launch tool. Use this for ordinary LibreChat requests that need a resumable workspace, browser/desktop work, local files, generated artifacts, or a long-running worker. "
-            "Its required inputs intentionally mirror the documented GlassHive UI: description, required success_criteria, and optional context. "
+            "Its inputs intentionally mirror the documented GlassHive UI: description, optional success_criteria, and optional context. "
             "Do not shorten, summarize, paraphrase, or water down the user's request. Use description for the outcome, success_criteria for hard gates, and context for the full available background, constraints, examples, links, file references, exclusions, and any original wording that matters. "
+            "For connected-account facts or actions, include broker/tool availability as context and let the GlassHive worker choose how to satisfy the user's goal; do not turn tool choice into a success criterion unless the user explicitly asked for that. Browser or computer UI inspection remains available when MCP/tools are missing, unavailable, auth-blocked, explicitly required, or genuinely the better visual/manual QA route. "
+            "The host assistant must not fabricate MCP/tool results or force a downloadable artifact; only pass real data/capabilities and let the worker decide whether a file, chat answer, browser action, or other output is appropriate. "
+            f"{HIGH_EFFORT_SELECTION_GUIDANCE} "
+            "If the user did not specify acceptance criteria, omit success_criteria or use only the minimal value 'Satisfy the user's request as stated, preserving explicit constraints.' Do not invent provider lists, output schemas, artifacts, ranking rules, workflow steps, memory-derived priorities, active-thread/contact/deal lists, or guessed urgency rubrics. For vague user adjectives like urgent or important, pass the adjective through instead of defining a rubric unless the user defines it. "
+            "Connected-account read authorization comes from the host-signed broker grant when reviewed host policy projects content-read scope; connected_account_content_intent is only a compatibility hint for missing-broker warnings, not a required authorization switch. The flag alone does not unlock content reads or writes. "
             f"{HOST_SIDE_ORCHESTRATION_GUIDANCE} "
             "Do not chain project_create, worker_create, and worker_run for routine tasks. Do not expose project/worker/run IDs unless expose_diagnostics is true. "
             "Returns a clean non-blocking dispatch result with view_steer_url and follow_up_context. "
@@ -2159,7 +2469,9 @@ def create_mcp_server(
             "explicitly wants a blocking wait. For attached/uploaded-file requests, set uploaded_files "
             "when file text is visible to the current model context, and include file names/references "
             "in context so GlassHive can also use request upload metadata when the host supplies it. "
-            "If the user asks you to wait for the result, call workspace_wait with the returned "
+            "If the user asks you to wait for the result, first show the View / Steer link to the "
+            "user when the chat protocol supports assistant text before another tool call, then "
+            "call workspace_wait with the returned "
             "follow_up_context.run_id, worker_id, and completion_wait_timeout_seconds in the same "
             "turn instead of asking them to confirm waiting. Before a long same-turn wait, surface "
             "the View / Steer link to the user first whenever the chat protocol supports text before "
@@ -2170,17 +2482,29 @@ def create_mcp_server(
     def workspace_launch(
         description: Annotated[str, Field(description="Describe your project or task in the user's own outcome language.")],
         success_criteria: Annotated[
-            str,
+            str | None,
             Field(
                 description=(
-                    "Required workspace-internal acceptance criteria. Treat these as hard gates before "
-                    "reporting completion; put host-side orchestration checks in context, not as worker blockers."
+                    "Optional workspace-internal acceptance criteria. Use explicit user requirements only; "
+                    "when the user did not provide distinct acceptance criteria, omit this field or use only "
+                    "'Satisfy the user's request as stated, preserving explicit constraints.' Treat supplied "
+                    "criteria as hard gates before reporting completion; put host-side orchestration checks, "
+                    "broker/tool availability, and other helpful background in context, not as worker blockers."
                 )
             ),
-        ],
+        ] = None,
         context: Annotated[
             str | None,
-            Field(description="Optional background, constraints, uploaded file names/references, links, and preferences that help the worker execute well."),
+            Field(
+                description=(
+                    "Optional background, constraints, uploaded file names/references, links, and preferences "
+                    "that help the worker execute well. Include only user-provided, retrieved, or explicitly "
+                    "requested background; do not add memory-derived priorities, active-thread/contact/deal "
+                    "lists, or guessed urgency rubrics unless the user asked for them. For vague user "
+                    "adjectives like urgent or important, pass the adjective through instead of defining a "
+                    "rubric unless the user defines it."
+                )
+            ),
         ] = None,
         workspace_alias: Annotated[
             str | None,
@@ -2188,6 +2512,17 @@ def create_mcp_server(
         ] = None,
         profile: ProfileParam = "",
         execution_mode: ExecutionModeParam = None,
+        connected_account_content_intent: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Optional compatibility hint for hosts that want GlassHive to warn when "
+                    "connected-account content was requested but no complete broker grant/config "
+                    "was supplied. Authorization comes only from a host-signed broker grant with "
+                    "content-read scope; this flag alone does not unlock reads or writes."
+                )
+            ),
+        ] = False,
         bootstrap_bundle_json: BootstrapBundleParam = None,
         uploaded_files: UploadedFilesParam = None,
         effort: Annotated[
@@ -2195,7 +2530,8 @@ def create_mcp_server(
             Field(
                 description=(
                     "Optional per-run effort override. Codex accepts none/minimal/low/medium/high/xhigh; "
-                    "Claude Code accepts max; OpenClaw accepts high/max. Omit to use saved user preferences or deployment default."
+                    "Claude Code accepts max; OpenClaw accepts high/max. Omit to use saved user preferences or deployment default. "
+                    + HIGH_EFFORT_SELECTION_GUIDANCE
                 )
             ),
         ] = None,
@@ -2203,31 +2539,39 @@ def create_mcp_server(
         expose_diagnostics: bool = False,
     ) -> dict[str, Any]:
         clean_description = description.strip()
-        clean_success_criteria = success_criteria.strip()
+        explicit_success_criteria = bool((success_criteria or "").strip())
+        clean_success_criteria = (
+            success_criteria or "Satisfy the user's request as stated, preserving explicit constraints."
+        ).strip()
         clean_context = (context or "").strip()
         if not clean_description:
             raise ValueError("description is required")
-        if not clean_success_criteria:
-            raise ValueError("success_criteria is required")
+        requested_execution_mode = str(execution_mode or "").strip()
         brief_sections = [
             "Project description:",
             clean_description,
             "",
-            "Success criteria:",
+            "Explicit success criteria:" if explicit_success_criteria else "Default completion check:",
             clean_success_criteria,
         ]
         if clean_context:
             brief_sections.extend(["", "Context:", clean_context])
+        success_rule = (
+            "- Treat explicit success criteria as hard acceptance gates."
+            if explicit_success_criteria
+            else "- Use the default completion check as a self-check against the user's request; do not invent extra gates."
+        )
         brief_sections.extend(
             [
                 "",
                 "Execution rules:",
-                "- Treat the success criteria as hard acceptance gates.",
-                "- Keep working until the criteria are satisfied or a real blocker appears.",
+                success_rule,
+                "- Keep working until the user's request is satisfied or a real blocker appears.",
                 WORKER_HOST_SIDE_ORCHESTRATION_RULE,
                 "- Preserve files, browser state, and workspace continuity for follow-up work.",
                 "- If the result is visual or browser-visible, open it in the workspace browser before finishing.",
-                "- Finish with a concise FINAL REPORT that states the outcome, artifacts, and any blocker.",
+                "- Before finishing, inspect the actual output, files/artifacts, tool results, or visible state; compare it with the user's request, explicit success criteria when supplied, constraints, and files; continue or fix if it does not match.",
+                "- Finish with a concise FINAL REPORT in the user's requested form; mention artifacts only when you intentionally created user-facing files, and mention blockers only when they remain.",
             ]
         )
         title = clean_description.splitlines()[0].strip()[:120] or "GlassHive workspace"
@@ -2241,6 +2585,7 @@ def create_mcp_server(
             bootstrap_bundle_json=bootstrap_bundle_json,
             uploaded_files=uploaded_files,
             effort=effort,
+            connected_account_content_intent=connected_account_content_intent,
             require_callback=require_callback,
             expose_diagnostics=expose_diagnostics,
         )
@@ -2253,6 +2598,9 @@ def create_mcp_server(
             "Use this when the user asks GlassHive or MCP to do work in 20 minutes, on a weekday, or at a specific run_at time. "
             "Inputs mirror workspace_launch plus schedule_text/run_at/delay_seconds. It creates or resumes the worker now, persists the schedule in GlassHive, and queues the run when due. "
             "For scheduled attached-file work, set uploaded_files when visible file text needs to be materialized into the future workspace. "
+            "For scheduled connected-account facts or actions, include broker/tool availability as context and prefer MCP/tools when they can satisfy the task. Read authorization comes from the host-signed broker grant, while connected_account_content_intent is only a compatibility hint for missing-broker warnings. "
+            f"{HIGH_EFFORT_SELECTION_GUIDANCE} "
+            "Do not invent schedule success criteria, provider lists, output schemas, artifacts, ranking rules, workflow steps, memory-derived priorities, active-thread/contact/deal lists, or guessed urgency rubrics. For vague user adjectives like urgent or important, pass the adjective through instead of defining a rubric unless the user defines it. Trust the scheduled GlassHive worker to choose the best path from the user's request and available context. "
             "Callbacks are optional; the schedule can be checked later through GlassHive MCP status tools."
         ),
         structured_output=True,
@@ -2260,9 +2608,16 @@ def create_mcp_server(
     def workspace_schedule(
         description: Annotated[str, Field(description="Describe the later project or task in the user's outcome language.")],
         success_criteria: Annotated[
-            str,
-            Field(description="Required acceptance criteria. Treat these as hard gates before reporting completion."),
-        ],
+            str | None,
+            Field(
+                description=(
+                    "Optional acceptance criteria. Use explicit user requirements only; when the user did not "
+                    "provide distinct acceptance criteria, omit this field or use only 'Satisfy the user's request "
+                    "as stated, preserving explicit constraints.' Treat supplied criteria as hard gates before "
+                    "reporting completion."
+                )
+            ),
+        ] = None,
         schedule_text: Annotated[
             str | None,
             Field(description="Human schedule expression, for example 'in 20 minutes' or 'on Mondays'."),
@@ -2274,7 +2629,15 @@ def create_mcp_server(
         delay_seconds: Annotated[int | None, Field(description="Optional relative delay in seconds for deterministic automation/QA.")] = None,
         context: Annotated[
             str | None,
-            Field(description="Optional background, constraints, files, links, and preferences that help the worker execute well."),
+            Field(
+                description=(
+                    "Optional background, constraints, files, links, and preferences that help the worker execute "
+                    "well. Include only user-provided, retrieved, or explicitly requested background; do not add "
+                    "memory-derived priorities, active-thread/contact/deal lists, or guessed urgency rubrics unless "
+                    "the user asked for them. For vague user adjectives like urgent or important, pass the "
+                    "adjective through instead of defining a rubric unless the user defines it."
+                )
+            ),
         ] = None,
         workspace_alias: Annotated[
             str | None,
@@ -2282,42 +2645,61 @@ def create_mcp_server(
         ] = None,
         profile: ProfileParam = "",
         execution_mode: ExecutionModeParam = None,
+        connected_account_content_intent: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Optional compatibility hint for hosts that want GlassHive to warn when "
+                    "connected-account content was requested but no complete broker grant/config "
+                    "was supplied. Authorization comes only from a host-signed broker grant with "
+                    "content-read scope; this flag alone does not unlock reads or writes."
+                )
+            ),
+        ] = False,
         bootstrap_bundle_json: BootstrapBundleParam = None,
         uploaded_files: UploadedFilesParam = None,
         effort: Annotated[
             str | None,
-            Field(description="Optional per-run effort override for the scheduled workspace."),
+            Field(description="Optional per-run effort override for the scheduled workspace. " + HIGH_EFFORT_SELECTION_GUIDANCE),
         ] = None,
         require_callback: bool = False,
         expose_diagnostics: bool = False,
     ) -> dict[str, Any]:
         clean_description = description.strip()
-        clean_success_criteria = success_criteria.strip()
+        explicit_success_criteria = bool((success_criteria or "").strip())
+        clean_success_criteria = (
+            success_criteria or "Satisfy the user's request as stated, preserving explicit constraints."
+        ).strip()
         clean_context = (context or "").strip()
         if not clean_description:
             raise ValueError("description is required")
-        if not clean_success_criteria:
-            raise ValueError("success_criteria is required")
+        requested_execution_mode = str(execution_mode or "").strip()
         brief_sections = [
             "Scheduled project description:",
             clean_description,
             "",
-            "Success criteria:",
+            "Explicit success criteria:" if explicit_success_criteria else "Default completion check:",
             clean_success_criteria,
         ]
         if clean_context:
             brief_sections.extend(["", "Context:", clean_context])
+        success_rule = (
+            "- Treat explicit success criteria as hard acceptance gates."
+            if explicit_success_criteria
+            else "- Use the default completion check as a self-check against the user's request; do not invent extra gates."
+        )
         brief_sections.extend(
             [
                 "",
                 "Execution rules:",
-                "- Treat the success criteria as hard acceptance gates.",
-                "- Keep working until the criteria are satisfied or a real blocker appears.",
+                success_rule,
+                "- Keep working until the user's request is satisfied or a real blocker appears.",
                 WORKER_HOST_SIDE_ORCHESTRATION_RULE,
                 "- Preserve files, browser state, and workspace continuity for follow-up work.",
-                "- Finish with a concise FINAL REPORT that states the outcome, artifacts, and any blocker.",
+                "- Finish with a concise FINAL REPORT in the user's requested form; mention artifacts only when you intentionally created user-facing files, and mention blockers only when they remain.",
             ]
         )
+        scheduled_instruction = "\n".join(brief_sections)
 
         resolved_owner_id = _request_owner_id(None)
         resolved_execution_mode = _resolve_execution_mode(execution_mode)
@@ -2328,10 +2710,40 @@ def create_mcp_server(
         resolved_profile = _resolve_profile_from_preferences(profile, preferences)
         resolved_effort = _resolve_effort_for_profile(resolved_profile, effort, preferences)
         title = clean_description.splitlines()[0].strip()[:120] or "GlassHive scheduled workspace"
+        blocked = _runtime_dependency_blocked_payload(
+            profile=resolved_profile,
+            execution_mode=resolved_execution_mode,
+        )
+        runtime_recovery: dict[str, Any] | None = None
+        if _can_recover_blocked_host_dispatch_to_docker(
+            blocked,
+            requested_execution_mode=requested_execution_mode,
+            resolved_execution_mode=resolved_execution_mode,
+            workspace_root=None,
+        ):
+            runtime_recovery = {
+                "from_execution_mode": "host",
+                "to_execution_mode": "docker",
+                "reason_class": blocked.get("failure_class"),
+                "reason_summary": blocked.get("failure_user_message"),
+            }
+            resolved_execution_mode = "docker"
+            blocked = _runtime_dependency_blocked_payload(
+                profile=resolved_profile,
+                execution_mode=resolved_execution_mode,
+            )
+        if blocked:
+            return _blocked_dispatch_result(
+                blocked,
+                profile=resolved_profile,
+                execution_mode=resolved_execution_mode,
+                effort=resolved_effort,
+                alias=(workspace_alias or _slugify_alias(resolved_profile, title)).strip(),
+            )
         bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json) or {}
         bundle.setdefault(
             "project_definition",
-            _default_project_definition(title=title, goal=clean_success_criteria, instruction="\n".join(brief_sections)),
+            _default_project_definition(title=title, goal=clean_success_criteria, instruction=scheduled_instruction),
         )
         bundle = _merge_request_context(bundle)
         request_context = bundle.get("glasshive_context") if isinstance(bundle, dict) else None
@@ -2344,6 +2756,12 @@ def create_mcp_server(
             owner_id=context_owner_id or resolved_owner_id,
         )
         bundle = _apply_effort_to_bundle(bundle, profile=resolved_profile, effort=resolved_effort)
+        bundle, scheduled_instruction = _apply_connected_account_intent_guard(
+            bundle,
+            scheduled_instruction,
+            connected_account_content_intent=connected_account_content_intent,
+        )
+        scheduled_instruction = scheduled_instruction or "\n".join(brief_sections)
         callback_ready, missing_callback_fields = _callback_state(bundle, required=require_callback)
         if require_callback and not callback_ready:
             return {
@@ -2388,7 +2806,7 @@ def create_mcp_server(
             raise ValueError("GlassHive worker create/resume did not return worker_id")
         schedule = client.schedule_run(
             worker_id,
-            "\n".join(brief_sections),
+            scheduled_instruction,
             run_at=run_at,
             schedule_text=schedule_text,
             delay_seconds=delay_seconds,
@@ -2408,7 +2826,7 @@ def create_mcp_server(
             "delegation_audit": {
                 "title": _audit_preview(title, max_chars=180),
                 "schedule": _audit_preview(schedule_text or run_at or str(delay_seconds or ""), max_chars=180),
-                "instruction_preview": _audit_preview("\n".join(brief_sections)),
+                "instruction_preview": _audit_preview(scheduled_instruction),
                 "use_for": "self-check only; do not show the user unless diagnostics were requested",
             },
         }
@@ -2423,6 +2841,8 @@ def create_mcp_server(
                     "effort": resolved_effort,
                 }
             )
+        if runtime_recovery:
+            result["runtime_recovery"] = runtime_recovery
         return result
 
     @server.tool(
@@ -2469,6 +2889,7 @@ def create_mcp_server(
             "Create a new worker in an existing project. Optionally pass bootstrap_profile and "
             "bootstrap_bundle_json as a JSON string or object to seed auth, MCP config, instructions, env, and project files. "
             "Use this lower-level tool for explicit orchestration or diagnostics; for a fresh one-off task, prefer worker_delegate_once. "
+            "When seeding connected-account read access for an immediately related run, pass the host-signed broker grant/config; connected_account_content_intent is only a compatibility hint for missing-broker warnings. "
             "Use execution_mode='host' for the user's real computer/session and 'docker' for isolated work. "
             "Returns the worker record with worker_id, execution mode, profile, alias, and bootstrap result metadata."
         ),
@@ -2485,10 +2906,25 @@ def create_mcp_server(
         alias: str | None = None,
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
+        connected_account_content_intent: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Optional compatibility hint for hosts that want GlassHive to warn when "
+                    "connected-account content was requested but no complete broker grant/config "
+                    "was supplied. Authorization comes only from a host-signed broker grant with "
+                    "content-read scope; this flag alone does not unlock reads or writes."
+                )
+            ),
+        ] = False,
         bootstrap_bundle_json: BootstrapBundleParam = None,
     ) -> dict[str, Any]:
         parsed_bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json)
         parsed_bundle = _merge_request_context(parsed_bundle)
+        parsed_bundle, _ = _apply_connected_account_intent_guard(
+            parsed_bundle,
+            connected_account_content_intent=connected_account_content_intent,
+        )
         resolved_execution_mode = _resolve_execution_mode(execution_mode)
         return client.create_worker(
             project_id=project_id,
@@ -2512,6 +2948,7 @@ def create_mcp_server(
             "Use execution_mode='host' for tasks on the user's real computer/session: signed-in browser profile, desktop apps, local files/projects, installed CLIs, or OS/window control. "
             "Use execution_mode='docker' for isolated sandbox, disposable browser, or risky untrusted work. "
             "Do not use for fresh one-off tasks when worker_delegate_once can create/resume and queue the run in one call. "
+            "When seeding connected-account read access for an immediately related run, pass the host-signed broker grant/config; connected_account_content_intent is only a compatibility hint for missing-broker warnings. "
             "bootstrap_bundle_json may be a JSON string or object. Returns the existing or newly created worker record."
         ),
         structured_output=True,
@@ -2527,10 +2964,25 @@ def create_mcp_server(
         execution_mode: ExecutionModeParam = None,
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
+        connected_account_content_intent: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Optional compatibility hint for hosts that want GlassHive to warn when "
+                    "connected-account content was requested but no complete broker grant/config "
+                    "was supplied. Authorization comes only from a host-signed broker grant with "
+                    "content-read scope; this flag alone does not unlock reads or writes."
+                )
+            ),
+        ] = False,
         bootstrap_bundle_json: BootstrapBundleParam = None,
     ) -> dict[str, Any]:
         parsed_bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json)
         parsed_bundle = _merge_request_context(parsed_bundle)
+        parsed_bundle, _ = _apply_connected_account_intent_guard(
+            parsed_bundle,
+            connected_account_content_intent=connected_account_content_intent,
+        )
         resolved_execution_mode = _resolve_execution_mode(execution_mode)
         return client.find_or_resume_worker(
             project_id=project_id,
@@ -2577,11 +3029,38 @@ def create_mcp_server(
         description=(
             "Queue a new instruction for an existing worker. Use for explicit steering/resume/reuse. "
             "For fresh one-off host/browser/desktop/local tasks, prefer worker_delegate_once. "
+            "bootstrap_bundle_json may be passed to refresh run-scoped auth, MCP config, or instructions before the run starts. "
+            "For connected-account content refreshes, pass the host-signed broker grant/config; connected_account_content_intent is only a compatibility hint for missing-broker warnings. "
             "Returns the queued run record with run_id/state and later completion delivered by callback when configured."
         ),
         structured_output=True,
     )
-    def worker_run(worker_id: str, instruction: str) -> dict[str, Any]:
+    def worker_run(
+        worker_id: str,
+        instruction: str,
+        connected_account_content_intent: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Optional compatibility hint for hosts that want GlassHive to warn when "
+                    "connected-account content was requested but no complete broker grant/config "
+                    "was supplied. Authorization comes only from a host-signed broker grant with "
+                    "content-read scope; this flag alone does not unlock reads or writes."
+                )
+            ),
+        ] = False,
+        bootstrap_bundle_json: BootstrapBundleParam = None,
+    ) -> dict[str, Any]:
+        parsed_bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json)
+        parsed_bundle = _merge_request_context(parsed_bundle)
+        parsed_bundle, instruction = _apply_connected_account_intent_guard(
+            parsed_bundle,
+            instruction,
+            connected_account_content_intent=connected_account_content_intent,
+        )
+        instruction = instruction or ""
+        if parsed_bundle is not None:
+            return client.assign_run(worker_id, instruction, bootstrap_bundle=parsed_bundle)
         return client.assign_run(worker_id, instruction)
 
     @server.tool(
@@ -2589,24 +3068,60 @@ def create_mcp_server(
         title="Schedule Worker Run",
         description=(
             "Schedule a run for an existing GlassHive worker using GlassHive's own scheduler. "
-            "Use when the user asks raw MCP/GlassHive to do something later. Provide run_at, schedule_text such as 'in 20 minutes', or delay_seconds."
+            "Use when the user asks raw MCP/GlassHive to do something later. Provide run_at, schedule_text such as 'in 20 minutes', or delay_seconds. "
+            "For scheduled connected-account content refreshes, pass the host-signed broker grant/config; connected_account_content_intent is only a compatibility hint for missing-broker warnings."
         ),
         structured_output=True,
     )
     def worker_schedule(
         worker_id: str,
         instruction: str,
+        connected_account_content_intent: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Optional compatibility hint for hosts that want GlassHive to warn when "
+                    "connected-account content was requested but no complete broker grant/config "
+                    "was supplied. Authorization comes only from a host-signed broker grant with "
+                    "content-read scope; this flag alone does not unlock reads or writes."
+                )
+            ),
+        ] = False,
         schedule_text: str | None = None,
         run_at: str | None = None,
         delay_seconds: int | None = None,
+        bootstrap_bundle_json: BootstrapBundleParam = None,
     ) -> dict[str, Any]:
-        return client.schedule_run(
-            worker_id,
-            instruction,
-            run_at=run_at,
-            schedule_text=schedule_text,
-            delay_seconds=delay_seconds,
+        worker = client.get_worker(worker_id)
+        worker_profile = str(worker.get("profile") or _configured_default_worker_profile())
+        worker_execution_mode = str(worker.get("execution_mode") or "docker")
+        blocked = _runtime_dependency_blocked_payload(
+            profile=worker_profile,
+            execution_mode=worker_execution_mode,
         )
+        if blocked:
+            return _blocked_dispatch_result(
+                blocked,
+                profile=worker_profile,
+                execution_mode=worker_execution_mode,
+                alias=str(worker.get("alias") or ""),
+            )
+        parsed_bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json)
+        parsed_bundle = _merge_request_context(parsed_bundle)
+        parsed_bundle, instruction = _apply_connected_account_intent_guard(
+            parsed_bundle,
+            instruction,
+            connected_account_content_intent=connected_account_content_intent,
+        )
+        instruction = instruction or ""
+        kwargs = {
+            "run_at": run_at,
+            "schedule_text": schedule_text,
+            "delay_seconds": delay_seconds,
+        }
+        if parsed_bundle is not None:
+            kwargs["bootstrap_bundle"] = parsed_bundle
+        return client.schedule_run(worker_id, instruction, **kwargs)
 
     @server.tool(
         name="worker_schedules",
@@ -2941,7 +3456,12 @@ def create_mcp_server(
             try:
                 artifact_worker = worker if worker else client.get_worker(clean_worker_id)
                 artifacts = client.list_artifacts(clean_worker_id)
-                artifact_links = _artifact_listing_payload(worker=artifact_worker, artifacts=artifacts)
+                artifact_links = _artifact_listing_payload(
+                    worker=artifact_worker,
+                    artifacts=artifacts,
+                    include_open_links=True,
+                    include_download_links=False,
+                )
             except Exception as exc:
                 artifact_links = {
                     "status": "unavailable",
@@ -2984,11 +3504,11 @@ def create_mcp_server(
                 "If requested_run_stale is true, acknowledge the requested run outcome first, then answer from the effective/latest run fields. "
                 "If terminal is true and run_state is failed, answer from failure_user_message, "
                 "failure_class, and failure_recommended_recovery before using error_text as diagnostics; "
-                "if artifact_links contains items, tell the user partial or final workspace files are available and include the relevant signed_open_url links instead of saying no artifacts were produced; "
+                "artifact_links are optional delivery aids, not mandatory answer content; include relevant signed_open_url links only when the user asked for files/artifacts or output_text references user-facing files; "
                 "if failure_retryable is true and the user asks to continue or retry, call workspace_continue "
                 "instead of relaunching from scratch. If terminal is true and completed, answer from output_text "
-                "and include relevant artifact_links signed_open_url values as the default file links when present; "
-                "only label signed_download_url as an explicit Download file action, plus the "
+                "and preserve the worker's natural result. Wrap exact filenames, paths, markers, and exact content in backticks or escape Markdown-sensitive characters so underscores and other literals are not lost. "
+                "Do not include raw download links unless the user explicitly requested a downloadable file; include the "
                 "View / Steer link when useful. If terminal is false and the user wants you to wait, "
                 "call workspace_wait with run_id; otherwise give a brief status and the View / Steer link."
             ),
@@ -3024,14 +3544,19 @@ def create_mcp_server(
             "Standalone blocking wait for a GlassHive run. Use only when the user explicitly asks you "
             "to wait/check until done, or when a single-turn answer is more important than returning "
             "immediately. For normal long-running work, launch non-blocking first and use "
-            "workspace_status later. When timeout_seconds is omitted, GlassHive uses "
+            "workspace_status later. If you just launched and the user asked you to wait in the same "
+            "turn, first surface the View / Steer link returned by workspace_launch/worker_delegate_once "
+            "when the chat protocol allows assistant text before another tool call, then call "
+            "workspace_wait so the user is not left guessing where to watch progress. When timeout_seconds is omitted, GlassHive uses "
             "WPR_MCP_BLOCKING_WAIT_DEFAULT_SEC capped by WPR_MCP_BLOCKING_WAIT_MAX_SEC so serious "
             "research, coding, and file-work runs are not misreported as failed just because a short "
             "poll expired. Provide run_id/worker_id from follow_up_context when available; if a "
             "same-conversation follow-up call accidentally omits ids, GlassHive resolves the most "
             "recent launch scoped to the authenticated user/conversation. This does not require "
-            "LibreChat or host-app callback wiring. Omit poll_interval_seconds for normal work so "
-            "GlassHive uses the configured efficient polling cadence. The runtime enforces that "
+            "LibreChat or host-app callback wiring. Omit poll_interval_seconds for normal work; "
+            "do not invent polling values unless the user/operator gave a concrete override. "
+            "GlassHive uses the configured efficient polling cadence, keeps early checks responsive, "
+            "and backs off toward the configured cap during long waits. The runtime enforces that "
             "cadence as a floor, so very low polling intervals cannot create long-run status loops."
         ),
         structured_output=True,
@@ -3071,6 +3596,7 @@ def create_mcp_server(
         if requested_interval <= 0:
             raise ValueError("poll_interval_seconds must be greater than 0")
         interval = max(default_interval, min(requested_interval, 30.0))
+        adaptive_polling = poll_interval_seconds is None
         deadline = time.monotonic() + timeout
         attempts = 0
         while True:
@@ -3117,7 +3643,12 @@ def create_mcp_server(
                     }
                 )
                 return payload
-            await asyncio.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+            sleep_interval = _blocking_wait_sleep_interval_seconds(
+                attempts=attempts,
+                base_interval=interval,
+                adaptive=adaptive_polling,
+            )
+            await asyncio.sleep(min(sleep_interval, max(0.0, deadline - time.monotonic())))
 
     def _continuation_instruction(
         *,
@@ -3142,7 +3673,7 @@ def create_mcp_server(
                     if index >= 0:
                         text = text[:index].strip()
                         break
-            return text
+            return _strip_worker_instruction_note(text, CONNECTED_ACCOUNT_NO_BROKER_NOTE)
 
         original_instruction = base_instruction(str(previous_run.get("instruction") or ""))
         failure_payload = _run_failure_payload(previous_run)
@@ -3191,12 +3722,25 @@ def create_mcp_server(
             str | None,
             Field(description="Optional extra instruction from the user, such as 'continue but avoid web search loops'."),
         ] = None,
+        connected_account_content_intent: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Optional compatibility hint for hosts that want GlassHive to warn when "
+                    "connected-account content is requested but no complete broker grant/config "
+                    "is supplied. Prior broker-absence warnings are re-evaluated against any "
+                    "fresh bootstrap bundle."
+                )
+            ),
+        ] = False,
+        bootstrap_bundle_json: BootstrapBundleParam = None,
         effort: Annotated[
             str | None,
             Field(
                 description=(
                     "Optional effort override for this continuation. Codex accepts none/minimal/low/medium/high/xhigh; "
-                    "Claude Code accepts max; OpenClaw accepts high/max. Omit to use the user's saved default."
+                    "Claude Code accepts max; OpenClaw accepts high/max. Omit to use the user's saved default. "
+                    + HIGH_EFFORT_SELECTION_GUIDANCE
                 )
             ),
         ] = None,
@@ -3232,7 +3776,27 @@ def create_mcp_server(
         worker_profile = str(worker.get("profile") or "").strip()
         resolved_effort = _resolve_effort_for_profile(worker_profile, effort, preferences)
         instruction = _continuation_instruction(previous_run=previous_run, continuation_goal=continuation_goal)
-        new_run = client.assign_run(clean_worker_id, instruction, effort=resolved_effort or None)
+        parsed_bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json)
+        parsed_bundle = _merge_request_context(parsed_bundle)
+        prior_connected_account_guard = CONNECTED_ACCOUNT_NO_BROKER_NOTE in str(previous_run.get("instruction") or "")
+        should_send_bootstrap_bundle = (
+            bootstrap_bundle_json is not None or connected_account_content_intent or prior_connected_account_guard
+        )
+        parsed_bundle, instruction = _apply_connected_account_intent_guard(
+            parsed_bundle,
+            instruction,
+            connected_account_content_intent=connected_account_content_intent or prior_connected_account_guard,
+        )
+        instruction = instruction or ""
+        if should_send_bootstrap_bundle and parsed_bundle is not None:
+            new_run = client.assign_run(
+                clean_worker_id,
+                instruction,
+                effort=resolved_effort or None,
+                bootstrap_bundle=parsed_bundle,
+            )
+        else:
+            new_run = client.assign_run(clean_worker_id, instruction, effort=resolved_effort or None)
         if _enterprise_mode_enabled():
             _require_enterprise_payload_scope(new_run, label="continued run", tenant_id=tenant_id)
         request_surface = _header_value(_request_headers(), HEADER_SURFACE)
@@ -3331,8 +3895,8 @@ def create_mcp_server(
             "signed_download_url": download_url,
             "download_link_ttl_seconds": signed_link_ttl_seconds(),
             "next_action_guidance": (
-                "Give the user signed_open_url as the default GlassHive file link when present, "
-                "and label signed_download_url explicitly as Download file if the user wants the raw artifact. "
+                "Use signed_open_url as the user-facing file link when present. Use signed_download_url "
+                "only when the user explicitly wants the raw artifact/download. "
                 "If unavailable, call workspace_artifacts or include the View / Steer link for manual access."
             ),
         }

@@ -20,6 +20,7 @@ NON_DELIVERABLE_URL_PATH_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 NON_DELIVERABLE_FILE_NAMES = {
+    ".mcp.json",
     "agents.md",
     "claude.md",
     "codex.md",
@@ -28,12 +29,32 @@ NON_DELIVERABLE_FILE_NAMES = {
     "work-log.md",
 }
 NON_DELIVERABLE_DIR_NAMES = {
+    ".codex",
     ".git",
+    ".glasshive",
     ".venv",
     "__pycache__",
     "glasshive-host-tools",
     "node_modules",
 }
+
+
+def is_user_deliverable_relative_path(relative_path: Path | str) -> bool:
+    try:
+        rel = Path(str(relative_path))
+    except TypeError:
+        return False
+    if not rel.parts or rel.is_absolute():
+        return False
+    parts = [part for part in rel.parts if part]
+    if any(part in {".", ".."} for part in parts):
+        return False
+    lowered_parts = [part.lower() for part in parts]
+    if any(part in NON_DELIVERABLE_DIR_NAMES for part in lowered_parts):
+        return False
+    if any(part.startswith(".") for part in lowered_parts):
+        return False
+    return rel.name.lower() not in NON_DELIVERABLE_FILE_NAMES
 
 
 def candidate_html_paths(worker: dict, max_entries: int = 20) -> list[Path]:
@@ -49,7 +70,7 @@ def candidate_html_paths(worker: dict, max_entries: int = 20) -> list[Path]:
             rel = path.relative_to(root)
         except ValueError:
             continue
-        if any(part in {".git", "node_modules", ".venv"} for part in rel.parts):
+        if not is_user_deliverable_relative_path(rel):
             continue
         candidates.append(path)
         if len(candidates) >= max_entries:
@@ -72,9 +93,7 @@ def candidate_artifact_paths(worker: dict, max_entries: int = 50) -> list[Path]:
             rel = path.relative_to(root)
         except ValueError:
             continue
-        if path.name.lower() in NON_DELIVERABLE_FILE_NAMES:
-            continue
-        if any(part.lower() in NON_DELIVERABLE_DIR_NAMES for part in rel.parts):
+        if not is_user_deliverable_relative_path(rel):
             continue
         candidates.append(path)
         if len(candidates) >= max_entries:
@@ -165,6 +184,23 @@ def deliverable_payload(
             payload["browser_url_available"] = False
         return payload
 
+    artifact_candidates = candidate_artifact_paths(worker)
+    if artifact_candidates:
+        artifact = artifact_candidates[0]
+        raw_root = str(worker.get("workspace_dir") or "").strip()
+        try:
+            rel = artifact.relative_to(Path(raw_root))
+        except ValueError:
+            rel = Path(artifact.name)
+        return {
+            "kind": "file",
+            "state": "ready" if latest_run else "available",
+            "source": "workspace_file",
+            "label": artifact.name,
+            "preferred_surface": "download",
+            "workspace_path": rel.as_posix(),
+        }
+
     if local_url or external_url:
         if execution_mode == "host":
             return {
@@ -185,23 +221,6 @@ def deliverable_payload(
             "browser_url": browser_url,
             "preferred_surface": "desktop",
             "workspace_path": None,
-        }
-
-    artifact_candidates = candidate_artifact_paths(worker)
-    if artifact_candidates:
-        artifact = artifact_candidates[0]
-        raw_root = str(worker.get("workspace_dir") or "").strip()
-        try:
-            rel = artifact.relative_to(Path(raw_root))
-        except ValueError:
-            rel = Path(artifact.name)
-        return {
-            "kind": "file",
-            "state": "ready" if latest_run else "available",
-            "source": "workspace_file",
-            "label": artifact.name,
-            "preferred_surface": "download",
-            "workspace_path": rel.as_posix(),
         }
 
     return None

@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import hmac
+from collections import deque
 from contextlib import asynccontextmanager
 from html import escape
 from pathlib import Path
@@ -14,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from .auth import AuthContext, EnterpriseAuthSettings, GlassHiveAuthError, scoped_alias
-from .deliverables import deliverable_payload
+from .deliverables import deliverable_payload, is_user_deliverable_relative_path
 from .failure_classification import classify_runtime_error
 from .models import (
     AssignRunRequest,
@@ -46,6 +47,7 @@ from .service import (
     HostWorkersDisabledError,
     WorkersProjectsService,
     allowed_worker_profiles,
+    merge_bootstrap_bundle,
 )
 from .signed_links import append_signed_query, sign_link_params, sign_link_token, verify_signed_link, verify_signed_link_token
 from .store import Store
@@ -78,10 +80,11 @@ TEXT_ARTIFACT_PREVIEW_EXTENSIONS = {
 }
 ARTIFACT_OPEN_SECURITY_HEADERS = {
     "Cache-Control": "no-store, no-cache, private, max-age=0",
-    "Content-Security-Policy": "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+    "Content-Security-Policy": "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'self'",
     "Pragma": "no-cache",
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "SAMEORIGIN",
 }
 ARTIFACT_DOWNLOAD_SECURITY_HEADERS = {
     "Cache-Control": "no-store, no-cache, private, max-age=0",
@@ -134,7 +137,77 @@ def create_app(
     @app.exception_handler(GlassHiveQuotaExceededError)
     async def quota_exceeded_handler(request: Request, exc: GlassHiveQuotaExceededError) -> JSONResponse:
         _ = request
-        return JSONResponse(status_code=429, content={"detail": str(exc)})
+        env_name = str(getattr(exc, "env_name", "") or "")
+        is_workspace_quota = "MAX_WORKSPACES" in env_name
+        retry_after: int | None = None
+        if not is_workspace_quota:
+            idle_release_after = int(os.environ.get("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "0") or "0")
+            if idle_release_after > 0:
+                retry_after = max(30, min(idle_release_after, 3600))
+            else:
+                retry_after = max(30, min(int(os.environ.get("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "60") or "60"), 300))
+        options = list(getattr(exc, "available_workspace_options", []) or [])
+        if is_workspace_quota:
+            option_text = (
+                "Use one of `available_workspace_options` when it fits the user's intent, ask the user which "
+                "existing workspace to continue, terminate/archive an unneeded workspace, or ask the operator "
+                "to raise the workspace quota. Waiting for idle release will not free a saved workspace slot."
+                if options
+                else "No reusable workspace options are visible in this user scope; terminate/archive an unneeded workspace or ask the operator to inspect capacity."
+            )
+            failure_user_message = (
+                "GlassHive did not start a new workspace because the saved workspace quota is currently full."
+            )
+            main_agent_next_action = (
+                "Review `available_workspace_options` and pick/reuse one that matches the user's task, "
+                "or ask the user which listed workspace to continue. If none fits, ask the user/operator to "
+                "terminate an unneeded workspace or raise quota. Do not retry this launch on a timer, and do "
+                "not suggest switching profile or sandbox mode as the fix for this quota."
+            )
+        else:
+            option_text = (
+                "Use one of `available_workspace_options` when it fits the user's intent, ask the user which "
+                "existing workspace to continue when needed, or wait for idle compute release before launching "
+                "another workspace."
+                if options
+                else "No reusable workspace options are visible in this user scope; wait for idle compute release or ask the operator to inspect capacity."
+            )
+            failure_user_message = (
+                "GlassHive did not start a new workspace because the active workspace limit is currently full."
+            )
+            main_agent_next_action = (
+                "Review `available_workspace_options` and pick/reuse one that matches the user's task, "
+                "or ask the user which listed workspace to continue. If none fits, wait for idle release "
+                "or ask the operator to adjust capacity. Do not suggest switching profile or sandbox mode "
+                "as the fix for this quota because active workers share the same cap."
+            )
+        headers = {"Retry-After": str(retry_after)} if retry_after is not None else {}
+        return JSONResponse(
+            status_code=429,
+            headers=headers,
+            content={
+                "status": "blocked",
+                "detail": str(exc),
+                "failure_class": "glasshive_worker_quota_exceeded",
+                "failure_retryable": 0 if is_workspace_quota else 1,
+                "failure_user_message": failure_user_message,
+                "failure_recommended_recovery": option_text,
+                "failure_diagnostic_summary": str(exc),
+                "quota": {
+                    "env_name": env_name,
+                    "label": getattr(exc, "label", ""),
+                    "limit": getattr(exc, "limit", 0),
+                    "current_count": getattr(exc, "current_count", 0),
+                },
+                "retry_after_seconds": retry_after,
+                "available_workspace_options": options,
+                "acknowledgement_guidance": (
+                    "Explain that GlassHive capacity is full. Do not claim a workspace is running and do "
+                    "not immediately relaunch the same request in a loop."
+                ),
+                "main_agent_next_action": main_agent_next_action,
+            },
+        )
 
     @app.exception_handler(GlassHiveProfileNotAllowedError)
     async def profile_not_allowed_handler(request: Request, exc: GlassHiveProfileNotAllowedError) -> JSONResponse:
@@ -358,6 +431,13 @@ def create_app(
             raise HTTPException(status_code=400, detail="effort override is not supported for this worker profile")
         return {"system_instructions": f"Worker effort preference for this run: {effort}."}
 
+    def merge_runtime_bundles(first: dict | None, second: dict | None) -> dict | None:
+        if first is None:
+            return second
+        if second is None:
+            return first
+        return merge_bootstrap_bundle(first, second)
+
     def _token_matches(candidate: str, expected: str) -> bool:
         return bool(candidate and expected and hmac.compare_digest(candidate, expected))
 
@@ -510,29 +590,40 @@ def create_app(
         if not root.exists():
             return []
         items: list[dict[str, object]] = []
-        for path in sorted(root.rglob("*")):
+        pending: deque[Path] = deque([root])
+        while pending:
+            current_path = pending.popleft()
             try:
-                rel = path.relative_to(root)
-            except ValueError:
-                continue
-            if any(part == ".git" for part in rel.parts):
-                continue
-            if len(rel.parts) > max_depth:
-                continue
-            try:
-                stat = path.stat()
+                entries = sorted(os.scandir(current_path), key=lambda entry: entry.name)
             except OSError:
                 continue
-            items.append(
-                {
-                    "path": rel.as_posix(),
-                    "is_dir": path.is_dir(),
-                    "size": None if path.is_dir() else stat.st_size,
-                    "modified_at": stat.st_mtime,
-                }
-            )
-            if len(items) >= max_entries:
-                break
+            next_dirs: list[Path] = []
+            for entry in entries:
+                path = Path(entry.path)
+                try:
+                    rel = path.relative_to(root)
+                except ValueError:
+                    continue
+                if not is_user_deliverable_relative_path(rel) or len(rel.parts) > max_depth:
+                    continue
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                    stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                items.append(
+                    {
+                        "path": rel.as_posix(),
+                        "is_dir": is_dir,
+                        "size": None if is_dir else stat.st_size,
+                        "modified_at": stat.st_mtime,
+                    }
+                )
+                if len(items) >= max_entries:
+                    return items
+                if is_dir and len(rel.parts) < max_depth:
+                    next_dirs.append(path)
+            pending.extend(next_dirs)
         return items
 
     def _latest_image_path(worker: dict) -> Path | None:
@@ -551,7 +642,7 @@ def create_app(
                 rel = path.relative_to(root)
             except ValueError:
                 continue
-            if any(part == ".git" for part in rel.parts):
+            if not is_user_deliverable_relative_path(rel):
                 continue
             visible.append(path)
         if not visible:
@@ -568,7 +659,7 @@ def create_app(
             rel = target.relative_to(root)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="Artifact path is outside the worker workspace") from exc
-        if any(part == ".git" for part in rel.parts):
+        if not is_user_deliverable_relative_path(rel):
             raise HTTPException(status_code=400, detail="Artifact path is not downloadable")
         if not target.exists() or not target.is_file():
             raise HTTPException(status_code=404, detail="Artifact not found")
@@ -606,6 +697,61 @@ def create_app(
         if token:
             return append_signed_query(watch_url, {"gh_token": token})
         return watch_url
+
+    def _deliverable_with_action_urls(worker: dict, deliverable: dict[str, object] | None) -> dict[str, object] | None:
+        if not deliverable:
+            return None
+        payload = dict(deliverable)
+        workspace_path = str(payload.get("workspace_path") or "").strip().lstrip("/")
+        if payload.get("kind") == "file" and workspace_path and is_user_deliverable_relative_path(workspace_path):
+            payload["open_url"] = _signed_artifact_action_url(
+                worker,
+                workspace_path,
+                kind="artifact_open",
+                fallback_action="open",
+            )
+            payload["download_url"] = _signed_artifact_action_url(
+                worker,
+                workspace_path,
+                kind="artifact_download",
+                fallback_action="download",
+            )
+        return payload
+
+    def _artifact_items_with_action_urls(
+        worker: dict,
+        workspace_items: list[dict[str, object]] | None = None,
+        *,
+        max_entries: int = 100,
+    ) -> list[dict[str, object]]:
+        items: list[dict[str, object]] = []
+        source_items = workspace_items if workspace_items is not None else _workspace_items(worker, max_entries=max_entries, max_depth=8)
+        for item in source_items:
+            if item.get("is_dir"):
+                continue
+            workspace_path = str(item.get("path") or "").strip().lstrip("/")
+            if not workspace_path or not is_user_deliverable_relative_path(workspace_path):
+                continue
+            items.append(
+                {
+                    **item,
+                    "open_url": _signed_artifact_action_url(
+                        worker,
+                        workspace_path,
+                        kind="artifact_open",
+                        fallback_action="open",
+                    ),
+                    "download_url": _signed_artifact_action_url(
+                        worker,
+                        workspace_path,
+                        kind="artifact_download",
+                        fallback_action="download",
+                    ),
+                }
+            )
+            if len(items) >= max_entries:
+                break
+        return items
 
     def _artifact_mime_type(target: Path) -> str:
         guessed, _ = mimetypes.guess_type(target.name)
@@ -693,7 +839,7 @@ def create_app(
       <div class="brand">GlassHive</div>
       <div class="actions">
         <a class="button" href="{escape(download_url, quote=True)}">Download file</a>
-        <a class="button secondary" href="{escape(workspace_url, quote=True)}">View workspace</a>
+        <a class="button secondary" href="{escape(workspace_url, quote=True)}" target="_top" rel="noopener noreferrer">View workspace</a>
       </div>
     </div>
     <h1>{escape(target.name)}</h1>
@@ -790,8 +936,17 @@ def create_app(
         if latest_run:
             latest_output = str(latest_run.get("output_text") or latest_run.get("error_text") or "")
         latest_image = _latest_image_path(worker)
-        deliverable = deliverable_payload(worker, latest_run, latest_output, stdout_text, stderr_text)
+        deliverable = _deliverable_with_action_urls(
+            worker,
+            deliverable_payload(worker, latest_run, latest_output, stdout_text, stderr_text),
+        )
         show_internal = _can_show_internal_details(ctx)
+        workspace_items = _workspace_items(worker, max_entries=120, max_depth=8)
+        workspace_summary_items = [
+            item
+            for item in workspace_items
+            if len(str(item.get("path") or "").split("/")) <= 3
+        ][:120]
         return {
             "worker": _sanitize_worker(worker) if show_internal else _redact_worker_for_member(worker),
             "latest_run": latest_run if show_internal or latest_run is None else _redact_run_for_member(latest_run),
@@ -807,11 +962,12 @@ def create_app(
             **(host_visibility if show_internal else {}),
             "workspace": {
                 "root": worker.get("workspace_dir") or "" if show_internal else "",
-                "items": _workspace_items(worker),
+                "items": workspace_summary_items,
             },
             "artifacts": {
                 "latest_image_name": latest_image.name if latest_image else None,
                 "latest_image_url": f"/v1/workers/{worker_id}/artifacts/latest-image" if latest_image else None,
+                "items": _artifact_items_with_action_urls(worker, workspace_items),
             },
             "deliverable": deliverable,
         }
@@ -1019,11 +1175,17 @@ def create_app(
 
     @app.post("/v1/workers/{worker_id}/assign", response_model=RunResponse, status_code=202)
     def assign(worker_id: str, payload: AssignRunRequest, request: Request) -> RunResponse:
+        ctx = _auth_context(request)
+        if ctx.auth_mode == "signed_link" and payload.bootstrap_bundle:
+            raise HTTPException(status_code=403, detail="Signed workspace links cannot modify worker bootstrap context")
         worker = require_worker(worker_id, request)
         run = service.assign_run(
             worker_id,
             payload.instruction,
-            runtime_bundle=_assign_effort_bundle(worker, payload.effort),
+            runtime_bundle=merge_runtime_bundles(
+                _assign_effort_bundle(worker, payload.effort),
+                payload.bootstrap_bundle,
+            ),
         )
         return RunResponse(**run)
 
@@ -1035,6 +1197,9 @@ def create_app(
 
     @app.post("/v1/workers/{worker_id}/schedule", response_model=ScheduleResponse, status_code=202)
     def schedule_worker_run(worker_id: str, payload: ScheduleRunRequest, request: Request) -> ScheduleResponse:
+        ctx = _auth_context(request)
+        if ctx.auth_mode == "signed_link" and payload.bootstrap_bundle:
+            raise HTTPException(status_code=403, detail="Signed workspace links cannot modify worker bootstrap context")
         require_worker(worker_id, request)
         try:
             schedule = service.schedule_run(
@@ -1043,6 +1208,7 @@ def create_app(
                 run_at=payload.run_at,
                 schedule_text=payload.schedule_text,
                 delay_seconds=payload.delay_seconds,
+                runtime_bundle=payload.bootstrap_bundle,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -2,10 +2,66 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import time
 
 from workers_projects_runtime.docker_sandbox import DockerSandboxManager
+from workers_projects_runtime.bootstrap import GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS, GLASSHIVE_SAFETY_CHECKPOINT_RULE
+
+
+def test_seed_bootstrap_writes_default_worker_contract_without_bundle(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    home_dir = tmp_path / "home"
+    workspace_dir = tmp_path / "workspace"
+    home_dir.mkdir()
+    workspace_dir.mkdir()
+
+    manager._seed_bootstrap(home_dir, workspace_dir, "codex-cli", {"worker_id": "wrk_contract"})
+
+    agents_text = (workspace_dir / "AGENTS.md").read_text()
+    assert "GlassHive Worker Contract" in agents_text
+    assert GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS in agents_text
+    assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in agents_text
+    assert "Less is more" in agents_text
+    assert "Do not force a download" in agents_text
+    assert "@AGENTS.md" in (workspace_dir / "CLAUDE.md").read_text()
+
+
+def test_create_container_adds_host_gateway_alias_for_broker_reachability(tmp_path, monkeypatch):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    captured: list[list[str]] = []
+
+    def fake_docker(args: list[str], **kwargs):
+        captured.append(args)
+        return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="cid", stderr="")
+
+    manager._docker = fake_docker  # type: ignore[method-assign]
+    manager._create_container(
+        "wpr-test",
+        {
+            "workspace_dir": tmp_path / "workspace",
+            "home_dir": tmp_path / "home",
+        },
+    )
+
+    command = captured[-1]
+    assert "--add-host" in command
+    assert "host.docker.internal:host-gateway" in command
+
+    monkeypatch.setenv("WPR_SANDBOX_ADD_HOST_GATEWAY", "0")
+    manager_without_alias = DockerSandboxManager(base_dir=str(tmp_path / "disabled"))
+    captured.clear()
+    manager_without_alias._docker = fake_docker  # type: ignore[method-assign]
+    manager_without_alias._create_container(
+        "wpr-test",
+        {
+            "workspace_dir": tmp_path / "workspace",
+            "home_dir": tmp_path / "home",
+        },
+    )
+
+    assert "--add-host" not in captured[-1]
 
 
 def test_inspect_reports_paused_when_docker_state_is_paused(tmp_path):
@@ -251,10 +307,12 @@ def test_seed_bootstrap_writes_project_scope_files(tmp_path, monkeypatch):
                 "system_instructions": "Use operator checkpoints before risky actions.",
                 "claude_project_mcp": {
                     "glass-hive": {
+                        "type": "http",
                         "transport": "http",
                         "url": "http://127.0.0.1:8767/mcp",
                     }
                 },
+                "codex_config_append": "[mcp_servers.glass-hive]\nurl = \"http://127.0.0.1:8767/mcp\"",
                 "claude_settings_local": {
                     "permissions": {
                         "allow": ["Bash(ls *)"],
@@ -278,10 +336,18 @@ def test_seed_bootstrap_writes_project_scope_files(tmp_path, monkeypatch):
 
     manager._seed_bootstrap(home_dir, workspace_dir, "claude-code", worker)
 
-    assert (workspace_dir / "CLAUDE.md").read_text().strip() == "Use operator checkpoints before risky actions."
-    assert (workspace_dir / "AGENTS.md").read_text().strip() == "Use operator checkpoints before risky actions."
-    assert json.loads((workspace_dir / ".mcp.json").read_text())["glass-hive"]["url"] == "http://127.0.0.1:8767/mcp"
+    agents_text = (workspace_dir / "AGENTS.md").read_text()
+    claude_text = (workspace_dir / "CLAUDE.md").read_text()
+    assert "GlassHive Worker Contract" in agents_text
+    assert "Use operator checkpoints before risky actions." in agents_text
+    assert "@AGENTS.md" in claude_text
+    assert "Use operator checkpoints before risky actions." in agents_text
+    assert json.loads((workspace_dir / ".mcp.json").read_text())["mcpServers"]["glass-hive"]["url"] == "http://127.0.0.1:8767/mcp"
     assert json.loads((workspace_dir / ".claude" / "settings.local.json").read_text())["permissions"]["allow"] == ["Bash(ls *)"]
+    assert "glass-hive" in (home_dir / ".codex" / "config.toml").read_text()
+    assert stat.S_IMODE((workspace_dir / ".mcp.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((workspace_dir / ".claude" / "settings.local.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((home_dir / ".codex" / "config.toml").stat().st_mode) == 0o600
     assert (workspace_dir / "notes" / "bootstrap.txt").read_text() == "Bootstrapped"
     assert (workspace_dir / "uploads" / "uploaded.txt").read_text() == "Uploaded content"
     assert "TEST_FLAG" in (home_dir / ".glasshive" / "runtime.env").read_text()
