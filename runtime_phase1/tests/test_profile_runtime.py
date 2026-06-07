@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import subprocess
 import threading
 import time
@@ -8,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from workers_projects_runtime.failure_classification import classify_runtime_error
+from workers_projects_runtime.bootstrap import GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS, GLASSHIVE_SAFETY_CHECKPOINT_RULE
+from workers_projects_runtime.failure_classification import classify_cli_failure, classify_runtime_error
 from workers_projects_runtime.openclaw_runtime import RuntimeDependencyMissingError, RuntimeErrorBase, WorkerTerminatedError
 from workers_projects_runtime.profile_runtime import BaseCliWorkerRuntime, ClaudeCodeRuntime, CodexCliRuntime, HostCodexCliRuntime, HostOpenClawRuntime, OpenClawWorkstationRuntime, ProfiledWorkerRuntime, _redact_text
 
@@ -617,11 +619,19 @@ def test_host_codex_runtime_materializes_required_workspace_files(tmp_path, monk
     assert (workspace_dir / "project-definition.md").read_text() == "# Project\n\nBuild the launch app."
     assert "main computer" in (workspace_dir / "harness-prompt.md").read_text()
     assert "bash /path/to/script.sh" in (workspace_dir / "harness-prompt.md").read_text()
+    assert GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS in (workspace_dir / "harness-prompt.md").read_text()
+    assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in (workspace_dir / "harness-prompt.md").read_text()
     assert (workspace_dir / "work-log.md").exists()
-    assert (workspace_dir / "agents.md").read_text() == "Agent context"
-    assert (workspace_dir / "AGENTS.md").read_text() == "Agent context"
-    assert (workspace_dir / "claude.md").read_text() == "Claude context"
-    assert (workspace_dir / "codex.md").read_text() == "Codex context"
+    agents_text = (workspace_dir / "AGENTS.md").read_text()
+    assert "GlassHive Worker Contract" in agents_text
+    assert GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS in agents_text
+    assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in agents_text
+    assert "Agent context" in agents_text
+    assert "real local machine session" in agents_text
+    assert (workspace_dir / "agents.md").read_text() == agents_text
+    assert "@AGENTS.md" in (workspace_dir / "claude.md").read_text()
+    assert "Claude context" in (workspace_dir / "claude.md").read_text()
+    assert "Codex context" in (workspace_dir / "codex.md").read_text()
     assert (workspace_dir / "glasshive-host-tools" / "capture-front-window.sh").exists()
     assert xattr_calls
     assert xattr_calls[0][:3] == ["/usr/bin/xattr", "-d", "com.apple.quarantine"]
@@ -865,6 +875,78 @@ def test_host_codex_runtime_default_prompts_require_final_report(tmp_path, monke
     for filename in ("harness-prompt.md", "agents.md", "AGENTS.md", "claude.md", "CLAUDE.md", "codex.md", "CODEX.md"):
         content = (workspace_dir / filename).read_text()
         assert "FINAL REPORT:" in content
+        assert "inspect" in content.lower()
+        assert "request and success criteria" in content.lower()
+        if filename in {"harness-prompt.md", "agents.md", "AGENTS.md"}:
+            assert GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS in content
+            assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in content
+    assert "canonical project instruction source" in (workspace_dir / "CLAUDE.md").read_text()
+    assert "@AGENTS.md" in (workspace_dir / "CLAUDE.md").read_text()
+
+
+def test_host_runtime_materializes_project_mcp_bootstrap_with_owner_only_files(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+    source_codex_home = tmp_path / "source-codex-home"
+    source_codex_home.mkdir()
+    (source_codex_home / "auth.json").write_text('{"OPENAI_API_KEY":"redacted-test-key"}')
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+
+    def fake_run(args, **_kwargs):
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
+    worker = {
+        "worker_id": "wrk_host_mcp_bootstrap",
+        "name": "Brokered Host Worker",
+        "role": "connected account task",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "claude_project_mcp": {
+                    "glasshive-user-capabilities": {
+                        "type": "http",
+                        "transport": "http",
+                        "url": "http://127.0.0.1:3080/api/viventium/glasshive/capabilities/mcp",
+                        "headers": {"Authorization": f"{'Bearer'} broker-grant"},
+                    }
+                },
+                "claude_settings_local": {"permissions": {"allow": ["Bash(ls *)"]}},
+                "codex_config_append": (
+                    "[mcp_servers.glasshive-user-capabilities]\n"
+                    "url = \"http://127.0.0.1:3080/api/viventium/glasshive/capabilities/mcp\"\n"
+                    "bearer_token_env_var = \"GLASSHIVE_CAPABILITY_BROKER_TOKEN\""
+                ),
+                "env": {"GLASSHIVE_CAPABILITY_BROKER_TOKEN": "broker-grant"},
+            }
+        ),
+    }
+
+    info = runtime.ensure_worker_ready(worker)
+    workspace_dir = Path(info.workspace_dir)
+
+    mcp_text = (workspace_dir / ".mcp.json").read_text()
+    assert "broker-grant" not in mcp_text
+    assert json.loads(mcp_text)["mcpServers"]["glasshive-user-capabilities"]["headers"]["Authorization"] == "Bearer ${GLASSHIVE_CAPABILITY_BROKER_TOKEN}"
+    assert json.loads((workspace_dir / ".claude" / "settings.local.json").read_text())["permissions"]["allow"] == ["Bash(ls *)"]
+    assert "glasshive-user-capabilities" in (workspace_dir / ".codex" / "config.toml").read_text()
+    worker_codex_home = runtime._host_codex_home(worker)
+    assert "glasshive-user-capabilities" in (worker_codex_home / "config.toml").read_text()
+    assert json.loads((worker_codex_home / "auth.json").read_text())["OPENAI_API_KEY"] == "redacted-test-key"
+    command, env = runtime._build_command(worker, "Use the broker", info)
+    assert env["CODEX_HOME"] == str(worker_codex_home)
+    assert env["GLASSHIVE_CAPABILITY_BROKER_TOKEN"] == "broker-grant"
+    assert "broker-grant" not in " ".join(command)
+    assert stat.S_IMODE((workspace_dir / ".mcp.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((workspace_dir / ".claude" / "settings.local.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((workspace_dir / ".codex" / "config.toml").stat().st_mode) == 0o600
+    assert stat.S_IMODE((worker_codex_home / "config.toml").stat().st_mode) == 0o600
+    assert stat.S_IMODE((worker_codex_home / "auth.json").stat().st_mode) == 0o600
 
 
 def test_host_runtime_live_description_refreshes_stale_prompt_files(tmp_path, monkeypatch):
@@ -897,6 +979,8 @@ def test_host_runtime_live_description_refreshes_stale_prompt_files(tmp_path, mo
     assert details["prompt_paths"]["harness_prompt"] == str(workspace_dir / "harness-prompt.md")
     assert "FINAL REPORT:" in (workspace_dir / "harness-prompt.md").read_text()
     assert "FINAL REPORT:" in (workspace_dir / "AGENTS.md").read_text()
+    assert "inspect the concrete output" in (workspace_dir / "harness-prompt.md").read_text()
+    assert "inspect the concrete output" in (workspace_dir / "AGENTS.md").read_text()
 
 
 def test_host_codex_runtime_rejects_untrusted_source_paths(tmp_path, monkeypatch):
@@ -1257,6 +1341,8 @@ def test_host_env_strips_parent_secrets_and_keeps_minimal_runtime_context(tmp_pa
     monkeypatch.setenv("OPENAI_API_KEY", "fake-openai-key")
     monkeypatch.setenv("LIBRECHAT_SECRET", "librechat-secret")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("USER", "testuser")
+    monkeypatch.setenv("LOGNAME", "testuser")
     worker = {
         "worker_id": "wrk_host",
         "name": "Main Host Worker",
@@ -1273,6 +1359,11 @@ def test_host_env_strips_parent_secrets_and_keeps_minimal_runtime_context(tmp_pa
     assert "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET" not in env
     assert "OPENAI_API_KEY" not in env
     assert "LIBRECHAT_SECRET" not in env
+    # USER/LOGNAME must pass through: macOS Keychain-backed CLIs (claude-code's
+    # subscription auth) resolve the keychain item by user and report "Not logged in"
+    # without them. They are identity, not secrets, so this does not weaken stripping.
+    assert env["USER"] == "testuser"
+    assert env["LOGNAME"] == "testuser"
 
 
 def test_host_openclaw_missing_cli_reports_named_binary(tmp_path):
@@ -1309,6 +1400,75 @@ def test_runtime_dependency_missing_classification_is_structured_and_sanitized()
     assert failure.retryable is False
     assert "`codex`" in failure.user_message
     assert "/private/tmp" not in failure.user_message
+    assert "sandbox/workstation" in failure.recommended_recovery
+
+
+def test_host_runtime_preflight_rejects_configured_version_mismatch(tmp_path, monkeypatch):
+    fake_node = tmp_path / "node"
+    fake_node.write_text("#!/usr/bin/env bash\necho 'v20.20.2'\n")
+    fake_node.chmod(0o755)
+    monkeypatch.setenv(
+        "GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON",
+        json.dumps(
+            {
+                "codex-cli": [
+                    {
+                        "binary": str(fake_node),
+                        "label": "Node.js",
+                        "min_version": "22.19.0",
+                    }
+                ]
+            }
+        ),
+    )
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+
+    with pytest.raises(RuntimeDependencyMissingError, match="Node.js") as captured:
+        runtime.preflight_worker_profile("codex-cli", "host")
+
+    assert captured.value.required_version == "22.19.0"
+    assert captured.value.actual_version == "20.20.2"
+    assert captured.value.dependency_label == "Node.js"
+
+
+def test_host_runtime_preflight_accepts_configured_version(tmp_path, monkeypatch):
+    fake_node = tmp_path / "node"
+    fake_node.write_text("#!/usr/bin/env bash\necho 'v22.19.0'\n")
+    fake_node.chmod(0o755)
+    monkeypatch.setenv(
+        "GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON",
+        json.dumps({"codex-cli": [{"binary": str(fake_node), "label": "Node.js", "min_version": "22.19.0"}]}),
+    )
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+
+    runtime.preflight_worker_profile("codex-cli", "host")
+
+
+def test_host_codex_runtime_uses_configured_binary_path(tmp_path, monkeypatch):
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text("#!/usr/bin/env bash\necho 'codex test'\n")
+    fake_codex.chmod(0o755)
+    monkeypatch.setenv("WPR_CODEX_BIN", str(fake_codex))
+    monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+
+    assert runtime.binary == str(fake_codex)
+    runtime.preflight_worker_profile("codex-cli", "host")
+
+
+def test_cli_failure_classifies_runtime_version_substrate():
+    failure = classify_cli_failure(
+        stdout="",
+        stderr="It failed. The local worker runtime needs Node.js v22.19+ and this machine is on v20.20.2.",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "runtime_dependency_missing"
+    assert failure.retryable is False
     assert "sandbox/workstation" in failure.recommended_recovery
 
 
@@ -1702,7 +1862,10 @@ def test_openclaw_projects_ignore_unknown_compat_max_token_field(tmp_path, monke
 
 def test_redact_text_masks_parent_visible_secret_shapes():
     synthetic_openai_token = "sk-" + "abc123456789xyz"
-    redacted = _redact_text(f"Authorization: Bearer abcdefghijklmnopqrstuvwxyz token=super-secret-value {synthetic_openai_token}")
+    synthetic_bearer = "abcdef" + "ghijklmnopqrstuvwxyz"
+    redacted = _redact_text(
+        f"Authorization: {'Bearer'} {synthetic_bearer} token=super-secret-value {synthetic_openai_token}"
+    )
     assert "abcdefghijklmnopqrstuvwxyz" not in redacted
     assert "super-secret-value" not in redacted
     assert synthetic_openai_token not in redacted

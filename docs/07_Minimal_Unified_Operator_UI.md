@@ -155,6 +155,7 @@ For this UI, the phase-1 operator brief should be:
   - treat success criteria as hard acceptance gates
   - keep working and researching until criteria are satisfied or a real blocker appears
   - keep asking: have I achieved this successfully?
+  - inspect the actual output, artifact, browser-visible result, or tool evidence before final report
   - pause before risky or irreversible external actions
   - if the deliverable is a webpage or app, open the final result in the sandbox browser and leave it visible
   - if the result is a simple static page, prefer opening the final HTML file directly instead of relying on a temporary localhost server

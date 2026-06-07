@@ -28,6 +28,41 @@ Glass Hive should provide:
 8. strong local-first posture
 9. safe publication through MCP and direct HTTP APIs
 10. a clean path for auth, MCP, memory, context, and callback injection
+11. a universal worker completion self-check before any user-facing final report
+12. harness-level prerequisite preflight and safe recovery before asking the user to fix local runtime substrate
+13. sparse, faithful delegation: pass goals, constraints, files, MCP/tool capability context, and
+    explicit success conditions without inventing plans, rubrics, artifacts, provider lists, or tool
+    results for the worker
+
+## Core Worker Operating Instructions
+
+The public source of truth is `docs/requirements_and_learnings/48_GlassHive_Workstation_Sandbox_Runtime.md`.
+The nested GlassHive runtime follows the same canonical worker contract:
+
+```
+CRITICAL OPERATING INSTRUCTIONS (FOLLOW STRICTLY):
+
+1. PATH OF LEAST RESISTANCE: Use the simplest, most direct solution. Don't reinvent wheels.
+
+2. JUST DO IT: Execute immediately without asking questions. Users want RESULTS. Rely on your intelligence, tools, MCPs, skills to find ways around blockers to get it done full and complete.
+
+3. SELF-TEST AND VERIFY:
+   - After creating code, RUN IT
+   - After starting a server, CURL IT to confirm it responds
+   - After researching or creating files, open them and deliver them
+   - NEVER report success without verification
+   - Debate with yourself on gaps, issues, mistakes, misalignments in your delivery and work on them. Do not stop early. Do not just tell the user what you missed. Actually take action and address them so that the delivery to the user is complete and reliable.
+
+4. LOOP UNTIL SUCCESS:
+   - If something fails, FIX IT and try again
+   - Keep iterating until ACTUALLY COMPLETE
+
+5. NO USER INTERVENTION: Deliver a COMPLETE, WORKING solution.
+```
+
+This is bounded by the runtime safety model: it does not override tenant/user scope, auth boundaries,
+destructive host-action checkpoints, or cost/time controls. Workers should fix what they can and
+report a concrete blocker instead of looping indefinitely.
 
 ## Non-Goals
 
@@ -60,6 +95,11 @@ The durable task definition around one or more workers, including goal, success 
 
 ### Bootstrap Bundle
 A portable preset describing what should be projected into a worker when it starts or resumes.
+It must be able to carry general instructions that tell the worker to verify its own deliverable
+against the user's request and success criteria without overfitting to one client, file type, or task.
+It should preserve real data in and data out: uploaded bytes/references, broker grants,
+capabilities, and retrieved context are projected when present; missing data is represented as a
+blocker or unavailable capability, not filled in by the host assistant.
 
 ## Client Compatibility Goal
 

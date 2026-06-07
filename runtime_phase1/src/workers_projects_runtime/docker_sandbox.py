@@ -709,6 +709,7 @@ class DockerSandboxManager:
             f"TERM={self.term_value}",
             "-e",
             f"SE_VNC_NO_PASSWORD={'1' if self.vnc_no_password else '0'}",
+            *self._host_gateway_args(),
             "-p",
             f"127.0.0.1::{self.novnc_container_port}",
             "-p",
@@ -727,6 +728,11 @@ class DockerSandboxManager:
         result = self._docker(command, check=False, capture_output=True)
         if result.returncode != 0:
             raise RuntimeError(f"Failed to create worker sandbox {container_name}: {(result.stderr or result.stdout or '').strip()[-2000:]}")
+
+    def _host_gateway_args(self) -> list[str]:
+        if not self._env_flag("WPR_SANDBOX_ADD_HOST_GATEWAY", True):
+            return []
+        return ["--add-host", "host.docker.internal:host-gateway"]
 
     def _insert_resource_limits(self, command: list[str]) -> None:
         resource_args: list[str] = []

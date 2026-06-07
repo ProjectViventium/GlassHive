@@ -13,6 +13,8 @@ Use this playbook to rapidly test whether Glass Hive is behaving like a real pow
 6. Confirm the project-first watch flow lands on the desktop by default.
 7. Confirm the active live terminal is visible inside that desktop by default.
 8. Confirm a fresh worker desktop does not default to the Selenium splash screen.
+9. Confirm the worker does not report final completion until it has checked the actual result against
+   the goal and success criteria, or returned a specific blocker.
 
 Pass if:
 
@@ -21,6 +23,7 @@ Pass if:
 - the run/event history is coherent
 - the desktop-first view still shows the real live run terminal
 - fresh workers open on a GlassHive-owned surface instead of Selenium branding
+- final reports reflect verified completion or a real blocker, not progress chatter
 
 ## 2. Sandbox Persistence
 
@@ -117,7 +120,29 @@ Pass if:
 - the expected files exist
 - env is present in shell/task execution
 - instructions and MCP config land in the right scope
+- the bootstrap includes a universal completion self-check instead of a task-specific QA script
+- delegation stays sparse and faithful: no invented provider lists, urgency rubrics, file outputs,
+  MCP/tool success criteria, or fake tool results are introduced by the host
 - no raw secrets are echoed in API responses
+
+## 7.1 Runtime Prerequisite Recovery
+
+1. Configure a host profile with a missing or too-old local runtime dependency.
+2. Start a public-safe task through the normal API/MCP path.
+3. Verify GlassHive classifies the prerequisite problem before creating dead work or telling the user
+   the task is running.
+4. Verify configured safe recovery is attempted first: managed/bundled dependency, worker-local
+   toolchain, alternate available profile, or sandbox/workstation mode when compatible with the user's
+   request. These branches must be declared in runtime/profile configuration, and unavailable
+   branches are skipped instead of faked with one-off shell commands.
+5. If recovery creates a replacement worker/run, verify the returned follow-up context points at the
+   active recovered run.
+
+Pass if:
+
+- the user's task is preserved through recovery
+- the user is not told to change global machine state while a managed or sandboxed recovery path exists
+- if recovery is impossible, the blocker is specific, structured, and does not masquerade as task failure
 
 ## 8. Connected-Account Broker Readiness
 

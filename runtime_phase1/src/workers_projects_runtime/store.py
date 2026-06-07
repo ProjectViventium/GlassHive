@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -87,6 +88,7 @@ class Store:
                     workspace_dir TEXT,
                     workspace_root TEXT,
                     favorite INTEGER NOT NULL DEFAULT 0,
+                    compute_released_at TEXT,
                     pid INTEGER,
                     last_run_id TEXT,
                     last_error TEXT,
@@ -112,6 +114,9 @@ class Store:
                     failure_user_message TEXT NOT NULL DEFAULT '',
                     failure_recommended_recovery TEXT NOT NULL DEFAULT '',
                     failure_diagnostic_summary TEXT NOT NULL DEFAULT '',
+                    retry_after TEXT,
+                    retry_attempts INTEGER NOT NULL DEFAULT 0,
+                    last_retry_class TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(worker_id) REFERENCES workers(worker_id),
                     FOREIGN KEY(project_id) REFERENCES projects(project_id)
                 );
@@ -202,6 +207,8 @@ class Store:
                 conn.execute("ALTER TABLE workers ADD COLUMN workspace_root TEXT")
             if "favorite" not in worker_columns:
                 conn.execute("ALTER TABLE workers ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0")
+            if "compute_released_at" not in worker_columns:
+                conn.execute("ALTER TABLE workers ADD COLUMN compute_released_at TEXT")
             run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
             if "tenant_id" not in run_columns:
                 conn.execute("ALTER TABLE runs ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
@@ -215,6 +222,12 @@ class Store:
                 conn.execute("ALTER TABLE runs ADD COLUMN failure_recommended_recovery TEXT NOT NULL DEFAULT ''")
             if "failure_diagnostic_summary" not in run_columns:
                 conn.execute("ALTER TABLE runs ADD COLUMN failure_diagnostic_summary TEXT NOT NULL DEFAULT ''")
+            if "retry_after" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN retry_after TEXT")
+            if "retry_attempts" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN retry_attempts INTEGER NOT NULL DEFAULT 0")
+            if "last_retry_class" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN last_retry_class TEXT NOT NULL DEFAULT ''")
             event_columns = {row["name"] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
             if "tenant_id" not in event_columns:
                 conn.execute("ALTER TABLE events ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
@@ -425,6 +438,7 @@ class Store:
             "workspace_dir": None,
             "workspace_root": workspace_root,
             "favorite": 0,
+            "compute_released_at": None,
             "pid": None,
             "last_run_id": None,
             "last_error": None,
@@ -437,11 +451,11 @@ class Store:
                 INSERT INTO workers (
                     worker_id, project_id, tenant_id, owner_id, name, role, profile, backend, execution_mode, alias, runtime, model, state,
                     bootstrap_profile, bootstrap_bundle_json, gateway_url, takeover_url, control_url, gateway_port, gateway_token, session_key,
-                    state_dir, workspace_dir, workspace_root, favorite, pid, last_run_id, last_error, created_at, updated_at
+                    state_dir, workspace_dir, workspace_root, favorite, compute_released_at, pid, last_run_id, last_error, created_at, updated_at
                 ) VALUES (
                     :worker_id, :project_id, :tenant_id, :owner_id, :name, :role, :profile, :backend, :execution_mode, :alias, :runtime, :model, :state,
                     :bootstrap_profile, :bootstrap_bundle_json, :gateway_url, :takeover_url, :control_url, :gateway_port, :gateway_token, :session_key,
-                    :state_dir, :workspace_dir, :workspace_root, :favorite, :pid, :last_run_id, :last_error, :created_at, :updated_at
+                    :state_dir, :workspace_dir, :workspace_root, :favorite, :compute_released_at, :pid, :last_run_id, :last_error, :created_at, :updated_at
                 )
                 """,
                 data,
@@ -469,6 +483,60 @@ class Store:
             query += " AND owner_id = ?"
             params.append(owner_id)
         query += " ORDER BY created_at DESC"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return self._rows(rows)
+
+    def list_worker_options(
+        self,
+        *,
+        tenant_id: str | None = None,
+        owner_id: str | None = None,
+        states: set[str] | None = None,
+        exclude_states: set[str] | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT
+                workers.worker_id,
+                workers.project_id,
+                workers.tenant_id,
+                workers.owner_id,
+                workers.name,
+                workers.role,
+                workers.profile,
+                workers.execution_mode,
+                workers.alias,
+                workers.state,
+                workers.favorite,
+                workers.last_run_id,
+                workers.created_at,
+                workers.updated_at,
+                projects.title AS project_title,
+                projects.goal AS project_goal
+            FROM workers
+            LEFT JOIN projects ON projects.project_id = workers.project_id
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if tenant_id:
+            clauses.append("workers.tenant_id = ?")
+            params.append(tenant_id)
+        if owner_id:
+            clauses.append("workers.owner_id = ?")
+            params.append(owner_id)
+        if states:
+            placeholders = ", ".join("?" for _ in states)
+            clauses.append(f"workers.state IN ({placeholders})")
+            params.extend(sorted(states))
+        if exclude_states:
+            placeholders = ", ".join("?" for _ in exclude_states)
+            clauses.append(f"workers.state NOT IN ({placeholders})")
+            params.extend(sorted(exclude_states))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY workers.favorite DESC, workers.updated_at DESC, workers.created_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 25)))
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return self._rows(rows)
@@ -585,6 +653,9 @@ class Store:
             "failure_user_message": "",
             "failure_recommended_recovery": "",
             "failure_diagnostic_summary": "",
+            "retry_after": None,
+            "retry_attempts": 0,
+            "last_retry_class": "",
         }
         with self._connect() as conn:
             conn.execute(
@@ -593,13 +664,14 @@ class Store:
                     run_id, worker_id, project_id, tenant_id, instruction, state, queued_at,
                     started_at, ended_at, output_text, error_text, failure_class,
                     failure_retryable, failure_user_message, failure_recommended_recovery,
-                    failure_diagnostic_summary
+                    failure_diagnostic_summary, retry_after, retry_attempts, last_retry_class
                 )
                 VALUES (
                     :run_id, :worker_id, :project_id, :tenant_id, :instruction, :state,
                     :queued_at, :started_at, :ended_at, :output_text, :error_text,
                     :failure_class, :failure_retryable, :failure_user_message,
-                    :failure_recommended_recovery, :failure_diagnostic_summary
+                    :failure_recommended_recovery, :failure_diagnostic_summary,
+                    :retry_after, :retry_attempts, :last_retry_class
                 )
                 """,
                 data,
@@ -661,19 +733,43 @@ class Store:
             row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         return self._row(row)
 
+    def peek_next_queued_run(self, worker_id: str, now_iso: str | None = None) -> dict[str, Any] | None:
+        now_iso = now_iso or utc_now()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM runs
+                WHERE worker_id = ?
+                  AND state = 'queued'
+                  AND (retry_after IS NULL OR retry_after = '' OR retry_after <= ?)
+                ORDER BY queued_at ASC
+                LIMIT 1
+                """,
+                (worker_id, now_iso),
+            ).fetchone()
+        return self._row(row)
+
     def claim_next_queued_run(self, worker_id: str) -> dict[str, Any] | None:
+        now_iso = utc_now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT * FROM runs WHERE worker_id = ? AND state = 'queued' ORDER BY queued_at ASC LIMIT 1",
-                (worker_id,),
+                """
+                SELECT * FROM runs
+                WHERE worker_id = ?
+                  AND state = 'queued'
+                  AND (retry_after IS NULL OR retry_after = '' OR retry_after <= ?)
+                ORDER BY queued_at ASC
+                LIMIT 1
+                """,
+                (worker_id, now_iso),
             ).fetchone()
             if row is None:
                 conn.execute("COMMIT")
                 return None
             started_at = utc_now()
             conn.execute(
-                "UPDATE runs SET state = 'running', started_at = ? WHERE run_id = ?",
+                "UPDATE runs SET state = 'running', started_at = ?, retry_after = NULL WHERE run_id = ?",
                 (started_at, row["run_id"]),
             )
             claimed = conn.execute("SELECT * FROM runs WHERE run_id = ?", (row["run_id"],)).fetchone()
@@ -704,6 +800,60 @@ class Store:
             ).fetchone()
         return row is not None
 
+    def next_retry_after_for_worker(self, worker_id: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT retry_after FROM runs
+                WHERE worker_id = ?
+                  AND state = 'queued'
+                  AND retry_after IS NOT NULL
+                  AND retry_after != ''
+                ORDER BY retry_after ASC
+                LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["retry_after"] or "") or None
+
+    def requeue_run_for_retry(
+        self,
+        run_id: str,
+        *,
+        retry_after: str,
+        error_text: str = "",
+        last_retry_class: str = "",
+        **failure_fields: Any,
+    ) -> dict[str, Any] | None:
+        normalized_failure_fields = _normalized_failure_fields(failure_fields)
+        update_fields = {
+            "run_id": run_id,
+            "retry_after": retry_after,
+            "error_text": error_text,
+            "last_retry_class": str(last_retry_class or normalized_failure_fields.get("failure_class") or ""),
+            **normalized_failure_fields,
+        }
+        failure_assignments = "".join(f", {key} = :{key}" for key in normalized_failure_fields.keys())
+        with self._connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE runs
+                SET state = 'queued',
+                    ended_at = NULL,
+                    retry_after = :retry_after,
+                    retry_attempts = COALESCE(retry_attempts, 0) + 1,
+                    last_retry_class = :last_retry_class,
+                    error_text = :error_text{failure_assignments}
+                WHERE run_id = :run_id
+                  AND state IN ('queued', 'running')
+                """,
+                update_fields,
+            )
+            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        return self._row(row)
+
     def finalize_run(
         self,
         run_id: str,
@@ -717,6 +867,7 @@ class Store:
             "ended_at": utc_now(),
             "output_text": output_text,
             "error_text": error_text,
+            "retry_after": None,
         }
         fields.update(_normalized_failure_fields(failure_fields))
         return self.update_run(run_id, **fields)
@@ -1086,6 +1237,30 @@ class Store:
             row = conn.execute("SELECT * FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
         return self._row(row)
 
+    def mark_callback_dead_lettered(
+        self,
+        callback_id: str,
+        *,
+        attempts: int,
+        payload_json: str,
+        last_error: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE callback_outbox
+                SET status = 'dead_lettered',
+                    attempts = attempts + ?,
+                    payload_json = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE callback_id = ?
+                """,
+                (attempts, payload_json, last_error[-2000:], utc_now(), callback_id),
+            )
+            row = conn.execute("SELECT * FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
+        return self._row(row)
+
     def list_pending_callbacks(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -1098,6 +1273,29 @@ class Store:
                 (limit,),
             ).fetchall()
         return self._rows(rows)
+
+    def reclaim_stale_delivering_callbacks(self, *, stale_before: str, limit: int = 50) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE callback_outbox
+                SET status = 'pending',
+                    last_error = CASE
+                        WHEN last_error = '' THEN 'callback delivery was interrupted and reclaimed'
+                        ELSE last_error
+                    END,
+                    updated_at = ?
+                WHERE callback_id IN (
+                    SELECT callback_id
+                    FROM callback_outbox
+                    WHERE status = 'delivering' AND updated_at < ?
+                    ORDER BY updated_at ASC
+                    LIMIT ?
+                )
+                """,
+                (utc_now(), stale_before, limit),
+            )
+        return cur.rowcount
 
     def metrics(self, tenant_id: str | None = None, owner_id: str | None = None) -> dict[str, int]:
         project_clause = ""
@@ -1122,23 +1320,33 @@ class Store:
         run_clause = ""
         event_join = ""
         event_clause = ""
+        callback_join = ""
+        callback_clause = ""
+        callback_params: list[Any] = []
         if tenant_id or owner_id:
             run_join = " JOIN workers ON workers.worker_id = runs.worker_id"
             event_join = " JOIN workers ON workers.worker_id = events.worker_id"
+            callback_join = " JOIN workers ON workers.worker_id = callback_outbox.worker_id"
             run_filters: list[str] = []
             event_filters: list[str] = []
+            callback_filters: list[str] = []
             if tenant_id:
                 run_filters.append("runs.tenant_id = ?")
                 event_filters.append("events.tenant_id = ?")
+                callback_filters.append("callback_outbox.tenant_id = ?")
                 run_params.append(tenant_id)
                 event_params.append(tenant_id)
+                callback_params.append(tenant_id)
             if owner_id:
                 run_filters.append("workers.owner_id = ?")
                 event_filters.append("workers.owner_id = ?")
+                callback_filters.append("workers.owner_id = ?")
                 run_params.append(owner_id)
                 event_params.append(owner_id)
+                callback_params.append(owner_id)
             run_clause = " WHERE " + " AND ".join(run_filters)
             event_clause = " WHERE " + " AND ".join(event_filters)
+            callback_clause = " WHERE " + " AND ".join(callback_filters)
         with self._connect() as conn:
             projects = conn.execute(f"SELECT COUNT(*) FROM projects{project_clause}", project_params).fetchone()[0]
             workers = conn.execute(f"SELECT COUNT(*) FROM workers{worker_clause}", worker_params).fetchone()[0]
@@ -1158,6 +1366,48 @@ class Store:
             queued_runs = conn.execute(queued_runs_query, queued_params).fetchone()[0]
             active_runs = conn.execute(active_runs_query, active_params).fetchone()[0]
             events = conn.execute(f"SELECT COUNT(*) FROM events{event_join}{event_clause}", event_params).fetchone()[0]
+            callback_from = f"callback_outbox{callback_join}"
+            callback_pending_query = f"SELECT COUNT(*) FROM {callback_from}"
+            callback_delivering_query = f"SELECT COUNT(*) FROM {callback_from}"
+            callback_dead_lettered_query = f"SELECT COUNT(*) FROM {callback_from}"
+            callback_max_attempts_query = f"SELECT COALESCE(MAX(callback_outbox.attempts), 0) FROM {callback_from}"
+            callback_oldest_pending_query = f"SELECT MIN(callback_outbox.updated_at) FROM {callback_from}"
+            pending_filters = ["callback_outbox.status = 'pending'"]
+            delivering_filters = ["callback_outbox.status = 'delivering'"]
+            active_callback_filters = ["callback_outbox.status IN ('pending', 'delivering')"]
+            dead_lettered_filters = ["callback_outbox.status = 'dead_lettered'"]
+            pending_params = list(callback_params)
+            delivering_params = list(callback_params)
+            max_attempts_params = list(callback_params)
+            dead_lettered_params = list(callback_params)
+            if callback_clause:
+                extra = callback_clause.removeprefix(" WHERE ")
+                pending_filters.append(extra)
+                delivering_filters.append(extra)
+                active_callback_filters.append(extra)
+                dead_lettered_filters.append(extra)
+            callback_pending_query += " WHERE " + " AND ".join(pending_filters)
+            callback_delivering_query += " WHERE " + " AND ".join(delivering_filters)
+            callback_dead_lettered_query += " WHERE " + " AND ".join(dead_lettered_filters)
+            callback_oldest_pending_query += " WHERE " + " AND ".join(pending_filters)
+            callback_max_attempts_query += " WHERE " + " AND ".join(active_callback_filters)
+            callback_pending = conn.execute(callback_pending_query, pending_params).fetchone()[0]
+            callback_delivering = conn.execute(callback_delivering_query, delivering_params).fetchone()[0]
+            callback_dead_lettered = conn.execute(callback_dead_lettered_query, dead_lettered_params).fetchone()[0]
+            callback_max_attempts = conn.execute(callback_max_attempts_query, max_attempts_params).fetchone()[0]
+            oldest_pending = conn.execute(callback_oldest_pending_query, pending_params).fetchone()[0]
+        callback_oldest_pending_age_seconds = 0
+        if oldest_pending:
+            try:
+                oldest_dt = datetime.fromisoformat(str(oldest_pending))
+                if oldest_dt.tzinfo is None:
+                    oldest_dt = oldest_dt.replace(tzinfo=timezone.utc)
+                callback_oldest_pending_age_seconds = max(
+                    0,
+                    int((datetime.now(timezone.utc) - oldest_dt).total_seconds()),
+                )
+            except ValueError:
+                callback_oldest_pending_age_seconds = 0
         return {
             "projects": projects,
             "workers": workers,
@@ -1165,4 +1415,9 @@ class Store:
             "queued_runs": queued_runs,
             "active_runs": active_runs,
             "events": events,
+            "callback_pending": callback_pending,
+            "callback_delivering": callback_delivering,
+            "callback_dead_lettered": callback_dead_lettered,
+            "callback_max_attempts": callback_max_attempts,
+            "callback_oldest_pending_age_seconds": callback_oldest_pending_age_seconds,
         }

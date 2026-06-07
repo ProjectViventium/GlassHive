@@ -719,6 +719,7 @@ def test_launcher_workspace_hive_static_controls():
     desktop_js = (static_dir / "desktop.js").read_text(encoding="utf-8")
     index_html = (static_dir / "index.html").read_text(encoding="utf-8")
     styles_css = (static_dir / "styles.css").read_text(encoding="utf-8")
+    watch_html = (static_dir / "watch.html").read_text(encoding="utf-8")
     watch_js = (static_dir / "watch.js").read_text(encoding="utf-8")
     assert "workspace-live-frame" in app_js
     assert "MAX_LIVE_TILE_IFRAMES" in app_js
@@ -759,6 +760,21 @@ def test_launcher_workspace_hive_static_controls():
     assert "Workspace resuming" in watch_js
     assert "IDLE_REFRESH_MS" in watch_js
     assert "refreshInFlight" in watch_js
+    assert "function filePreviewUrl()" in watch_js
+    assert "function fileDeliverableKey(deliverable, runId)" in watch_js
+    assert "function isFilePreviewUrl(url)" in watch_js
+    assert "lastAttachedFilePreviewKey === filePreviewKey" in watch_js
+    assert "if (!isFilePreviewUrl(url))" in watch_js
+    assert "currentDeliverable?.kind === 'file'" in watch_js
+    assert "syncResultActions(currentDeliverable)" in watch_js
+    assert 'id="artifact-list"' in watch_html
+    assert "function syncArtifactList(items)" in watch_js
+    assert "data.artifacts?.items || []" in watch_js
+    assert "Workspace files" in watch_js
+    assert ".artifact-row" in styles_css
+    assert "artifact-list-more" in watch_js
+    assert ".artifact-list-more" in styles_css
+    assert "Open delivered file in new tab" in watch_js
     assert "setInterval(refresh" not in watch_js
     assert "Workspace paused" not in watch_js
     assert 'grid-template-areas:' in styles_css
@@ -1729,6 +1745,7 @@ def test_launch_projects_uploaded_files_into_new_workspace_bootstrap():
     assert bundle['files'][0]['path'] == 'uploads/brief.txt'
     assert bundle['files'][0]['encoding'] == 'base64'
     assert 'uploads/brief.txt' in bundle['system_instructions']
+    assert 'do not force a downloadable file' in bundle['system_instructions']
 
 
 def test_schedule_project_creates_worker_without_starting_and_persists_schedule():
