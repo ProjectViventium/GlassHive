@@ -51,9 +51,41 @@ from .terminal_takeover import TerminalTarget
 
 logger = logging.getLogger(__name__)
 
-_CODEX_MCP_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 _CODEX_TOP_LEVEL_MCP_ASSIGNMENT_RE = re.compile(r"^\s*mcp_servers(?:\.|\s*=)")
 _HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
+
+
+def _strip_toml_inline_comment(line: str) -> str:
+    in_quote: str | None = None
+    escaped = False
+    for index, char in enumerate(line):
+        if in_quote:
+            if escaped:
+                escaped = False
+                continue
+            if in_quote == '"' and char == "\\":
+                escaped = True
+                continue
+            if char == in_quote:
+                in_quote = None
+            continue
+        if char in ("'", '"'):
+            in_quote = char
+            continue
+        if char == "#":
+            return line[:index]
+    return line
+
+
+def _codex_toml_section_name(line: str) -> str | None:
+    stripped = _strip_toml_inline_comment(line).strip()
+    if stripped.startswith("[[") and stripped.endswith("]]"):
+        section_name = stripped[2:-2].strip()
+    elif stripped.startswith("[") and stripped.endswith("]"):
+        section_name = stripped[1:-1].strip()
+    else:
+        return None
+    return section_name or None
 
 
 def _codex_mcp_section_server_name(section_name: str) -> str | None:
@@ -67,10 +99,10 @@ def _codex_mcp_section_server_name(section_name: str) -> str | None:
 def _codex_mcp_server_names(config_text: str) -> set[str]:
     names: set[str] = set()
     for line in config_text.splitlines():
-        match = _CODEX_MCP_SECTION_RE.match(line)
-        if not match:
+        section_name = _codex_toml_section_name(line)
+        if not section_name:
             continue
-        server = _codex_mcp_section_server_name(match.group(1))
+        server = _codex_mcp_section_server_name(section_name)
         if server:
             names.add(server)
     return names
@@ -82,9 +114,9 @@ def _select_codex_mcp_server_blocks(config_text: str, names: set[str]) -> str:
     output: list[str] = []
     keeping = False
     for line in config_text.splitlines():
-        section = _CODEX_MCP_SECTION_RE.match(line)
-        if section:
-            server = _codex_mcp_section_server_name(section.group(1))
+        section_name = _codex_toml_section_name(line)
+        if section_name:
+            server = _codex_mcp_section_server_name(section_name)
             keeping = server in names if server else False
         if keeping:
             output.append(line)
@@ -97,9 +129,9 @@ def _strip_codex_mcp_server_blocks(config_text: str, names: set[str]) -> str:
     output: list[str] = []
     skipping = False
     for line in config_text.splitlines():
-        section = _CODEX_MCP_SECTION_RE.match(line)
-        if section:
-            server = _codex_mcp_section_server_name(section.group(1))
+        section_name = _codex_toml_section_name(line)
+        if section_name:
+            server = _codex_mcp_section_server_name(section_name)
             skipping = server in names if server else False
         if not skipping:
             output.append(line)
@@ -114,9 +146,8 @@ def _sanitize_malformed_codex_source_config(
     output: list[str] = []
     keeping = True
     for line in config_text.splitlines():
-        section = _CODEX_MCP_SECTION_RE.match(line)
-        if section:
-            section_name = section.group(1).strip()
+        section_name = _codex_toml_section_name(line)
+        if section_name:
             if section_name == "mcp_servers" or section_name.startswith("mcp_servers."):
                 server = _codex_mcp_section_server_name(section_name)
                 keeping = bool(server and server in preserve_names and server not in append_names)
