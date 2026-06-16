@@ -12,6 +12,11 @@ LOCALHOST_URL_PATTERN = re.compile(
     r"://(?:127\.0\.0\.1|localhost|0\.0\.0\.0)(?:[:/]|$)",
     flags=re.IGNORECASE,
 )
+EXPLICIT_WEB_SURFACE_PATTERN = re.compile(
+    r"\b(?:web\s*app|web\s*page|website|webpage|browser|dashboard|interactive|site|"
+    r"app(?:lication)?|html\s+(?:app|dashboard|deliverable|page|report|site))\b",
+    flags=re.IGNORECASE,
+)
 NON_DELIVERABLE_URL_HOST_PATTERN = re.compile(
     r"(^|\.)(api\.openai\.com|api\.anthropic\.com|api\.portkey\.ai|openai\.azure\.com|cognitiveservices\.azure\.com|services\.ai\.azure\.com)$",
     flags=re.IGNORECASE,
@@ -211,21 +216,7 @@ def output_prefers_web_surface(path: Path, root: Path, *texts: str) -> bool:
     if not text_references_workspace_path(path, root, *texts):
         return False
     combined = "\n".join(texts).lower()
-    web_terms = (
-        "app",
-        "browser",
-        "dashboard",
-        "html",
-        "index.html",
-        "open",
-        "page",
-        "preview",
-        "site",
-        "url",
-        "web",
-        "webpage",
-    )
-    return any(term in combined for term in web_terms)
+    return EXPLICIT_WEB_SURFACE_PATTERN.search(combined) is not None
 
 
 def workspace_browser_url(path: Path, worker: dict) -> str | None:

@@ -1499,6 +1499,86 @@ def test_worker_delegate_once_blocks_missing_host_cli_before_api_calls(monkeypat
     assert api_client.calls == []
 
 
+def test_worker_delegate_once_mcp_preflight_uses_configured_host_binary(monkeypatch, tmp_path):
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"--version\" ]]; then echo 'codex-cli 0.140.0'; exit 0; fi\n"
+        "echo 'codex test'\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("WPR_CODEX_BIN", str(fake_codex))
+    monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("WPR_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_FILE", raising=False)
+    monkeypatch.delenv("WPR_HOST_RUNTIME_REQUIREMENTS_FILE", raising=False)
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    api_client = TrackingApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "owner_id": "demo-owner",
+                    "title": "Configured host Codex",
+                    "instruction": "Run a host Codex task.",
+                    "profile": "codex-cli",
+                    "execution_mode": "host",
+                },
+            )
+            payload = _tool_json(delegated)
+            assert payload["status"] == "dispatched"
+            assert payload["follow_up_context"]["run_id"] == "run_assign"
+
+    asyncio.run(scenario())
+    assert api_client.find_or_resume_payloads[-1]["execution_mode"] == "host"
+
+
+def test_worker_delegate_once_mcp_preflight_blocks_claude_without_chrome(monkeypatch, tmp_path):
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"--version\" ]]; then echo '2.1.178 (Claude Code)'; exit 0; fi\n"
+        "echo 'Usage: claude [options] --effort'\n",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(0o755)
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", str(fake_claude))
+    monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("WPR_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("WPR_CLAUDE_CODE_ENABLE_CHROME", raising=False)
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    api_client = TrackingApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "owner_id": "demo-owner",
+                    "title": "Host Claude without Chrome",
+                    "instruction": "Run a host Claude browser task.",
+                    "profile": "claude-code",
+                    "execution_mode": "host",
+                },
+            )
+            payload = _tool_json(delegated)
+            assert payload["status"] == "blocked"
+            assert payload["failure_class"] == "runtime_dependency_missing"
+            assert "supports --chrome" in payload["failure_user_message"]
+
+    asyncio.run(scenario())
+    assert api_client.calls == []
+
+
 def test_worker_delegate_once_recovers_default_host_dependency_to_docker(monkeypatch, tmp_path):
     fake_node = tmp_path / "node"
     fake_node.write_text("#!/usr/bin/env bash\necho 'v20.20.2'\n")

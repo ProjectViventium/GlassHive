@@ -8,7 +8,6 @@ import json
 import math
 import os
 import re
-import shutil
 import threading
 import time
 from dataclasses import dataclass
@@ -32,8 +31,9 @@ from .bootstrap import (
     sign_bootstrap_source_path,
 )
 from .deliverables import is_user_deliverable_relative_path
+from .openclaw_runtime import RuntimeDependencyMissingError
 from .operator_urls import surface_aware_watch_url, surface_can_open_operator_url
-from .runtime_requirements import host_runtime_requirement_issue
+from .profile_runtime import HostClaudeCodeRuntime, HostCodexCliRuntime, HostOpenClawRuntime
 from .runtime_env import load_viventium_runtime_env
 from .signed_links import append_signed_query, sign_link_token, signed_link_ttl_seconds
 
@@ -151,66 +151,88 @@ def _host_profile_binary(profile: str) -> str:
     return os.environ.get("WPR_OPENCLAW_BIN", "").strip() or "openclaw"
 
 
-def _host_profile_runtime_name(profile: str) -> str:
+def _host_preflight_base_dir() -> str:
+    raw = os.environ.get("WPR_MCP_PREFLIGHT_BASE_DIR", "").strip()
+    if raw:
+        return raw
+    return str(Path(os.environ.get("TMPDIR", "/tmp")) / "glasshive-mcp-host-preflight")
+
+
+def _host_profile_runtime(profile: str):
+    base_dir = _host_preflight_base_dir()
     clean = str(profile or "").strip()
     if clean == "codex-cli":
-        return "codex-cli"
+        return HostCodexCliRuntime(base_dir=base_dir)
     if clean == "claude-code":
-        return "claude-code"
-    return "openclaw"
+        return HostClaudeCodeRuntime(base_dir=base_dir)
+    return HostOpenClawRuntime(base_dir=base_dir)
 
 
 def _host_profile_available(profile: str) -> bool:
-    requirement_checker = globals().get("host_runtime_requirement_issue")
-    return (
-        shutil.which(_host_profile_binary(profile)) is not None
-        and (
-            not callable(requirement_checker)
-            or requirement_checker(profile, _host_profile_runtime_name(profile)) is None
+    return _runtime_dependency_blocked_payload(profile=profile, execution_mode="host") is None
+
+
+def _runtime_dependency_blocked_payload_from_error(
+    error: RuntimeDependencyMissingError,
+    *,
+    profile: str,
+    execution_mode: str,
+) -> dict[str, Any]:
+    binary = str(error.binary or _host_profile_binary(profile))
+    label = str(error.dependency_label or "").strip() or binary.replace("\\", "/").rstrip("/").split("/")[-1] or binary
+    profile_hint = f" for `{profile}`" if profile else ""
+    user_message = str(error).strip()
+    if error.required_version:
+        actual = f" Current version: {error.actual_version}." if error.actual_version else ""
+        user_message = (
+            f"GlassHive cannot start the selected host worker{profile_hint} because {label} "
+            f"must be >= {error.required_version}.{actual}"
         )
-    )
+    elif "not installed or not on PATH" in user_message or binary in user_message:
+        user_message = (
+            f"GlassHive cannot start the selected host worker{profile_hint} because the required "
+            f"CLI `{label}` is not installed or not available to the GlassHive service."
+        )
+    diagnostic_parts = [
+        f"Host runtime dependency unavailable for profile={profile} execution_mode={execution_mode}"
+    ]
+    if error.runtime_name:
+        diagnostic_parts.append(f"runtime={error.runtime_name}")
+    if error.required_version:
+        diagnostic_parts.append(f"required_version={error.required_version}")
+    if error.actual_version:
+        diagnostic_parts.append(f"actual_version={error.actual_version}")
+    if str(error).strip():
+        diagnostic_parts.append(str(error).strip())
+    return {
+        "status": "blocked",
+        "failure_class": "runtime_dependency_missing",
+        "failure_retryable": False,
+        "failure_user_message": user_message,
+        "failure_recommended_recovery": error.recovery_hint
+        or (
+            "Use a configured managed dependency, choose another available worker profile, or use "
+            "sandbox/workstation execution when that still satisfies the user's request. Ask the "
+            "operator to change the host service runtime only when no configured recovery path is available."
+        ),
+        "failure_diagnostic_summary": "; ".join(diagnostic_parts),
+        "profile": profile,
+        "execution_mode": execution_mode,
+    }
 
 
 def _runtime_dependency_blocked_payload(*, profile: str, execution_mode: str) -> dict[str, Any] | None:
     if execution_mode != "host":
         return None
-    binary = _host_profile_binary(profile)
-    if shutil.which(binary) is None:
-        label = binary.replace("\\", "/").rstrip("/").split("/")[-1] or binary
-        profile_hint = f" for `{profile}`" if profile else ""
-        return {
-            "status": "blocked",
-            "failure_class": "runtime_dependency_missing",
-            "failure_retryable": False,
-            "failure_user_message": (
-                f"GlassHive cannot start the selected host worker{profile_hint} because the required "
-                f"CLI `{label}` is not installed or not available to the GlassHive service."
-            ),
-            "failure_recommended_recovery": (
-                "Use a configured managed dependency, choose another available worker profile, or use "
-                "sandbox/workstation execution when that still satisfies the user's request. Ask the "
-                "operator to change the host service runtime only when no configured recovery path is available."
-            ),
-            "failure_diagnostic_summary": f"Missing host CLI for profile={profile} execution_mode={execution_mode}",
-            "profile": profile,
-            "execution_mode": execution_mode,
-        }
-    issue = host_runtime_requirement_issue(profile, _host_profile_runtime_name(profile))
-    if issue is None:
+    try:
+        _host_profile_runtime(profile).preflight_worker_profile(profile, execution_mode)
         return None
-    profile_hint = f" for `{profile}`" if profile else ""
-    return {
-        "status": "blocked",
-        "failure_class": "runtime_dependency_missing",
-        "failure_retryable": False,
-        "failure_user_message": issue.user_message.replace("selected host worker", f"selected host worker{profile_hint}", 1)
-        if profile_hint and "selected host worker for" not in issue.user_message
-        else issue.user_message,
-        "failure_recommended_recovery": issue.recommended_recovery,
-        "failure_diagnostic_summary": issue.diagnostic_summary,
-        "profile": profile,
-        "execution_mode": execution_mode,
-    }
+    except RuntimeDependencyMissingError as error:
+        return _runtime_dependency_blocked_payload_from_error(
+            error,
+            profile=profile,
+            execution_mode=execution_mode,
+        )
 
 
 def _worker_capability_summary() -> str:

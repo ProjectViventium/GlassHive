@@ -1818,6 +1818,30 @@ def test_host_runtime_preflight_accepts_configured_version(tmp_path, monkeypatch
     runtime.preflight_worker_profile("codex-cli", "host")
 
 
+def test_host_runtime_preflight_rejects_invalid_requirements_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", "{not valid json")
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+
+    with pytest.raises(RuntimeDependencyMissingError, match="requirements configuration") as captured:
+        runtime.preflight_worker_profile("codex-cli", "host")
+
+    assert captured.value.dependency_label == "host runtime requirements configuration"
+    assert "restore the built-in GlassHive host dependency guardrails" in captured.value.recovery_hint
+
+
+def test_host_runtime_preflight_rejects_unreadable_requirements_file(tmp_path, monkeypatch):
+    missing_requirements = tmp_path / "missing-requirements.json"
+    monkeypatch.setenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_FILE", str(missing_requirements))
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+
+    with pytest.raises(RuntimeDependencyMissingError, match="requirements configuration") as captured:
+        runtime.preflight_worker_profile("codex-cli", "host")
+
+    assert captured.value.dependency_label == "host runtime requirements configuration"
+
+
 def test_host_runtime_preflight_rejects_default_version_mismatch(tmp_path, monkeypatch):
     fake_claude = tmp_path / "claude"
     fake_claude.write_text(

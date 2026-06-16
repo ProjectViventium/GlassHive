@@ -3652,6 +3652,31 @@ def test_deliverable_payload_keeps_explicit_web_app_primary_over_supporting_docu
     assert payload["browser_url"] == "file:///workspace/project/index.html"
 
 
+def test_deliverable_payload_keeps_document_primary_when_html_is_supporting_preview(tmp_path):
+    workspace = tmp_path / "workspace"
+    artifacts = workspace / "artifacts"
+    artifacts.mkdir(parents=True)
+    (workspace / "index.html").write_text("<!doctype html><h1>Supporting preview</h1>", encoding="utf-8")
+    write_minimal_docx(artifacts / "research-brief.docx")
+    worker = {
+        "worker_id": "wrk_doc",
+        "workspace_dir": str(workspace),
+        "execution_mode": "docker",
+    }
+    output = (
+        "FINAL REPORT: The polished document is ready at artifacts/research-brief.docx. "
+        "I also included index.html as a supporting preview."
+    )
+
+    payload = deliverable_payload(worker, {"state": "completed"}, output)
+
+    assert payload is not None
+    assert payload["kind"] == "file"
+    assert payload["source"] == "workspace_file"
+    assert payload["workspace_path"] == "artifacts/research-brief.docx"
+    assert payload["preferred_surface"] == "download"
+
+
 def test_live_payload_does_not_promote_fake_document_over_html(tmp_path):
     db_path = tmp_path / "runtime.db"
     client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
