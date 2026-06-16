@@ -52,6 +52,7 @@ from .terminal_takeover import TerminalTarget
 logger = logging.getLogger(__name__)
 
 _CODEX_MCP_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+_CODEX_TOP_LEVEL_MCP_ASSIGNMENT_RE = re.compile(r"^\s*mcp_servers(?:\.|\s*=)")
 _HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
 
 
@@ -121,6 +122,9 @@ def _sanitize_malformed_codex_source_config(
                 keeping = bool(server and server in preserve_names and server not in append_names)
             else:
                 keeping = True
+        elif _CODEX_TOP_LEVEL_MCP_ASSIGNMENT_RE.match(line):
+            keeping = False
+            continue
         if keeping:
             output.append(line)
     return "\n".join(output).rstrip()

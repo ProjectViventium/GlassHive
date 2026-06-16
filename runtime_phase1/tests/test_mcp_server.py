@@ -1579,6 +1579,42 @@ def test_worker_delegate_once_mcp_preflight_blocks_claude_without_chrome(monkeyp
     assert api_client.calls == []
 
 
+def test_worker_delegate_once_mcp_preflight_redacts_missing_host_binary_path(monkeypatch):
+    private_binary = "/Users/example/private/bin/claude"
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", private_binary)
+    monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("WPR_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    api_client = TrackingApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "owner_id": "demo-owner",
+                    "title": "Host Claude missing binary",
+                    "instruction": "Run a host Claude task.",
+                    "profile": "claude-code",
+                    "execution_mode": "host",
+                },
+            )
+            payload = _tool_json(delegated)
+            assert payload["status"] == "blocked"
+            assert payload["failure_class"] == "runtime_dependency_missing"
+            assert private_binary not in payload["failure_user_message"]
+            assert "/Users/example" not in payload["failure_user_message"]
+            assert private_binary not in payload["failure_diagnostic_summary"]
+            assert "/Users/example" not in payload["failure_diagnostic_summary"]
+            assert "[local path]" in payload["failure_diagnostic_summary"]
+
+    asyncio.run(scenario())
+    assert api_client.calls == []
+
+
 def test_worker_delegate_once_mcp_preflight_blocks_claude_max_without_effort(
     monkeypatch,
     tmp_path,

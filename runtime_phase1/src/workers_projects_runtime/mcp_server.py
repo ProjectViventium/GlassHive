@@ -203,7 +203,7 @@ def _runtime_dependency_blocked_payload_from_error(
     if error.actual_version:
         diagnostic_parts.append(f"actual_version={error.actual_version}")
     if str(error).strip():
-        diagnostic_parts.append(str(error).strip())
+        diagnostic_parts.append(_audit_preview(str(error).strip(), max_chars=300))
     return {
         "status": "blocked",
         "failure_class": "runtime_dependency_missing",

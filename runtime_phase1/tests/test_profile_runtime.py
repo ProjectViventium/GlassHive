@@ -1158,6 +1158,35 @@ def test_host_codex_malformed_config_strips_inline_private_mcp_tables(tmp_path, 
     assert "secret" not in config
 
 
+def test_host_codex_malformed_config_strips_top_level_private_mcp_assignment(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    source_codex_home = tmp_path / "source-codex-home"
+    source_codex_home.mkdir()
+    (source_codex_home / "config.toml").write_text(
+        'model = "gpt-local-public-safe"\n\n'
+        'mcp_servers = { private_mail = { command = "/bin/private-mail", env = { PRIVATE_TOKEN = "secret" }\n'
+        'mcp_servers.private_calendar = { command = "/bin/private-calendar", env = { PRIVATE_TOKEN = "secret" } }\n\n'
+        "[projects.example]\n"
+        'trust_level = "trusted"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+
+    config = runtime._host_codex_worker_config(
+        "[mcp_servers.glasshive-user-capabilities]\n"
+        "url = \"http://127.0.0.1:3190/api/viventium/glasshive/capabilities/mcp\"\n"
+        "bearer_token_env_var = \"GLASSHIVE_CAPABILITY_BROKER_TOKEN\""
+    )
+
+    assert 'model = "gpt-local-public-safe"' in config
+    assert "[projects.example]" in config
+    assert "glasshive-user-capabilities" in config
+    assert "private_mail" not in config
+    assert "private_calendar" not in config
+    assert "PRIVATE_TOKEN" not in config
+    assert "secret" not in config
+
+
 def test_host_runtime_live_description_refreshes_stale_prompt_files(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
