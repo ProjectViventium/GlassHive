@@ -725,8 +725,12 @@ def test_launcher_workspace_hive_static_controls():
     assert 'src="/static/app.js?v=20260616a"' in index_html
     assert 'href="/static/styles.css?v=20260616a"' in watch_html
     assert 'src="/static/watch.js?v=20260616a"' in watch_html
+    assert "const GLASSHIVE_UI_REV = '20260616a'" in app_js
+    assert "const GLASSHIVE_UI_REV = '20260616a'" in watch_js
     assert "20260531b" not in index_html
     assert "20260531b" not in watch_html
+    assert "20260525c" not in app_js
+    assert "20260531b" not in watch_js
     assert "workspace-live-frame" in app_js
     assert "MAX_LIVE_TILE_IFRAMES" in app_js
     assert "RETAINED_TILE_REFRESH_MS" in app_js

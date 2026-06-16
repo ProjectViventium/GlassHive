@@ -50,6 +50,13 @@ available instead of launching stripped shells. GlassHive checks the configured 
 dispatching a host worker and fails closed when the selected substrate cannot provide the required
 native surface.
 
+Host-native Codex preserves non-MCP Codex configuration so model/provider defaults and project trust
+settings continue to behave like the user's real Codex environment. Private or non-brokered MCP
+server blocks are stripped before worker config is materialized, then GlassHive appends only the
+allowed native/broker MCP entries. Operators should choose host mode only when exposing host-local
+Codex configuration to that host worker is intended; sandbox/workstation mode remains the safer
+default when host-local state should not be shared.
+
 Built-in minimums:
 
 - Codex CLI: `0.140.0`

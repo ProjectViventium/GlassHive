@@ -12,7 +12,7 @@ const queueShortcutLabel = isApplePlatform ? '⌘+Enter' : 'Ctrl+Enter';
 const LONG_PRESS_MS = 550;
 const ACTIVE_REFRESH_MS = 2000;
 const IDLE_REFRESH_MS = 10000;
-const GLASSHIVE_UI_REV = '20260531b';
+const GLASSHIVE_UI_REV = '20260616a';
 
 const frame = document.getElementById('desktop-frame');
 const overlay = document.getElementById('stage-overlay');
