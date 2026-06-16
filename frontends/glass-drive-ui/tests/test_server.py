@@ -717,17 +717,20 @@ def test_launcher_workspace_hive_static_controls():
     static_dir = Path(server_module.__file__).parent / "static"
     app_js = (static_dir / "app.js").read_text(encoding="utf-8")
     desktop_js = (static_dir / "desktop.js").read_text(encoding="utf-8")
+    desktop_html = (static_dir / "desktop.html").read_text(encoding="utf-8")
     index_html = (static_dir / "index.html").read_text(encoding="utf-8")
     styles_css = (static_dir / "styles.css").read_text(encoding="utf-8")
     watch_html = (static_dir / "watch.html").read_text(encoding="utf-8")
     watch_js = (static_dir / "watch.js").read_text(encoding="utf-8")
     assert 'href="/static/styles.css?v=20260616a"' in index_html
     assert 'src="/static/app.js?v=20260616a"' in index_html
+    assert 'src="/static/desktop.js?v=20260616a"' in desktop_html
     assert 'href="/static/styles.css?v=20260616a"' in watch_html
     assert 'src="/static/watch.js?v=20260616a"' in watch_html
     assert "const GLASSHIVE_UI_REV = '20260616a'" in app_js
     assert "const GLASSHIVE_UI_REV = '20260616a'" in watch_js
     assert "20260531b" not in index_html
+    assert "20260525c" not in desktop_html
     assert "20260531b" not in watch_html
     assert "20260525c" not in app_js
     assert "20260531b" not in watch_js
