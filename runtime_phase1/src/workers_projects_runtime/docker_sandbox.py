@@ -46,7 +46,73 @@ SAFE_DOCKER_EXEC_ENV_KEYS = {
     "WPR_OPENCLAW_MODEL_PROVIDER",
     "WPR_OPENCLAW_USE_CUSTOM_PROVIDER",
     "WPR_OPENCLAW_WIRE_API",
+    "TMPDIR",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
 }
+
+AI_WORKER_BROWSER_EXTENSION_UPDATE_URL = "https://clients2.google.com/service/update2/crx"
+AI_WORKER_BROWSER_EXTENSIONS = {
+    "claude": "fcoeoabgfenejglbffodgkkbkcdhcgfn",
+    "codex": "hehggadaopoacecdllhhajmbjkdcmajg",
+}
+AI_WORKER_BROWSER_EXTENSION_POLICY_PATHS = (
+    "/etc/chromium/policies/managed/glasshive-ai-worker-extensions.json",
+    "/etc/opt/chrome/policies/managed/glasshive-ai-worker-extensions.json",
+)
+AI_WORKER_CODEX_NPM_SPEC = os.environ.get("WPR_SANDBOX_CODEX_NPM_SPEC", "@openai/codex@0.140.0").strip() or "@openai/codex@0.140.0"
+AI_WORKER_CLAUDE_CODE_NPM_SPEC = (
+    os.environ.get("WPR_SANDBOX_CLAUDE_CODE_NPM_SPEC", "@anthropic-ai/claude-code@2.1.178").strip()
+    or "@anthropic-ai/claude-code@2.1.178"
+)
+AI_WORKER_OPENCLAW_NPM_SPEC = os.environ.get("WPR_SANDBOX_OPENCLAW_NPM_SPEC", "openclaw@latest").strip() or "openclaw@latest"
+
+
+def _ai_worker_browser_extension_policy_json() -> str:
+    return json.dumps(
+        {
+            "ExtensionInstallForcelist": [
+                f"{extension_id};{AI_WORKER_BROWSER_EXTENSION_UPDATE_URL}"
+                for extension_id in AI_WORKER_BROWSER_EXTENSIONS.values()
+            ]
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _ai_worker_browser_extension_check_script() -> str:
+    extension_ids = " ".join(shlex.quote(extension_id) for extension_id in AI_WORKER_BROWSER_EXTENSIONS.values())
+    policy_paths = " ".join(shlex.quote(path) for path in AI_WORKER_BROWSER_EXTENSION_POLICY_PATHS)
+    return "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            f"extension_ids=({extension_ids})",
+            f"policy_paths=({policy_paths})",
+            "require_profile=0",
+            'if [ "${1:-}" = "--require-profile" ]; then require_profile=1; fi',
+            'for policy in "${policy_paths[@]}"; do',
+            '  test -f "$policy"',
+            '  grep -Fq "ExtensionInstallForcelist" "$policy"',
+            '  for extension_id in "${extension_ids[@]}"; do',
+            f'    grep -Fq "${{extension_id}};{AI_WORKER_BROWSER_EXTENSION_UPDATE_URL}" "$policy"',
+            "  done",
+            "done",
+            'profile_root="${CHROME_USER_DATA_DIR:-${HOME:-/workspace/.wpr-home}/.config/chromium}"',
+            "missing=0",
+            'for extension_id in "${extension_ids[@]}"; do',
+            '  if [ -d "$profile_root/Default/Extensions/$extension_id" ] || [ -d "$profile_root/Extensions/$extension_id" ]; then',
+            '    printf "%s profile-installed\\n" "$extension_id"',
+            "  else",
+            '    printf "%s policy-present profile-pending\\n" "$extension_id"',
+            "    missing=1",
+            "  fi",
+            "done",
+            'if [ "$require_profile" = "1" ] && [ "$missing" = "1" ]; then exit 2; fi',
+            'printf "glasshive browser extension policy ok\\n"',
+        ]
+    )
 
 
 @dataclass
@@ -73,7 +139,7 @@ def _safe_docker_exec_env(env: dict[str, str] | None) -> dict[str, str]:
 
 class DockerSandboxManager:
     _build_lock = Lock()
-    _default_image = "workers-projects-runtime-workstation:phase1-node22"
+    _default_image = "workers-projects-runtime-workstation:phase1-node22-docs4"
 
     def __init__(self, base_dir: str | None = None) -> None:
         self.base_dir = Path(base_dir) if base_dir else Path(__file__).resolve().parents[2] / "data"
@@ -158,7 +224,7 @@ class DockerSandboxManager:
         if sandbox is None:
             raise RuntimeError("Failed to start worker sandbox")
         if needs_path_repair or (repair_paths and self._env_flag("WPR_REPAIR_RUNNING_CONTAINER_ROOTS", False)):
-            self._ensure_container_writable_paths(sandbox.container_name, [self.workspace_mount, self.home_mount])
+            self._ensure_container_writable_paths(sandbox.container_name, self._default_writable_container_paths())
         self._harden_secret_runtime_files(sandbox.container_name)
         if needs_idle_prime:
             self._set_plain_background(sandbox.container_name)
@@ -295,6 +361,12 @@ class DockerSandboxManager:
             f"HOME={self.home_mount}",
             "-e",
             f"TERM={self.term_value}",
+            "-e",
+            f"TMPDIR={self._browser_tmp_dir()}",
+            "-e",
+            f"XDG_CACHE_HOME={self._browser_cache_dir()}",
+            "-e",
+            f"XDG_CONFIG_HOME={self._browser_config_dir()}",
             sandbox.container_name,
             "screen",
             "-xRR",
@@ -308,11 +380,7 @@ class DockerSandboxManager:
         result = self._docker_exec(
             sandbox.container_name,
             ["bash", "-c", "screen -ls || true"],
-            env={
-                "HOME": self.home_mount,
-                "TERM": self.term_value,
-                "DISPLAY": self.display_value,
-            },
+            env=self._desktop_env(),
             cwd=self.workspace_mount,
         )
         output = "\n".join(filter(None, [(result.stdout or "").strip(), (result.stderr or "").strip()]))
@@ -341,9 +409,7 @@ class DockerSandboxManager:
         sandbox = self.fast_sandbox_from_worker(resolved_worker) or self.ensure_ready(resolved_worker, runtime_name=runtime_name)
         self._ensure_screen_runtime_dir(sandbox.container_name)
         merged_env = {
-            "HOME": self.home_mount,
-            "TERM": self.term_value,
-            "DISPLAY": self.display_value,
+            **self._desktop_env(),
             **_safe_docker_exec_env(env),
         }
         self.stop_screen_session(worker_id, runtime_name, session_name, worker=resolved_worker, missing_ok=True)
@@ -413,11 +479,7 @@ class DockerSandboxManager:
         result = self._docker_exec(
             container_name,
             ["bash", "-c", script, "glasshive-stop-screen", session_name],
-            env={
-                "HOME": self.home_mount,
-                "TERM": self.term_value,
-                "DISPLAY": self.display_value,
-            },
+            env=self._desktop_env(),
             cwd=self.workspace_mount,
         )
         if result.returncode != 0 and not (missing_ok and result.returncode == 42):
@@ -467,11 +529,7 @@ class DockerSandboxManager:
         self._docker_exec(
             container_name,
             ["bash", "-c", script],
-            env={
-                "HOME": self.home_mount,
-                "TERM": self.term_value,
-                "DISPLAY": self.display_value,
-            },
+            env=self._desktop_env(),
             cwd=self.workspace_mount,
         )
 
@@ -496,9 +554,7 @@ class DockerSandboxManager:
         if not command:
             raise ValueError(f"Unsupported desktop action: {action}")
         merged_env = {
-            "HOME": self.home_mount,
-            "TERM": self.term_value,
-            "DISPLAY": self.display_value,
+            **self._desktop_env(),
         }
         result = self._docker_exec(
             sandbox.container_name,
@@ -571,6 +627,34 @@ class DockerSandboxManager:
         )
         return f"data:text/html,{quote(html)}"
 
+    def _browser_tmp_dir(self) -> str:
+        return f"{self.home_mount}/tmp"
+
+    def _browser_cache_dir(self) -> str:
+        return f"{self.home_mount}/.cache"
+
+    def _browser_config_dir(self) -> str:
+        return f"{self.home_mount}/.config"
+
+    def _default_writable_container_paths(self) -> list[str]:
+        return [
+            self.workspace_mount,
+            self.home_mount,
+            self._browser_tmp_dir(),
+            self._browser_cache_dir(),
+            self._browser_config_dir(),
+        ]
+
+    def _desktop_env(self) -> dict[str, str]:
+        return {
+            "HOME": self.home_mount,
+            "TERM": self.term_value,
+            "DISPLAY": self.display_value,
+            "TMPDIR": self._browser_tmp_dir(),
+            "XDG_CACHE_HOME": self._browser_cache_dir(),
+            "XDG_CONFIG_HOME": self._browser_config_dir(),
+        }
+
     def _container_name(self, worker_id: str) -> str:
         token = worker_id.replace("_", "-").lower()
         return f"wpr-{token}"
@@ -586,22 +670,13 @@ class DockerSandboxManager:
         worker_id = str(worker.get("worker_id") or "").strip()
         if not worker_id:
             return None
-        if not (worker.get("state_dir") or worker.get("workspace_dir")):
+        # State/workspace directories are projected before container startup so
+        # operators can inspect paths early. They are not evidence that Docker
+        # has created the workstation. Only use the shortcut when the caller has
+        # real container evidence, then validate it through inspect/cache.
+        if not str(worker.get("container_id") or "").strip():
             return None
-        state = str(worker.get("state") or "running").strip().lower() or "running"
-        paths = self._paths(worker_id)
-        return SandboxInfo(
-            container_name=self._container_name(worker_id),
-            container_id=None,
-            state=state,
-            workspace_dir=str(paths["workspace_dir"]),
-            home_dir=str(paths["home_dir"]),
-            pid=None,
-            image=self.image,
-            novnc_port=None,
-            selenium_port=None,
-            openclaw_port=None,
-        )
+        return self.inspect(worker_id)
 
     def paths(self, worker_id: str) -> dict[str, Path]:
         worker_root = self.runtime_root / "workers" / worker_id
@@ -662,16 +737,46 @@ class DockerSandboxManager:
                 self._image_checked_at = now
                 return
             dockerfile = self.build_root / "Dockerfile"
+            extension_policy = _ai_worker_browser_extension_policy_json()
+            extension_policy_source = AI_WORKER_BROWSER_EXTENSION_POLICY_PATHS[0]
+            extension_policy_dirs = " ".join(
+                shlex.quote(str(Path(path).parent))
+                for path in AI_WORKER_BROWSER_EXTENSION_POLICY_PATHS
+            )
+            extension_policy_writes = " && ".join(
+                [
+                    f"printf '%s\\n' {shlex.quote(extension_policy)} > {shlex.quote(extension_policy_source)}",
+                    *(
+                        f"cp {shlex.quote(extension_policy_source)} {shlex.quote(path)}"
+                        for path in AI_WORKER_BROWSER_EXTENSION_POLICY_PATHS[1:]
+                    ),
+                ]
+            )
+            extension_check_script_lines = " ".join(
+                shlex.quote(line)
+                for line in _ai_worker_browser_extension_check_script().splitlines()
+            )
+            npm_worker_specs = " ".join(
+                shlex.quote(spec)
+                for spec in (
+                    AI_WORKER_CODEX_NPM_SPEC,
+                    AI_WORKER_CLAUDE_CODE_NPM_SPEC,
+                    AI_WORKER_OPENCLAW_NPM_SPEC,
+                )
+            )
             dockerfile.write_text(
                 "\n".join(
                     [
                         "FROM selenium/standalone-chromium:latest",
                         "USER root",
-                        "RUN apt-get update && apt-get install -y --no-install-recommends bash ca-certificates curl git gnupg jq less nano openssh-client pcmanfm procps python-is-python3 python3-pip ripgrep screen tmux tree vim wmctrl x11-utils xdotool xterm && rm -rf /var/lib/apt/lists/*",
+                        "RUN apt-get update && apt-get install -y --no-install-recommends bash ca-certificates curl file fonts-dejavu git gnupg jq less libreoffice-calc libreoffice-impress libreoffice-writer nano openssh-client pandoc pcmanfm poppler-utils procps python-is-python3 python3-pip ripgrep screen tmux tree vim wmctrl x11-utils xdotool xterm && rm -rf /var/lib/apt/lists/*",
+                        "RUN if [ ! -x /usr/bin/locale-check ]; then printf '%s\\n' '#!/bin/sh' 'locale_value=${1:-C.UTF-8}' 'echo LANG=$locale_value' 'echo LC_ALL=$locale_value' > /usr/bin/locale-check && chmod +x /usr/bin/locale-check; fi",
                         "RUN mkdir -p /etc/apt/keyrings && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main' > /etc/apt/sources.list.d/nodesource.list",
                         "RUN apt-get update && apt-get install -y --no-install-recommends nodejs && node --version && npm --version && rm -rf /var/lib/apt/lists/*",
-                        "RUN npm install -g @openai/codex @anthropic-ai/claude-code openclaw@latest",
-                        "RUN pip3 install --no-cache-dir selenium",
+                        f"RUN npm install -g {npm_worker_specs}",
+                        "RUN pip3 install --no-cache-dir selenium beautifulsoup4 markdown matplotlib openpyxl pdf2image pillow PyMuPDF PyPDF2 python-docx python-pptx reportlab xlsxwriter",
+                        f"RUN mkdir -p {extension_policy_dirs} && {extension_policy_writes}",
+                        f"RUN printf '%s\\n' {extension_check_script_lines} > /usr/local/bin/glasshive-browser-extension-check && chmod +x /usr/local/bin/glasshive-browser-extension-check && glasshive-browser-extension-check",
                         "RUN mkdir -p /workspace/project /workspace/.wpr-home",
                         "USER seluser",
                         "WORKDIR /workspace/project",
@@ -707,6 +812,12 @@ class DockerSandboxManager:
             f"HOME={self.home_mount}",
             "-e",
             f"TERM={self.term_value}",
+            "-e",
+            f"TMPDIR={self._browser_tmp_dir()}",
+            "-e",
+            f"XDG_CACHE_HOME={self._browser_cache_dir()}",
+            "-e",
+            f"XDG_CONFIG_HOME={self._browser_config_dir()}",
             "-e",
             f"SE_VNC_NO_PASSWORD={'1' if self.vnc_no_password else '0'}",
             *self._host_gateway_args(),
@@ -913,11 +1024,7 @@ class DockerSandboxManager:
         self._docker_exec(
             container_name,
             ["bash", "-c", script],
-            env={
-                "HOME": self.home_mount,
-                "TERM": self.term_value,
-                "DISPLAY": self.display_value,
-            },
+            env=self._desktop_env(),
             cwd=self.workspace_mount,
             detach=True,
             fire_and_forget=True,
@@ -936,11 +1043,7 @@ class DockerSandboxManager:
                     "wmctrl -xa chromium.Chromium || wmctrl -a Chromium || true"
                 ),
             ],
-            env={
-                "HOME": self.home_mount,
-                "TERM": self.term_value,
-                "DISPLAY": self.display_value,
-            },
+            env=self._desktop_env(),
             cwd=self.workspace_mount,
         )
 

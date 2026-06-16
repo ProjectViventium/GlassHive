@@ -22,9 +22,20 @@
           </div>
           <div class="watch-meta-line">
             <p id="watch-subtitle">Connecting to workspace…</p>
-            <span id="status-label" class="meta-label">Live status</span>
-            <button id="result-toggle" class="result-toggle" type="button" aria-expanded="false">
-              <span id="latest-output-inline">No run output yet.</span>
+            <button
+              id="result-toggle"
+              class="result-toggle"
+              type="button"
+              aria-controls="result-panel"
+              aria-expanded="false"
+              aria-label="Open latest workspace output status"
+            >
+              <span class="result-toggle-head">
+                <span class="result-toggle-kicker">Latest workspace output</span>
+                <span id="status-label" class="result-toggle-state">Live status</span>
+                <span id="result-toggle-action" class="result-toggle-action">Open status</span>
+              </span>
+              <span id="latest-output-inline" class="result-toggle-summary">No run output yet.</span>
             </button>
           </div>
         </div>

@@ -9,6 +9,7 @@ import re
 import sqlite3
 import time
 import uuid
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
@@ -20,7 +21,11 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from workers_projects_runtime.api import create_app
-from workers_projects_runtime.deliverables import deliverable_payload, is_deliverable_url
+from workers_projects_runtime.deliverables import (
+    deliverable_payload,
+    is_deliverable_url,
+    is_user_deliverable_relative_path,
+)
 from workers_projects_runtime.openclaw_runtime import (
     RuntimeErrorBase,
     RuntimeInfo,
@@ -38,6 +43,33 @@ from workers_projects_runtime.service import (
 )
 from workers_projects_runtime.signed_links import sign_link_params, sign_link_token, verify_signed_link_token
 from workers_projects_runtime.store import Store
+
+
+def write_minimal_docx(path: Path) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>""",
+        )
+        archive.writestr(
+            "_rels/.rels",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>""",
+        )
+        archive.writestr(
+            "word/document.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>Client-ready research brief</w:t></w:r></w:p></w:body>
+</w:document>""",
+        )
 
 
 def wait_for_run(client: TestClient, run_id: str, timeout: float = 3.0) -> dict:
@@ -2158,7 +2190,7 @@ def _callback_row(store: Store, callback_id: str):
         return conn.execute("SELECT * FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
 
 
-def test_permanent_403_callback_dead_letters_after_total_budget(tmp_path, monkeypatch):
+def test_permanent_403_callback_dead_letters_immediately(tmp_path, monkeypatch):
     attempts: list[int] = []
 
     class Response:
@@ -2183,23 +2215,15 @@ def test_permanent_403_callback_dead_letters_after_total_budget(tmp_path, monkey
     service = WorkersProjectsService(store, StubRuntime())
     try:
         _project, worker, _run, record = _create_callback_outbox_record(store)
-        for expected_attempts in (1, 2):
-            pending = store.list_pending_callbacks()
-            assert len(pending) == 1
-            service._deliver_callback_record(worker, pending[0], service._callback_config_for(worker))
-            row = _callback_row(store, record["callback_id"])
-            assert row["status"] == "pending"
-            assert row["attempts"] == expected_attempts
-
         service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
     finally:
         service.shutdown()
 
     row = _callback_row(store, record["callback_id"])
     assert row["status"] == "dead_lettered"
-    assert row["attempts"] == 3
-    assert "retry budget exhausted" in row["last_error"]
-    assert len(attempts) == 3
+    assert row["attempts"] == 1
+    assert "terminal HTTP 403" in row["last_error"]
+    assert len(attempts) == 1
     assert not store.list_pending_callbacks()
     assert [event for event in store.list_events(worker["worker_id"]) if event["event_type"] == "callback.dead_lettered"]
 
@@ -3060,6 +3084,50 @@ def test_assign_run_effort_updates_codex_worker_bootstrap_bundle(tmp_path):
     assert "Codex effort" in rejected.json()["detail"]
 
 
+def test_assign_run_effort_updates_claude_worker_bootstrap_bundle(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub"))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Claude effort",
+            "goal": "Verify per-run effort handoff.",
+            "default_worker_profile": "claude-code",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Claude Worker",
+            "role": "research",
+            "profile": "claude-code",
+            "backend": "openclaw",
+            "start_synchronously": False,
+        },
+    ).json()
+
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Continue with a max effort pass.", "effort": "max"},
+    )
+    assert run.status_code == 202
+    assert run.json()["state"] == "queued"
+
+    stored_worker = Store(str(db_path)).get_worker(worker["worker_id"])
+    bundle = json.loads(stored_worker["bootstrap_bundle_json"])
+    assert bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == "max"
+    assert "Worker effort preference" not in str(bundle)
+
+    rejected = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Invalid effort should fail.", "effort": "high"},
+    )
+    assert rejected.status_code == 400
+    assert "Claude effort" in rejected.json()["detail"]
+
+
 def test_signed_worker_view_cannot_inject_bootstrap_bundle_on_assign(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
     monkeypatch.setenv("WPR_API_TOKEN", "api-token")
@@ -3397,7 +3465,9 @@ def test_nonblocking_worker_create_defers_runtime_start_to_run_queue(tmp_path):
     settled = wait_for_run(client, assign_resp.json()["run_id"], timeout=3.0)
     assert settled["state"] == "completed"
     assert settled["output_text"] == "BACKGROUND_START_OK"
-    assert runtime.events[0] == "run_task"
+    assert runtime.events[0] == "ready"
+    assert "run_task" in runtime.events
+    assert runtime.events.index("run_task") > 0
 
 
 def test_openclaw_worker_exposes_operator_control_surface(tmp_path):
@@ -3518,6 +3588,109 @@ def test_live_payload_promotes_workspace_html_as_deliverable(tmp_path):
     assert payload["deliverable"]["preferred_surface"] == "desktop"
 
 
+def test_live_payload_prefers_professional_document_over_supporting_html(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Document Deliverable",
+            "goal": "Expose the client-ready document before supporting source artifacts.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Document Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+        },
+    ).json()
+
+    workspace = Path(worker["workspace_dir"])
+    artifacts = workspace / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (workspace / "index.html").write_text("<!doctype html><h1>Supporting preview</h1>", encoding="utf-8")
+    write_minimal_docx(artifacts / "research-brief.docx")
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live")
+    assert live.status_code == 200
+    deliverable = live.json()["deliverable"]
+    assert deliverable["kind"] == "file"
+    assert deliverable["workspace_path"] == "artifacts/research-brief.docx"
+    assert deliverable["preferred_surface"] == "download"
+
+
+def test_deliverable_payload_keeps_explicit_web_app_primary_over_supporting_document(tmp_path):
+    workspace = tmp_path / "workspace"
+    artifacts = workspace / "artifacts"
+    artifacts.mkdir(parents=True)
+    (workspace / "index.html").write_text("<!doctype html><h1>Interactive app</h1>", encoding="utf-8")
+    write_minimal_docx(artifacts / "supporting-notes.docx")
+    worker = {
+        "worker_id": "wrk_app",
+        "workspace_dir": str(workspace),
+        "execution_mode": "docker",
+    }
+    output = (
+        "FINAL REPORT: The interactive web app is ready. Open index.html to review the delivered "
+        "page; supporting notes are also included."
+    )
+
+    payload = deliverable_payload(worker, {"state": "completed"}, output)
+
+    assert payload is not None
+    assert payload["kind"] == "webpage"
+    assert payload["source"] == "workspace_html"
+    assert payload["workspace_path"] == "index.html"
+    assert payload["browser_url"] == "file:///workspace/project/index.html"
+
+
+def test_live_payload_does_not_promote_fake_document_over_html(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Document Deliverable",
+            "goal": "Reject renamed fake office documents.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Document Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+        },
+    ).json()
+
+    workspace = Path(worker["workspace_dir"])
+    artifacts = workspace / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (workspace / "index.html").write_text("<!doctype html><h1>Supporting preview</h1>", encoding="utf-8")
+    (artifacts / "research-brief.docx").write_text("not a real Word package", encoding="utf-8")
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live")
+    assert live.status_code == 200
+    deliverable = live.json()["deliverable"]
+    assert deliverable["kind"] == "webpage"
+    assert deliverable["workspace_path"] == "index.html"
+    assert deliverable["source"] == "workspace_html"
+
+
 def test_live_payload_file_deliverable_includes_signed_open_and_download_links(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
 
@@ -3614,6 +3787,118 @@ def test_live_payload_artifact_inventory_includes_multiple_signed_files(tmp_path
     assert downloaded.text == "FIRST_OK"
 
 
+def test_artifact_surfaces_reject_browser_runtime_scratch_paths(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Scratch Artifact Filtering",
+            "goal": "Expose user deliverables without exposing browser profile state.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Scratch Filter Worker",
+            "role": "writer",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+            "execution_mode": "host",
+        },
+    ).json()
+
+    workspace = Path(worker["workspace_dir"])
+    workspace.mkdir(parents=True, exist_ok=True)
+    deliverable = workspace / "artifacts" / "result.csv"
+    deliverable.parent.mkdir(parents=True, exist_ok=True)
+    deliverable.write_text("name,status\nsynthetic,ok\n", encoding="utf-8")
+    script = workspace / "scripts" / "helper.js"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("console.log('not the deliverable');\n", encoding="utf-8")
+    os.utime(script, (9999999999, 9999999999))
+
+    extension_index = (
+        workspace
+        / "tmp"
+        / "chrome-user-data"
+        / "Default"
+        / "Default"
+        / "Extensions"
+        / "fdpohaocaechififmbbbbbknoalclacl"
+        / "8.6_0"
+        / "capture"
+        / "index.html"
+    )
+    extension_index.parent.mkdir(parents=True, exist_ok=True)
+    extension_index.write_text("<!doctype html><title>Capture (redir)</title>", encoding="utf-8")
+    copied_cookie_store = workspace / "tmp" / "chrome-default-cookies.sqlite"
+    copied_cookie_store.write_bytes(b"synthetic cookie db")
+    persistent_extension = (
+        workspace
+        / ".config"
+        / "chromium"
+        / "Default"
+        / "Extensions"
+        / "fcoeoabgfenejglbffodgkkbkcdhcgfn"
+        / "1.0_0"
+        / "manifest.json"
+    )
+    persistent_extension.parent.mkdir(parents=True, exist_ok=True)
+    persistent_extension.write_text("{}", encoding="utf-8")
+    upload_metadata = workspace / "uploads" / "source.txt.metadata.json"
+    upload_metadata.parent.mkdir(parents=True, exist_ok=True)
+    upload_metadata.write_text("{}", encoding="utf-8")
+
+    assert not is_user_deliverable_relative_path(extension_index.relative_to(workspace))
+    assert not is_user_deliverable_relative_path(copied_cookie_store.relative_to(workspace))
+    assert not is_user_deliverable_relative_path(persistent_extension.relative_to(workspace))
+    assert not is_user_deliverable_relative_path(upload_metadata.relative_to(workspace))
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live")
+    assert live.status_code == 200
+    payload = live.json()
+    assert payload["deliverable"]["kind"] == "file"
+    assert payload["deliverable"]["workspace_path"] == "artifacts/result.csv"
+
+    listed = client.get(f"/v1/workers/{worker['worker_id']}/artifacts")
+    assert listed.status_code == 200
+    listed_paths = {item["path"] for item in listed.json()["items"]}
+    assert "artifacts/result.csv" in listed_paths
+    assert "scripts/helper.js" in listed_paths
+    assert extension_index.relative_to(workspace).as_posix() not in listed_paths
+    assert copied_cookie_store.relative_to(workspace).as_posix() not in listed_paths
+    assert persistent_extension.relative_to(workspace).as_posix() not in listed_paths
+    assert upload_metadata.relative_to(workspace).as_posix() not in listed_paths
+
+    opened = client.get(
+        f"/v1/workers/{worker['worker_id']}/artifacts/open",
+        params={"path": extension_index.relative_to(workspace).as_posix()},
+    )
+    assert opened.status_code == 400
+    assert opened.json()["detail"] == "Artifact path is not downloadable"
+
+    downloaded = client.get(
+        f"/v1/workers/{worker['worker_id']}/artifacts/download",
+        params={"path": copied_cookie_store.relative_to(workspace).as_posix()},
+    )
+    assert downloaded.status_code == 400
+    assert downloaded.json()["detail"] == "Artifact path is not downloadable"
+
+    persistent_download = client.get(
+        f"/v1/workers/{worker['worker_id']}/artifacts/download",
+        params={"path": persistent_extension.relative_to(workspace).as_posix()},
+    )
+    assert persistent_download.status_code == 400
+    assert persistent_download.json()["detail"] == "Artifact path is not downloadable"
+
+
 def test_deliverable_detection_ignores_provider_api_endpoints(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -3623,12 +3908,9 @@ def test_deliverable_detection_ignores_provider_api_endpoints(tmp_path):
         "workspace_dir": str(workspace),
         "execution_mode": "docker",
     }
-    output = (
-        "Using https://pai-aaf.cognitiveservices.azure.com/openai/v1 for the model.\n"
-        "FINAL REPORT: wrote the marker file."
-    )
+    output = "Using https://example-ai.openai.azure.com/openai/v1 for the model.\nFINAL REPORT: wrote the marker file."
 
-    assert not is_deliverable_url("https://pai-aaf.cognitiveservices.azure.com/openai/v1")
+    assert not is_deliverable_url("https://example-ai.openai.azure.com/openai/v1")
     assert not is_deliverable_url("https://[REDACTED_CREDENTIAL]/openai/v1")
     payload = deliverable_payload(worker, {"state": "completed"}, output)
 
@@ -4366,6 +4648,18 @@ class RuntimeErrorWithPartialArtifactsRuntime(StubRuntime):
         }
 
 
+class BlockingLiveStateRuntime(RuntimeErrorWithPartialArtifactsRuntime):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.started = Event()
+        self.release = Event()
+
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        self.started.set()
+        assert self.release.wait(timeout=3)
+        return "Completed after live-state inspection"
+
+
 class RuntimeErrorWithDeliverableArtifactRuntime(RuntimeErrorWithPartialArtifactsRuntime):
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
         _, workspace_dir = self._worker_paths(worker["worker_id"])
@@ -4409,6 +4703,45 @@ class RuntimeIoFailureWithDeliverableArtifactRuntime(RuntimeErrorWithDeliverable
             "failure_recommended_recovery": "Use workspace_continue to resume from the same workspace.",
             "failure_diagnostic_summary": "write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true",
         }
+
+
+def test_running_worker_exposes_runtime_paths_before_task_finishes(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    runtime = BlockingLiveStateRuntime(tmp_path / "workers")
+    service = WorkersProjectsService(store, runtime)
+    try:
+        project = service.create_project("demo-owner", "Live state", "Expose workspace while running.", "codex-cli")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="demo-owner",
+            name="Codex Worker",
+            role="research",
+            profile="codex-cli",
+            backend="openclaw",
+        )
+
+        run = service.assign_run(worker["worker_id"], "do live work")
+        assert runtime.started.wait(timeout=2)
+
+        live_worker = store.get_worker(worker["worker_id"])
+        live_run = store.get_run(run["run_id"])
+
+        assert live_worker is not None
+        assert live_run is not None
+        assert live_worker["state"] == "running"
+        assert live_run["state"] == "running"
+        assert live_worker["workspace_dir"].endswith(f"{worker['worker_id']}/state/workspace")
+        assert live_worker["state_dir"].endswith(f"{worker['worker_id']}/state")
+        assert live_worker["runtime"] == "codex-cli"
+        assert live_worker["pid"] == 4242
+
+        runtime.release.set()
+        wait_until(lambda: (store.get_run(run["run_id"]) or {}).get("state") == "completed")
+        assert store.get_run(run["run_id"])["output_text"] == "Completed after live-state inspection"
+    finally:
+        runtime.release.set()
+        service.shutdown()
 
 
 def test_runtime_error_recovers_codex_failure_metadata_and_artifacts(tmp_path, monkeypatch):

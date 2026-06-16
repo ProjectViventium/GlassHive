@@ -407,6 +407,12 @@ def _apply_effort_to_bundle(bundle: dict[str, Any], *, profile: str, effort: str
     if profile == "claude-code":
         if clean_effort not in {"default", "max"}:
             raise ValueError("Claude effort must be default or max")
+        if clean_effort == "default":
+            return next_bundle
+        env = dict(next_bundle.get("env") or {})
+        env["WPR_CLAUDE_CODE_EFFORT"] = clean_effort
+        next_bundle["env"] = env
+        return next_bundle
     elif profile == "openclaw-general":
         if clean_effort not in {"default", "high", "max"}:
             raise ValueError("OpenClaw effort must be default, high, or max")
@@ -2375,7 +2381,12 @@ def create_mcp_server(
             raise ValueError("GlassHive worker create/resume did not return worker_id")
 
         try:
-            run = client.assign_run(worker_id, worker_instruction)
+            run = client.assign_run(
+                worker_id,
+                worker_instruction,
+                effort=resolved_effort,
+                bootstrap_bundle=bundle,
+            )
         except GlassHiveBlockedError as exc:
             return _blocked_dispatch_result(
                 exc.payload,
@@ -2810,6 +2821,7 @@ def create_mcp_server(
             run_at=run_at,
             schedule_text=schedule_text,
             delay_seconds=delay_seconds,
+            bootstrap_bundle=bundle,
         )
         result: dict[str, Any] = {
             "status": "scheduled",

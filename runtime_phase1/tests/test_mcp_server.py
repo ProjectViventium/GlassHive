@@ -164,7 +164,19 @@ class FakeApiClient:
                     "name": "config.toml",
                     "size": 64,
                     "download_url": f"/v1/workers/{worker_id}/artifacts/download?path=.codex/config.toml",
-                }
+                },
+                {
+                    "path": "tmp/chrome-user-data/Default/Default/Extensions/fdpohaocaechififmbbbbbknoalclacl/8.6_0/capture/index.html",
+                    "name": "index.html",
+                    "size": 197,
+                    "download_url": f"/v1/workers/{worker_id}/artifacts/download?path=tmp/chrome-user-data/Default/Default/Extensions/fdpohaocaechififmbbbbbknoalclacl/8.6_0/capture/index.html",
+                },
+                {
+                    "path": "uploads/source.txt.metadata.json",
+                    "name": "source.txt.metadata.json",
+                    "size": 32,
+                    "download_url": f"/v1/workers/{worker_id}/artifacts/download?path=uploads/source.txt.metadata.json",
+                },
             ]
         }
 
@@ -275,9 +287,7 @@ class PreferenceApiClient(TrackingApiClient):
     def __init__(self):
         super().__init__()
         self.preference_payloads: list[dict] = []
-
-    def get_preferences(self):
-        return {
+        self.preferences: dict = {
             "tenant_id": "local",
             "owner_id": "demo-owner",
             "default_worker_profile": "codex-cli",
@@ -287,9 +297,13 @@ class PreferenceApiClient(TrackingApiClient):
             "updated_at": "2026-05-24T00:00:00+00:00",
         }
 
+    def get_preferences(self):
+        return dict(self.preferences)
+
     def update_preferences(self, payload: dict):
         self.preference_payloads.append(payload)
-        return {**self.get_preferences(), **payload}
+        self.preferences = {**self.preferences, **payload}
+        return dict(self.preferences)
 
 
 class PollingApiClient(FakeApiClient):
@@ -342,8 +356,20 @@ class RememberedDispatchApiClient(TrackingApiClient):
         self.workers[payload["worker_id"]] = payload
         return payload
 
-    def assign_run(self, worker_id: str, instruction: str, *, effort: str | None = None):
-        payload = super().assign_run(worker_id, instruction, effort=effort)
+    def assign_run(
+        self,
+        worker_id: str,
+        instruction: str,
+        *,
+        effort: str | None = None,
+        bootstrap_bundle: dict | None = None,
+    ):
+        payload = super().assign_run(
+            worker_id,
+            instruction,
+            effort=effort,
+            bootstrap_bundle=bootstrap_bundle,
+        )
         payload.update(
             {
                 "tenant_id": self.tenant_id,
@@ -429,8 +455,22 @@ class RetryableFailureApiClient(FakeApiClient):
             "project_runs": [],
         }
 
-    def assign_run(self, worker_id: str, instruction: str, *, effort: str | None = None):
-        self.assigned.append({"worker_id": worker_id, "instruction": instruction, "effort": effort or ""})
+    def assign_run(
+        self,
+        worker_id: str,
+        instruction: str,
+        *,
+        effort: str | None = None,
+        bootstrap_bundle: dict | None = None,
+    ):
+        self.assigned.append(
+            {
+                "worker_id": worker_id,
+                "instruction": instruction,
+                "effort": effort or "",
+                "bootstrap_bundle": bootstrap_bundle,
+            }
+        )
         return {
             "run_id": "run_continued",
             "worker_id": worker_id,
@@ -439,6 +479,7 @@ class RetryableFailureApiClient(FakeApiClient):
             "state": "queued",
             "instruction": instruction,
             "effort": effort or "",
+            "bootstrap_bundle": bootstrap_bundle,
         }
 
 
@@ -476,8 +517,20 @@ class EnterpriseRetryableFailureApiClient(RetryableFailureApiClient):
         )
         return payload
 
-    def assign_run(self, worker_id: str, instruction: str, *, effort: str | None = None):
-        payload = super().assign_run(worker_id, instruction, effort=effort)
+    def assign_run(
+        self,
+        worker_id: str,
+        instruction: str,
+        *,
+        effort: str | None = None,
+        bootstrap_bundle: dict | None = None,
+    ):
+        payload = super().assign_run(
+            worker_id,
+            instruction,
+            effort=effort,
+            bootstrap_bundle=bootstrap_bundle,
+        )
         payload["tenant_id"] = self.new_run_tenant_id
         return payload
 
@@ -1001,6 +1054,8 @@ def test_workspace_artifacts_returns_signed_download_links(monkeypatch):
             assert payload["status"] == "ok"
             assert payload["items"][0]["path"] == "index.html"
             assert all(item["path"] != ".codex/config.toml" for item in payload["items"])
+            assert all(not item["path"].startswith("tmp/chrome-user-data/") for item in payload["items"])
+            assert all(not item["path"].startswith("uploads/") for item in payload["items"])
             assert payload["items"][0]["signed_open_url"].startswith(
                 "https://glasshive.example.test/v1/signed-links/"
             )
@@ -1062,6 +1117,42 @@ def test_workspace_launch_uses_saved_profile_and_effort_preferences(monkeypatch)
             assert payload["effort"] == "xhigh"
             bundle = api.find_or_resume_payloads[-1]["bootstrap_bundle"]
             assert bundle["env"]["WPR_CODEX_CLI_REASONING_EFFORT"] == "xhigh"
+            assigned = api.assign_run_payloads[-1]
+            assert assigned["effort"] == "xhigh"
+            assert assigned["bootstrap_bundle"]["env"]["WPR_CODEX_CLI_REASONING_EFFORT"] == "xhigh"
+
+    asyncio.run(scenario())
+
+
+def test_workspace_launch_projects_saved_claude_max_effort(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,claude-code")
+    api = PreferenceApiClient()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            saved = await client.call_tool(
+                "workspace_preferences_set",
+                {"default_worker_profile": "claude-code", "claude_effort": "max"},
+            )
+            assert _tool_json(saved)["default_worker_profile"] == "claude-code"
+
+            launched = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Create a synthetic Claude QA marker",
+                    "success_criteria": "Marker exists",
+                    "expose_diagnostics": True,
+                },
+            )
+            payload = _tool_json(launched)
+            assert payload["profile"] == "claude-code"
+            assert payload["effort"] == "max"
+            bundle = api.find_or_resume_payloads[-1]["bootstrap_bundle"]
+            assert bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == "max"
+            assigned = api.assign_run_payloads[-1]
+            assert assigned["effort"] == "max"
+            assert assigned["bootstrap_bundle"]["env"]["WPR_CLAUDE_CODE_EFFORT"] == "max"
 
     asyncio.run(scenario())
 
@@ -1073,7 +1164,14 @@ def test_workspace_artifact_download_rejects_traversal_before_signing(monkeypatc
 
     async def scenario():
         async with Client(server) as client:
-            for path in ("../runtime_phase1.db", "/etc/passwd", "outputs/../secret.txt", "outputs\\.git/config"):
+            for path in (
+                "../runtime_phase1.db",
+                "/etc/passwd",
+                "outputs/../secret.txt",
+                "outputs\\.git/config",
+                "tmp/chrome-user-data/Default/Default/Extensions/fdpohaocaechififmbbbbbknoalclacl/8.6_0/capture/index.html",
+                "uploads/source.txt.metadata.json",
+            ):
                 with pytest.raises(ToolError):
                     await client.call_tool(
                         "workspace_artifact_download",
@@ -4097,6 +4195,55 @@ def test_runtime_env_loads_host_cli_binary_paths(monkeypatch, tmp_path):
     assert loaded["WPR_CODEX_BIN"] == str(tmp_path / "codex")
     assert os.environ["WPR_CLAUDE_CODE_BIN"] == str(tmp_path / "claude")
     assert os.environ["WPR_OPENCLAW_BIN"] == str(tmp_path / "openclaw")
+
+
+def test_runtime_env_loads_host_worker_native_capability_knobs(monkeypatch, tmp_path):
+    runtime_file = tmp_path / "runtime.env"
+    runtime_file.write_text(
+        "\n".join(
+            [
+                'GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON={"claude-code":{"required_help_flags":["--chrome"]}}',
+                "WPR_HOST_RUNTIME_REQUIREMENTS_FILE=glasshive-requirements.json",
+                "GLASSHIVE_HOST_CODEX_NATIVE_MCP_ALLOWLIST=computer-use,node_repl",
+                "WPR_HOST_CODEX_NATIVE_MCP_ALLOWLIST=computer-use,node_repl",
+                "GLASSHIVE_HOST_CODEX_PLUGIN_CACHE=codex-plugin-cache",
+                "WPR_HOST_CODEX_PLUGIN_CACHE=codex-plugin-cache",
+                "WPR_CODEX_CLI_IGNORE_USER_CONFIG=false",
+                "WPR_CODEX_CLI_DISABLE_FEATURES=image_generation",
+                "WPR_CODEX_CLI_PROVIDER_NAME=GlassHive Test Provider",
+                "WPR_CODEX_CLI_DISABLE_CUSTOM_PROVIDER=false",
+                "WPR_CLAUDE_CODE_ENABLE_CHROME=true",
+                "WPR_CLAUDE_CODE_EFFORT=max",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    keys = {
+        "GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON",
+        "WPR_HOST_RUNTIME_REQUIREMENTS_FILE",
+        "GLASSHIVE_HOST_CODEX_NATIVE_MCP_ALLOWLIST",
+        "WPR_HOST_CODEX_NATIVE_MCP_ALLOWLIST",
+        "GLASSHIVE_HOST_CODEX_PLUGIN_CACHE",
+        "WPR_HOST_CODEX_PLUGIN_CACHE",
+        "WPR_CODEX_CLI_IGNORE_USER_CONFIG",
+        "WPR_CODEX_CLI_DISABLE_FEATURES",
+        "WPR_CODEX_CLI_PROVIDER_NAME",
+        "WPR_CODEX_CLI_DISABLE_CUSTOM_PROVIDER",
+        "WPR_CLAUDE_CODE_ENABLE_CHROME",
+        "WPR_CLAUDE_CODE_EFFORT",
+    }
+    monkeypatch.setenv("VIVENTIUM_ENV_FILE", str(runtime_file))
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+
+    loaded = runtime_env.load_viventium_runtime_env()
+
+    for key in keys:
+        assert key in loaded
+        assert os.environ[key] == loaded[key]
+    assert os.environ["WPR_CLAUDE_CODE_EFFORT"] == "max"
+    assert "computer-use" in os.environ["GLASSHIVE_HOST_CODEX_NATIVE_MCP_ALLOWLIST"]
 
 
 def test_merge_request_context_projects_extracted_upload_text(monkeypatch):

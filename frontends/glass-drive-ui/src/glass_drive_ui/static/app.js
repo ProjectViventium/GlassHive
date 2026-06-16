@@ -512,17 +512,27 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   meta.textContent = `${workspaceProfileLabel(workspace.profile)} · ${displayStateLabel(state)}`;
   body.appendChild(meta);
 
-  const report = document.createElement('section');
-  report.className = 'workspace-status-report';
-  report.setAttribute('aria-label', 'Latest workspace output');
+  const report = document.createElement('button');
+  report.type = 'button';
+  report.className = 'workspace-status-report workspace-status-button';
+  report.setAttribute('aria-label', `Open latest workspace output for ${workspaceTileTitle(workspace)}`);
+  report.addEventListener('click', () => {
+    window.location.href = String(workspace.watch_url || '#');
+  });
+  const reportHead = document.createElement('span');
+  reportHead.className = 'workspace-report-head';
   const reportLabel = document.createElement('span');
   reportLabel.className = 'workspace-report-label';
   reportLabel.textContent = 'Latest workspace output';
-  const liveOutput = document.createElement('p');
+  const reportAction = document.createElement('span');
+  reportAction.className = 'workspace-report-action';
+  reportAction.textContent = 'Open status';
+  reportHead.append(reportLabel, reportAction);
+  const liveOutput = document.createElement('span');
   liveOutput.className = 'workspace-live-output';
   liveOutput.dataset.workerOutput = 'true';
   liveOutput.textContent = 'Loading workspace status...';
-  report.append(reportLabel, liveOutput);
+  report.append(reportHead, liveOutput);
   body.appendChild(report);
 
   const actions = document.createElement('div');

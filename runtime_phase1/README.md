@@ -39,6 +39,9 @@ Current behavior:
 - existing host-projection defaults remain backward-compatible
 - Glass Hive writes a non-secret bootstrap manifest inside the sandbox for inspection
 - bundle environment is available to sandboxed runs and interactive shells
+- broker/client config is additive over native worker capability: Codex/Claude host and workstation
+  launches must not drop browser, computer/desktop, shell, file, or MCP capabilities just because
+  GlassHive projected a broker MCP
 
 ## Run
 

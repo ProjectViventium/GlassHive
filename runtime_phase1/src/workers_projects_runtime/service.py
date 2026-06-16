@@ -40,7 +40,7 @@ FINAL_REPORT_PATTERN = re.compile(r"(?m)^[ \t]*FINAL REPORT:\s*")
 VIVENTIUM_CALLBACK_PATH = "/api/viventium/glasshive/callback"
 ACTIONABLE_CALLBACK_LINK_EVENTS = {"run.failed", "run.paused", "run.interrupted", "run.cancelled"}
 PARENT_VISIBLE_CALLBACK_FIELDS = ("user_id", "conversation_id", "parent_message_id", "message_id")
-CALLBACK_DEAD_LETTER_IMMEDIATE_STATUS_CODES = {400, 404, 410, 422, 501}
+CALLBACK_DEAD_LETTER_IMMEDIATE_STATUS_CODES = {400, 401, 403, 404, 410, 422, 501}
 CALLBACK_RETRYABLE_STATUS_CODES = {408, 425, 429}
 RUN_STATE_BY_EVENT = {
     "run.queued": "queued",
@@ -180,6 +180,14 @@ def public_callback_message_text(message: str) -> str:
         text,
     )
     return text.strip()
+
+
+def runtime_failure_callback_message(failure_fields: dict[str, object], fallback: str) -> str:
+    message = str(failure_fields.get("failure_user_message") or "").strip() or str(fallback or "Run failed")
+    diagnostic = str(failure_fields.get("failure_diagnostic_summary") or "").strip()
+    if diagnostic and diagnostic not in message:
+        return f"{message}\n\nDetails: {diagnostic}"
+    return message
 
 
 def _is_viventium_callback_url(url: str) -> bool:
@@ -2005,7 +2013,7 @@ class WorkersProjectsService:
             self.store.finalize_schedule_for_run(run["run_id"], state="failed", last_error=error_text)
             self.store.update_worker(worker_id, state="ready", last_error=error_text, last_run_id=run["run_id"])
             self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.failed", error_text or "Run failed")
-            failure_message = str(failure_fields.get("failure_user_message") or "").strip() or error_text or "Run failed"
+            failure_message = runtime_failure_callback_message(failure_fields, error_text or "Run failed")
             self._emit_callback(
                 refreshed_worker,
                 "run.failed",
@@ -2192,7 +2200,7 @@ class WorkersProjectsService:
                     return
 
                 worker = self.store.get_worker(worker_id) or worker
-                self.store.update_worker_state(worker_id, "running", last_error="")
+                worker = self._refresh_runtime_info(worker_id, state="running", last_error="") or self.store.get_worker(worker_id) or worker
                 self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.started", run["instruction"])
                 self._emit_callback(worker, "run.started", run=run, message=run["instruction"])
 
@@ -2293,7 +2301,7 @@ class WorkersProjectsService:
                         if final_state == "failed"
                         else None
                     )
-                    failure_message = str(failure_fields.get("failure_user_message") or "").strip() or str(exc)
+                    failure_message = runtime_failure_callback_message(failure_fields, str(exc))
                     self._emit_callback(
                         callback_worker,
                         f"run.{final_state}",
@@ -2307,11 +2315,17 @@ class WorkersProjectsService:
                 except Exception as exc:
                     if not self._processor_is_current(worker_id, generation):
                         return
-                    self.store.finalize_run(run["run_id"], state="failed", error_text=str(exc))
+                    failure_fields = classify_runtime_error(
+                        exc,
+                        runtime_name=str(worker.get("profile") or worker.get("runtime") or "worker"),
+                    ).as_store_fields()
+                    self.store.finalize_run(run["run_id"], state="failed", error_text=str(exc), **failure_fields)
                     self.store.finalize_schedule_for_run(run["run_id"], state="failed", last_error=str(exc))
                     self.store.update_worker_state(worker_id, "ready", last_error=str(exc))
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.failed", str(exc))
-                    self._emit_callback(worker, "run.failed", run={**run, "state": "failed", "error_text": str(exc)}, message=str(exc))
+                    failed_run = {**run, "state": "failed", "error_text": str(exc), **failure_fields}
+                    failure_message = runtime_failure_callback_message(failure_fields, str(exc))
+                    self._emit_callback(worker, "run.failed", run=failed_run, message=failure_message)
                     continue
 
                 if not self._processor_is_current(worker_id, generation):

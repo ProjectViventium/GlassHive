@@ -738,6 +738,9 @@ def test_launcher_workspace_hive_static_controls():
     assert "dataset.watchVisible !== 'false'" in app_js
     assert "dataset.watchVisible === 'true' || tile.dataset.statusVisible === 'true'" in app_js
     assert "Full watch" in app_js
+    assert "workspace-status-button" in app_js
+    assert "Open latest workspace output" in app_js
+    assert "Open status" in app_js
     assert "Status Report" in index_html
     assert "Inactive Workspaces" in index_html
     assert "glasshive:duplicate-workspace" in app_js
@@ -774,6 +777,11 @@ def test_launcher_workspace_hive_static_controls():
     assert ".artifact-row" in styles_css
     assert "artifact-list-more" in watch_js
     assert ".artifact-list-more" in styles_css
+    assert 'aria-controls="result-panel"' in watch_html
+    assert "result-toggle-action" in watch_html
+    assert "Close latest workspace output status" in watch_js
+    assert ".result-toggle-action" in styles_css
+    assert ".workspace-status-button" in styles_css
     assert "Open delivered file in new tab" in watch_js
     assert "setInterval(refresh" not in watch_js
     assert "Workspace paused" not in watch_js

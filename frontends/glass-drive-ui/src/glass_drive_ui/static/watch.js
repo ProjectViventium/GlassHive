@@ -31,6 +31,7 @@ const statePill = document.getElementById('watch-state');
 const menu = document.getElementById('more-menu');
 const menuToggle = document.getElementById('menu-toggle');
 const resultToggle = document.getElementById('result-toggle');
+const resultToggleAction = document.getElementById('result-toggle-action');
 const resultPanel = document.getElementById('result-panel');
 const resultPanelTitle = document.getElementById('result-panel-title');
 const resultClose = document.getElementById('result-close');
@@ -122,12 +123,16 @@ function closeMenu() {
 function closeResultPanel() {
   resultPanel.hidden = true;
   resultToggle.setAttribute('aria-expanded', 'false');
+  resultToggle.setAttribute('aria-label', 'Open latest workspace output status');
+  if (resultToggleAction) resultToggleAction.textContent = 'Open status';
 }
 
 function openResultPanel() {
   if (!currentFullOutput.trim()) return;
   resultPanel.hidden = false;
   resultToggle.setAttribute('aria-expanded', 'true');
+  resultToggle.setAttribute('aria-label', 'Close latest workspace output status');
+  if (resultToggleAction) resultToggleAction.textContent = 'Close status';
 }
 
 function forceReloadFrame(url) {

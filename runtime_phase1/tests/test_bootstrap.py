@@ -42,7 +42,15 @@ def test_bootstrap_materializes_canonical_worker_operating_contract(tmp_path):
     assert GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS in agents_text
     assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in agents_text
     assert "FINAL REPORT:" in agents_text
+    assert "polished ordinary end-user artifact" in agents_text
     assert "Do not force a download" in agents_text
+    assert "Native capability inventory" in agents_text
+    assert "Claude Code's native browser/computer-use" in agents_text
+    assert "Codex's native browser/computer-use" in agents_text
+    assert "documents, PDFs, spreadsheets, slide decks" in agents_text
+    assert "NVIDIA AI-Q" not in agents_text
+    assert "daymade" not in agents_text
+    assert "Use these capabilities when relevant" in agents_text
 
 
 def test_enterprise_bootstrap_filters_worker_env_and_projects_provider_env(monkeypatch):
@@ -91,7 +99,7 @@ def test_enterprise_worker_env_allowlist_rejects_user_provider_tokens(monkeypatc
         bootstrap_env_for(worker)
 
 
-def test_local_bootstrap_env_behavior_stays_unfiltered_by_default(monkeypatch):
+def test_local_bootstrap_env_filters_user_provider_tokens_without_blocking_provider_keys(monkeypatch):
     monkeypatch.delenv("GLASSHIVE_ENTERPRISE_MODE", raising=False)
     monkeypatch.delenv("WPR_ENTERPRISE_MODE", raising=False)
     monkeypatch.delenv("GLASSHIVE_PROJECT_PROVIDER_ENV", raising=False)
@@ -103,6 +111,9 @@ def test_local_bootstrap_env_behavior_stays_unfiltered_by_default(monkeypatch):
                 "env": {
                     "OPENAI_API_KEY": "bundle-openai",
                     "PRIVATE_INTERNAL_TOKEN": "local-mode-keeps-existing-behavior",
+                    "GOOGLE_REFRESH_TOKEN": "must-not-project",
+                    "GOOGLE_OAUTH_CLIENT_SECRET": "must-not-project",
+                    "MS365_ACCESS_TOKEN": "must-not-project",
                 }
             }
         )
@@ -112,6 +123,9 @@ def test_local_bootstrap_env_behavior_stays_unfiltered_by_default(monkeypatch):
 
     assert env["OPENAI_API_KEY"] == "bundle-openai"
     assert env["PRIVATE_INTERNAL_TOKEN"] == "local-mode-keeps-existing-behavior"
+    assert "GOOGLE_REFRESH_TOKEN" not in env
+    assert "GOOGLE_OAUTH_CLIENT_SECRET" not in env
+    assert "MS365_ACCESS_TOKEN" not in env
 
 
 def test_enterprise_bootstrap_does_not_copy_host_auth_or_identity_files(tmp_path, monkeypatch):

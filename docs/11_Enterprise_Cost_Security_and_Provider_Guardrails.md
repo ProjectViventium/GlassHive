@@ -73,9 +73,11 @@ providers with environment variables. Common defaults:
 - `WPR_CODEX_CLI_BASE_URL=<openai-compatible-base-url>`
 - `WPR_CODEX_CLI_ENV_KEY=<env-var-name-for-key>`
 - `WPR_CODEX_CLI_WIRE_API=responses`
-- `WPR_CODEX_CLI_REASONING_EFFORT=medium`
+- `WPR_CODEX_CLI_REASONING_EFFORT=high` after the active route is proven for high; use `medium`
+  only when the provider route or workload QA requires it.
 - `WPR_MODEL_CLAUDE_CODE=<claude-model>`
 - `WPR_CLAUDE_CODE_USE_API_KEY=1`
+- `WPR_CLAUDE_CODE_ENABLE_CHROME=1` unless this deployment is explicitly locked down
 - `WPR_MODEL_OPENCLAW_GENERAL=<model-or-route>`
 - `WPR_OPENCLAW_BASE_URL=<openai-compatible-or-portkey-base-url>`
 - `WPR_OPENCLAW_ENV_KEY=<env-var-name-for-key>`
@@ -88,12 +90,23 @@ instead, repair or reroute Codex, prove it live, and keep unsupported profiles o
 until their own worker matrix passes.
 
 Codex supports global default reasoning through `WPR_CODEX_CLI_REASONING_EFFORT` with values
-`minimal`, `low`, `medium`, `high`, or `xhigh`. Claude Code effort is selected primarily by model
-and provider configuration. GlassHive also stores per-user defaults for default worker profile and
-per-profile effort. The UI and MCP expose this through authenticated preferences, so a user can make
-Codex, OpenClaw, or any other profile present in `GLASSHIVE_ALLOWED_WORKER_PROFILES` the default
-without affecting other users. Per-run effort overrides must stay allowlisted by runtime profile:
-Codex accepts `minimal`/`low`/`medium`/`high`/`xhigh`; Claude Code currently accepts `default` or
+`none`, `minimal`, `low`, `medium`, `high`, or `xhigh`, subject to the active provider route's tested
+allowlist. Enterprise deep-work deployments should prove and use `high` by default for Codex; `xhigh`
+is reserved for explicitly hard work once direct route probes and real worker runs prove it.
+Claude Code effort is selected by model/provider configuration plus the native `--effort max` flag
+when a run asks for `max`. GlassHive must project that through `WPR_CLAUDE_CODE_EFFORT=max` in the
+worker bootstrap env for MCP, UI, and direct API assignments, the generated worker command must show
+`--effort max`, and host-native preflight/command generation must fail closed if the configured
+Claude CLI does not expose `--effort`. Claude Code workers should also preserve native
+Chrome/browser substrate with `--chrome` by default when the CLI supports it.
+Codex feature lockdown is opt-in only: `WPR_CODEX_CLI_DISABLE_FEATURES` must be unset by default so
+native app, multi-agent, plugin, browser/computer, workspace-dependency, and adjacent capability
+surfaces remain available unless an operator intentionally locks them down with QA evidence.
+GlassHive also stores per-user defaults for default worker profile and per-profile effort. The UI and MCP expose this
+through authenticated preferences, so a user can make Codex, OpenClaw, or any other profile present
+in `GLASSHIVE_ALLOWED_WORKER_PROFILES` the default without affecting other users. Per-run effort
+overrides must stay allowlisted by runtime profile:
+Codex accepts `none`/`minimal`/`low`/`medium`/`high`/`xhigh`; Claude Code currently accepts `default` or
 `max`; OpenClaw currently accepts `default`, `high`, or `max`.
 
 Portkey can be used in more than one shape, and each shape must be validated separately:

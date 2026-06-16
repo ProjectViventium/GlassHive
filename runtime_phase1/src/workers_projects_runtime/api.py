@@ -422,6 +422,7 @@ def create_app(
                 raise HTTPException(status_code=400, detail="Claude effort must be default or max")
             if effort == "default":
                 return None
+            return {"env": {"WPR_CLAUDE_CODE_EFFORT": effort}}
         elif profile == "openclaw-general":
             if effort not in {"default", "high", "max"}:
                 raise HTTPException(status_code=400, detail="OpenClaw effort must be default, high, or max")
