@@ -936,6 +936,8 @@ class BaseCliWorkerRuntime:
             "sandbox_state": sandbox["state"],
             "sandbox_image": sandbox["image"],
             "view_url": sandbox.get("view_url"),
+            "view_available": bool(sandbox.get("view_available") or sandbox.get("view_url")),
+            "view_health": sandbox.get("view_health"),
             "novnc_port": sandbox.get("novnc_port"),
             "selenium_port": sandbox.get("selenium_port"),
             "openclaw_port": sandbox.get("openclaw_port"),

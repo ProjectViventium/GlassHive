@@ -9,7 +9,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
+from urllib.error import URLError
 from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
 
 from .bootstrap import apply_bootstrap
 
@@ -127,6 +129,7 @@ class SandboxInfo:
     novnc_port: int | None = None
     selenium_port: int | None = None
     openclaw_port: int | None = None
+    security_options: tuple[str, ...] = ()
 
 
 def _safe_docker_exec_env(env: dict[str, str] | None) -> dict[str, str]:
@@ -151,8 +154,17 @@ class DockerSandboxManager:
         self.user = os.environ.get("WPR_SANDBOX_USER", "seluser")
         self.home_mount = os.environ.get("WPR_SANDBOX_HOME", "/workspace/.wpr-home")
         self.workspace_mount = os.environ.get("WPR_SANDBOX_WORKSPACE", "/workspace/project")
+        self.service_tmp_dir = os.environ.get("WPR_SANDBOX_SERVICE_TMPDIR", "/tmp").strip() or "/tmp"
         self.term_value = os.environ.get("WPR_SANDBOX_TERM", "xterm-256color")
         self.display_value = os.environ.get("WPR_SANDBOX_DISPLAY", ":99.0")
+        self.chromium_binary = (
+            os.environ.get("WPR_SANDBOX_CHROMIUM_BINARY", "/usr/bin/chromium-base").strip()
+            or "/usr/bin/chromium-base"
+        )
+        self.chromium_userns_security_opt = (
+            os.environ.get("WPR_SANDBOX_CHROMIUM_USERNS_SECURITY_OPT", "seccomp=unconfined").strip()
+            or "seccomp=unconfined"
+        )
         self.novnc_container_port = int(os.environ.get("WPR_SANDBOX_NOVNC_PORT", "7900"))
         self.selenium_container_port = int(os.environ.get("WPR_SANDBOX_SELENIUM_PORT", "4444"))
         self.openclaw_container_port = int(os.environ.get("WPR_SANDBOX_OPENCLAW_PORT", "18789"))
@@ -170,9 +182,14 @@ class DockerSandboxManager:
         self.image_build_timeout_sec = float(os.environ.get("WPR_DOCKER_IMAGE_BUILD_TIMEOUT_SEC", "900") or "900")
         self.image_check_ttl_sec = float(os.environ.get("WPR_DOCKER_IMAGE_CHECK_TTL_SEC", "300") or "300")
         self._image_checked_at: float = 0.0
+        self.novnc_health_timeout_sec = float(os.environ.get("WPR_SANDBOX_NOVNC_HEALTH_TIMEOUT_SEC", "1.5") or "1.5")
+        self.novnc_health_cache_ttl_sec = float(os.environ.get("WPR_SANDBOX_NOVNC_HEALTH_CACHE_TTL_SEC", "10") or "10")
+        self.novnc_self_heal = self._env_flag("WPR_SANDBOX_NOVNC_SELF_HEAL", True)
+        self._novnc_health_cache: dict[str, tuple[float, dict[str, object]]] = {}
 
     def _invalidate_inspect_cache(self, worker_id: str) -> None:
         self._inspect_cache.pop(worker_id, None)
+        self._novnc_health_cache.pop(worker_id, None)
 
     def _env_flag(self, name: str, default: bool) -> bool:
         raw = str(os.environ.get(name, "")).strip().lower()
@@ -196,6 +213,16 @@ class DockerSandboxManager:
         sandbox = self.inspect(worker["worker_id"])
         needs_idle_prime = False
         needs_path_repair = False
+        if (
+            sandbox is not None
+            and self._sandbox_needs_chromium_userns_recreate(sandbox)
+            and self._worker_state_allows_substrate_recreate(worker)
+        ):
+            self._docker(["rm", "-f", sandbox.container_name], check=False)
+            self._invalidate_inspect_cache(worker["worker_id"])
+            sandbox = None
+            needs_idle_prime = True
+            needs_path_repair = True
         if sandbox is None:
             fast_sandbox = self.fast_sandbox_from_worker(worker)
             if fast_sandbox is not None:
@@ -260,6 +287,7 @@ class DockerSandboxManager:
             return None
         entry = payload[0]
         state = entry.get("State") or {}
+        host_config = entry.get("HostConfig") or {}
         status = str(state.get("Status") or "unknown")
         if bool(state.get("Paused")):
             status = "paused"
@@ -276,6 +304,11 @@ class DockerSandboxManager:
             novnc_port=self._host_port_for(ports, self.novnc_container_port),
             selenium_port=self._host_port_for(ports, self.selenium_container_port),
             openclaw_port=self._host_port_for(ports, self.openclaw_container_port),
+            security_options=tuple(
+                str(option)
+                for option in (host_config.get("SecurityOpt") or [])
+                if option
+            ),
         )
         self._inspect_cache[worker_id] = (now, sandbox)
         return sandbox
@@ -577,6 +610,8 @@ class DockerSandboxManager:
     def describe(self, worker_id: str) -> dict[str, object]:
         sandbox = self.inspect(worker_id)
         paths = self._paths(worker_id)
+        view_health = self._desktop_view_health(worker_id, sandbox)
+        view_url = self._view_url_from_sandbox(sandbox) if view_health.get("healthy") else None
         return {
             "driver": "docker",
             "image": sandbox.image if sandbox else self.image,
@@ -589,7 +624,9 @@ class DockerSandboxManager:
             "novnc_port": sandbox.novnc_port if sandbox else None,
             "selenium_port": sandbox.selenium_port if sandbox else None,
             "openclaw_port": sandbox.openclaw_port if sandbox else None,
-            "view_url": self.view_url(worker_id),
+            "view_url": view_url,
+            "view_available": bool(view_url),
+            "view_health": view_health,
         }
 
     def view_url(self, worker_id: str) -> str | None:
@@ -609,6 +646,72 @@ class DockerSandboxManager:
             }
         )
         return f"http://127.0.0.1:{sandbox.novnc_port}/?{query}"
+
+    def _desktop_view_health(self, worker_id: str, sandbox: SandboxInfo | None) -> dict[str, object]:
+        if sandbox is None or sandbox.state != "running" or sandbox.novnc_port is None:
+            return {"healthy": False, "reason": "desktop_not_running"}
+        now = time.monotonic()
+        cached = self._novnc_health_cache.get(worker_id)
+        if cached and cached[0] > now:
+            return cached[1]
+        healthy = self._novnc_http_ready(sandbox.novnc_port)
+        repaired = False
+        if not healthy and self.novnc_self_heal:
+            repaired = self._repair_novnc_proxy(sandbox)
+            if repaired:
+                time.sleep(0.75)
+                healthy = self._novnc_http_ready(sandbox.novnc_port)
+        health = {
+            "healthy": healthy,
+            "repaired": repaired,
+            "reason": "ok" if healthy else "novnc_unhealthy",
+        }
+        self._novnc_health_cache[worker_id] = (now + self.novnc_health_cache_ttl_sec, health)
+        return health
+
+    def _novnc_http_ready(self, port: int) -> bool:
+        target = f"http://127.0.0.1:{port}/core/rfb.js"
+        request = Request(target, headers={"Cache-Control": "no-cache"})
+        try:
+            with urlopen(request, timeout=self.novnc_health_timeout_sec) as response:
+                return 200 <= int(response.status) < 300 and bool(response.read(1))
+        except (OSError, URLError, TimeoutError, ValueError):
+            return False
+
+    def _repair_novnc_proxy(self, sandbox: SandboxInfo) -> bool:
+        script = "\n".join(
+            [
+                "set +e",
+                "supervisorctl stop novnc >/dev/null 2>&1 || true",
+                f"listen_port={shlex.quote(str(self.novnc_container_port))}",
+                f"vnc_port={shlex.quote(os.environ.get('WPR_SANDBOX_VNC_PORT', '5900'))}",
+                "pids=$(ps -eo pid=,args= | awk -v listen=\"$listen_port\" '",
+                "  index($0, \"websockify\") && index($0, listen) { print $1; next }",
+                "  index($0, \"novnc_proxy\") && index($0, \"--listen \" listen) { print $1; next }",
+                "')",
+                "for pid in $pids; do [ \"$pid\" = \"$$\" ] || kill \"$pid\" >/dev/null 2>&1 || true; done",
+                "sleep 0.3",
+                "for pid in $pids; do [ \"$pid\" = \"$$\" ] || kill -KILL \"$pid\" >/dev/null 2>&1 || true; done",
+                f"mkdir -p {shlex.quote(self.service_tmp_dir)}",
+                (
+                    f"TMPDIR={shlex.quote(self.service_tmp_dir)} "
+                    "nohup /opt/bin/noVNC/utils/novnc_proxy "
+                    "--listen \"$listen_port\" --vnc \"localhost:${vnc_port}\" "
+                    ">/tmp/glasshive-novnc-repair.out 2>/tmp/glasshive-novnc-repair.err &"
+                ),
+            ]
+        )
+        result = self._docker_exec(
+            sandbox.container_name,
+            ["bash", "-c", script],
+            env={
+                "HOME": self.home_mount,
+                "TERM": self.term_value,
+            },
+            cwd=self.workspace_mount,
+            user="root",
+        )
+        return result.returncode == 0
 
     def _default_browser_url(self) -> str:
         html = (
@@ -635,6 +738,105 @@ class DockerSandboxManager:
 
     def _browser_config_dir(self) -> str:
         return f"{self.home_mount}/.config"
+
+    def _prepare_chromium_profile_script(self) -> str:
+        preferences_path = f"{self._browser_config_dir()}/chromium/Default/Preferences"
+        return "\n".join(
+            [
+                f"mkdir -p {shlex.quote(str(Path(preferences_path).parent))}",
+                "python3 - <<'PY'",
+                "import json",
+                "from pathlib import Path",
+                f"path = Path({preferences_path!r})",
+                "try:",
+                "    data = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}",
+                "except Exception:",
+                "    data = {}",
+                "if not isinstance(data, dict):",
+                "    data = {}",
+                "bookmark_bar = data.setdefault('bookmark_bar', {})",
+                "if isinstance(bookmark_bar, dict):",
+                "    bookmark_bar['show_on_all_tabs'] = False",
+                "browser = data.setdefault('browser', {})",
+                "if isinstance(browser, dict):",
+                "    browser['show_home_button'] = False",
+                "path.write_text(json.dumps(data, sort_keys=True, separators=(',', ':')), encoding='utf-8')",
+                "PY",
+            ]
+        )
+
+    def _chromium_launch_args(self, *, start_maximized: bool = False, new_window: bool = False, new_tab: bool = False) -> list[str]:
+        args = [
+            self.chromium_binary,
+            "--disable-dev-shm-usage",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+        ]
+        if start_maximized:
+            args.append("--start-maximized")
+        if new_window:
+            args.append("--new-window")
+        if new_tab:
+            args.append("--new-tab")
+        return args
+
+    def _chromium_launch_command(
+        self,
+        url: str,
+        *,
+        start_maximized: bool = False,
+        new_window: bool = False,
+        new_tab: bool = False,
+    ) -> list[str]:
+        return [
+            *self._chromium_launch_args(
+                start_maximized=start_maximized,
+                new_window=new_window,
+                new_tab=new_tab,
+            ),
+            url,
+        ]
+
+    def _chromium_launch_line(
+        self,
+        url: str,
+        *,
+        start_maximized: bool = False,
+        new_window: bool = False,
+        new_tab: bool = False,
+    ) -> str:
+        return shlex.join(
+            self._chromium_launch_command(
+                url,
+                start_maximized=start_maximized,
+                new_window=new_window,
+                new_tab=new_tab,
+            )
+        )
+
+    def _chromium_launch_script(
+        self,
+        url: str,
+        *,
+        start_maximized: bool = False,
+        new_window: bool = False,
+        new_tab: bool = False,
+        replace_shell: bool = True,
+    ) -> str:
+        launch = self._chromium_launch_line(
+            url,
+            start_maximized=start_maximized,
+            new_window=new_window,
+            new_tab=new_tab,
+        )
+        return "\n".join(
+            [
+                self._prepare_chromium_profile_script(),
+                f"{'exec ' if replace_shell else ''}{launch}",
+            ]
+        )
 
     def _default_writable_container_paths(self) -> list[str]:
         return [
@@ -664,6 +866,19 @@ class DockerSandboxManager:
         state = str((worker or {}).get("state") or "").strip().lower()
         return state in {"ready", "running", "failed", "cancelled", "interrupted"}
 
+    @staticmethod
+    def _worker_state_allows_substrate_recreate(worker: dict | None) -> bool:
+        state = str((worker or {}).get("state") or "").strip().lower()
+        return state in {"ready", "failed", "cancelled", "interrupted"}
+
+    def _sandbox_needs_chromium_userns_recreate(self, sandbox: SandboxInfo) -> bool:
+        if not self._env_flag("WPR_SANDBOX_ALLOW_CHROMIUM_USERNS", True):
+            return False
+        security_options = getattr(sandbox, "security_options", None)
+        if security_options is None:
+            return False
+        return self.chromium_userns_security_opt not in security_options
+
     def fast_sandbox_from_worker(self, worker: dict | None) -> SandboxInfo | None:
         if not worker or not self._worker_state_allows_fast_exec(worker):
             return None
@@ -676,7 +891,14 @@ class DockerSandboxManager:
         # real container evidence, then validate it through inspect/cache.
         if not str(worker.get("container_id") or "").strip():
             return None
-        return self.inspect(worker_id)
+        sandbox = self.inspect(worker_id)
+        if (
+            sandbox is not None
+            and self._sandbox_needs_chromium_userns_recreate(sandbox)
+            and self._worker_state_allows_substrate_recreate(worker)
+        ):
+            return None
+        return sandbox
 
     def paths(self, worker_id: str) -> dict[str, Path]:
         worker_root = self.runtime_root / "workers" / worker_id
@@ -773,7 +995,7 @@ class DockerSandboxManager:
                         "RUN if [ ! -x /usr/bin/locale-check ]; then printf '%s\\n' '#!/bin/sh' 'locale_value=${1:-C.UTF-8}' 'echo LANG=$locale_value' 'echo LC_ALL=$locale_value' > /usr/bin/locale-check && chmod +x /usr/bin/locale-check; fi",
                         "RUN mkdir -p /etc/apt/keyrings && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main' > /etc/apt/sources.list.d/nodesource.list",
                         "RUN apt-get update && apt-get install -y --no-install-recommends nodejs && node --version && npm --version && rm -rf /var/lib/apt/lists/*",
-                        f"RUN npm install -g {npm_worker_specs}",
+                        f"RUN npm install -g --cache /tmp/glasshive-npm-cache {npm_worker_specs} && npm cache clean --force --cache /tmp/glasshive-npm-cache && rm -rf /tmp/glasshive-npm-cache /root/.npm /home/seluser/.npm",
                         "RUN pip3 install --no-cache-dir selenium beautifulsoup4 markdown matplotlib openpyxl pdf2image pillow PyMuPDF PyPDF2 python-docx python-pptx reportlab xlsxwriter",
                         f"RUN mkdir -p {extension_policy_dirs} && {extension_policy_writes}",
                         f"RUN printf '%s\\n' {extension_check_script_lines} > /usr/local/bin/glasshive-browser-extension-check && chmod +x /usr/local/bin/glasshive-browser-extension-check && glasshive-browser-extension-check",
@@ -813,7 +1035,7 @@ class DockerSandboxManager:
             "-e",
             f"TERM={self.term_value}",
             "-e",
-            f"TMPDIR={self._browser_tmp_dir()}",
+            f"TMPDIR={self.service_tmp_dir}",
             "-e",
             f"XDG_CACHE_HOME={self._browser_cache_dir()}",
             "-e",
@@ -821,6 +1043,7 @@ class DockerSandboxManager:
             "-e",
             f"SE_VNC_NO_PASSWORD={'1' if self.vnc_no_password else '0'}",
             *self._host_gateway_args(),
+            *self._chromium_sandbox_args(),
             "-p",
             f"127.0.0.1::{self.novnc_container_port}",
             "-p",
@@ -844,6 +1067,11 @@ class DockerSandboxManager:
         if not self._env_flag("WPR_SANDBOX_ADD_HOST_GATEWAY", True):
             return []
         return ["--add-host", "host.docker.internal:host-gateway"]
+
+    def _chromium_sandbox_args(self) -> list[str]:
+        if not self._env_flag("WPR_SANDBOX_ALLOW_CHROMIUM_USERNS", True):
+            return []
+        return ["--security-opt", self.chromium_userns_security_opt]
 
     def _insert_resource_limits(self, command: list[str]) -> None:
         resource_args: list[str] = []
@@ -1031,18 +1259,17 @@ class DockerSandboxManager:
         )
 
     def _prime_idle_desktop(self, container_name: str) -> None:
-        safe_url = shlex.quote(self._default_browser_url())
+        launch_script = "\n".join(
+            [
+                self._prepare_chromium_profile_script(),
+                f"nohup {self._chromium_launch_line(self._default_browser_url(), new_window=True)} >/dev/null 2>&1 &",
+                "sleep 1",
+                "wmctrl -xa chromium.Chromium || wmctrl -a Chromium || true",
+            ]
+        )
         self._docker_exec(
             container_name,
-            [
-                "bash",
-                "-c",
-                (
-                    f"(chromium --no-sandbox --disable-dev-shm-usage --new-window {safe_url} >/dev/null 2>&1 &) ; "
-                    "sleep 1; "
-                    "wmctrl -xa chromium.Chromium || wmctrl -a Chromium || true"
-                ),
-            ],
+            ["bash", "-lc", launch_script],
             env=self._desktop_env(),
             cwd=self.workspace_mount,
         )
@@ -1101,13 +1328,11 @@ class DockerSandboxManager:
         if action == "files":
             return ["pcmanfm", self.workspace_mount]
         if action == "browser":
+            launch_script = self._chromium_launch_script(safe_url, start_maximized=True, new_tab=True)
             return [
-                "chromium",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--start-maximized",
-                "--new-tab",
-                safe_url,
+                "bash",
+                "-lc",
+                launch_script,
             ]
         if action == "focus_browser":
             return [

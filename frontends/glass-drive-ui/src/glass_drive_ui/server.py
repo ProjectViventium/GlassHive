@@ -849,10 +849,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             worker.pop(key, None)
         safe["worker"] = worker
         runtime = dict(safe.get("runtime_details") or {})
-        view_available = bool(runtime.get("view_url"))
+        view_available = bool(runtime.get("view_available")) if "view_available" in runtime else bool(runtime.get("view_url"))
         safe["runtime_details"] = {
             key: runtime.get(key)
-            for key in ("mode", "runtime", "sandbox_state")
+            for key in ("mode", "runtime", "sandbox_state", "view_health")
             if runtime.get(key) not in (None, "", [])
         }
         safe["runtime_details"]["view_available"] = view_available

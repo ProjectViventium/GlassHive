@@ -48,7 +48,10 @@ def test_create_container_adds_host_gateway_alias_for_broker_reachability(tmp_pa
     command = captured[-1]
     assert "--add-host" in command
     assert "host.docker.internal:host-gateway" in command
-    assert f"TMPDIR={manager._browser_tmp_dir()}" in command
+    assert "--security-opt" in command
+    assert "seccomp=unconfined" in command
+    assert f"TMPDIR={manager.service_tmp_dir}" in command
+    assert f"TMPDIR={manager._browser_tmp_dir()}" not in command
     assert f"XDG_CACHE_HOME={manager._browser_cache_dir()}" in command
     assert f"XDG_CONFIG_HOME={manager._browser_config_dir()}" in command
 
@@ -65,6 +68,61 @@ def test_create_container_adds_host_gateway_alias_for_broker_reachability(tmp_pa
     )
 
     assert "--add-host" not in captured[-1]
+    assert "--security-opt" in captured[-1]
+    assert "seccomp=unconfined" in captured[-1]
+
+    monkeypatch.setenv("WPR_SANDBOX_ALLOW_CHROMIUM_USERNS", "0")
+    manager_without_chromium_userns = DockerSandboxManager(base_dir=str(tmp_path / "no-userns"))
+    captured.clear()
+    manager_without_chromium_userns._docker = fake_docker  # type: ignore[method-assign]
+    manager_without_chromium_userns._create_container(
+        "wpr-test",
+        {
+            "workspace_dir": tmp_path / "workspace",
+            "home_dir": tmp_path / "home",
+        },
+    )
+
+    assert "--security-opt" not in captured[-1]
+    assert "seccomp=unconfined" not in captured[-1]
+
+
+def test_describe_self_heals_novnc_when_service_port_resets(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[tuple[str, object]] = []
+
+    sandbox = SandboxInfo(
+        container_name="wpr-wrk-test",
+        container_id="cid",
+        state="running",
+        workspace_dir=str(tmp_path / "workspace"),
+        home_dir=str(tmp_path / "home"),
+        pid=1234,
+        image="img",
+        novnc_port=57900,
+        selenium_port=57901,
+        openclaw_port=57902,
+    )
+    manager.inspect = lambda worker_id: sandbox  # type: ignore[method-assign]
+
+    readiness = iter([False, True])
+    manager._novnc_http_ready = lambda port: next(readiness)  # type: ignore[method-assign]
+
+    def fake_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
+        calls.append(("exec", command))
+        return subprocess.CompletedProcess(["docker"], returncode=0, stdout="", stderr="")
+
+    manager._docker_exec = fake_exec  # type: ignore[method-assign]
+
+    details = manager.describe("wrk_test")
+
+    assert details["view_available"] is True
+    assert details["view_url"] == "http://127.0.0.1:57900/?autoconnect=1&resize=scale&reconnect=1&show_dot=1"
+    assert details["view_health"] == {"healthy": True, "repaired": True, "reason": "ok"}
+    assert calls
+    repair_script = str(calls[0][1])
+    assert "TMPDIR=/tmp" in repair_script
+    assert manager._browser_tmp_dir() not in repair_script
 
 
 def test_inspect_reports_paused_when_docker_state_is_paused(tmp_path):
@@ -156,6 +214,69 @@ def test_ensure_ready_creates_container_when_only_projected_paths_exist(tmp_path
 
     assert created == ["wpr-wrk-projected"]
     assert sandbox.container_id == "container123"
+
+
+def test_ensure_ready_recreates_ready_container_missing_chromium_userns(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[str] = []
+    removed = False
+    created = False
+
+    def fake_inspect(worker_id: str):
+        if created:
+            return SandboxInfo(
+                container_name="wpr-wrk-test",
+                container_id="container-new",
+                state="running",
+                workspace_dir=str(tmp_path / "workspace"),
+                home_dir=str(tmp_path / "home"),
+                pid=4242,
+                image=manager.image,
+                security_options=("seccomp=unconfined",),
+            )
+        if removed:
+            return None
+        return SandboxInfo(
+            container_name="wpr-wrk-test",
+            container_id="container-old",
+            state="running",
+            workspace_dir=str(tmp_path / "workspace"),
+            home_dir=str(tmp_path / "home"),
+            pid=4242,
+            image=manager.image,
+            security_options=(),
+        )
+
+    def fake_docker(args: list[str], **kwargs):
+        nonlocal removed
+        if args[:2] == ["rm", "-f"]:
+            calls.append("rm")
+            removed = True
+            return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected docker call: {args}")
+
+    def fake_create_container(container_name, paths):
+        nonlocal created
+        calls.append(f"create:{container_name}")
+        created = True
+
+    manager._require_docker = lambda: calls.append("require")  # type: ignore[method-assign]
+    manager._ensure_host_dirs = lambda paths: calls.append("host_dirs")  # type: ignore[method-assign]
+    manager._seed_bootstrap = lambda *args, **kwargs: calls.append("seed")  # type: ignore[method-assign]
+    manager.inspect = fake_inspect  # type: ignore[method-assign]
+    manager._docker = fake_docker  # type: ignore[method-assign]
+    manager._ensure_image = lambda: calls.append("image")  # type: ignore[method-assign]
+    manager._create_container = fake_create_container  # type: ignore[method-assign]
+    manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("writable")  # type: ignore[method-assign]
+    manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
+    manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
+    manager._prime_idle_desktop = lambda container_name: calls.append("prime")  # type: ignore[method-assign]
+
+    sandbox = manager.ensure_ready({"worker_id": "wrk_test", "state": "ready", "container_id": "container-old"}, "codex-cli")
+
+    assert sandbox.container_id == "container-new"
+    assert sandbox.security_options == ("seccomp=unconfined",)
+    assert calls == ["require", "host_dirs", "seed", "rm", "image", "create:wpr-wrk-test", "writable", "harden", "background", "prime"]
 
 
 def test_inspect_uses_short_cache_and_stale_fallback(tmp_path):
@@ -426,6 +547,52 @@ def test_terminal_desktop_action_waits_for_live_session(tmp_path):
     assert "job-run_123456" in command[-1]
 
 
+def test_browser_desktop_action_uses_clean_chromium_profile_and_no_no_sandbox(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    command = manager._desktop_action_command("browser", url="https://example.test/report")
+    assert command is not None
+    assert command[:2] == ["bash", "-lc"]
+    launch_script = command[-1]
+    syntax = subprocess.run(["bash", "-n"], input=launch_script, text=True, capture_output=True)
+    assert syntax.returncode == 0, syntax.stderr
+    assert "--no-sandbox" not in launch_script
+    assert "--disable-dev-shm-usage" in launch_script
+    assert "--no-first-run" in launch_script
+    assert "--no-default-browser-check" in launch_script
+    assert "/usr/bin/chromium-base" in launch_script
+    assert "--start-maximized" in launch_script
+    assert "--new-tab" in launch_script
+    assert "bookmark_bar" in launch_script
+    assert "show_on_all_tabs" in launch_script
+    assert "https://example.test/report" in launch_script
+
+
+def test_prime_idle_desktop_uses_clean_chromium_profile_and_no_no_sandbox(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[tuple[str, list[str]]] = []
+
+    def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
+        calls.append((container_name, command))
+        return subprocess.CompletedProcess(["docker"], returncode=0, stdout="", stderr="")
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+
+    manager._prime_idle_desktop("wpr-test")
+
+    assert calls
+    script = calls[-1][1][-1]
+    assert calls[-1][1][:2] == ["bash", "-lc"]
+    syntax = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
+    assert syntax.returncode == 0, syntax.stderr
+    assert "--no-sandbox" not in script
+    assert "--disable-dev-shm-usage" in script
+    assert "--new-window" in script
+    assert "nohup /usr/bin/chromium-base" in script
+    assert "bookmark_bar" in script
+    assert "show_on_all_tabs" in script
+    assert "wmctrl -xa chromium.Chromium" in script
+
+
 def test_desktop_action_skips_heavy_path_repair_for_running_container(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     calls: list[str] = []
@@ -643,6 +810,8 @@ def test_ensure_image_installs_ai_worker_browser_extension_policy(tmp_path):
     assert manager.image.endswith(":phase1-node22-docs4")
     assert "@openai/codex@0.140.0" in dockerfile
     assert "@anthropic-ai/claude-code@2.1.178" in dockerfile
+    assert "--cache /tmp/glasshive-npm-cache" in dockerfile
+    assert "rm -rf /tmp/glasshive-npm-cache /root/.npm /home/seluser/.npm" in dockerfile
     assert "/etc/chromium/policies/managed/glasshive-ai-worker-extensions.json" in dockerfile
     assert "/etc/opt/chrome/policies/managed/glasshive-ai-worker-extensions.json" in dockerfile
     assert "ExtensionInstallForcelist" in dockerfile

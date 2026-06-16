@@ -781,6 +781,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "function isFilePreviewUrl(url)" in watch_js
     assert "lastAttachedFilePreviewKey === filePreviewKey" in watch_js
     assert "if (!isFilePreviewUrl(url))" in watch_js
+    assert "if (previewUrl) return previewUrl" not in watch_js
     assert "currentDeliverable?.kind === 'file'" in watch_js
     assert "syncResultActions(currentDeliverable)" in watch_js
     assert 'id="artifact-list"' in watch_html
@@ -795,7 +796,8 @@ def test_launcher_workspace_hive_static_controls():
     assert "Close latest workspace output status" in watch_js
     assert ".result-toggle-action" in styles_css
     assert ".workspace-status-button" in styles_css
-    assert "Open delivered file in new tab" in watch_js
+    assert "Open current desktop in new tab" in watch_js
+    assert "Open delivered file in new tab" not in watch_js
     assert "setInterval(refresh" not in watch_js
     assert "Workspace paused" not in watch_js
     assert 'grid-template-areas:' in styles_css

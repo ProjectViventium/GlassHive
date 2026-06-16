@@ -187,8 +187,6 @@ function isFilePreviewUrl(url) {
 
 function currentSurfaceUrl() {
   if (activeSurface === 'desktop') {
-    const previewUrl = filePreviewUrl();
-    if (previewUrl) return previewUrl;
     return currentDesktopUrl || currentTerminalUrl;
   }
   return currentTerminalUrl || currentDesktopUrl;
@@ -290,10 +288,7 @@ function scheduleRefresh(delayMs = refreshDelayForState()) {
 function syncMenuLabels() {
   surfaceTerminalButton.dataset.active = String(activeSurface === 'terminal');
   surfaceDesktopButton.dataset.active = String(activeSurface === 'desktop');
-  const filePreviewActive = activeSurface === 'desktop' && Boolean(filePreviewUrl());
-  openExternal.textContent = filePreviewActive
-    ? 'Open delivered file in new tab'
-    : activeSurface === 'desktop'
+  openExternal.textContent = activeSurface === 'desktop'
       ? 'Open current desktop in new tab'
       : 'Open current session in new tab';
 }
@@ -307,10 +302,7 @@ function setSurface(surface, { force = false } = {}) {
     setOverlay(state);
     return;
   }
-  const filePreviewAvailable = activeSurface === 'desktop'
-    && currentDeliverable?.kind === 'file'
-    && (currentDeliverable.open_url || currentDeliverable.browser_url);
-  if (activeSurface === 'desktop' && !currentDesktopAvailable && !filePreviewAvailable) {
+  if (activeSurface === 'desktop' && !currentDesktopAvailable) {
     clearAttachedView();
     overlay.hidden = false;
     if (stage) {
@@ -326,7 +318,7 @@ function setSurface(surface, { force = false } = {}) {
     return;
   }
   const url = currentSurfaceUrl();
-  const filePreviewKey = activeSurface === 'desktop' ? currentFilePreviewKey : '';
+  const filePreviewKey = '';
   const sameFilePreviewAttached = Boolean(
     filePreviewKey
       && lastAttachedFilePreviewKey === filePreviewKey
@@ -543,8 +535,6 @@ async function maybePromoteDeliverable(data) {
     syncResultActions(currentDeliverable);
     if (promotionKey && promotionKey !== lastPromotedDeliverableKey) {
       lastPromotedDeliverableKey = promotionKey;
-      activeSurface = 'desktop';
-      setSurface('desktop', { force: true });
     }
     return;
   }
@@ -636,7 +626,6 @@ async function submitFooterInstruction(mode) {
 
 function setOverlay(state, detail) {
   const connecting = attachStartedAt && !frameReady && Date.now() - attachStartedAt < 12000;
-  const filePreviewActive = activeSurface === 'desktop' && Boolean(filePreviewUrl());
   const waiting = state === 'starting' || state === 'paused' || state === 'idle' || state === 'idle_terminated' || state === 'stopped' || connecting;
   overlay.hidden = !waiting;
   if (stage) {
@@ -666,17 +655,13 @@ function setOverlay(state, detail) {
 
   if (connecting) {
     if (overlayLabel) {
-      overlayLabel.textContent = filePreviewActive ? 'Delivered file' : 'Workspace attaching';
+      overlayLabel.textContent = 'Workspace attaching';
     }
-    overlayTitle.textContent = filePreviewActive
-      ? 'Opening delivered file…'
-      : activeSurface === 'desktop'
-        ? 'Attaching live workspace…'
-        : 'Attaching exact live session…';
-    overlayDetail.textContent = filePreviewActive
-      ? 'The completed file preview is loading. Use Open delivered file in new tab if this takes more than a few seconds.'
-      : activeSurface === 'desktop'
-        ? 'The desktop is waking up. If it takes more than a few seconds, open the current desktop in a new tab.'
+    overlayTitle.textContent = activeSurface === 'desktop'
+      ? 'Attaching live workspace…'
+      : 'Attaching exact live session…';
+    overlayDetail.textContent = activeSurface === 'desktop'
+      ? 'The desktop is waking up. If it takes more than a few seconds, open the current desktop in a new tab.'
       : 'We are connecting to the exact running session. If it takes more than a few seconds, open the current session in a new tab.';
     return;
   }
@@ -684,15 +669,11 @@ function setOverlay(state, detail) {
   if (overlayLabel) {
     overlayLabel.textContent = 'Workspace warming up';
   }
-  overlayTitle.textContent = filePreviewActive
-    ? 'Opening delivered file…'
-    : activeSurface === 'desktop'
-      ? 'Preparing live workspace…'
-      : 'Preparing exact live session…';
-  overlayDetail.textContent = detail || (filePreviewActive
-    ? 'The completed file preview will appear here automatically.'
-    : activeSurface === 'desktop'
-      ? 'The desktop will attach automatically when the workspace is ready.'
+  overlayTitle.textContent = activeSurface === 'desktop'
+    ? 'Preparing live workspace…'
+    : 'Preparing exact live session…';
+  overlayDetail.textContent = detail || (activeSurface === 'desktop'
+    ? 'The desktop will attach automatically when the workspace is ready.'
     : 'The exact workspace session will appear here as soon as the workspace is ready.');
 }
 
