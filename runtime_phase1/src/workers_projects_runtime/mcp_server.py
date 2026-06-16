@@ -1266,6 +1266,34 @@ def _can_recover_blocked_host_dispatch_to_docker(
     return True
 
 
+def _same_workspace_runtime_dependency_blocked_payload(blocked: dict[str, Any]) -> dict[str, Any]:
+    recovery = str(blocked.get("failure_recommended_recovery") or "").strip()
+    same_workspace_guidance = (
+        "Repair or update the host runtime dependency, then call workspace_continue again to preserve "
+        "the same workspace files, browser state, notes, and partial outputs. If preserving this host "
+        "workspace is no longer required, launch a fresh sandbox/workstation workspace instead; "
+        "GlassHive will not silently move an existing host workspace to another substrate and pretend "
+        "its host-local state was preserved."
+    )
+    return {
+        **blocked,
+        "failure_retryable": True,
+        "failure_recommended_recovery": (
+            f"{recovery} {same_workspace_guidance}" if recovery else same_workspace_guidance
+        ),
+        "acknowledgement_guidance": (
+            "Explain plainly that GlassHive did not continue this workspace because the existing host "
+            "worker substrate is unavailable. Do not claim that work is running, and do not imply "
+            "GlassHive migrated the same workspace into a sandbox."
+        ),
+        "main_agent_next_action": (
+            "Tell the user the same workspace can be retried after the host runtime dependency is "
+            "repaired or updated. Offer a fresh sandbox/workstation workspace only when the user no "
+            "longer needs the current host workspace state preserved."
+        ),
+    }
+
+
 def _iter_upload_file_objects(value: Any):
     if isinstance(value, list):
         for item in value:
@@ -3859,7 +3887,7 @@ def create_mcp_server(
         )
         if blocked:
             return _blocked_dispatch_result(
-                blocked,
+                _same_workspace_runtime_dependency_blocked_payload(blocked),
                 profile=worker_profile,
                 execution_mode=worker_execution_mode,
                 effort=resolved_effort,

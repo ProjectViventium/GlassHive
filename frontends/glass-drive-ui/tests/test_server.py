@@ -721,6 +721,12 @@ def test_launcher_workspace_hive_static_controls():
     styles_css = (static_dir / "styles.css").read_text(encoding="utf-8")
     watch_html = (static_dir / "watch.html").read_text(encoding="utf-8")
     watch_js = (static_dir / "watch.js").read_text(encoding="utf-8")
+    assert 'href="/static/styles.css?v=20260616a"' in index_html
+    assert 'src="/static/app.js?v=20260616a"' in index_html
+    assert 'href="/static/styles.css?v=20260616a"' in watch_html
+    assert 'src="/static/watch.js?v=20260616a"' in watch_html
+    assert "20260531b" not in index_html
+    assert "20260531b" not in watch_html
     assert "workspace-live-frame" in app_js
     assert "MAX_LIVE_TILE_IFRAMES" in app_js
     assert "RETAINED_TILE_REFRESH_MS" in app_js

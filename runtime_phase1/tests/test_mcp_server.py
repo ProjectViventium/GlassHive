@@ -1713,6 +1713,53 @@ def test_worker_delegate_once_recovers_default_host_dependency_to_docker(monkeyp
     assert api_client.assign_run_payloads[-1]["worker_id"] == "wrk_resumed"
 
 
+def test_worker_delegate_once_recovers_default_host_claude_dependency_to_docker(monkeypatch, tmp_path):
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"--version\" ]]; then echo '2.1.178 (Claude Code)'; exit 0; fi\n"
+        "if [[ \"$1\" == \"--help\" ]]; then echo 'Usage: claude [options] --effort'; exit 0; fi\n"
+        "echo 'claude test'\n",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(0o755)
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", str(fake_claude))
+    monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("WPR_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_FILE", raising=False)
+    monkeypatch.delenv("WPR_HOST_RUNTIME_REQUIREMENTS_FILE", raising=False)
+    monkeypatch.delenv("WPR_CLAUDE_CODE_ENABLE_CHROME", raising=False)
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    api_client = TrackingApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "owner_id": "demo-owner",
+                    "title": "Recover Claude to sandbox",
+                    "instruction": "Use Claude-quality research behavior for a public-safe task.",
+                    "profile": "claude-code",
+                },
+            )
+            payload = _tool_json(delegated)
+            assert payload["status"] == "dispatched"
+            assert payload["runtime_recovery"]["from_execution_mode"] == "host"
+            assert payload["runtime_recovery"]["to_execution_mode"] == "docker"
+            assert payload["runtime_recovery"]["reason_class"] == "runtime_dependency_missing"
+            assert payload["follow_up_context"]["run_id"] == "run_assign"
+            assert "install global software" in payload["acknowledgement_guidance"]
+
+    asyncio.run(scenario())
+    assert api_client.find_or_resume_payloads[-1]["profile"] == "claude-code"
+    assert api_client.find_or_resume_payloads[-1]["execution_mode"] == "docker"
+    assert api_client.assign_run_payloads[-1]["worker_id"] == "wrk_resumed"
+
+
 def test_worker_delegate_once_blocks_explicit_host_dependency_mismatch_before_api_calls(monkeypatch, tmp_path):
     fake_node = tmp_path / "node"
     fake_node.write_text("#!/usr/bin/env bash\necho 'v20.20.2'\n")
@@ -2350,6 +2397,52 @@ def test_workspace_continue_queues_same_workspace_recovery(monkeypatch):
     assert "provider_rate_limited" in instruction
     assert "current files" in instruction
     assert api_client.assigned[0]["effort"] == "medium"
+
+
+def test_workspace_continue_blocks_host_dependency_with_retryable_same_workspace_guidance(monkeypatch, tmp_path):
+    fake_node = tmp_path / "node"
+    fake_node.write_text("#!/usr/bin/env bash\necho 'v20.20.2'\n")
+    fake_node.chmod(0o755)
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "http://127.0.0.1:8780")
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
+    monkeypatch.setenv("WPR_CODEX_BIN", "/bin/echo")
+    monkeypatch.setenv(
+        "GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON",
+        json.dumps({"codex-cli": [{"binary": str(fake_node), "label": "Node.js", "min_version": "22.19.0"}]}),
+    )
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {"X-Viventium-Surface": "web"})
+
+    class HostContinuationApiClient(RetryableFailureApiClient):
+        def get_worker(self, worker_id: str):
+            payload = super().get_worker(worker_id)
+            payload["execution_mode"] = "host"
+            return payload
+
+    api_client = HostContinuationApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            continued = await client.call_tool(
+                "workspace_continue",
+                {
+                    "run_id": "run_retryable_failed",
+                    "continuation_goal": "Continue from the current files.",
+                },
+            )
+            payload = _tool_json(continued)
+            assert payload["status"] == "blocked"
+            assert payload["failure_class"] == "runtime_dependency_missing"
+            assert payload["failure_retryable"] is True
+            assert "Node.js" in payload["failure_user_message"]
+            assert "workspace_continue again" in payload["failure_recommended_recovery"]
+            assert "fresh sandbox/workstation workspace" in payload["failure_recommended_recovery"]
+            assert "same workspace" in payload["main_agent_next_action"]
+            assert payload["view_steer_url"] is None
+            assert payload["view_steer"]["include_in_acknowledgement"] is False
+
+    asyncio.run(scenario())
+    assert api_client.assigned == []
 
 
 def test_workspace_continue_does_not_nest_previous_continue_wrappers(monkeypatch):
