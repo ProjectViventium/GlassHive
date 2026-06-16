@@ -221,10 +221,24 @@ def _runtime_dependency_blocked_payload_from_error(
     }
 
 
-def _runtime_dependency_blocked_payload(*, profile: str, execution_mode: str) -> dict[str, Any] | None:
+def _runtime_dependency_blocked_payload(
+    *,
+    profile: str,
+    execution_mode: str,
+    preflight_env: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
     if execution_mode != "host":
         return None
+    overlay = {
+        key: value
+        for key, value in (preflight_env or {}).items()
+        if key in RUNTIME_PREFLIGHT_BOOTSTRAP_ENV_KEYS
+    }
+    previous: dict[str, str | None] = {}
     try:
+        for key, value in overlay.items():
+            previous[key] = os.environ.get(key)
+            os.environ[key] = value
         _host_profile_runtime(profile).preflight_worker_profile(profile, execution_mode)
         return None
     except RuntimeDependencyMissingError as error:
@@ -233,6 +247,12 @@ def _runtime_dependency_blocked_payload(*, profile: str, execution_mode: str) ->
             profile=profile,
             execution_mode=execution_mode,
         )
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _worker_capability_summary() -> str:
@@ -301,6 +321,9 @@ HEADER_ALIASES = {
     HEADER_SERVICE_TOKEN: ("x-glasshive-service-token", "x-glasshive-mcp-service-token"),
 }
 CALLBACK_REQUIRED_CONTEXT_KEYS = ("user_id", "conversation_id", "parent_message_id", "message_id")
+RUNTIME_PREFLIGHT_BOOTSTRAP_ENV_KEYS = {
+    "WPR_CLAUDE_CODE_EFFORT",
+}
 
 ExecutionModeParam = Annotated[
     Literal["docker", "host"] | None,
@@ -446,6 +469,17 @@ def _apply_effort_to_bundle(bundle: dict[str, Any], *, profile: str, effort: str
     addition = f"Worker effort preference for this run: {clean_effort}."
     next_bundle["system_instructions"] = f"{current}\n\n{addition}".strip()
     return next_bundle
+
+
+def _runtime_preflight_env_from_bundle(bundle: dict[str, Any] | None) -> dict[str, str]:
+    env = bundle.get("env") if isinstance(bundle, dict) else None
+    if not isinstance(env, dict):
+        return {}
+    values: dict[str, str] = {}
+    for key in RUNTIME_PREFLIGHT_BOOTSTRAP_ENV_KEYS:
+        if key in env:
+            values[key] = str(env.get(key) or "").strip()
+    return values
 
 
 def _host_workers_enabled() -> bool:
@@ -2278,9 +2312,12 @@ def create_mcp_server(
             )
         worker_instruction = _with_worker_host_side_orchestration_rule(worker_instruction_body)
         resolved_alias = (alias or _slugify_alias(resolved_profile, clean_title)).strip()
+        bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json) or {}
+        bundle = _apply_effort_to_bundle(bundle, profile=resolved_profile, effort=resolved_effort)
         blocked = _runtime_dependency_blocked_payload(
             profile=resolved_profile,
             execution_mode=resolved_execution_mode,
+            preflight_env=_runtime_preflight_env_from_bundle(bundle),
         )
         runtime_recovery: dict[str, Any] | None = None
         if _can_recover_blocked_host_dispatch_to_docker(
@@ -2299,6 +2336,7 @@ def create_mcp_server(
             blocked = _runtime_dependency_blocked_payload(
                 profile=resolved_profile,
                 execution_mode=resolved_execution_mode,
+                preflight_env=_runtime_preflight_env_from_bundle(bundle),
             )
         if blocked:
             return _blocked_dispatch_result(
@@ -2309,7 +2347,6 @@ def create_mcp_server(
                 alias=resolved_alias,
             )
 
-        bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json) or {}
         bundle.setdefault(
             "project_definition",
             _default_project_definition(title=clean_title, goal=clean_goal, instruction=clean_instruction),
@@ -2324,7 +2361,6 @@ def create_mcp_server(
             tenant_id=context_tenant_id,
             owner_id=context_owner_id or resolved_owner_id,
         )
-        bundle = _apply_effort_to_bundle(bundle, profile=resolved_profile, effort=resolved_effort)
         bundle, worker_instruction = _apply_connected_account_intent_guard(
             bundle,
             worker_instruction,
@@ -2743,9 +2779,12 @@ def create_mcp_server(
         resolved_profile = _resolve_profile_from_preferences(profile, preferences)
         resolved_effort = _resolve_effort_for_profile(resolved_profile, effort, preferences)
         title = clean_description.splitlines()[0].strip()[:120] or "GlassHive scheduled workspace"
+        bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json) or {}
+        bundle = _apply_effort_to_bundle(bundle, profile=resolved_profile, effort=resolved_effort)
         blocked = _runtime_dependency_blocked_payload(
             profile=resolved_profile,
             execution_mode=resolved_execution_mode,
+            preflight_env=_runtime_preflight_env_from_bundle(bundle),
         )
         runtime_recovery: dict[str, Any] | None = None
         if _can_recover_blocked_host_dispatch_to_docker(
@@ -2764,6 +2803,7 @@ def create_mcp_server(
             blocked = _runtime_dependency_blocked_payload(
                 profile=resolved_profile,
                 execution_mode=resolved_execution_mode,
+                preflight_env=_runtime_preflight_env_from_bundle(bundle),
             )
         if blocked:
             return _blocked_dispatch_result(
@@ -2773,7 +2813,6 @@ def create_mcp_server(
                 effort=resolved_effort,
                 alias=(workspace_alias or _slugify_alias(resolved_profile, title)).strip(),
             )
-        bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json) or {}
         bundle.setdefault(
             "project_definition",
             _default_project_definition(title=title, goal=clean_success_criteria, instruction=scheduled_instruction),
@@ -2788,7 +2827,6 @@ def create_mcp_server(
             tenant_id=context_tenant_id,
             owner_id=context_owner_id or resolved_owner_id,
         )
-        bundle = _apply_effort_to_bundle(bundle, profile=resolved_profile, effort=resolved_effort)
         bundle, scheduled_instruction = _apply_connected_account_intent_guard(
             bundle,
             scheduled_instruction,
@@ -3129,9 +3167,11 @@ def create_mcp_server(
         worker = client.get_worker(worker_id)
         worker_profile = str(worker.get("profile") or _configured_default_worker_profile())
         worker_execution_mode = str(worker.get("execution_mode") or "docker")
+        parsed_bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json)
         blocked = _runtime_dependency_blocked_payload(
             profile=worker_profile,
             execution_mode=worker_execution_mode,
+            preflight_env=_runtime_preflight_env_from_bundle(parsed_bundle),
         )
         if blocked:
             return _blocked_dispatch_result(
@@ -3140,7 +3180,6 @@ def create_mcp_server(
                 execution_mode=worker_execution_mode,
                 alias=str(worker.get("alias") or ""),
             )
-        parsed_bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json)
         parsed_bundle = _merge_request_context(parsed_bundle)
         parsed_bundle, instruction = _apply_connected_account_intent_guard(
             parsed_bundle,
@@ -3810,7 +3849,22 @@ def create_mcp_server(
         worker_profile = str(worker.get("profile") or "").strip()
         resolved_effort = _resolve_effort_for_profile(worker_profile, effort, preferences)
         instruction = _continuation_instruction(previous_run=previous_run, continuation_goal=continuation_goal)
-        parsed_bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json)
+        worker_execution_mode = str(worker.get("execution_mode") or "docker")
+        parsed_bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json) or {}
+        parsed_bundle = _apply_effort_to_bundle(parsed_bundle, profile=worker_profile, effort=resolved_effort)
+        blocked = _runtime_dependency_blocked_payload(
+            profile=worker_profile,
+            execution_mode=worker_execution_mode,
+            preflight_env=_runtime_preflight_env_from_bundle(parsed_bundle),
+        )
+        if blocked:
+            return _blocked_dispatch_result(
+                blocked,
+                profile=worker_profile,
+                execution_mode=worker_execution_mode,
+                effort=resolved_effort,
+                alias=str(worker.get("alias") or ""),
+            )
         parsed_bundle = _merge_request_context(parsed_bundle)
         prior_connected_account_guard = CONNECTED_ACCOUNT_NO_BROKER_NOTE in str(previous_run.get("instruction") or "")
         should_send_bootstrap_bundle = (

@@ -1579,6 +1579,66 @@ def test_worker_delegate_once_mcp_preflight_blocks_claude_without_chrome(monkeyp
     assert api_client.calls == []
 
 
+def test_worker_delegate_once_mcp_preflight_blocks_claude_max_without_effort(
+    monkeypatch,
+    tmp_path,
+):
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"--version\" ]]; then echo '2.1.178 (Claude Code)'; exit 0; fi\n"
+        "if [[ \"$1\" == \"--help\" ]]; then echo 'Usage: claude [options] --chrome'; exit 0; fi\n"
+        "echo 'claude test'\n",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(0o755)
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", str(fake_claude))
+    monkeypatch.setenv(
+        "GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON",
+        json.dumps(
+            {
+                "claude-code": [
+                    {
+                        "binary": str(fake_claude),
+                        "label": "Claude Code",
+                        "required_help_flags": ["--chrome"],
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.delenv("WPR_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("WPR_CLAUDE_CODE_EFFORT", raising=False)
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    api_client = TrackingApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "owner_id": "demo-owner",
+                    "title": "Host Claude max effort",
+                    "instruction": "Run a host Claude max-effort task.",
+                    "profile": "claude-code",
+                    "execution_mode": "host",
+                    "effort": "max",
+                },
+            )
+            payload = _tool_json(delegated)
+            assert payload["status"] == "blocked"
+            assert payload["failure_class"] == "runtime_dependency_missing"
+            assert "native --effort" in payload["failure_user_message"]
+            assert payload["effort"] == "max"
+
+    asyncio.run(scenario())
+    assert api_client.calls == []
+    assert "WPR_CLAUDE_CODE_EFFORT" not in os.environ
+
+
 def test_worker_delegate_once_recovers_default_host_dependency_to_docker(monkeypatch, tmp_path):
     fake_node = tmp_path / "node"
     fake_node.write_text("#!/usr/bin/env bash\necho 'v20.20.2'\n")
