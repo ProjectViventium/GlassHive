@@ -11,12 +11,17 @@ import shutil
 import signal
 import subprocess
 import time
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 compatibility
+    import tomli as tomllib
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
 
 from .bootstrap import (
     GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
+    GLASSHIVE_NATIVE_CAPABILITY_INVENTORY,
     GLASSHIVE_SAFETY_CHECKPOINT_RULE,
     GLASSHIVE_WORKER_COMPLETION_CONTRACT,
     bootstrap_env_for,
@@ -46,6 +51,201 @@ from .terminal_takeover import TerminalTarget
 
 logger = logging.getLogger(__name__)
 
+_CODEX_MCP_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+_HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
+
+
+def _codex_mcp_section_server_name(section_name: str) -> str | None:
+    section_name = section_name.strip()
+    if not section_name.startswith("mcp_servers."):
+        return None
+    server = section_name[len("mcp_servers.") :].split(".", 1)[0].strip()
+    return server.strip("\"'") or None
+
+
+def _codex_mcp_server_names(config_text: str) -> set[str]:
+    names: set[str] = set()
+    for line in config_text.splitlines():
+        match = _CODEX_MCP_SECTION_RE.match(line)
+        if not match:
+            continue
+        server = _codex_mcp_section_server_name(match.group(1))
+        if server:
+            names.add(server)
+    return names
+
+
+def _select_codex_mcp_server_blocks(config_text: str, names: set[str]) -> str:
+    if not config_text.strip() or not names:
+        return ""
+    output: list[str] = []
+    keeping = False
+    for line in config_text.splitlines():
+        section = _CODEX_MCP_SECTION_RE.match(line)
+        if section:
+            server = _codex_mcp_section_server_name(section.group(1))
+            keeping = server in names if server else False
+        if keeping:
+            output.append(line)
+    return "\n".join(output).strip()
+
+
+def _strip_codex_mcp_server_blocks(config_text: str, names: set[str]) -> str:
+    if not config_text.strip() or not names:
+        return config_text.rstrip()
+    output: list[str] = []
+    skipping = False
+    for line in config_text.splitlines():
+        section = _CODEX_MCP_SECTION_RE.match(line)
+        if section:
+            server = _codex_mcp_section_server_name(section.group(1))
+            skipping = server in names if server else False
+        if not skipping:
+            output.append(line)
+    return "\n".join(output).rstrip()
+
+
+def _sanitize_malformed_codex_source_config(
+    config_text: str,
+    preserve_names: set[str],
+    append_names: set[str],
+) -> str:
+    output: list[str] = []
+    keeping = True
+    for line in config_text.splitlines():
+        section = _CODEX_MCP_SECTION_RE.match(line)
+        if section:
+            section_name = section.group(1).strip()
+            if section_name == "mcp_servers" or section_name.startswith("mcp_servers."):
+                server = _codex_mcp_section_server_name(section_name)
+                keeping = bool(server and server in preserve_names and server not in append_names)
+            else:
+                keeping = True
+        if keeping:
+            output.append(line)
+    return "\n".join(output).rstrip()
+
+
+def _toml_string(value: object) -> str:
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _toml_value(value: object, *, manifest_dir: Path | None = None, key: str = "") -> str | None:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, str):
+        rendered = str(manifest_dir) if key == "cwd" and value == "." and manifest_dir else value
+        return _toml_string(rendered)
+    if isinstance(value, list):
+        rendered_items: list[str] = []
+        for item in value:
+            item_rendered = _toml_value(item)
+            if item_rendered is None:
+                return None
+            rendered_items.append(item_rendered)
+        return "[" + ", ".join(rendered_items) + "]"
+    return None
+
+
+def _toml_table_name(name: str) -> str:
+    return name if re.fullmatch(r"[A-Za-z0-9_-]+", name) else _toml_string(name)
+
+
+def _render_codex_mcp_server_from_json(name: str, config: object, manifest_dir: Path) -> str:
+    if not isinstance(config, dict):
+        return ""
+    root_lines = [f"[mcp_servers.{_toml_table_name(name)}]"]
+    nested: list[tuple[str, dict[str, object]]] = []
+    for key, value in config.items():
+        key_text = str(key).strip()
+        if not key_text:
+            continue
+        if isinstance(value, dict):
+            nested.append((key_text, value))
+            continue
+        rendered = _toml_value(value, manifest_dir=manifest_dir, key=key_text)
+        if rendered is not None:
+            root_lines.append(f"{_toml_table_name(key_text)} = {rendered}")
+    for nested_key, nested_values in nested:
+        nested_lines = [f"[mcp_servers.{_toml_table_name(name)}.{_toml_table_name(nested_key)}]"]
+        for key, value in nested_values.items():
+            rendered = _toml_value(value)
+            if rendered is not None:
+                nested_lines.append(f"{_toml_table_name(str(key))} = {rendered}")
+        if len(nested_lines) > 1:
+            root_lines.extend(["", *nested_lines])
+    return "\n".join(root_lines).strip()
+
+
+def _render_toml_document(data: dict[str, object]) -> str:
+    root_lines: list[str] = []
+    table_blocks: list[str] = []
+    for key, value in data.items():
+        key_text = str(key).strip()
+        if not key_text:
+            continue
+        if isinstance(value, dict):
+            table_blocks.extend(_render_toml_table([key_text], value))
+            continue
+        rendered = _toml_value(value)
+        if rendered is not None:
+            root_lines.append(f"{_toml_table_name(key_text)} = {rendered}")
+    blocks: list[str] = []
+    if root_lines:
+        blocks.append("\n".join(root_lines))
+    blocks.extend(table_blocks)
+    return "\n\n".join(block for block in blocks if block.strip()).strip()
+
+
+def _render_toml_table(path: list[str], table: dict[str, object]) -> list[str]:
+    scalar_lines: list[str] = []
+    nested_blocks: list[str] = []
+    for key, value in table.items():
+        key_text = str(key).strip()
+        if not key_text:
+            continue
+        if isinstance(value, dict):
+            nested_blocks.extend(_render_toml_table([*path, key_text], value))
+            continue
+        rendered = _toml_value(value)
+        if rendered is not None:
+            scalar_lines.append(f"{_toml_table_name(key_text)} = {rendered}")
+    blocks: list[str] = []
+    if scalar_lines:
+        table_name = ".".join(_toml_table_name(part) for part in path)
+        blocks.append("\n".join([f"[{table_name}]", *scalar_lines]))
+    blocks.extend(nested_blocks)
+    return blocks
+
+
+def _sanitize_codex_source_config(config_text: str, preserve_names: set[str], append_names: set[str]) -> str:
+    if not config_text.strip():
+        return ""
+    try:
+        parsed = tomllib.loads(config_text)
+    except Exception:
+        return _sanitize_malformed_codex_source_config(config_text, preserve_names, append_names)
+    if not isinstance(parsed, dict):
+        return ""
+    sanitized: dict[str, object] = {
+        str(key): value
+        for key, value in parsed.items()
+        if str(key) != "mcp_servers"
+    }
+    mcp_servers = parsed.get("mcp_servers")
+    if isinstance(mcp_servers, dict):
+        kept_servers = {
+            str(name): value
+            for name, value in mcp_servers.items()
+            if str(name) in preserve_names and str(name) not in append_names
+        }
+        if kept_servers:
+            sanitized["mcp_servers"] = kept_servers
+    return _render_toml_document(sanitized)
+
+
 # Keep prompt templates near the top. Host-native workers read these through real files in their
 # workspace (`harness-prompt.md`, `AGENTS.md`, `CLAUDE.md`, `CODEX.md`) and through the command-line
 # instruction wrapper. The constants live here so future edits do not require spelunking through the
@@ -70,6 +270,8 @@ Operational requirements:
 - For screen evidence on macOS, prefer the workspace helper `glasshive-host-tools/capture-front-window.sh` and invoke it with `bash`.
 - For host browser or desktop tasks, first use the user's existing local app/session when the task asks for the main computer, Chrome, browser profile, local files, or installed OS tools. Do not claim host control is unavailable until you have checked the available local shell/desktop/browser automation paths.
 
+{GLASSHIVE_NATIVE_CAPABILITY_INVENTORY}
+
 {GLASSHIVE_WORKER_COMPLETION_CONTRACT}
 
 {GLASSHIVE_SAFETY_CHECKPOINT_RULE}
@@ -86,6 +288,7 @@ Required context files in this workspace:
 HOST_DEFAULT_AGENTS_MD = (
     "Follow these AGENTS.md project instructions and keep `work-log.md` updated.\n"
     "When the task involves the host browser, desktop, files, shell, or installed apps, operate on the real local machine session unless the project definition explicitly says sandbox.\n"
+    f"{GLASSHIVE_NATIVE_CAPABILITY_INVENTORY}\n"
     "Before `FINAL REPORT:`, inspect the concrete output, files/artifacts, tool results, or visible state you produced; compare it with the user's request and success criteria; then continue, fix, or report the exact blocker.\n"
     "End with `FINAL REPORT:` containing the user-facing result in the user's requested form; mention artifacts only when you intentionally created user-facing files and blockers only when they remain.\n"
 )
@@ -606,6 +809,18 @@ class BaseCliWorkerRuntime:
     def _parse_output(self, worker: dict, stdout: str, stderr: str, info: RuntimeInfo) -> tuple[str | None, str]:
         raise NotImplementedError
 
+    def _bootstrap_env_value(self, worker: dict, name: str) -> str:
+        try:
+            bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
+        except json.JSONDecodeError:
+            return ""
+        if not isinstance(bundle, dict):
+            return ""
+        env = bundle.get("env")
+        if not isinstance(env, dict):
+            return ""
+        return str(env.get(name) or "").strip()
+
     def _container_env(self, *keys: str) -> dict[str, str]:
         env: dict[str, str] = {
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -686,6 +901,8 @@ class BaseCliWorkerRuntime:
             "sandbox_state": sandbox["state"],
             "sandbox_image": sandbox["image"],
             "view_url": sandbox.get("view_url"),
+            "view_available": bool(sandbox.get("view_available") or sandbox.get("view_url")),
+            "view_health": sandbox.get("view_health"),
             "novnc_port": sandbox.get("novnc_port"),
             "selenium_port": sandbox.get("selenium_port"),
             "openclaw_port": sandbox.get("openclaw_port"),
@@ -1372,19 +1589,8 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
 class CodexCliRuntime(BaseCliWorkerRuntime):
     runtime_name = "codex-cli"
     worker_root_name = "codex_cli_runtime"
-    binary_env_var = "WPR_CODEX_BIN"
     binary_name = "codex"
-    _default_compatible_provider_disabled_features = (
-        "apps",
-        "plugins",
-        "browser_use",
-        "computer_use",
-        "multi_agent",
-        "image_generation",
-        "workspace_dependencies",
-        "tool_suggest",
-        "hooks",
-    )
+    _default_compatible_provider_disabled_features: tuple[str, ...] = ()
 
     def resolve_model(self, profile: str) -> str:
         if profile == "codex-cli":
@@ -1400,14 +1606,14 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             return
         subprocess.run(["git", "init", "-q"], cwd=workspace_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(
-            ["git", "config", "user.email", "worker@workers-projects-runtime.local"],
+            ["git", "config", "user.email", "worker@glasshive.local"],
             cwd=workspace_dir,
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         subprocess.run(
-            ["git", "config", "user.name", "Workers Projects Runtime"],
+            ["git", "config", "user.name", "GlassHive Runtime"],
             cwd=workspace_dir,
             check=False,
             stdout=subprocess.DEVNULL,
@@ -1475,18 +1681,6 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             return "medium"
         return sorted(allowed)[0] if allowed else ""
 
-    def _bootstrap_env_value(self, worker: dict, name: str) -> str:
-        try:
-            bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
-        except json.JSONDecodeError:
-            return ""
-        if not isinstance(bundle, dict):
-            return ""
-        env = bundle.get("env")
-        if not isinstance(env, dict):
-            return ""
-        return str(env.get(name) or "").strip()
-
     def _append_codex_compatible_provider_config(self, command: list[str], worker: dict) -> None:
         if not self._compatible_provider_enabled():
             return
@@ -1503,8 +1697,20 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         ).strip().lower()
         allowed_efforts = self._compatible_provider_allowed_reasoning_efforts()
         if reasoning_effort and reasoning_effort not in allowed_efforts:
+            requested_effort = reasoning_effort
             reasoning_effort = self._compatible_provider_reasoning_effort_fallback(allowed_efforts)
-        if self._env_flag("WPR_CODEX_CLI_IGNORE_USER_CONFIG", True):
+            logger.warning(
+                "Codex CLI reasoning effort clamped to provider-route fallback",
+                extra={
+                    "worker_id": str(worker.get("worker_id") or ""),
+                    "profile": str(worker.get("profile") or "codex-cli"),
+                    "model": str(worker.get("model") or self.resolve_model(worker.get("profile", "codex-cli"))),
+                    "requested_effort": requested_effort,
+                    "effective_effort": reasoning_effort,
+                    "allowed_efforts": ",".join(sorted(allowed_efforts)),
+                },
+            )
+        if self._env_flag("WPR_CODEX_CLI_IGNORE_USER_CONFIG", False):
             command.append("--ignore-user-config")
         for feature in self._compatible_provider_disabled_features():
             command.extend(["--disable", feature])
@@ -1659,7 +1865,6 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
 class ClaudeCodeRuntime(BaseCliWorkerRuntime):
     runtime_name = "claude-code"
     worker_root_name = "claude_code_runtime"
-    binary_env_var = "WPR_CLAUDE_CODE_BIN"
     binary_name = "claude"
 
     def resolve_model(self, profile: str) -> str:
@@ -1672,6 +1877,10 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         if worker.get("session_key") and not str(worker.get("session_key")).startswith("worker:"):
             return str(worker.get("session_key"))
         return f"claude-worker:{worker['worker_id']}"
+
+    def _chrome_enabled(self) -> bool:
+        raw = os.environ.get("WPR_CLAUDE_CODE_ENABLE_CHROME", "").strip().lower()
+        return raw not in {"0", "false", "no", "off", "disabled"}
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_key = self._read_session_key(worker["worker_id"])
@@ -1687,9 +1896,22 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             "--model",
             model,
         ]
+        if self._chrome_enabled():
+            command.insert(2, "--chrome")
+        effort = (
+            self._bootstrap_env_value(worker, "WPR_CLAUDE_CODE_EFFORT")
+            or os.environ.get("WPR_CLAUDE_CODE_EFFORT", "")
+        ).strip().lower()
+        if effort == "max":
+            command.extend(["--effort", effort])
+        elif effort and effort != "default":
+            logger.warning(
+                "Ignoring unsupported Claude Code effort",
+                extra={"worker_id": str(worker.get("worker_id") or ""), "effort": effort},
+            )
         if session_key and not session_key.startswith("claude-worker:"):
             command.extend(["--resume", session_key])
-        command.append(instruction)
+        command.append(_instruction_with_completion_contract(instruction))
         env = self._container_env(
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_BASE_URL",
@@ -1890,15 +2112,115 @@ class HostNativeCliMixin:
     def _host_codex_home(self, worker: dict) -> Path:
         return self._home_dir(worker["worker_id"]) / ".codex"
 
+    def _source_host_codex_home(self) -> Path:
+        return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+
     def _copy_host_codex_auth(self, target_codex_home: Path) -> None:
-        source_codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
-        source_auth = source_codex_home / "auth.json"
+        source_auth = self._source_host_codex_home() / "auth.json"
         if not source_auth.exists() or not source_auth.is_file():
             return
         target_codex_home.mkdir(parents=True, exist_ok=True)
         target_auth = target_codex_home / "auth.json"
         shutil.copy2(source_auth, target_auth)
         target_auth.chmod(0o600)
+
+    def _host_codex_native_mcp_allowlist(self) -> set[str]:
+        raw = os.environ.get(
+            "GLASSHIVE_HOST_CODEX_NATIVE_MCP_ALLOWLIST",
+            os.environ.get("WPR_HOST_CODEX_NATIVE_MCP_ALLOWLIST", ""),
+        ).strip()
+        if not raw:
+            return set(_HOST_CODEX_NATIVE_MCP_ALLOWLIST)
+        if raw.lower() in {"0", "false", "no", "off", "none", "disabled"}:
+            return set()
+        return {
+            item.strip()
+            for item in raw.split(",")
+            if item.strip() and re.fullmatch(r"[A-Za-z0-9_.-]+", item.strip())
+        }
+
+    def _host_codex_plugin_cache_root(self) -> Path:
+        raw = os.environ.get(
+            "GLASSHIVE_HOST_CODEX_PLUGIN_CACHE",
+            os.environ.get("WPR_HOST_CODEX_PLUGIN_CACHE", ""),
+        ).strip()
+        if raw:
+            return Path(raw).expanduser()
+        return self._source_host_codex_home() / "plugins" / "cache"
+
+    def _host_codex_bundled_mcp_config(self, names: set[str]) -> str:
+        if not names:
+            return ""
+        cache_root = self._host_codex_plugin_cache_root()
+        if not cache_root.exists():
+            return ""
+        blocks: list[str] = []
+        found: set[str] = set()
+        for manifest in sorted(cache_root.rglob(".mcp.json")):
+            try:
+                payload = json.loads(manifest.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            servers = payload.get("mcpServers") if isinstance(payload, dict) else None
+            if not isinstance(servers, dict):
+                continue
+            for name in sorted(names - found):
+                if name not in servers:
+                    continue
+                rendered = _render_codex_mcp_server_from_json(name, servers[name], manifest.parent)
+                if rendered:
+                    blocks.append(rendered)
+                    found.add(name)
+            if found >= names:
+                break
+        return "\n\n".join(blocks).strip()
+
+    def _host_codex_known_native_mcp_config(self, names: set[str]) -> str:
+        blocks: list[str] = []
+        if "computer-use" in names:
+            computer_use_client = (
+                self._source_host_codex_home()
+                / "computer-use"
+                / "Codex Computer Use.app"
+                / "Contents"
+                / "SharedSupport"
+                / "SkyComputerUseClient.app"
+                / "Contents"
+                / "MacOS"
+                / "SkyComputerUseClient"
+            )
+            if computer_use_client.exists():
+                blocks.append(
+                    "[mcp_servers.computer-use]\n"
+                    f"command = {_toml_string(computer_use_client)}\n"
+                    "args = [\"mcp\"]"
+                )
+        return "\n\n".join(blocks).strip()
+
+    def _host_codex_worker_config(self, codex_config_append: str) -> str:
+        append = codex_config_append.strip()
+        append_names = _codex_mcp_server_names(append)
+        preserve_names = self._host_codex_native_mcp_allowlist() - append_names
+        source_config_path = self._source_host_codex_home() / "config.toml"
+        preserved = ""
+        if source_config_path.exists() and source_config_path.is_file():
+            try:
+                source_config = source_config_path.read_text()
+            except OSError:
+                source_config = ""
+            preserved = _sanitize_codex_source_config(source_config, preserve_names, append_names)
+        preserved_names = _codex_mcp_server_names(preserved)
+        plugin_preserved = self._host_codex_bundled_mcp_config(preserve_names - preserved_names)
+        plugin_names = _codex_mcp_server_names(plugin_preserved)
+        known_native = self._host_codex_known_native_mcp_config(
+            preserve_names - preserved_names - plugin_names
+        )
+        native = "\n\n".join(
+            part for part in (preserved, plugin_preserved, known_native) if part.strip()
+        ).strip()
+        if append_names:
+            native = _strip_codex_mcp_server_blocks(native, append_names)
+        return "\n\n".join(part for part in (native, append) if part.strip()).strip()
 
     def _write_host_project_mcp_files(self, worker: dict, workspace: Path, bundle: dict[str, object]) -> None:
         """Project scoped MCP/client config for host-native workers.
@@ -1929,15 +2251,16 @@ class HostNativeCliMixin:
 
         codex_config_append = str(bundle.get("codex_config_append") or "").strip()
         if codex_config_append:
+            codex_config = self._host_codex_worker_config(codex_config_append)
             target = workspace / ".codex" / "config.toml"
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(codex_config_append + "\n")
+            target.write_text(codex_config + "\n")
             target.chmod(0o600)
             codex_home = self._host_codex_home(worker)
             codex_home.mkdir(parents=True, exist_ok=True)
             codex_home.chmod(0o700)
             codex_target = codex_home / "config.toml"
-            codex_target.write_text(codex_config_append + "\n")
+            codex_target.write_text(codex_config + "\n")
             codex_target.chmod(0o600)
             self._copy_host_codex_auth(codex_home)
 
@@ -2142,7 +2465,7 @@ class HostNativeCliMixin:
                 profile=profile,
                 execution_mode=execution_mode,
             )
-        issue = host_runtime_requirement_issue(profile, self.runtime_name)
+        issue = host_runtime_requirement_issue(profile, self.runtime_name, configured_binary=self.binary)
         if issue is not None:
             raise RuntimeDependencyMissingError(
                 issue.user_message,
@@ -2477,6 +2800,7 @@ class HostNativeCliMixin:
 
 class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
     worker_root_name = "host_codex_cli_runtime"
+    binary_env_var = "WPR_CODEX_BIN"
 
     def resolve_model(self, profile: str) -> str:
         if profile != "codex-cli":
@@ -2535,6 +2859,72 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
 
 class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
     worker_root_name = "host_claude_code_runtime"
+    binary_env_var = "WPR_CLAUDE_CODE_BIN"
+
+    def _chrome_supported(self) -> bool:
+        return self._help_supports("--chrome")
+
+    def _effort_supported(self) -> bool:
+        return self._help_supports("--effort")
+
+    def _help_supports(self, flag: str) -> bool:
+        resolved = shutil.which(self.binary)
+        if not resolved:
+            return False
+        try:
+            completed = subprocess.run(
+                [resolved, "--help"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            return False
+        return flag in f"{completed.stdout}\n{completed.stderr}"
+
+    def _requires_max_effort(self, worker: dict | None = None) -> bool:
+        worker = worker or {}
+        effort = (
+            self._bootstrap_env_value(worker, "WPR_CLAUDE_CODE_EFFORT")
+            or os.environ.get("WPR_CLAUDE_CODE_EFFORT", "")
+        ).strip().lower()
+        return effort == "max"
+
+    def _raise_missing_effort_support(self, profile: str, execution_mode: str) -> None:
+        raise RuntimeDependencyMissingError(
+            "Claude Code workers requested `max` effort, but the configured Claude Code CLI "
+            "does not expose the native --effort flag.",
+            binary=self.binary,
+            runtime_name=self.runtime_name,
+            profile=profile,
+            execution_mode=execution_mode,
+            dependency_label="Claude Code",
+            recovery_hint=(
+                "Update Claude Code to a version with native --effort support, or use default "
+                "Claude effort only when that lower-effort mode is intended."
+            ),
+        )
+
+    def preflight_worker_profile(self, profile: str, execution_mode: str = "host") -> None:
+        super().preflight_worker_profile(profile, execution_mode)
+        if os.environ.get("WPR_CLAUDE_CODE_EFFORT", "").strip().lower() == "max" and not self._effort_supported():
+            self._raise_missing_effort_support(profile, execution_mode)
+        if self._chrome_enabled() and not self._chrome_supported():
+            raise RuntimeDependencyMissingError(
+                "Claude Code host workers require a Claude Code CLI that supports --chrome, "
+                "or WPR_CLAUDE_CODE_ENABLE_CHROME=0 for an explicit locked-down launch.",
+                binary=self.binary,
+                runtime_name=self.runtime_name,
+                profile=profile,
+                execution_mode=execution_mode,
+                dependency_label="Claude Code",
+                recovery_hint=(
+                    "Update Claude Code to a version with Chrome integration, or explicitly disable "
+                    "host Claude Chrome support only when that locked-down mode is intended."
+                ),
+            )
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_key = self._read_session_key(worker["worker_id"])
@@ -2550,6 +2940,21 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
             "--model",
             model,
         ]
+        if self._chrome_enabled():
+            command.insert(2, "--chrome")
+        effort = (
+            self._bootstrap_env_value(worker, "WPR_CLAUDE_CODE_EFFORT")
+            or os.environ.get("WPR_CLAUDE_CODE_EFFORT", "")
+        ).strip().lower()
+        if effort == "max":
+            if not self._effort_supported():
+                self._raise_missing_effort_support(str(worker.get("profile") or "claude-code"), "host")
+            command.extend(["--effort", effort])
+        elif effort and effort != "default":
+            logger.warning(
+                "Ignoring unsupported Claude Code effort",
+                extra={"worker_id": str(worker.get("worker_id") or ""), "effort": effort},
+            )
         if session_key and not session_key.startswith("claude-worker:"):
             command.extend(["--resume", session_key])
         command.append(self._instruction_with_completion_contract(instruction))

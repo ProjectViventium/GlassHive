@@ -57,17 +57,30 @@ GLASSHIVE_WORKER_COMPLETION_CONTRACT = (
     "GlassHive completion contract:\n"
     "- Do the requested work before reporting completion.\n"
     "- Before `FINAL REPORT:`, inspect the concrete output/artifacts/tool results/visible state you produced against the user's request and success criteria, constraints, and files, and keep working or remediate if they do not match. Report a concrete blocker only when you cannot complete it.\n"
+    "- For research/source-gathering work, preserve citations and evidence, but do not dump large raw webpages, docs, logs, or command outputs into the conversation context. Save working notes/excerpts to files when useful and bring back concise source-grounded summaries so the task can continue without overflowing or destabilizing the provider route.\n"
+    "- When the request calls for a report, document, deck, client deliverable, or other shareable work product and the user did not ask for a technical/source format, make the primary user-facing output a polished ordinary end-user artifact such as PDF, DOCX, PPTX, spreadsheet, or another appropriate professional format. Markdown, HTML, or source files may be included as supporting artifacts, but should not be the only default deliverable for that class of work unless the runtime cannot create a professional artifact; if blocked, say so concretely.\n"
     "- Your final assistant message MUST end with a separate section exactly named `FINAL REPORT:`.\n"
     "- Put only the user-facing result after `FINAL REPORT:`. Include the concrete outcome, key facts, artifact/file names when useful, blockers, or the next decision needed.\n"
     "- If the user requested a very short answer or an exact string, put only that answer after `FINAL REPORT:`.\n"
     "- Do not put progress narration after `FINAL REPORT:`."
 )
+GLASSHIVE_NATIVE_CAPABILITY_INVENTORY = """Native capability inventory (choose when relevant, never forced):
+
+- You may have worker-native CLI, browser, computer-use, MCP, plugin, and skill surfaces. Inspect what is actually available before saying a capability is unavailable, and do not claim to have used a capability unless you have evidence.
+- Claude Code workers are expected to be provisioned with Claude Code's native browser/computer-use capability when available, plus Claude Code skill/plugin families for document-skills, doc-coauthoring, theme-factory, daymade deep-research, daymade fact-checker, daymade ppt-creator, daymade excel-automation, daymade doc-to-markdown, academic-research-skills for academic/literature-review work, and NVIDIA AI-Q for enterprise/private deep research when configured.
+- Claude Code skill families to consider when relevant: anthropic document-skills; anthropic doc-coauthoring; anthropic theme-factory; daymade deep-research; daymade fact-checker; daymade ppt-creator; daymade excel-automation; daymade doc-to-markdown; academic-research-skills for academic/literature-review work; NVIDIA AI-Q for enterprise/private deep research when configured.
+- Codex workers are expected to be provisioned with Codex's native browser/computer-use, MCP, plugin, and skill surfaces when available, plus skill/plugin families for PDFs, notebooks, screenshots, research documentation, Office artifacts, deep research, fact checking, spreadsheets, and decks.
+- Codex skill families to consider when relevant: openai pdf; openai jupyter-notebook; openai screenshot; openai notion-research-documentation; anthropic docx; anthropic pptx; anthropic xlsx; anthropic pdf; daymade deep-research; daymade fact-checker; daymade excel-automation; daymade ppt-creator.
+- Use these capabilities when relevant based on the user's request. Do not overfit to examples, force a specific tool, or replace the worker's own planning and review with host-authored workflows. Plan, execute, inspect, identify gaps/issues/misalignments, and fix them before the final delivery.
+"""
 GLASSHIVE_WORKER_PROJECT_CONTRACT = f"""# GlassHive Worker Contract
 
 - You are a general intelligent worker. Less is more: preserve the user's real goal, constraints, files, MCP/tool capabilities, and context without inventing project goals, success criteria, provider lists, forced artifacts, output schemas, rankings, or workflow steps.
 - Treat MCP/tools as available capabilities, not proof that work was done. Use brokered MCP/tools when configured and appropriate; if a needed tool, grant, auth, file, or runtime is absent or fails, report that concrete blocker instead of pretending to have used it.
 - Keep data in and data out exact. Read the actual workspace files, uploaded paths, MCP/tool results, generated outputs, and visible state before relying on them.
 - Mention user-facing artifacts/files only when you intentionally created them, they are needed, or the user asked for them. Do not force a download when a concise chat answer satisfies the request.
+
+{GLASSHIVE_NATIVE_CAPABILITY_INVENTORY}
 
 {GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS}
 
@@ -114,10 +127,13 @@ USER_PROVIDER_SECRET_ENV_PREFIXES = (
 )
 USER_PROVIDER_SECRET_ENV_MARKERS = (
     "ACCESS_TOKEN",
+    "CLIENT_SECRET",
     "ID_TOKEN",
     "OAUTH",
     "REFRESH_TOKEN",
+    "SECRET",
     "SESSION_TOKEN",
+    "TOKEN",
 )
 
 
@@ -313,6 +329,8 @@ def bootstrap_env_for(worker: dict[str, Any]) -> dict[str, str]:
             if value is None:
                 continue
             env_key = str(key)
+            if _looks_like_user_provider_secret_env_key(env_key):
+                continue
             if allowed is not None and env_key not in allowed:
                 continue
             env[env_key] = str(value)
@@ -686,7 +704,8 @@ def _strip_codex_mcp_server_blocks(config_text: str, names: set[str]) -> str:
         section = re.match(r"^\s*\[([^\]]+)\]\s*$", line)
         if section:
             section_name = section.group(1).strip()
-            skipping = section_name.startswith("mcp_servers.") and section_name[len("mcp_servers.") :] in names
+            server_name = section_name[len("mcp_servers.") :].split(".", 1)[0].strip("\"'")
+            skipping = section_name.startswith("mcp_servers.") and server_name in names
         if not skipping:
             output.append(line)
     return "\n".join(output).rstrip()

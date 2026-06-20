@@ -404,7 +404,8 @@ Do these in order:
 3. re-export policy-approved native MCP tools through one broker MCP with namespaced tool names
 4. inject the broker MCP into GlassHive launch/create/run/schedule `bootstrap_bundle_json` paths
 5. keep provider tokens server-side and issue only short-lived broker grants
-6. add host-native `.mcp.json` / `.claude/settings.local.json` / Codex config parity
+6. add host-native `.mcp.json` / `.claude/settings.local.json` / Codex config parity, preserving
+   the worker CLI's native browser/computer/MCP capability surface before appending broker grants
 7. run shadow QA before retiring any Google/MS365/background-agent path
 
 Do not start with generic “bidirectional MCP federation.”

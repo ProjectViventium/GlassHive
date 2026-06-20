@@ -5,11 +5,12 @@ import json
 import mimetypes
 import os
 import hmac
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 from html import escape
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -49,11 +50,22 @@ from .service import (
     allowed_worker_profiles,
     merge_bootstrap_bundle,
 )
-from .signed_links import append_signed_query, sign_link_params, sign_link_token, verify_signed_link, verify_signed_link_token
+from .signed_links import (
+    append_signed_query,
+    create_signed_link_ref,
+    install_sensitive_url_log_filter,
+    resolve_signed_link_ref,
+    sign_link_params,
+    signed_link_ref_url,
+    sign_link_token,
+    verify_signed_link,
+    verify_signed_link_token,
+)
 from .store import Store
 from .terminal_takeover import TerminalTarget, bridge_terminal
 
 load_viventium_runtime_env()
+install_sensitive_url_log_filter()
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "runtime_phase1.db"
 TEXT_ARTIFACT_PREVIEW_EXTENSIONS = {
@@ -91,6 +103,7 @@ ARTIFACT_DOWNLOAD_SECURITY_HEADERS = {
     "Pragma": "no-cache",
     "X-Content-Type-Options": "nosniff",
 }
+SIGNED_QUERY_KEYS = {"gh_token", "gh_sig", "gh_exp", "gh_kind"}
 
 
 def _build_runtime(runtime_backend: str, db_path: str, runtime: WorkerRuntime | None) -> WorkerRuntime:
@@ -124,7 +137,7 @@ def create_app(
             service.shutdown()
 
     app = FastAPI(
-        title="Glass Hive Runtime Phase 1",
+        title="GlassHive Runtime",
         version="0.3.0",
         lifespan=lifespan,
     )
@@ -242,7 +255,9 @@ def create_app(
         "/docs",
         "/openapi.json",
         "/redoc",
+        "/r/",
         "/ui",
+        "/v1/link-refs",
         "/v1/signed-links",
         "/favicon.ico",
     )
@@ -422,6 +437,7 @@ def create_app(
                 raise HTTPException(status_code=400, detail="Claude effort must be default or max")
             if effort == "default":
                 return None
+            return {"env": {"WPR_CLAUDE_CODE_EFFORT": effort}}
         elif profile == "openclaw-general":
             if effort not in {"default", "high", "max"}:
                 raise HTTPException(status_code=400, detail="OpenClaw effort must be default, high, or max")
@@ -478,6 +494,26 @@ def create_app(
                 raise HTTPException(status_code=404, detail="Run not found")
         return run
 
+    def _profile_for_project(project: dict, requested_profile: str | None) -> str:
+        return (
+            str(requested_profile or "").strip()
+            or str(project.get("default_worker_profile") or "").strip()
+            or _configured_default_worker_profile()
+        )
+
+    def _configured_default_execution_mode() -> str:
+        mode = (
+            os.environ.get("GLASSHIVE_DEFAULT_EXECUTION_MODE", "").strip().lower()
+            or os.environ.get("WPR_DEFAULT_EXECUTION_MODE", "docker").strip().lower()
+        )
+        return mode if mode in {"docker", "host"} else "docker"
+
+    def _execution_mode_for_request(requested_mode: str | None) -> str:
+        mode = str(requested_mode or "").strip().lower() or _configured_default_execution_mode()
+        if mode not in {"docker", "host"}:
+            raise HTTPException(status_code=400, detail="execution_mode must be docker or host")
+        return mode
+
     def absolute_ui_url(request: Request, worker_id: str) -> str:
         return f"{str(request.base_url).rstrip('/')}/ui/workers/{worker_id}"
 
@@ -497,6 +533,46 @@ def create_app(
             "gh_sig": str(request.query_params.get("gh_sig") or "").strip(),
         }
         return legacy if all(legacy.values()) else {}
+
+    def _strip_signed_query_params(url: str) -> str:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(str(url or ""))
+        query = urlencode(
+            [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key not in SIGNED_QUERY_KEYS]
+        )
+        return parsed._replace(query=query).geturl()
+
+    def _worker_cookie_name(worker_id: str) -> str:
+        clean = str(worker_id or "").strip()
+        if not clean or any(char in clean for char in "/\\;\x00"):
+            raise HTTPException(status_code=400, detail="Invalid worker id")
+        return f"glasshive_gh_token_{clean}"
+
+    def _request_uses_https(request: Request) -> bool:
+        forwarded_proto = str(request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+        return request.url.scheme == "https" or forwarded_proto == "https"
+
+    def _set_signed_worker_cookie(
+        response: Response,
+        request: Request,
+        *,
+        worker_id: str,
+        token: str,
+        payload: dict[str, object],
+    ) -> None:
+        try:
+            cookie_max_age = max(1, min(30 * 60, int(payload.get("exp") or 0) - int(time.time())))
+        except (TypeError, ValueError):
+            cookie_max_age = 30 * 60
+        response.set_cookie(
+            _worker_cookie_name(worker_id),
+            str(token or ""),
+            max_age=cookie_max_age,
+            httponly=True,
+            samesite="lax",
+            secure=_request_uses_https(request),
+        )
 
     def _runtime_details(worker: dict) -> dict[str, object]:
         if hasattr(runtime_impl, "describe_worker"):
@@ -536,8 +612,16 @@ def create_app(
             handle.seek(max(size - max_bytes, 0))
             return _redact_text(handle.read().decode("utf-8", errors="replace"))
 
+    def _profile_runtime_label(worker: dict) -> str:
+        profile = str(worker.get("profile") or "").strip()
+        if profile in {"codex-cli", "claude-code"}:
+            return profile
+        if profile.startswith("openclaw"):
+            return "openclaw"
+        return str(worker.get("runtime") or "").strip()
+
     def _log_paths(worker: dict) -> tuple[Path, Path]:
-        runtime_name = str(worker.get("runtime") or "")
+        runtime_name = _profile_runtime_label(worker)
         if str(worker.get("execution_mode") or "docker") == "host":
             root_map = {
                 "openclaw": "host_openclaw_runtime",
@@ -681,7 +765,8 @@ def create_app(
             path=str(relative_path or "").strip().lstrip("/"),
         )
         if token:
-            return f"/v1/signed-links/{quote(token, safe='')}"
+            ref_id = create_signed_link_ref(token=token)
+            return signed_link_ref_url("", ref_id) if ref_id else ""
         return _artifact_query_url(worker_id, fallback_action, relative_path)
 
     def _signed_watch_action_url(worker: dict) -> str:
@@ -695,7 +780,9 @@ def create_app(
             owner_id=str(worker.get("owner_id") or ""),
         )
         if token:
-            return append_signed_query(watch_url, {"gh_token": token})
+            target_url = append_signed_query(watch_url, {"gh_token": token})
+            ref_id = create_signed_link_ref(token=token, target_url=target_url)
+            return signed_link_ref_url("", ref_id, route="/r") if ref_id else ""
         return watch_url
 
     def _deliverable_with_action_urls(worker: dict, deliverable: dict[str, object] | None) -> dict[str, object] | None:
@@ -852,6 +939,14 @@ def create_app(
 
     def _sanitize_worker(worker: dict) -> dict[str, object]:
         safe = dict(worker)
+        profile = str(safe.get("profile") or "").strip()
+        runtime = str(safe.get("runtime") or "").strip()
+        if profile in {"codex-cli", "claude-code"}:
+            safe["backend"] = profile
+        elif profile.startswith("openclaw"):
+            safe["backend"] = "openclaw"
+        elif runtime:
+            safe["backend"] = runtime
         safe.pop("gateway_token", None)
         safe.pop("bootstrap_bundle_json", None)
         return safe
@@ -974,11 +1069,18 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict[str, object]:
+        default_profile = _configured_default_worker_profile()
+        visible_runtime_backend = resolved_runtime_backend
+        if resolved_runtime_backend == "openclaw":
+            visible_runtime_backend = (
+                _profile_runtime_label({"profile": default_profile, "runtime": resolved_runtime_backend})
+                or resolved_runtime_backend
+            )
         payload: dict[str, object] = {
             "status": "ok",
             "version": app.version,
-            "runtime_backend": resolved_runtime_backend,
-            "default_worker_profile": _configured_default_worker_profile(),
+            "runtime_backend": visible_runtime_backend,
+            "default_worker_profile": default_profile,
             "allowed_worker_profiles": allowed_worker_profiles(),
         }
         if not auth_settings.enterprise:
@@ -1046,14 +1148,16 @@ def create_app(
         project = require_project(project_id, request)
         owner_id = _request_owner(ctx, payload.owner_id)
         tenant_id = str(project.get("tenant_id") or ctx.tenant_id if ctx.enterprise else "local")
+        profile = _profile_for_project(project, payload.profile)
+        execution_mode = _execution_mode_for_request(payload.execution_mode)
         worker = service.create_worker(
             project_id=project_id,
             owner_id=owner_id,
             name=payload.name,
             role=payload.role,
-            profile=payload.profile,
+            profile=profile,
             backend=payload.backend,
-            execution_mode=payload.execution_mode,
+            execution_mode=execution_mode,
             alias=scoped_alias(ctx, payload.alias or payload.name) if ctx.enterprise else payload.alias,
             workspace_root=payload.workspace_root,
             bootstrap_profile=payload.bootstrap_profile,
@@ -1069,7 +1173,9 @@ def create_app(
         project = require_project(project_id, request)
         owner_id = _request_owner(ctx, payload.owner_id)
         tenant_id = str(project.get("tenant_id") or ctx.tenant_id if ctx.enterprise else "local")
-        alias = (payload.alias or payload.name or payload.profile).strip()
+        profile = _profile_for_project(project, payload.profile)
+        execution_mode = _execution_mode_for_request(payload.execution_mode)
+        alias = (payload.alias or payload.name or profile).strip()
         if ctx.enterprise:
             alias = scoped_alias(ctx, alias)
         worker = service.find_or_create_worker(
@@ -1077,10 +1183,10 @@ def create_app(
             owner_id=owner_id,
             name=payload.name,
             role=payload.role,
-            profile=payload.profile,
+            profile=profile,
             backend=payload.backend,
             alias=alias,
-            execution_mode=payload.execution_mode,
+            execution_mode=execution_mode,
             workspace_root=payload.workspace_root,
             bootstrap_profile=payload.bootstrap_profile,
             bootstrap_bundle=payload.bootstrap_bundle,
@@ -1273,13 +1379,13 @@ def create_app(
                 supported=True,
                 url=absolute_view_url(request, worker_id),
                 mode="workstation-desktop",
-                notes="Phase 1 takeover exposes the worker workstation desktop through a live browser view, with terminal control still available as a secondary surface.",
+                notes="GlassHive takeover exposes the worker workstation desktop through a live browser view, with terminal control still available as a secondary surface.",
             )
         return TakeoverInfo(
             supported=True,
             url=absolute_terminal_url(request, worker_id),
             mode="web-terminal",
-            notes="Phase 1 takeover is a real terminal session in the worker runtime. Desktop streaming stays deferred for this worker type.",
+            notes="GlassHive takeover is a real terminal session in the worker runtime. Desktop streaming stays deferred for this worker type.",
         )
 
     @app.get("/v1/workers/{worker_id}/artifacts/latest-image")
@@ -1290,11 +1396,30 @@ def create_app(
             raise HTTPException(status_code=404, detail="No image artifacts found for this worker")
         return FileResponse(latest)
 
-    @app.get("/v1/signed-links/{token}")
-    def open_signed_link(token: str, request: Request) -> Response:
-        payload = verify_signed_link_token(token)
-        if not payload:
-            raise HTTPException(status_code=401, detail="Signed link is invalid or expired")
+    def _require_authenticated_link_ref_scope(payload: dict[str, object], request: Request) -> None:
+        ctx = _auth_context(request)
+        if not ctx.enterprise:
+            return
+        tenant_id = str(payload.get("tenant_id") or "")
+        owner_id = str(payload.get("owner_id") or "")
+        if tenant_id != ctx.tenant_id or owner_id != ctx.owner_id:
+            raise HTTPException(status_code=404, detail="GlassHive link not found for this user")
+
+    def _fresh_worker_view_token(payload: dict[str, object]) -> tuple[str, dict[str, object]]:
+        worker_id = str(payload.get("worker_id") or "").strip()
+        token = sign_link_token(
+            kind="worker_view",
+            worker_id=worker_id,
+            tenant_id=str(payload.get("tenant_id") or ""),
+            owner_id=str(payload.get("owner_id") or ""),
+            path=str(payload.get("path") or ""),
+        )
+        refreshed_payload = verify_signed_link_token(token) if token else None
+        if not token or not isinstance(refreshed_payload, dict):
+            raise HTTPException(status_code=500, detail="GlassHive workspace session could not be refreshed")
+        return token, refreshed_payload
+
+    def _open_verified_signed_link(payload: dict[str, object], request: Request) -> Response:
         worker_id = str(payload.get("worker_id") or "").strip()
         worker = store.get_worker(worker_id)
         if not worker:
@@ -1319,6 +1444,50 @@ def create_app(
             store.add_event(worker["project_id"], worker_id, None, "worker.artifact_downloaded", target.name)
             return FileResponse(target, filename=target.name, headers=ARTIFACT_DOWNLOAD_SECURITY_HEADERS)
         raise HTTPException(status_code=400, detail="Signed link kind is not supported")
+
+    @app.get("/v1/signed-links/{token}")
+    def open_signed_link(token: str, request: Request) -> Response:
+        payload = verify_signed_link_token(token)
+        if not payload:
+            raise HTTPException(status_code=401, detail="Signed link is invalid or expired")
+        return _open_verified_signed_link(payload, request)
+
+    @app.get("/v1/link-refs/{ref_id}")
+    def open_signed_link_ref(ref_id: str, request: Request) -> Response:
+        record = resolve_signed_link_ref(ref_id)
+        if not record:
+            raise HTTPException(status_code=401, detail="Signed link reference is invalid or expired")
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=401, detail="Signed link reference is invalid or expired")
+        _require_authenticated_link_ref_scope(payload, request)
+        return _open_verified_signed_link(payload, request)
+
+    @app.get("/r/{ref_id}")
+    def open_relative_signed_link_ref(ref_id: str, request: Request) -> Response:
+        record = resolve_signed_link_ref(ref_id)
+        if not record:
+            raise HTTPException(status_code=401, detail="Signed link reference is invalid or expired")
+        payload = record.get("payload")
+        if not isinstance(payload, dict) or str(payload.get("kind") or "") != "worker_view":
+            raise HTTPException(status_code=403, detail="This GlassHive link cannot open a workspace")
+        _require_authenticated_link_ref_scope(payload, request)
+        worker_id = str(payload.get("worker_id") or "").strip()
+        if not worker_id:
+            raise HTTPException(status_code=401, detail="Signed link reference is invalid or expired")
+        target_url = _strip_signed_query_params(str(record.get("target_url") or "").strip())
+        if not target_url:
+            raise HTTPException(status_code=400, detail="Signed link reference has no target")
+        response = RedirectResponse(target_url, status_code=307)
+        session_token, session_payload = _fresh_worker_view_token(payload)
+        _set_signed_worker_cookie(
+            response,
+            request,
+            worker_id=worker_id,
+            token=session_token,
+            payload=session_payload,
+        )
+        return response
 
     @app.get("/v1/workers/{worker_id}/artifacts")
     def list_worker_artifacts(worker_id: str, request: Request) -> dict[str, object]:
@@ -1408,14 +1577,14 @@ def create_app(
         body = "".join(project_items) or "<p>No projects yet.</p>"
         docs_link = f"<p><a href='{escape(str(request.base_url).rstrip('/'))}/docs'>OpenAPI docs</a></p>" if show_internal else ""
         return (
-            "<html><head><title>Workers Projects Runtime</title>"
+            "<html><head><title>GlassHive Workspace Runtime</title>"
             "<style>body{font-family:system-ui,sans-serif;margin:2rem;max-width:1100px;}"
             "section{border:1px solid #ddd;padding:1rem;border-radius:12px;margin-bottom:1rem;}"
             "code,pre{background:#f6f6f6;padding:.2rem .4rem;border-radius:6px;}"
             "input,textarea,button{font:inherit;padding:.55rem;}"
             "</style></head><body>"
-            "<h1>Workers Projects Runtime</h1>"
-            f"<p>Phase 1 standalone worker control plane. Default worker: {escape(default_profile)}.</p>"
+            "<h1>GlassHive Workspace Runtime</h1>"
+            f"<p>Standalone workspace control plane. Default worker profile: {escape(default_profile)}.</p>"
             f"{docs_link}"
             "<section>"
             "<h2>Create project</h2>"
@@ -1462,6 +1631,11 @@ def create_app(
         selected_runtime_details = _runtime_details(selected_worker) if selected_worker else {}
         selected_view_url = str(selected_runtime_details.get("view_url") or "").strip()
         selected_is_host = str((selected_worker or {}).get("execution_mode") or "docker") == "host"
+        project_default_profile = (
+            str(project.get("default_worker_profile") or "").strip()
+            or _configured_default_worker_profile()
+        )
+        project_default_profile_json = json.dumps(project_default_profile)
         selected_latest_image_url = (
             f"/v1/workers/{selected_worker['worker_id']}/artifacts/latest-image" if selected_worker and _latest_image_path(selected_worker) else ""
         )
@@ -1544,6 +1718,11 @@ def create_app(
                     """
             workstation_tools_card = ""
             if selected_worker:
+                openclaw_action_button = (
+                    '<button onclick="desktopAction(\'openclaw\')">Open OpenClaw</button>'
+                    if str(selected_worker.get("profile") or "").startswith("openclaw")
+                    else ""
+                )
                 tools_label = "Host Computer Tools" if selected_is_host else "Workstation Tools"
                 tools_description = (
                     "These request real surfaces on the host computer for this worker."
@@ -1557,13 +1736,13 @@ def create_app(
                   <div class="actions">
                     <button onclick="desktopAction('terminal')">Open Shell</button>
                     <button onclick="desktopAction('files')">Open Files</button>
-                    <button onclick="desktopAction('browser')">Open Browser</button>
-                    <button onclick="desktopAction('codex')">Open Codex</button>
-                    <button onclick="desktopAction('claude')">Open Claude</button>
-                    <button onclick="desktopAction('openclaw')">Open OpenClaw</button>
-                    <button onclick="desktopAction('focus_browser')">Raise Browser</button>
-                  </div>
-                </div>
+	                    <button onclick="desktopAction('browser')">Open Browser</button>
+	                    <button onclick="desktopAction('codex')">Open Codex</button>
+	                    <button onclick="desktopAction('claude')">Open Claude</button>
+	                    {openclaw_action_button}
+	                    <button onclick="desktopAction('focus_browser')">Raise Browser</button>
+	                  </div>
+	                </div>
                 """
             latest_artifact_card = ""
             if selected_latest_image_url:
@@ -1649,13 +1828,13 @@ def create_app(
                   </select>
                   <div id="new-worker-fields" style="display:{'none' if selected_worker else 'block'}; margin-top: .75rem;">
                     <p><input id="worker-name" placeholder="Worker name" value="New Worker"/></p>
-                    <p><input id="worker-owner" placeholder="Owner ID" value="{escape(project['owner_id'])}"/></p>
-                    <p><input id="worker-role" placeholder="Role" value="research"/></p>
-                    <p><select id="worker-profile">
-                      <option value="openclaw-general"{' selected' if (project.get('default_worker_profile') or 'openclaw-general') == 'openclaw-general' else ''}>OpenClaw</option>
-                      <option value="claude-code"{' selected' if (project.get('default_worker_profile') or '') == 'claude-code' else ''}>Claude Code</option>
-                      <option value="codex-cli"{' selected' if (project.get('default_worker_profile') or '') == 'codex-cli' else ''}>Codex CLI</option>
-                    </select></p>
+	                    <p><input id="worker-owner" placeholder="Owner ID" value="{escape(project['owner_id'])}"/></p>
+	                    <p><input id="worker-role" placeholder="Role" value="research"/></p>
+	                    <p><select id="worker-profile">
+	                      <option value="openclaw-general"{' selected' if project_default_profile == 'openclaw-general' else ''}>OpenClaw</option>
+	                      <option value="claude-code"{' selected' if project_default_profile == 'claude-code' else ''}>Claude Code</option>
+	                      <option value="codex-cli"{' selected' if project_default_profile == 'codex-cli' else ''}>Codex CLI</option>
+	                    </select></p>
                   </div>
                   <p><strong>Project Prompt</strong></p>
                   <textarea id="instruction" placeholder="Describe what this worker should do right now."></textarea>
@@ -1738,7 +1917,7 @@ def create_app(
                 const owner_id = document.getElementById('worker-owner').value.trim();
                 const name = document.getElementById('worker-name').value.trim();
                 const role = document.getElementById('worker-role').value.trim() || 'research';
-                const profile = document.getElementById('worker-profile').value.trim() || 'openclaw-general';
+                const profile = document.getElementById('worker-profile').value.trim() || {project_default_profile_json};
                 if (!owner_id || !name) {{
                   alert('worker owner and name are required');
                   return '';
@@ -1746,7 +1925,7 @@ def create_app(
                 const res = await fetch(`/v1/projects/${{projectId}}/workers`, {{
                   method: 'POST',
                   headers: {{ 'Content-Type': 'application/json' }},
-                  body: JSON.stringify({{ owner_id, name, role, profile, backend: 'openclaw' }})
+                  body: JSON.stringify({{ owner_id, name, role, profile }})
                 }});
                 if (!res.ok) {{
                   alert(await res.text());
@@ -1973,6 +2152,11 @@ def create_app(
         stderr_console = escape(console["stderr"] or "No stderr yet.") if show_internal else "Diagnostics hidden in enterprise member view."
         workstation_tools = ""
         tools_label = "Host Computer Tools" if is_host_worker else "Workstation Tools"
+        openclaw_action_button = (
+            '<button onclick="desktopAction(\'openclaw\')">Open OpenClaw</button>'
+            if str(worker.get("profile") or "").startswith("openclaw")
+            else ""
+        )
         workstation_tools = f"""
                 <h3>{tools_label}</h3>
                 <div class="actions">
@@ -1981,7 +2165,7 @@ def create_app(
                   <button onclick="desktopAction('browser')">Open Browser</button>
                   <button onclick="desktopAction('codex')">Open Codex</button>
                   <button onclick="desktopAction('claude')">Open Claude</button>
-                  <button onclick="desktopAction('openclaw')">Open OpenClaw</button>
+                  {openclaw_action_button}
                   <button onclick="desktopAction('focus_browser')">Raise Browser</button>
                 </div>
             """
@@ -2230,6 +2414,11 @@ def create_app(
         signed_query = str(request.url.query or "") if "gh_sig=" in str(request.url.query or "") else ""
         signed_query_suffix = f"?{escape(signed_query, quote=True)}" if signed_query else ""
         signed_query_json = json.dumps(signed_query)
+        openclaw_action_button = (
+            '<button onclick="desktopAction(\'openclaw\')">OpenClaw</button>'
+            if str(worker.get("profile") or "").startswith("openclaw")
+            else ""
+        )
         meta_identity = (
             escape(str(runtime_details.get("container_name") or worker.get("session_key") or worker_id))
             if show_internal
@@ -2290,7 +2479,7 @@ def create_app(
                 <button onclick="desktopAction('browser')">Browser</button>
                 <button onclick="desktopAction('codex')">Codex</button>
                 <button onclick="desktopAction('claude')">Claude</button>
-                <button onclick="desktopAction('openclaw')">OpenClaw</button>
+                {openclaw_action_button}
               </div>
             </header>
             <div class="notice">

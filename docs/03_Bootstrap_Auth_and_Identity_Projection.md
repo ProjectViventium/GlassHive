@@ -134,6 +134,14 @@ explicitly enabled later.
 Host-native CLI subprocesses receive a minimal runtime environment. Parent process secrets, provider
 API keys, callback secrets, and LibreChat internals are not inherited by default.
 
+Capability projection is additive, not substitutive. When GlassHive writes worker-local CLI config
+for broker MCP grants, it must preserve the selected worker type's native host capabilities unless
+an operator explicitly configured a locked-down profile. For Codex host workers this means the
+worker-local `CODEX_HOME/config.toml` keeps allowlisted native MCP/tool definitions, including
+bundled plugin manifests such as computer-use when present, then appends the scoped
+`glasshive-user-capabilities` broker block. For Claude Code host workers this means launching with
+the CLI's native Chrome integration enabled when the installed CLI supports it.
+
 Current validated local footprints on this machine:
 
 - Codex auth state exists in `~/.codex/auth.json`
@@ -186,6 +194,8 @@ This keeps Glass Hive independent and publishable outside the Viventium stack.
   which connected-account tool to call without the host chat model choosing for it
 - grant-bearing MCP config, Claude local settings, and Codex config files are written with
   owner-only permissions in both host-native and sandbox materialization paths
+- broker config must not erase native worker/browser/computer/MCP capabilities; it is added beside
+  them so the worker can choose direct native tools, brokered connected-account tools, or both
 - `context` may mention the broker compactly, but large schemas, token material, and provider
   credential state belong in bootstrap/tool results, not prompt text
 

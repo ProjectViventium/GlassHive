@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 ProjectStatus = Literal["active", "paused", "completed", "archived", "failed"]
 WorkerState = Literal[
@@ -49,9 +49,18 @@ class CreateWorkerRequest(BaseModel):
     owner_id: str
     name: str
     role: str
-    profile: str = "openclaw-general"
-    backend: str = "openclaw"
-    execution_mode: ExecutionMode = "docker"
+    profile: str = Field(
+        default="",
+        description="Worker profile selector. Empty means use the project/deployment default.",
+    )
+    backend: str = Field(
+        default="",
+        description="Deprecated compatibility field. Runtime is derived from profile and execution_mode.",
+    )
+    execution_mode: str = Field(
+        default="",
+        description="Execution mode, host or docker. Empty means use the deployment default.",
+    )
     alias: str | None = None
     workspace_root: str | None = None
     bootstrap_profile: str | None = None
@@ -77,7 +86,7 @@ class WorkerResponse(BaseModel):
     backend: str
     execution_mode: ExecutionMode = "docker"
     alias: str | None = None
-    runtime: str = "openclaw"
+    runtime: str = ""
     model: str = ""
     state: WorkerState
     bootstrap_profile: str | None = None
@@ -95,6 +104,24 @@ class WorkerResponse(BaseModel):
     last_error: str | None = None
     created_at: str
     updated_at: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def derive_legacy_backend_from_profile(cls, data):
+        if not isinstance(data, dict):
+            return data
+        profile = str(data.get("profile") or "").strip()
+        runtime = str(data.get("runtime") or "").strip()
+        if profile in {"codex-cli", "claude-code"}:
+            data = dict(data)
+            data["backend"] = profile
+        elif profile.startswith("openclaw"):
+            data = dict(data)
+            data["backend"] = "openclaw"
+        elif runtime:
+            data = dict(data)
+            data["backend"] = runtime
+        return data
 
 
 class AssignRunRequest(BaseModel):

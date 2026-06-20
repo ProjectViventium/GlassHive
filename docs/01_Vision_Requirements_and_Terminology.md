@@ -90,6 +90,16 @@ Examples:
 - `claude-code`
 - `openclaw-general`
 
+The worker profile plus execution mode is the runtime selector. The legacy API field
+`backend=openclaw` may still appear for compatibility, but it must not be presented as the product
+backend or used to override `codex-cli`, `claude-code`, or `openclaw-general` profile selection.
+
+There are three separate OpenClaw concepts that must not be collapsed:
+
+- `integrations.openclaw` is a lab/integration toggle.
+- `@openclaw` is a mention/activation alias.
+- `openclaw-general` is a worker profile, selected the same way as `codex-cli` or `claude-code`.
+
 ### Project
 The durable task definition around one or more workers, including goal, success criteria, continuity, and audit trail.
 

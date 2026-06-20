@@ -8,13 +8,13 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, parse_qsl, quote, urlencode, unquote, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, unquote, urlparse
 
 import httpx
 import websockets
 from fastapi import Body, FastAPI, HTTPException, Request, WebSocket
 from starlette.websockets import WebSocketDisconnect
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -26,7 +26,14 @@ from .prompt_template import (
     normalize_launch_surface,
 )
 from .runtime_client import RuntimeClient
-from .signed_links import sign_link_token, verify_signed_link_token
+from .signed_links import (
+    create_signed_link_ref,
+    install_sensitive_url_log_filter,
+    resolve_signed_link_ref,
+    signed_link_ref_url,
+    sign_link_token,
+    verify_signed_link_token,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SAFE_WORKER_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -43,6 +50,11 @@ RUNTIME_ENV_KEYS = {
     "GLASSHIVE_OPERATOR_BASE_URL",
     "GLASSHIVE_RUNTIME_BASE_URL",
     "GLASSHIVE_SIGNED_LINK_SECRET",
+    "GLASSHIVE_LINK_REF_STATE_PATH",
+    "GLASSHIVE_LINK_REF_TTL_SECONDS",
+    "WPR_LINK_REF_TTL_SECONDS",
+    "GLASSHIVE_WATCH_SESSION_STATE_PATH",
+    "GLASSHIVE_MAX_WATCH_SESSION_DURATION_S",
     "GLASSHIVE_TRUST_INBOUND_IDENTITY",
     "WPR_API_TOKEN",
 }
@@ -259,24 +271,42 @@ class MetadataRequest(BaseModel):
     name: str | None = None
 
 
-def _append_signed_worker_token(url: str, worker_id: str, identity: dict[str, str] | None) -> str:
+SIGNED_QUERY_KEYS = {"gh_token", "gh_sig", "gh_exp", "gh_kind"}
+
+
+def _strip_signed_query_params(url: str) -> str:
+    parsed = urlparse(str(url or ""))
+    query = urlencode(
+        [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key not in SIGNED_QUERY_KEYS]
+    )
+    return parsed._replace(query=query).geturl()
+
+
+def _worker_view_token(worker_id: str, identity: dict[str, str] | None) -> str:
     if not identity:
-        return url
+        return ""
     ttl_seconds = None
     expires_at = _watch_session_expires_at(worker_id, identity)
     if expires_at is not None:
         ttl_seconds = max(1, expires_at - int(time.time()))
-    token = sign_link_token(
+    return sign_link_token(
         kind="worker_view",
         worker_id=worker_id,
         tenant_id=str(identity.get("tenant_id") or ""),
         owner_id=str(identity.get("user_id") or ""),
         ttl_seconds=ttl_seconds,
     )
+
+
+def _append_signed_worker_token(url: str, worker_id: str, identity: dict[str, str] | None) -> str:
+    target_url = _strip_signed_query_params(url)
+    token = _worker_view_token(worker_id, identity)
     if not token:
-        return url
-    separator = "&" if "?" in url else "?"
-    return f"{url}{separator}gh_token={quote(token)}"
+        return target_url
+    ref_id = create_signed_link_ref(token=token, target_url=target_url)
+    if not ref_id:
+        return target_url
+    return signed_link_ref_url("", ref_id)
 
 
 def flatten_workspaces(client: RuntimeClient, identity: dict[str, str] | None = None) -> list[dict[str, Any]]:
@@ -422,7 +452,11 @@ def _workspace_type_options() -> list[dict[str, object]]:
 
 
 def _default_workspace_type() -> str:
-    default_mode = str(os.environ.get("WPR_DEFAULT_EXECUTION_MODE") or "docker").strip().lower()
+    default_mode = str(
+        os.environ.get("GLASSHIVE_DEFAULT_EXECUTION_MODE")
+        or os.environ.get("WPR_DEFAULT_EXECUTION_MODE")
+        or "docker"
+    ).strip().lower()
     if default_mode == "host" and _env_flag("GLASSHIVE_HOST_WORKERS_ENABLED", True):
         return "host"
     return "sandboxed"
@@ -493,8 +527,8 @@ def _bootstrap_bundle_with_effort(bundle: dict[str, Any] | None, profile: str, e
         return bundle
     next_bundle: dict[str, Any] = dict(bundle or {})
     if profile == "codex-cli":
-        if clean_effort not in {"minimal", "low", "medium", "high", "xhigh"}:
-            raise HTTPException(status_code=400, detail="Codex effort must be minimal, low, medium, high, or xhigh")
+        if clean_effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+            raise HTTPException(status_code=400, detail="Codex effort must be none, minimal, low, medium, high, or xhigh")
         env = dict(next_bundle.get("env") or {})
         env["WPR_CODEX_CLI_REASONING_EFFORT"] = clean_effort
         next_bundle["env"] = env
@@ -502,6 +536,12 @@ def _bootstrap_bundle_with_effort(bundle: dict[str, Any] | None, profile: str, e
     if profile == "claude-code":
         if clean_effort not in {"default", "max"}:
             raise HTTPException(status_code=400, detail="Claude effort must be default or max")
+        if clean_effort == "default":
+            return next_bundle
+        env = dict(next_bundle.get("env") or {})
+        env["WPR_CLAUDE_CODE_EFFORT"] = clean_effort
+        next_bundle["env"] = env
+        return next_bundle
     elif profile == "openclaw-general":
         if clean_effort not in {"default", "high", "max"}:
             raise HTTPException(status_code=400, detail="OpenClaw effort must be default, high, or max")
@@ -598,6 +638,7 @@ def _launch_desktop_surfaces(
 
 def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     _load_viventium_runtime_env()
+    install_sensitive_url_log_filter()
     _validate_enterprise_startup()
     client = runtime_client or RuntimeClient()
     enterprise = _truthy_env("GLASSHIVE_ENTERPRISE_MODE") or _truthy_env("WPR_ENTERPRISE_MODE")
@@ -797,6 +838,49 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             "role": role,
         }
 
+    def _trusted_proxy_identity_for_short_ref(request: Request) -> dict[str, str] | None:
+        if not _enterprise_mode_enabled():
+            return None
+        tenant_id = _enterprise_tenant_id()
+        user_id = str(os.environ.get("GLASSHIVE_DEFAULT_OWNER_ID") or "demo-owner").strip()
+        if _truthy_env("GLASSHIVE_TRUST_INBOUND_IDENTITY"):
+            asserted_tenant = _incoming_identity_header(request, "X-Viventium-Tenant-Id")
+            asserted_user = _incoming_identity_header(request, "X-Viventium-User-Id")
+            if asserted_tenant and tenant_id and asserted_tenant != tenant_id:
+                raise HTTPException(status_code=401, detail="GlassHive tenant assertion does not match this deployment")
+            tenant_id = asserted_tenant or tenant_id
+            user_id = asserted_user or (user_id if _allow_default_owner() else "")
+        elif not _allow_default_owner():
+            user_id = ""
+        if not user_id:
+            raise HTTPException(
+                status_code=401,
+                detail="GlassHive enterprise UI requires an authenticated user assertion from the trusted proxy",
+            )
+        return {"tenant_id": tenant_id, "user_id": user_id}
+
+    def _require_short_ref_owner(payload: dict[str, object], request: Request) -> None:
+        identity = _trusted_proxy_identity_for_short_ref(request)
+        if identity is None:
+            return
+        tenant_id = str(payload.get("tenant_id") or "").strip()
+        owner_id = str(payload.get("owner_id") or "").strip()
+        if tenant_id != str(identity.get("tenant_id") or "").strip() or owner_id != str(identity.get("user_id") or "").strip():
+            raise HTTPException(status_code=404, detail="GlassHive workspace link not found for this user")
+
+    def _fresh_worker_view_token_from_payload(worker_id: str, payload: dict[str, object]) -> tuple[str, dict[str, object]]:
+        token = _worker_view_token(
+            worker_id,
+            {
+                "tenant_id": str(payload.get("tenant_id") or "").strip(),
+                "user_id": str(payload.get("owner_id") or "").strip(),
+            },
+        )
+        refreshed_payload = verify_signed_link_token(token) if token else None
+        if not token or not isinstance(refreshed_payload, dict):
+            raise HTTPException(status_code=500, detail="GlassHive workspace session could not be refreshed")
+        return token, refreshed_payload
+
     def _runtime_headers_for_request(
         request: Request,
         worker_id: str | None = None,
@@ -849,10 +933,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             worker.pop(key, None)
         safe["worker"] = worker
         runtime = dict(safe.get("runtime_details") or {})
-        view_available = bool(runtime.get("view_url"))
+        view_available = bool(runtime.get("view_available")) if "view_available" in runtime else bool(runtime.get("view_url"))
         safe["runtime_details"] = {
             key: runtime.get(key)
-            for key in ("mode", "runtime", "sandbox_state")
+            for key in ("mode", "runtime", "sandbox_state", "view_health")
             if runtime.get(key) not in (None, "", [])
         }
         safe["runtime_details"]["view_available"] = view_available
@@ -1005,6 +1089,42 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, Any]:
         return {"status": "ok", "runtime": client.health()}
+
+    @app.get("/r/{ref_id}")
+    def open_short_link(ref_id: str, request: Request) -> Response:
+        record = resolve_signed_link_ref(ref_id)
+        if not record:
+            raise HTTPException(status_code=401, detail="Invalid or expired GlassHive workspace link")
+        payload = record.get("payload")
+        if not isinstance(payload, dict) or str(payload.get("kind") or "") != "worker_view":
+            raise HTTPException(status_code=403, detail="This GlassHive link cannot open a workspace")
+        _require_short_ref_owner(payload, request)
+        worker_id = str(payload.get("worker_id") or "").strip()
+        if not worker_id:
+            raise HTTPException(status_code=401, detail="Invalid GlassHive workspace link")
+        token_tenant_id = str(payload.get("tenant_id") or "").strip()
+        deployment_tenant_id = _enterprise_tenant_id()
+        if _enterprise_mode_enabled() and deployment_tenant_id and token_tenant_id != deployment_tenant_id:
+            raise HTTPException(status_code=401, detail="GlassHive workspace link is for a different tenant")
+        target_url = _strip_signed_query_params(str(record.get("target_url") or "").strip())
+        if not target_url:
+            raise HTTPException(status_code=400, detail="GlassHive workspace link has no target")
+        _ensure_signed_worker_watch_session(worker_id, payload)
+        response = RedirectResponse(target_url, status_code=307)
+        session_token, session_payload = _fresh_worker_view_token_from_payload(worker_id, payload)
+        try:
+            cookie_max_age = max(1, min(30 * 60, int(session_payload.get("exp") or 0) - int(time.time())))
+        except (TypeError, ValueError):
+            cookie_max_age = 30 * 60
+        response.set_cookie(
+            _worker_cookie_name(worker_id),
+            session_token,
+            max_age=cookie_max_age,
+            httponly=True,
+            samesite="lax",
+            secure=_request_uses_https(request),
+        )
+        return response
 
     @app.get("/favicon.ico")
     def favicon() -> FileResponse:

@@ -35,7 +35,13 @@ from .deliverables import is_user_deliverable_relative_path
 from .operator_urls import surface_aware_watch_url, surface_can_open_operator_url
 from .runtime_requirements import host_runtime_requirement_issue
 from .runtime_env import load_viventium_runtime_env
-from .signed_links import append_signed_query, sign_link_token, signed_link_ttl_seconds
+from .signed_links import (
+    append_signed_query,
+    create_signed_link_ref,
+    sign_link_token,
+    signed_link_ref_url,
+    signed_link_ttl_seconds,
+)
 
 try:
     from fastmcp.server.dependencies import get_http_headers
@@ -81,7 +87,8 @@ HIGH_EFFORT_SELECTION_GUIDANCE = (
     "For complex multi-source research, deep research, critical analysis, large file transformation, "
     "coding, comparison, or executive-quality deliverables, choose a higher effort setting: Codex "
     "high/xhigh, Claude max, OpenClaw high/max, or the configured equivalent, unless the user clearly "
-    "asks for a quick/cheap pass. Use medium only for ordinary bounded tasks."
+    "asks for a quick/cheap pass. For ordinary bounded tasks, omit effort unless the user explicitly "
+    "asks for a cheaper/faster pass; user preferences and deployment defaults own the baseline."
 )
 
 
@@ -284,9 +291,10 @@ ExecutionModeParam = Annotated[
     Literal["docker", "host"] | None,
     Field(
         description=(
-            "Execution surface. Use 'host' for the user's real computer/session: local browser profile, "
-            "desktop apps, local files/projects, installed CLIs, or OS tools. Use 'docker' for isolated "
-            "sandbox/disposable/risky work. Omit only when the configured default is correct."
+            "Execution surface. Omit to use the configured default. Use 'host' only when GlassHive "
+            "instructions say host-native workers are enabled and the task depends on the user's real "
+            "computer/session: local browser profile, desktop apps, local files/projects, installed "
+            "CLIs, or OS tools. Use 'docker' for isolated sandbox/disposable/risky work."
         )
     ),
 ]
@@ -301,8 +309,13 @@ ProfileParam = Annotated[
     ),
 ]
 BackendParam = Annotated[
-    str,
-    Field(description="Worker backend. Current GlassHive workers use 'openclaw'."),
+    str | None,
+    Field(
+        description=(
+            "Legacy compatibility field. Prefer omitting it; GlassHive selects and reports workers "
+            "from profile plus execution_mode. Only older clients should pass a backend value."
+        )
+    ),
 ]
 DesktopActionParam = Annotated[
     Literal["terminal", "files", "browser", "focus_browser", "codex", "claude", "openclaw"],
@@ -337,7 +350,10 @@ UploadedFilesParam = Annotated[
 def _default_execution_mode() -> str:
     if not _host_workers_enabled():
         return "docker"
-    mode = os.environ.get("WPR_DEFAULT_EXECUTION_MODE", "docker").strip().lower()
+    mode = (
+        os.environ.get("GLASSHIVE_DEFAULT_EXECUTION_MODE", "").strip().lower()
+        or os.environ.get("WPR_DEFAULT_EXECUTION_MODE", "docker").strip().lower()
+    )
     return mode if mode in {"docker", "host"} else "docker"
 
 
@@ -407,6 +423,12 @@ def _apply_effort_to_bundle(bundle: dict[str, Any], *, profile: str, effort: str
     if profile == "claude-code":
         if clean_effort not in {"default", "max"}:
             raise ValueError("Claude effort must be default or max")
+        if clean_effort == "default":
+            return next_bundle
+        env = dict(next_bundle.get("env") or {})
+        env["WPR_CLAUDE_CODE_EFFORT"] = clean_effort
+        next_bundle["env"] = env
+        return next_bundle
     elif profile == "openclaw-general":
         if clean_effort not in {"default", "high", "max"}:
             raise ValueError("OpenClaw effort must be default, high, or max")
@@ -526,26 +548,26 @@ def _host_worker_mentions() -> tuple[str, str, str]:
     )
 
 
-def glasshive_workers_server_instructions() -> str:
+def _worker_execution_instruction() -> str:
     if _host_workers_enabled():
         if _default_execution_mode() == "host":
-            execution_instruction = (
+            return (
                 "Default to host-native execution for the user's real Chrome/browser profile, "
                 "desktop apps, OS tools, host files, local projects, and installed CLIs."
             )
-        else:
-            execution_instruction = (
-                f"When execution_mode is omitted, MCP worker tools use the configured default "
-                f"'{_default_execution_mode()}'. Set execution_mode='host' when the task depends "
-                "on the user's real computer/session: logged-in browser profile, desktop apps, "
-                "local files/projects, installed CLIs, or OS/window control."
-            )
-    else:
-        execution_instruction = (
-            "Host-native workers are disabled by GlassHive config; configured default 'docker'; "
-            "do not request execution_mode='host'."
+        return (
+            f"When execution_mode is omitted, MCP worker tools use the configured default "
+            f"'{_default_execution_mode()}'. Set execution_mode='host' when the task depends "
+            "on the user's real computer/session: logged-in browser profile, desktop apps, "
+            "local files/projects, installed CLIs, or OS/window control."
         )
+    return (
+        "Host-native workers are disabled by GlassHive config; configured default 'docker'; "
+        "do not request execution_mode='host'."
+    )
 
+
+def glasshive_workers_server_instructions() -> str:
     codex_mention, claude_mention, openclaw_mention = _host_worker_mentions()
     return (
         "GlassHive owns persistent projects, resumable workers, host-native workers for browser and desktop action, "
@@ -585,7 +607,7 @@ def glasshive_workers_server_instructions() -> str:
         "same connected account, describe the brokered capability as the preferred scoped option; "
         "non-broker host connectors are fallback after broker omission, unavailability, auth block, "
         "or explicit user request. "
-        f"{execution_instruction} "
+        f"{_worker_execution_instruction()} "
         "Use Docker/workstation mode for isolated sandbox, disposable browser, risky untrusted "
         "browsing, explicit sandbox requests, or when the user says sandboxed workspace, sandbox, "
         "Codex Workspace, or workstation. In those cases set execution_mode='docker' even if this "
@@ -627,18 +649,18 @@ def glasshive_workers_server_instructions() -> str:
         "worker_delegate_once is the lower-level one-call fallback when the caller already has a "
         "precise instruction/title. These high-level tools create or resume the "
         "project/worker, include optional callback/upload context, queue the run in one call, and "
-        "return a View / Steer link plus follow_up_context for later status/result questions. "
+        "return a compact View / Steer link plus result_tools for later status/result questions. "
         "GlassHive must work standalone: callbacks are an optional host-app delivery enhancement, "
         "not a requirement.\n\nAfter workspace_launch or worker_delegate_once, write one short "
         "outcome-focused acknowledgement in the assistant's own voice and include the View / Steer "
         "link when present on web/browser surfaces. If callback_ready=false, say the work is running "
         "and can be checked with the standalone MCP status tools. If the user asks whether it is "
-        "done or what happened, use follow_up_context run_id/worker_id with workspace_status for a "
-        "non-blocking check or workspace_wait for a blocking wait before answering. When the user "
-        "asks to wait for the result, pass workspace_wait timeout_seconds from "
-        "follow_up_context.completion_wait_timeout_seconds so ordinary long-running work is not "
-        "mistaken for failure just because a short poll expired; pass run_id/worker_id whenever "
-        "available, but if the same-conversation wait call accidentally omits ids GlassHive will "
+        "done or what happened in the same conversation, call workspace_status for a non-blocking "
+        "check or workspace_wait for a blocking wait before answering. Request diagnostics only "
+        "when raw project/worker/run ids are explicitly needed. When the user asks to wait for the "
+        "result, use the returned completion_wait_timeout_seconds so ordinary long-running work is "
+        "not mistaken for failure just because a short poll expired; if the same-conversation wait "
+        "call omits ids GlassHive will "
         "resolve the most recent launch scoped to the authenticated user/conversation; do not ask "
         "the user to confirm waiting when they already asked you to wait. When you launch and then "
         "wait in the same turn, surface the View / Steer link before entering the long wait whenever "
@@ -943,6 +965,26 @@ def _safe_owner_path_component(value: object) -> str:
     return clean
 
 
+def _origin_from_url(url: str) -> str:
+    parsed = urlparse(str(url or ""))
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _normalize_worker_backend(worker: dict[str, Any]) -> dict[str, Any]:
+    safe = dict(worker or {})
+    profile = str(safe.get("profile") or "").strip()
+    runtime = str(safe.get("runtime") or "").strip()
+    if profile in {"codex-cli", "claude-code"}:
+        safe["backend"] = profile
+    elif profile.startswith("openclaw"):
+        safe["backend"] = "openclaw"
+    elif runtime:
+        safe["backend"] = runtime
+    return safe
+
+
 def _owner_scoped_upload_source_for_filename(filename: str, *, owner_id: str | None = None) -> str:
     roots = _upload_root_candidates()
     clean_owner = _safe_owner_path_component(owner_id)
@@ -987,7 +1029,11 @@ def _signed_view_steer_url(worker: dict[str, Any], project_id: str | None, reque
         owner_id=str(worker.get("owner_id") or ""),
     )
     if token:
-        return append_signed_query(url, {"gh_token": token})
+        target_url = append_signed_query(url, {"gh_token": token})
+        ref_id = create_signed_link_ref(token=token, target_url=target_url)
+        if not ref_id:
+            return None
+        return signed_link_ref_url(_origin_from_url(url), ref_id, route="/r")
     if _enterprise_mode_enabled():
         return None
     if str(worker.get("tenant_id") or "") not in {"", "local"}:
@@ -1035,7 +1081,10 @@ def _signed_artifact_url(worker: dict[str, Any], path: str, *, kind: str, action
     )
     public_base = _public_artifact_base_url()
     if token:
-        return f"{public_base}/v1/signed-links/{quote(token)}"
+        ref_id = create_signed_link_ref(token=token)
+        if not ref_id:
+            return None
+        return signed_link_ref_url(public_base, ref_id)
     if _enterprise_mode_enabled():
         return None
     return f"{public_base}/v1/workers/{quote(worker_id)}/artifacts/{action}?path={quote(clean_path)}"
@@ -1093,55 +1142,42 @@ def _dispatch_follow_up_context(
     project_id: str,
     run: dict[str, Any],
     request_surface: str | None,
+    expose_diagnostics: bool = False,
 ) -> dict[str, Any]:
     worker_id = str(worker.get("worker_id") or "").strip()
     run_id = str(run.get("run_id") or "").strip()
     view_steer_url = _signed_view_steer_url(worker, project_id, request_surface)
-    follow_up_context: dict[str, Any] = {
-        "project_id": project_id,
-        "worker_id": worker_id,
-        "run_id": run_id,
+    payload: dict[str, Any] = {
         "run_state": run.get("state"),
-        "status_tool": "workspace_status",
-        "blocking_wait_tool": "workspace_wait",
+        "result_tools": {
+            "status": "workspace_status",
+            "wait": "workspace_wait",
+            "artifacts": "workspace_artifacts",
+        },
         "completion_wait_timeout_seconds": _blocking_wait_default_seconds(),
-        "live_tool": "worker_live",
-        "takeover_tool": "worker_takeover",
-        "main_agent_rule": (
-            "For follow-up result/status questions, call workspace_status with run_id and/or "
-            "worker_id for a non-blocking check, or workspace_wait with run_id when the user "
-            "explicitly wants you to wait. When the user asks you to wait for the result, pass "
-            "run_id, worker_id when available, and timeout_seconds=completion_wait_timeout_seconds. "
-            "Do not guess from the acknowledgement. If a same-conversation follow-up tool call "
-            "accidentally omits ids, GlassHive will resolve the most recent launch scoped to the "
-            "authenticated user/conversation, but passing the ids is still preferred."
-        ),
-        "user_facing_id_policy": "Do not show raw project_id/worker_id/run_id unless the user asks for diagnostics.",
-    }
-    if view_steer_url:
-        follow_up_context["view_steer_url"] = view_steer_url
-    follow_up_context["artifact_tool"] = "workspace_artifacts"
-    follow_up_context["artifact_download_tool"] = "workspace_artifact_download"
-    return {
-        "view_steer_url": view_steer_url,
         "view_steer": {
             "label": "View / Steer GlassHive workspace",
             "url": view_steer_url,
-            "include_in_acknowledgement": bool(view_steer_url),
+            "include_in_response": bool(view_steer_url),
         },
-        "pre_wait_user_update": {
-            "use_before_blocking_wait_when_possible": bool(view_steer_url),
-            "message_guidance": (
-                "If you are about to call workspace_wait for a long wait and this chat protocol "
-                "allows assistant text before the next tool call, first tell the user the work has "
-                "started and include this as a labeled [View / Steer](view_steer_url) link rather "
-                "than a bare URL. If the protocol does not allow an "
-                "intermediate assistant message, include the View / Steer link in the final answer."
-            ),
-            "view_steer_url": view_steer_url,
-        },
-        "follow_up_context": follow_up_context,
     }
+    if view_steer_url:
+        payload["view_steer_url"] = view_steer_url
+    if expose_diagnostics:
+        payload["follow_up_context"] = {
+            "project_id": project_id,
+            "worker_id": worker_id,
+            "run_id": run_id,
+            "run_state": run.get("state"),
+            "status_tool": "workspace_status",
+            "blocking_wait_tool": "workspace_wait",
+            "completion_wait_timeout_seconds": _blocking_wait_default_seconds(),
+            "live_tool": "worker_live",
+            "takeover_tool": "worker_takeover",
+            "artifact_tool": "workspace_artifacts",
+            "artifact_download_tool": "workspace_artifact_download",
+        }
+    return payload
 
 
 @dataclass
@@ -1748,7 +1784,7 @@ class WorkersProjectsApiClient:
             return [project for project in projects if project.get("owner_id") == owner_id]
         return projects
 
-    def create_project(self, *, owner_id: str | None, title: str, goal: str, default_worker_profile: str = "openclaw-general") -> dict[str, Any]:
+    def create_project(self, *, owner_id: str | None, title: str, goal: str, default_worker_profile: str = "codex-cli") -> dict[str, Any]:
         return self._request(
             "POST",
             "/v1/projects",
@@ -1802,8 +1838,8 @@ class WorkersProjectsApiClient:
         owner_id: str | None,
         name: str,
         role: str,
-        profile: str = "openclaw-general",
-        backend: str = "openclaw",
+        profile: str = "codex-cli",
+        backend: str | None = None,
         execution_mode: str | None = None,
         alias: str | None = None,
         workspace_root: str | None = None,
@@ -1811,23 +1847,21 @@ class WorkersProjectsApiClient:
         bootstrap_bundle: dict[str, Any] | None = None,
         start_synchronously: bool = True,
     ) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            f"/v1/projects/{project_id}/workers",
-            json_body={
-                "owner_id": self._owner_id(owner_id),
-                "name": name,
-                "role": role,
-                "profile": profile,
-                "backend": backend,
-                "execution_mode": _resolve_execution_mode(execution_mode),
-                "alias": alias,
-                "workspace_root": workspace_root,
-                "bootstrap_profile": bootstrap_profile,
-                "bootstrap_bundle": bootstrap_bundle,
-                "start_synchronously": start_synchronously,
-            },
-        )
+        payload = {
+            "owner_id": self._owner_id(owner_id),
+            "name": name,
+            "role": role,
+            "profile": profile,
+            "execution_mode": _resolve_execution_mode(execution_mode),
+            "alias": alias,
+            "workspace_root": workspace_root,
+            "bootstrap_profile": bootstrap_profile,
+            "bootstrap_bundle": bootstrap_bundle,
+            "start_synchronously": start_synchronously,
+        }
+        if backend:
+            payload["backend"] = backend
+        return self._request("POST", f"/v1/projects/{project_id}/workers", json_body=payload)
 
     def find_or_resume_worker(
         self,
@@ -1837,31 +1871,29 @@ class WorkersProjectsApiClient:
         name: str,
         role: str,
         alias: str,
-        profile: str = "openclaw-general",
-        backend: str = "openclaw",
+        profile: str = "codex-cli",
+        backend: str | None = None,
         execution_mode: str | None = None,
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
         bootstrap_bundle: dict[str, Any] | None = None,
         start_synchronously: bool = True,
     ) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            f"/v1/projects/{project_id}/workers/find-or-resume",
-            json_body={
-                "owner_id": self._owner_id(owner_id),
-                "name": name,
-                "role": role,
-                "profile": profile,
-                "backend": backend,
-                "execution_mode": _resolve_execution_mode(execution_mode),
-                "alias": alias,
-                "workspace_root": workspace_root,
-                "bootstrap_profile": bootstrap_profile,
-                "bootstrap_bundle": bootstrap_bundle,
-                "start_synchronously": start_synchronously,
-            },
-        )
+        payload = {
+            "owner_id": self._owner_id(owner_id),
+            "name": name,
+            "role": role,
+            "profile": profile,
+            "execution_mode": _resolve_execution_mode(execution_mode),
+            "alias": alias,
+            "workspace_root": workspace_root,
+            "bootstrap_profile": bootstrap_profile,
+            "bootstrap_bundle": bootstrap_bundle,
+            "start_synchronously": start_synchronously,
+        }
+        if backend:
+            payload["backend"] = backend
+        return self._request("POST", f"/v1/projects/{project_id}/workers/find-or-resume", json_body=payload)
 
     def get_worker(self, worker_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/workers/{worker_id}")
@@ -2173,7 +2205,7 @@ def create_mcp_server(
             "Callbacks are optional; plain LibreChat or standalone deployments can use workspace_status for non-blocking checks and workspace_wait when the user explicitly wants to wait. "
             "For attached/uploaded-file tasks, use uploaded_files when the file content is visible in the current model context, for example [{'filename':'brief.txt','text':'...'}]. "
             "If the chat model cannot read the file body, still call this with file names/references and requested transformation so GlassHive can use request upload metadata supplied by the host or return an honest blocker. "
-            "Write your own short acknowledgement, include the View / Steer link when view_steer_url is present, and keep follow_up_context for later user status/result questions; it contains the worker_id/run_id needed to poll without exposing raw IDs to the user. "
+            "Write your own short acknowledgement and include the View / Steer link when view_steer_url is present. Use result_tools for later user status/result questions; request diagnostics only when raw ids are needed. "
             "Do not shorten, summarize, paraphrase, or water down the user's request: pass the full available brief, background, constraints, examples, links, file references, exclusions, and success criteria through instruction/goal/bootstrap context so the worker receives the full picture. "
             "For connected-account facts or actions, prefer MCP/tools over browser or computer UI when available. Connected-account read authorization comes from the host-signed broker grant; connected_account_content_intent is only a compatibility hint for missing-broker warnings, not a required authorization switch. "
             "Pass MCP/tool availability as context, not as a made-up project goal or success criterion, unless the user explicitly asked to prove tool usage. "
@@ -2181,7 +2213,7 @@ def create_mcp_server(
             f"{HOST_SIDE_ORCHESTRATION_GUIDANCE} "
             "Preserve the user's requested final-answer format in the instruction, especially short/exact-answer constraints. "
             "Use delegation_audit to self-check the dispatched instruction, but do not expose it unless diagnostics were requested. "
-            "Use execution_mode='host' for the user's real computer/session and 'docker' for isolated sandbox/Codex Workspace/workstation work, disposable browsers, or risky untrusted browsing. "
+            "Omit execution_mode to use the configured default. Set execution_mode='host' only when GlassHive instructions say host-native workers are enabled and the task depends on the user's real computer/session; set execution_mode='docker' for isolated sandbox/Codex Workspace/workstation work, disposable browsers, or risky untrusted browsing. "
             "If this returns status='blocked' with a failure_class such as runtime_dependency_missing, do not say work is running; explain the blocker and retry only with an available profile or sandbox mode that matches the user's request. "
             "Set expose_diagnostics=true only when the user explicitly asked for run/project/worker diagnostics."
         ),
@@ -2197,7 +2229,7 @@ def create_mcp_server(
         worker_role: str | None = None,
         alias: str | None = None,
         profile: ProfileParam = "",
-        backend: BackendParam = "openclaw",
+        backend: BackendParam = None,
         execution_mode: ExecutionModeParam = None,
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
@@ -2375,7 +2407,12 @@ def create_mcp_server(
             raise ValueError("GlassHive worker create/resume did not return worker_id")
 
         try:
-            run = client.assign_run(worker_id, worker_instruction)
+            run = client.assign_run(
+                worker_id,
+                worker_instruction,
+                effort=resolved_effort,
+                bootstrap_bundle=bundle,
+            )
         except GlassHiveBlockedError as exc:
             return _blocked_dispatch_result(
                 exc.payload,
@@ -2390,6 +2427,7 @@ def create_mcp_server(
             project_id=resolved_project_id,
             run=run,
             request_surface=request_surface,
+            expose_diagnostics=expose_diagnostics,
         )
         _remember_recent_dispatch_context(
             worker=worker,
@@ -2398,38 +2436,10 @@ def create_mcp_server(
         )
         result: dict[str, Any] = {
             "status": "dispatched",
-            "acknowledgement_guidance": (
-                "Write one short acknowledgement in your own voice that the task has started. "
-                "Include view_steer_url as a labeled [View / Steer](view_steer_url) link when present; "
-                "do not paste the bare URL. If callback_ready is "
-                "false, say the user can ask for status and you will check GlassHive through MCP; do "
-                "not claim an automatic chat callback is required. If runtime_recovery is present, you may "
-                "briefly say GlassHive used an available sandbox/workstation path because the default host "
-                "runtime was unavailable; do not ask the user to install global software. Do not quote a canned template or "
-                "expose raw worker/run IDs."
-            ),
-            "main_agent_next_action": (
-            "Send one short acknowledgement in your own voice, include view_steer_url as a labeled "
-            "[View / Steer](view_steer_url) link when available, and stop this chat turn unless the user explicitly asked you to wait. "
-            "Do not call workspace_status, worker_live, run_get, or workspace_wait in the same "
-            "turn unless the user asked for diagnostics/live status/blocking completion. On later "
-            "follow-up status/result questions, use follow_up_context.run_id/worker_id with "
-            "workspace_status for non-blocking status or workspace_wait for a blocking wait before answering. "
-            "When the user asks you to wait for results, pass timeout_seconds from "
-            "follow_up_context.completion_wait_timeout_seconds; first surface the View / Steer link "
-            "when the chat protocol supports assistant text before another tool call, then call "
-            "workspace_wait immediately in this same turn instead of asking the user to confirm waiting."
-        ),
             "callback_ready": callback_ready,
             "callback_delivery": "optional" if callback_ready else "not_configured_standalone_polling_available",
             "missing_callback_fields": missing_callback_fields,
             **dispatch_context,
-            "delegation_audit": {
-                "title": _audit_preview(clean_title, max_chars=180),
-                "goal": _audit_preview(clean_goal, max_chars=360),
-                "instruction_preview": _audit_preview(worker_instruction),
-                "use_for": "self-check only; do not show the user unless diagnostics were requested",
-            },
         }
         if runtime_recovery:
             result["runtime_recovery"] = runtime_recovery
@@ -2445,6 +2455,11 @@ def create_mcp_server(
                     "effort": resolved_effort,
                     "alias": resolved_alias,
                     "submitted_instruction": worker_instruction,
+                    "delegation_audit": {
+                        "title": _audit_preview(clean_title, max_chars=180),
+                        "goal": _audit_preview(clean_goal, max_chars=360),
+                        "instruction_preview": _audit_preview(worker_instruction),
+                    },
                 }
             )
         return result
@@ -2463,7 +2478,7 @@ def create_mcp_server(
             "Connected-account read authorization comes from the host-signed broker grant when reviewed host policy projects content-read scope; connected_account_content_intent is only a compatibility hint for missing-broker warnings, not a required authorization switch. The flag alone does not unlock content reads or writes. "
             f"{HOST_SIDE_ORCHESTRATION_GUIDANCE} "
             "Do not chain project_create, worker_create, and worker_run for routine tasks. Do not expose project/worker/run IDs unless expose_diagnostics is true. "
-            "Returns a clean non-blocking dispatch result with view_steer_url and follow_up_context. "
+            "Returns a clean non-blocking dispatch result with view_steer_url and result_tools; raw ids are hidden unless expose_diagnostics is true. "
             "Callbacks are optional; for plain LibreChat or standalone deployments without callback wiring, "
             "use workspace_status for non-blocking follow-up checks and workspace_wait when the user "
             "explicitly wants a blocking wait. For attached/uploaded-file requests, set uploaded_files "
@@ -2471,8 +2486,7 @@ def create_mcp_server(
             "in context so GlassHive can also use request upload metadata when the host supplies it. "
             "If the user asks you to wait for the result, first show the View / Steer link to the "
             "user when the chat protocol supports assistant text before another tool call, then "
-            "call workspace_wait with the returned "
-            "follow_up_context.run_id, worker_id, and completion_wait_timeout_seconds in the same "
+            "call workspace_wait with the returned completion_wait_timeout_seconds in the same "
             "turn instead of asking them to confirm waiting. Before a long same-turn wait, surface "
             "the View / Steer link to the user first whenever the chat protocol supports text before "
             "the next tool call; always include it in the final answer."
@@ -2796,7 +2810,7 @@ def create_mcp_server(
             role=clean_success_criteria,
             alias=resolved_alias,
             profile=resolved_profile,
-            backend="openclaw",
+            backend=None,
             execution_mode=resolved_execution_mode,
             bootstrap_bundle=bundle,
             start_synchronously=False,
@@ -2810,6 +2824,7 @@ def create_mcp_server(
             run_at=run_at,
             schedule_text=schedule_text,
             delay_seconds=delay_seconds,
+            bootstrap_bundle=bundle,
         )
         result: dict[str, Any] = {
             "status": "scheduled",
@@ -2880,7 +2895,7 @@ def create_mcp_server(
         structured_output=True,
     )
     def workers_list(project_id: str) -> list[dict[str, Any]]:
-        return client.list_workers(project_id)
+        return [_normalize_worker_backend(worker) for worker in client.list_workers(project_id)]
 
     @server.tool(
         name="worker_create",
@@ -2890,7 +2905,7 @@ def create_mcp_server(
             "bootstrap_bundle_json as a JSON string or object to seed auth, MCP config, instructions, env, and project files. "
             "Use this lower-level tool for explicit orchestration or diagnostics; for a fresh one-off task, prefer worker_delegate_once. "
             "When seeding connected-account read access for an immediately related run, pass the host-signed broker grant/config; connected_account_content_intent is only a compatibility hint for missing-broker warnings. "
-            "Use execution_mode='host' for the user's real computer/session and 'docker' for isolated work. "
+            "Omit execution_mode to use the configured default. Set execution_mode='host' only when GlassHive instructions say host-native workers are enabled and the task depends on the user's real computer/session; set execution_mode='docker' for isolated work. "
             "Returns the worker record with worker_id, execution mode, profile, alias, and bootstrap result metadata."
         ),
         structured_output=True,
@@ -2901,7 +2916,7 @@ def create_mcp_server(
         role: str,
         owner_id: str | None = None,
         profile: ProfileParam = "",
-        backend: BackendParam = "openclaw",
+        backend: BackendParam = None,
         execution_mode: ExecutionModeParam = None,
         alias: str | None = None,
         workspace_root: str | None = None,
@@ -2926,7 +2941,7 @@ def create_mcp_server(
             connected_account_content_intent=connected_account_content_intent,
         )
         resolved_execution_mode = _resolve_execution_mode(execution_mode)
-        return client.create_worker(
+        return _normalize_worker_backend(client.create_worker(
             project_id=project_id,
             owner_id=_request_owner_id(owner_id),
             name=name,
@@ -2938,14 +2953,14 @@ def create_mcp_server(
             workspace_root=workspace_root,
             bootstrap_profile=bootstrap_profile,
             bootstrap_bundle=parsed_bundle,
-        )
+        ))
 
     @server.tool(
         name="worker_find_or_resume",
         title="Find Or Resume Worker",
         description=(
             "Find an existing non-terminated worker by alias for a project/owner, or create one. "
-            "Use execution_mode='host' for tasks on the user's real computer/session: signed-in browser profile, desktop apps, local files/projects, installed CLIs, or OS/window control. "
+            "Omit execution_mode to use the configured default. Set execution_mode='host' only when GlassHive instructions say host-native workers are enabled and the task depends on the user's real computer/session: signed-in browser profile, desktop apps, local files/projects, installed CLIs, or OS/window control. "
             "Use execution_mode='docker' for isolated sandbox, disposable browser, or risky untrusted work. "
             "Do not use for fresh one-off tasks when worker_delegate_once can create/resume and queue the run in one call. "
             "When seeding connected-account read access for an immediately related run, pass the host-signed broker grant/config; connected_account_content_intent is only a compatibility hint for missing-broker warnings. "
@@ -2960,7 +2975,7 @@ def create_mcp_server(
         alias: str,
         owner_id: str | None = None,
         profile: ProfileParam = "",
-        backend: BackendParam = "openclaw",
+        backend: BackendParam = None,
         execution_mode: ExecutionModeParam = None,
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
@@ -2984,7 +2999,7 @@ def create_mcp_server(
             connected_account_content_intent=connected_account_content_intent,
         )
         resolved_execution_mode = _resolve_execution_mode(execution_mode)
-        return client.find_or_resume_worker(
+        return _normalize_worker_backend(client.find_or_resume_worker(
             project_id=project_id,
             owner_id=_request_owner_id(owner_id),
             name=name,
@@ -2996,7 +3011,7 @@ def create_mcp_server(
             workspace_root=workspace_root,
             bootstrap_profile=bootstrap_profile,
             bootstrap_bundle=parsed_bundle,
-        )
+        ))
 
     @server.tool(
         name="worker_get",
@@ -3008,7 +3023,7 @@ def create_mcp_server(
         structured_output=True,
     )
     def worker_get(worker_id: str) -> dict[str, Any]:
-        return client.get_worker(worker_id)
+        return _normalize_worker_backend(client.get_worker(worker_id))
 
     @server.tool(
         name="worker_live",
@@ -3382,6 +3397,7 @@ def create_mcp_server(
         run_id: str | None = None,
         worker_id: str | None = None,
         include_live: bool = True,
+        include_diagnostics: bool = False,
     ) -> dict[str, Any]:
         clean_run_id = str(run_id or "").strip()
         clean_worker_id = str(worker_id or "").strip()
@@ -3468,22 +3484,16 @@ def create_mcp_server(
                     "items": [],
                     "error": _audit_preview(str(exc), max_chars=220),
                 }
-        return {
+        if artifact_links and not include_diagnostics:
+            artifact_links = {
+                key: value
+                for key, value in artifact_links.items()
+                if key not in {"worker_id", "next_action_guidance"}
+            }
+        payload: dict[str, Any] = {
             "status": "ok",
             "mode": "non_blocking",
             "terminal": terminal,
-            "run_id": str((effective_run or {}).get("run_id") or clean_run_id or "").strip() or None,
-            "requested_run_id": clean_run_id or None,
-            "requested_run_state": str((run or {}).get("state") or "").strip() or None,
-            "requested_run_stale": requested_run_stale,
-            "latest_run_id": str((newer_run or effective_run or {}).get("run_id") or "").strip() or None,
-            "latest_run_state": str((newer_run or effective_run or {}).get("state") or "").strip() or None,
-            "worker_id": clean_worker_id or None,
-            "project_id": project_id or None,
-            "resolved_from_recent_dispatch": bool(recent_context),
-            "recent_dispatch_age_seconds": (
-                max(0, int(time.monotonic() - recent_context.created_monotonic)) if recent_context else None
-            ),
             "run_state": run_state,
             "worker_state": worker_state,
             "output_text": (effective_run or {}).get("output_text") if effective_run else None,
@@ -3496,23 +3506,29 @@ def create_mcp_server(
                 "include_in_response": bool(view_steer_url),
             },
             "artifact_links": artifact_links,
-            "run": effective_run,
-            "requested_run": run,
-            "latest_run": newer_run or effective_run,
-            "worker_live": live,
-            "next_action_guidance": (
-                "If requested_run_stale is true, acknowledge the requested run outcome first, then answer from the effective/latest run fields. "
-                "If terminal is true and run_state is failed, answer from failure_user_message, "
-                "failure_class, and failure_recommended_recovery before using error_text as diagnostics; "
-                "artifact_links are optional delivery aids, not mandatory answer content; include relevant signed_open_url links only when the user asked for files/artifacts or output_text references user-facing files; "
-                "if failure_retryable is true and the user asks to continue or retry, call workspace_continue "
-                "instead of relaunching from scratch. If terminal is true and completed, answer from output_text "
-                "and preserve the worker's natural result. Wrap exact filenames, paths, markers, and exact content in backticks or escape Markdown-sensitive characters so underscores and other literals are not lost. "
-                "Do not include raw download links unless the user explicitly requested a downloadable file; include the "
-                "View / Steer link when useful. If terminal is false and the user wants you to wait, "
-                "call workspace_wait with run_id; otherwise give a brief status and the View / Steer link."
-            ),
         }
+        if include_diagnostics:
+            payload.update(
+                {
+                    "run_id": str((effective_run or {}).get("run_id") or clean_run_id or "").strip() or None,
+                    "requested_run_id": clean_run_id or None,
+                    "requested_run_state": str((run or {}).get("state") or "").strip() or None,
+                    "requested_run_stale": requested_run_stale,
+                    "latest_run_id": str((newer_run or effective_run or {}).get("run_id") or "").strip() or None,
+                    "latest_run_state": str((newer_run or effective_run or {}).get("state") or "").strip() or None,
+                    "worker_id": clean_worker_id or None,
+                    "project_id": project_id or None,
+                    "resolved_from_recent_dispatch": bool(recent_context),
+                    "recent_dispatch_age_seconds": (
+                        max(0, int(time.monotonic() - recent_context.created_monotonic)) if recent_context else None
+                    ),
+                    "run": effective_run,
+                    "requested_run": run,
+                    "latest_run": newer_run or effective_run,
+                    "worker_live": live,
+                }
+            )
+        return payload
 
     @server.tool(
         name="workspace_status",
@@ -3521,9 +3537,8 @@ def create_mcp_server(
             "Standalone non-blocking status/result check for GlassHive. Use this after workspace_launch, "
             "worker_delegate_once, or worker_run when the user asks whether the work is done, wants the "
             "latest result, or needs a quick status check. Do not call it immediately after launch "
-            "unless the user asked for status/diagnostics. Provide run_id from follow_up_context when "
-            "available, and worker_id when a live workspace snapshot is useful. If a same-conversation "
-            "follow-up call accidentally omits ids, GlassHive resolves the most recent launch scoped "
+            "unless the user asked for status/diagnostics. If a same-conversation "
+            "follow-up call omits ids, GlassHive resolves the most recent launch scoped "
             "to the authenticated user/conversation. This does not require LibreChat or host-app "
             "callback wiring. Returns run state, worker state, output/error text, and View / Steer "
             "link data when available."
@@ -3531,11 +3546,17 @@ def create_mcp_server(
         structured_output=True,
     )
     def workspace_status(
-        run_id: Annotated[str | None, Field(description="Run id from follow_up_context. Preferred for result/status checks.")] = None,
-        worker_id: Annotated[str | None, Field(description="Worker id from follow_up_context. Include for live state and View / Steer link.")] = None,
+        run_id: Annotated[str | None, Field(description="Optional run id from diagnostics or a prior explicit status result. Omit after a same-conversation launch when scoped recent dispatch is available.")] = None,
+        worker_id: Annotated[str | None, Field(description="Optional worker id for live state and View / Steer link. Omit after a same-conversation launch when scoped recent dispatch is available.")] = None,
         include_live: Annotated[bool, Field(description="Include worker live details when worker_id is available.")] = True,
+        include_diagnostics: Annotated[bool, Field(description="Include raw run/workspace ids and live diagnostic snapshots.")] = False,
     ) -> dict[str, Any]:
-        return _workspace_status_payload(run_id=run_id, worker_id=worker_id, include_live=include_live)
+        return _workspace_status_payload(
+            run_id=run_id,
+            worker_id=worker_id,
+            include_live=include_live,
+            include_diagnostics=include_diagnostics,
+        )
 
     @server.tool(
         name="workspace_wait",
@@ -3550,8 +3571,8 @@ def create_mcp_server(
             "workspace_wait so the user is not left guessing where to watch progress. When timeout_seconds is omitted, GlassHive uses "
             "WPR_MCP_BLOCKING_WAIT_DEFAULT_SEC capped by WPR_MCP_BLOCKING_WAIT_MAX_SEC so serious "
             "research, coding, and file-work runs are not misreported as failed just because a short "
-            "poll expired. Provide run_id/worker_id from follow_up_context when available; if a "
-            "same-conversation follow-up call accidentally omits ids, GlassHive resolves the most "
+            "poll expired. If a "
+            "same-conversation follow-up call omits ids, GlassHive resolves the most "
             "recent launch scoped to the authenticated user/conversation. This does not require "
             "LibreChat or host-app callback wiring. Omit poll_interval_seconds for normal work; "
             "do not invent polling values unless the user/operator gave a concrete override. "
@@ -3562,11 +3583,12 @@ def create_mcp_server(
         structured_output=True,
     )
     async def workspace_wait(
-        run_id: Annotated[str | None, Field(description="Run id from workspace_launch/worker_delegate_once follow_up_context. Preferred when available.")] = None,
+        run_id: Annotated[str | None, Field(description="Optional run id from diagnostics or a prior explicit status result. Omit after a same-conversation launch when scoped recent dispatch is available.")] = None,
         worker_id: Annotated[str | None, Field(description="Optional worker id for live state and View / Steer link.")] = None,
         timeout_seconds: Annotated[float | None, Field(description="Maximum seconds to block before returning timeout status. Omit to use the configured GlassHive completion wait default.")] = None,
         poll_interval_seconds: Annotated[float | None, Field(description="Optional polling interval in seconds. Omit for the configured efficient default.")] = None,
         include_live: Annotated[bool, Field(description="Include worker live details in the final response when available.")] = True,
+        include_diagnostics: Annotated[bool, Field(description="Include raw run/workspace ids and live diagnostic snapshots.")] = False,
     ) -> dict[str, Any]:
         clean_run_id = str(run_id or "").strip()
         clean_worker_id = str(worker_id or "").strip()
@@ -3606,8 +3628,9 @@ def create_mcp_server(
                 run_id=clean_run_id,
                 worker_id=clean_worker_id,
                 include_live=include_live,
+                include_diagnostics=include_diagnostics,
             )
-            if resolved_recent_context:
+            if resolved_recent_context and include_diagnostics:
                 payload.update(
                     {
                         "resolved_from_recent_dispatch": True,
@@ -3631,15 +3654,11 @@ def create_mcp_server(
             if time.monotonic() >= deadline:
                 payload.update(
                     {
-                        "status": "timeout",
+                        "status": "still_running",
                         "mode": "blocking_wait",
                         "waited": True,
                         "attempts": attempts,
                         "timed_out": True,
-                        "next_action_guidance": (
-                            "Tell the user GlassHive is still running, include the View / Steer link "
-                            "when present, and offer to check again with workspace_status or workspace_wait."
-                        ),
                     }
                 )
                 return payload
@@ -3711,12 +3730,12 @@ def create_mcp_server(
             "Use this when the user says retry, continue, finish it, or resume from the same workspace. "
             "This is an explicit user-requested recovery path, not an automatic retry loop. It preserves "
             "the original instruction and current workspace files/state instead of relaunching from scratch. "
-            "Returns a fresh run_id, View / Steer link, and follow_up_context for status/wait."
+            "Returns a fresh run, View / Steer link, and result_tools for status/wait."
         ),
         structured_output=True,
     )
     def workspace_continue(
-        run_id: Annotated[str, Field(description="Previous run id from follow_up_context or workspace_status/workspace_wait.")],
+        run_id: Annotated[str, Field(description="Previous run id from diagnostics or an explicit workspace_status/workspace_wait result.")],
         worker_id: Annotated[str | None, Field(description="Optional worker id. If omitted, GlassHive derives it from the previous run.")] = None,
         continuation_goal: Annotated[
             str | None,
@@ -3821,7 +3840,7 @@ def create_mcp_server(
             "continuation_instruction_preview": _audit_preview(instruction, max_chars=900),
             "acknowledgement_guidance": (
                 "Tell the user GlassHive is continuing in the same workspace, include the View / Steer "
-                "link when present, and use the returned follow_up_context for later status or wait."
+                "link when present, and use the returned result_tools for later status or wait."
             ),
             **dispatch_context,
         }
@@ -3841,7 +3860,7 @@ def create_mcp_server(
         structured_output=True,
     )
     def workspace_artifacts(
-        worker_id: Annotated[str, Field(description="Worker id from workspace_launch/worker_delegate_once follow_up_context.")],
+        worker_id: Annotated[str, Field(description="Worker id from diagnostics, an explicit status result, or a known GlassHive workspace.")],
         include_download_links: Annotated[bool, Field(description="Include short-lived signed download URLs for each file artifact.")] = True,
     ) -> dict[str, Any]:
         clean_worker_id = str(worker_id or "").strip()
@@ -3872,7 +3891,7 @@ def create_mcp_server(
         structured_output=True,
     )
     def workspace_artifact_download(
-        worker_id: Annotated[str, Field(description="Worker id from GlassHive follow_up_context.")],
+        worker_id: Annotated[str, Field(description="Worker id from diagnostics, an explicit status result, or a known GlassHive workspace.")],
         path: Annotated[str, Field(description="Workspace-relative file path, for example index.html or output/report.pdf.")],
     ) -> dict[str, Any]:
         clean_worker_id = str(worker_id or "").strip()
@@ -3916,7 +3935,7 @@ def create_mcp_server(
     @server.resource(
         "wpr://projects",
         name="projects",
-        title="Workers Projects Runtime Projects",
+        title="GlassHive Workspace Projects",
         description="Current projects visible to the MCP server.",
         mime_type="application/json",
     )
@@ -3926,7 +3945,7 @@ def create_mcp_server(
     @server.resource(
         "wpr://projects/{project_id}",
         name="project",
-        title="Workers Projects Runtime Project",
+        title="GlassHive Workspace Project",
         description="A single project record.",
         mime_type="application/json",
     )
@@ -3936,8 +3955,8 @@ def create_mcp_server(
     @server.resource(
         "wpr://projects/{project_id}/workers",
         name="project-workers",
-        title="Workers For Project",
-        description="Workers belonging to a project.",
+        title="GlassHive Workspaces For Project",
+        description="Workspaces belonging to a GlassHive project.",
         mime_type="application/json",
     )
     def project_workers_resource(project_id: str) -> str:
@@ -3946,8 +3965,8 @@ def create_mcp_server(
     @server.resource(
         "wpr://workers/{worker_id}",
         name="worker",
-        title="Worker Record",
-        description="The current worker record.",
+        title="GlassHive Workspace Record",
+        description="The current workspace record.",
         mime_type="application/json",
     )
     def worker_resource(worker_id: str) -> str:
@@ -3956,8 +3975,8 @@ def create_mcp_server(
     @server.resource(
         "wpr://workers/{worker_id}/live",
         name="worker-live",
-        title="Worker Live State",
-        description="Rich live state for a worker, including recent runs, events, and runtime details.",
+        title="GlassHive Workspace Live State",
+        description="Rich live state for a workspace, including recent runs, events, and runtime details.",
         mime_type="application/json",
     )
     def worker_live_resource(worker_id: str) -> str:
@@ -3966,8 +3985,8 @@ def create_mcp_server(
     @server.resource(
         "wpr://runs/{run_id}",
         name="run",
-        title="Run Record",
-        description="A single run record.",
+        title="GlassHive Run Record",
+        description="A single GlassHive run record.",
         mime_type="application/json",
     )
     def run_resource(run_id: str) -> str:

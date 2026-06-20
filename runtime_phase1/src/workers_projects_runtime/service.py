@@ -30,7 +30,13 @@ from .openclaw_runtime import (
 )
 from .operator_urls import surface_aware_watch_url
 from .runtime_env import load_viventium_runtime_env
-from .signed_links import append_signed_query, sign_link_params, sign_link_token
+from .signed_links import (
+    append_signed_query,
+    create_signed_link_ref,
+    sign_link_params,
+    signed_link_ref_url,
+    sign_link_token,
+)
 from .store import Store
 
 
@@ -40,7 +46,7 @@ FINAL_REPORT_PATTERN = re.compile(r"(?m)^[ \t]*FINAL REPORT:\s*")
 VIVENTIUM_CALLBACK_PATH = "/api/viventium/glasshive/callback"
 ACTIONABLE_CALLBACK_LINK_EVENTS = {"run.failed", "run.paused", "run.interrupted", "run.cancelled"}
 PARENT_VISIBLE_CALLBACK_FIELDS = ("user_id", "conversation_id", "parent_message_id", "message_id")
-CALLBACK_DEAD_LETTER_IMMEDIATE_STATUS_CODES = {400, 404, 410, 422, 501}
+CALLBACK_DEAD_LETTER_IMMEDIATE_STATUS_CODES = {400, 401, 403, 404, 410, 422, 501}
 CALLBACK_RETRYABLE_STATUS_CODES = {408, 425, 429}
 RUN_STATE_BY_EVENT = {
     "run.queued": "queued",
@@ -180,6 +186,14 @@ def public_callback_message_text(message: str) -> str:
         text,
     )
     return text.strip()
+
+
+def runtime_failure_callback_message(failure_fields: dict[str, object], fallback: str) -> str:
+    message = str(failure_fields.get("failure_user_message") or "").strip() or str(fallback or "Run failed")
+    diagnostic = str(failure_fields.get("failure_diagnostic_summary") or "").strip()
+    if diagnostic and diagnostic not in message:
+        return f"{message}\n\nDetails: {diagnostic}"
+    return message
 
 
 def _is_viventium_callback_url(url: str) -> bool:
@@ -618,7 +632,8 @@ class WorkersProjectsService:
             path=path,
         )
         if token:
-            return f"{base_url}/v1/signed-links/{quote(token)}"
+            ref_id = create_signed_link_ref(token=token)
+            return signed_link_ref_url(base_url, ref_id) if ref_id else ""
         if str(worker.get("tenant_id") or "") not in {"", "local"}:
             return ""
         return f"{base_url}/v1/workers/{worker_id}/artifacts/{action}?{urlencode({'path': path})}"
@@ -658,7 +673,9 @@ class WorkersProjectsService:
         if not watch_url:
             return ""
         if token:
-            return append_signed_query(watch_url, {"gh_token": token})
+            target_url = append_signed_query(watch_url, {"gh_token": token})
+            ref_id = create_signed_link_ref(token=token, target_url=target_url)
+            return signed_link_ref_url(base_url, ref_id, route="/r") if ref_id else ""
         if str(worker.get("tenant_id") or "") not in {"", "local"}:
             return ""
         return watch_url
@@ -1336,6 +1353,12 @@ class WorkersProjectsService:
             return "openclaw"
         return clean_profile or str(execution_mode or "").strip() or "worker"
 
+    def _legacy_backend_label(self, profile: str, execution_mode: str, requested_backend: str) -> str:
+        runtime_label = self._initial_runtime_label(profile, execution_mode)
+        if runtime_label:
+            return runtime_label
+        return str(requested_backend or "").strip() or "worker"
+
     def create_worker(
         self,
         project_id: str,
@@ -1365,7 +1388,7 @@ class WorkersProjectsService:
                 name=name,
                 role=role,
                 profile=profile,
-                backend=backend,
+                backend=self._legacy_backend_label(profile, execution_mode, backend),
                 runtime=self._initial_runtime_label(profile, execution_mode),
                 model=model,
                 execution_mode=execution_mode,
@@ -1437,7 +1460,8 @@ class WorkersProjectsService:
                 "name": name,
                 "role": role,
                 "profile": profile,
-                "backend": backend,
+                "backend": self._legacy_backend_label(profile, execution_mode, backend),
+                "runtime": self._initial_runtime_label(profile, execution_mode),
             }
             if workspace_root is not None:
                 updates["workspace_root"] = workspace_root
@@ -1571,15 +1595,17 @@ class WorkersProjectsService:
     ) -> dict:
         source_worker = self.require_worker(source_worker_id)
         bootstrap_bundle = self._bootstrap_bundle_for(source_worker)
+        profile = str(source_worker.get("profile") or "codex-cli")
+        execution_mode = str(source_worker.get("execution_mode") or "docker")
         duplicated = self.create_worker(
             project_id=project_id,
             tenant_id=str(source_worker.get("tenant_id") or "local"),
             owner_id=owner_id,
             name=name,
             role=role,
-            profile=str(source_worker.get("profile") or "codex-cli"),
-            backend=str(source_worker.get("backend") or "openclaw"),
-            execution_mode=str(source_worker.get("execution_mode") or "docker"),
+            profile=profile,
+            backend=self._legacy_backend_label(profile, execution_mode, str(source_worker.get("backend") or "")),
+            execution_mode=execution_mode,
             alias=None,
             workspace_root=str(source_worker.get("workspace_root") or "") or None,
             bootstrap_profile=str(source_worker.get("bootstrap_profile") or "") or None,
@@ -2005,7 +2031,7 @@ class WorkersProjectsService:
             self.store.finalize_schedule_for_run(run["run_id"], state="failed", last_error=error_text)
             self.store.update_worker(worker_id, state="ready", last_error=error_text, last_run_id=run["run_id"])
             self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.failed", error_text or "Run failed")
-            failure_message = str(failure_fields.get("failure_user_message") or "").strip() or error_text or "Run failed"
+            failure_message = runtime_failure_callback_message(failure_fields, error_text or "Run failed")
             self._emit_callback(
                 refreshed_worker,
                 "run.failed",
@@ -2192,7 +2218,11 @@ class WorkersProjectsService:
                     return
 
                 worker = self.store.get_worker(worker_id) or worker
-                self.store.update_worker_state(worker_id, "running", last_error="")
+                capacity_error = self._runtime_capacity_error(worker)
+                if capacity_error:
+                    self._requeue_retryable_run(worker, run, capacity_error)
+                    return
+                worker = self._refresh_runtime_info(worker_id, state="running", last_error="") or self.store.get_worker(worker_id) or worker
                 self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.started", run["instruction"])
                 self._emit_callback(worker, "run.started", run=run, message=run["instruction"])
 
@@ -2293,7 +2323,7 @@ class WorkersProjectsService:
                         if final_state == "failed"
                         else None
                     )
-                    failure_message = str(failure_fields.get("failure_user_message") or "").strip() or str(exc)
+                    failure_message = runtime_failure_callback_message(failure_fields, str(exc))
                     self._emit_callback(
                         callback_worker,
                         f"run.{final_state}",
@@ -2307,11 +2337,17 @@ class WorkersProjectsService:
                 except Exception as exc:
                     if not self._processor_is_current(worker_id, generation):
                         return
-                    self.store.finalize_run(run["run_id"], state="failed", error_text=str(exc))
+                    failure_fields = classify_runtime_error(
+                        exc,
+                        runtime_name=str(worker.get("profile") or worker.get("runtime") or "worker"),
+                    ).as_store_fields()
+                    self.store.finalize_run(run["run_id"], state="failed", error_text=str(exc), **failure_fields)
                     self.store.finalize_schedule_for_run(run["run_id"], state="failed", last_error=str(exc))
                     self.store.update_worker_state(worker_id, "ready", last_error=str(exc))
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.failed", str(exc))
-                    self._emit_callback(worker, "run.failed", run={**run, "state": "failed", "error_text": str(exc)}, message=str(exc))
+                    failed_run = {**run, "state": "failed", "error_text": str(exc), **failure_fields}
+                    failure_message = runtime_failure_callback_message(failure_fields, str(exc))
+                    self._emit_callback(worker, "run.failed", run=failed_run, message=failure_message)
                     continue
 
                 if not self._processor_is_current(worker_id, generation):

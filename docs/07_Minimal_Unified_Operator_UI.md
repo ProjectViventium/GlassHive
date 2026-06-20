@@ -59,6 +59,10 @@ Calm dark glass over a bright signal core, like a modern appliance or Tesla cont
    - more menu
    - delete/shut down available from more menu
 18. The latest result must be visible in the top ribbon and expandable without leaving the live view.
+18a. The latest workspace output affordance must look and read like an explicit action wherever it
+   appears. The watch ribbon and workspace overview tiles should show `Latest workspace output`,
+   the current status/summary, and a clear `Open status` / `Close status` control state so users do
+   not have to guess which text is clickable.
 19. The steering box must remain visible across normal desktop widths and mobile-safe layouts.
 20. A non-technical user should be able to understand the flow with near-zero explanation.
 21. `Steer + send` must behave like a real redirect, not a passive note:

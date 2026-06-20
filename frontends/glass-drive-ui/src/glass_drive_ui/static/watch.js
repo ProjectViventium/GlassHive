@@ -12,7 +12,7 @@ const queueShortcutLabel = isApplePlatform ? '⌘+Enter' : 'Ctrl+Enter';
 const LONG_PRESS_MS = 550;
 const ACTIVE_REFRESH_MS = 2000;
 const IDLE_REFRESH_MS = 10000;
-const GLASSHIVE_UI_REV = '20260531b';
+const GLASSHIVE_UI_REV = '20260616a';
 
 const frame = document.getElementById('desktop-frame');
 const overlay = document.getElementById('stage-overlay');
@@ -31,6 +31,7 @@ const statePill = document.getElementById('watch-state');
 const menu = document.getElementById('more-menu');
 const menuToggle = document.getElementById('menu-toggle');
 const resultToggle = document.getElementById('result-toggle');
+const resultToggleAction = document.getElementById('result-toggle-action');
 const resultPanel = document.getElementById('result-panel');
 const resultPanelTitle = document.getElementById('result-panel-title');
 const resultClose = document.getElementById('result-close');
@@ -41,6 +42,7 @@ const openTerminalLink = document.getElementById('open-terminal-link');
 const openWorkerConsole = document.getElementById('open-worker-console');
 const openProjectWorkspace = document.getElementById('open-project-workspace');
 const openProjectWorkspaceMenu = document.getElementById('open-project-workspace-menu');
+const openclawActionButton = document.querySelector('[data-action="openclaw"]');
 const steerForm = document.getElementById('steer-form');
 const steerInput = document.getElementById('steer-input');
 const sendButton = document.getElementById('send-button');
@@ -122,12 +124,16 @@ function closeMenu() {
 function closeResultPanel() {
   resultPanel.hidden = true;
   resultToggle.setAttribute('aria-expanded', 'false');
+  resultToggle.setAttribute('aria-label', 'Open latest workspace output status');
+  if (resultToggleAction) resultToggleAction.textContent = 'Open status';
 }
 
 function openResultPanel() {
   if (!currentFullOutput.trim()) return;
   resultPanel.hidden = false;
   resultToggle.setAttribute('aria-expanded', 'true');
+  resultToggle.setAttribute('aria-label', 'Close latest workspace output status');
+  if (resultToggleAction) resultToggleAction.textContent = 'Close status';
 }
 
 function forceReloadFrame(url) {
@@ -182,8 +188,6 @@ function isFilePreviewUrl(url) {
 
 function currentSurfaceUrl() {
   if (activeSurface === 'desktop') {
-    const previewUrl = filePreviewUrl();
-    if (previewUrl) return previewUrl;
     return currentDesktopUrl || currentTerminalUrl;
   }
   return currentTerminalUrl || currentDesktopUrl;
@@ -285,10 +289,7 @@ function scheduleRefresh(delayMs = refreshDelayForState()) {
 function syncMenuLabels() {
   surfaceTerminalButton.dataset.active = String(activeSurface === 'terminal');
   surfaceDesktopButton.dataset.active = String(activeSurface === 'desktop');
-  const filePreviewActive = activeSurface === 'desktop' && Boolean(filePreviewUrl());
-  openExternal.textContent = filePreviewActive
-    ? 'Open delivered file in new tab'
-    : activeSurface === 'desktop'
+  openExternal.textContent = activeSurface === 'desktop'
       ? 'Open current desktop in new tab'
       : 'Open current session in new tab';
 }
@@ -302,10 +303,7 @@ function setSurface(surface, { force = false } = {}) {
     setOverlay(state);
     return;
   }
-  const filePreviewAvailable = activeSurface === 'desktop'
-    && currentDeliverable?.kind === 'file'
-    && (currentDeliverable.open_url || currentDeliverable.browser_url);
-  if (activeSurface === 'desktop' && !currentDesktopAvailable && !filePreviewAvailable) {
+  if (activeSurface === 'desktop' && !currentDesktopAvailable) {
     clearAttachedView();
     overlay.hidden = false;
     if (stage) {
@@ -321,7 +319,7 @@ function setSurface(surface, { force = false } = {}) {
     return;
   }
   const url = currentSurfaceUrl();
-  const filePreviewKey = activeSurface === 'desktop' ? currentFilePreviewKey : '';
+  const filePreviewKey = '';
   const sameFilePreviewAttached = Boolean(
     filePreviewKey
       && lastAttachedFilePreviewKey === filePreviewKey
@@ -538,8 +536,6 @@ async function maybePromoteDeliverable(data) {
     syncResultActions(currentDeliverable);
     if (promotionKey && promotionKey !== lastPromotedDeliverableKey) {
       lastPromotedDeliverableKey = promotionKey;
-      activeSurface = 'desktop';
-      setSurface('desktop', { force: true });
     }
     return;
   }
@@ -709,6 +705,9 @@ async function refresh() {
 
     title.textContent = currentProjectTitle || 'Workspace live view';
     subtitle.textContent = `${worker.profile || 'worker'} workspace · ${displayStateLabel(displayState)}`;
+    if (openclawActionButton) {
+      openclawActionButton.hidden = !String(worker.profile || '').startsWith('openclaw');
+    }
     syncDocumentTitle(currentProjectTitle, worker.name);
     statePill.textContent = displayStateLabel(displayState);
     syncRunToggle(displayState);
