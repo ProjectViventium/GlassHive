@@ -24,8 +24,18 @@ Every enterprise deployment must configure and QA these controls before users ar
 - `GLASSHIVE_IDLE_REAPER_INTERVAL_S`: lifecycle reaper interval.
 - `GLASSHIVE_MAX_RUN_DURATION_S`: hard cap for long-running work; also feeds worker CLI timeout
   where supported.
-- `GLASSHIVE_MAX_WATCH_SESSION_DURATION_S`: caps signed View / Steer link lifetime and the active
-  websocket session for already-open watch tabs.
+- `GLASSHIVE_LINK_REF_TTL_SECONDS`: durable short-ref lifetime. Default `0` means `/r/{ref}` and
+  `/v1/link-refs/{ref}` do not expire; values `never`, `none`, `disabled`, `off`, `false`, and
+  `no` also mean no expiry. Set a positive integer number of seconds only for deployments that
+  intentionally want user-facing short refs to expire.
+- `GLASSHIVE_LINK_REF_STATE_PATH`: SQLite state file for short refs. If the runtime process creates
+  View / Steer refs that redirect to a separate GlassHive UI service, both processes must point at
+  the same state file on the same host or supported shared storage. Do not put SQLite WAL state on
+  unsafe network filesystems.
+- `GLASSHIVE_MAX_WATCH_SESSION_DURATION_S`: caps signed View / Steer session-token lifetime and
+  the active websocket session for already-open watch tabs. This is separate from durable short
+  refs: a user can reopen a durable owner-scoped link later, but the forgotten active tab does not
+  have to keep an active session alive forever.
 - `GLASSHIVE_WATCH_SESSION_STATE_PATH`: persists per-user/per-worker watch-session deadlines so a
   reconnect before expiry does not reset the active-session timer.
 - `GLASSHIVE_MAX_ACTIVE_WORKERS_PER_USER`: concurrent active worker cap per user.
@@ -164,8 +174,17 @@ Enterprise mode must:
 - fail closed on missing, ambiguous, forged, expired, or wrong-tenant auth
 - keep non-health routes, docs, UI, MCP, watch, artifact, and websocket surfaces gated
 
-Signed View / Steer and artifact links must be short-lived and scoped to the worker owner. Do not
-store valid signed links in reports, logs, or public artifacts.
+Raw signed View / Steer and artifact tokens must be short-lived and scoped to the worker owner.
+Public tool payloads, callbacks, preview pages, and member UI actions should expose only short link
+references such as `/r/{ref}` or `/v1/link-refs/{ref}`. Those short refs are durable authenticated
+pointers by default (`GLASSHIVE_LINK_REF_TTL_SECONDS=0`), not bearer credentials and not compute
+leases. Enterprise `/r/{ref}` and `/v1/link-refs/{ref}` handlers must require the authenticated
+tenant/user to match the ref payload before minting a fresh bounded worker cookie or returning an
+artifact. Raw `gh_token` URLs and opaque `/v1/signed-links/{token}` targets are credential-bearing
+implementation details and must stay server-side or legacy inbound-only. `/r/{ref}` handlers should
+redirect to a tokenless watch/project/desktop URL, so the browser address bar and follow-up UI/API
+polling do not retain `gh_token`. Do not store valid signed links in reports, logs, or public
+artifacts.
 
 Signed-link TTL is not enough by itself. If a user opens a watch session before the link expires,
 the browser can keep an active websocket open. `GLASSHIVE_MAX_WATCH_SESSION_DURATION_S` must also
@@ -173,10 +192,10 @@ close that live websocket after the configured duration. In plain terms: link ex
 door from opening; active session timeout also closes the door that is already open.
 
 When `GLASSHIVE_WATCH_SESSION_STATE_PATH` is configured, the UI records a
-tenant/user/worker-specific watch deadline. Re-minting the same worker link before expiry keeps the
-original deadline; after expiry, the old link and websocket session fail closed. A newly minted
-owner-scoped link from the authenticated GlassHive UI or MCP/status flow can start a fresh watch
-session for that same owner.
+tenant/user/worker-specific watch deadline. Re-minting a worker session before expiry keeps the
+original deadline; after expiry, the old active token and websocket session fail closed. Opening the
+same durable authenticated short ref later can mint a new bounded session for the same owner and
+reattach to the retained workspace/artifacts without treating the inactive time as active compute.
 
 Upload/data-plane QA is part of the enterprise contract, not a separate convenience feature. For
 LibreChat integrations, the worker must receive actual uploaded bytes through a read-only shared

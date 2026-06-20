@@ -42,6 +42,7 @@ const openTerminalLink = document.getElementById('open-terminal-link');
 const openWorkerConsole = document.getElementById('open-worker-console');
 const openProjectWorkspace = document.getElementById('open-project-workspace');
 const openProjectWorkspaceMenu = document.getElementById('open-project-workspace-menu');
+const openclawActionButton = document.querySelector('[data-action="openclaw"]');
 const steerForm = document.getElementById('steer-form');
 const steerInput = document.getElementById('steer-input');
 const sendButton = document.getElementById('send-button');
@@ -626,6 +627,7 @@ async function submitFooterInstruction(mode) {
 
 function setOverlay(state, detail) {
   const connecting = attachStartedAt && !frameReady && Date.now() - attachStartedAt < 12000;
+  const filePreviewActive = activeSurface === 'desktop' && Boolean(filePreviewUrl());
   const waiting = state === 'starting' || state === 'paused' || state === 'idle' || state === 'idle_terminated' || state === 'stopped' || connecting;
   overlay.hidden = !waiting;
   if (stage) {
@@ -655,13 +657,17 @@ function setOverlay(state, detail) {
 
   if (connecting) {
     if (overlayLabel) {
-      overlayLabel.textContent = 'Workspace attaching';
+      overlayLabel.textContent = filePreviewActive ? 'Delivered file' : 'Workspace attaching';
     }
-    overlayTitle.textContent = activeSurface === 'desktop'
-      ? 'Attaching live workspace…'
-      : 'Attaching exact live session…';
-    overlayDetail.textContent = activeSurface === 'desktop'
-      ? 'The desktop is waking up. If it takes more than a few seconds, open the current desktop in a new tab.'
+    overlayTitle.textContent = filePreviewActive
+      ? 'Opening delivered file…'
+      : activeSurface === 'desktop'
+        ? 'Attaching live workspace…'
+        : 'Attaching exact live session…';
+    overlayDetail.textContent = filePreviewActive
+      ? 'The completed file preview is loading. Use Open delivered file in new tab if this takes more than a few seconds.'
+      : activeSurface === 'desktop'
+        ? 'The desktop is waking up. If it takes more than a few seconds, open the current desktop in a new tab.'
       : 'We are connecting to the exact running session. If it takes more than a few seconds, open the current session in a new tab.';
     return;
   }
@@ -669,11 +675,15 @@ function setOverlay(state, detail) {
   if (overlayLabel) {
     overlayLabel.textContent = 'Workspace warming up';
   }
-  overlayTitle.textContent = activeSurface === 'desktop'
-    ? 'Preparing live workspace…'
-    : 'Preparing exact live session…';
-  overlayDetail.textContent = detail || (activeSurface === 'desktop'
-    ? 'The desktop will attach automatically when the workspace is ready.'
+  overlayTitle.textContent = filePreviewActive
+    ? 'Opening delivered file…'
+    : activeSurface === 'desktop'
+      ? 'Preparing live workspace…'
+      : 'Preparing exact live session…';
+  overlayDetail.textContent = detail || (filePreviewActive
+    ? 'The completed file preview will appear here automatically.'
+    : activeSurface === 'desktop'
+      ? 'The desktop will attach automatically when the workspace is ready.'
     : 'The exact workspace session will appear here as soon as the workspace is ready.');
 }
 
@@ -695,6 +705,9 @@ async function refresh() {
 
     title.textContent = currentProjectTitle || 'Workspace live view';
     subtitle.textContent = `${worker.profile || 'worker'} workspace · ${displayStateLabel(displayState)}`;
+    if (openclawActionButton) {
+      openclawActionButton.hidden = !String(worker.profile || '').startsWith('openclaw');
+    }
     syncDocumentTitle(currentProjectTitle, worker.name);
     statePill.textContent = displayStateLabel(displayState);
     syncRunToggle(displayState);

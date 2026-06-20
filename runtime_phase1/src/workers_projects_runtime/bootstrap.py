@@ -67,9 +67,10 @@ GLASSHIVE_WORKER_COMPLETION_CONTRACT = (
 GLASSHIVE_NATIVE_CAPABILITY_INVENTORY = """Native capability inventory (choose when relevant, never forced):
 
 - You may have worker-native CLI, browser, computer-use, MCP, plugin, and skill surfaces. Inspect what is actually available before saying a capability is unavailable, and do not claim to have used a capability unless you have evidence.
-- Claude Code workers are expected to be provisioned with Claude Code's native browser/computer-use, MCP, plugin, and skill surfaces when available.
-- Codex workers are expected to be provisioned with Codex's native browser/computer-use, MCP, plugin, and skill surfaces when available.
-- Capability families to consider when relevant include documents, PDFs, spreadsheets, slide decks, notebooks, screenshots, deep research, fact checking, browser/desktop operation, local files, shell, and connected MCP/tool work.
+- Claude Code workers are expected to be provisioned with Claude Code's native browser/computer-use capability when available, plus Claude Code skill/plugin families for document-skills, doc-coauthoring, theme-factory, daymade deep-research, daymade fact-checker, daymade ppt-creator, daymade excel-automation, daymade doc-to-markdown, academic-research-skills for academic/literature-review work, and NVIDIA AI-Q for enterprise/private deep research when configured.
+- Claude Code skill families to consider when relevant: anthropic document-skills; anthropic doc-coauthoring; anthropic theme-factory; daymade deep-research; daymade fact-checker; daymade ppt-creator; daymade excel-automation; daymade doc-to-markdown; academic-research-skills for academic/literature-review work; NVIDIA AI-Q for enterprise/private deep research when configured.
+- Codex workers are expected to be provisioned with Codex's native browser/computer-use, MCP, plugin, and skill surfaces when available, plus skill/plugin families for PDFs, notebooks, screenshots, research documentation, Office artifacts, deep research, fact checking, spreadsheets, and decks.
+- Codex skill families to consider when relevant: openai pdf; openai jupyter-notebook; openai screenshot; openai notion-research-documentation; anthropic docx; anthropic pptx; anthropic xlsx; anthropic pdf; daymade deep-research; daymade fact-checker; daymade excel-automation; daymade ppt-creator.
 - Use these capabilities when relevant based on the user's request. Do not overfit to examples, force a specific tool, or replace the worker's own planning and review with host-authored workflows. Plan, execute, inspect, identify gaps/issues/misalignments, and fix them before the final delivery.
 """
 GLASSHIVE_WORKER_PROJECT_CONTRACT = f"""# GlassHive Worker Contract

@@ -45,11 +45,11 @@ def test_bootstrap_materializes_canonical_worker_operating_contract(tmp_path):
     assert "polished ordinary end-user artifact" in agents_text
     assert "Do not force a download" in agents_text
     assert "Native capability inventory" in agents_text
-    assert "Claude Code's native browser/computer-use" in agents_text
-    assert "Codex's native browser/computer-use" in agents_text
-    assert "documents, PDFs, spreadsheets, slide decks" in agents_text
-    assert "NVIDIA AI-Q" not in agents_text
-    assert "daymade" not in agents_text
+    assert "Claude Code skill families" in agents_text
+    assert "Codex skill families" in agents_text
+    assert "daymade deep-research" in agents_text
+    assert "openai pdf" in agents_text
+    assert "anthropic document-skills" in agents_text
     assert "Use these capabilities when relevant" in agents_text
 
 

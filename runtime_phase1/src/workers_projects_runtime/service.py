@@ -30,7 +30,13 @@ from .openclaw_runtime import (
 )
 from .operator_urls import surface_aware_watch_url
 from .runtime_env import load_viventium_runtime_env
-from .signed_links import append_signed_query, sign_link_params, sign_link_token
+from .signed_links import (
+    append_signed_query,
+    create_signed_link_ref,
+    sign_link_params,
+    signed_link_ref_url,
+    sign_link_token,
+)
 from .store import Store
 
 
@@ -626,7 +632,8 @@ class WorkersProjectsService:
             path=path,
         )
         if token:
-            return f"{base_url}/v1/signed-links/{quote(token)}"
+            ref_id = create_signed_link_ref(token=token)
+            return signed_link_ref_url(base_url, ref_id) if ref_id else ""
         if str(worker.get("tenant_id") or "") not in {"", "local"}:
             return ""
         return f"{base_url}/v1/workers/{worker_id}/artifacts/{action}?{urlencode({'path': path})}"
@@ -666,7 +673,9 @@ class WorkersProjectsService:
         if not watch_url:
             return ""
         if token:
-            return append_signed_query(watch_url, {"gh_token": token})
+            target_url = append_signed_query(watch_url, {"gh_token": token})
+            ref_id = create_signed_link_ref(token=token, target_url=target_url)
+            return signed_link_ref_url(base_url, ref_id, route="/r") if ref_id else ""
         if str(worker.get("tenant_id") or "") not in {"", "local"}:
             return ""
         return watch_url
@@ -1344,6 +1353,12 @@ class WorkersProjectsService:
             return "openclaw"
         return clean_profile or str(execution_mode or "").strip() or "worker"
 
+    def _legacy_backend_label(self, profile: str, execution_mode: str, requested_backend: str) -> str:
+        runtime_label = self._initial_runtime_label(profile, execution_mode)
+        if runtime_label:
+            return runtime_label
+        return str(requested_backend or "").strip() or "worker"
+
     def create_worker(
         self,
         project_id: str,
@@ -1373,7 +1388,7 @@ class WorkersProjectsService:
                 name=name,
                 role=role,
                 profile=profile,
-                backend=backend,
+                backend=self._legacy_backend_label(profile, execution_mode, backend),
                 runtime=self._initial_runtime_label(profile, execution_mode),
                 model=model,
                 execution_mode=execution_mode,
@@ -1445,7 +1460,8 @@ class WorkersProjectsService:
                 "name": name,
                 "role": role,
                 "profile": profile,
-                "backend": backend,
+                "backend": self._legacy_backend_label(profile, execution_mode, backend),
+                "runtime": self._initial_runtime_label(profile, execution_mode),
             }
             if workspace_root is not None:
                 updates["workspace_root"] = workspace_root
@@ -1579,15 +1595,17 @@ class WorkersProjectsService:
     ) -> dict:
         source_worker = self.require_worker(source_worker_id)
         bootstrap_bundle = self._bootstrap_bundle_for(source_worker)
+        profile = str(source_worker.get("profile") or "codex-cli")
+        execution_mode = str(source_worker.get("execution_mode") or "docker")
         duplicated = self.create_worker(
             project_id=project_id,
             tenant_id=str(source_worker.get("tenant_id") or "local"),
             owner_id=owner_id,
             name=name,
             role=role,
-            profile=str(source_worker.get("profile") or "codex-cli"),
-            backend=str(source_worker.get("backend") or "openclaw"),
-            execution_mode=str(source_worker.get("execution_mode") or "docker"),
+            profile=profile,
+            backend=self._legacy_backend_label(profile, execution_mode, str(source_worker.get("backend") or "")),
+            execution_mode=execution_mode,
             alias=None,
             workspace_root=str(source_worker.get("workspace_root") or "") or None,
             bootstrap_profile=str(source_worker.get("bootstrap_profile") or "") or None,
@@ -2200,6 +2218,10 @@ class WorkersProjectsService:
                     return
 
                 worker = self.store.get_worker(worker_id) or worker
+                capacity_error = self._runtime_capacity_error(worker)
+                if capacity_error:
+                    self._requeue_retryable_run(worker, run, capacity_error)
+                    return
                 worker = self._refresh_runtime_info(worker_id, state="running", last_error="") or self.store.get_worker(worker_id) or worker
                 self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.started", run["instruction"])
                 self._emit_callback(worker, "run.started", run=run, message=run["instruction"])

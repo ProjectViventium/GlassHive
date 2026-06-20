@@ -89,7 +89,6 @@ class RuntimeClient:
                 "name": name,
                 "role": role,
                 "profile": profile,
-                "backend": "openclaw",
                 "execution_mode": execution_mode,
                 "bootstrap_profile": {
                     "codex-cli": "codex-host",

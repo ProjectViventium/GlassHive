@@ -33,11 +33,14 @@ RUNTIME_ENV_KEYS = (
     "GLASSHIVE_WORKER_SECRET_ENV_EXPOSURE",
     "GLASSHIVE_WORKER_SECRET_ENV_KEYS",
     "GLASSHIVE_SIGNED_LINK_SECRET",
+    "GLASSHIVE_LINK_REF_STATE_PATH",
+    "GLASSHIVE_LINK_REF_TTL_SECONDS",
     "GLASSHIVE_WORKER_ENV_ALLOWLIST",
     "GLASSHIVE_ALLOWED_WORKER_PROFILES",
     "GLASSHIVE_DEFAULT_WORKER_PROFILE",
     "WPR_API_TOKEN",
     "WPR_DB_PATH",
+    "WPR_LINK_REF_TTL_SECONDS",
     "WPR_DEFAULT_EXECUTION_MODE",
     "WPR_ENTERPRISE_MODE",
     "WPR_ENTERPRISE_TENANT_ID",
@@ -66,7 +69,8 @@ for key in RUNTIME_ENV_KEYS:
 
 
 @pytest.fixture(autouse=True)
-def isolate_runtime_env(monkeypatch: pytest.MonkeyPatch):
+def isolate_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
     for key in RUNTIME_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(tmp_path / "link_refs.sqlite3"))
     yield

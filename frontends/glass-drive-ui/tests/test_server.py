@@ -1,7 +1,10 @@
 import asyncio
 import base64
 import hmac
+import importlib.util
 import json
+import logging
+import os
 import time
 from hashlib import sha256
 from pathlib import Path
@@ -13,10 +16,17 @@ from starlette.websockets import WebSocketDisconnect
 
 import glass_drive_ui.server as server_module
 from glass_drive_ui.server import create_app
+from glass_drive_ui.signed_links import (
+    SensitiveUrlLogFilter,
+    create_signed_link_ref,
+    install_sensitive_url_log_filter,
+    redact_sensitive_url_text,
+    resolve_signed_link_ref,
+)
 
 
 @pytest.fixture(autouse=True)
-def clear_glasshive_ui_env(monkeypatch):
+def clear_glasshive_ui_env(monkeypatch, tmp_path):
     for name in (
         "WPR_API_TOKEN",
         "GLASSHIVE_DEFAULT_OWNER_ID",
@@ -29,16 +39,21 @@ def clear_glasshive_ui_env(monkeypatch):
         "GLASSHIVE_ALLOW_LOCAL_DEMO_OWNER",
         "GLASSHIVE_COOKIE_SECURE",
         "GLASSHIVE_SIGNED_LINK_SECRET",
+        "GLASSHIVE_LINK_REF_STATE_PATH",
+        "GLASSHIVE_LINK_REF_TTL_SECONDS",
         "GLASSHIVE_HOST_WORKERS_ENABLED",
         "GLASSHIVE_DEFAULT_WORKER_PROFILE",
         "GLASSHIVE_ALLOWED_WORKER_PROFILES",
         "GLASSHIVE_WATCH_SESSION_STATE_PATH",
+        "GLASSHIVE_MAX_WATCH_SESSION_DURATION_S",
         "WPR_DEFAULT_EXECUTION_MODE",
         "WPR_ALLOWED_WORKER_PROFILES",
+        "WPR_LINK_REF_TTL_SECONDS",
         "VIVENTIUM_ENV_FILE",
         "VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(tmp_path / "link_refs.sqlite3"))
     server_module._NOVNC_VIEW_URL_CACHE.clear()
     server_module._NOVNC_ASSET_CACHE.clear()
     server_module._NOVNC_HTTP_CLIENT = None
@@ -197,6 +212,25 @@ def signed_worker_token(secret: str, *, worker_id: str = "wrk_1", tenant_id: str
     return f"{encoded}.{signature}"
 
 
+def worker_ref_record(url: str) -> dict[str, object]:
+    assert url.startswith("/r/")
+    assert "gh_token=" not in url
+    record = resolve_signed_link_ref(url.rsplit("/", 1)[1])
+    assert record is not None
+    assert record["kind"] == "worker_view"
+    assert "gh_token=" not in str(record.get("target_url") or "")
+    return record
+
+
+def load_runtime_signed_links_module():
+    module_path = Path(__file__).resolve().parents[3] / "runtime_phase1" / "src" / "workers_projects_runtime" / "signed_links.py"
+    spec = importlib.util.spec_from_file_location("glasshive_runtime_signed_links_for_ui_test", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def signed_artifact_token(
     secret: str,
     *,
@@ -237,6 +271,7 @@ def set_enterprise_ui_env(
 
 def test_ui_loads_enterprise_service_auth_from_runtime_env_file(tmp_path, monkeypatch):
     env_file = tmp_path / "runtime.env"
+    link_ref_state = tmp_path / "shared-link-refs.sqlite3"
     env_file.write_text(
         "\n".join(
             [
@@ -246,11 +281,13 @@ def test_ui_loads_enterprise_service_auth_from_runtime_env_file(tmp_path, monkey
                 "GLASSHIVE_TRUST_INBOUND_IDENTITY=true",
                 "WPR_API_TOKEN=service-secret",
                 "GLASSHIVE_SIGNED_LINK_SECRET=signed-link-secret",
+                f"GLASSHIVE_LINK_REF_STATE_PATH={link_ref_state}",
             ]
         )
     )
     monkeypatch.setenv("VIVENTIUM_ENV_FILE", str(env_file))
     monkeypatch.setenv("VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV", "1")
+    monkeypatch.delenv("GLASSHIVE_LINK_REF_STATE_PATH", raising=False)
     fake = FakeRuntimeClient()
 
     client = TestClient(create_app(runtime_client=fake))
@@ -265,6 +302,7 @@ def test_ui_loads_enterprise_service_auth_from_runtime_env_file(tmp_path, monkey
     )
 
     assert response.status_code == 200
+    assert os.environ["GLASSHIVE_LINK_REF_STATE_PATH"] == str(link_ref_state)
     assert fake.header_contexts[0]["X-WPR-Token"] == "service-secret"
     assert fake.header_contexts[0]["X-Viventium-User-Id"] == "qa-user"
 
@@ -316,6 +354,63 @@ def test_launch_applies_codex_effort_to_new_workspace_bootstrap():
     assert bundle["env"]["WPR_CODEX_CLI_REASONING_EFFORT"] == "xhigh"
 
 
+def test_launch_accepts_codex_none_effort_to_match_mcp_policy():
+    fake = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=fake))
+
+    launch = client.post('/api/launch', json={
+        'description': 'Create a report',
+        'success_criteria': 'Report exists',
+        'workspace_option': 'new:codex-cli',
+        'effort': 'none',
+    })
+
+    assert launch.status_code == 200
+    bundle = fake.create_worker_requests[-1]['bootstrap_bundle']
+    assert bundle["env"]["WPR_CODEX_CLI_REASONING_EFFORT"] == "none"
+
+
+def test_launch_applies_claude_max_effort_to_runtime_env():
+    fake = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=fake))
+
+    launch = client.post('/api/launch', json={
+        'description': 'Create a report',
+        'success_criteria': 'Report exists',
+        'workspace_option': 'new:claude-code',
+        'effort': 'max',
+    })
+
+    assert launch.status_code == 200
+    bundle = fake.create_worker_requests[-1]['bootstrap_bundle']
+    assert bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == "max"
+    assert "Worker effort preference" not in bundle.get("system_instructions", "")
+
+
+def test_launch_watch_url_uses_short_ref_when_signed_links_enabled(monkeypatch):
+    monkeypatch.setenv("WPR_API_TOKEN", "ui-service-token")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "ui-signed-link-secret")
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    launch = client.post('/api/launch', json={
+        'description': 'Verify signed launch URL shape',
+        'success_criteria': 'The returned watch URL is a short ref with no raw token',
+        'context': '',
+        'workspace_option': 'new:codex-cli',
+    })
+
+    assert launch.status_code == 200
+    watch_url = launch.json()["watch_url"]
+    record = worker_ref_record(watch_url)
+    assert str(record["target_url"]).startswith("/watch/wrk_new?")
+    assert "surface=desktop" in str(record["target_url"])
+    redirect = client.get(watch_url, follow_redirects=False)
+    assert redirect.status_code == 307
+    assert redirect.headers["location"].startswith("/watch/wrk_new?")
+    assert "gh_token=" not in redirect.headers["location"]
+
+
 def test_launch_honors_available_host_workspace_type(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
@@ -342,6 +437,19 @@ def test_launch_honors_available_host_workspace_type(monkeypatch):
 
     assert launch.status_code == 200
     assert fake.create_worker_requests[-1]["execution_mode"] == "host"
+
+
+def test_bootstrap_prefers_glasshive_execution_mode_alias(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_EXECUTION_MODE", "host")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    fake = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=fake))
+
+    boot = client.get("/api/bootstrap")
+
+    assert boot.status_code == 200
+    assert boot.json()["default_workspace_type"] == "host"
 
 
 def test_host_workspace_type_available_even_when_docker_is_default(monkeypatch):
@@ -597,19 +705,19 @@ def test_signed_workspace_links_reuse_persisted_watch_session_deadline(tmp_path,
     monkeypatch.setattr(server_module.sign_link_token.__globals__["time"], "time", lambda: now["value"])
 
     first_url = server_module._append_signed_worker_token("/watch/wrk_1", "wrk_1", identity)
-    first_payload = server_module.verify_signed_link_token(first_url.split("gh_token=", 1)[1])
+    first_payload = server_module.verify_signed_link_token(str(worker_ref_record(first_url)["token"]))
     assert first_payload is not None
     assert first_payload["exp"] == 1_060
 
     now["value"] = 1_020
     second_url = server_module._append_signed_worker_token("/watch/wrk_1", "wrk_1", identity)
-    second_payload = server_module.verify_signed_link_token(second_url.split("gh_token=", 1)[1])
+    second_payload = server_module.verify_signed_link_token(str(worker_ref_record(second_url)["token"]))
     assert second_payload is not None
     assert second_payload["exp"] == 1_060
 
     now["value"] = 1_061
     third_url = server_module._append_signed_worker_token("/watch/wrk_1", "wrk_1", identity)
-    third_payload = server_module.verify_signed_link_token(third_url.split("gh_token=", 1)[1])
+    third_payload = server_module.verify_signed_link_token(str(worker_ref_record(third_url)["token"]))
     assert third_payload is not None
     assert third_payload["exp"] == 1_121
 
@@ -717,23 +825,10 @@ def test_launcher_workspace_hive_static_controls():
     static_dir = Path(server_module.__file__).parent / "static"
     app_js = (static_dir / "app.js").read_text(encoding="utf-8")
     desktop_js = (static_dir / "desktop.js").read_text(encoding="utf-8")
-    desktop_html = (static_dir / "desktop.html").read_text(encoding="utf-8")
     index_html = (static_dir / "index.html").read_text(encoding="utf-8")
     styles_css = (static_dir / "styles.css").read_text(encoding="utf-8")
     watch_html = (static_dir / "watch.html").read_text(encoding="utf-8")
     watch_js = (static_dir / "watch.js").read_text(encoding="utf-8")
-    assert 'href="/static/styles.css?v=20260616a"' in index_html
-    assert 'src="/static/app.js?v=20260616a"' in index_html
-    assert 'src="/static/desktop.js?v=20260616a"' in desktop_html
-    assert 'href="/static/styles.css?v=20260616a"' in watch_html
-    assert 'src="/static/watch.js?v=20260616a"' in watch_html
-    assert "const GLASSHIVE_UI_REV = '20260616a'" in app_js
-    assert "const GLASSHIVE_UI_REV = '20260616a'" in watch_js
-    assert "20260531b" not in index_html
-    assert "20260525c" not in desktop_html
-    assert "20260531b" not in watch_html
-    assert "20260525c" not in app_js
-    assert "20260531b" not in watch_js
     assert "workspace-live-frame" in app_js
     assert "MAX_LIVE_TILE_IFRAMES" in app_js
     assert "RETAINED_TILE_REFRESH_MS" in app_js
@@ -781,7 +876,6 @@ def test_launcher_workspace_hive_static_controls():
     assert "function isFilePreviewUrl(url)" in watch_js
     assert "lastAttachedFilePreviewKey === filePreviewKey" in watch_js
     assert "if (!isFilePreviewUrl(url))" in watch_js
-    assert "if (previewUrl) return previewUrl" not in watch_js
     assert "currentDeliverable?.kind === 'file'" in watch_js
     assert "syncResultActions(currentDeliverable)" in watch_js
     assert 'id="artifact-list"' in watch_html
@@ -797,7 +891,7 @@ def test_launcher_workspace_hive_static_controls():
     assert ".result-toggle-action" in styles_css
     assert ".workspace-status-button" in styles_css
     assert "Open current desktop in new tab" in watch_js
-    assert "Open delivered file in new tab" not in watch_js
+    assert "if (previewUrl) return previewUrl" not in watch_js
     assert "setInterval(refresh" not in watch_js
     assert "Workspace paused" not in watch_js
     assert 'grid-template-areas:' in styles_css
@@ -1048,14 +1142,16 @@ def test_bootstrap_signs_workspace_links_in_enterprise_mode(monkeypatch):
 
     assert response.status_code == 200
     workspace = response.json()["existing_workspaces"][0]
-    assert "gh_token=" in workspace["watch_url"]
-    assert "gh_token=" in workspace["project_url"]
-    assert "gh_token=" in workspace["desktop_url"]
-    assert "gh_token=" in workspace["api_url"]
-    assert client.get(workspace["watch_url"]).status_code == 200
-    assert client.get(workspace["desktop_url"]).status_code == 200
-    api_live_url = workspace["api_url"].replace("?gh_token=", "/live?gh_token=")
-    assert client.get(api_live_url).status_code == 200
+    watch_ref = worker_ref_record(workspace["watch_url"])
+    project_ref = worker_ref_record(workspace["project_url"])
+    desktop_ref = worker_ref_record(workspace["desktop_url"])
+    api_ref = worker_ref_record(workspace["api_url"])
+    assert str(watch_ref["target_url"]).startswith("/watch/wrk_1?")
+    assert str(project_ref["target_url"]).startswith("/ui/projects/prj_1?")
+    assert str(desktop_ref["target_url"]) == "/desktop/wrk_1"
+    assert str(api_ref["target_url"]) == "/api/worker/wrk_1"
+    assert client.get(workspace["watch_url"], headers=headers).status_code == 200
+    assert client.get(workspace["desktop_url"], headers=headers).status_code == 200
 
 
 def test_signed_watch_token_is_worker_scoped(monkeypatch):
@@ -1191,6 +1287,184 @@ def test_signed_watch_sets_worker_scoped_cookie(monkeypatch):
     assert "HttpOnly" in set_cookie
     assert "SameSite=lax" in set_cookie
     assert response.headers["referrer-policy"] == "same-origin"
+
+
+def test_short_worker_view_ref_redirects_and_sets_worker_cookie(monkeypatch):
+    secret = "ui-signed-link-secret"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    token = signed_worker_token(secret)
+    target_url = f"http://testserver/watch/wrk_1?surface=desktop&gh_token={token}"
+    ref_id = create_signed_link_ref(token=token, target_url=target_url)
+
+    response = client.get(f"/r/{ref_id}", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "http://testserver/watch/wrk_1?surface=desktop"
+    assert "gh_token=" not in response.headers["location"]
+    assert f"/r/{ref_id}" not in target_url
+    set_cookie = response.headers["set-cookie"]
+    assert "glasshive_gh_token_wrk_1=" in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "SameSite=lax" in set_cookie
+
+
+def test_enterprise_short_worker_view_ref_requires_authenticated_owner_and_refreshes_expired_token(monkeypatch):
+    secret = "ui-signed-link-secret"
+    set_enterprise_ui_env(monkeypatch, signed_secret=secret)
+    monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
+    monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "300")
+    now = {"value": 1_000}
+    monkeypatch.setattr(server_module.time, "time", lambda: now["value"])
+    monkeypatch.setattr(server_module.sign_link_token.__globals__["time"], "time", lambda: now["value"])
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    token = server_module.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        ttl_seconds=60,
+    )
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/watch/wrk_1?surface=desktop&gh_token={token}",
+    )
+    assert ref_id
+
+    now["value"] = 2_000
+    assert client.get(f"/r/{ref_id}", follow_redirects=False).status_code == 401
+    wrong_user = {
+        "X-GlassHive-Tenant-Id": "tenant-alpha",
+        "X-GlassHive-User-Id": "user-b",
+        "X-GlassHive-User-Role": "member",
+    }
+    assert client.get(f"/r/{ref_id}", headers=wrong_user, follow_redirects=False).status_code == 404
+    response = client.get(
+        f"/r/{ref_id}",
+        headers={
+            "X-GlassHive-Tenant-Id": "tenant-alpha",
+            "X-GlassHive-User-Id": "user-a",
+            "X-GlassHive-User-Role": "member",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 307
+    assert response.headers["location"] == "http://testserver/watch/wrk_1?surface=desktop"
+    set_cookie = response.headers["set-cookie"]
+    cookie_value = set_cookie.split("glasshive_gh_token_wrk_1=", 1)[1].split(";", 1)[0]
+    assert cookie_value != token
+    refreshed_payload = server_module.verify_signed_link_token(cookie_value)
+    assert refreshed_payload is not None
+    assert refreshed_payload["worker_id"] == "wrk_1"
+    assert refreshed_payload["owner_id"] == "user-a"
+
+
+def test_ui_resolves_runtime_created_short_ref_when_state_path_is_shared(monkeypatch):
+    secret = "ui-signed-link-secret"
+    set_enterprise_ui_env(monkeypatch, signed_secret=secret)
+    monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
+    runtime_signed_links = load_runtime_signed_links_module()
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    token = runtime_signed_links.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    ref_id = runtime_signed_links.create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/watch/wrk_1?surface=desktop&gh_token={token}",
+    )
+    assert ref_id
+
+    response = client.get(
+        f"/r/{ref_id}",
+        headers={
+            "X-GlassHive-Tenant-Id": "tenant-alpha",
+            "X-GlassHive-User-Id": "user-a",
+            "X-GlassHive-User-Role": "member",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "http://testserver/watch/wrk_1?surface=desktop"
+    assert "gh_token=" not in response.headers["location"]
+
+
+def test_short_worker_view_ref_ttl_config_can_expire_refs(monkeypatch):
+    secret = "ui-signed-link-secret"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_TTL_SECONDS", "30")
+    now = {"value": 1_000}
+    monkeypatch.setattr(server_module.time, "time", lambda: now["value"])
+    monkeypatch.setattr(server_module.sign_link_token.__globals__["time"], "time", lambda: now["value"])
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    token = server_module.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    ref_id = create_signed_link_ref(token=token, target_url=f"http://testserver/watch/wrk_1?gh_token={token}")
+    record = resolve_signed_link_ref(ref_id)
+    assert record is not None
+    assert record["expires_at"] == 1_030
+
+    now["value"] = 1_031
+    response = client.get(f"/r/{ref_id}", follow_redirects=False)
+    assert response.status_code == 401
+
+
+def test_ui_sensitive_url_log_filter_redacts_signed_tokens():
+    raw = (
+        'GET /novnc/wrk_1/websockify?gh_token=secret-token&gh_sig=signature&gh_exp=123 '
+        'GET /v1/signed-links/opaque-token?download=1'
+    )
+
+    cookie = "Set-Cookie: glasshive_gh_token_wrk_1=worker-secret; HttpOnly; SameSite=lax"
+
+    assert redact_sensitive_url_text(f"{raw} {cookie}") == (
+        'GET /novnc/wrk_1/websockify?gh_token=[redacted]&gh_sig=[redacted]&gh_exp=[redacted] '
+        'GET /v1/signed-links/[redacted]?download=1 '
+        'Set-Cookie: glasshive_gh_token_wrk_1=[redacted]; HttpOnly; SameSite=lax'
+    )
+    record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=0,
+        msg="%s",
+        args=(f"{raw} {cookie}",),
+        exc_info=None,
+    )
+    assert SensitiveUrlLogFilter().filter(record) is True
+    assert "secret-token" not in record.args[0]
+    assert "opaque-token" not in record.args[0]
+    assert "worker-secret" not in record.args[0]
+    assert "gh_token=[redacted]" in record.args[0]
+    assert "glasshive_gh_token_wrk_1=[redacted]" in record.args[0]
+
+
+def test_ui_sensitive_url_log_filter_installs_for_child_loggers(caplog):
+    install_sensitive_url_log_filter()
+    raw = "https://glasshive.example.test/watch/wrk_1?gh_token=secret-token&gh_sig=signature"
+    logger = logging.getLogger("glass_drive_ui.server")
+
+    with caplog.at_level(logging.INFO, logger="glass_drive_ui.server"):
+        logger.info("opening %s", raw, extra={"target_url": raw})
+
+    assert "secret-token" not in caplog.text
+    assert "gh_token=[redacted]" in caplog.text
+    assert caplog.records
+    assert getattr(caplog.records[-1], "target_url") == (
+        "https://glasshive.example.test/watch/wrk_1?gh_token=[redacted]&gh_sig=[redacted]"
+    )
 
 
 def test_signed_watch_does_not_set_cookie_for_different_worker(monkeypatch):

@@ -43,39 +43,6 @@ Current behavior:
   launches must not drop browser, computer/desktop, shell, file, or MCP capabilities just because
   GlassHive projected a broker MCP
 
-## Host Runtime Requirements
-
-Host workers are native AI-agent substrates. They must keep the worker's real CLI capabilities
-available instead of launching stripped shells. GlassHive checks the configured host CLI before
-dispatching a host worker and fails closed when the selected substrate cannot provide the required
-native surface.
-
-Host-native Codex preserves non-MCP Codex configuration so model/provider defaults and project trust
-settings continue to behave like the user's real Codex environment. Private or non-brokered MCP
-server blocks are stripped before worker config is materialized, then GlassHive appends only the
-allowed native/broker MCP entries. Operators should choose host mode only when exposing host-local
-Codex configuration to that host worker is intended; sandbox/workstation mode remains the safer
-default when host-local state should not be shared.
-
-Built-in minimums:
-
-- Codex CLI: `0.140.0`
-- Claude Code: `2.1.178` with native `--effort` support and, unless explicitly disabled,
-  Chrome/browser support
-- OpenClaw: `2026.6.6`
-
-Override files or JSON may be supplied with `GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_FILE`,
-`WPR_HOST_RUNTIME_REQUIREMENTS_FILE`, `GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON`, or
-`WPR_HOST_RUNTIME_REQUIREMENTS_JSON`. Invalid override configuration blocks host dispatch rather
-than silently weakening worker capability.
-
-When the default execution mode is host and the user did not explicitly choose host or a fixed
-workspace path, GlassHive may recover a blocked first dispatch to sandbox/workstation execution.
-`workspace_continue` is different: it preserves the same workspace files, browser state, notes, and
-partial outputs. If that existing host workspace cannot be continued because the host CLI is missing
-or too old, repair/update the host runtime and call `workspace_continue` again, or intentionally
-start a fresh sandbox/workstation workspace if preserving host-local state is no longer required.
-
 ## Run
 
 ```bash
@@ -95,6 +62,17 @@ Run MCP:
 cd <workspace-root>/viventium_v0_4/GlassHive/runtime_phase1
 uv run python -m workers_projects_runtime.mcp_server --transport streamable-http --port 8767
 ```
+
+## Link Lifetime Defaults
+
+- `GLASSHIVE_LINK_REF_TTL_SECONDS` default: `0`, so `/r/{ref}` and `/v1/link-refs/{ref}` short
+  links do not expire by default. Positive values expire short refs after that many seconds.
+- `GLASSHIVE_LINK_REF_STATE_PATH` default: `<state-root>/glasshive/link_refs.sqlite3`. When the
+  runtime emits `/r/{ref}` links that point at the separate GlassHive UI service, the runtime and UI
+  must use the same local link-ref state path on the same host or supported shared storage.
+- `GLASSHIVE_SIGNED_LINK_TTL_S` default: `900` seconds for raw signed-token compatibility URLs.
+- Enterprise short refs are authenticated owner-scoped routes. Opening a durable `/r/{ref}` mints a
+  fresh bounded worker-view session cookie; the durable ref itself is not an active compute lease.
 
 ## Test
 

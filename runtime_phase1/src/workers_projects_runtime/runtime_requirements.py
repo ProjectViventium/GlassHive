@@ -87,11 +87,6 @@ class RuntimeRequirementIssue:
                 f"GlassHive cannot start the selected host worker{profile_hint} because it could not "
                 f"verify the native capability surface for {self.label}."
             )
-        if self.problem == "requirements_config_invalid":
-            return (
-                f"GlassHive cannot start the selected host worker{profile_hint} because the host "
-                "runtime requirements configuration is invalid or unreadable."
-            )
         return (
             f"GlassHive cannot start the selected host worker{profile_hint} because the required "
             f"host dependency `{self.label}` is not installed or not available to the GlassHive service."
@@ -115,20 +110,6 @@ def host_runtime_requirement_issue(
     *,
     configured_binary: str = "",
 ) -> RuntimeRequirementIssue | None:
-    config_error = _host_runtime_requirements_config_error()
-    if config_error:
-        return RuntimeRequirementIssue(
-            profile=str(profile or "").strip(),
-            runtime_name=str(runtime_name or "").strip(),
-            binary="",
-            label="host runtime requirements configuration",
-            problem="requirements_config_invalid",
-            diagnostic_summary=config_error,
-            recovery_hint=(
-                "Fix the host runtime requirements JSON/file configuration, or unset the override "
-                "to restore the built-in GlassHive host dependency guardrails."
-            ),
-        )
     for requirement in host_runtime_requirements_for(profile, runtime_name):
         if configured_binary and requirement.get("use_configured_binary"):
             requirement = {**requirement, "binary": configured_binary}
@@ -168,33 +149,23 @@ def host_runtime_requirements_for(profile: str, runtime_name: str) -> list[dict[
 
 
 def _load_requirements_payload() -> Any:
-    payload, _error = _load_requirements_payload_with_error()
-    return payload
-
-
-def _host_runtime_requirements_config_error() -> str:
-    _payload, error = _load_requirements_payload_with_error()
-    return error
-
-
-def _load_requirements_payload_with_error() -> tuple[Any, str]:
     for env_name in ("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_FILE", "WPR_HOST_RUNTIME_REQUIREMENTS_FILE"):
         path = os.environ.get(env_name, "").strip()
         if not path:
             continue
         try:
-            return json.loads(Path(path).expanduser().read_text()), ""
-        except Exception as exc:
-            return None, f"{env_name} could not be read or parsed: {type(exc).__name__}"
+            return json.loads(Path(path).expanduser().read_text())
+        except Exception:
+            return {}
     for env_name in ("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", "WPR_HOST_RUNTIME_REQUIREMENTS_JSON"):
         raw = os.environ.get(env_name, "").strip()
         if not raw:
             continue
         try:
-            return json.loads(raw), ""
+            return json.loads(raw)
         except json.JSONDecodeError:
-            return None, f"{env_name} contains invalid JSON"
-    return DEFAULT_HOST_RUNTIME_REQUIREMENTS, ""
+            return {}
+    return DEFAULT_HOST_RUNTIME_REQUIREMENTS
 
 
 def _normalize_requirement(requirement: dict[str, Any]) -> dict[str, Any]:

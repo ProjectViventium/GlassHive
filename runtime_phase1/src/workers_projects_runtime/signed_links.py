@@ -3,13 +3,50 @@ from __future__ import annotations
 import base64
 import hmac
 import json
+import logging
 import os
+import re
+import sqlite3
 import time
+import uuid
 from hashlib import sha256
-from urllib.parse import urlencode
+from pathlib import Path
+from urllib.parse import quote, urlencode
 
 
 DEFAULT_TTL_SECONDS = 15 * 60
+DEFAULT_LINK_REF_TTL_SECONDS = 0
+LINK_REF_ROUTE = "/v1/link-refs"
+_SAFE_LINK_REF_RE = re.compile(r"^[A-Za-z0-9_-]{12,96}$")
+_SENSITIVE_QUERY_RE = re.compile(r"(?i)([?&](?:gh_token|gh_sig|gh_exp|gh_kind)=)([^&#\s\"']+)")
+_SIGNED_LINK_PATH_RE = re.compile(r"(?i)(/v1/signed-links/)([^/?#\s\"']+)")
+_WORKER_COOKIE_TOKEN_RE = re.compile(r"(?i)(\bglasshive_gh_token_[A-Za-z0-9._-]+=)([^;\s\"']+)")
+_LOG_FILTER_INSTALLED = False
+_LOG_RECORD_FACTORY_INSTALLED = False
+_STANDARD_LOG_RECORD_FIELDS = {
+    "args",
+    "asctime",
+    "created",
+    "exc_info",
+    "exc_text",
+    "filename",
+    "funcName",
+    "levelname",
+    "levelno",
+    "lineno",
+    "module",
+    "msecs",
+    "message",
+    "msg",
+    "name",
+    "pathname",
+    "process",
+    "processName",
+    "relativeCreated",
+    "stack_info",
+    "thread",
+    "threadName",
+}
 
 
 def signed_link_secret() -> str:
@@ -26,6 +63,22 @@ def signed_link_ttl_seconds() -> int:
     except ValueError:
         value = DEFAULT_TTL_SECONDS
     return max(60, min(value, 24 * 3600))
+
+
+def link_ref_ttl_seconds() -> int:
+    raw = (
+        os.environ.get("GLASSHIVE_LINK_REF_TTL_SECONDS", "").strip()
+        or os.environ.get("WPR_LINK_REF_TTL_SECONDS", "").strip()
+    )
+    if not raw:
+        return DEFAULT_LINK_REF_TTL_SECONDS
+    if raw.lower() in {"0", "none", "never", "disabled", "off", "false", "no"}:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_LINK_REF_TTL_SECONDS
+    return max(0, value)
 
 
 def signed_link_ttl_for_kind(kind: str, ttl_seconds: int | None = None) -> int:
@@ -107,6 +160,211 @@ def append_signed_query(url: str, params: dict[str, str]) -> str:
     return f"{url}{separator}{urlencode(params)}"
 
 
+def redact_sensitive_url_text(value: object) -> str:
+    text = str(value or "")
+    text = _SENSITIVE_QUERY_RE.sub(lambda match: f"{match.group(1)}[redacted]", text)
+    text = _SIGNED_LINK_PATH_RE.sub(lambda match: f"{match.group(1)}[redacted]", text)
+    return _WORKER_COOKIE_TOKEN_RE.sub(lambda match: f"{match.group(1)}[redacted]", text)
+
+
+class SensitiveUrlLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = redact_sensitive_url_text(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(redact_sensitive_url_text(item) if isinstance(item, str) else item for item in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {
+                key: redact_sensitive_url_text(value) if isinstance(value, str) else value
+                for key, value in record.args.items()
+            }
+        for key, value in list(record.__dict__.items()):
+            if key in _STANDARD_LOG_RECORD_FIELDS:
+                continue
+            if isinstance(value, str):
+                record.__dict__[key] = redact_sensitive_url_text(value)
+        return True
+
+
+def install_sensitive_url_log_filter() -> None:
+    global _LOG_FILTER_INSTALLED, _LOG_RECORD_FACTORY_INSTALLED
+    log_filter = SensitiveUrlLogFilter()
+    target_loggers = [
+        logging.getLogger(),
+        logging.getLogger("uvicorn.access"),
+        logging.getLogger("uvicorn.error"),
+        logging.getLogger("workers_projects_runtime"),
+    ]
+    for logger in list(logging.Logger.manager.loggerDict.values()):
+        if isinstance(logger, logging.Logger) and logger.name.startswith("workers_projects_runtime."):
+            target_loggers.append(logger)
+    seen_handlers: set[int] = set()
+    for logger in target_loggers:
+        if not any(isinstance(existing, SensitiveUrlLogFilter) for existing in logger.filters):
+            logger.addFilter(log_filter)
+        for handler in logger.handlers:
+            handler_id = id(handler)
+            if handler_id in seen_handlers:
+                continue
+            seen_handlers.add(handler_id)
+            if not any(isinstance(existing, SensitiveUrlLogFilter) for existing in handler.filters):
+                handler.addFilter(log_filter)
+    if not _LOG_RECORD_FACTORY_INSTALLED:
+        original_factory = logging.getLogRecordFactory()
+
+        def redacting_record_factory(*args, **kwargs):
+            record = original_factory(*args, **kwargs)
+            log_filter.filter(record)
+            return record
+
+        logging.setLogRecordFactory(redacting_record_factory)
+        _LOG_RECORD_FACTORY_INSTALLED = True
+    _LOG_FILTER_INSTALLED = True
+
+
+def link_ref_state_path() -> Path:
+    raw = str(os.environ.get("GLASSHIVE_LINK_REF_STATE_PATH") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    watch_state = str(os.environ.get("GLASSHIVE_WATCH_SESSION_STATE_PATH") or "").strip()
+    if watch_state:
+        return Path(watch_state).expanduser().parent / "link_refs.sqlite3"
+    state_root = (
+        Path(os.environ["XDG_STATE_HOME"]).expanduser()
+        if os.environ.get("XDG_STATE_HOME")
+        else Path.home() / ".local" / "state"
+    )
+    return state_root / "glasshive" / "link_refs.sqlite3"
+
+
+def _link_ref_conn() -> sqlite3.Connection:
+    db_path = link_ref_state_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS signed_link_refs (
+            ref_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            token TEXT NOT NULL,
+            target_url TEXT NOT NULL DEFAULT '',
+            expires_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(signed_link_refs)").fetchall()}
+    if "payload_json" not in columns:
+        conn.execute("ALTER TABLE signed_link_refs ADD COLUMN payload_json TEXT NOT NULL DEFAULT ''")
+    _migrate_legacy_link_ref_rows(conn)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_signed_link_refs_expires_at ON signed_link_refs(expires_at)")
+    return conn
+
+
+def _payload_json(payload: dict[str, object]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _migrate_legacy_link_ref_rows(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        "SELECT ref_id, token, payload_json FROM signed_link_refs WHERE payload_json = ''"
+    ).fetchall()
+    if not rows:
+        return
+    default_never_expires = link_ref_ttl_seconds() <= 0
+    for row in rows:
+        payload = _decode_signed_link_token(str(row["token"] or ""), allow_expired=True)
+        if not payload:
+            continue
+        expires_at = 0 if default_never_expires else None
+        if expires_at is None:
+            conn.execute(
+                "UPDATE signed_link_refs SET payload_json = ? WHERE ref_id = ?",
+                (_payload_json(payload), row["ref_id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE signed_link_refs SET payload_json = ?, expires_at = ? WHERE ref_id = ?",
+                (_payload_json(payload), expires_at, row["ref_id"]),
+            )
+
+
+def create_signed_link_ref(*, token: str, target_url: str = "") -> str:
+    payload = verify_signed_link_token(token)
+    if not payload:
+        return ""
+    ref_id = f"ghr_{uuid.uuid4().hex[:24]}"
+    now = int(time.time())
+    ref_ttl = link_ref_ttl_seconds()
+    expires_at = now + ref_ttl if ref_ttl > 0 else 0
+    with _link_ref_conn() as conn:
+        conn.execute("DELETE FROM signed_link_refs WHERE expires_at > 0 AND expires_at < ?", (now,))
+        conn.execute(
+            """
+            INSERT INTO signed_link_refs (ref_id, kind, token, target_url, expires_at, created_at, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ref_id,
+                str(payload.get("kind") or ""),
+                str(token or ""),
+                str(target_url or ""),
+                expires_at,
+                now,
+                _payload_json(payload),
+            ),
+        )
+    return ref_id
+
+
+def resolve_signed_link_ref(ref_id: str) -> dict[str, object] | None:
+    clean_ref = str(ref_id or "").strip()
+    if not _SAFE_LINK_REF_RE.fullmatch(clean_ref):
+        return None
+    now = int(time.time())
+    with _link_ref_conn() as conn:
+        conn.execute("DELETE FROM signed_link_refs WHERE expires_at > 0 AND expires_at < ?", (now,))
+        row = conn.execute(
+            "SELECT * FROM signed_link_refs WHERE ref_id = ?",
+            (clean_ref,),
+        ).fetchone()
+    if row is None:
+        return None
+    token = str(row["token"] or "")
+    payload = None
+    payload_json = str(row["payload_json"] or "")
+    if payload_json:
+        try:
+            parsed = json.loads(payload_json)
+        except (ValueError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            payload = parsed
+    if not payload:
+        payload = _decode_signed_link_token(token, allow_expired=True)
+    if not payload:
+        return None
+    return {
+        "ref_id": clean_ref,
+        "kind": str(row["kind"] or payload.get("kind") or ""),
+        "token": token,
+        "target_url": str(row["target_url"] or ""),
+        "expires_at": int(row["expires_at"]),
+        "created_at": int(row["created_at"]),
+        "payload": payload,
+    }
+
+
+def signed_link_ref_url(base_url: str, ref_id: str, *, route: str = LINK_REF_ROUTE) -> str:
+    clean_ref = str(ref_id or "").strip()
+    if not clean_ref:
+        return ""
+    return f"{str(base_url or '').rstrip('/')}{route}/{quote(clean_ref, safe='')}"
+
+
 def verify_signed_link(
     *,
     kind: str,
@@ -173,7 +431,7 @@ def sign_link_token(
     return f"{encoded}.{_signature(secret, encoded)}"
 
 
-def verify_signed_link_token(token: str) -> dict[str, object] | None:
+def _decode_signed_link_token(token: str, *, allow_expired: bool = False) -> dict[str, object] | None:
     secret = signed_link_secret()
     if not secret:
         return None
@@ -193,6 +451,10 @@ def verify_signed_link_token(token: str) -> dict[str, object] | None:
         expires_at = int(payload.get("exp") or 0)
     except (TypeError, ValueError):
         return None
-    if expires_at < int(time.time()):
+    if expires_at < int(time.time()) and not allow_expired:
         return None
     return payload
+
+
+def verify_signed_link_token(token: str) -> dict[str, object] | None:
+    return _decode_signed_link_token(token, allow_expired=False)

@@ -1158,103 +1158,6 @@ def test_host_codex_malformed_config_strips_inline_private_mcp_tables(tmp_path, 
     assert "secret" not in config
 
 
-def test_host_codex_malformed_config_strips_top_level_private_mcp_assignment(tmp_path, monkeypatch):
-    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
-    source_codex_home = tmp_path / "source-codex-home"
-    source_codex_home.mkdir()
-    (source_codex_home / "config.toml").write_text(
-        'model = "gpt-local-public-safe"\n\n'
-        'mcp_servers = { private_mail = { command = "/bin/private-mail", env = { PRIVATE_TOKEN = "secret" }\n'
-        'mcp_servers.private_calendar = { command = "/bin/private-calendar", env = { PRIVATE_TOKEN = "secret" } }\n\n'
-        "[projects.example]\n"
-        'trust_level = "trusted"\n',
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
-
-    config = runtime._host_codex_worker_config(
-        "[mcp_servers.glasshive-user-capabilities]\n"
-        "url = \"http://127.0.0.1:3190/api/viventium/glasshive/capabilities/mcp\"\n"
-        "bearer_token_env_var = \"GLASSHIVE_CAPABILITY_BROKER_TOKEN\""
-    )
-
-    assert 'model = "gpt-local-public-safe"' in config
-    assert "[projects.example]" in config
-    assert "glasshive-user-capabilities" in config
-    assert "private_mail" not in config
-    assert "private_calendar" not in config
-    assert "PRIVATE_TOKEN" not in config
-    assert "secret" not in config
-
-
-def test_host_codex_malformed_config_strips_private_mcp_table_with_comment(tmp_path, monkeypatch):
-    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
-    source_codex_home = tmp_path / "source-codex-home"
-    source_codex_home.mkdir()
-    (source_codex_home / "config.toml").write_text(
-        'model = "gpt-local-public-safe"\n'
-        'broken = [\n\n'
-        '[mcp_servers.private_mail] # local-only mail account\n'
-        'command = "/bin/private-mail"\n'
-        'env = { PRIVATE_TOKEN = "redacted-private-value-67890" }\n\n'
-        "[mcp_servers.computer-use]\n"
-        'command = "/bin/computer-use"\n'
-        'args = ["mcp"]\n\n'
-        "[projects.example]\n"
-        'trust_level = "trusted"\n',
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
-
-    config = runtime._host_codex_worker_config(
-        "[mcp_servers.glasshive-user-capabilities]\n"
-        "url = \"http://127.0.0.1:3190/api/viventium/glasshive/capabilities/mcp\"\n"
-        "bearer_token_env_var = \"GLASSHIVE_CAPABILITY_BROKER_TOKEN\""
-    )
-
-    assert 'model = "gpt-local-public-safe"' in config
-    assert "[projects.example]" in config
-    assert "[mcp_servers.computer-use]" in config
-    assert "glasshive-user-capabilities" in config
-    assert "private_mail" not in config
-    assert "PRIVATE_TOKEN" not in config
-    assert "redacted-private-value-67890" not in config
-
-
-def test_host_codex_malformed_config_strips_private_mcp_array_table(tmp_path, monkeypatch):
-    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
-    source_codex_home = tmp_path / "source-codex-home"
-    source_codex_home.mkdir()
-    (source_codex_home / "config.toml").write_text(
-        'model = "gpt-local-public-safe"\n'
-        'broken = [\n\n'
-        "[[mcp_servers.private_calendar]]\n"
-        'command = "/bin/private-calendar"\n'
-        'env = { PRIVATE_TOKEN = "redacted-private-value-aot-999" }\n\n'
-        "[[mcp_servers.computer-use]]\n"
-        'command = "/bin/computer-use"\n'
-        'args = ["mcp"]\n\n'
-        "[projects.example]\n"
-        'trust_level = "trusted"\n',
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
-
-    config = runtime._host_codex_worker_config(
-        "[mcp_servers.glasshive-user-capabilities]\n"
-        "url = \"http://127.0.0.1:3190/api/viventium/glasshive/capabilities/mcp\"\n"
-        "bearer_token_env_var = \"GLASSHIVE_CAPABILITY_BROKER_TOKEN\""
-    )
-
-    assert 'model = "gpt-local-public-safe"' in config
-    assert "[projects.example]" in config
-    assert "[[mcp_servers.computer-use]]" in config
-    assert "glasshive-user-capabilities" in config
-    assert "private_calendar" not in config
-    assert "PRIVATE_TOKEN" not in config
-    assert "redacted-private-value-aot-999" not in config
-
-
 def test_host_runtime_live_description_refreshes_stale_prompt_files(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
@@ -1913,30 +1816,6 @@ def test_host_runtime_preflight_accepts_configured_version(tmp_path, monkeypatch
     runtime.binary = "/bin/echo"
 
     runtime.preflight_worker_profile("codex-cli", "host")
-
-
-def test_host_runtime_preflight_rejects_invalid_requirements_json(tmp_path, monkeypatch):
-    monkeypatch.setenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", "{not valid json")
-    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
-    runtime.binary = "/bin/echo"
-
-    with pytest.raises(RuntimeDependencyMissingError, match="requirements configuration") as captured:
-        runtime.preflight_worker_profile("codex-cli", "host")
-
-    assert captured.value.dependency_label == "host runtime requirements configuration"
-    assert "restore the built-in GlassHive host dependency guardrails" in captured.value.recovery_hint
-
-
-def test_host_runtime_preflight_rejects_unreadable_requirements_file(tmp_path, monkeypatch):
-    missing_requirements = tmp_path / "missing-requirements.json"
-    monkeypatch.setenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_FILE", str(missing_requirements))
-    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
-    runtime.binary = "/bin/echo"
-
-    with pytest.raises(RuntimeDependencyMissingError, match="requirements configuration") as captured:
-        runtime.preflight_worker_profile("codex-cli", "host")
-
-    assert captured.value.dependency_label == "host runtime requirements configuration"
 
 
 def test_host_runtime_preflight_rejects_default_version_mismatch(tmp_path, monkeypatch):

@@ -12,11 +12,6 @@ LOCALHOST_URL_PATTERN = re.compile(
     r"://(?:127\.0\.0\.1|localhost|0\.0\.0\.0)(?:[:/]|$)",
     flags=re.IGNORECASE,
 )
-EXPLICIT_WEB_SURFACE_PATTERN = re.compile(
-    r"\b(?:web\s*app|web\s*page|website|webpage|browser|dashboard|interactive|site|"
-    r"app(?:lication)?|html\s+(?:app|dashboard|deliverable|page|report|site))\b",
-    flags=re.IGNORECASE,
-)
 NON_DELIVERABLE_URL_HOST_PATTERN = re.compile(
     r"(^|\.)(api\.openai\.com|api\.anthropic\.com|api\.portkey\.ai|openai\.azure\.com|cognitiveservices\.azure\.com|services\.ai\.azure\.com)$",
     flags=re.IGNORECASE,
@@ -198,27 +193,6 @@ def is_valid_professional_artifact(path: Path) -> bool:
     return True
 
 
-def text_references_workspace_path(path: Path, root: Path, *texts: str) -> bool:
-    combined = "\n".join(texts).lower()
-    if not combined.strip():
-        return False
-    try:
-        rel = path.relative_to(root).as_posix()
-    except ValueError:
-        rel = path.name
-    candidates = {rel.lower(), path.name.lower()}
-    if rel.lower() == "index.html":
-        candidates.add("index")
-    return any(candidate and candidate in combined for candidate in candidates)
-
-
-def output_prefers_web_surface(path: Path, root: Path, *texts: str) -> bool:
-    if not text_references_workspace_path(path, root, *texts):
-        return False
-    combined = "\n".join(texts).lower()
-    return EXPLICIT_WEB_SURFACE_PATTERN.search(combined) is not None
-
-
 def workspace_browser_url(path: Path, worker: dict) -> str | None:
     raw_root = str(worker.get("workspace_dir") or "").strip()
     if not raw_root:
@@ -272,8 +246,6 @@ def deliverable_payload(
     stderr_text: str = "",
 ) -> dict[str, object] | None:
     execution_mode = str(worker.get("execution_mode") or "docker")
-    raw_root = str(worker.get("workspace_dir") or "").strip()
-    root = Path(raw_root) if raw_root else Path()
     artifact_candidates = candidate_artifact_paths(worker)
     valid_artifact_candidates = [
         path
@@ -281,26 +253,14 @@ def deliverable_payload(
         if path.suffix.lower() not in PROFESSIONAL_ARTIFACT_EXTENSIONS
         or is_valid_professional_artifact(path)
     ]
-    html_candidates = candidate_html_paths(worker)
-    preferred_html = next((path for path in html_candidates if path.name.lower() == "index.html"), None)
-    if preferred_html is None and html_candidates:
-        preferred_html = html_candidates[0]
-
-    urls = [url for url in extract_urls(latest_output, stdout_text, stderr_text) if is_deliverable_url(url)]
-    external_url = next((url for url in urls if not LOCALHOST_URL_PATTERN.search(url)), None)
-    local_url = next((url for url in urls if LOCALHOST_URL_PATTERN.search(url)), None)
-    web_surface_is_explicit = (
-        preferred_html is not None
-        and output_prefers_web_surface(preferred_html, root, latest_output, stdout_text, stderr_text)
-    ) or local_url is not None
-
     preferred_artifact = next(
         (path for path in valid_artifact_candidates if path.suffix.lower() in PROFESSIONAL_ARTIFACT_EXTENSIONS),
         None,
     )
-    if preferred_artifact is not None and not web_surface_is_explicit:
+    if preferred_artifact is not None:
+        raw_root = str(worker.get("workspace_dir") or "").strip()
         try:
-            rel = preferred_artifact.relative_to(root)
+            rel = preferred_artifact.relative_to(Path(raw_root))
         except ValueError:
             rel = Path(preferred_artifact.name)
         return {
@@ -312,10 +272,20 @@ def deliverable_payload(
             "workspace_path": rel.as_posix(),
         }
 
+    html_candidates = candidate_html_paths(worker)
+    preferred_html = next((path for path in html_candidates if path.name.lower() == "index.html"), None)
+    if preferred_html is None and html_candidates:
+        preferred_html = html_candidates[0]
+
+    urls = [url for url in extract_urls(latest_output, stdout_text, stderr_text) if is_deliverable_url(url)]
+    external_url = next((url for url in urls if not LOCALHOST_URL_PATTERN.search(url)), None)
+    local_url = next((url for url in urls if LOCALHOST_URL_PATTERN.search(url)), None)
+
     if preferred_html is not None:
         browser_url = workspace_browser_url(preferred_html, worker)
+        raw_root = str(worker.get("workspace_dir") or "").strip()
         try:
-            workspace_path = preferred_html.relative_to(root).as_posix() if raw_root else preferred_html.name
+            workspace_path = preferred_html.relative_to(Path(raw_root)).as_posix() if raw_root else preferred_html.name
         except ValueError:
             workspace_path = preferred_html.name
         payload: dict[str, object] = {
