@@ -17,8 +17,9 @@ DEFAULT_TTL_SECONDS = 15 * 60
 DEFAULT_LINK_REF_TTL_SECONDS = 0
 LINK_REF_ROUTE = "/r"
 _SAFE_LINK_REF_RE = re.compile(r"^[A-Za-z0-9_-]{12,96}$")
-_SENSITIVE_QUERY_RE = re.compile(r"(?i)([?&](?:gh_token|gh_sig|gh_exp|gh_kind)=)([^&#\s\"']+)")
+_SENSITIVE_QUERY_RE = re.compile(r"(?i)((?:^|[?&])(?:gh_token|gh_sig|gh_exp|gh_kind)=)([^&#\s\"']+)")
 _SIGNED_LINK_PATH_RE = re.compile(r"(?i)(/v1/signed-links/)([^/?#\s\"']+)")
+_LINK_REF_PATH_RE = re.compile(r"(?i)(/(?:v1/link-refs|r)/)(ghr_[A-Za-z0-9_-]{12,96})")
 _WORKER_COOKIE_TOKEN_RE = re.compile(r"(?i)(\bglasshive_gh_token_[A-Za-z0-9._-]+=)([^;\s\"']+)")
 _LOG_FILTER_INSTALLED = False
 _LOG_RECORD_FACTORY_INSTALLED = False
@@ -97,6 +98,7 @@ def redact_sensitive_url_text(value: object) -> str:
     text = str(value or "")
     text = _SENSITIVE_QUERY_RE.sub(lambda match: f"{match.group(1)}[redacted]", text)
     text = _SIGNED_LINK_PATH_RE.sub(lambda match: f"{match.group(1)}[redacted]", text)
+    text = _LINK_REF_PATH_RE.sub(lambda match: f"{match.group(1)}[redacted]", text)
     return _WORKER_COOKIE_TOKEN_RE.sub(lambda match: f"{match.group(1)}[redacted]", text)
 
 
@@ -253,15 +255,19 @@ def _link_ref_conn() -> sqlite3.Connection:
             target_url TEXT NOT NULL DEFAULT '',
             expires_at INTEGER NOT NULL,
             created_at INTEGER NOT NULL,
-            payload_json TEXT NOT NULL DEFAULT ''
+            payload_json TEXT NOT NULL DEFAULT '',
+            scope_key TEXT NOT NULL DEFAULT ''
         )
         """
     )
     columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(signed_link_refs)").fetchall()}
     if "payload_json" not in columns:
         conn.execute("ALTER TABLE signed_link_refs ADD COLUMN payload_json TEXT NOT NULL DEFAULT ''")
+    if "scope_key" not in columns:
+        conn.execute("ALTER TABLE signed_link_refs ADD COLUMN scope_key TEXT NOT NULL DEFAULT ''")
     _migrate_legacy_link_ref_rows(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_signed_link_refs_expires_at ON signed_link_refs(expires_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_signed_link_refs_scope_key ON signed_link_refs(scope_key)")
     return conn
 
 
@@ -269,9 +275,21 @@ def _payload_json(payload: dict[str, object]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
+def _scope_key(payload: dict[str, object], target_url: str = "") -> str:
+    scoped = {
+        "kind": str(payload.get("kind") or ""),
+        "worker_id": str(payload.get("worker_id") or ""),
+        "tenant_id": str(payload.get("tenant_id") or ""),
+        "owner_id": str(payload.get("owner_id") or ""),
+        "path": str(payload.get("path") or ""),
+        "target_url": str(target_url or ""),
+    }
+    return json.dumps(scoped, sort_keys=True, separators=(",", ":"))
+
+
 def _migrate_legacy_link_ref_rows(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
-        "SELECT ref_id, token, payload_json FROM signed_link_refs WHERE payload_json = ''"
+        "SELECT ref_id, token, target_url, payload_json, scope_key FROM signed_link_refs WHERE payload_json = '' OR scope_key = ''"
     ).fetchall()
     if not rows:
         return
@@ -280,15 +298,17 @@ def _migrate_legacy_link_ref_rows(conn: sqlite3.Connection) -> None:
         payload = _decode_signed_link_token(str(row["token"] or ""), allow_expired=True)
         if not payload:
             continue
+        payload_json = str(row["payload_json"] or "") or _payload_json(payload)
+        scope_key = str(row["scope_key"] or "") or _scope_key(payload, str(row["target_url"] or ""))
         if default_never_expires:
             conn.execute(
-                "UPDATE signed_link_refs SET payload_json = ?, expires_at = 0 WHERE ref_id = ?",
-                (_payload_json(payload), row["ref_id"]),
+                "UPDATE signed_link_refs SET payload_json = ?, scope_key = ?, expires_at = 0 WHERE ref_id = ?",
+                (payload_json, scope_key, row["ref_id"]),
             )
         else:
             conn.execute(
-                "UPDATE signed_link_refs SET payload_json = ? WHERE ref_id = ?",
-                (_payload_json(payload), row["ref_id"]),
+                "UPDATE signed_link_refs SET payload_json = ?, scope_key = ? WHERE ref_id = ?",
+                (payload_json, scope_key, row["ref_id"]),
             )
 
 
@@ -296,16 +316,38 @@ def create_signed_link_ref(*, token: str, target_url: str = "") -> str:
     payload = verify_signed_link_token(token)
     if not payload:
         return ""
-    ref_id = f"ghr_{uuid.uuid4().hex[:24]}"
     now = int(time.time())
     ref_ttl = link_ref_ttl_seconds()
     expires_at = now + ref_ttl if ref_ttl > 0 else 0
+    payload_json = _payload_json(payload)
+    scope_key = _scope_key(payload, target_url)
     with _link_ref_conn() as conn:
         conn.execute("DELETE FROM signed_link_refs WHERE expires_at > 0 AND expires_at < ?", (now,))
+        existing = conn.execute(
+            """
+            SELECT ref_id, token FROM signed_link_refs
+            WHERE scope_key = ?
+              AND (expires_at = 0 OR expires_at >= ?)
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (scope_key, now),
+        ).fetchone()
+        if existing is not None:
+            if str(payload.get("kind") or "") != "worker_view":
+                return str(existing["ref_id"] or "")
+            existing_payload = _decode_signed_link_token(str(existing["token"] or ""), allow_expired=True)
+            try:
+                existing_exp = int((existing_payload or {}).get("exp") or 0)
+            except (TypeError, ValueError):
+                existing_exp = 0
+            if existing_exp >= now:
+                return str(existing["ref_id"] or "")
+        ref_id = f"ghr_{uuid.uuid4().hex[:24]}"
         conn.execute(
             """
-            INSERT INTO signed_link_refs (ref_id, kind, token, target_url, expires_at, created_at, payload_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO signed_link_refs (ref_id, kind, token, target_url, expires_at, created_at, payload_json, scope_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ref_id,
@@ -314,10 +356,22 @@ def create_signed_link_ref(*, token: str, target_url: str = "") -> str:
                 str(target_url or ""),
                 expires_at,
                 now,
-                _payload_json(payload),
+                payload_json,
+                scope_key,
             ),
         )
     return ref_id
+
+
+def revoke_signed_link_refs_for_worker(worker_id: str) -> int:
+    clean_worker_id = str(worker_id or "").strip()
+    if not clean_worker_id:
+        return 0
+    worker_value = json.dumps(clean_worker_id, separators=(",", ":"))
+    pattern = f'%"worker_id":{worker_value}%'
+    with _link_ref_conn() as conn:
+        cursor = conn.execute("DELETE FROM signed_link_refs WHERE scope_key LIKE ?", (pattern,))
+        return int(cursor.rowcount or 0)
 
 
 def resolve_signed_link_ref(ref_id: str) -> dict[str, object] | None:
@@ -334,6 +388,9 @@ def resolve_signed_link_ref(ref_id: str) -> dict[str, object] | None:
     if row is None:
         return None
     token = str(row["token"] or "")
+    verified_payload = _decode_signed_link_token(token, allow_expired=True)
+    if not verified_payload:
+        return None
     payload = None
     payload_json = str(row["payload_json"] or "")
     if payload_json:
@@ -344,7 +401,7 @@ def resolve_signed_link_ref(ref_id: str) -> dict[str, object] | None:
         if isinstance(parsed, dict):
             payload = parsed
     if not payload:
-        payload = _decode_signed_link_token(token, allow_expired=True)
+        payload = verified_payload
     if not payload:
         return None
     return {

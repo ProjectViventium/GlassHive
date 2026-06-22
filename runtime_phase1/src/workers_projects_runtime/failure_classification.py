@@ -24,6 +24,10 @@ class FailureClassification:
         }
 
 
+def has_structured_failure_evidence(*texts: str) -> bool:
+    return any(_collect_structured_failure_evidence(text or "") for text in texts)
+
+
 def classify_cli_failure(
     *,
     stdout: str,
@@ -65,14 +69,53 @@ def classify_cli_failure(
             ),
             diagnostic_summary=diagnostic_summary,
         )
-    if "401" in lowered or "403" in lowered or "unauthorized" in lowered or "invalid api key" in lowered:
+    if (
+        "request rejected" in lowered
+        or "invalid_request_error" in lowered
+        or "invalid request" in lowered
+        or ("400" in lowered and "bad request" in lowered)
+    ):
+        return FailureClassification(
+            failure_class="provider_request_rejected",
+            retryable=False,
+            user_message=(
+                "The model provider rejected the worker request before it could finish."
+            ),
+            recommended_recovery=(
+                "Inspect the provider diagnostic and continue the same workspace only after correcting "
+                "the provider route, request shape, or unsupported option that caused the rejection."
+            ),
+            diagnostic_summary=diagnostic_summary,
+        )
+    if _looks_like_provider_service_failure(lowered, structured=bool(evidence)):
+        return FailureClassification(
+            failure_class="provider_response_failed",
+            retryable=True,
+            user_message=(
+                "The model provider was temporarily unavailable or overloaded before the worker could finish."
+            ),
+            recommended_recovery=(
+                "Use workspace_continue to resume from the same workspace after a short wait, preserving "
+                "the original task and any files already produced."
+            ),
+            diagnostic_summary=diagnostic_summary,
+        )
+    if (
+        "401" in lowered
+        or "403" in lowered
+        or "unauthorized" in lowered
+        or "invalid api key" in lowered
+        or "not logged in" in lowered
+        or "please run /login" in lowered
+        or "please run login" in lowered
+    ):
         return FailureClassification(
             failure_class="provider_auth_missing",
             retryable=False,
             user_message="The worker could not use the configured model provider credentials.",
             recommended_recovery=(
-                "Fix the provider key or route configuration, then use workspace_continue to resume the "
-                "same workspace."
+                "Fix the provider key, route configuration, or CLI login projected into this worker, "
+                "then use workspace_continue to resume the same workspace."
             ),
             diagnostic_summary=diagnostic_summary,
         )
@@ -178,6 +221,26 @@ def classify_runtime_error(
     actual_version = str(getattr(exc, "actual_version", "") or "").strip()
     recovery_hint = str(getattr(exc, "recovery_hint", "") or "").strip()
 
+    if (
+        "401" in lowered
+        or "403" in lowered
+        or "unauthorized" in lowered
+        or "invalid api key" in lowered
+        or "not logged in" in lowered
+        or "please run /login" in lowered
+        or "please run login" in lowered
+    ):
+        return FailureClassification(
+            failure_class="provider_auth_missing",
+            retryable=False,
+            user_message="The worker could not use the configured model provider credentials.",
+            recommended_recovery=(
+                recovery_hint
+                or "Fix the provider key, route, or CLI login projected into this worker, then use "
+                "workspace_continue to resume the same workspace."
+            ),
+            diagnostic_summary=message,
+        )
     if _looks_like_sandbox_lifecycle_failure(lowered):
         return FailureClassification(
             failure_class="runtime_sandbox_unavailable",
@@ -258,6 +321,21 @@ def classify_runtime_error(
             ),
             diagnostic_summary=message,
         )
+    if "glasshive evidence check failed" in lowered:
+        return FailureClassification(
+            failure_class="glasshive_evidence_check_failed",
+            retryable=True,
+            user_message=(
+                f"The {runtime_label} worker finished a provider turn, but GlassHive verification found "
+                "that the result did not satisfy the generic completion or constraint contract."
+            ),
+            recommended_recovery=(
+                "Open the View / Steer page and inspect the artifacts/evidence. Use workspace_continue "
+                "to ask the same worker to repair the missing or invalid deliverables while preserving "
+                "the original request and constraints."
+            ),
+            diagnostic_summary=message,
+        )
 
     return FailureClassification(
         failure_class="runtime_error",
@@ -286,31 +364,97 @@ def _collect_structured_failure_evidence(text: str) -> list[str]:
     return evidence
 
 
-def _extract_failure_strings(value: Any, *, path: str = "") -> list[str]:
+def _extract_failure_strings(value: Any, *, path: str = "", failure_context: bool = False) -> list[str]:
     results: list[str] = []
     if isinstance(value, dict):
         event_type = str(value.get("type") or value.get("event") or value.get("name") or "")
         status = str(value.get("status") or value.get("code") or value.get("error_code") or "")
-        if event_type and _looks_failure_related(event_type):
+        event_is_failure = bool(event_type and _looks_failure_related(event_type))
+        status_is_failure = bool(status and _looks_failure_related(status))
+        if event_is_failure:
             results.append(f"{path or 'event'} type={event_type}")
-        if status and _looks_failure_related(status):
+        if status_is_failure:
             results.append(f"{path or 'event'} status={status}")
+        child_context = failure_context or event_is_failure or status_is_failure or _dict_has_failure_signal(value)
         for key, child in value.items():
             child_path = f"{path}.{key}" if path else str(key)
+            key_context = child_context or _failure_key_creates_context(key)
             if isinstance(child, str):
-                if _looks_failure_related(child) or _looks_failure_field(key):
+                if key_context and (_looks_failure_field(key) or _looks_failure_related(child)):
+                    if _looks_failure_field(key) and not _failure_scalar_has_value(child):
+                        continue
                     results.append(f"{child_path}: {child}")
+            elif _looks_failure_field(key) and _failure_scalar_has_value(child):
+                results.append(f"{child_path}: {child}")
             elif isinstance(child, (dict, list)):
-                results.extend(_extract_failure_strings(child, path=child_path))
+                results.extend(_extract_failure_strings(child, path=child_path, failure_context=key_context))
     elif isinstance(value, list):
         for index, child in enumerate(value):
-            results.extend(_extract_failure_strings(child, path=f"{path}[{index}]"))
+            results.extend(_extract_failure_strings(child, path=f"{path}[{index}]", failure_context=failure_context))
     return results
+
+
+def _dict_has_failure_signal(value: dict[str, Any]) -> bool:
+    if value.get("is_error") is True:
+        return True
+    for key in ("api_error_status", "status_code", "error_code"):
+        if _failure_scalar_has_value(value.get(key)):
+            return True
+    return any(key in value and _failure_scalar_has_value(value.get(key)) for key in ("error", "failure"))
+
+
+def _failure_scalar_has_value(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip()) and value.strip().lower() not in {"false", "0", "no", "none", "null"}
+    return True
+
+
+def _failure_key_creates_context(key: str) -> bool:
+    return key.lower() in {
+        "api_error_status",
+        "detail",
+        "error",
+        "error_code",
+        "failure",
+        "is_error",
+        "status_code",
+    }
 
 
 def _looks_failure_field(key: str) -> bool:
     lowered = key.lower()
-    return lowered in {"error", "error_code", "message", "failure", "status_code", "detail"}
+    return lowered in {
+        "api_error_status",
+        "detail",
+        "error",
+        "error_code",
+        "failure",
+        "is_error",
+        "message",
+        "result",
+        "status_code",
+    }
+
+
+def _looks_like_provider_service_failure(lowered: str, *, structured: bool = False) -> bool:
+    if (
+        "api_error_status" in lowered and "529" in lowered
+    ) or (
+        "529" in lowered and "overloaded" in lowered
+    ) or (
+        "503" in lowered and ("service unavailable" in lowered or "temporarily unavailable" in lowered)
+    ):
+        return True
+    if not structured:
+        return False
+    return (
+        "overloaded" in lowered
+        or "server-side issue" in lowered
+        or "service unavailable" in lowered
+        or "temporarily unavailable" in lowered
+    )
 
 
 def _looks_like_runtime_dependency_or_version_failure(lowered: str) -> bool:
@@ -326,6 +470,8 @@ def _looks_like_runtime_dependency_or_version_failure(lowered: str) -> bool:
         or "too old" in lowered
         or "exited with code 127" in lowered
         or "executable file not found" in lowered
+        or "modulenotfounderror" in lowered
+        or "no module named" in lowered
     )
 
 
@@ -358,6 +504,14 @@ def _looks_failure_related(value: str) -> bool:
         "invalid api key",
         "response.failed",
         "turn.failed",
+        "api error",
+        "api_error_status",
+        "529",
+        "503",
+        "overloaded",
+        "server-side issue",
+        "service unavailable",
+        "temporarily unavailable",
     )
     return any(marker in lowered for marker in markers)
 

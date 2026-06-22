@@ -17,7 +17,13 @@ from urllib.parse import quote, urlencode
 
 import httpx
 
-from .deliverables import deliverable_payload, is_user_deliverable_relative_path
+from .deliverables import (
+    PROFESSIONAL_ARTIFACT_EXTENSIONS,
+    SUPPORT_ARTIFACT_DIR_NAMES,
+    deliverable_payload,
+    is_user_deliverable_relative_path,
+    is_valid_professional_artifact,
+)
 from .failure_classification import classify_runtime_error
 from .models import utc_now
 from .openclaw_runtime import (
@@ -30,9 +36,11 @@ from .openclaw_runtime import (
 )
 from .operator_urls import surface_aware_watch_url
 from .runtime_env import load_viventium_runtime_env
+from .runtime_identity import derive_legacy_backend_label
 from .signed_links import (
     append_signed_query,
     create_signed_link_ref,
+    revoke_signed_link_refs_for_worker,
     sign_link_params,
     signed_link_ref_url,
     sign_link_token,
@@ -1346,12 +1354,17 @@ class WorkersProjectsService:
         return self.store.create_project(owner_id, title, goal, default_worker_profile, tenant_id=tenant_id)
 
     def _initial_runtime_label(self, profile: str, execution_mode: str) -> str:
-        clean_profile = str(profile or "").strip()
-        if clean_profile in {"codex-cli", "claude-code"}:
-            return clean_profile
-        if clean_profile.startswith("openclaw"):
-            return "openclaw"
-        return clean_profile or str(execution_mode or "").strip() or "worker"
+        return derive_legacy_backend_label(profile=profile, execution_mode=execution_mode, default="worker")
+
+    def _legacy_backend_label(self, profile: str, execution_mode: str, requested_backend: str) -> str:
+        runtime_label = self._initial_runtime_label(profile, execution_mode)
+        return derive_legacy_backend_label(
+            profile=profile,
+            runtime=runtime_label,
+            backend=requested_backend,
+            execution_mode=execution_mode,
+            default="worker",
+        )
 
     def _legacy_backend_label(self, profile: str, execution_mode: str, requested_backend: str) -> str:
         runtime_label = self._initial_runtime_label(profile, execution_mode)
@@ -1574,11 +1587,21 @@ class WorkersProjectsService:
             worker_id = str(claimed.get("worker_id") or "")
             try:
                 run = self.assign_run(worker_id, str(claimed.get("instruction") or ""), event_type="schedule.queued")
+                run_id = str(run.get("run_id") or "")
                 updated = self.store.finalize_schedule(
                     schedule_id,
                     state="queued",
-                    queued_run_id=str(run.get("run_id") or ""),
+                    queued_run_id=run_id,
                 )
+                current_run = self.store.get_run(run_id) if run_id else None
+                current_state = str((current_run or {}).get("state") or "")
+                if current_state in {"completed", "failed", "cancelled", "interrupted", "paused"}:
+                    schedule_state = current_state if current_state in {"completed", "cancelled"} else "failed"
+                    updated = self.store.finalize_schedule_for_run(
+                        run_id,
+                        state=schedule_state,
+                        last_error=str((current_run or {}).get("error_text") or ""),
+                    ) or updated
                 processed.append(updated or claimed)
             except Exception as exc:
                 updated = self.store.finalize_schedule(schedule_id, state="failed", last_error=str(exc))
@@ -1787,6 +1810,7 @@ class WorkersProjectsService:
             compute_released_at=utc_now(),
         )
         self.store.add_event(worker["project_id"], worker_id, None, "worker.terminated", "Worker terminated")
+        revoke_signed_link_refs_for_worker(worker_id)
         self._emit_callback(worker, "worker.terminated", message="Worker terminated")
         return updated or worker
 
@@ -1892,8 +1916,19 @@ class WorkersProjectsService:
         if not hasattr(self.runtime, "collect_completed_run"):
             return None
         try:
-            return self.runtime.collect_completed_run(worker, run_id=run["run_id"])
+            return self.runtime.collect_completed_run(
+                worker,
+                run_id=run["run_id"],
+                instruction=str(run.get("instruction") or ""),
+            )
         except TypeError as exc:
+            if "instruction" in str(exc):
+                try:
+                    return self.runtime.collect_completed_run(worker, run_id=run["run_id"])
+                except TypeError as run_id_exc:
+                    if "run_id" not in str(run_id_exc):
+                        raise
+                    return self.runtime.collect_completed_run(worker)
             if "run_id" not in str(exc):
                 raise
             return self.runtime.collect_completed_run(worker)
@@ -1907,8 +1942,7 @@ class WorkersProjectsService:
         workspace_path = Path(str(deliverable.get("workspace_path") or "").strip())
         if not workspace_path.parts:
             return False
-        first_part = workspace_path.parts[0].lower()
-        if first_part != "artifacts" and workspace_path.name.lower() != "index.html":
+        if not is_user_deliverable_relative_path(workspace_path):
             return False
         raw_root = str(worker.get("workspace_dir") or "").strip()
         if not raw_root:
@@ -1921,6 +1955,10 @@ class WorkersProjectsService:
             return False
         if not artifact_path.is_file():
             return False
+        if any(part.lower() in SUPPORT_ARTIFACT_DIR_NAMES for part in workspace_path.parts[:-1]):
+            return False
+        if not self._looks_like_completed_user_deliverable(workspace_path, artifact_path):
+            return False
         started_at = str(run.get("started_at") or run.get("queued_at") or "").strip()
         if not started_at:
             return False
@@ -1929,6 +1967,25 @@ class WorkersProjectsService:
         except ValueError:
             return False
         return artifact_path.stat().st_mtime >= started - 5
+
+    def _looks_like_completed_user_deliverable(self, workspace_path: Path, artifact_path: Path) -> bool:
+        suffix = artifact_path.suffix.lower()
+        name = workspace_path.name.lower()
+        if suffix in PROFESSIONAL_ARTIFACT_EXTENSIONS:
+            return is_valid_professional_artifact(artifact_path)
+        if suffix in {".html", ".htm"}:
+            return True
+        if suffix not in {".csv", ".json", ".md", ".tsv", ".txt"}:
+            return False
+        token_pattern = r"(?:^|[^a-z0-9]){}(?:[^a-z0-9]|$)"
+        if re.search(token_pattern.format(r"(?:partial|draft|scratch|notes?|research|batch)"), name):
+            return False
+        if suffix in {".csv", ".json", ".tsv"}:
+            try:
+                return artifact_path.stat().st_size > 0
+            except OSError:
+                return False
+        return bool(re.search(token_pattern.format(r"(?:final|finished|complete|completed|report|deliverable|summary|brief|workbook|deck)"), name))
 
     def _artifact_completed_output(self, deliverable: dict[str, object], failure_fields: dict[str, object]) -> str:
         path = str(deliverable.get("workspace_path") or deliverable.get("label") or "generated artifact").strip()
@@ -2283,11 +2340,6 @@ class WorkersProjectsService:
                         or self.store.get_worker(worker_id)
                         or current_worker
                     )
-                    if final_state == "failed":
-                        recovered = self._collect_completed_run(refreshed_worker, run)
-                        if recovered:
-                            self._apply_recovered_run(refreshed_worker, run, recovered)
-                            continue
                     failure_fields = (
                         classify_runtime_error(
                             exc,
@@ -2296,6 +2348,14 @@ class WorkersProjectsService:
                         if final_state == "failed"
                         else {}
                     )
+                    if (
+                        final_state == "failed"
+                        and str(failure_fields.get("failure_class") or "") != "glasshive_evidence_check_failed"
+                    ):
+                        recovered = self._collect_completed_run(refreshed_worker, run)
+                        if recovered:
+                            self._apply_recovered_run(refreshed_worker, run, recovered)
+                            continue
                     if (
                         final_state == "failed"
                         and bool(failure_fields.get("failure_retryable"))

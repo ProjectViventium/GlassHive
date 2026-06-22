@@ -6,16 +6,17 @@ import mimetypes
 import os
 import hmac
 import time
+from hashlib import sha256
 from collections import deque
 from contextlib import asynccontextmanager
 from html import escape
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from .auth import AuthContext, EnterpriseAuthSettings, GlassHiveAuthError, scoped_alias
+from .auth import AuthContext, EnterpriseAuthSettings, GlassHiveAuthError, header_identity_value, scoped_alias
 from .deliverables import deliverable_payload, is_user_deliverable_relative_path
 from .failure_classification import classify_runtime_error
 from .models import (
@@ -42,6 +43,7 @@ from .models import (
 from .openclaw_runtime import RuntimeDependencyMissingError, StubRuntime, WorkerRuntime
 from .profile_runtime import ProfiledWorkerRuntime, _redact_text
 from .runtime_env import load_viventium_runtime_env
+from .runtime_identity import derive_legacy_backend_label
 from .service import (
     GlassHiveProfileNotAllowedError,
     GlassHiveQuotaExceededError,
@@ -248,6 +250,7 @@ def create_app(
     auth_settings.validate_startup(api_token=api_token)
     unauthenticated_prefixes = (
         "/health",
+        "/r/",
         "/v1/signed-links",
         "/favicon.ico",
     ) if auth_settings.enterprise else (
@@ -378,6 +381,34 @@ def create_app(
         if allowed:
             return "codex-cli" if "codex-cli" in allowed else sorted(allowed)[0]
         return "codex-cli"
+
+    def _ui_show_legacy_openclaw_profile() -> bool:
+        return os.environ.get("GLASSHIVE_UI_SHOW_LEGACY_OPENCLAW_PROFILE", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "enabled",
+        }
+
+    def _ui_worker_profile_options(selected_profile: str) -> str:
+        selected = (selected_profile or "").strip() or _configured_default_worker_profile()
+        allowed_profiles = set(allowed_worker_profiles() or ["codex-cli", "claude-code", "openclaw-general"])
+        profile_labels = {
+            "codex-cli": "Codex CLI",
+            "claude-code": "Claude Code",
+            "openclaw-general": "OpenClaw",
+        }
+        profiles: list[str] = []
+        for profile in ("codex-cli", "claude-code", "openclaw-general"):
+            if profile.startswith("openclaw") and profile != selected and not _ui_show_legacy_openclaw_profile():
+                continue
+            if profile in allowed_profiles or profile == selected:
+                profiles.append(profile)
+        return "".join(
+            f"<option value='{escape(profile)}'{' selected' if profile == selected else ''}>{escape(profile_labels.get(profile, profile))}</option>"
+            for profile in profiles
+        )
 
     def _preference_owner(ctx: AuthContext) -> str:
         if ctx.enterprise:
@@ -535,19 +566,55 @@ def create_app(
         return legacy if all(legacy.values()) else {}
 
     def _strip_signed_query_params(url: str) -> str:
-        from urllib.parse import urlparse
-
         parsed = urlparse(str(url or ""))
         query = urlencode(
             [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key not in SIGNED_QUERY_KEYS]
         )
         return parsed._replace(query=query).geturl()
 
+    def _configured_redirect_hosts(request: Request) -> set[str]:
+        hosts = {str(request.url.netloc or "").lower(), str(request.base_url.netloc or "").lower()}
+        for name in (
+            "GLASSHIVE_OPERATOR_BASE_URL",
+            "WPR_OPERATOR_BASE_URL",
+            "GLASSHIVE_RUNTIME_BASE_URL",
+            "GLASSHIVE_RUNTIME_PUBLIC_BASE_URL",
+            "GLASSHIVE_ARTIFACT_BASE_URL",
+        ):
+            value = str(os.environ.get(name) or "").strip()
+            if value:
+                parsed = urlparse(value)
+                if parsed.netloc:
+                    hosts.add(parsed.netloc.lower())
+        for name in ("GLASSHIVE_ALLOWED_REDIRECT_HOSTS", "WPR_ALLOWED_REDIRECT_HOSTS"):
+            raw = str(os.environ.get(name) or "").strip()
+            for item in raw.split(","):
+                value = item.strip()
+                if not value:
+                    continue
+                parsed = urlparse(value)
+                hosts.add((parsed.netloc or value).strip().rstrip("/").lower())
+        return {host for host in hosts if host}
+
+    def _validate_short_ref_redirect_target(target_url: str, request: Request) -> str:
+        target = str(target_url or "").strip()
+        if "\\" in target or target.startswith("//"):
+            raise HTTPException(status_code=400, detail="GlassHive workspace link target path is not allowed")
+        parsed = urlparse(target)
+        if not parsed.scheme and not parsed.netloc:
+            return target
+        if parsed.scheme.lower() not in {"http", "https"}:
+            raise HTTPException(status_code=400, detail="GlassHive workspace link target scheme is not allowed")
+        if str(parsed.netloc or "").lower() not in _configured_redirect_hosts(request):
+            raise HTTPException(status_code=403, detail="GlassHive workspace link target is not allowed")
+        return target
+
     def _worker_cookie_name(worker_id: str) -> str:
         clean = str(worker_id or "").strip()
         if not clean or any(char in clean for char in "/\\;\x00"):
             raise HTTPException(status_code=400, detail="Invalid worker id")
-        return f"glasshive_gh_token_{clean}"
+        digest = sha256(clean.encode("utf-8")).hexdigest()[:24]
+        return f"glasshive_gh_token_{digest}"
 
     def _request_uses_https(request: Request) -> bool:
         forwarded_proto = str(request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
@@ -613,12 +680,11 @@ def create_app(
             return _redact_text(handle.read().decode("utf-8", errors="replace"))
 
     def _profile_runtime_label(worker: dict) -> str:
-        profile = str(worker.get("profile") or "").strip()
-        if profile in {"codex-cli", "claude-code"}:
-            return profile
-        if profile.startswith("openclaw"):
-            return "openclaw"
-        return str(worker.get("runtime") or "").strip()
+        return derive_legacy_backend_label(
+            profile=worker.get("profile"),
+            runtime=worker.get("runtime"),
+            backend=worker.get("backend"),
+        )
 
     def _log_paths(worker: dict) -> tuple[Path, Path]:
         runtime_name = _profile_runtime_label(worker)
@@ -771,8 +837,6 @@ def create_app(
 
     def _signed_watch_action_url(worker: dict) -> str:
         worker_id = str(worker.get("worker_id") or "")
-        project_id = str(worker.get("project_id") or "")
-        watch_url = f"/watch/{quote(worker_id)}?surface=desktop&project_id={quote(project_id)}"
         token = sign_link_token(
             kind="worker_view",
             worker_id=worker_id,
@@ -780,10 +844,65 @@ def create_app(
             owner_id=str(worker.get("owner_id") or ""),
         )
         if token:
-            target_url = append_signed_query(watch_url, {"gh_token": token})
-            ref_id = create_signed_link_ref(token=token, target_url=target_url)
-            return signed_link_ref_url("", ref_id, route="/r") if ref_id else ""
-        return watch_url
+            ref_id = create_signed_link_ref(token=token, target_url="")
+            return signed_link_ref_url("", ref_id, route="/w") if ref_id else ""
+        project_id = str(worker.get("project_id") or "")
+        return f"/ui/workers/{quote(worker_id)}/view?project_id={quote(project_id)}"
+
+    def _deliverable_with_action_urls(worker: dict, deliverable: dict[str, object] | None) -> dict[str, object] | None:
+        if not deliverable:
+            return None
+        payload = dict(deliverable)
+        workspace_path = str(payload.get("workspace_path") or "").strip().lstrip("/")
+        if payload.get("kind") == "file" and workspace_path and is_user_deliverable_relative_path(workspace_path):
+            payload["open_url"] = _signed_artifact_action_url(
+                worker,
+                workspace_path,
+                kind="artifact_open",
+                fallback_action="open",
+            )
+            payload["download_url"] = _signed_artifact_action_url(
+                worker,
+                workspace_path,
+                kind="artifact_download",
+                fallback_action="download",
+            )
+        return payload
+
+    def _artifact_items_with_action_urls(
+        worker: dict,
+        workspace_items: list[dict[str, object]] | None = None,
+        *,
+        max_entries: int = 100,
+    ) -> list[dict[str, object]]:
+        items: list[dict[str, object]] = []
+        source_items = workspace_items if workspace_items is not None else _workspace_items(worker, max_entries=max_entries, max_depth=8)
+        for item in source_items:
+            if item.get("is_dir"):
+                continue
+            workspace_path = str(item.get("path") or "").strip().lstrip("/")
+            if not workspace_path or not is_user_deliverable_relative_path(workspace_path):
+                continue
+            items.append(
+                {
+                    **item,
+                    "open_url": _signed_artifact_action_url(
+                        worker,
+                        workspace_path,
+                        kind="artifact_open",
+                        fallback_action="open",
+                    ),
+                    "download_url": _signed_artifact_action_url(
+                        worker,
+                        workspace_path,
+                        kind="artifact_download",
+                        fallback_action="download",
+                    ),
+                }
+            )
+            if len(items) >= max_entries:
+                break
+        return items
 
     def _deliverable_with_action_urls(worker: dict, deliverable: dict[str, object] | None) -> dict[str, object] | None:
         if not deliverable:
@@ -939,14 +1058,13 @@ def create_app(
 
     def _sanitize_worker(worker: dict) -> dict[str, object]:
         safe = dict(worker)
-        profile = str(safe.get("profile") or "").strip()
-        runtime = str(safe.get("runtime") or "").strip()
-        if profile in {"codex-cli", "claude-code"}:
-            safe["backend"] = profile
-        elif profile.startswith("openclaw"):
-            safe["backend"] = "openclaw"
-        elif runtime:
-            safe["backend"] = runtime
+        backend = derive_legacy_backend_label(
+            profile=safe.get("profile"),
+            runtime=safe.get("runtime"),
+            backend=safe.get("backend"),
+        )
+        if backend:
+            safe["backend"] = backend
         safe.pop("gateway_token", None)
         safe.pop("bootstrap_bundle_json", None)
         return safe
@@ -979,6 +1097,52 @@ def create_app(
             for key, value in details.items()
             if key in allowed and value is not None and value != "" and value != []
         }
+
+    def _runtime_detail_key_is_pathlike(key: object) -> bool:
+        lowered = str(key or "").strip().lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "path",
+                "paths",
+                "dir",
+                "directory",
+                "root",
+                "home",
+                "workspace",
+                "log",
+                "logs",
+            )
+        )
+
+    def _runtime_detail_value_is_local_path(value: object) -> bool:
+        text = str(value or "").strip()
+        return text.startswith(("/", "~/")) or text.startswith("file:///")
+
+    def _runtime_details_without_paths(value: object, *, key: object = "") -> object:
+        if _runtime_detail_key_is_pathlike(key):
+            return None
+        if isinstance(value, dict):
+            cleaned: dict[str, object] = {}
+            for nested_key, nested_value in value.items():
+                safe_value = _runtime_details_without_paths(nested_value, key=nested_key)
+                if safe_value is not None and safe_value != "" and safe_value != [] and safe_value != {}:
+                    cleaned[str(nested_key)] = safe_value
+            return cleaned
+        if isinstance(value, list):
+            cleaned_items = [
+                item
+                for item in (_runtime_details_without_paths(item, key=key) for item in value)
+                if item is not None and item != "" and item != [] and item != {}
+            ]
+            return cleaned_items
+        if isinstance(value, str) and _runtime_detail_value_is_local_path(value):
+            return None
+        return value
+
+    def _runtime_details_for_display(details: dict[str, object]) -> dict[str, object]:
+        cleaned = _runtime_details_without_paths(details)
+        return cleaned if isinstance(cleaned, dict) else {}
 
     def _redact_run_for_member(run: dict) -> dict[str, object]:
         return {
@@ -1042,6 +1206,19 @@ def create_app(
             for item in workspace_items
             if len(str(item.get("path") or "").split("/")) <= 3
         ][:120]
+        show_diagnostics = show_internal and request is not None and str(request.query_params.get("diagnostics") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        runtime_details_payload = (
+            runtime_details
+            if show_diagnostics
+            else _runtime_details_for_display(runtime_details)
+            if show_internal
+            else _redact_runtime_details(runtime_details)
+        )
         return {
             "worker": _sanitize_worker(worker) if show_internal else _redact_worker_for_member(worker),
             "latest_run": latest_run if show_internal or latest_run is None else _redact_run_for_member(latest_run),
@@ -1049,14 +1226,14 @@ def create_app(
             "runs": runs if show_internal else [_redact_run_for_member(run) for run in runs],
             "project_runs": project_runs if show_internal else [_redact_run_for_member(run) for run in project_runs],
             "events": events if show_internal else [_redact_event_for_member(event) for event in events],
-            "runtime_details": runtime_details if show_internal else _redact_runtime_details(runtime_details),
+            "runtime_details": runtime_details_payload,
             "console": {
                 "stdout": stdout_text if show_internal else "",
                 "stderr": stderr_text if show_internal else "",
             },
-            **(host_visibility if show_internal else {}),
+            **(host_visibility if show_internal and show_diagnostics else {}),
             "workspace": {
-                "root": worker.get("workspace_dir") or "" if show_internal else "",
+                "root": worker.get("workspace_dir") or "" if show_diagnostics else "",
                 "items": workspace_summary_items,
             },
             "artifacts": {
@@ -1351,6 +1528,12 @@ def create_app(
         require_worker(worker_id, request)
         return WorkerResponse(**service.terminate_worker(worker_id))
 
+    @app.post("/v1/workers/{worker_id}/view-opened", status_code=204)
+    def worker_view_opened(worker_id: str, request: Request) -> Response:
+        worker = require_worker(worker_id, request)
+        store.add_event(worker["project_id"], worker_id, None, "worker.view_opened", "Worker view opened")
+        return Response(status_code=204)
+
     @app.post("/v1/workers/{worker_id}/desktop-action", response_model=DesktopActionResponse, status_code=202)
     def desktop_action(worker_id: str, payload: DesktopActionRequest, request: Request) -> DesktopActionResponse:
         worker = require_worker(worker_id, request)
@@ -1404,6 +1587,30 @@ def create_app(
         owner_id = str(payload.get("owner_id") or "")
         if tenant_id != ctx.tenant_id or owner_id != ctx.owner_id:
             raise HTTPException(status_code=404, detail="GlassHive link not found for this user")
+
+    def _require_authenticated_short_ref_scope_if_asserted(payload: dict[str, object], request: Request) -> None:
+        if not auth_settings.enterprise:
+            return
+        headers = {str(key).lower(): value for key, value in request.headers.items()}
+        has_identity_assertion = any(
+            header_identity_value(headers, name)
+            for name in (
+                auth_settings.tenant_header,
+                auth_settings.user_header,
+                auth_settings.email_header,
+                auth_settings.role_header,
+            )
+        )
+        if not has_identity_assertion:
+            return
+        try:
+            ctx = auth_settings.context_from_headers(headers)
+        except GlassHiveAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        tenant_id = str(payload.get("tenant_id") or "")
+        owner_id = str(payload.get("owner_id") or "")
+        if tenant_id != ctx.tenant_id or owner_id != ctx.owner_id:
+            raise HTTPException(status_code=404, detail="GlassHive workspace link not found for this user")
 
     def _fresh_worker_view_token(payload: dict[str, object]) -> tuple[str, dict[str, object]]:
         worker_id = str(payload.get("worker_id") or "").strip()
@@ -1471,13 +1678,18 @@ def create_app(
         payload = record.get("payload")
         if not isinstance(payload, dict) or str(payload.get("kind") or "") != "worker_view":
             raise HTTPException(status_code=403, detail="This GlassHive link cannot open a workspace")
-        _require_authenticated_link_ref_scope(payload, request)
+        _require_authenticated_short_ref_scope_if_asserted(payload, request)
         worker_id = str(payload.get("worker_id") or "").strip()
         if not worker_id:
             raise HTTPException(status_code=401, detail="Signed link reference is invalid or expired")
-        target_url = _strip_signed_query_params(str(record.get("target_url") or "").strip())
+        target_url = _validate_short_ref_redirect_target(
+            _strip_signed_query_params(str(record.get("target_url") or "").strip()),
+            request,
+        )
         if not target_url:
             raise HTTPException(status_code=400, detail="Signed link reference has no target")
+        worker = service.require_worker(worker_id)
+        store.add_event(worker["project_id"], worker_id, None, "worker.view_opened", "Worker view opened")
         response = RedirectResponse(target_url, status_code=307)
         session_token, session_payload = _fresh_worker_view_token(payload)
         _set_signed_worker_cookie(
@@ -1488,6 +1700,233 @@ def create_app(
             payload=session_payload,
         )
         return response
+
+    def _require_worker_view_ref(ref_id: str, request: Request) -> tuple[dict[str, object], dict]:
+        record = resolve_signed_link_ref(ref_id)
+        if not record:
+            raise HTTPException(status_code=401, detail="GlassHive workspace link is invalid or expired")
+        payload = record.get("payload")
+        if not isinstance(payload, dict) or str(payload.get("kind") or "") != "worker_view":
+            raise HTTPException(status_code=403, detail="This GlassHive link cannot open a workspace")
+        _require_authenticated_short_ref_scope_if_asserted(payload, request)
+        worker_id = str(payload.get("worker_id") or "").strip()
+        if not worker_id:
+            raise HTTPException(status_code=401, detail="GlassHive workspace link is invalid or expired")
+        worker = service.require_worker(worker_id)
+        tenant_id = str(payload.get("tenant_id") or "")
+        owner_id = str(payload.get("owner_id") or "")
+        if tenant_id != str(worker.get("tenant_id") or "") or owner_id != str(worker.get("owner_id") or ""):
+            raise HTTPException(status_code=404, detail="GlassHive workspace link not found")
+        request.state.auth_context = AuthContext(
+            tenant_id=str(worker.get("tenant_id") or "local"),
+            user_id=str(worker.get("owner_id") or ""),
+            auth_mode="signed_link",
+            enterprise=auth_settings.enterprise,
+        )
+        return payload, worker
+
+    def _response_with_worker_view_cookie(
+        response: Response,
+        request: Request,
+        *,
+        payload: dict[str, object],
+        worker_id: str,
+    ) -> Response:
+        session_token, session_payload = _fresh_worker_view_token(payload)
+        _set_signed_worker_cookie(
+            response,
+            request,
+            worker_id=worker_id,
+            token=session_token,
+            payload=session_payload,
+        )
+        return response
+
+    @app.get("/w/{ref_id}", response_class=HTMLResponse)
+    def open_ref_workspace_view(ref_id: str, request: Request) -> Response:
+        payload, worker = _require_worker_view_ref(ref_id, request)
+        worker_id = str(worker.get("worker_id") or "")
+        store.add_event(worker["project_id"], worker_id, None, "worker.view_opened", "Worker view opened")
+        runtime_details = _runtime_details(worker)
+        external_view_url = str(runtime_details.get("view_url") or "").strip()
+        subtitle = escape(str(runtime_details.get("mode") or worker.get("runtime") or "worker view"))
+        openclaw_action_button = (
+            '<button onclick="desktopAction(\'openclaw\')">OpenClaw</button>'
+            if str(worker.get("profile") or "").startswith("openclaw")
+            else ""
+        )
+        ref_route = f"/w/{escape(ref_id, quote=True)}"
+        desktop_route = f"{ref_route}/desktop"
+        desktop_frame_route = f"{ref_route}/desktop-frame"
+        if not external_view_url:
+            response = HTMLResponse(
+                f"""
+                <html>
+                  <head>
+                    <title>{escape(worker['name'])} live view</title>
+                    <style>
+                      body {{ font-family: system-ui, sans-serif; margin: 2rem; max-width: 900px; }}
+                      .card {{ border: 1px solid #ddd; border-radius: 12px; padding: 1rem; }}
+                    </style>
+                  </head>
+                  <body>
+                    <div class="card">
+                      <h1>{escape(worker['name'])}</h1>
+                      <p>{subtitle}</p>
+                      <p>No workstation desktop view is available for this worker right now.</p>
+                    </div>
+                  </body>
+                </html>
+                """
+            )
+            return _response_with_worker_view_cookie(response, request, payload=payload, worker_id=worker_id)
+        html = f"""
+        <html>
+          <head>
+            <title>{escape(worker['name'])} live view</title>
+            <style>
+              body {{ font-family: system-ui, sans-serif; margin: 0; background: #0f172a; color: #e5e7eb; }}
+              header {{ padding: 1rem 1.25rem; border-bottom: 1px solid rgba(255,255,255,.12); display: flex; justify-content: space-between; gap: 1rem; align-items: center; flex-wrap: wrap; }}
+              a {{ color: #93c5fd; }}
+              .actions {{ display: flex; gap: .5rem; flex-wrap: wrap; }}
+              button {{ font: inherit; padding: .55rem .85rem; border-radius: 8px; border: 1px solid rgba(255,255,255,.14); background: #111827; color: #f9fafb; }}
+              .meta {{ color: #cbd5e1; font-size: .95rem; }}
+              iframe {{ width: 100%; height: calc(100vh - 98px); border: 0; background: #020617; }}
+            </style>
+          </head>
+          <body>
+            <header>
+              <div>
+                <div><strong>{escape(worker['name'])}</strong></div>
+                <div class="meta">{subtitle} · managed workspace</div>
+                <div class="meta"><a href="{desktop_route}" target="_blank" rel="noreferrer">Desktop directly</a></div>
+              </div>
+              <div class="actions">
+                <button onclick="action('resume')">Resume</button>
+                <button onclick="action('pause')">Pause</button>
+                <button onclick="action('interrupt')">Interrupt</button>
+                <button onclick="action('terminate')">Terminate</button>
+                <button onclick="pauseAndOpenDirect()">Pause + Open Desktop</button>
+                <button onclick="desktopAction('terminal')">Shell</button>
+                <button onclick="desktopAction('files')">Files</button>
+                <button onclick="desktopAction('browser')">Browser</button>
+                <button onclick="desktopAction('codex')">Codex</button>
+                <button onclick="desktopAction('claude')">Claude</button>
+                {openclaw_action_button}
+              </div>
+            </header>
+            <iframe src="{desktop_frame_route}" loading="eager"></iframe>
+            <script>
+              const refRoute = {ref_route!r};
+              const directDesktopUrl = {desktop_route!r};
+              async function action(name) {{
+                await fetch(`${{refRoute}}/actions/${{encodeURIComponent(name)}}`, {{ method: 'POST' }});
+              }}
+              async function pauseAndOpenDirect() {{
+                await action('pause');
+                window.open(directDesktopUrl, '_blank', 'noopener');
+              }}
+              async function desktopAction(name, url='') {{
+                const res = await fetch(`${{refRoute}}/desktop-action`, {{
+                  method: 'POST',
+                  headers: {{ 'Content-Type': 'application/json' }},
+                  body: JSON.stringify({{ action: name, url: url || undefined }})
+                }});
+                if (!res.ok) {{
+                  alert(await res.text());
+                  return;
+                }}
+                window.open(directDesktopUrl, '_blank', 'noopener');
+              }}
+            </script>
+          </body>
+        </html>
+        """
+        response = HTMLResponse(html)
+        return _response_with_worker_view_cookie(response, request, payload=payload, worker_id=worker_id)
+
+    @app.get("/w/{ref_id}/desktop", response_class=HTMLResponse)
+    def open_ref_workspace_desktop(ref_id: str, request: Request) -> Response:
+        payload, worker = _require_worker_view_ref(ref_id, request)
+        worker_id = str(worker.get("worker_id") or "")
+        runtime_details = _runtime_details(worker)
+        external_view_url = str(runtime_details.get("view_url") or "").strip()
+        if not external_view_url:
+            raise HTTPException(status_code=404, detail="GlassHive desktop view is not available")
+        ref_route = f"/w/{escape(ref_id, quote=True)}"
+        desktop_frame_route = f"{ref_route}/desktop-frame"
+        response = HTMLResponse(
+            f"""
+            <html>
+              <head>
+                <title>{escape(worker['name'])} desktop</title>
+                <style>
+                  body {{ margin: 0; background: #020617; color: #e5e7eb; font-family: system-ui, sans-serif; }}
+                  header {{ padding: .75rem 1rem; border-bottom: 1px solid rgba(255,255,255,.12); display: flex; justify-content: space-between; align-items: center; gap: 1rem; }}
+                  a {{ color: #93c5fd; }}
+                  iframe {{ width: 100%; height: calc(100vh - 54px); border: 0; background: #020617; }}
+                </style>
+              </head>
+              <body>
+                <header>
+                  <strong>{escape(worker['name'])}</strong>
+                  <a href="{ref_route}" target="_top">Back to workspace controls</a>
+                </header>
+                <iframe src="{desktop_frame_route}" loading="eager"></iframe>
+              </body>
+            </html>
+            """
+        )
+        return _response_with_worker_view_cookie(response, request, payload=payload, worker_id=worker_id)
+
+    @app.get("/w/{ref_id}/desktop-frame")
+    def open_ref_workspace_desktop_frame(ref_id: str, request: Request) -> Response:
+        payload, worker = _require_worker_view_ref(ref_id, request)
+        worker_id = str(worker.get("worker_id") or "")
+        runtime_details = _runtime_details(worker)
+        external_view_url = str(runtime_details.get("view_url") or "").strip()
+        if not external_view_url:
+            raise HTTPException(status_code=404, detail="GlassHive desktop view is not available")
+        response = RedirectResponse(external_view_url, status_code=307)
+        return _response_with_worker_view_cookie(response, request, payload=payload, worker_id=worker_id)
+
+    @app.post("/w/{ref_id}/actions/{action_name}", status_code=202)
+    def ref_workspace_action(ref_id: str, action_name: str, request: Request) -> dict[str, object]:
+        payload, worker = _require_worker_view_ref(ref_id, request)
+        worker_id = str(worker.get("worker_id") or "")
+        action = str(action_name or "").strip().lower()
+        if action == "resume":
+            updated = service.resume_worker(worker_id)
+        elif action == "pause":
+            updated = service.pause_worker(worker_id)
+        elif action == "interrupt":
+            updated = service.interrupt_worker(worker_id)
+        elif action == "terminate":
+            updated = service.terminate_worker(worker_id)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported workspace action")
+        response = {"status": "ok", "state": str(updated.get("state") or "")}
+        _ = payload
+        return response
+
+    @app.post("/w/{ref_id}/desktop-action", response_model=DesktopActionResponse, status_code=202)
+    def ref_workspace_desktop_action(ref_id: str, payload: DesktopActionRequest, request: Request) -> DesktopActionResponse:
+        _ref_payload, worker = _require_worker_view_ref(ref_id, request)
+        worker_id = str(worker.get("worker_id") or "")
+        try:
+            launched = service.desktop_action(worker_id, payload.action, url=payload.url, run_id=payload.run_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        resolved_url = str(launched.get("url") or launched.get("view_url") or f"/w/{quote(ref_id, safe='')}/desktop")
+        notes = str(launched.get("notes") or "")
+        return DesktopActionResponse(
+            action=str(launched.get("action") or payload.action),
+            status=str(launched.get("status") or "launched"),
+            mode=str(launched.get("mode") or "workstation-desktop"),
+            url=resolved_url,
+            view_url=str(launched.get("view_url") or resolved_url),
+            notes=notes or None,
+        )
 
     @app.get("/v1/workers/{worker_id}/artifacts")
     def list_worker_artifacts(worker_id: str, request: Request) -> dict[str, object]:
@@ -1547,17 +1986,7 @@ def create_app(
         show_internal = _can_show_internal_details(ctx)
         projects = store.list_projects(_tenant_filter(ctx), _owner_filter(ctx))
         default_profile = _configured_default_worker_profile()
-        allowed_profiles = set(allowed_worker_profiles() or ["codex-cli", "claude-code", "openclaw-general"])
-        profile_labels = {
-            "codex-cli": "Codex CLI",
-            "claude-code": "Claude Code",
-            "openclaw-general": "OpenClaw",
-        }
-        profile_options = "".join(
-            f"<option value='{escape(profile)}'{' selected' if profile == default_profile else ''}>{escape(profile_labels.get(profile, profile))}</option>"
-            for profile in ("codex-cli", "claude-code", "openclaw-general")
-            if profile in allowed_profiles or profile == default_profile
-        )
+        profile_options = _ui_worker_profile_options(default_profile)
         project_items = []
         for project in projects:
             workers = store.list_workers(project["project_id"], _tenant_filter(ctx), _owner_filter(ctx))
@@ -1831,9 +2260,7 @@ def create_app(
 	                    <p><input id="worker-owner" placeholder="Owner ID" value="{escape(project['owner_id'])}"/></p>
 	                    <p><input id="worker-role" placeholder="Role" value="research"/></p>
 	                    <p><select id="worker-profile">
-	                      <option value="openclaw-general"{' selected' if project_default_profile == 'openclaw-general' else ''}>OpenClaw</option>
-	                      <option value="claude-code"{' selected' if project_default_profile == 'claude-code' else ''}>Claude Code</option>
-	                      <option value="codex-cli"{' selected' if project_default_profile == 'codex-cli' else ''}>Codex CLI</option>
+	                      {_ui_worker_profile_options(project_default_profile)}
 	                    </select></p>
                   </div>
                   <p><strong>Project Prompt</strong></p>
@@ -2083,12 +2510,17 @@ def create_app(
         workspace = live["workspace"]
         runtime_details = live["runtime_details"]
         show_internal = _can_show_internal_details(ctx)
+        show_raw_paths = show_internal and str(request.query_params.get("diagnostics") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         is_host_worker = str(worker.get("execution_mode") or "docker") == "host"
         artifacts = live["artifacts"]
         latest_run_marker = escape(str((latest_run or {}).get("ended_at") or (latest_run or {}).get("started_at") or ""), quote=True)
-        signed_query = str(request.url.query or "") if "gh_sig=" in str(request.url.query or "") else ""
-        signed_query_suffix = f"?{escape(signed_query, quote=True)}" if signed_query else ""
-        signed_query_json = json.dumps(signed_query)
+        signed_query_suffix = ""
+        signed_query_json = json.dumps("")
         if show_internal:
             run_items = "".join(
                 "<li>"
@@ -2133,20 +2565,26 @@ def create_app(
                 return f"<ul>{nested}</ul>" if nested else "None"
             return escape(str(value))
 
+        runtime_details_for_page = dict(runtime_details) if show_raw_paths else _runtime_details_for_display(runtime_details)
         detail_items = "".join(
             f"<li><strong>{escape(str(key).replace('_', ' ').title())}:</strong> {detail_value_html(value)}</li>"
-            for key, value in runtime_details.items()
+            for key, value in runtime_details_for_page.items()
             if value is not None and value != "" and value != []
         ) or "<li>No runtime details yet</li>"
         worker_id_row = f"<p><strong>Worker ID:</strong> {escape(worker['worker_id'])}</p>" if show_internal else ""
+        workspace_row = (
+            f"<p><strong>Workspace:</strong> <code id=\"workspace-root\">{escape(worker.get('workspace_dir') or '')}</code></p>"
+            if show_raw_paths
+            else '<p><strong>Workspace:</strong> <span id="workspace-root">Managed by GlassHive</span></p>'
+        )
         diagnostic_rows = (
             f"""
                 <p><strong>Gateway:</strong> {escape(worker.get('gateway_url') or '')}</p>
                 <p><strong>Session Key:</strong> <code>{escape(worker.get('session_key') or '')}</code></p>
-                <p><strong>Workspace:</strong> <code id="workspace-root">{escape(worker.get('workspace_dir') or '')}</code></p>
+                {workspace_row}
             """
             if show_internal
-            else '<p><strong>Workspace:</strong> <span id="workspace-root">Managed by GlassHive</span></p>'
+            else workspace_row
         )
         stdout_console = escape(console["stdout"] or "No stdout yet.") if show_internal else "Diagnostics hidden in enterprise member view."
         stderr_console = escape(console["stderr"] or "No stderr yet.") if show_internal else "Diagnostics hidden in enterprise member view."
@@ -2366,6 +2804,7 @@ def create_app(
               }}
 
               const signedQuery = {signed_query_json};
+              const diagnosticsEnabled = {str(bool(show_raw_paths)).lower()};
               function withSignedQuery(url) {{
                 if (!signedQuery) return url;
                 return `${{url}}${{url.includes('?') ? '&' : '?'}}${{signedQuery}}`;
@@ -2373,7 +2812,8 @@ def create_app(
 
               async function refreshLive() {{
                 try {{
-                  const res = await fetch(withSignedQuery(`/v1/workers/{escape(worker_id)}/live`));
+                  const liveUrl = diagnosticsEnabled ? `/v1/workers/{escape(worker_id)}/live?diagnostics=1` : `/v1/workers/{escape(worker_id)}/live`;
+                  const res = await fetch(withSignedQuery(liveUrl));
                   if (!res.ok) return;
                   const live = await res.json();
                   document.getElementById('worker-state').textContent = live.worker.state || '';
@@ -2411,9 +2851,8 @@ def create_app(
         show_internal = _can_show_internal_details(ctx)
         external_view_url = str(runtime_details.get("view_url") or "").strip()
         subtitle = escape(str(runtime_details.get("mode") or worker.get("runtime") or "worker view"))
-        signed_query = str(request.url.query or "") if "gh_sig=" in str(request.url.query or "") else ""
-        signed_query_suffix = f"?{escape(signed_query, quote=True)}" if signed_query else ""
-        signed_query_json = json.dumps(signed_query)
+        signed_query_suffix = ""
+        signed_query_json = json.dumps("")
         openclaw_action_button = (
             '<button onclick="desktopAction(\'openclaw\')">OpenClaw</button>'
             if str(worker.get("profile") or "").startswith("openclaw")
@@ -2526,9 +2965,8 @@ def create_app(
         runtime_details = _runtime_details(worker)
         show_internal = _can_show_internal_details(ctx)
         subtitle = escape(str(runtime_details.get("mode") or worker.get("runtime") or "worker terminal"))
-        signed_query = str(request.url.query or "") if "gh_sig=" in str(request.url.query or "") else ""
-        signed_query_suffix = f"?{escape(signed_query, quote=True)}" if signed_query else ""
-        signed_query_json = json.dumps(signed_query)
+        signed_query_suffix = ""
+        signed_query_json = json.dumps("")
         meta_identity = (
             escape(str(runtime_details.get("container_name") or worker.get("session_key") or worker["worker_id"]))
             if show_internal

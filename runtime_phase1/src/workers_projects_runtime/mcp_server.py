@@ -35,6 +35,7 @@ from .deliverables import is_user_deliverable_relative_path
 from .operator_urls import surface_aware_watch_url, surface_can_open_operator_url
 from .runtime_requirements import host_runtime_requirement_issue
 from .runtime_env import load_viventium_runtime_env
+from .runtime_identity import derive_legacy_backend_label
 from .signed_links import (
     append_signed_query,
     create_signed_link_ref,
@@ -567,11 +568,38 @@ def _worker_execution_instruction() -> str:
     )
 
 
+def _worker_surface_summary() -> str:
+    if _host_workers_enabled():
+        return (
+            "persistent projects, resumable workers, host-native workers for browser and desktop action, "
+            "local files/projects, installed CLIs, workstation sandboxes, and live operator takeover"
+        )
+    return (
+        "persistent projects, resumable workers, Docker/workstation sandboxes, generated artifacts, "
+        "sandboxed browser/desktop action, and live operator takeover"
+    )
+
+
+def _worker_surface_routing_guidance() -> str:
+    if _host_workers_enabled():
+        return (
+            "Use it when the user asks the host assistant to act in a real browser, desktop app, local file, "
+            "local project, installed tool, or current computer session; the user does not need to say "
+            "GlassHive, Codex, Computer Use, or local machine. Do not answer from memory or inference when "
+            "real browser/desktop/local state must be inspected or changed. "
+        )
+    return (
+        "Use it for advanced long-running workspace, file, code, research, artifact, sandboxed browser, "
+        "or sandboxed desktop work; host-native access to the user's real computer/session is disabled in "
+        "this deployment, so do not imply real local-browser, desktop-app, local-file, installed-CLI, or OS "
+        "control unless the host explicitly exposes a separate capability. "
+    )
+
+
 def glasshive_workers_server_instructions() -> str:
     codex_mention, claude_mention, openclaw_mention = _host_worker_mentions()
     return (
-        "GlassHive owns persistent projects, resumable workers, host-native workers for browser and desktop action, "
-        "local files/projects, installed CLIs, workstation sandboxes, and live operator takeover. "
+        f"GlassHive owns {_worker_surface_summary()}. "
         "GlassHive workers are general intelligent workers; less is more. Give them faithful goals, "
         "constraints, files, MCP/tool capability context, and user-visible success conditions, then trust "
         "the worker to choose the path. The host assistant must not invent tool results, claim MCP access "
@@ -581,10 +609,7 @@ def glasshive_workers_server_instructions() -> str:
         "and retrieved context when available, and report unavailable data as a blocker instead of filling gaps. "
         "When reporting exact filenames, paths, markers, IDs, or exact content in Markdown, wrap them in "
         "backticks or escape Markdown-sensitive characters so underscores and other literals survive rendering. "
-        "Use it when the user asks the host assistant to act in a real browser, desktop app, local file, "
-        "local project, installed tool, or current computer session; the user does not need to say "
-        "GlassHive, Codex, Computer Use, or local machine. Do not answer from memory or inference when "
-        "real browser/desktop/local state must be inspected or changed. "
+        f"{_worker_surface_routing_guidance()}"
         "Call the exact GlassHive tool id exposed by the host application. Some hosts namespace MCP "
         "tools, so action names like workspace_launch may be displayed as suffixed callable ids such "
         "as workspace_launch_mcp_glasshive-workers-projects; use the callable id, not a bare action "
@@ -613,8 +638,8 @@ def glasshive_workers_server_instructions() -> str:
         "Codex Workspace, or workstation. In those cases set execution_mode='docker' even if this "
         "deployment's default execution mode is host.\n\n"
         f"For configured mentions {codex_mention}, {claude_mention}, and {openclaw_mention}, create "
-        "or resume a host worker with the matching profile semantics; prefer codex-cli for available "
-        "host browser/desktop/file/code execution, claude-code when Claude is explicitly requested, "
+        "or resume a worker with the matching profile semantics; prefer codex-cli for available "
+        "browser/desktop/file/code execution, claude-code when Claude is explicitly requested, "
         "and openclaw-general only when installed or explicitly requested. Current request upload "
         "metadata is projected through neutral GlassHive/LibreChat headers when the host supplies "
         "it. Some standalone LibreChat builds do not expose upload metadata to MCP headers; when "
@@ -628,7 +653,7 @@ def glasshive_workers_server_instructions() -> str:
         "to an attached or uploaded file and your model context cannot read the file body directly, "
         "still call workspace_launch or worker_delegate_once; do not refuse solely because your own "
         "model context lacks file contents.\n\nFor fresh one-off "
-        "host/browser/desktop/local tasks, prefer workspace_launch, whose fields mirror the "
+        "workspace/browser/desktop/file/code tasks, prefer workspace_launch, whose fields mirror the "
         "documented GlassHive UI: description, optional success_criteria, and optional context. "
         "Use success_criteria for explicit user requirements only; if the user gave no distinct acceptance "
         "criteria, omit it or keep it minimal instead of manufacturing a plan for the worker. "
@@ -974,14 +999,13 @@ def _origin_from_url(url: str) -> str:
 
 def _normalize_worker_backend(worker: dict[str, Any]) -> dict[str, Any]:
     safe = dict(worker or {})
-    profile = str(safe.get("profile") or "").strip()
-    runtime = str(safe.get("runtime") or "").strip()
-    if profile in {"codex-cli", "claude-code"}:
-        safe["backend"] = profile
-    elif profile.startswith("openclaw"):
-        safe["backend"] = "openclaw"
-    elif runtime:
-        safe["backend"] = runtime
+    backend = derive_legacy_backend_label(
+        profile=safe.get("profile"),
+        runtime=safe.get("runtime"),
+        backend=safe.get("backend"),
+    )
+    if backend:
+        safe["backend"] = backend
     return safe
 
 

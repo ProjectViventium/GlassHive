@@ -6,8 +6,22 @@ import stat
 import subprocess
 import time
 
-from workers_projects_runtime.docker_sandbox import DockerSandboxManager, SandboxInfo
+from workers_projects_runtime.docker_sandbox import DockerSandboxManager, SandboxInfo, _safe_docker_exec_env
 from workers_projects_runtime.bootstrap import GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS, GLASSHIVE_SAFETY_CHECKPOINT_RULE
+
+
+def test_safe_docker_exec_env_preserves_claude_headless_oauth_only():
+    env = _safe_docker_exec_env(
+        {
+            "CLAUDE_CODE_OAUTH_TOKEN": "oauth-token",
+            "ANTHROPIC_API_KEY": "api-key",
+            "UNRELATED_SECRET": "must-not-pass",
+        }
+    )
+
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-token"
+    assert env["ANTHROPIC_API_KEY"] == "api-key"
+    assert "UNRELATED_SECRET" not in env
 
 
 def test_seed_bootstrap_writes_default_worker_contract_without_bundle(tmp_path):
@@ -790,6 +804,7 @@ def test_ensure_image_includes_document_delivery_toolchain(tmp_path):
     assert "python-docx" in dockerfile
     assert "python-pptx" in dockerfile
     assert "reportlab" in dockerfile
+    assert "requests" in dockerfile
     assert "PyMuPDF" in dockerfile
     assert "/usr/bin/locale-check" in dockerfile
 
