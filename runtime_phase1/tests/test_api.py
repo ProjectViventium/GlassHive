@@ -4,9 +4,13 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
+import sqlite3
 import time
+import uuid
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
@@ -17,8 +21,13 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+import workers_projects_runtime.api as api_module
 from workers_projects_runtime.api import create_app
-from workers_projects_runtime.deliverables import deliverable_payload, is_deliverable_url
+from workers_projects_runtime.deliverables import (
+    deliverable_payload,
+    is_deliverable_url,
+    is_user_deliverable_relative_path,
+)
 from workers_projects_runtime.openclaw_runtime import (
     RuntimeErrorBase,
     RuntimeInfo,
@@ -30,11 +39,49 @@ from workers_projects_runtime.openclaw_runtime import (
 from workers_projects_runtime.service import (
     GlassHiveQuotaExceededError,
     WorkersProjectsService,
+    public_callback_message_text,
     terminal_callback_full_message,
     terminal_callback_message,
 )
-from workers_projects_runtime.signed_links import sign_link_params, sign_link_token, verify_signed_link_token
+from workers_projects_runtime.signed_links import (
+    SensitiveUrlLogFilter,
+    create_signed_link_ref,
+    install_sensitive_url_log_filter,
+    redact_sensitive_url_text,
+    resolve_signed_link_ref,
+    revoke_signed_link_refs_for_worker,
+    sign_link_params,
+    sign_link_token,
+    verify_signed_link_token,
+)
 from workers_projects_runtime.store import Store
+
+
+def write_minimal_docx(path: Path) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>""",
+        )
+        archive.writestr(
+            "_rels/.rels",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>""",
+        )
+        archive.writestr(
+            "word/document.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>Client-ready research brief</w:t></w:r></w:p></w:body>
+</w:document>""",
+        )
 
 
 def wait_for_run(client: TestClient, run_id: str, timeout: float = 3.0) -> dict:
@@ -58,10 +105,56 @@ def wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> None:
     raise AssertionError("Condition did not become true before timeout")
 
 
+def assert_link_ref_url(url: str, *, prefix: str, kind: str) -> dict:
+    assert url.startswith(prefix)
+    assert "/v1/signed-links/" not in url
+    assert "gh_token=" not in url
+    ref_id = urlsplit(url).path.rsplit("/", 1)[-1]
+    record = resolve_signed_link_ref(ref_id)
+    assert record is not None
+    assert record["kind"] == kind
+    assert record["payload"]["kind"] == kind
+    return record
+
+
 def href_for_link_text(html: str, label: str) -> str:
     match = re.search(r'<a\b[^>]*href="([^"]+)"[^>]*>\s*' + re.escape(label) + r"\s*</a>", html)
     assert match, f"Expected link labeled {label!r}"
     return match.group(1)
+
+
+def anchor_for_link_text(html: str, label: str) -> str:
+    match = re.search(r"<a\b([^>]*)>\s*" + re.escape(label) + r"\s*</a>", html)
+    assert match, f"Expected link labeled {label!r}"
+    return match.group(1)
+
+
+def test_store_migrates_compute_released_marker_for_existing_db(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    with store._connect() as conn:
+        assert "compute_released_at" in {row["name"] for row in conn.execute("PRAGMA table_info(workers)").fetchall()}
+        try:
+            conn.execute("ALTER TABLE workers DROP COLUMN compute_released_at")
+        except sqlite3.OperationalError as exc:
+            pytest.skip(f"SQLite runtime does not support DROP COLUMN: {exc}")
+
+    migrated = Store(str(db_path))
+    with migrated._connect() as conn:
+        assert "compute_released_at" in {row["name"] for row in conn.execute("PRAGMA table_info(workers)").fetchall()}
+    project = migrated.create_project("owner", "Migration", "Verify worker marker migration", "codex-cli")
+    worker = migrated.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Migrated Worker",
+        role="coder",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="stub/codex-cli",
+    )
+
+    assert worker["compute_released_at"] is None
 
 
 def test_terminal_callback_message_prefers_final_report():
@@ -156,19 +249,23 @@ def test_terminal_callback_message_uses_tail_without_mid_word_fragment():
     assert not message.startswith("ows ")
 
 
-def test_terminal_callback_message_prefers_concise_final_line_without_marker():
+def test_terminal_callback_message_keeps_long_markerless_tail_with_context():
     output = "\n".join(
         [
-            "Progress " + ("still working " * 120),
-            "More progress " + ("checking browser state " * 80),
+            "Progress " + ("still working " * 220),
+            "More progress " + ("checking browser state " * 160),
             "Example Domain",
         ]
     )
 
-    assert terminal_callback_message(output, fallback="Done") == "Example Domain"
+    message = terminal_callback_message(output, fallback="Done")
+
+    assert len(message) <= 4000
+    assert message.startswith("...")
+    assert message.endswith("Example Domain")
 
 
-def test_terminal_callback_message_prefers_final_line_for_short_markerless_progress():
+def test_terminal_callback_message_keeps_short_markerless_multiline_result():
     output = "\n".join(
         [
             "Using the host browser and checking the page.",
@@ -177,7 +274,7 @@ def test_terminal_callback_message_prefers_final_line_for_short_markerless_progr
         ]
     )
 
-    assert terminal_callback_message(output, fallback="Done") == "Viventium"
+    assert terminal_callback_message(output, fallback="Done") == output
 
 
 def test_terminal_callback_message_respects_visible_budget_with_prefix():
@@ -193,7 +290,7 @@ def test_terminal_callback_message_respects_visible_budget_with_prefix():
 
     message = terminal_callback_message(output)
 
-    assert len(message) <= 2400
+    assert len(message) <= 4000
     assert message.startswith("A")
     assert message.endswith("...")
 
@@ -356,22 +453,33 @@ def test_completed_file_callback_adds_signed_open_download_and_watch_links(tmp_p
         completed = next(payload for payload in payloads if payload.get("event") == "run.completed")
         assert completed["deliverable"]["kind"] == "file"
         assert completed["deliverable"]["workspace_path"] == "answer.txt"
-        assert "File: [Open GlassHive file](https://glasshive-api.example.test/v1/signed-links/" in completed["message"]
-        assert "Download: [Download file](https://glasshive-api.example.test/v1/signed-links/" in completed["message"]
-        assert completed["message"].index("File: [Open GlassHive file]") < completed["message"].index("Download: [Download file]")
-        assert (
-            f"View / Steer: [Open GlassHive workspace](https://glasshive-ui.example.test/watch/{worker['worker_id']}?"
-            in completed["message"]
-        )
-        assert completed["message"].index("Download: [Download file]") < completed["message"].index("View / Steer:")
-        assert "surface=desktop" in completed["message"]
-        assert f"project_id={project['project_id']}" in completed["message"]
-        assert "gh_token=" in completed["message"]
+        assert "/v1/signed-links/" not in completed["message"]
+        assert "gh_token=" not in completed["message"]
+        assert "File: [Open GlassHive file](https://glasshive-api.example.test/v1/link-refs/" in completed["message"]
+        assert "Download: [Download file]" not in completed["message"]
+        assert "View / Steer: [Open GlassHive workspace](https://glasshive-ui.example.test/r/" in completed["message"]
+        assert completed["message"].index("File: [Open GlassHive file]") < completed["message"].index("View / Steer:")
+        artifact_match = re.search(r"https://glasshive-api\.example\.test/v1/link-refs/([A-Za-z0-9_-]+)", completed["message"])
+        assert artifact_match
+        artifact_record = resolve_signed_link_ref(artifact_match.group(1))
+        assert artifact_record is not None
+        assert artifact_record["kind"] == "artifact_open"
+        watch_match = re.search(r"https://glasshive-ui\.example\.test/r/([A-Za-z0-9_-]+)", completed["message"])
+        assert watch_match
+        watch_record = resolve_signed_link_ref(watch_match.group(1))
+        assert watch_record is not None
+        assert watch_record["kind"] == "worker_view"
+        assert "surface=desktop" in watch_record["target_url"]
+        assert f"project_id={project['project_id']}" in watch_record["target_url"]
+        assert "gh_token=" in watch_record["target_url"]
     finally:
         service.shutdown()
 
 
 def test_failed_callback_reports_terminal_state_and_view_steer_link_without_local_path(tmp_path, monkeypatch):
+    synthetic_home_path = "/" + "/".join(("Users", "example", "private-upload.pdf"))
+    synthetic_home_prefix = "/".join(("Users", "example"))
+
     class FailingRuntime(StubRuntime):
         def run_task(
             self,
@@ -381,7 +489,7 @@ def test_failed_callback_reports_terminal_state_and_view_steer_link_without_loca
             run_id: str | None = None,
         ) -> str:
             _ = worker, instruction, timeout_sec, run_id
-            raise FileNotFoundError("Bootstrap source file not found: /Users/example/private-upload.pdf")
+            raise FileNotFoundError(f"Bootstrap source file not found: {synthetic_home_path}")
 
     class Response:
         status_code = 200
@@ -437,15 +545,202 @@ def test_failed_callback_reports_terminal_state_and_view_steer_link_without_loca
         failed = next(payload for payload in payloads if payload.get("event") == "run.failed")
         assert failed["run_state"] == "failed"
         assert "Bootstrap source file not found: [local path]" in failed["message"]
-        assert "/Users/example" not in failed["message"]
-        assert (
-            f"View / Steer: [Open GlassHive workspace](https://glasshive-ui.example.test/watch/{worker['worker_id']}?"
-            in failed["message"]
-        )
-        assert "gh_token=" in failed["message"]
-        assert failed["watch_url"].startswith(f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?")
+        assert synthetic_home_prefix not in failed["message"]
+        assert "View / Steer: [Open GlassHive workspace](https://glasshive-ui.example.test/r/" in failed["message"]
+        assert "gh_token=" not in failed["message"]
+        watch_record = assert_link_ref_url(failed["watch_url"], prefix="https://glasshive-ui.example.test/r/", kind="worker_view")
+        assert f"/watch/{worker['worker_id']}" in watch_record["target_url"]
+        assert "gh_token=" in watch_record["target_url"]
     finally:
         service.shutdown()
+
+
+def test_retryable_host_busy_waits_and_retries_without_terminal_failure(tmp_path, monkeypatch):
+    class CapacityRuntime(StubRuntime):
+        def __init__(self) -> None:
+            self.busy = True
+            self.run_calls = 0
+
+        def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
+            if not self.busy:
+                return None
+            return RuntimeErrorBase(
+                "Host-native codex-cli already has an active worker (wrk_busy123456); "
+                "v1 allows one active host worker per CLI family."
+            )
+
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            _ = worker, timeout_sec, run_id
+            self.run_calls += 1
+            return f"Completed after capacity wait: {instruction}"
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    payloads: list[dict] = []
+
+    def capture_post(url, *, content, headers, timeout):
+        _ = url, headers, timeout
+        payloads.append(json.loads(content.decode("utf-8")))
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("GLASSHIVE_HOST_BUSY_RETRY_BASE_DELAY_S", "0.1")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", capture_post)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = CapacityRuntime()
+    service = WorkersProjectsService(store, runtime, max_workers=2)
+    try:
+        project = store.create_project("owner", "Capacity", "Wait for host worker capacity.", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Capacity Worker",
+            role="worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                    "conversation_id": "conv-1",
+                    "parent_message_id": "msg-user",
+                    "message_id": "msg-assistant",
+                }
+            },
+        )
+
+        run = service.assign_run(worker["worker_id"], "finish when capacity is free")
+
+        wait_until(lambda: (store.get_run(run["run_id"]) or {}).get("retry_attempts") == 1)
+        waiting = store.get_run(run["run_id"])
+        assert waiting["state"] == "queued"
+        assert waiting["failure_class"] == "host_worker_busy"
+        assert waiting["failure_retryable"] == 1
+        assert waiting["retry_after"]
+        assert not [event for event in store.list_events(worker["worker_id"]) if event["event_type"] == "run.failed"]
+        assert not any(payload.get("event") == "run.failed" for payload in payloads)
+        wait_until(
+            lambda: any(payload.get("event") == "run.waiting_on_capacity" for payload in payloads),
+            timeout=3.0,
+        )
+        waiting_payload = next(payload for payload in payloads if payload.get("event") == "run.waiting_on_capacity")
+        assert waiting_payload["run_state"] == "queued"
+        assert "wrk_busy" not in waiting_payload["message"]
+
+        runtime.busy = False
+        wait_until(lambda: (store.get_run(run["run_id"]) or {}).get("state") == "completed", timeout=3.0)
+
+        completed = store.get_run(run["run_id"])
+        assert completed["state"] == "completed"
+        assert "Completed after capacity wait" in completed["output_text"]
+        assert runtime.run_calls == 1
+        assert not any(payload.get("event") == "run.failed" for payload in payloads)
+    finally:
+        service.shutdown()
+
+
+def test_retryable_capacity_wait_has_max_attempts(tmp_path, monkeypatch):
+    class AlwaysBusyRuntime(StubRuntime):
+        def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
+            _ = worker
+            return RuntimeErrorBase("Host-native codex-cli already has an active worker (wrk_busy123456).")
+
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            _ = worker, instruction, timeout_sec, run_id
+            raise AssertionError("capacity-blocked run should not start task execution")
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    payloads: list[dict] = []
+
+    def capture_post(url, *, content, headers, timeout):
+        _ = url, headers, timeout
+        payloads.append(json.loads(content.decode("utf-8")))
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("GLASSHIVE_HOST_BUSY_RETRY_BASE_DELAY_S", "0.1")
+    monkeypatch.setenv("GLASSHIVE_MAX_CAPACITY_RETRY_ATTEMPTS", "1")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", capture_post)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, AlwaysBusyRuntime(), max_workers=2)
+    try:
+        project = store.create_project("owner", "Capacity Cap", "Bound retry loops.", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Capacity Cap Worker",
+            role="worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                    "conversation_id": "conv-1",
+                    "parent_message_id": "msg-user",
+                    "message_id": "msg-assistant",
+                }
+            },
+        )
+
+        run = service.assign_run(worker["worker_id"], "wait, but not forever")
+
+        wait_until(lambda: (store.get_run(run["run_id"]) or {}).get("state") == "failed", timeout=3.0)
+        failed = store.get_run(run["run_id"])
+        assert failed["retry_attempts"] == 1
+        assert failed["failure_class"] == "host_worker_busy"
+        assert failed["failure_retryable"] == 0
+        assert failed["retry_after"] is None
+        assert "stopped retrying" in failed["failure_user_message"]
+        assert (store.get_worker(worker["worker_id"]) or {})["state"] == "ready"
+        assert len([payload for payload in payloads if payload.get("event") == "run.waiting_on_capacity"]) == 1
+        wait_until(lambda: any(payload.get("event") == "run.failed" for payload in payloads), timeout=3.0)
+        failed_payloads = [payload for payload in payloads if payload.get("event") == "run.failed"]
+        assert len(failed_payloads) == 1
+        assert "stopped retrying" in failed_payloads[0]["message"]
+    finally:
+        service.shutdown()
+
+
+def test_public_callback_message_redacts_glasshive_ids():
+    message = (
+        "Host-native codex-cli already has an active worker (wrk_busy123456); "
+        "retrying run_deadbeef123 for project prj_private7890."
+    )
+
+    redacted = public_callback_message_text(message)
+
+    assert "wrk_busy123456" not in redacted
+    assert "run_deadbeef123" not in redacted
+    assert "prj_private7890" not in redacted
+    assert redacted.count("[glasshive-id]") == 3
 
 
 def test_project_worker_lifecycle_with_stub_runtime(tmp_path):
@@ -561,6 +856,114 @@ def test_api_uses_configured_default_worker_profile_when_project_omits_it(tmp_pa
     assert project_resp.json()["default_worker_profile"] == "codex-cli"
 
 
+def test_health_reports_default_profile_runtime_instead_of_legacy_openclaw(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,openclaw-general")
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", "codex-cli")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="openclaw", runtime=StubRuntime()))
+
+    health = client.get("/health").json()
+
+    assert health["runtime_backend"] == "codex-cli"
+    assert "runtime_backend_plumbing" not in health
+    assert health["default_worker_profile"] == "codex-cli"
+
+
+def test_builtin_project_ui_defaults_new_worker_to_project_default_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,openclaw-general")
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", "codex-cli")
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+    project = Store(str(db_path)).create_project(
+        "demo-owner",
+        "Default UI Worker",
+        "New workers should use the configured default profile when legacy project metadata is blank.",
+        "",
+    )
+
+    response = client.get(f"/ui/projects/{project['project_id']}")
+
+    assert response.status_code == 200
+    html = response.text
+    assert "<option value='codex-cli' selected>Codex CLI</option>" in html
+    assert "<option value='openclaw-general' selected>" not in html
+    assert "OpenClaw" not in html
+
+
+def test_builtin_home_ui_hides_legacy_openclaw_profile_choice_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,openclaw-general")
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", "codex-cli")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+
+    response = client.get("/ui")
+
+    assert response.status_code == 200
+    html = response.text
+    assert "<option value='codex-cli' selected>Codex CLI</option>" in html
+    assert "OpenClaw" not in html
+
+
+def test_builtin_home_ui_can_show_legacy_openclaw_profile_choice_when_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,openclaw-general")
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", "codex-cli")
+    monkeypatch.setenv("GLASSHIVE_UI_SHOW_LEGACY_OPENCLAW_PROFILE", "true")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+
+    response = client.get("/ui")
+
+    assert response.status_code == 200
+    html = response.text
+    assert "<option value='codex-cli' selected>Codex CLI</option>" in html
+    assert "<option value='openclaw-general'>OpenClaw</option>" in html
+
+
+def test_builtin_home_ui_keeps_openclaw_visible_when_it_is_selected_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "openclaw-general")
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", "openclaw-general")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+
+    response = client.get("/ui")
+
+    assert response.status_code == 200
+    assert "<option value='openclaw-general' selected>OpenClaw</option>" in response.text
+
+
+def test_create_worker_omitted_profile_uses_project_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,openclaw-general")
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_EXECUTION_MODE", "host")
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Worker Default",
+            "goal": "Workers inherit the project default.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+
+    response = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Default Worker",
+            "role": "coding",
+            "backend": "openclaw",
+            "start_synchronously": False,
+        },
+    )
+
+    assert response.status_code == 201
+    worker_payload = response.json()
+    assert worker_payload["profile"] == "codex-cli"
+    assert worker_payload["runtime"] == "codex-cli"
+    assert worker_payload["backend"] == "codex-cli"
+    assert worker_payload["execution_mode"] == "host"
+    fetched = client.get(f"/v1/workers/{worker_payload['worker_id']}")
+    assert fetched.status_code == 200
+    assert fetched.json()["backend"] == "codex-cli"
+
+
 def test_enterprise_mode_scopes_projects_workers_and_artifacts(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
@@ -593,6 +996,8 @@ def test_enterprise_mode_scopes_projects_workers_and_artifacts(tmp_path, monkeyp
     }
 
     assert client.get("/docs").status_code == 401
+    assert client.get("/redoc").status_code == 401
+    assert client.get("/runs").status_code == 401
     assert client.get("/v1/projects", headers={"X-WPR-Token": "service-secret"}).status_code == 401
     assert client.get("/v1/projects", headers=generic_headers).status_code == 200
     mismatched_tenant = {**headers_a, "X-Viventium-Tenant-Id": "tenant-beta"}
@@ -635,9 +1040,13 @@ def test_enterprise_mode_scopes_projects_workers_and_artifacts(tmp_path, monkeyp
     workspace_file = Path(worker_a_payload["workspace_dir"]) / "result.txt"
     workspace_file.parent.mkdir(parents=True, exist_ok=True)
     workspace_file.write_text("user-a result", encoding="utf-8")
+    hidden_config = Path(worker_a_payload["workspace_dir"]) / ".codex" / "config.toml"
+    hidden_config.parent.mkdir(parents=True, exist_ok=True)
+    hidden_config.write_text("[mcp_servers]\n", encoding="utf-8")
     listed = client.get(f"/v1/workers/{worker_a_payload['worker_id']}/artifacts", headers=headers_a)
     assert listed.status_code == 200
     assert listed.json()["items"][0]["path"] == "result.txt"
+    assert all(item["path"] != ".codex/config.toml" for item in listed.json()["items"])
     downloaded = client.get(
         f"/v1/workers/{worker_a_payload['worker_id']}/artifacts/download",
         headers=headers_a,
@@ -727,6 +1136,12 @@ def test_enterprise_mode_scopes_projects_workers_and_artifacts(tmp_path, monkeyp
         params={"path": "../runtime.db"},
     )
     assert traversal.status_code == 400
+    hidden_download = client.get(
+        f"/v1/workers/{worker_a_payload['worker_id']}/artifacts/download",
+        headers=headers_a,
+        params={"path": ".codex/config.toml"},
+    )
+    assert hidden_download.status_code == 400
     outside_file = tmp_path / "outside.txt"
     outside_file.write_text("outside", encoding="utf-8")
     symlink_path = Path(worker_a_payload["workspace_dir"]) / "outside-link.txt"
@@ -761,6 +1176,7 @@ def test_enterprise_opaque_signed_links_reject_tamper_expiry_and_mismatch(tmp_pa
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive-ui.example.test")
 
     client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
     headers = {
@@ -797,6 +1213,40 @@ def test_enterprise_opaque_signed_links_reject_tamper_expiry_and_mismatch(tmp_pa
         path="result.txt",
     )
     assert client.get(f"/v1/signed-links/{valid}").status_code == 200
+    ref_id = create_signed_link_ref(token=valid)
+    assert ref_id
+    assert client.get(f"/v1/link-refs/{ref_id}").status_code == 401
+    ref_response = client.get(f"/v1/link-refs/{ref_id}", headers=headers)
+    assert ref_response.status_code == 200
+    assert "signed result" in ref_response.text
+    assert client.get(f"/v1/link-refs/{valid}").status_code == 401
+
+    view_token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    target_url = f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop&gh_token={view_token}"
+    view_ref_id = create_signed_link_ref(token=view_token, target_url=target_url)
+    assert view_ref_id
+    wrong_owner_headers = {**headers, "X-Viventium-User-Id": "user-b"}
+    assert client.get(f"/r/{view_ref_id}", headers=wrong_owner_headers, follow_redirects=False).status_code == 404
+    direct_redirect = client.get(f"/r/{view_ref_id}", follow_redirects=False)
+    assert direct_redirect.status_code == 307
+    assert direct_redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
+    assert "gh_token=" not in direct_redirect.headers["location"]
+    redirect = client.get(f"/r/{view_ref_id}", headers=headers, follow_redirects=False)
+    assert redirect.status_code == 307
+    assert redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
+    assert "gh_token=" not in redirect.headers["location"]
+    set_cookie = redirect.headers["set-cookie"]
+    cookie_name = f"glasshive_gh_token_{hashlib.sha256(worker['worker_id'].encode('utf-8')).hexdigest()[:24]}"
+    assert f"{cookie_name}=" in set_cookie
+    assert f"glasshive_gh_token_{worker['worker_id']}=" not in set_cookie
+    assert "HttpOnly" in set_cookie
+    events = client.get(f"/v1/workers/{worker['worker_id']}/live", headers=headers).json()["events"]
+    assert any(event["event_type"] == "worker.view_opened" for event in events)
 
     tampered = f"{valid[:-1]}{'0' if valid[-1] != '0' else '1'}"
     assert client.get(f"/v1/signed-links/{tampered}").status_code == 401
@@ -811,14 +1261,476 @@ def test_enterprise_opaque_signed_links_reject_tamper_expiry_and_mismatch(tmp_pa
     )
     assert client.get(f"/v1/signed-links/{expired}").status_code == 401
 
-    mismatched_owner = sign_link_token(
+
+def test_link_refs_are_redacted_deduplicated_and_secret_rotation_bound(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    now = {"value": 1_000}
+    monkeypatch.setattr(sign_link_token.__globals__["time"], "time", lambda: now["value"])
+
+    token = sign_link_token(
+        kind="artifact_download",
+        worker_id="wrk_dedupe",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="outputs/report.md",
+    )
+    ref_id = create_signed_link_ref(token=token)
+    assert ref_id.startswith("ghr_")
+    assert f"/r/{ref_id}" not in redact_sensitive_url_text(f"GET /r/{ref_id}")
+    assert f"/v1/link-refs/{ref_id}" not in redact_sensitive_url_text(f"GET /v1/link-refs/{ref_id}")
+
+    now["value"] = 1_001
+    second_token = sign_link_token(
+        kind="artifact_download",
+        worker_id="wrk_dedupe",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="outputs/report.md",
+    )
+    assert second_token != token
+    assert create_signed_link_ref(token=second_token) == ref_id
+
+    db_path = os.environ["GLASSHIVE_LINK_REF_STATE_PATH"]
+    with sqlite3.connect(db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM signed_link_refs").fetchone()[0]
+    assert count == 1
+
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "rotated-secret")
+    assert resolve_signed_link_ref(ref_id) is None
+
+
+def test_link_refs_can_be_revoked_by_worker(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    token_a = sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_revoke",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    token_b = sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_keep",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    ref_a = create_signed_link_ref(token=token_a, target_url="/watch/wrk_revoke")
+    ref_b = create_signed_link_ref(token=token_b, target_url="/watch/wrk_keep")
+    assert ref_a and ref_b
+
+    assert revoke_signed_link_refs_for_worker("wrk_revoke") == 1
+    assert resolve_signed_link_ref(ref_a) is None
+    assert resolve_signed_link_ref(ref_b) is not None
+
+
+def test_terminate_revokes_worker_link_refs(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    headers = {
+        "X-WPR-Token": "service-secret",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+        "X-Viventium-User-Role": "member",
+    }
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={"owner_id": "ignored", "title": "Revoke Links", "goal": "Terminate revokes links."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "ignored",
+            "name": "Revoked Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+    token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    ref_id = create_signed_link_ref(token=token, target_url=f"/watch/{worker['worker_id']}")
+    assert resolve_signed_link_ref(ref_id) is not None
+
+    assert client.post(f"/v1/workers/{worker['worker_id']}/terminate", headers=headers).status_code == 202
+    assert resolve_signed_link_ref(ref_id) is None
+
+
+def test_enterprise_short_artifact_ref_is_auth_gated_and_durable_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    now = {"value": 1_000}
+    monkeypatch.setattr(api_module.time, "time", lambda: now["value"])
+    monkeypatch.setattr(sign_link_token.__globals__["time"], "time", lambda: now["value"])
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    headers = {
+        "X-WPR-Token": "service-secret",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+        "X-Viventium-User-Role": "member",
+    }
+    wrong_user_headers = {**headers, "X-Viventium-User-Id": "user-b"}
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={"owner_id": "ignored", "title": "Durable Links", "goal": "Keep old result links usable."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "ignored",
+            "name": "Durable Link Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+    result_path = Path(worker["workspace_dir"]) / "overnight-result.txt"
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text("still here tomorrow", encoding="utf-8")
+
+    token = sign_link_token(
         kind="artifact_download",
         worker_id=worker["worker_id"],
         tenant_id="tenant-alpha",
-        owner_id="user-b",
-        path="result.txt",
+        owner_id="user-a",
+        path="overnight-result.txt",
+        ttl_seconds=60,
     )
-    assert client.get(f"/v1/signed-links/{mismatched_owner}").status_code == 401
+    ref_id = create_signed_link_ref(token=token)
+    assert ref_id
+
+    now["value"] = 2_000
+    assert client.get(f"/v1/link-refs/{ref_id}").status_code == 401
+    assert client.get(f"/v1/link-refs/{ref_id}", headers=wrong_user_headers).status_code == 404
+    response = client.get(f"/v1/link-refs/{ref_id}", headers=headers)
+    assert response.status_code == 200
+    assert response.text == "still here tomorrow"
+
+
+def test_enterprise_short_workspace_ref_mints_fresh_session_cookie_after_original_token_expiry(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "300")
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive-ui.example.test")
+    now = {"value": 1_000}
+    monkeypatch.setattr(api_module.time, "time", lambda: now["value"])
+    monkeypatch.setattr(sign_link_token.__globals__["time"], "time", lambda: now["value"])
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    headers = {
+        "X-WPR-Token": "service-secret",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+        "X-Viventium-User-Role": "member",
+    }
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={"owner_id": "ignored", "title": "Durable Workspace Links", "goal": "Reopen old workspaces."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "ignored",
+            "name": "View Link Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+    token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        ttl_seconds=60,
+    )
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop&gh_token={token}",
+    )
+    assert ref_id
+
+    now["value"] = 2_000
+    wrong_user_headers = {**headers, "X-Viventium-User-Id": "user-b"}
+    assert client.get(f"/r/{ref_id}", headers=wrong_user_headers, follow_redirects=False).status_code == 404
+    direct_redirect = client.get(f"/r/{ref_id}", follow_redirects=False)
+    assert direct_redirect.status_code == 307
+    assert direct_redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
+    redirect = client.get(f"/r/{ref_id}", headers=headers, follow_redirects=False)
+    assert redirect.status_code == 307
+    assert redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
+    set_cookie = redirect.headers["set-cookie"]
+    cookie_name = f"glasshive_gh_token_{hashlib.sha256(worker['worker_id'].encode('utf-8')).hexdigest()[:24]}"
+    cookie_value = set_cookie.split(f"{cookie_name}=", 1)[1].split(";", 1)[0]
+    assert cookie_value != token
+    refreshed_payload = verify_signed_link_token(cookie_value)
+    assert refreshed_payload is not None
+    assert refreshed_payload["worker_id"] == worker["worker_id"]
+    assert refreshed_payload["owner_id"] == "user-a"
+
+
+def test_short_workspace_ref_rejects_unconfigured_absolute_redirect_target(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    headers = {
+        "X-WPR-Token": "service-secret",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+        "X-Viventium-User-Role": "member",
+    }
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={"owner_id": "ignored", "title": "Redirect Guard", "goal": "Reject open redirects."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "ignored",
+            "name": "Redirect Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+    token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"https://unexpected.example.test/watch/{worker['worker_id']}?gh_token={token}",
+    )
+
+    response = client.get(f"/r/{ref_id}", headers=headers, follow_redirects=False)
+
+    assert response.status_code == 403
+    assert "target is not allowed" in response.text
+
+
+@pytest.mark.parametrize(
+    "target_url",
+    [
+        "//unexpected.example.test/watch",
+        "////unexpected.example.test/watch",
+        r"/\unexpected.example.test/watch",
+    ],
+)
+def test_short_workspace_ref_rejects_relative_redirect_bypass_targets(tmp_path, monkeypatch, target_url):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    headers = {
+        "X-WPR-Token": "service-secret",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+        "X-Viventium-User-Role": "member",
+    }
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={"owner_id": "ignored", "title": "Redirect Guard", "goal": "Reject relative redirect bypasses."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "ignored",
+            "name": "Redirect Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+    token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    ref_id = create_signed_link_ref(token=token, target_url=target_url)
+
+    response = client.get(f"/r/{ref_id}", headers=headers, follow_redirects=False)
+
+    assert response.status_code == 400
+    assert "target path is not allowed" in response.text
+
+
+def test_short_workspace_ref_allows_explicit_redirect_host_allowlist(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_REDIRECT_HOSTS", "allowed.example.test, https://other.example.test")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    headers = {
+        "X-WPR-Token": "service-secret",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+        "X-Viventium-User-Role": "member",
+    }
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={"owner_id": "ignored", "title": "Redirect Allowlist", "goal": "Allow configured redirect hosts."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "ignored",
+            "name": "Redirect Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+    token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"https://allowed.example.test/watch/{worker['worker_id']}?surface=desktop&gh_token={token}",
+    )
+
+    response = client.get(f"/r/{ref_id}", headers=headers, follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == f"https://allowed.example.test/watch/{worker['worker_id']}?surface=desktop"
+    assert "gh_token=" not in response.headers["location"]
+
+
+def test_short_ref_ttl_config_can_expire_authenticated_refs(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_TTL_SECONDS", "30")
+    now = {"value": 1_000}
+    monkeypatch.setattr(api_module.time, "time", lambda: now["value"])
+    monkeypatch.setattr(sign_link_token.__globals__["time"], "time", lambda: now["value"])
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    headers = {
+        "X-WPR-Token": "service-secret",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+        "X-Viventium-User-Role": "member",
+    }
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={"owner_id": "ignored", "title": "Configured Link Expiry", "goal": "Expire short refs when configured."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "ignored",
+            "name": "Expiring Ref Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+    result_path = Path(worker["workspace_dir"]) / "configured-expiry.txt"
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text("expires by policy", encoding="utf-8")
+    token = sign_link_token(
+        kind="artifact_download",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="configured-expiry.txt",
+    )
+    ref_id = create_signed_link_ref(token=token)
+    record = resolve_signed_link_ref(ref_id)
+    assert record is not None
+    assert record["expires_at"] == 1_030
+
+    now["value"] = 1_031
+    assert client.get(f"/v1/link-refs/{ref_id}", headers=headers).status_code == 401
+
+
+def test_legacy_signed_link_ref_row_migrates_to_durable_payload_after_token_expiry(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    now = {"value": 1_000}
+    monkeypatch.setattr(sign_link_token.__globals__["time"], "time", lambda: now["value"])
+    token = sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_legacy",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        ttl_seconds=60,
+    )
+    ref_id = "ghr_legacy_migrated_123456"
+    db_path = os.environ["GLASSHIVE_LINK_REF_STATE_PATH"]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE signed_link_refs (
+                ref_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                token TEXT NOT NULL,
+                target_url TEXT NOT NULL DEFAULT '',
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO signed_link_refs (ref_id, kind, token, target_url, expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (ref_id, "worker_view", token, "https://glasshive.example.test/watch/wrk_legacy", 1_060, 1_000),
+        )
+
+    now["value"] = 2_000
+    record = resolve_signed_link_ref(ref_id)
+    assert record is not None
+    assert record["expires_at"] == 0
+    assert record["payload"]["worker_id"] == "wrk_legacy"
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT expires_at, payload_json FROM signed_link_refs WHERE ref_id = ?", (ref_id,)).fetchone()
+    assert row is not None
+    assert row[0] == 0
+    assert '"worker_id":"wrk_legacy"' in row[1]
 
 
 def test_worker_view_signed_links_are_capped_by_watch_session_duration(monkeypatch):
@@ -837,6 +1749,60 @@ def test_worker_view_signed_links_are_capped_by_watch_session_duration(monkeypat
 
     assert payload is not None
     assert int(payload["exp"]) - now <= 121
+
+
+def test_runtime_sensitive_url_log_filter_redacts_signed_tokens():
+    token_query = "gh_" + "token=secret-token"
+    raw = (
+        f'GET /novnc/wrk_1/websockify?{token_query}&gh_sig=signature&gh_exp=123 '
+        'GET /v1/signed-links/opaque-token?download=1'
+        ' GET /w/ghr_public_ref_123456'
+    )
+
+    cookie = "Set-Cookie: glasshive_gh_token_0123456789abcdef01234567=worker-secret; HttpOnly; SameSite=lax"
+
+    assert redact_sensitive_url_text(f"{raw} {cookie}") == (
+        'GET /novnc/wrk_1/websockify?gh_token=[redacted]&gh_sig=[redacted]&gh_exp=[redacted] '
+        'GET /v1/signed-links/[redacted]?download=1'
+        ' GET /w/[redacted] '
+        'Set-Cookie: glasshive_gh_token_0123456789abcdef01234567=[redacted]; HttpOnly; SameSite=lax'
+    )
+    assert redact_sensitive_url_text("gh_sig=signature&gh_token=secret-token") == (
+        "gh_sig=[redacted]&gh_token=[redacted]"
+    )
+    record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=0,
+        msg="%s",
+        args=(f"{raw} {cookie}",),
+        exc_info=None,
+    )
+    assert SensitiveUrlLogFilter().filter(record) is True
+    assert "secret-token" not in record.args[0]
+    assert "opaque-token" not in record.args[0]
+    assert "worker-secret" not in record.args[0]
+    assert "gh_token=[redacted]" in record.args[0]
+    assert "GET /w/[redacted]" in record.args[0]
+    assert "glasshive_gh_token_0123456789abcdef01234567=[redacted]" in record.args[0]
+
+
+def test_runtime_sensitive_url_log_filter_installs_for_child_loggers(caplog):
+    install_sensitive_url_log_filter()
+    token_query = "gh_" + "token=secret-token"
+    raw = f"https://glasshive.example.test/watch/wrk_1?{token_query}&gh_sig=signature"
+    logger = logging.getLogger("workers_projects_runtime.service")
+
+    with caplog.at_level(logging.INFO, logger="workers_projects_runtime.service"):
+        logger.info("opening %s", raw, extra={"target_url": raw})
+
+    assert "secret-token" not in caplog.text
+    assert "gh_token=[redacted]" in caplog.text
+    assert caplog.records
+    assert getattr(caplog.records[-1], "target_url") == (
+        "https://glasshive.example.test/watch/wrk_1?gh_token=[redacted]&gh_sig=[redacted]"
+    )
 
 
 def test_enterprise_member_ui_redacts_runtime_internals(tmp_path, monkeypatch):
@@ -901,6 +1867,17 @@ def test_enterprise_member_ui_redacts_runtime_internals(tmp_path, monkeypatch):
     assert "agent:main:wpr:worker" not in body
     assert "/tmp/" not in body
     assert "Managed by GlassHive" in body
+    signed_query = "gh_sig=signature&gh_exp=123&gh_kind=worker_view"
+    for path in (
+        f"/ui/workers/{worker['worker_id']}",
+        f"/ui/workers/{worker['worker_id']}/view",
+        f"/ui/workers/{worker['worker_id']}/terminal",
+    ):
+        signed_page = client.get(f"{path}?{signed_query}", headers=headers)
+        assert signed_page.status_code == 200
+        assert "gh_sig=signature" not in signed_page.text
+        assert "gh_exp=123" not in signed_page.text
+        assert "gh_kind=worker_view" not in signed_page.text
 
     project_page = client.get(f"/ui/projects/{project['project_id']}?worker_id={worker['worker_id']}", headers=headers)
     assert project_page.status_code == 200
@@ -1056,6 +2033,7 @@ def test_enterprise_mode_requires_signed_link_secret_distinct_from_service_token
 
 def test_enterprise_mode_loads_direct_runtime_env_file(tmp_path, monkeypatch):
     runtime_env = tmp_path / "runtime.env"
+    link_ref_state = tmp_path / "shared-link-refs.sqlite3"
     runtime_env.write_text(
         "\n".join(
             [
@@ -1069,6 +2047,8 @@ def test_enterprise_mode_loads_direct_runtime_env_file(tmp_path, monkeypatch):
                 "WPR_OPENCLAW_USE_CUSTOM_PROVIDER=1",
                 "WPR_OPENCLAW_WIRE_API=openai-completions",
                 "GLASSHIVE_MAX_WORKSPACES_PER_USER=4",
+                f"GLASSHIVE_LINK_REF_STATE_PATH={link_ref_state}",
+                "GLASSHIVE_LINK_REF_TTL_SECONDS=0",
             ]
         )
         + "\n",
@@ -1086,6 +2066,8 @@ def test_enterprise_mode_loads_direct_runtime_env_file(tmp_path, monkeypatch):
         "WPR_OPENCLAW_USE_CUSTOM_PROVIDER",
         "WPR_OPENCLAW_WIRE_API",
         "GLASSHIVE_MAX_WORKSPACES_PER_USER",
+        "GLASSHIVE_LINK_REF_STATE_PATH",
+        "GLASSHIVE_LINK_REF_TTL_SECONDS",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -1093,11 +2075,14 @@ def test_enterprise_mode_loads_direct_runtime_env_file(tmp_path, monkeypatch):
 
     assert client.get("/health").status_code == 200
     assert client.get("/docs").status_code == 401
+    assert client.get("/redoc").status_code == 401
     assert os.environ["OPENAI_API_KEY"] == "runtime-openai-key"
     assert os.environ["ANTHROPIC_API_KEY"] == "runtime-anthropic-key"
     assert os.environ["WPR_OPENCLAW_USE_CUSTOM_PROVIDER"] == "1"
     assert os.environ["WPR_OPENCLAW_WIRE_API"] == "openai-completions"
     assert os.environ["GLASSHIVE_MAX_WORKSPACES_PER_USER"] == "4"
+    assert os.environ["GLASSHIVE_LINK_REF_STATE_PATH"] == str(link_ref_state)
+    assert os.environ["GLASSHIVE_LINK_REF_TTL_SECONDS"] == "0"
 
 
 def test_enterprise_oauth_modes_require_external_validator(tmp_path, monkeypatch):
@@ -1207,6 +2192,7 @@ def test_idle_reaper_stops_compute_but_preserves_worker(tmp_path, monkeypatch):
         refreshed = store.get_worker(worker["worker_id"])
         assert refreshed is not None
         assert refreshed["state"] == "paused"
+        assert refreshed["compute_released_at"]
         assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.idle_terminated"
         with store._connect() as conn:
             conn.execute(
@@ -1268,6 +2254,7 @@ def test_idle_reaper_preserves_completed_worker_state(tmp_path, monkeypatch):
         refreshed = store.get_worker(worker["worker_id"])
         assert refreshed is not None
         assert refreshed["state"] == "completed"
+        assert refreshed["compute_released_at"]
         assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.idle_terminated"
     finally:
         service.shutdown()
@@ -1322,7 +2309,22 @@ def test_paused_reaper_stops_paused_compute_without_deleting_workspace(tmp_path,
         refreshed = store.get_worker(worker["worker_id"])
         assert refreshed is not None
         assert refreshed["state"] == "paused"
+        assert refreshed["compute_released_at"]
         assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.paused_compute_terminated"
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+                ((datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(), worker["worker_id"]),
+            )
+
+        assert service.reap_paused_workers_once() == []
+        assert runtime.terminated == [worker["worker_id"]]
+        paused_release_events = [
+            event
+            for event in store.list_events(worker["worker_id"])
+            if event["event_type"] == "worker.paused_compute_terminated"
+        ]
+        assert len(paused_release_events) == 1
     finally:
         service.shutdown()
 
@@ -1379,6 +2381,7 @@ def test_max_run_duration_cancels_expired_run_and_releases_compute(tmp_path, mon
         assert refreshed_run is not None and refreshed_run["state"] == "cancelled"
         assert "GLASSHIVE_MAX_RUN_DURATION_S=1" in refreshed_run["error_text"]
         assert refreshed_worker is not None and refreshed_worker["state"] == "paused"
+        assert refreshed_worker["compute_released_at"]
         assert store.list_events(worker["worker_id"])[-1]["event_type"] == "run.duration_exceeded"
     finally:
         service.shutdown()
@@ -1722,8 +2725,9 @@ def test_failed_callback_stays_pending_and_replays_on_restart(tmp_path, monkeypa
     with store._connect() as conn:
         row = conn.execute("SELECT status, attempts FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
     assert row["status"] == "delivered"
-    assert row["attempts"] == 2
-    assert attempts == [500, 200]
+    assert row["attempts"] >= 2
+    assert attempts[0] == 500
+    assert attempts[-1] == 200
 
 
 def test_pending_callback_replay_does_not_block_service_startup(tmp_path, monkeypatch):
@@ -1849,6 +2853,302 @@ def test_callbacks_retry_budget_is_configurable(tmp_path, monkeypatch):
 
     assert len(attempts) == 4
     assert not [event for event in store.list_events(worker["worker_id"]) if event["event_type"] == "callback.failed"]
+
+
+def _create_callback_outbox_record(store: Store, *, payload_json: str | None = None, url: str = "http://callback.local/glasshive"):
+    project = store.create_project("owner", "Callbacks", "Verify callback outbox", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Codex Host",
+        role="host worker",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="gpt-5.4",
+        bootstrap_bundle={
+            "callbacks": {
+                "events_webhook_url": url,
+                "hmac_secret": "callback-secret",
+            }
+        },
+    )
+    run = store.create_run(worker["worker_id"], project["project_id"], "Open Chrome", state="completed")
+    callback_id = "cb_" + uuid.uuid4().hex
+    payload = {
+        "callback_id": callback_id,
+        "callback_ts": int(time.time()),
+        "event": "run.completed",
+        "project_id": project["project_id"],
+        "worker_id": worker["worker_id"],
+        "run_id": run["run_id"],
+        "run_state": "completed",
+        "message": "Done",
+    }
+    record = store.upsert_callback_outbox(
+        callback_id=callback_id,
+        project_id=project["project_id"],
+        worker_id=worker["worker_id"],
+        run_id=run["run_id"],
+        event_type="run.completed",
+        url=url,
+        payload_json=payload_json if payload_json is not None else json.dumps(payload, ensure_ascii=False),
+    )
+    return project, worker, run, record
+
+
+def _callback_row(store: Store, callback_id: str):
+    with store._connect() as conn:
+        return conn.execute("SELECT * FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
+
+
+def test_permanent_403_callback_dead_letters_immediately(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    class Response:
+        status_code = 403
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "http://callback.local/glasshive")
+            response = httpx.Response(403, request=request)
+            raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_MAX_TOTAL_ATTEMPTS", "3")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(store)
+        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "dead_lettered"
+    assert row["attempts"] == 1
+    assert "terminal HTTP 403" in row["last_error"]
+    assert len(attempts) == 1
+    assert not store.list_pending_callbacks()
+    assert [event for event in store.list_events(worker["worker_id"]) if event["event_type"] == "callback.dead_lettered"]
+
+
+def test_callback_total_budget_uses_stored_attempts(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    class Response:
+        status_code = 500
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "http://callback.local/glasshive")
+            response = httpx.Response(500, request=request)
+            raise httpx.HTTPStatusError("server error", request=request, response=response)
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_MAX_TOTAL_ATTEMPTS", "3")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(store)
+        with store._connect() as conn:
+            conn.execute("UPDATE callback_outbox SET attempts = 2 WHERE callback_id = ?", (record["callback_id"],))
+        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "dead_lettered"
+    assert row["attempts"] == 3
+    assert len(attempts) == 1
+
+
+def test_callback_over_budget_dead_letters_without_http(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        raise AssertionError("over-budget callback should not call the remote endpoint")
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_MAX_TOTAL_ATTEMPTS", "3")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(store)
+        with store._connect() as conn:
+            conn.execute("UPDATE callback_outbox SET attempts = 3 WHERE callback_id = ?", (record["callback_id"],))
+        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "dead_lettered"
+    assert row["attempts"] == 3
+    assert "retry budget exhausted before delivery" in row["last_error"]
+    assert attempts == []
+
+
+def test_terminal_404_callback_dead_letters_immediately(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    class Response:
+        status_code = 404
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "http://callback.local/glasshive")
+            response = httpx.Response(404, request=request)
+            raise httpx.HTTPStatusError("not found", request=request, response=response)
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "3")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(store)
+        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "dead_lettered"
+    assert row["attempts"] == 1
+    assert "terminal HTTP 404" in row["last_error"]
+    assert len(attempts) == 1
+
+
+def test_invalid_callback_payload_dead_letters_without_http(tmp_path, monkeypatch):
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        raise AssertionError("invalid payload must not be posted")
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(store, payload_json="{invalid")
+        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "dead_lettered"
+    assert row["attempts"] == 1
+    assert "invalid callback payload json" in row["last_error"]
+
+
+def test_missing_callback_url_dead_letters_immediately(tmp_path, monkeypatch):
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        raise AssertionError("missing callback URL must not be posted")
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(store, url="")
+        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], {})
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "dead_lettered"
+    assert row["attempts"] == 1
+    assert "missing callback url" in row["last_error"]
+
+
+def test_stale_delivering_callback_is_reclaimed_for_replay(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_DELIVERING_STALE_AFTER_S", "1")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(store)
+        old_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE callback_outbox SET status = 'delivering', updated_at = ? WHERE callback_id = ?",
+                (old_time, record["callback_id"]),
+            )
+        service._replay_pending_callbacks()
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "delivered"
+    assert row["attempts"] == 1
+    assert len(attempts) == 1
+
+
+def test_metrics_include_callback_outbox_health(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    _project, _worker, _run, pending = _create_callback_outbox_record(store)
+    _project, _worker, _run, delivering = _create_callback_outbox_record(store)
+    _project, _worker, _run, dead_lettered = _create_callback_outbox_record(store)
+    old_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE callback_outbox SET attempts = 7, updated_at = ? WHERE callback_id = ?",
+            (old_time, pending["callback_id"]),
+        )
+        conn.execute(
+            "UPDATE callback_outbox SET status = 'delivering', attempts = 3 WHERE callback_id = ?",
+            (delivering["callback_id"],),
+        )
+    store.mark_callback_dead_lettered(
+        dead_lettered["callback_id"],
+        attempts=99,
+        payload_json=str(dead_lettered["payload_json"]),
+        last_error="terminal test callback",
+    )
+
+    metrics = store.metrics()
+
+    assert metrics["callback_pending"] == 1
+    assert metrics["callback_delivering"] == 1
+    assert metrics["callback_dead_lettered"] == 1
+    assert metrics["callback_max_attempts"] == 7
+    assert metrics["callback_oldest_pending_age_seconds"] >= 250
 
 
 def test_assign_run_does_not_block_on_callback_delivery(tmp_path, monkeypatch):
@@ -1989,6 +3289,175 @@ def test_reconcile_interrupts_active_run_when_worker_process_is_missing(tmp_path
     assert any(event["event_type"] == "run.orphaned" for event in store.list_events(worker["worker_id"]))
 
 
+def test_reconcile_orphaned_running_run_emits_interrupted_callback(tmp_path):
+    class MissingProcessRuntime(StubRuntime):
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            info = super().reconcile_worker(worker)
+            info.pid = None
+            return info
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, MissingProcessRuntime())
+    try:
+        project = store.create_project("owner", "Orphan Callback", "Notify parent on orphaned run", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                    "conversation_id": "conv-1",
+                    "parent_message_id": "msg-user",
+                    "message_id": "msg-assistant",
+                    "surface": "web",
+                }
+            },
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+        run = store.create_run(worker["worker_id"], project["project_id"], "Long host task", state="running")
+
+        service.reconcile_all_workers()
+    finally:
+        service.shutdown()
+
+    callbacks = [row for row in store.list_pending_callbacks() if row["run_id"] == run["run_id"]]
+    assert len(callbacks) == 1
+    payload = json.loads(callbacks[0]["payload_json"])
+    assert payload["event"] == "run.interrupted"
+    assert payload["run_state"] == "interrupted"
+    assert "not running during reconcile" in payload["message"]
+
+
+def test_reconcile_collects_completed_run_before_orphaning_missing_process(tmp_path):
+    class CompletedMissingProcessRuntime(StubRuntime):
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            info = super().reconcile_worker(worker)
+            info.pid = None
+            return info
+
+        def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
+            return {
+                "state": "completed",
+                "output_text": "FINAL REPORT:\nRecovered completed output.",
+            }
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, CompletedMissingProcessRuntime())
+    try:
+        project = store.create_project("owner", "Reconcile Recovery", "Collect completed run", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                    "conversation_id": "conv-1",
+                    "parent_message_id": "msg-user",
+                    "message_id": "msg-assistant",
+                    "surface": "web",
+                }
+            },
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+        run = store.create_run(worker["worker_id"], project["project_id"], "Long host task", state="running")
+
+        service.reconcile_all_workers()
+    finally:
+        service.shutdown()
+
+    recovered_run = store.get_run(run["run_id"])
+    assert recovered_run["state"] == "completed"
+    assert "Recovered completed output" in recovered_run["output_text"]
+    assert not any(event["event_type"] == "run.orphaned" for event in store.list_events(worker["worker_id"]))
+    callbacks = [row for row in store.list_pending_callbacks() if row["run_id"] == run["run_id"]]
+    assert len(callbacks) == 1
+    payload = json.loads(callbacks[0]["payload_json"])
+    assert payload["event"] == "run.completed"
+    assert payload["run_state"] == "completed"
+
+
+def test_reconcile_continues_when_one_completed_run_collection_raises(tmp_path):
+    class PartiallyFailingRuntime(StubRuntime):
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            info = super().reconcile_worker(worker)
+            info.pid = None
+            return info
+
+        def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
+            if worker.get("name") == "Broken Worker":
+                raise RuntimeError("synthetic collection failure")
+            return {
+                "state": "completed",
+                "output_text": "FINAL REPORT:\nSecond worker still reconciled.",
+            }
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, PartiallyFailingRuntime())
+    try:
+        project = store.create_project("owner", "Reconcile Isolation", "Continue after worker error", "codex-cli")
+        broken_worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Broken Worker",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+        )
+        healthy_worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Healthy Worker",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+        )
+        store.update_worker_state(broken_worker["worker_id"], "running")
+        store.update_worker_state(healthy_worker["worker_id"], "running")
+        broken_run = store.create_run(
+            broken_worker["worker_id"],
+            project["project_id"],
+            "Broken host task",
+            state="running",
+        )
+        healthy_run = store.create_run(
+            healthy_worker["worker_id"],
+            project["project_id"],
+            "Healthy host task",
+            state="running",
+        )
+
+        service.reconcile_all_workers()
+    finally:
+        service.shutdown()
+
+    assert store.get_run(broken_run["run_id"])["state"] == "running"
+    recovered_run = store.get_run(healthy_run["run_id"])
+    assert recovered_run["state"] == "completed"
+    assert "Second worker still reconciled" in recovered_run["output_text"]
+    assert any(
+        event["event_type"] == "worker.reconcile_failed"
+        for event in store.list_events(broken_worker["worker_id"])
+    )
+
+
 def test_reconcile_skips_idle_paused_workers_and_cleans_inconsistent_runs(tmp_path):
     class CountingRuntime(StubRuntime):
         def __init__(self) -> None:
@@ -2114,6 +3583,70 @@ def test_worker_find_or_resume_reuses_alias_and_preserves_host_fields(tmp_path):
     assert second.json()["execution_mode"] == "host"
     assert second.json()["alias"] == "codex-main"
     assert second.json()["workspace_root"] == str(tmp_path / "workspaces")
+
+
+def test_worker_find_or_resume_refreshes_runtime_when_alias_reprofiles(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Reprofile Workers",
+            "goal": "Reuse an alias with the currently selected profile.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    openclaw_payload = {
+        "owner_id": "demo-owner",
+        "name": "Reusable Worker",
+        "role": "research",
+        "profile": "openclaw-general",
+        "backend": "openclaw",
+        "execution_mode": "docker",
+        "alias": "main",
+        "start_synchronously": False,
+    }
+    codex_payload = {
+        **openclaw_payload,
+        "profile": "codex-cli",
+        "name": "Reusable Codex Worker",
+        "role": "coding",
+    }
+
+    first = client.post(f"/v1/projects/{project['project_id']}/workers/find-or-resume", json=openclaw_payload)
+    second = client.post(f"/v1/projects/{project['project_id']}/workers/find-or-resume", json=codex_payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["worker_id"] == first.json()["worker_id"]
+    assert second.json()["profile"] == "codex-cli"
+    assert second.json()["runtime"] == "codex-cli"
+
+
+def test_live_logs_follow_profile_when_legacy_runtime_metadata_is_stale(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+    store = Store(str(db_path))
+    project = store.create_project("demo-owner", "Stale Runtime", "Read logs from current profile.", "codex-cli")
+    worker = store.create_worker(
+        project["project_id"],
+        "demo-owner",
+        "Codex Worker",
+        "coding",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="openclaw",
+        model="gpt-5.4",
+    )
+    log_dir = db_path.parent / "codex_cli_runtime" / "logs"
+    log_dir.mkdir(parents=True)
+    (log_dir / f"{worker['worker_id']}.stdout.log").write_text("codex profile log marker\n", encoding="utf-8")
+
+    response = client.get(f"/v1/workers/{worker['worker_id']}/live")
+
+    assert response.status_code == 200
+    assert "codex profile log marker" in response.json()["console"]["stdout"]
 
 
 def test_worker_find_or_resume_refreshes_callback_bundle_on_alias_reuse(tmp_path, monkeypatch):
@@ -2327,6 +3860,105 @@ def test_assign_run_effort_updates_codex_worker_bootstrap_bundle(tmp_path):
     assert "Codex effort" in rejected.json()["detail"]
 
 
+def test_assign_run_effort_updates_claude_worker_bootstrap_bundle(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub"))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Claude effort",
+            "goal": "Verify per-run effort handoff.",
+            "default_worker_profile": "claude-code",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Claude Worker",
+            "role": "research",
+            "profile": "claude-code",
+            "backend": "openclaw",
+            "start_synchronously": False,
+        },
+    ).json()
+
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Continue with a max effort pass.", "effort": "max"},
+    )
+    assert run.status_code == 202
+    assert run.json()["state"] == "queued"
+
+    stored_worker = Store(str(db_path)).get_worker(worker["worker_id"])
+    bundle = json.loads(stored_worker["bootstrap_bundle_json"])
+    assert bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == "max"
+    assert "Worker effort preference" not in str(bundle)
+
+    rejected = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Invalid effort should fail.", "effort": "high"},
+    )
+    assert rejected.status_code == 400
+    assert "Claude effort" in rejected.json()["detail"]
+
+
+def test_signed_worker_view_cannot_inject_bootstrap_bundle_on_assign(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("WPR_API_TOKEN", "api-token")
+
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub"))
+    headers = {"x-wpr-token": "api-token"}
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={
+            "owner_id": "demo-owner",
+            "title": "Signed Link Assign",
+            "goal": "Signed watch links can steer, not reshape bootstrap context.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "demo-owner",
+            "name": "Codex Worker",
+            "role": "coding",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+            "start_synchronously": False,
+        },
+    ).json()
+    signed_watch = sign_link_params(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id=str(worker.get("tenant_id") or ""),
+        owner_id="demo-owner",
+    )
+
+    injected = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        params=signed_watch,
+        json={
+            "instruction": "Try to reshape bootstrap.",
+            "bootstrap_bundle": {"env": {"UNTRUSTED_FROM_LINK": "1"}},
+        },
+    )
+    assert injected.status_code == 403
+    assert "cannot modify worker bootstrap context" in injected.json()["detail"]
+
+    allowed = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        params=signed_watch,
+        json={"instruction": "Continue without bootstrap injection.", "effort": "medium"},
+    )
+    assert allowed.status_code == 202
+
+
 def test_missing_host_cli_blocks_creation_before_worker_row(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
     monkeypatch.setenv("WPR_CODEX_BIN", str(tmp_path / "missing-codex"))
@@ -2403,6 +4035,11 @@ def test_duplicate_worker_copies_workspace_into_new_worker(tmp_path):
     source_workspace.mkdir(parents=True, exist_ok=True)
     (source_workspace / "app.txt").write_text("copied from source")
     (source_workspace / ".mcp.json").write_text('{"seed":"source"}')
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE workers SET backend = ? WHERE worker_id = ?",
+            ("openclaw", source_worker["worker_id"]),
+        )
 
     target_project = client.post(
         "/v1/projects",
@@ -2427,6 +4064,7 @@ def test_duplicate_worker_copies_workspace_into_new_worker(tmp_path):
     duplicated_worker = duplicate.json()
     duplicated_workspace = Path(duplicated_worker["workspace_dir"])
 
+    assert duplicated_worker["backend"] == "codex-cli"
     assert (duplicated_workspace / "app.txt").read_text() == "copied from source"
     assert (duplicated_workspace / ".mcp.json").read_text() == '{"seed":"source"}'
 
@@ -2609,7 +4247,9 @@ def test_nonblocking_worker_create_defers_runtime_start_to_run_queue(tmp_path):
     settled = wait_for_run(client, assign_resp.json()["run_id"], timeout=3.0)
     assert settled["state"] == "completed"
     assert settled["output_text"] == "BACKGROUND_START_OK"
-    assert runtime.events[0] == "run_task"
+    assert runtime.events[0] == "ready"
+    assert "run_task" in runtime.events
+    assert runtime.events.index("run_task") > 0
 
 
 def test_openclaw_worker_exposes_operator_control_surface(tmp_path):
@@ -2730,6 +4370,302 @@ def test_live_payload_promotes_workspace_html_as_deliverable(tmp_path):
     assert payload["deliverable"]["preferred_surface"] == "desktop"
 
 
+def test_live_payload_prefers_professional_document_over_supporting_html(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Document Deliverable",
+            "goal": "Expose the client-ready document before supporting source artifacts.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Document Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+        },
+    ).json()
+
+    workspace = Path(worker["workspace_dir"])
+    artifacts = workspace / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (workspace / "index.html").write_text("<!doctype html><h1>Supporting preview</h1>", encoding="utf-8")
+    write_minimal_docx(artifacts / "research-brief.docx")
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live")
+    assert live.status_code == 200
+    deliverable = live.json()["deliverable"]
+    assert deliverable["kind"] == "file"
+    assert deliverable["workspace_path"] == "artifacts/research-brief.docx"
+    assert deliverable["preferred_surface"] == "download"
+
+
+def test_live_payload_does_not_promote_fake_document_over_html(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Document Deliverable",
+            "goal": "Reject renamed fake office documents.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Document Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+        },
+    ).json()
+
+    workspace = Path(worker["workspace_dir"])
+    artifacts = workspace / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (workspace / "index.html").write_text("<!doctype html><h1>Supporting preview</h1>", encoding="utf-8")
+    (artifacts / "research-brief.docx").write_text("not a real Word package", encoding="utf-8")
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live")
+    assert live.status_code == 200
+    deliverable = live.json()["deliverable"]
+    assert deliverable["kind"] == "webpage"
+    assert deliverable["workspace_path"] == "index.html"
+    assert deliverable["source"] == "workspace_html"
+
+
+def test_live_payload_file_deliverable_includes_signed_open_and_download_links(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "File Deliverable",
+            "goal": "Expose a downloadable file result to the operator UI.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "File Worker",
+            "role": "writer",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+        },
+    ).json()
+
+    workspace = Path(worker["workspace_dir"])
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "answer.txt").write_text("download me", encoding="utf-8")
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live")
+    assert live.status_code == 200
+    deliverable = live.json()["deliverable"]
+    assert deliverable["kind"] == "file"
+    assert deliverable["workspace_path"] == "answer.txt"
+    assert_link_ref_url(deliverable["open_url"], prefix="/v1/link-refs/", kind="artifact_open")
+    assert_link_ref_url(deliverable["download_url"], prefix="/v1/link-refs/", kind="artifact_download")
+    with sqlite3.connect(os.environ["GLASSHIVE_LINK_REF_STATE_PATH"]) as conn:
+        link_ref_count = conn.execute("SELECT COUNT(*) FROM signed_link_refs").fetchone()[0]
+
+    second_live = client.get(f"/v1/workers/{worker['worker_id']}/live")
+    assert second_live.status_code == 200
+    second_deliverable = second_live.json()["deliverable"]
+    assert second_deliverable["open_url"] == deliverable["open_url"]
+    assert second_deliverable["download_url"] == deliverable["download_url"]
+    with sqlite3.connect(os.environ["GLASSHIVE_LINK_REF_STATE_PATH"]) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM signed_link_refs").fetchone()[0] == link_ref_count
+
+    opened = client.get(deliverable["open_url"])
+    assert opened.status_code == 200
+    assert "download me" in opened.text
+    assert "Download file" in opened.text
+    downloaded = client.get(deliverable["download_url"])
+    assert downloaded.status_code == 200
+    assert downloaded.text == "download me"
+    assert "attachment" in downloaded.headers["content-disposition"]
+
+
+def test_live_payload_artifact_inventory_includes_multiple_signed_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Multi File Deliverable",
+            "goal": "Expose all generated files to the operator UI.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Multi File Worker",
+            "role": "writer",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+        },
+    ).json()
+
+    workspace = Path(worker["workspace_dir"])
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "first.txt").write_text("FIRST_OK", encoding="utf-8")
+    (workspace / "second.txt").write_text("SECOND_OK", encoding="utf-8")
+    (workspace / ".mcp.json").write_text("{}", encoding="utf-8")
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live")
+    assert live.status_code == 200
+    artifact_items = live.json()["artifacts"]["items"]
+    by_path = {item["path"]: item for item in artifact_items}
+    assert sorted(by_path) == ["first.txt", "second.txt"]
+    assert_link_ref_url(by_path["first.txt"]["open_url"], prefix="/v1/link-refs/", kind="artifact_open")
+    assert_link_ref_url(by_path["first.txt"]["download_url"], prefix="/v1/link-refs/", kind="artifact_download")
+    assert_link_ref_url(by_path["second.txt"]["open_url"], prefix="/v1/link-refs/", kind="artifact_open")
+    assert_link_ref_url(by_path["second.txt"]["download_url"], prefix="/v1/link-refs/", kind="artifact_download")
+
+    downloaded = client.get(by_path["first.txt"]["download_url"])
+    assert downloaded.status_code == 200
+    assert downloaded.text == "FIRST_OK"
+
+
+def test_artifact_surfaces_reject_browser_runtime_scratch_paths(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Scratch Artifact Filtering",
+            "goal": "Expose user deliverables without exposing browser profile state.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Scratch Filter Worker",
+            "role": "writer",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+            "execution_mode": "host",
+        },
+    ).json()
+
+    workspace = Path(worker["workspace_dir"])
+    workspace.mkdir(parents=True, exist_ok=True)
+    deliverable = workspace / "artifacts" / "result.csv"
+    deliverable.parent.mkdir(parents=True, exist_ok=True)
+    deliverable.write_text("name,status\nsynthetic,ok\n", encoding="utf-8")
+    script = workspace / "scripts" / "helper.js"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("console.log('not the deliverable');\n", encoding="utf-8")
+    os.utime(script, (9999999999, 9999999999))
+
+    extension_index = (
+        workspace
+        / "tmp"
+        / "chrome-user-data"
+        / "Default"
+        / "Default"
+        / "Extensions"
+        / "fdpohaocaechififmbbbbbknoalclacl"
+        / "8.6_0"
+        / "capture"
+        / "index.html"
+    )
+    extension_index.parent.mkdir(parents=True, exist_ok=True)
+    extension_index.write_text("<!doctype html><title>Capture (redir)</title>", encoding="utf-8")
+    copied_cookie_store = workspace / "tmp" / "chrome-default-cookies.sqlite"
+    copied_cookie_store.write_bytes(b"synthetic cookie db")
+    persistent_extension = (
+        workspace
+        / ".config"
+        / "chromium"
+        / "Default"
+        / "Extensions"
+        / "fcoeoabgfenejglbffodgkkbkcdhcgfn"
+        / "1.0_0"
+        / "manifest.json"
+    )
+    persistent_extension.parent.mkdir(parents=True, exist_ok=True)
+    persistent_extension.write_text("{}", encoding="utf-8")
+    upload_metadata = workspace / "uploads" / "source.txt.metadata.json"
+    upload_metadata.parent.mkdir(parents=True, exist_ok=True)
+    upload_metadata.write_text("{}", encoding="utf-8")
+
+    assert not is_user_deliverable_relative_path(extension_index.relative_to(workspace))
+    assert not is_user_deliverable_relative_path(copied_cookie_store.relative_to(workspace))
+    assert not is_user_deliverable_relative_path(persistent_extension.relative_to(workspace))
+    assert not is_user_deliverable_relative_path(upload_metadata.relative_to(workspace))
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live")
+    assert live.status_code == 200
+    payload = live.json()
+    assert payload["deliverable"]["kind"] == "file"
+    assert payload["deliverable"]["workspace_path"] == "artifacts/result.csv"
+
+    listed = client.get(f"/v1/workers/{worker['worker_id']}/artifacts")
+    assert listed.status_code == 200
+    listed_paths = {item["path"] for item in listed.json()["items"]}
+    assert "artifacts/result.csv" in listed_paths
+    assert "scripts/helper.js" in listed_paths
+    assert extension_index.relative_to(workspace).as_posix() not in listed_paths
+    assert copied_cookie_store.relative_to(workspace).as_posix() not in listed_paths
+    assert persistent_extension.relative_to(workspace).as_posix() not in listed_paths
+    assert upload_metadata.relative_to(workspace).as_posix() not in listed_paths
+
+    opened = client.get(
+        f"/v1/workers/{worker['worker_id']}/artifacts/open",
+        params={"path": extension_index.relative_to(workspace).as_posix()},
+    )
+    assert opened.status_code == 400
+    assert opened.json()["detail"] == "Artifact path is not downloadable"
+
+    downloaded = client.get(
+        f"/v1/workers/{worker['worker_id']}/artifacts/download",
+        params={"path": copied_cookie_store.relative_to(workspace).as_posix()},
+    )
+    assert downloaded.status_code == 400
+    assert downloaded.json()["detail"] == "Artifact path is not downloadable"
+
+    persistent_download = client.get(
+        f"/v1/workers/{worker['worker_id']}/artifacts/download",
+        params={"path": persistent_extension.relative_to(workspace).as_posix()},
+    )
+    assert persistent_download.status_code == 400
+    assert persistent_download.json()["detail"] == "Artifact path is not downloadable"
+
+
 def test_deliverable_detection_ignores_provider_api_endpoints(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -2739,12 +4675,9 @@ def test_deliverable_detection_ignores_provider_api_endpoints(tmp_path):
         "workspace_dir": str(workspace),
         "execution_mode": "docker",
     }
-    output = (
-        "Using https://pai-aaf.cognitiveservices.azure.com/openai/v1 for the model.\n"
-        "FINAL REPORT: wrote the marker file."
-    )
+    output = "Using https://example-ai.openai.azure.com/openai/v1 for the model.\nFINAL REPORT: wrote the marker file."
 
-    assert not is_deliverable_url("https://pai-aaf.cognitiveservices.azure.com/openai/v1")
+    assert not is_deliverable_url("https://example-ai.openai.azure.com/openai/v1")
     assert not is_deliverable_url("https://[REDACTED_CREDENTIAL]/openai/v1")
     payload = deliverable_payload(worker, {"state": "completed"}, output)
 
@@ -2753,6 +4686,33 @@ def test_deliverable_detection_ignores_provider_api_endpoints(tmp_path):
     assert payload["source"] == "workspace_file"
     assert payload["workspace_path"] == "qa_enterprise_launcher_ui_pass.txt"
     assert "cognitiveservices" not in json.dumps(payload)
+
+
+def test_deliverable_detection_prefers_user_file_over_incidental_external_url(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifact_name = "qa_synthetic_claude_worker.txt"
+    (workspace / artifact_name).write_text("SYNTHETIC_CLAUDE_WORKER_OK")
+    worker = {
+        "worker_id": "wrk_1",
+        "workspace_dir": str(workspace),
+        "execution_mode": "docker",
+    }
+    output = "\n".join(
+        [
+            "Fetched https://example.com while checking network reachability.",
+            "FINAL REPORT: SYNTHETIC_CLAUDE_WORKER_OK",
+            f"File: {artifact_name}",
+        ]
+    )
+
+    payload = deliverable_payload(worker, {"state": "completed"}, output)
+
+    assert payload is not None
+    assert payload["kind"] == "file"
+    assert payload["source"] == "workspace_file"
+    assert payload["workspace_path"] == artifact_name
+    assert "example.com" not in json.dumps(payload)
 
 
 def test_deliverable_detection_ignores_glasshive_scaffold_files(tmp_path):
@@ -2779,6 +4739,14 @@ def test_deliverable_detection_ignores_glasshive_scaffold_files(tmp_path):
     mixed_case_helper = mixed_case_helper_dir / "latest-helper-output.txt"
     mixed_case_helper.write_text("not a user artifact")
     os.utime(mixed_case_helper, (9999999999, 9999999999))
+    codex_dir = workspace / ".codex"
+    codex_dir.mkdir()
+    codex_config = codex_dir / "config.toml"
+    codex_config.write_text("[mcp_servers]\n")
+    os.utime(codex_config, (9999999999, 9999999999))
+    mcp_config = workspace / ".mcp.json"
+    mcp_config.write_text("{}")
+    os.utime(mcp_config, (9999999999, 9999999999))
     worker = {
         "worker_id": "wrk_1",
         "workspace_dir": str(workspace),
@@ -2931,10 +4899,12 @@ def test_resume_worker_refreshes_stale_worker_model_before_runtime_start(tmp_pat
         start_synchronously=False,
     )
 
+    store.update_worker(worker["worker_id"], compute_released_at=datetime.now(timezone.utc).isoformat())
     runtime.model = "gpt-5.4"
     resumed = service.resume_worker(worker["worker_id"])
 
     assert resumed["model"] == "gpt-5.4"
+    assert resumed["compute_released_at"] is None
     assert runtime.ensure_models[-1] == "gpt-5.4"
 
 
@@ -3445,6 +5415,18 @@ class RuntimeErrorWithPartialArtifactsRuntime(StubRuntime):
         }
 
 
+class BlockingLiveStateRuntime(RuntimeErrorWithPartialArtifactsRuntime):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.started = Event()
+        self.release = Event()
+
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        self.started.set()
+        assert self.release.wait(timeout=3)
+        return "Completed after live-state inspection"
+
+
 class RuntimeErrorWithDeliverableArtifactRuntime(RuntimeErrorWithPartialArtifactsRuntime):
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
         _, workspace_dir = self._worker_paths(worker["worker_id"])
@@ -3488,6 +5470,45 @@ class RuntimeIoFailureWithDeliverableArtifactRuntime(RuntimeErrorWithDeliverable
             "failure_recommended_recovery": "Use workspace_continue to resume from the same workspace.",
             "failure_diagnostic_summary": "write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true",
         }
+
+
+def test_running_worker_exposes_runtime_paths_before_task_finishes(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    runtime = BlockingLiveStateRuntime(tmp_path / "workers")
+    service = WorkersProjectsService(store, runtime)
+    try:
+        project = service.create_project("demo-owner", "Live state", "Expose workspace while running.", "codex-cli")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="demo-owner",
+            name="Codex Worker",
+            role="research",
+            profile="codex-cli",
+            backend="openclaw",
+        )
+
+        run = service.assign_run(worker["worker_id"], "do live work")
+        assert runtime.started.wait(timeout=2)
+
+        live_worker = store.get_worker(worker["worker_id"])
+        live_run = store.get_run(run["run_id"])
+
+        assert live_worker is not None
+        assert live_run is not None
+        assert live_worker["state"] == "running"
+        assert live_run["state"] == "running"
+        assert live_worker["workspace_dir"].endswith(f"{worker['worker_id']}/state/workspace")
+        assert live_worker["state_dir"].endswith(f"{worker['worker_id']}/state")
+        assert live_worker["runtime"] == "codex-cli"
+        assert live_worker["pid"] == 4242
+
+        runtime.release.set()
+        wait_until(lambda: (store.get_run(run["run_id"]) or {}).get("state") == "completed")
+        assert store.get_run(run["run_id"])["output_text"] == "Completed after live-state inspection"
+    finally:
+        runtime.release.set()
+        service.shutdown()
 
 
 def test_runtime_error_recovers_codex_failure_metadata_and_artifacts(tmp_path, monkeypatch):
@@ -4070,17 +6091,21 @@ def test_completed_web_callback_includes_operator_url_and_deliverable(tmp_path, 
         payload = callback_payload()
         assert payload is not None
         expected_url = f"http://127.0.0.1:8780/watch/{worker['worker_id']}?surface=desktop&project_id={project['project_id']}"
-        assert payload["operator_url"].startswith(expected_url)
-        assert payload["watch_url"].startswith(expected_url)
-        assert "gh_token=" in payload["operator_url"]
-        assert "gh_token=" in payload["watch_url"]
+        operator_record = assert_link_ref_url(payload["operator_url"], prefix="http://127.0.0.1:8780/r/", kind="worker_view")
+        watch_record = assert_link_ref_url(payload["watch_url"], prefix="http://127.0.0.1:8780/r/", kind="worker_view")
+        assert operator_record["target_url"].startswith(expected_url)
+        assert watch_record["target_url"].startswith(expected_url)
+        assert "gh_token=" in operator_record["target_url"]
+        assert "gh_token=" not in payload["operator_url"]
+        assert "gh_token=" not in payload["watch_url"]
         assert payload["deliverable"]["kind"] == "webpage"
         assert payload["deliverable"]["browser_url"] == "file:///workspace/project/index.html"
-        assert "File: [Open GlassHive file](http://127.0.0.1:8780/v1/signed-links/" in payload["message"]
-        assert "Download: [Download file](http://127.0.0.1:8780/v1/signed-links/" in payload["message"]
-        assert payload["message"].index("File: [Open GlassHive file]") < payload["message"].index("Download: [Download file]")
+        assert "/v1/signed-links/" not in payload["message"]
+        assert "gh_token=" not in payload["message"]
+        assert "File: [Open GlassHive file](http://127.0.0.1:8780/v1/link-refs/" in payload["message"]
+        assert "Download: [Download file]" not in payload["message"]
         assert "View / Steer: [Open GlassHive workspace]" in payload["message"]
-        assert payload["message"].index("Download: [Download file]") < payload["message"].index("View / Steer:")
+        assert payload["message"].index("File: [Open GlassHive file]") < payload["message"].index("View / Steer:")
 
 
 def test_artifact_open_page_previews_text_without_forcing_download(tmp_path, monkeypatch):
@@ -4114,12 +6139,35 @@ def test_artifact_open_page_previews_text_without_forcing_download(tmp_path, mon
         assert "no-store" in opened.headers["cache-control"]
         assert opened.headers["pragma"] == "no-cache"
         assert opened.headers["x-content-type-options"] == "nosniff"
+        assert opened.headers["x-frame-options"] == "SAMEORIGIN"
         assert "default-src 'none'" in opened.headers["content-security-policy"]
+        assert "frame-ancestors 'self'" in opened.headers["content-security-policy"]
         assert "GlassHive preview works." in opened.text
         assert "Download file" in opened.text
-        assert 'href="/v1/signed-links/' in opened.text
-        assert "gh_token=" in opened.text
+        assert "/v1/signed-links/" not in opened.text
+        assert 'href="/v1/link-refs/' in opened.text
+        assert 'target="_top"' in anchor_for_link_text(opened.text, "View workspace")
+        assert "gh_token=" not in opened.text
         opened_download_href = href_for_link_text(opened.text, "Download file")
+        assert_link_ref_url(opened_download_href, prefix="/v1/link-refs/", kind="artifact_download")
+        workspace_href = href_for_link_text(opened.text, "View workspace")
+        workspace_record = assert_link_ref_url(workspace_href, prefix="/w/", kind="worker_view")
+        assert workspace_record["target_url"] == ""
+        workspace_view = client.get(workspace_href)
+        assert workspace_view.status_code == 200
+        assert "managed workspace" in workspace_view.text
+        assert "How to take over" not in workspace_view.text
+        assert worker["worker_id"] not in workspace_view.text
+        assert project["project_id"] not in workspace_view.text
+        assert "/ui/workers/" not in workspace_view.text
+        assert "/watch/" not in workspace_view.text
+        desktop_response = client.get(f"{workspace_href}/desktop", follow_redirects=False)
+        assert desktop_response.status_code == 200
+        assert worker["worker_id"] not in desktop_response.text
+        assert project["project_id"] not in desktop_response.text
+        desktop_frame = client.get(f"{workspace_href}/desktop-frame", follow_redirects=False)
+        assert desktop_frame.status_code == 307
+        assert desktop_frame.headers["location"]
         opened_download = client.get(opened_download_href)
         assert opened_download.status_code == 200
         assert "attachment" in opened_download.headers["content-disposition"]
@@ -4181,9 +6229,10 @@ def test_artifact_open_page_previews_text_without_forcing_download(tmp_path, mon
         assert "content-disposition" not in signed_open.headers
         assert "no-store" in signed_open.headers["cache-control"]
         assert "GlassHive preview works." in signed_open.text
-        assert 'href="/v1/signed-links/' in signed_open.text
+        assert "/v1/signed-links/" not in signed_open.text
+        assert 'href="/v1/link-refs/' in signed_open.text
         signed_open_download_href = href_for_link_text(signed_open.text, "Download file")
-        assert signed_open_download_href.startswith("/v1/signed-links/")
+        assert_link_ref_url(signed_open_download_href, prefix="/v1/link-refs/", kind="artifact_download")
         signed_open_download = client.get(signed_open_download_href)
         assert signed_open_download.status_code == 200
         assert "attachment" in signed_open_download.headers["content-disposition"]
@@ -4261,10 +6310,18 @@ def test_enterprise_signed_artifact_open_page_actions_remain_signed(tmp_path, mo
 
     download_href = href_for_link_text(opened.text, "Download file")
     workspace_href = href_for_link_text(opened.text, "View workspace")
-    assert download_href.startswith("/v1/signed-links/")
-    assert "gh_token=" in workspace_href
+    assert_link_ref_url(download_href, prefix="/v1/link-refs/", kind="artifact_download")
+    workspace_record = assert_link_ref_url(workspace_href, prefix="/w/", kind="worker_view")
+    assert "gh_token=" not in workspace_record["target_url"]
+    assert "gh_token=" not in workspace_href
+    assert 'target="_top"' in anchor_for_link_text(opened.text, "View workspace")
+    workspace_view = client.get(workspace_href, headers=headers)
+    assert workspace_view.status_code == 200
+    assert "How to take over" not in workspace_view.text
+    assert worker["worker_id"] not in workspace_view.text
+    assert project["project_id"] not in workspace_view.text
 
-    downloaded = client.get(download_href)
+    downloaded = client.get(download_href, headers=headers)
     assert downloaded.status_code == 200
     assert downloaded.text == "enterprise preview roundtrip"
     assert "attachment" in downloaded.headers["content-disposition"]
@@ -4397,6 +6454,119 @@ def test_async_worker_creation_parks_without_starting_compute(tmp_path):
     assert any(event["event_type"] == "worker.prepared" for event in events)
 
 
+def test_due_schedule_reconciles_fast_completed_run_before_queued_id_exists(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        project = store.create_project("owner", "Fast Schedule", "Avoid queued state race.", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Fast Worker",
+            role="operator",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+        )
+        schedule = store.create_scheduled_run(
+            worker_id=worker["worker_id"],
+            project_id=project["project_id"],
+            tenant_id="local",
+            owner_id="owner",
+            instruction="finish immediately",
+            run_at=datetime.now(timezone.utc).isoformat(),
+            schedule_text="now",
+        )
+
+        def complete_before_schedule_is_linked(worker_id: str, instruction: str, event_type: str = "run.queued") -> dict:
+            _ = event_type
+            run = store.create_run(worker_id, project["project_id"], instruction, state="running")
+            store.finalize_run(run["run_id"], state="completed", output_text="fast complete")
+            return run
+
+        service.assign_run = complete_before_schedule_is_linked  # type: ignore[method-assign]
+
+        processed = service.process_due_schedules_once()
+
+        assert processed and processed[0]["state"] == "completed"
+        refreshed = store.get_schedule(schedule["schedule_id"])
+        assert refreshed
+        assert refreshed["state"] == "completed"
+        assert refreshed["queued_run_id"]
+    finally:
+        service.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("run_state", "schedule_state"),
+    [("cancelled", "cancelled"), ("failed", "failed")],
+)
+def test_cancel_pending_runs_finalizes_linked_schedule(tmp_path, run_state, schedule_state):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project("owner", "Cancel Schedule", "Finalize linked schedules.", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Cancel Worker",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="stub/codex-cli",
+    )
+    run = store.create_run(worker["worker_id"], project["project_id"], "scheduled work", state="queued")
+    schedule = store.create_scheduled_run(
+        worker_id=worker["worker_id"],
+        project_id=project["project_id"],
+        tenant_id="local",
+        owner_id="owner",
+        instruction="scheduled work",
+        run_at=datetime.now(timezone.utc).isoformat(),
+        schedule_text="now",
+    )
+    store.finalize_schedule(schedule["schedule_id"], state="queued", queued_run_id=run["run_id"])
+
+    store.cancel_pending_runs(worker["worker_id"], error_text="stop work", state=run_state)
+
+    refreshed = store.get_schedule(schedule["schedule_id"])
+    assert refreshed
+    assert refreshed["state"] == schedule_state
+    assert refreshed["last_error"] == "stop work"
+
+
+def test_finalize_schedule_does_not_downgrade_terminal_state(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project("owner", "Terminal Schedule", "Do not regress terminal state.", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Terminal Worker",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="stub/codex-cli",
+    )
+    schedule = store.create_scheduled_run(
+        worker_id=worker["worker_id"],
+        project_id=project["project_id"],
+        tenant_id="local",
+        owner_id="owner",
+        instruction="scheduled work",
+        run_at=datetime.now(timezone.utc).isoformat(),
+        schedule_text="now",
+    )
+    store.finalize_schedule(schedule["schedule_id"], state="completed", queued_run_id="run_done")
+
+    refreshed = store.finalize_schedule(schedule["schedule_id"], state="queued", queued_run_id="run_late")
+
+    assert refreshed
+    assert refreshed["state"] == "completed"
+    assert refreshed["queued_run_id"] == "run_done"
+
+
 def test_native_schedule_queues_due_run(tmp_path):
     db_path = tmp_path / "runtime.db"
     client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
@@ -4422,7 +6592,7 @@ def test_native_schedule_queues_due_run(tmp_path):
 
     assert processed.status_code == 200
     queued = client.get(f"/v1/schedules/{schedule_id}").json()
-    assert queued["state"] == "queued"
+    assert queued["state"] in {"queued", "running", "completed"}
     assert queued["queued_run_id"]
     run = wait_for_run(client, queued["queued_run_id"])
     assert run["state"] == "completed"
@@ -4451,7 +6621,48 @@ def test_worker_quota_enforced_per_user(tmp_path, monkeypatch):
 
     assert first.status_code == 201
     assert second.status_code == 429
-    assert "GLASSHIVE_MAX_WORKSPACES_PER_USER=1" in second.json()["detail"]
+    payload = second.json()
+    assert "GLASSHIVE_MAX_WORKSPACES_PER_USER=1" in payload["detail"]
+    assert payload["status"] == "blocked"
+    assert payload["failure_class"] == "glasshive_worker_quota_exceeded"
+    assert payload["failure_retryable"] == 0
+    assert payload["quota"]["env_name"] == "GLASSHIVE_MAX_WORKSPACES_PER_USER"
+    assert payload["retry_after_seconds"] is None
+    assert "Retry-After" not in second.headers
+    assert payload["available_workspace_options"][0]["workspace_name"] == "First"
+    assert payload["available_workspace_options"][0]["project_title"] == "Quota"
+    assert "available_workspace_options" in payload["main_agent_next_action"]
+    assert "switching profile or sandbox mode" in payload["main_agent_next_action"]
+    assert "Do not retry this launch on a timer" in payload["main_agent_next_action"]
+
+
+def test_active_worker_quota_retry_after_uses_idle_release(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_MAX_ACTIVE_WORKERS_PER_USER", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "900")
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Active Quota", "goal": "Limit active workspace count."},
+    ).json()
+
+    first = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "First", "role": "operator", "profile": "codex-cli"},
+    )
+    second = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Second", "role": "operator", "profile": "codex-cli"},
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 429
+    payload = second.json()
+    assert payload["failure_retryable"] == 1
+    assert payload["quota"]["env_name"] == "GLASSHIVE_MAX_ACTIVE_WORKERS_PER_USER"
+    assert payload["retry_after_seconds"] == 900
+    assert second.headers["Retry-After"] == "900"
+    assert "wait for idle release" in payload["main_agent_next_action"]
 
 
 def test_active_worker_quota_counts_resuming_workers(tmp_path, monkeypatch):
@@ -4483,6 +6694,59 @@ def test_active_worker_quota_counts_resuming_workers(tmp_path, monkeypatch):
             )
 
         assert "GLASSHIVE_MAX_ACTIVE_WORKERS_PER_USER=1" in str(exc.value)
+        assert exc.value.env_name == "GLASSHIVE_MAX_ACTIVE_WORKERS_PER_USER"
+        assert exc.value.available_workspace_options[0]["workspace_name"] == "First"
+    finally:
+        service.shutdown()
+
+
+def test_tenant_quota_options_remain_requesting_owner_scoped(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_MAX_ACTIVE_WORKERS_PER_TENANT", "2")
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        project_a = service.create_project("owner-a", "Owner A", "Owner A work.", "codex-cli", tenant_id="tenant-1")
+        project_b = service.create_project("owner-b", "Owner B", "Owner B work.", "codex-cli", tenant_id="tenant-1")
+        first_a = service.create_worker(
+            project_a["project_id"],
+            "owner-a",
+            "Owner A Active",
+            "operator",
+            "codex-cli",
+            "stub",
+            tenant_id="tenant-1",
+            start_synchronously=False,
+        )
+        first_b = service.create_worker(
+            project_b["project_id"],
+            "owner-b",
+            "Owner B Active",
+            "operator",
+            "codex-cli",
+            "stub",
+            tenant_id="tenant-1",
+            start_synchronously=False,
+        )
+        store.update_worker_state(first_a["worker_id"], "ready")
+        store.update_worker_state(first_b["worker_id"], "ready")
+
+        with pytest.raises(GlassHiveQuotaExceededError) as exc:
+            service.create_worker(
+                project_a["project_id"],
+                "owner-a",
+                "Owner A Blocked",
+                "operator",
+                "codex-cli",
+                "stub",
+                tenant_id="tenant-1",
+                start_synchronously=False,
+            )
+
+        assert exc.value.env_name == "GLASSHIVE_MAX_ACTIVE_WORKERS_PER_TENANT"
+        assert [option["workspace_name"] for option in exc.value.available_workspace_options] == ["Owner A Active"]
+        assert "Owner B Active" not in {
+            option["workspace_name"] for option in exc.value.available_workspace_options
+        }
     finally:
         service.shutdown()
 

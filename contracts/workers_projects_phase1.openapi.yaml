@@ -278,6 +278,8 @@ components:
           type: string
         backend:
           type: string
+          description: Legacy compatibility field. Worker profile and execution_mode select the runtime.
+          deprecated: true
         state:
           type: string
         takeover_url:
@@ -351,9 +353,32 @@ components:
           type: string
         profile:
           type: string
+          description: Worker profile selector. Omit to use the project or deployment default.
+          enum: [codex-cli, claude-code, openclaw-general]
         backend:
           type: string
-      required: [owner_id, name, role, profile, backend]
+          description: Legacy compatibility field. Profile and execution_mode select the runtime.
+          default: openclaw
+        execution_mode:
+          type: string
+          description: Execution mode. Omit to use the deployment default.
+          enum: [docker, host]
+        alias:
+          type: string
+          nullable: true
+        workspace_root:
+          type: string
+          nullable: true
+        bootstrap_profile:
+          type: string
+          nullable: true
+        bootstrap_bundle:
+          type: object
+          nullable: true
+        start_synchronously:
+          type: boolean
+          default: true
+      required: [owner_id, name, role]
     AssignRunRequest:
       type: object
       properties:

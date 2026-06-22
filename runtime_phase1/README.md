@@ -39,6 +39,9 @@ Current behavior:
 - existing host-projection defaults remain backward-compatible
 - Glass Hive writes a non-secret bootstrap manifest inside the sandbox for inspection
 - bundle environment is available to sandboxed runs and interactive shells
+- broker/client config is additive over native worker capability: Codex/Claude host and workstation
+  launches must not drop browser, computer/desktop, shell, file, or MCP capabilities just because
+  GlassHive projected a broker MCP
 
 ## Run
 
@@ -59,6 +62,17 @@ Run MCP:
 cd <workspace-root>/viventium_v0_4/GlassHive/runtime_phase1
 uv run python -m workers_projects_runtime.mcp_server --transport streamable-http --port 8767
 ```
+
+## Link Lifetime Defaults
+
+- `GLASSHIVE_LINK_REF_TTL_SECONDS` default: `0`, so `/r/{ref}` and `/v1/link-refs/{ref}` short
+  links do not expire by default. Positive values expire short refs after that many seconds.
+- `GLASSHIVE_LINK_REF_STATE_PATH` default: `<state-root>/glasshive/link_refs.sqlite3`. When the
+  runtime emits `/r/{ref}` links that point at the separate GlassHive UI service, the runtime and UI
+  must use the same local link-ref state path on the same host or supported shared storage.
+- `GLASSHIVE_SIGNED_LINK_TTL_S` default: `900` seconds for raw signed-token compatibility URLs.
+- Enterprise short refs are authenticated owner-scoped routes. Opening a durable `/r/{ref}` mints a
+  fresh bounded worker-view session cookie; the durable ref itself is not an active compute lease.
 
 ## Test
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import zipfile
 from pathlib import Path
 from urllib.parse import quote
 
@@ -20,20 +21,87 @@ NON_DELIVERABLE_URL_PATH_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 NON_DELIVERABLE_FILE_NAMES = {
+    ".mcp.json",
+    "account web data",
+    "account web data-journal",
     "agents.md",
     "claude.md",
     "codex.md",
+    "chrome-default-cookies.sqlite",
+    "cookies",
+    "cookies-journal",
     "harness-prompt.md",
+    "local state",
+    "login data",
+    "login data-journal",
     "project-definition.md",
+    "web data",
+    "web data-journal",
     "work-log.md",
 }
 NON_DELIVERABLE_DIR_NAMES = {
+    ".codex",
     ".git",
+    ".glasshive",
     ".venv",
     "__pycache__",
+    "chrome-user-data",
+    "chromium-user-data",
+    "glasshive-run",
     "glasshive-host-tools",
     "node_modules",
 }
+NON_DELIVERABLE_PATH_PREFIXES = {
+    ("tmp",),
+    ("uploads",),
+}
+USER_DELIVERABLE_DIR_PRIORITY = {
+    "artifacts": 0,
+    "reports": 1,
+    "output": 2,
+}
+PROFESSIONAL_ARTIFACT_EXTENSIONS = {
+    ".doc",
+    ".docx",
+    ".odp",
+    ".ods",
+    ".odt",
+    ".pdf",
+    ".ppt",
+    ".pptx",
+    ".rtf",
+    ".xls",
+    ".xlsx",
+}
+
+OOXML_ARTIFACT_MARKERS = {
+    ".docx": "word/document.xml",
+    ".pptx": "ppt/presentation.xml",
+    ".xlsx": "xl/workbook.xml",
+}
+ODF_ARTIFACT_EXTENSIONS = {".odp", ".ods", ".odt"}
+OLE_ARTIFACT_EXTENSIONS = {".doc", ".ppt", ".xls"}
+OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def is_user_deliverable_relative_path(relative_path: Path | str) -> bool:
+    try:
+        rel = Path(str(relative_path))
+    except TypeError:
+        return False
+    if not rel.parts or rel.is_absolute():
+        return False
+    parts = [part for part in rel.parts if part]
+    if any(part in {".", ".."} for part in parts):
+        return False
+    lowered_parts = [part.lower() for part in parts]
+    if any(part in NON_DELIVERABLE_DIR_NAMES for part in lowered_parts):
+        return False
+    if any(tuple(lowered_parts[: len(prefix)]) == prefix for prefix in NON_DELIVERABLE_PATH_PREFIXES):
+        return False
+    if any(part.startswith(".") for part in lowered_parts):
+        return False
+    return rel.name.lower() not in NON_DELIVERABLE_FILE_NAMES
 
 
 def candidate_html_paths(worker: dict, max_entries: int = 20) -> list[Path]:
@@ -49,7 +117,7 @@ def candidate_html_paths(worker: dict, max_entries: int = 20) -> list[Path]:
             rel = path.relative_to(root)
         except ValueError:
             continue
-        if any(part in {".git", "node_modules", ".venv"} for part in rel.parts):
+        if not is_user_deliverable_relative_path(rel):
             continue
         candidates.append(path)
         if len(candidates) >= max_entries:
@@ -72,14 +140,56 @@ def candidate_artifact_paths(worker: dict, max_entries: int = 50) -> list[Path]:
             rel = path.relative_to(root)
         except ValueError:
             continue
-        if path.name.lower() in NON_DELIVERABLE_FILE_NAMES:
-            continue
-        if any(part.lower() in NON_DELIVERABLE_DIR_NAMES for part in rel.parts):
+        if not is_user_deliverable_relative_path(rel):
             continue
         candidates.append(path)
-        if len(candidates) >= max_entries:
-            break
-    return sorted(candidates, key=lambda item: item.stat().st_mtime, reverse=True)
+
+    def priority(path: Path) -> tuple[int, float, str]:
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            return (99, -path.stat().st_mtime, path.as_posix())
+        first_part = rel.parts[0].lower() if rel.parts else ""
+        directory_priority = USER_DELIVERABLE_DIR_PRIORITY.get(first_part)
+        if directory_priority is None:
+            directory_priority = 3 if len(rel.parts) == 1 else 4
+        return (directory_priority, -path.stat().st_mtime, rel.as_posix())
+
+    return sorted(candidates, key=priority)[:max_entries]
+
+
+def is_valid_professional_artifact(path: Path) -> bool:
+    suffix = path.suffix.lower()
+    if suffix not in PROFESSIONAL_ARTIFACT_EXTENSIONS:
+        return False
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False
+        with path.open("rb") as handle:
+            header = handle.read(16)
+    except OSError:
+        return False
+    if suffix == ".pdf":
+        return header.startswith(b"%PDF-")
+    if suffix == ".rtf":
+        return header.startswith(b"{\\rtf")
+    if suffix in OLE_ARTIFACT_EXTENSIONS:
+        return header.startswith(OLE_MAGIC)
+    if suffix in OOXML_ARTIFACT_MARKERS:
+        try:
+            with zipfile.ZipFile(path) as archive:
+                names = set(archive.namelist())
+        except (OSError, zipfile.BadZipFile):
+            return False
+        return "[Content_Types].xml" in names and OOXML_ARTIFACT_MARKERS[suffix] in names
+    if suffix in ODF_ARTIFACT_EXTENSIONS:
+        try:
+            with zipfile.ZipFile(path) as archive:
+                names = set(archive.namelist())
+        except (OSError, zipfile.BadZipFile):
+            return False
+        return "mimetype" in names and "content.xml" in names
+    return True
 
 
 def workspace_browser_url(path: Path, worker: dict) -> str | None:
@@ -135,6 +245,32 @@ def deliverable_payload(
     stderr_text: str = "",
 ) -> dict[str, object] | None:
     execution_mode = str(worker.get("execution_mode") or "docker")
+    artifact_candidates = candidate_artifact_paths(worker)
+    valid_artifact_candidates = [
+        path
+        for path in artifact_candidates
+        if path.suffix.lower() not in PROFESSIONAL_ARTIFACT_EXTENSIONS
+        or is_valid_professional_artifact(path)
+    ]
+    preferred_artifact = next(
+        (path for path in valid_artifact_candidates if path.suffix.lower() in PROFESSIONAL_ARTIFACT_EXTENSIONS),
+        None,
+    )
+    if preferred_artifact is not None:
+        raw_root = str(worker.get("workspace_dir") or "").strip()
+        try:
+            rel = preferred_artifact.relative_to(Path(raw_root))
+        except ValueError:
+            rel = Path(preferred_artifact.name)
+        return {
+            "kind": "file",
+            "state": "ready" if latest_run else "available",
+            "source": "workspace_file",
+            "label": preferred_artifact.name,
+            "preferred_surface": "download",
+            "workspace_path": rel.as_posix(),
+        }
+
     html_candidates = candidate_html_paths(worker)
     preferred_html = next((path for path in html_candidates if path.name.lower() == "index.html"), None)
     if preferred_html is None and html_candidates:
@@ -165,6 +301,22 @@ def deliverable_payload(
             payload["browser_url_available"] = False
         return payload
 
+    if valid_artifact_candidates:
+        artifact = valid_artifact_candidates[0]
+        raw_root = str(worker.get("workspace_dir") or "").strip()
+        try:
+            rel = artifact.relative_to(Path(raw_root))
+        except ValueError:
+            rel = Path(artifact.name)
+        return {
+            "kind": "file",
+            "state": "ready" if latest_run else "available",
+            "source": "workspace_file",
+            "label": artifact.name,
+            "preferred_surface": "download",
+            "workspace_path": rel.as_posix(),
+        }
+
     if local_url or external_url:
         if execution_mode == "host":
             return {
@@ -185,23 +337,6 @@ def deliverable_payload(
             "browser_url": browser_url,
             "preferred_surface": "desktop",
             "workspace_path": None,
-        }
-
-    artifact_candidates = candidate_artifact_paths(worker)
-    if artifact_candidates:
-        artifact = artifact_candidates[0]
-        raw_root = str(worker.get("workspace_dir") or "").strip()
-        try:
-            rel = artifact.relative_to(Path(raw_root))
-        except ValueError:
-            rel = Path(artifact.name)
-        return {
-            "kind": "file",
-            "state": "ready" if latest_run else "available",
-            "source": "workspace_file",
-            "label": artifact.name,
-            "preferred_surface": "download",
-            "workspace_path": rel.as_posix(),
         }
 
     return None

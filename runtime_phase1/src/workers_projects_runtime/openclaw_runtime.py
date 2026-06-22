@@ -83,12 +83,20 @@ class RuntimeDependencyMissingError(RuntimeErrorBase):
         runtime_name: str = "",
         profile: str = "",
         execution_mode: str = "",
+        required_version: str = "",
+        actual_version: str = "",
+        dependency_label: str = "",
+        recovery_hint: str = "",
     ) -> None:
         super().__init__(message)
         self.binary = binary
         self.runtime_name = runtime_name
         self.profile = profile
         self.execution_mode = execution_mode
+        self.required_version = required_version
+        self.actual_version = actual_version
+        self.dependency_label = dependency_label
+        self.recovery_hint = recovery_hint
 
 
 class WorkerPausedError(RuntimeErrorBase):

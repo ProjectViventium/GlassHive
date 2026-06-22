@@ -2,10 +2,127 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import time
 
-from workers_projects_runtime.docker_sandbox import DockerSandboxManager
+from workers_projects_runtime.docker_sandbox import DockerSandboxManager, SandboxInfo
+from workers_projects_runtime.bootstrap import GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS, GLASSHIVE_SAFETY_CHECKPOINT_RULE
+
+
+def test_seed_bootstrap_writes_default_worker_contract_without_bundle(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    home_dir = tmp_path / "home"
+    workspace_dir = tmp_path / "workspace"
+    home_dir.mkdir()
+    workspace_dir.mkdir()
+
+    manager._seed_bootstrap(home_dir, workspace_dir, "codex-cli", {"worker_id": "wrk_contract"})
+
+    agents_text = (workspace_dir / "AGENTS.md").read_text()
+    assert "GlassHive Worker Contract" in agents_text
+    assert GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS in agents_text
+    assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in agents_text
+    assert "Less is more" in agents_text
+    assert "Do not force a download" in agents_text
+    assert "@AGENTS.md" in (workspace_dir / "CLAUDE.md").read_text()
+
+
+def test_create_container_adds_host_gateway_alias_for_broker_reachability(tmp_path, monkeypatch):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    captured: list[list[str]] = []
+
+    def fake_docker(args: list[str], **kwargs):
+        captured.append(args)
+        return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="cid", stderr="")
+
+    manager._docker = fake_docker  # type: ignore[method-assign]
+    manager._create_container(
+        "wpr-test",
+        {
+            "workspace_dir": tmp_path / "workspace",
+            "home_dir": tmp_path / "home",
+        },
+    )
+
+    command = captured[-1]
+    assert "--add-host" in command
+    assert "host.docker.internal:host-gateway" in command
+    assert "--security-opt" in command
+    assert "seccomp=unconfined" in command
+    assert f"TMPDIR={manager.service_tmp_dir}" in command
+    assert f"TMPDIR={manager._browser_tmp_dir()}" not in command
+    assert f"XDG_CACHE_HOME={manager._browser_cache_dir()}" in command
+    assert f"XDG_CONFIG_HOME={manager._browser_config_dir()}" in command
+
+    monkeypatch.setenv("WPR_SANDBOX_ADD_HOST_GATEWAY", "0")
+    manager_without_alias = DockerSandboxManager(base_dir=str(tmp_path / "disabled"))
+    captured.clear()
+    manager_without_alias._docker = fake_docker  # type: ignore[method-assign]
+    manager_without_alias._create_container(
+        "wpr-test",
+        {
+            "workspace_dir": tmp_path / "workspace",
+            "home_dir": tmp_path / "home",
+        },
+    )
+
+    assert "--add-host" not in captured[-1]
+    assert "--security-opt" in captured[-1]
+    assert "seccomp=unconfined" in captured[-1]
+
+    monkeypatch.setenv("WPR_SANDBOX_ALLOW_CHROMIUM_USERNS", "0")
+    manager_without_chromium_userns = DockerSandboxManager(base_dir=str(tmp_path / "no-userns"))
+    captured.clear()
+    manager_without_chromium_userns._docker = fake_docker  # type: ignore[method-assign]
+    manager_without_chromium_userns._create_container(
+        "wpr-test",
+        {
+            "workspace_dir": tmp_path / "workspace",
+            "home_dir": tmp_path / "home",
+        },
+    )
+
+    assert "--security-opt" not in captured[-1]
+    assert "seccomp=unconfined" not in captured[-1]
+
+
+def test_describe_self_heals_novnc_when_service_port_resets(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[tuple[str, object]] = []
+
+    sandbox = SandboxInfo(
+        container_name="wpr-wrk-test",
+        container_id="cid",
+        state="running",
+        workspace_dir=str(tmp_path / "workspace"),
+        home_dir=str(tmp_path / "home"),
+        pid=1234,
+        image="img",
+        novnc_port=57900,
+        selenium_port=57901,
+        openclaw_port=57902,
+    )
+    manager.inspect = lambda worker_id: sandbox  # type: ignore[method-assign]
+
+    readiness = iter([False, True])
+    manager._novnc_http_ready = lambda port: next(readiness)  # type: ignore[method-assign]
+
+    def fake_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
+        calls.append(("exec", command))
+        return subprocess.CompletedProcess(["docker"], returncode=0, stdout="", stderr="")
+
+    manager._docker_exec = fake_exec  # type: ignore[method-assign]
+
+    details = manager.describe("wrk_test")
+
+    assert details["view_available"] is True
+    assert details["view_url"] == "http://127.0.0.1:57900/?autoconnect=1&resize=scale&reconnect=1&show_dot=1"
+    assert details["view_health"] == {"healthy": True, "repaired": True, "reason": "ok"}
+    assert calls
+    repair_script = str(calls[0][1])
+    assert "TMPDIR=/tmp" in repair_script
+    assert manager._browser_tmp_dir() not in repair_script
 
 
 def test_inspect_reports_paused_when_docker_state_is_paused(tmp_path):
@@ -40,6 +157,126 @@ def test_inspect_reports_paused_when_docker_state_is_paused(tmp_path):
     assert sandbox.pid is None
     assert sandbox.novnc_port == 58100
     assert sandbox.selenium_port == 58101
+
+
+def test_fast_sandbox_does_not_treat_projected_paths_as_container_evidence(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+
+    def missing_docker(args: list[str], *, check: bool = True, capture_output: bool = False, **kwargs):
+        return subprocess.CompletedProcess(["docker", *args], returncode=1, stdout="", stderr="No such container")
+
+    manager._docker = missing_docker  # type: ignore[method-assign]
+
+    worker = {
+        "worker_id": "wrk_projected",
+        "state": "ready",
+        "state_dir": str(tmp_path / "state"),
+        "workspace_dir": str(tmp_path / "workspace"),
+    }
+
+    assert manager.fast_sandbox_from_worker(worker) is None
+
+
+def test_ensure_ready_creates_container_when_only_projected_paths_exist(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    created: list[str] = []
+
+    def fake_inspect(worker_id: str):
+        if created:
+            return SandboxInfo(
+                container_name="wpr-wrk-projected",
+                container_id="container123",
+                state="running",
+                workspace_dir=str(tmp_path / "docker_sandboxes" / "workers" / worker_id / "state" / "workspace"),
+                home_dir=str(tmp_path / "docker_sandboxes" / "workers" / worker_id / "state" / "home"),
+                pid=4242,
+                image=manager.image,
+            )
+        return None
+
+    manager._require_docker = lambda: None  # type: ignore[method-assign]
+    manager._ensure_image = lambda: None  # type: ignore[method-assign]
+    manager.inspect = fake_inspect  # type: ignore[method-assign]
+    manager._create_container = lambda container_name, paths: created.append(container_name)  # type: ignore[method-assign]
+    manager._ensure_container_writable_paths = lambda container_name, paths: None  # type: ignore[method-assign]
+    manager._harden_secret_runtime_files = lambda container_name: None  # type: ignore[method-assign]
+    manager._set_plain_background = lambda container_name: None  # type: ignore[method-assign]
+    manager._prime_idle_desktop = lambda container_name: None  # type: ignore[method-assign]
+
+    worker = {
+        "worker_id": "wrk_projected",
+        "state": "ready",
+        "state_dir": str(tmp_path / "state"),
+        "workspace_dir": str(tmp_path / "workspace"),
+    }
+
+    sandbox = manager.ensure_ready(worker, runtime_name="codex-cli")
+
+    assert created == ["wpr-wrk-projected"]
+    assert sandbox.container_id == "container123"
+
+
+def test_ensure_ready_recreates_ready_container_missing_chromium_userns(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[str] = []
+    removed = False
+    created = False
+
+    def fake_inspect(worker_id: str):
+        if created:
+            return SandboxInfo(
+                container_name="wpr-wrk-test",
+                container_id="container-new",
+                state="running",
+                workspace_dir=str(tmp_path / "workspace"),
+                home_dir=str(tmp_path / "home"),
+                pid=4242,
+                image=manager.image,
+                security_options=("seccomp=unconfined",),
+            )
+        if removed:
+            return None
+        return SandboxInfo(
+            container_name="wpr-wrk-test",
+            container_id="container-old",
+            state="running",
+            workspace_dir=str(tmp_path / "workspace"),
+            home_dir=str(tmp_path / "home"),
+            pid=4242,
+            image=manager.image,
+            security_options=(),
+        )
+
+    def fake_docker(args: list[str], **kwargs):
+        nonlocal removed
+        if args[:2] == ["rm", "-f"]:
+            calls.append("rm")
+            removed = True
+            return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected docker call: {args}")
+
+    def fake_create_container(container_name, paths):
+        nonlocal created
+        calls.append(f"create:{container_name}")
+        created = True
+
+    manager._require_docker = lambda: calls.append("require")  # type: ignore[method-assign]
+    manager._ensure_host_dirs = lambda paths: calls.append("host_dirs")  # type: ignore[method-assign]
+    manager._seed_bootstrap = lambda *args, **kwargs: calls.append("seed")  # type: ignore[method-assign]
+    manager.inspect = fake_inspect  # type: ignore[method-assign]
+    manager._docker = fake_docker  # type: ignore[method-assign]
+    manager._ensure_image = lambda: calls.append("image")  # type: ignore[method-assign]
+    manager._create_container = fake_create_container  # type: ignore[method-assign]
+    manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("writable")  # type: ignore[method-assign]
+    manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
+    manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
+    manager._prime_idle_desktop = lambda container_name: calls.append("prime")  # type: ignore[method-assign]
+
+    sandbox = manager.ensure_ready({"worker_id": "wrk_test", "state": "ready", "container_id": "container-old"}, "codex-cli")
+
+    assert sandbox.container_id == "container-new"
+    assert sandbox.security_options == ("seccomp=unconfined",)
+    assert calls == ["require", "host_dirs", "seed", "rm", "image", "create:wpr-wrk-test", "writable", "harden", "background", "prime"]
 
 
 def test_inspect_uses_short_cache_and_stale_fallback(tmp_path):
@@ -251,10 +488,12 @@ def test_seed_bootstrap_writes_project_scope_files(tmp_path, monkeypatch):
                 "system_instructions": "Use operator checkpoints before risky actions.",
                 "claude_project_mcp": {
                     "glass-hive": {
+                        "type": "http",
                         "transport": "http",
                         "url": "http://127.0.0.1:8767/mcp",
                     }
                 },
+                "codex_config_append": "[mcp_servers.glass-hive]\nurl = \"http://127.0.0.1:8767/mcp\"",
                 "claude_settings_local": {
                     "permissions": {
                         "allow": ["Bash(ls *)"],
@@ -278,10 +517,18 @@ def test_seed_bootstrap_writes_project_scope_files(tmp_path, monkeypatch):
 
     manager._seed_bootstrap(home_dir, workspace_dir, "claude-code", worker)
 
-    assert (workspace_dir / "CLAUDE.md").read_text().strip() == "Use operator checkpoints before risky actions."
-    assert (workspace_dir / "AGENTS.md").read_text().strip() == "Use operator checkpoints before risky actions."
-    assert json.loads((workspace_dir / ".mcp.json").read_text())["glass-hive"]["url"] == "http://127.0.0.1:8767/mcp"
+    agents_text = (workspace_dir / "AGENTS.md").read_text()
+    claude_text = (workspace_dir / "CLAUDE.md").read_text()
+    assert "GlassHive Worker Contract" in agents_text
+    assert "Use operator checkpoints before risky actions." in agents_text
+    assert "@AGENTS.md" in claude_text
+    assert "Use operator checkpoints before risky actions." in agents_text
+    assert json.loads((workspace_dir / ".mcp.json").read_text())["mcpServers"]["glass-hive"]["url"] == "http://127.0.0.1:8767/mcp"
     assert json.loads((workspace_dir / ".claude" / "settings.local.json").read_text())["permissions"]["allow"] == ["Bash(ls *)"]
+    assert "glass-hive" in (home_dir / ".codex" / "config.toml").read_text()
+    assert stat.S_IMODE((workspace_dir / ".mcp.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((workspace_dir / ".claude" / "settings.local.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((home_dir / ".codex" / "config.toml").stat().st_mode) == 0o600
     assert (workspace_dir / "notes" / "bootstrap.txt").read_text() == "Bootstrapped"
     assert (workspace_dir / "uploads" / "uploaded.txt").read_text() == "Uploaded content"
     assert "TEST_FLAG" in (home_dir / ".glasshive" / "runtime.env").read_text()
@@ -300,9 +547,56 @@ def test_terminal_desktop_action_waits_for_live_session(tmp_path):
     assert "job-run_123456" in command[-1]
 
 
+def test_browser_desktop_action_uses_clean_chromium_profile_and_no_no_sandbox(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    command = manager._desktop_action_command("browser", url="https://example.test/report")
+    assert command is not None
+    assert command[:2] == ["bash", "-lc"]
+    launch_script = command[-1]
+    syntax = subprocess.run(["bash", "-n"], input=launch_script, text=True, capture_output=True)
+    assert syntax.returncode == 0, syntax.stderr
+    assert "--no-sandbox" not in launch_script
+    assert "--disable-dev-shm-usage" in launch_script
+    assert "--no-first-run" in launch_script
+    assert "--no-default-browser-check" in launch_script
+    assert "/usr/bin/chromium-base" in launch_script
+    assert "--start-maximized" in launch_script
+    assert "--new-tab" in launch_script
+    assert "bookmark_bar" in launch_script
+    assert "show_on_all_tabs" in launch_script
+    assert "https://example.test/report" in launch_script
+
+
+def test_prime_idle_desktop_uses_clean_chromium_profile_and_no_no_sandbox(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[tuple[str, list[str]]] = []
+
+    def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
+        calls.append((container_name, command))
+        return subprocess.CompletedProcess(["docker"], returncode=0, stdout="", stderr="")
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+
+    manager._prime_idle_desktop("wpr-test")
+
+    assert calls
+    script = calls[-1][1][-1]
+    assert calls[-1][1][:2] == ["bash", "-lc"]
+    syntax = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
+    assert syntax.returncode == 0, syntax.stderr
+    assert "--no-sandbox" not in script
+    assert "--disable-dev-shm-usage" in script
+    assert "--new-window" in script
+    assert "nohup /usr/bin/chromium-base" in script
+    assert "bookmark_bar" in script
+    assert "show_on_all_tabs" in script
+    assert "wmctrl -xa chromium.Chromium" in script
+
+
 def test_desktop_action_skips_heavy_path_repair_for_running_container(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     calls: list[str] = []
+    envs: list[dict] = []
 
     class FakeSandbox:
         container_name = "wpr-test"
@@ -325,6 +619,7 @@ def test_desktop_action_skips_heavy_path_repair_for_running_container(tmp_path):
 
     def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
         calls.append(f"exec:{detach}:{fire_and_forget}:{command[0]}")
+        envs.append(dict(env or {}))
         return subprocess.CompletedProcess(["docker"], returncode=0, stdout="", stderr="")
 
     manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
@@ -334,15 +629,26 @@ def test_desktop_action_skips_heavy_path_repair_for_running_container(tmp_path):
     assert launched["status"] == "launched"
     assert "writable" not in calls
     assert calls == ["harden", "exec:True:True:bash"]
+    assert envs[-1]["TMPDIR"] == manager._browser_tmp_dir()
+    assert envs[-1]["XDG_CACHE_HOME"] == manager._browser_cache_dir()
+    assert envs[-1]["XDG_CONFIG_HOME"] == manager._browser_config_dir()
 
 
-def test_desktop_action_uses_ready_worker_fast_path_without_inspect(tmp_path):
+def test_desktop_action_revalidates_projected_worker_without_container_evidence(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     calls: list[str] = []
 
-    manager._require_docker = lambda: calls.append("require")  # type: ignore[method-assign]
-    manager._ensure_image = lambda: calls.append("image")  # type: ignore[method-assign]
-    manager.inspect = lambda worker_id: (_ for _ in ()).throw(AssertionError("hot desktop action must not inspect"))  # type: ignore[method-assign]
+    sandbox = SandboxInfo(
+        container_name="wpr-wrk-test",
+        container_id="container123",
+        state="running",
+        workspace_dir=str(tmp_path / "workspace"),
+        home_dir=str(tmp_path / "home"),
+        pid=1234,
+        image="img",
+        novnc_port=None,
+    )
+    manager.ensure_ready = lambda *args, **kwargs: calls.append("ensure") or sandbox  # type: ignore[method-assign]
 
     def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
         calls.append(f"{container_name}:{detach}:{fire_and_forget}:{command[0]}")
@@ -359,7 +665,7 @@ def test_desktop_action_uses_ready_worker_fast_path_without_inspect(tmp_path):
 
     assert launched["status"] == "launched"
     assert launched["view_url"] is None
-    assert calls == ["wpr-wrk-test:True:True:bash"]
+    assert calls == ["ensure", "wpr-wrk-test:True:True:bash"]
 
 
 def test_ensure_ready_skips_image_probe_for_existing_container(tmp_path):
@@ -390,21 +696,43 @@ def test_ensure_ready_skips_image_probe_for_existing_container(tmp_path):
     assert calls == ["require", "host_dirs", "seed"]
 
 
-def test_ensure_ready_uses_known_worker_fast_path_when_inspect_misses(tmp_path):
+def test_ensure_ready_builds_container_when_projected_worker_inspect_misses(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     calls: list[str] = []
+
+    inspect_calls = 0
+
+    def fake_inspect(worker_id: str):
+        nonlocal inspect_calls
+        inspect_calls += 1
+        if inspect_calls == 1:
+            return None
+        return SandboxInfo(
+            container_name="wpr-wrk-test",
+            container_id="container123",
+            state="running",
+            workspace_dir=str(tmp_path / "workspace"),
+            home_dir=str(tmp_path / "home"),
+            pid=1234,
+            image="img",
+        )
 
     manager._require_docker = lambda: calls.append("require")  # type: ignore[method-assign]
     manager._ensure_host_dirs = lambda paths: calls.append("host_dirs")  # type: ignore[method-assign]
     manager._seed_bootstrap = lambda *args, **kwargs: calls.append("seed")  # type: ignore[method-assign]
-    manager.inspect = lambda worker_id: None  # type: ignore[method-assign]
-    manager._ensure_image = lambda: (_ for _ in ()).throw(AssertionError("known active worker must not rebuild image"))  # type: ignore[method-assign]
+    manager.inspect = fake_inspect  # type: ignore[method-assign]
+    manager._ensure_image = lambda: calls.append("image")  # type: ignore[method-assign]
+    manager._create_container = lambda container_name, paths: calls.append(f"create:{container_name}")  # type: ignore[method-assign]
+    manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("writable")  # type: ignore[method-assign]
+    manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
+    manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
+    manager._prime_idle_desktop = lambda container_name: calls.append("prime")  # type: ignore[method-assign]
 
     sandbox = manager.ensure_ready({"worker_id": "wrk_test", "state": "running", "state_dir": str(tmp_path / "state")}, "openclaw")
 
     assert sandbox.container_name == "wpr-wrk-test"
     assert sandbox.state == "running"
-    assert calls == ["require", "host_dirs", "seed"]
+    assert calls == ["require", "host_dirs", "seed", "image", "create:wpr-wrk-test", "writable", "harden", "background", "prime"]
 
 
 def test_ensure_image_uses_short_probe_and_caches_success(tmp_path):
@@ -442,6 +770,56 @@ def test_ensure_image_uses_dedicated_long_build_timeout(tmp_path, monkeypatch):
     assert calls[-1][1] == 777
 
 
+def test_ensure_image_includes_document_delivery_toolchain(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+
+    def fake_docker(args: list[str], *, check: bool = True, capture_output: bool = False, timeout_sec=None):
+        if args[:2] == ["image", "inspect"]:
+            return subprocess.CompletedProcess(["docker", *args], returncode=1, stdout="", stderr="")
+        return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="", stderr="")
+
+    manager._docker = fake_docker  # type: ignore[method-assign]
+
+    manager._ensure_image()
+
+    dockerfile = (manager.build_root / "Dockerfile").read_text()
+    assert "libreoffice-writer" in dockerfile
+    assert "libreoffice-impress" in dockerfile
+    assert "pandoc" in dockerfile
+    assert "poppler-utils" in dockerfile
+    assert "python-docx" in dockerfile
+    assert "python-pptx" in dockerfile
+    assert "reportlab" in dockerfile
+    assert "PyMuPDF" in dockerfile
+    assert "/usr/bin/locale-check" in dockerfile
+
+
+def test_ensure_image_installs_ai_worker_browser_extension_policy(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+
+    def fake_docker(args: list[str], *, check: bool = True, capture_output: bool = False, timeout_sec=None):
+        if args[:2] == ["image", "inspect"]:
+            return subprocess.CompletedProcess(["docker", *args], returncode=1, stdout="", stderr="")
+        return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="", stderr="")
+
+    manager._docker = fake_docker  # type: ignore[method-assign]
+
+    manager._ensure_image()
+
+    dockerfile = (manager.build_root / "Dockerfile").read_text()
+    assert manager.image.endswith(":phase1-node22-docs4")
+    assert "@openai/codex@0.140.0" in dockerfile
+    assert "@anthropic-ai/claude-code@2.1.178" in dockerfile
+    assert "--cache /tmp/glasshive-npm-cache" in dockerfile
+    assert "rm -rf /tmp/glasshive-npm-cache /root/.npm /home/seluser/.npm" in dockerfile
+    assert "/etc/chromium/policies/managed/glasshive-ai-worker-extensions.json" in dockerfile
+    assert "/etc/opt/chrome/policies/managed/glasshive-ai-worker-extensions.json" in dockerfile
+    assert "ExtensionInstallForcelist" in dockerfile
+    assert "fcoeoabgfenejglbffodgkkbkcdhcgfn;https://clients2.google.com/service/update2/crx" in dockerfile
+    assert "hehggadaopoacecdllhhajmbjkdcmajg;https://clients2.google.com/service/update2/crx" in dockerfile
+    assert "glasshive-browser-extension-check" in dockerfile
+
+
 def test_start_screen_session_prepares_runtime_dir_and_detaches(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     calls: list[tuple[str | None, list[str], bool, dict | None]] = []
@@ -474,11 +852,20 @@ def test_start_screen_session_prepares_runtime_dir_and_detaches(tmp_path):
     assert calls[1][3]["OPENAI_API_KEY"] == "secret"
 
 
-def test_start_screen_session_uses_known_worker_fast_path(tmp_path):
+def test_start_screen_session_revalidates_projected_worker_without_container_evidence(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     calls: list[tuple[str, list[str], bool, bool]] = []
 
-    manager.ensure_ready = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("known active worker must not inspect/build"))  # type: ignore[method-assign]
+    sandbox = SandboxInfo(
+        container_name="wpr-wrk-test",
+        container_id="container123",
+        state="running",
+        workspace_dir=str(tmp_path / "workspace"),
+        home_dir=str(tmp_path / "home"),
+        pid=1234,
+        image="img",
+    )
+    manager.ensure_ready = lambda *args, **kwargs: calls.append(("ensure", [], False, False)) or sandbox  # type: ignore[method-assign]
     manager.stop_screen_session = lambda *args, **kwargs: None  # type: ignore[method-assign]
 
     def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
@@ -495,9 +882,10 @@ def test_start_screen_session_uses_known_worker_fast_path(tmp_path):
         worker={"worker_id": "wrk_test", "state": "running", "state_dir": str(tmp_path / "state")},
     )
 
-    assert calls[0][0] == "wpr-wrk-test"
-    assert "mkdir -p /run/screen" in calls[0][1][-1]
-    assert calls[1] == ("wpr-wrk-test", ["screen", "-DmS", "job-run_fast", "echo", "ok"], True, False)
+    assert calls[0] == ("ensure", [], False, False)
+    assert calls[1][0] == "wpr-wrk-test"
+    assert "mkdir -p /run/screen" in calls[1][1][-1]
+    assert calls[2] == ("wpr-wrk-test", ["screen", "-DmS", "job-run_fast", "echo", "ok"], True, False)
 
 
 def test_stop_screen_session_targets_all_exact_duplicate_sockets(tmp_path):
@@ -596,7 +984,10 @@ def test_ensure_ready_repairs_bind_mount_ownership_before_prime(tmp_path):
     assert calls[0] == "create"
     assert calls[1].startswith("root:")
     assert "setfacl -R -m u:seluser:rwX" in calls[1]
-    assert "find /workspace/project /workspace/.wpr-home -type d -exec setfacl" in calls[1]
+    assert (
+        "find /workspace/project /workspace/.wpr-home /workspace/.wpr-home/tmp "
+        "/workspace/.wpr-home/.cache /workspace/.wpr-home/.config -type d -exec setfacl"
+    ) in calls[1]
     assert calls[2].startswith("root:set -e; for file in /workspace/.wpr-home/.glasshive/secret-runtime.env")
     assert calls[3:] == ["background", "prime"]
 

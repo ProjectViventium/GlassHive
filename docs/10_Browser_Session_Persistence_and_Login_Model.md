@@ -42,6 +42,22 @@ Evidence:
 
 That means browser profile data written under the worker home persists for that worker.
 
+The worker browser should also look like a normal usable browser when the user opens the desktop:
+
+1. the default bookmark bar is hidden unless the user turns it on
+2. Chromium is not launched with `--no-sandbox` in the normal sandboxed workstation path
+3. the user-visible browser launcher bypasses Selenium's `/usr/bin/chromium` wrapper because that
+   wrapper force-adds `--no-sandbox`
+4. the worker container allows Chromium's user-namespace sandbox to initialize; the current Docker
+   Desktop implementation uses `seccomp=unconfined` and must prove `unshare -U` succeeds in QA
+5. first-run, default-browser, and crash-restore prompts are suppressed
+6. the profile/cache/temp roots remain worker-home scoped so the same workspace preserves browser
+   identity without leaking host browser state
+
+If Chromium cannot start without `--no-sandbox`, that is a workstation substrate/preflight issue to
+fix or explicitly fallback from. It should not be the silent default because it creates the warning
+banner the user sees before any worker intelligence can shine.
+
 ## What This Means In Practice
 
 If you log into LinkedIn, Gmail, or another site inside a given worker sandbox, that browser session should remain available when that same worker is paused and resumed later.

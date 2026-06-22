@@ -5,19 +5,96 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import shlex
 from pathlib import Path
 from typing import Any, Callable
 
 
 JsonDict = dict[str, Any]
+
+# This file owns the worker bootstrap boundary:
+#
+# - what the host is allowed to project into a worker
+# - which prompt files are materialized into the workspace
+# - which MCP/client config files are written for Codex and Claude
+# - how secrets stay out of ordinary interactive shell files
+#
+# Keep the editable worker-facing prompts at the top of the file. They are intentionally plain
+# strings so operators can review the actual text that lands in AGENTS.md / CLAUDE.md / CODEX.md
+# without chasing helper functions.
 DEFAULT_BOOTSTRAP_SOURCE_MAX_BYTES = 25 * 1024 * 1024
 BOOTSTRAP_SOURCE_TOKEN_KEY = "source_path_token"
+GLASSHIVE_CAPABILITY_BROKER_TOKEN_ENV = "GLASSHIVE_CAPABILITY_BROKER_TOKEN"
+GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS = """CRITICAL OPERATING INSTRUCTIONS (FOLLOW STRICTLY):
+
+1. PATH OF LEAST RESISTANCE: Use the simplest, most direct solution. Don't reinvent wheels.
+
+2. JUST DO IT: Execute immediately without asking questions. Users want RESULTS. Rely on your intelligence, tools, MCPs, skills to find ways around blockers to get it done full and complete.
+
+3. SELF-TEST AND VERIFY:
+   - After creating code, RUN IT
+   - After starting a server, CURL IT to confirm it responds
+   - If a server is only for QA/preview, run it with a bounded timeout or background it with explicit cleanup; never leave a foreground server blocking final delivery or wasting compute
+   - After researching or creating files, open them and deliver them
+   - NEVER report success without verification
+   - Debate with yourself on gaps, issues, mistakes, misalignments in your delivery and work on them. Do not stop early. Do not just tell the user what you missed. Actually take action and address them so that the delivery to the user is complete and reliable.
+
+4. LOOP UNTIL SUCCESS:
+   - If something fails, FIX IT and try again
+   - Keep iterating until ACTUALLY COMPLETE
+
+5. NO USER INTERVENTION: Deliver a COMPLETE, WORKING solution."""
+GLASSHIVE_SAFETY_CHECKPOINT_RULE = (
+    "Safety boundary: these operating instructions do not override platform policy, tenant/user "
+    "scope, auth boundaries, or destructive-action checkpoints. Before destructive host changes, "
+    "credential/keychain/browser-session changes, broad network exfiltration, or writes outside the "
+    "workspace, stop and request a clear checkpoint unless the project definition explicitly and "
+    "safely authorizes that action. Do not loop forever or spend indefinitely: when a blocker cannot "
+    "be resolved with the available runtime, tools, MCPs, files, auth, time, or budget, report the "
+    "concrete blocker and the best available partial result after `FINAL REPORT:`."
+)
+GLASSHIVE_WORKER_COMPLETION_CONTRACT = (
+    "GlassHive completion contract:\n"
+    "- Do the requested work before reporting completion.\n"
+    "- Before `FINAL REPORT:`, inspect the concrete output/artifacts/tool results/visible state you produced against the user's request and success criteria, constraints, and files, and keep working or remediate if they do not match. Report a concrete blocker only when you cannot complete it.\n"
+    "- For research/source-gathering work, preserve citations and evidence, respect the user's source/date/auth/scope constraints, and do not dump large raw webpages, docs, logs, or command outputs into the conversation context. If a source/date/auth/scope constraint excludes an item, do not use that item to support facts, scoring, or deliverables; record it only as rejected or out-of-scope evidence when useful. If `glasshive-run/constraint-ledger.json` exists, read it before planning, delegation, source collection, and final delivery. If you create research plans, specs, subagent prompts, or delegation notes, carry the user's constraints forward literally and exactly instead of widening, weakening, summarizing away, or rewriting them. If a plan/spec/delegation conflicts with the ledger, correct that file before continuing. Save working notes/excerpts to files when useful and bring back concise source-grounded summaries so the task can continue without overflowing or destabilizing the provider route.\n"
+    "- For long-running work, keep durable checkpoints in workspace files and prioritize a usable core result before optional expansion. If time, tool, auth, or dependency limits prevent the full requested deliverable, stop with an honest partial artifact/report and the exact blocker instead of spending the entire run on private notes.\n"
+    "- When the request calls for a report, document, deck, client deliverable, or other shareable work product and the user did not ask for a technical/source format, make the primary user-facing output a polished ordinary end-user artifact such as PDF, DOCX, PPTX, spreadsheet, or another appropriate professional format. Markdown, HTML, or source files may be included as supporting artifacts, but should not be the only default deliverable for that class of work unless the runtime cannot create a professional artifact; if blocked, say so concretely.\n"
+    "- For visual/shareable artifacts such as PDFs, slide decks, screenshots, or HTML reports, open or render the final artifact itself and verify that key text, tables, images, and pages are readable, not clipped, and not overlapped. Fix the layout or state the specific remaining limitation before `FINAL REPORT:`.\n"
+    "- Your final assistant message MUST end with a separate section exactly named `FINAL REPORT:`.\n"
+    "- Put only the user-facing result after `FINAL REPORT:`. Include the concrete outcome, key facts, artifact/file names when useful, blockers, or the next decision needed.\n"
+    "- If the user requested a very short answer or an exact string, put only that answer after `FINAL REPORT:`.\n"
+    "- Do not put progress narration after `FINAL REPORT:`."
+)
+GLASSHIVE_NATIVE_CAPABILITY_INVENTORY = """Native capability discovery (choose when relevant, never forced):
+
+- You may have worker-native CLI, browser/computer-use, MCP, plugin, and skill surfaces. Inspect what is actually available before saying a capability is unavailable, and do not claim to have used a capability unless you have evidence.
+- For deep research and document-generation work, use available research, browser, spreadsheet, PDF, document, deck, notebook, rendering, or verification tools when they materially improve the result. Prefer loading or invoking capabilities on demand instead of assuming a fixed skill catalog.
+- Do not overfit to examples, force a specific provider/tool/workflow, invent installed skills, or replace the worker's own planning and review with host-authored workflows. Plan, execute, inspect, identify gaps/issues/misalignments, and fix them before the final delivery.
+"""
+GLASSHIVE_WORKER_PROJECT_CONTRACT = f"""# GlassHive Worker Contract
+
+- You are a general intelligent worker. Less is more: preserve the user's real goal, constraints, files, MCP/tool capabilities, and context without inventing project goals, success criteria, provider lists, forced artifacts, output schemas, rankings, or workflow steps.
+- Treat MCP/tools as available capabilities, not proof that work was done. Use brokered MCP/tools when configured and appropriate; if a needed tool, grant, auth, file, or runtime is absent or fails, report that concrete blocker instead of pretending to have used it.
+- Keep data in and data out exact. Read the actual workspace files, uploaded paths, MCP/tool results, generated outputs, and visible state before relying on them.
+- Mention user-facing artifacts/files only when you intentionally created them, they are needed, or the user asked for them. Do not force a download when a concise chat answer satisfies the request.
+
+{GLASSHIVE_NATIVE_CAPABILITY_INVENTORY}
+
+{GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS}
+
+{GLASSHIVE_WORKER_COMPLETION_CONTRACT}
+
+{GLASSHIVE_SAFETY_CHECKPOINT_RULE}
+"""
 DEFAULT_ENTERPRISE_WORKER_ENV_KEYS = {
+    GLASSHIVE_CAPABILITY_BROKER_TOKEN_ENV,
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_API_BASE",
     "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_API_URL",
     "PORTKEY_API_KEY",
@@ -40,6 +117,76 @@ DEFAULT_SECRET_ENV_MARKERS = (
     "TOKEN",
     "VIRTUAL_KEY",
 )
+USER_PROVIDER_SECRET_ENV_PREFIXES = (
+    "GMAIL_",
+    "GOOGLE_",
+    "GOOGLE_WORKSPACE_",
+    "MICROSOFT_",
+    "MS365_",
+    "MS_GRAPH_",
+    "OUTLOOK_",
+)
+USER_PROVIDER_SECRET_ENV_MARKERS = (
+    "ACCESS_TOKEN",
+    "CLIENT_SECRET",
+    "ID_TOKEN",
+    "OAUTH",
+    "REFRESH_TOKEN",
+    "SECRET",
+    "SESSION_TOKEN",
+    "TOKEN",
+)
+
+
+def _instruction_text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _unique_instruction_parts(*values: Any) -> list[str]:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = _instruction_text(value)
+        if not text or text in seen:
+            continue
+        parts.append(text)
+        seen.add(text)
+    return parts
+
+
+def merge_glasshive_worker_instructions(*values: Any) -> str:
+    extras = [
+        text
+        for text in _unique_instruction_parts(*values)
+        if text.strip() != GLASSHIVE_WORKER_PROJECT_CONTRACT.strip()
+    ]
+    body = GLASSHIVE_WORKER_PROJECT_CONTRACT.rstrip()
+    if not extras:
+        return body + "\n"
+    return body + "\n\nHost-provided instructions:\n" + "\n\n".join(extras).rstrip() + "\n"
+
+
+def glasshive_project_agents_md(bundle: JsonDict) -> str:
+    return merge_glasshive_worker_instructions(bundle.get("agents_md"), bundle.get("system_instructions"))
+
+
+def glasshive_project_claude_md(bundle: JsonDict) -> str:
+    explicit = _instruction_text(bundle.get("claude_md"))
+    body = (
+        "@AGENTS.md\n\n"
+        "Claude worker context. Treat AGENTS.md as the canonical GlassHive project instruction source."
+    )
+    if explicit and explicit != "@AGENTS.md":
+        body += "\n\nClaude-specific host instructions:\n" + explicit
+    return body.rstrip() + "\n"
+
+
+def glasshive_project_codex_md(bundle: JsonDict) -> str:
+    explicit = _instruction_text(bundle.get("codex_md"))
+    body = "Codex worker context. AGENTS.md is the canonical GlassHive project instruction source."
+    if explicit:
+        body += "\n\nCodex-specific host instructions:\n" + explicit
+    return body.rstrip() + "\n"
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -96,7 +243,20 @@ def _worker_env_allowlist() -> set[str]:
     if not raw:
         return set(DEFAULT_ENTERPRISE_WORKER_ENV_KEYS)
     values = {item.strip() for item in raw.split(",") if item.strip()}
+    disallowed = sorted(key for key in values if _looks_like_user_provider_secret_env_key(key))
+    if disallowed:
+        raise RuntimeError(
+            "GLASSHIVE_WORKER_ENV_ALLOWLIST must not include user provider OAuth/session token keys: "
+            + ", ".join(disallowed)
+        )
     return values | DEFAULT_ENTERPRISE_WORKER_ENV_KEYS
+
+
+def _looks_like_user_provider_secret_env_key(key: str) -> bool:
+    upper = key.upper()
+    return any(upper.startswith(prefix) for prefix in USER_PROVIDER_SECRET_ENV_PREFIXES) and any(
+        marker in upper for marker in USER_PROVIDER_SECRET_ENV_MARKERS
+    )
 
 
 def _worker_secret_env_keys(env: dict[str, str]) -> set[str]:
@@ -129,6 +289,22 @@ def bootstrap_profile_for(worker: dict[str, Any], runtime_name: str) -> str:
 
 
 def bootstrap_bundle_for(worker: dict[str, Any]) -> JsonDict:
+    """Return the structured bootstrap bundle attached to a worker row.
+
+    Typical shape, abbreviated:
+
+        {
+            "project_definition": "# User goal...",
+            "files": [{"scope": "workspace", "path": "uploads/brief.pdf", "source_path": "..."}],
+            "claude_project_mcp": {"glasshive-user-capabilities": {...}},
+            "codex_config_append": "[mcp_servers.glasshive-user-capabilities]...",
+            "env": {"GLASSHIVE_CAPABILITY_BROKER_TOKEN": "..."}
+        }
+
+    The bundle is the host-to-worker data plane. It should carry real files, real scoped grants,
+    and real configuration only; missing capabilities are represented as missing data, not invented
+    prompt text.
+    """
     raw = worker.get("bootstrap_bundle_json")
     if not raw:
         return {}
@@ -154,6 +330,8 @@ def bootstrap_env_for(worker: dict[str, Any]) -> dict[str, str]:
             if value is None:
                 continue
             env_key = str(key)
+            if _looks_like_user_provider_secret_env_key(env_key):
+                continue
             if allowed is not None and env_key not in allowed:
                 continue
             env[env_key] = str(value)
@@ -174,6 +352,12 @@ def apply_bootstrap(
     copy_file: Callable[[Path, Path], None],
     copy_tree: Callable[[Path, Path], None],
 ) -> None:
+    """Materialize login/config/files for a fresh sandbox worker.
+
+    Local developer mode may copy existing CLI auth so the worker can run with the owner's tools.
+    Enterprise mode does not copy host auth files; it projects only the scoped bundle/env allowed by
+    policy and writes MCP grants into owner-only files.
+    """
     profile = bootstrap_profile_for(worker, runtime_name)
     bundle = bootstrap_bundle_for(worker)
 
@@ -199,6 +383,13 @@ def apply_bootstrap(
 def refresh_runtime_env_for_worker(home_dir: Path, worker: dict[str, Any]) -> None:
     """Refresh per-run environment projection without rewriting project files."""
     _write_runtime_env(home_dir, bootstrap_env_for(worker))
+
+
+def refresh_project_runtime_files_for_worker(home_dir: Path, workspace_dir: Path, worker: dict[str, Any]) -> None:
+    """Refresh run-scoped MCP/client config without copying host auth or user files."""
+    bundle = bootstrap_bundle_for(worker)
+    _write_claude_project_files(workspace_dir, bundle)
+    _write_codex_config(home_dir, bundle)
 
 
 def _atomic_write_text(path: Path, text: str, *, mode: int = 0o644) -> None:
@@ -229,7 +420,8 @@ def _write_runtime_env(home_dir: Path, env: dict[str, str]) -> None:
         secret_keys = _worker_secret_env_keys(env)
         secret_env_values = {key: value for key, value in env.items() if key in secret_keys}
         shell_env_values = {key: value for key, value in env.items() if key not in secret_keys}
-    _write_env_file(runtime_env, shell_env_values)
+    runtime_env_mode = 0o600 if _worker_secret_env_keys(shell_env_values) else 0o644
+    _write_env_file(runtime_env, shell_env_values, mode=runtime_env_mode)
     _write_env_file(secret_env, secret_env_values, mode=0o600)
     if secret_env_values:
         _atomic_write_text(secret_keys_path, "\n".join(sorted(secret_env_values)) + "\n", mode=0o600)
@@ -359,6 +551,15 @@ def _write_project_files(
     copy_file: Callable[[Path, Path], None],
     copy_tree: Callable[[Path, Path], None],
 ) -> None:
+    """Materialize `bundle["files"]` into the worker home or workspace.
+
+    Supported entries:
+    - inline text: `{"path": "uploads/note.txt", "content": "..."}`
+    - inline bytes: `{"path": "uploads/file.pdf", "encoding": "base64", "content_base64": "..."}`
+    - trusted source copy: `{"path": "uploads/file.pdf", "source_path": "/trusted/file.pdf"}`
+
+    Enterprise source copies require a signed path token scoped to the same tenant/user.
+    """
     files = bundle.get("files")
     if not isinstance(files, list):
         return
@@ -388,8 +589,7 @@ def _write_project_files(
             continue
         source = _source_path_from_entry(entry)
         if source is None:
-            target.write_text("")
-            continue
+            raise ValueError(f"Bootstrap file {rel_path} is missing content or source_path")
         if _enterprise_mode_enabled() and not _source_token_is_valid(entry, source, worker):
             raise PermissionError("Bootstrap source_path is not authorized for this enterprise user")
         source = resolve_bootstrap_source_path(source)
@@ -402,35 +602,113 @@ def _write_project_files(
 
 
 def _write_claude_project_files(workspace_dir: Path, bundle: JsonDict) -> None:
+    """Write project-scoped Claude/Codex instruction and MCP files.
+
+    Claude reads `.mcp.json` and `.claude/settings.local.json` from the project. Codex reads
+    `AGENTS.md` and, for MCP, the worker-specific `.codex/config.toml` written under the worker
+    home. The lower-case files are compatibility mirrors for older agents/tools.
+    """
+    workspace_dir.mkdir(parents=True, exist_ok=True)
     settings_local = bundle.get("claude_settings_local")
     if isinstance(settings_local, dict):
         target = workspace_dir / ".claude" / "settings.local.json"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(settings_local, indent=2, sort_keys=True) + "\n")
+        target.chmod(0o600)
 
     project_mcp = bundle.get("claude_project_mcp")
     if isinstance(project_mcp, dict):
+        payload = _claude_project_mcp_payload(bundle, project_mcp)
         target = workspace_dir / ".mcp.json"
-        target.write_text(json.dumps(project_mcp, indent=2, sort_keys=True) + "\n")
+        target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        target.chmod(0o600)
 
-    claude_md = bundle.get("claude_md") or bundle.get("system_instructions")
-    if isinstance(claude_md, str) and claude_md.strip():
-        (workspace_dir / "CLAUDE.md").write_text(claude_md.rstrip() + "\n")
+    agents_md = glasshive_project_agents_md(bundle)
+    claude_md = glasshive_project_claude_md(bundle)
+    codex_md = glasshive_project_codex_md(bundle)
+    for filename, content in (
+        ("agents.md", agents_md),
+        ("AGENTS.md", agents_md),
+        ("claude.md", claude_md),
+        ("CLAUDE.md", claude_md),
+        ("codex.md", codex_md),
+        ("CODEX.md", codex_md),
+    ):
+        (workspace_dir / filename).write_text(content)
 
-    agents_md = bundle.get("agents_md") or bundle.get("system_instructions")
-    if isinstance(agents_md, str) and agents_md.strip():
-        (workspace_dir / "AGENTS.md").write_text(agents_md.rstrip() + "\n")
+
+def _claude_project_mcp_payload(bundle: JsonDict, project_mcp: dict[str, Any]) -> JsonDict:
+    """Normalize Claude MCP config and avoid embedding broker tokens in `.mcp.json`.
+
+    Hosts may construct a Claude MCP payload with a literal bearer grant for convenience. Before the
+    file hits disk, replace the literal grant with `${GLASSHIVE_CAPABILITY_BROKER_TOKEN}` whenever
+    the same token is present in the scoped bootstrap env.
+    """
+    payload = project_mcp if isinstance(project_mcp.get("mcpServers"), dict) else {"mcpServers": project_mcp}
+    payload = json.loads(json.dumps(payload))
+    env = bootstrap_env_for({"bootstrap_bundle_json": bundle})
+    grant = str(env.get(GLASSHIVE_CAPABILITY_BROKER_TOKEN_ENV) or "").strip()
+    if not grant:
+        return payload
+    env_auth = f"Bearer ${{{GLASSHIVE_CAPABILITY_BROKER_TOKEN_ENV}}}"
+    literal_auth = f"Bearer {grant}"
+    servers = payload.get("mcpServers")
+    if not isinstance(servers, dict):
+        return payload
+    for config in servers.values():
+        if not isinstance(config, dict):
+            continue
+        headers = config.get("headers")
+        if not isinstance(headers, dict):
+            continue
+        if str(headers.get("Authorization") or "").strip() == literal_auth:
+            headers["Authorization"] = env_auth
+    return payload
+
+
+def claude_project_mcp_payload_for_bundle(bundle: JsonDict, project_mcp: dict[str, Any]) -> JsonDict:
+    """Public wrapper for host and sandbox bootstrap paths that write Claude `.mcp.json` files."""
+    return _claude_project_mcp_payload(bundle, project_mcp)
 
 
 def _write_codex_config(home_dir: Path, bundle: JsonDict) -> None:
+    """Append/refresh worker-local Codex MCP config without duplicating old server blocks."""
     append = bundle.get("codex_config_append")
     if not isinstance(append, str) or not append.strip():
         return
     target = home_dir / ".codex" / "config.toml"
     target.parent.mkdir(parents=True, exist_ok=True)
     existing = target.read_text() if target.exists() else ""
+    mcp_names = _codex_mcp_server_names(append)
+    if mcp_names:
+        existing = _strip_codex_mcp_server_blocks(existing, mcp_names)
     prefix = existing.rstrip() + ("\n\n" if existing.strip() else "")
     target.write_text(prefix + append.strip() + "\n")
+    target.chmod(0o600)
+
+
+def _codex_mcp_server_names(config_text: str) -> set[str]:
+    return {
+        match.group(1).strip()
+        for match in re.finditer(r"(?m)^\s*\[mcp_servers\.([^\]\s]+)\]\s*$", config_text)
+        if match.group(1).strip()
+    }
+
+
+def _strip_codex_mcp_server_blocks(config_text: str, names: set[str]) -> str:
+    if not config_text.strip() or not names:
+        return config_text.rstrip()
+    output: list[str] = []
+    skipping = False
+    for line in config_text.splitlines():
+        section = re.match(r"^\s*\[([^\]]+)\]\s*$", line)
+        if section:
+            section_name = section.group(1).strip()
+            server_name = section_name[len("mcp_servers.") :].split(".", 1)[0].strip("\"'")
+            skipping = section_name.startswith("mcp_servers.") and server_name in names
+        if not skipping:
+            output.append(line)
+    return "\n".join(output).rstrip()
 
 
 def _write_manifest(home_dir: Path, profile: str, bundle: JsonDict) -> None:

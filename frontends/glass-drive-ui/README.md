@@ -39,8 +39,14 @@ Env:
 - `GLASSHIVE_RUNTIME_BASE_URL` default: `http://127.0.0.1:8766`
 - `GLASSHIVE_DEFAULT_OWNER_ID` default: `demo-owner`
 - `WPR_API_TOKEN` optional: service token used by enterprise UI calls to the runtime
-- `GLASSHIVE_SIGNED_LINK_SECRET` optional: HMAC secret for short-lived `/watch/{worker}?gh_token=...`
+- `GLASSHIVE_SIGNED_LINK_SECRET` optional: HMAC secret for bounded signed watch
   links; defaults to `WPR_API_TOKEN` when omitted
+- `GLASSHIVE_LINK_REF_TTL_SECONDS` default: `0`, meaning `/r/{ref}` short links do not expire;
+  use a positive number of seconds only when user-facing short refs should expire
+- `GLASSHIVE_LINK_REF_STATE_PATH` default: `<state-root>/glasshive/link_refs.sqlite3`; must match
+  the runtime process when runtime-generated View / Steer links point at this UI service
+- `GLASSHIVE_MAX_WATCH_SESSION_DURATION_S` default: `0`, meaning no UI-enforced active watch
+  session cap; enterprise deployments should set this when forgotten tabs must be closed
 - Production service managers must disable raw HTTP access logs or use a sanitizer that redacts
   `gh_token`, bearer tokens, service-token headers, and artifact signed-link paths before logs leave
   the VM.

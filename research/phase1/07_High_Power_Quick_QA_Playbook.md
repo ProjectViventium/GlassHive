@@ -347,14 +347,14 @@ Phase 1 is in acceptable shape only if all of the following are true:
 
 Fresh live proof created on 2026-03-19:
 
-- project: `prj_9456a21400`
-- worker: `wrk_da2c2a526e`
+- project: `<project-id>`
+- worker: `<worker-id>`
 - project page:
-  - `http://127.0.0.1:8766/ui/projects/prj_9456a21400?worker_id=wrk_da2c2a526e`
+  - `<local-operator-url>/ui/projects/<project-id>?worker_id=<worker-id>`
 - takeover page:
-  - `http://127.0.0.1:8766/ui/workers/wrk_da2c2a526e/view`
+  - `<local-operator-url>/ui/workers/<worker-id>/view`
 - direct desktop:
-  - `http://127.0.0.1:62310/?autoconnect=1&resize=scale&reconnect=1`
+  - `<local-desktop-url>/?autoconnect=1&resize=scale&reconnect=1`
 
 Live proof outcomes:
 

@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from .runtime_identity import derive_legacy_backend_label
 
 ProjectStatus = Literal["active", "paused", "completed", "archived", "failed"]
 WorkerState = Literal[
@@ -49,9 +51,18 @@ class CreateWorkerRequest(BaseModel):
     owner_id: str
     name: str
     role: str
-    profile: str = "openclaw-general"
-    backend: str = "openclaw"
-    execution_mode: ExecutionMode = "docker"
+    profile: str = Field(
+        default="",
+        description="Worker profile selector. Empty means use the project/deployment default.",
+    )
+    backend: str = Field(
+        default="",
+        description="Deprecated compatibility field. Runtime is derived from profile and execution_mode.",
+    )
+    execution_mode: str = Field(
+        default="",
+        description="Execution mode, host or docker. Empty means use the deployment default.",
+    )
     alias: str | None = None
     workspace_root: str | None = None
     bootstrap_profile: str | None = None
@@ -77,7 +88,7 @@ class WorkerResponse(BaseModel):
     backend: str
     execution_mode: ExecutionMode = "docker"
     alias: str | None = None
-    runtime: str = "openclaw"
+    runtime: str = ""
     model: str = ""
     state: WorkerState
     bootstrap_profile: str | None = None
@@ -90,15 +101,36 @@ class WorkerResponse(BaseModel):
     workspace_dir: str | None = None
     workspace_root: str | None = None
     favorite: bool = False
+    compute_released_at: str | None = None
     last_run_id: str | None = None
+    current_run_id: str | None = None
     last_error: str | None = None
     created_at: str
     updated_at: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def derive_legacy_backend_from_profile(cls, data):
+        if not isinstance(data, dict):
+            return data
+        backend = derive_legacy_backend_label(
+            profile=data.get("profile"),
+            runtime=data.get("runtime"),
+            backend=data.get("backend"),
+        )
+        if backend:
+            data = dict(data)
+            data["backend"] = backend
+        if not data.get("current_run_id") and data.get("state") in {"running", "paused"}:
+            data = dict(data)
+            data["current_run_id"] = data.get("last_run_id") or None
+        return data
 
 
 class AssignRunRequest(BaseModel):
     instruction: str = Field(min_length=1)
     effort: str | None = None
+    bootstrap_bundle: dict[str, object] | None = None
 
 
 class SendMessageRequest(BaseModel):
@@ -110,6 +142,7 @@ class ScheduleRunRequest(BaseModel):
     run_at: str | None = None
     schedule_text: str | None = None
     delay_seconds: int | None = Field(default=None, ge=0)
+    bootstrap_bundle: dict[str, object] | None = None
 
 
 class UpdateWorkerMetadataRequest(BaseModel):
@@ -213,3 +246,8 @@ class MetricsSummary(BaseModel):
     queued_runs: int
     active_runs: int
     events: int
+    callback_pending: int = 0
+    callback_delivering: int = 0
+    callback_dead_lettered: int = 0
+    callback_max_attempts: int = 0
+    callback_oldest_pending_age_seconds: int = 0

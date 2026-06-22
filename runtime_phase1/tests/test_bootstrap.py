@@ -5,8 +5,11 @@ import json
 import pytest
 
 from workers_projects_runtime.bootstrap import (
+    GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
+    GLASSHIVE_SAFETY_CHECKPOINT_RULE,
     apply_bootstrap,
     bootstrap_env_for,
+    refresh_project_runtime_files_for_worker,
     refresh_runtime_env_for_worker,
     sign_bootstrap_source_path,
 )
@@ -22,7 +25,38 @@ def _clear_ambient_provider_env(monkeypatch):
         "PORTKEY_VIRTUAL_KEY",
         "PORTKEY_CONFIG",
     ):
-        monkeypatch.delenv(key, raising=False)
+            monkeypatch.delenv(key, raising=False)
+
+
+def test_bootstrap_materializes_canonical_worker_operating_contract(tmp_path):
+    apply_bootstrap(
+        home_dir=tmp_path / "home",
+        workspace_dir=tmp_path / "workspace",
+        runtime_name="codex-cli",
+        worker={"bootstrap_bundle_json": json.dumps({})},
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+    )
+
+    agents_text = (tmp_path / "workspace" / "AGENTS.md").read_text()
+    assert GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS in agents_text
+    assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in agents_text
+    assert "FINAL REPORT:" in agents_text
+    assert "polished ordinary end-user artifact" in agents_text
+    assert "never leave a foreground server blocking final delivery or wasting compute" in agents_text
+    assert "source/date/auth/scope constraints" in agents_text
+    assert "do not use that item to support facts, scoring, or deliverables" in agents_text
+    assert "rejected or out-of-scope evidence" in agents_text
+    assert "read it before planning, delegation, source collection, and final delivery" in agents_text
+    assert "carry the user's constraints forward literally and exactly" in agents_text
+    assert "correct that file before continuing" in agents_text
+    assert "prioritize a usable core result before optional expansion" in agents_text
+    assert "not clipped" in agents_text
+    assert "Do not force a download" in agents_text
+    assert "Native capability discovery" in agents_text
+    assert "Inspect what is actually available" in agents_text
+    assert "use available research, browser, spreadsheet, PDF, document, deck, notebook, rendering, or verification tools" in agents_text
+    assert "Do not overfit to examples" in agents_text
 
 
 def test_enterprise_bootstrap_filters_worker_env_and_projects_provider_env(monkeypatch):
@@ -37,6 +71,7 @@ def test_enterprise_bootstrap_filters_worker_env_and_projects_provider_env(monke
                 "env": {
                     "OPENAI_API_KEY": "bundle-openai",
                     "ANTHROPIC_BASE_URL": "https://anthropic.enterprise.example.com",
+                    "GLASSHIVE_CAPABILITY_BROKER_TOKEN": "public-safe-broker-grant",
                     "PRIVATE_INTERNAL_TOKEN": "must-not-project",
                 }
             }
@@ -47,11 +82,30 @@ def test_enterprise_bootstrap_filters_worker_env_and_projects_provider_env(monke
 
     assert env["OPENAI_API_KEY"] == "bundle-openai"
     assert env["ANTHROPIC_BASE_URL"] == "https://anthropic.enterprise.example.com"
+    assert env["GLASSHIVE_CAPABILITY_BROKER_TOKEN"] == "public-safe-broker-grant"
     assert env["PORTKEY_BASE_URL"] == "https://portkey.example.com"
     assert "PRIVATE_INTERNAL_TOKEN" not in env
 
 
-def test_local_bootstrap_env_behavior_stays_unfiltered_by_default(monkeypatch):
+def test_enterprise_worker_env_allowlist_rejects_user_provider_tokens(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_WORKER_ENV_ALLOWLIST", "GOOGLE_REFRESH_TOKEN")
+
+    worker = {
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "env": {
+                    "GOOGLE_REFRESH_TOKEN": "provider-token-must-not-project",
+                }
+            }
+        )
+    }
+
+    with pytest.raises(RuntimeError, match="must not include user provider"):
+        bootstrap_env_for(worker)
+
+
+def test_local_bootstrap_env_filters_user_provider_tokens_without_blocking_provider_keys(monkeypatch):
     monkeypatch.delenv("GLASSHIVE_ENTERPRISE_MODE", raising=False)
     monkeypatch.delenv("WPR_ENTERPRISE_MODE", raising=False)
     monkeypatch.delenv("GLASSHIVE_PROJECT_PROVIDER_ENV", raising=False)
@@ -63,6 +117,9 @@ def test_local_bootstrap_env_behavior_stays_unfiltered_by_default(monkeypatch):
                 "env": {
                     "OPENAI_API_KEY": "bundle-openai",
                     "PRIVATE_INTERNAL_TOKEN": "local-mode-keeps-existing-behavior",
+                    "GOOGLE_REFRESH_TOKEN": "must-not-project",
+                    "GOOGLE_OAUTH_CLIENT_SECRET": "must-not-project",
+                    "MS365_ACCESS_TOKEN": "must-not-project",
                 }
             }
         )
@@ -72,6 +129,9 @@ def test_local_bootstrap_env_behavior_stays_unfiltered_by_default(monkeypatch):
 
     assert env["OPENAI_API_KEY"] == "bundle-openai"
     assert env["PRIVATE_INTERNAL_TOKEN"] == "local-mode-keeps-existing-behavior"
+    assert "GOOGLE_REFRESH_TOKEN" not in env
+    assert "GOOGLE_OAUTH_CLIENT_SECRET" not in env
+    assert "MS365_ACCESS_TOKEN" not in env
 
 
 def test_enterprise_bootstrap_does_not_copy_host_auth_or_identity_files(tmp_path, monkeypatch):
@@ -101,6 +161,7 @@ def test_enterprise_bootstrap_keeps_provider_secrets_out_of_interactive_runtime_
             {
                 "env": {
                     "OPENAI_API_KEY": "synthetic-openai-key-not-for-shell",
+                    "CLAUDE_CODE_OAUTH_TOKEN": "synthetic-claude-oauth-token-not-for-shell",
                     "PORTKEY_VIRTUAL_KEY": "pk-test-not-for-shell",
                     "OPENAI_BASE_URL": "https://provider.example.com/v1",
                 }
@@ -123,10 +184,12 @@ def test_enterprise_bootstrap_keeps_provider_secrets_out_of_interactive_runtime_
 
     assert "OPENAI_BASE_URL" in runtime_env
     assert "OPENAI_API_KEY" not in runtime_env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in runtime_env
     assert "PORTKEY_VIRTUAL_KEY" not in runtime_env
     assert "OPENAI_API_KEY" in secret_env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in secret_env
     assert "PORTKEY_VIRTUAL_KEY" in secret_env
-    assert set(secret_keys) == {"OPENAI_API_KEY", "PORTKEY_VIRTUAL_KEY"}
+    assert set(secret_keys) == {"CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "PORTKEY_VIRTUAL_KEY"}
     assert oct((tmp_path / "home" / ".glasshive" / "secret-runtime.env").stat().st_mode & 0o777) == "0o600"
     assert oct((tmp_path / "home" / ".glasshive" / "secret-runtime.keys").stat().st_mode & 0o777) == "0o600"
 
@@ -205,6 +268,61 @@ def test_enterprise_run_only_secrets_are_refreshed_for_each_run(tmp_path, monkey
     assert oct(secret_env.stat().st_mode & 0o777) == "0o600"
 
 
+def test_refresh_project_runtime_files_rotates_broker_mcp_configs(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    home_dir = tmp_path / "home"
+    workspace_dir = tmp_path / "workspace"
+
+    def worker_for(token: str, url: str) -> dict:
+        return {
+            "bootstrap_bundle_json": json.dumps(
+                {
+                    "claude_project_mcp": {
+                        "glasshive-user-capabilities": {
+                            "type": "http",
+                            "url": url,
+                            "headers": {"Authorization": f"Bearer {token}"},
+                        }
+                    },
+                    "codex_config_append": (
+                        "[mcp_servers.glasshive-user-capabilities]\n"
+                        f'url = "{url}"\n'
+                        'bearer_token_env_var = "GLASSHIVE_CAPABILITY_BROKER_TOKEN"'
+                    ),
+                    "env": {"GLASSHIVE_CAPABILITY_BROKER_TOKEN": token},
+                }
+            )
+        }
+
+    apply_bootstrap(
+        home_dir=home_dir,
+        workspace_dir=workspace_dir,
+        runtime_name="codex-cli",
+        worker=worker_for("old-grant", "http://broker-old.example/mcp"),
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+    )
+    refresh_project_runtime_files_for_worker(
+        home_dir,
+        workspace_dir,
+        worker_for("new-grant", "http://broker-new.example/mcp"),
+    )
+
+    project_mcp = json.loads((workspace_dir / ".mcp.json").read_text())
+    codex_config = (home_dir / ".codex" / "config.toml").read_text()
+
+    assert project_mcp["mcpServers"]["glasshive-user-capabilities"]["headers"]["Authorization"] == (
+        "Bearer ${GLASSHIVE_CAPABILITY_BROKER_TOKEN}"
+    )
+    assert "new-grant" not in (workspace_dir / ".mcp.json").read_text()
+    assert "old-grant" not in (workspace_dir / ".mcp.json").read_text()
+    assert "http://broker-new.example/mcp" in codex_config
+    assert "http://broker-old.example/mcp" not in codex_config
+    assert codex_config.count("[mcp_servers.glasshive-user-capabilities]") == 1
+    assert oct((workspace_dir / ".mcp.json").stat().st_mode & 0o777) == "0o600"
+    assert oct((home_dir / ".codex" / "config.toml").stat().st_mode & 0o777) == "0o600"
+
+
 def test_enterprise_ambient_provider_keys_are_run_only(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     _clear_ambient_provider_env(monkeypatch)
@@ -245,6 +363,7 @@ def test_local_bootstrap_keeps_legacy_interactive_runtime_env_behavior(tmp_path,
 
     runtime_env = (tmp_path / "home" / ".glasshive" / "runtime.env").read_text()
     assert "OPENAI_API_KEY" in runtime_env
+    assert oct((tmp_path / "home" / ".glasshive" / "runtime.env").stat().st_mode & 0o777) == "0o600"
     assert not (tmp_path / "home" / ".glasshive" / "secret-runtime.env").exists()
 
 
@@ -350,3 +469,30 @@ def test_bootstrap_materializes_base64_uploaded_file(tmp_path):
     )
 
     assert (workspace / "uploads" / "report.bin").read_bytes() == b"\x00\x01\x02Hello"
+
+
+def test_bootstrap_rejects_file_entry_without_content_or_source(tmp_path):
+    workspace = tmp_path / "workspace"
+
+    with pytest.raises(ValueError, match="missing content or source_path"):
+        apply_bootstrap(
+            home_dir=tmp_path / "home",
+            workspace_dir=workspace,
+            runtime_name="codex-cli",
+            worker={
+                "bootstrap_bundle_json": json.dumps(
+                    {
+                        "files": [
+                            {
+                                "scope": "workspace",
+                                "path": "uploads/missing.txt",
+                            }
+                        ]
+                    }
+                )
+            },
+            copy_file=lambda source, target: None,
+            copy_tree=lambda source, target: None,
+        )
+
+    assert not (workspace / "uploads" / "missing.txt").exists()

@@ -59,6 +59,24 @@ standalone/plain LibreChat deployments must still work without them by using:
   defaults
 - the returned View / Steer URL for operator visibility and takeover
 
+Default `workspace_launch`, `workspace_wait`, and `workspace_status` payloads are intentionally
+compact. They return user-actionable state, result tools, output text, artifact short links, and a
+View / Steer short link when available; raw project/worker/run ids and live diagnostic snapshots are
+returned only when the caller explicitly requests diagnostics. MCP outputs must not expose raw
+`gh_token` URLs or opaque signed-link tokens; they should expose `/r/{ref}` and `/v1/link-refs/{ref}`
+indirection instead.
+
+Short refs are the durable user-facing link contract. `GLASSHIVE_LINK_REF_TTL_SECONDS` defaults to
+`0` (`never`/`none`/`disabled`/`off`/`false`/`no` are equivalent), so a completed artifact or
+View / Steer link remains usable for the authenticated owner after the underlying signed token has
+expired. Set a positive integer number of seconds only when the deployment deliberately wants
+short refs to expire. Enterprise clients must treat `/r/{ref}` and `/v1/link-refs/{ref}` as
+authenticated routes, not bearer links.
+
+When MCP/runtime payloads emit `/r/{ref}` URLs whose host is the separate GlassHive UI service, the
+runtime and UI must share `GLASSHIVE_LINK_REF_STATE_PATH` or otherwise route the ref to the process
+that created it. This is a deployment contract, not a LibreChat behavior.
+
 The MCP descriptions must make this non-callback path obvious to connected LLMs. A model should
 launch work with `workspace_launch`, include `uploaded_files` when the user attached files, return
 the View / Steer URL promptly, and use status/wait/artifact tools for follow-up and delivery. It
@@ -66,10 +84,10 @@ must not fall back to pasting whole generated files into chat or writing its own
 code path when GlassHive has already produced a signed artifact link.
 
 `workspace_launch` is intentionally non-blocking. If the user asks to "wait", the model should call
-`workspace_wait` with the returned follow-up context. If the requested run is older than the
-worker's latest run, status/wait responses preserve both the requested run outcome and the latest
-effective run so the model can say, for example, "the run you asked about failed, but the same
-workspace later completed and produced these artifacts" instead of falsely reporting failure.
+`workspace_wait` with the returned completion wait timeout or rely on same-conversation scoped
+recent-dispatch resolution. If the requested run is older than the worker's latest run,
+diagnostic status/wait responses preserve both the requested run outcome and the latest effective
+run so an operator can explain the lineage without exposing raw ids in normal user-facing payloads.
 
 When no `profile` is supplied, MCP tools must use the authenticated user's saved preference first
 and then the deployment default from `GLASSHIVE_DEFAULT_WORKER_PROFILE`. Enterprise deployments

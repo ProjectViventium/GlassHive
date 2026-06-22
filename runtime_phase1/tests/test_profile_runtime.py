@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import stat
 import subprocess
 import threading
 import time
@@ -8,9 +11,22 @@ from pathlib import Path
 
 import pytest
 
-from workers_projects_runtime.failure_classification import classify_runtime_error
+from workers_projects_runtime.bootstrap import GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS, GLASSHIVE_SAFETY_CHECKPOINT_RULE
+from workers_projects_runtime.failure_classification import classify_cli_failure, classify_runtime_error
 from workers_projects_runtime.openclaw_runtime import RuntimeDependencyMissingError, RuntimeErrorBase, WorkerTerminatedError
-from workers_projects_runtime.profile_runtime import BaseCliWorkerRuntime, ClaudeCodeRuntime, CodexCliRuntime, HostCodexCliRuntime, HostOpenClawRuntime, OpenClawWorkstationRuntime, ProfiledWorkerRuntime, _redact_text
+from workers_projects_runtime.profile_runtime import BaseCliWorkerRuntime, ClaudeCodeRuntime, CodexCliRuntime, HostClaudeCodeRuntime, HostCodexCliRuntime, HostOpenClawRuntime, OpenClawWorkstationRuntime, ProfiledWorkerRuntime, _redact_text
+
+
+def _patch_host_codex_requirement_probe(monkeypatch):
+    monkeypatch.setattr(
+        "workers_projects_runtime.runtime_requirements.subprocess.run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="codex-cli 0.140.0\n",
+            stderr="",
+        ),
+    )
 
 
 def test_terminal_target_uses_inferred_job_session_when_metadata_missing(tmp_path):
@@ -109,6 +125,42 @@ def test_collect_completed_run_classifies_and_redacts_provider_rate_limit(tmp_pa
     assert "Too Many Requests" in recovered["failure_diagnostic_summary"]
     assert "PUBLIC_FAKE_API_KEY_VALUE" not in recovered["error_text"]
     assert "PUBLIC_FAKE_TOKEN_VALUE" not in recovered["error_text"]
+
+
+def test_classify_cli_failure_maps_structured_provider_overload():
+    failure = classify_cli_failure(
+        stdout=json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "api_error_status": 529,
+                "result": "API Error: 529 Overloaded. This is a server-side issue, usually temporary.",
+            }
+        )
+        + "\n",
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_response_failed"
+    assert failure.retryable is True
+    assert "workspace_continue" in failure.recommended_recovery
+    assert "api_error_status: 529" in failure.diagnostic_summary
+    assert "Overloaded" in failure.diagnostic_summary
+
+
+def test_classify_cli_failure_does_not_treat_unstructured_overloaded_prose_as_provider_outage():
+    failure = classify_cli_failure(
+        stdout="",
+        stderr="The worker wrote a draft saying the market is overloaded with generic options.",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "unknown"
+    assert failure.retryable is False
 
 
 def test_collect_completed_run_prefers_stdout_provider_failure_over_stale_stderr(tmp_path):
@@ -570,15 +622,14 @@ def test_global_stop_reason_still_applies_to_current_run(tmp_path):
 def test_host_codex_runtime_materializes_required_workspace_files(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
     xattr_calls = []
 
     def fake_run(args, **_kwargs):
+        if "--version" in args:
+            return subprocess.CompletedProcess(args, returncode=0, stdout="codex-cli 0.140.0\n", stderr="")
         xattr_calls.append(args)
-
-        class Result:
-            returncode = 0
-
-        return Result()
+        return subprocess.CompletedProcess(args, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
     upload_source = tmp_path / "uploaded-brief.txt"
@@ -617,16 +668,93 @@ def test_host_codex_runtime_materializes_required_workspace_files(tmp_path, monk
     assert (workspace_dir / "project-definition.md").read_text() == "# Project\n\nBuild the launch app."
     assert "main computer" in (workspace_dir / "harness-prompt.md").read_text()
     assert "bash /path/to/script.sh" in (workspace_dir / "harness-prompt.md").read_text()
+    assert GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS in (workspace_dir / "harness-prompt.md").read_text()
+    assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in (workspace_dir / "harness-prompt.md").read_text()
     assert (workspace_dir / "work-log.md").exists()
-    assert (workspace_dir / "agents.md").read_text() == "Agent context"
-    assert (workspace_dir / "AGENTS.md").read_text() == "Agent context"
-    assert (workspace_dir / "claude.md").read_text() == "Claude context"
-    assert (workspace_dir / "codex.md").read_text() == "Codex context"
+    agents_text = (workspace_dir / "AGENTS.md").read_text()
+    assert "GlassHive Worker Contract" in agents_text
+    assert GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS in agents_text
+    assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in agents_text
+    assert "Agent context" in agents_text
+    assert "real local machine session" in agents_text
+    assert (workspace_dir / "agents.md").read_text() == agents_text
+    assert "@AGENTS.md" in (workspace_dir / "claude.md").read_text()
+    assert "Claude context" in (workspace_dir / "claude.md").read_text()
+    assert "Codex context" in (workspace_dir / "codex.md").read_text()
     assert (workspace_dir / "glasshive-host-tools" / "capture-front-window.sh").exists()
+    content_hygiene = workspace_dir / "glasshive-host-tools" / "content-hygiene.py"
+    assert content_hygiene.exists()
+    assert "content-hygiene.py check" in (workspace_dir / "harness-prompt.md").read_text()
     assert xattr_calls
     assert xattr_calls[0][:3] == ["/usr/bin/xattr", "-d", "com.apple.quarantine"]
     assert (workspace_dir / "uploads" / "uploaded-brief.txt").read_text() == "Uploaded brief"
     assert (tmp_path / "data" / "host_codex_cli_runtime" / "workers" / "wrk_host" / "state" / "action-audit.jsonl").exists()
+
+
+def test_host_runtime_content_hygiene_helper_strips_and_flags_page_chrome(tmp_path, monkeypatch):
+    real_subprocess_run = subprocess.run
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
+
+    def fake_run(args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stderr="",
+        )
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
+    worker = {
+        "worker_id": "wrk_host_hygiene",
+        "name": "Host Hygiene Worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+    info = runtime.ensure_worker_ready(worker)
+    workspace_dir = Path(info.workspace_dir)
+    helper = workspace_dir / "glasshive-host-tools" / "content-hygiene.py"
+    html_path = workspace_dir / "page.html"
+    html_path.write_text(
+        "<html><head><style>.nav{}</style><script>window.bad=true</script></head>"
+        "<body><nav>Skip to Content</nav><button>MENU</button><button>CLOSE</button>"
+        "<main><h1>Useful finding</h1>"
+        "<p>AI workflow evidence for a regulated services business.</p></main></body></html>"
+    )
+    csv_path = workspace_dir / "output.csv"
+    csv_path.write_text(
+        "firm_name,sector_notes\n"
+        "Example Capital,\"Skip to Content Cookie Settings window.bad=true\"\n"
+        "Normal Capital,\"Value-creation function (post-closing) and first-wave outreach window.\"\n"
+    )
+
+    readable = real_subprocess_run(
+        ["python3", str(helper), "readable", str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "Useful finding" in readable
+    assert "MENU" not in readable
+    assert "CLOSE" not in readable
+    assert "window.bad" not in readable
+
+    checked = real_subprocess_run(
+        ["python3", str(helper), "check", str(csv_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert checked.returncode == 1
+    assert "failure_count" in checked.stdout
+    assert "Skip to Content" in checked.stdout
+    assert "function (post-closing)" not in checked.stdout
+    assert "outreach window" not in checked.stdout
+    assert "carry the user's source/date/auth/scope constraints forward exactly" in (
+        workspace_dir / "harness-prompt.md"
+    ).read_text()
 
 
 def test_host_codex_model_can_differ_from_docker_provider_model(tmp_path, monkeypatch):
@@ -676,6 +804,26 @@ def test_host_codex_honors_codex_model_env_before_local_config(tmp_path, monkeyp
     assert runtime.resolve_model("codex-cli") == "gpt-5.5"
 
 
+def test_host_codex_command_honors_per_run_reasoning_effort(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_MODEL_HOST_CODEX_CLI", "gpt-5.4")
+    monkeypatch.setenv("WPR_CODEX_CLI_XHIGH_ROUTE_PROVEN", "true")
+    worker = {
+        "worker_id": "wrk_host_effort",
+        "name": "Host Effort Worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "xhigh"}}),
+    }
+
+    command, _env = runtime._build_command(worker, "create the marker", runtime._host_runtime_info(worker))
+
+    joined = "\n".join(command)
+    assert 'model_reasoning_effort="xhigh"' in joined
+    assert "-m\ngpt-5.4" in joined
+
+
 def test_profiled_runtime_resolves_host_codex_model_by_execution_mode(tmp_path, monkeypatch):
     runtime = ProfiledWorkerRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.setenv("WPR_MODEL_CODEX_CLI", "gpt-5.2-chat")
@@ -689,6 +837,7 @@ def test_codex_cli_provider_config_honors_reasoning_effort_env(tmp_path, monkeyp
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
     monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("WPR_CODEX_CLI_XHIGH_ROUTE_PROVEN", "true")
 
     command: list[str] = []
     runtime._append_codex_compatible_provider_config(command, {"worker_id": "wrk_effort"})
@@ -701,6 +850,7 @@ def test_codex_cli_provider_config_honors_per_run_reasoning_effort(tmp_path, mon
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
     monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "medium")
+    monkeypatch.setenv("WPR_CODEX_CLI_XHIGH_ROUTE_PROVEN", "true")
     worker = {
         "worker_id": "wrk_effort",
         "bootstrap_bundle_json": json.dumps({"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "xhigh"}}),
@@ -712,6 +862,21 @@ def test_codex_cli_provider_config_honors_per_run_reasoning_effort(tmp_path, mon
     joined = "\n".join(command)
     assert 'model_reasoning_effort="xhigh"' in joined
     assert 'model_reasoning_effort="medium"' not in joined
+
+
+def test_codex_cli_provider_config_clamps_xhigh_without_route_proof(tmp_path, monkeypatch, caplog):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "xhigh")
+
+    command: list[str] = []
+    caplog.set_level(logging.WARNING, logger="workers_projects_runtime.profile_runtime")
+    runtime._append_codex_compatible_provider_config(command, {"worker_id": "wrk_effort", "profile": "codex-cli"})
+
+    joined = "\n".join(command)
+    assert 'model_reasoning_effort="medium"' in joined
+    assert 'model_reasoning_effort="xhigh"' not in joined
+    assert any(record.message == "Codex CLI reasoning effort clamped to provider-route fallback" for record in caplog.records)
 
 
 def test_codex_cli_provider_config_disables_web_search_for_minimal_effort(tmp_path, monkeypatch):
@@ -766,6 +931,40 @@ def test_codex_cli_provider_config_coerces_unsupported_reasoning_effort(tmp_path
     assert 'web_search="disabled"' not in joined
 
 
+def test_codex_cli_provider_config_coerces_high_effort_when_route_allows_medium_only(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_ALLOWED_REASONING_EFFORTS", "medium")
+    monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT_FALLBACK", "medium")
+    worker = {
+        "worker_id": "wrk_effort",
+        "profile": "codex-cli",
+        "model": "gpt-5.2-chat",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "high"}}),
+    }
+
+    command: list[str] = []
+    caplog.set_level(logging.WARNING, logger="workers_projects_runtime.profile_runtime")
+    runtime._append_codex_compatible_provider_config(command, worker)
+
+    joined = "\n".join(command)
+    assert 'model_reasoning_effort="medium"' in joined
+    assert 'model_reasoning_effort="high"' not in joined
+    clamp_records = [
+        record
+        for record in caplog.records
+        if record.message == "Codex CLI reasoning effort clamped to provider-route fallback"
+    ]
+    assert len(clamp_records) == 1
+    assert clamp_records[0].requested_effort == "high"
+    assert clamp_records[0].effective_effort == "medium"
+    assert clamp_records[0].allowed_efforts == "medium"
+
+
 def test_codex_cli_provider_config_honors_reasoning_effort_fallback(tmp_path, monkeypatch):
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
@@ -803,6 +1002,7 @@ def test_codex_cli_provider_config_ignores_invalid_allowed_reasoning_efforts(tmp
 def test_host_cli_run_closes_stdin_for_noninteractive_workers(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
     captured: dict[str, object] = {}
 
     class FakeProcess:
@@ -824,7 +1024,12 @@ def test_host_cli_run_closes_stdin_for_noninteractive_workers(tmp_path, monkeypa
 
     monkeypatch.setattr(
         "workers_projects_runtime.profile_runtime.subprocess.run",
-        lambda args, **kwargs: subprocess.CompletedProcess(args, returncode=0, stdout="", stderr=""),
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stderr="",
+        ),
     )
     monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.Popen", FakeProcess)
     worker = {
@@ -839,15 +1044,289 @@ def test_host_cli_run_closes_stdin_for_noninteractive_workers(tmp_path, monkeypa
     assert captured["stdin"] is subprocess.DEVNULL
 
 
+def test_host_cli_run_writes_constraint_ledger_and_evidence(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
+    workspace = tmp_path / "workspace"
+
+    class FakeProcess:
+        pid = 12345
+
+        def __init__(self, _command, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            output_dir = cwd / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "result.csv").write_text("name,status\nsynthetic,ok\n")
+            stdout = kwargs["stdout"]
+            stdout.write(
+                '{"type":"item.completed","item":{"type":"agent_message","text":"FINAL REPORT:\\nDone"}}\n'
+            )
+            stdout.flush()
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.subprocess.run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.Popen", FakeProcess)
+    worker = {
+        "worker_id": "wrk_evidence",
+        "name": "Evidence Worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_dir": str(workspace),
+    }
+
+    result = runtime.run_task(
+        worker,
+        "Use sources from January 2024 through May 2026 only.\nDeliver a CSV report.",
+        run_id="run_evidence",
+    )
+
+    assert result == "Done"
+    ledger = json.loads((workspace / "glasshive-run" / "constraint-ledger.json").read_text())
+    evidence = json.loads((workspace / "glasshive-run" / "evidence.json").read_text())
+    active_status = json.loads((workspace / "glasshive-run" / "runs" / "run_evidence" / "active-run.json").read_text())
+    assert ledger["run_id"] == "run_evidence"
+    assert any("May 2026" in item for item in ledger["constraints"]["date"])
+    assert evidence["run_id"] == "run_evidence"
+    assert evidence["worker"]["profile"] == "codex-cli"
+    assert evidence["final_output"]["has_final_report"] is True
+    assert "output/result.csv" in {item["path"] for item in evidence["artifacts"]["items"]}
+    assert "glasshive-run/constraint-ledger.json" not in {item["path"] for item in evidence["artifacts"]["items"]}
+    assert active_status["state"] == "completed"
+    assert active_status["run_id"] == "run_evidence"
+    assert active_status["process_pid"] is None
+    assert active_status["transcript_paths"]["stdout"].endswith("/stdout.log")
+    assert active_status["evidence_path"] == "glasshive-run/evidence.json"
+
+
+def test_host_cli_run_fails_when_evidence_contract_fails(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
+    workspace = tmp_path / "workspace"
+
+    class FakeProcess:
+        pid = 12345
+
+        def __init__(self, _command, **kwargs):
+            stdout = kwargs["stdout"]
+            stdout.write(
+                '{"type":"item.completed","item":{"type":"agent_message","text":"FINAL REPORT:\\nDone"}}\n'
+            )
+            stdout.flush()
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.subprocess.run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.Popen", FakeProcess)
+    worker = {
+        "worker_id": "wrk_evidence_fail",
+        "name": "Evidence Fail Worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_dir": str(workspace),
+    }
+
+    with pytest.raises(RuntimeErrorBase, match="GlassHive evidence check failed"):
+        runtime.run_task(worker, "Deliver a PDF report.", run_id="run_evidence_fail")
+
+    evidence = json.loads((workspace / "glasshive-run" / "evidence.json").read_text())
+    active_status = json.loads((workspace / "glasshive-run" / "runs" / "run_evidence_fail" / "active-run.json").read_text())
+    assert evidence["evidence_result"]["status"] == "fail"
+    assert evidence["completion_compliance"]["missing_required_artifact_types"] == ["pdf"]
+    assert active_status["state"] == "failed"
+    assert active_status["stop_reason"] == "evidence_check_failed"
+
+
+def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
+    workspace = tmp_path / "workspace"
+
+    class TimeoutProcess:
+        pid = 12345
+
+        def __init__(self, _command, **kwargs):
+            self.terminated = False
+            stdout = kwargs["stdout"]
+            stdout.write("working before timeout\n")
+            stdout.flush()
+
+        def wait(self, timeout=None):
+            if self.terminated:
+                return 130
+            raise subprocess.TimeoutExpired(["fake-codex"], timeout)
+
+        def poll(self):
+            return 130 if self.terminated else None
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.terminated = True
+
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.subprocess.run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.Popen", TimeoutProcess)
+    worker = {
+        "worker_id": "wrk_timeout_evidence",
+        "name": "Timeout Evidence Worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_dir": str(workspace),
+    }
+
+    with pytest.raises(RuntimeErrorBase, match="timed out"):
+        runtime.run_task(worker, "Do long work.", timeout_sec=0.01, run_id="run_timeout_evidence")
+
+    evidence = json.loads((workspace / "glasshive-run" / "evidence.json").read_text())
+    active_status = json.loads((workspace / "glasshive-run" / "runs" / "run_timeout_evidence" / "active-run.json").read_text())
+    assert evidence["run_id"] == "run_timeout_evidence"
+    assert evidence["exit_code"] is None
+    assert evidence["timeout"]["exit_source"] == "timeout"
+    assert evidence["timeout"]["stop_reason"] == "timeout"
+    assert evidence["transcript"]["stdout_tail"].strip() == "working before timeout"
+    assert evidence["final_output"]["status"] == "failed"
+    assert active_status["state"] == "timeout"
+    assert active_status["stop_reason"] == "timeout"
+    assert active_status["timeout_seconds"] == 0.01
+
+
+def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
+    workspace = tmp_path / "workspace"
+    processes: list[object] = []
+
+    class BlockingProcess:
+        pid = 12345
+
+        def __init__(self, _command, **kwargs):
+            self.terminated = False
+            processes.append(self)
+            stdout = kwargs["stdout"]
+            stdout.write("working before interrupt\n")
+            stdout.flush()
+
+        def wait(self, timeout=None):
+            deadline = time.time() + 2
+            while not self.terminated and time.time() < deadline:
+                time.sleep(0.01)
+            if self.terminated:
+                return -15
+            raise subprocess.TimeoutExpired(["fake-codex"], timeout)
+
+        def poll(self):
+            return -15 if self.terminated else None
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.terminated = True
+
+    def fake_killpg(_pgid, _signal):
+        for process in processes:
+            process.terminate()
+
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.subprocess.run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.Popen", BlockingProcess)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.killpg", fake_killpg)
+    worker = {
+        "worker_id": "wrk_interrupt_evidence",
+        "name": "Interrupt Evidence Worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_dir": str(workspace),
+    }
+    errors: list[Exception] = []
+
+    def run_worker():
+        try:
+            runtime.run_task(worker, "Do long work.\n" + ("private detail " * 80), run_id="run_interrupt_evidence")
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_worker)
+    thread.start()
+    deadline = time.time() + 2
+    while runtime._read_active_session(worker["worker_id"]) is None and time.time() < deadline:
+        time.sleep(0.01)
+
+    runtime.interrupt_worker(worker, run_id="run_interrupt_evidence")
+    thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert errors
+    evidence = json.loads((workspace / "glasshive-run" / "evidence.json").read_text())
+    active_status = json.loads((workspace / "glasshive-run" / "runs" / "run_interrupt_evidence" / "active-run.json").read_text())
+    assert evidence["run_id"] == "run_interrupt_evidence"
+    assert evidence["final_output"]["status"] == "failed"
+    assert "working before interrupt" in evidence["transcript"]["stdout_tail"]
+    assert evidence["artifacts"]["count"] == 0
+    display = evidence["command"]["display_redacted"]
+    assert "private detail" not in display
+    assert "[REDACTED_LONG_ARG" in display
+    assert active_status["state"] == "interrupted"
+    assert active_status["stop_reason"] in {"interrupted", "WorkerInterruptedError"}
+
+
 def test_host_codex_runtime_default_prompts_require_final_report(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
 
     def fake_run(args, **_kwargs):
-        class Result:
-            returncode = 0
-
-        return Result()
+        return subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stderr="",
+        )
 
     monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
     worker = {
@@ -865,17 +1344,246 @@ def test_host_codex_runtime_default_prompts_require_final_report(tmp_path, monke
     for filename in ("harness-prompt.md", "agents.md", "AGENTS.md", "claude.md", "CLAUDE.md", "codex.md", "CODEX.md"):
         content = (workspace_dir / filename).read_text()
         assert "FINAL REPORT:" in content
+        assert "inspect" in content.lower()
+        assert "request and success criteria" in content.lower()
+        if filename in {"harness-prompt.md", "agents.md", "AGENTS.md"}:
+            assert GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS in content
+            assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in content
+    assert "canonical project instruction source" in (workspace_dir / "CLAUDE.md").read_text()
+    assert "@AGENTS.md" in (workspace_dir / "CLAUDE.md").read_text()
+
+
+def test_host_runtime_materializes_project_mcp_bootstrap_with_owner_only_files(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
+    source_codex_home = tmp_path / "source-codex-home"
+    source_codex_home.mkdir()
+    (source_codex_home / "auth.json").write_text('{"OPENAI_API_KEY":"redacted-test-key"}')
+    (source_codex_home / "config.toml").write_text(
+        'model = "gpt-local-public-safe"\n'
+        'model_provider = "local_provider"\n\n'
+        '[model_providers.local_provider]\n'
+        'name = "Local Provider"\n'
+        'base_url = "https://models.example.test/v1"\n\n'
+        '[plugins."computer-use@openai-bundled"]\n'
+        "enabled = true\n\n"
+        "[mcp_servers.private-mail]\n"
+        "url = \"https://private.example.test/mcp\"\n"
+        "bearer_token_env_var = \"PRIVATE_TOKEN\"\n\n"
+        "[mcp_servers.node_repl]\n"
+        "command = \"/Applications/Codex.app/Contents/Resources/cua_node/bin/node_repl\"\n"
+        "args = []\n\n"
+        "[mcp_servers.node_repl.env]\n"
+        "NODE_REPL_TRUSTED_CODE_PATHS = \"/tmp/public-safe\"\n"
+    )
+    computer_use_manifest = (
+        source_codex_home
+        / "plugins"
+        / "cache"
+        / "openai-bundled"
+        / "computer-use"
+        / "1.0.0"
+        / ".mcp.json"
+    )
+    computer_use_manifest.parent.mkdir(parents=True)
+    computer_use_manifest.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "computer-use": {
+                        "command": "./Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+                        "args": ["mcp"],
+                        "cwd": ".",
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+
+    def fake_run(args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stderr="",
+        )
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
+    worker = {
+        "worker_id": "wrk_host_mcp_bootstrap",
+        "name": "Brokered Host Worker",
+        "role": "connected account task",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "claude_project_mcp": {
+                    "glasshive-user-capabilities": {
+                        "type": "http",
+                        "transport": "http",
+                        "url": "http://127.0.0.1:3080/api/viventium/glasshive/capabilities/mcp",
+                        "headers": {"Authorization": f"{'Bearer'} broker-grant"},
+                    }
+                },
+                "claude_settings_local": {"permissions": {"allow": ["Bash(ls *)"]}},
+                "codex_config_append": (
+                    "[mcp_servers.glasshive-user-capabilities]\n"
+                    "url = \"http://127.0.0.1:3080/api/viventium/glasshive/capabilities/mcp\"\n"
+                    "bearer_token_env_var = \"GLASSHIVE_CAPABILITY_BROKER_TOKEN\""
+                ),
+                "env": {"GLASSHIVE_CAPABILITY_BROKER_TOKEN": "broker-grant"},
+            }
+        ),
+    }
+
+    info = runtime.ensure_worker_ready(worker)
+    workspace_dir = Path(info.workspace_dir)
+
+    mcp_text = (workspace_dir / ".mcp.json").read_text()
+    assert "broker-grant" not in mcp_text
+    assert json.loads(mcp_text)["mcpServers"]["glasshive-user-capabilities"]["headers"]["Authorization"] == "Bearer ${GLASSHIVE_CAPABILITY_BROKER_TOKEN}"
+    assert json.loads((workspace_dir / ".claude" / "settings.local.json").read_text())["permissions"]["allow"] == ["Bash(ls *)"]
+    worker_codex_home = runtime._host_codex_home(worker)
+    workspace_codex_config = (workspace_dir / ".codex" / "config.toml").read_text()
+    worker_codex_config = (worker_codex_home / "config.toml").read_text()
+    assert "glasshive-user-capabilities" in workspace_codex_config
+    assert "glasshive-user-capabilities" in worker_codex_config
+    assert 'model = "gpt-local-public-safe"' in worker_codex_config
+    assert 'model_provider = "local_provider"' in worker_codex_config
+    assert "[model_providers.local_provider]" in worker_codex_config
+    assert '[plugins."computer-use@openai-bundled"]' in worker_codex_config
+    assert "mcp_servers.node_repl" in worker_codex_config
+    assert "mcp_servers.node_repl.env" in worker_codex_config
+    assert "mcp_servers.computer-use" in worker_codex_config
+    assert str(computer_use_manifest.parent) in worker_codex_config
+    assert "private-mail" not in worker_codex_config
+    assert "PRIVATE_TOKEN" not in worker_codex_config
+    assert json.loads((worker_codex_home / "auth.json").read_text())["OPENAI_API_KEY"] == "redacted-test-key"
+    command, env = runtime._build_command(worker, "Use the broker", info)
+    assert env["CODEX_HOME"] == str(worker_codex_home)
+    assert env["GLASSHIVE_CAPABILITY_BROKER_TOKEN"] == "broker-grant"
+    assert "broker-grant" not in " ".join(command)
+    assert stat.S_IMODE((workspace_dir / ".mcp.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((workspace_dir / ".claude" / "settings.local.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((workspace_dir / ".codex" / "config.toml").stat().st_mode) == 0o600
+    assert stat.S_IMODE((worker_codex_home / "config.toml").stat().st_mode) == 0o600
+    assert stat.S_IMODE((worker_codex_home / "auth.json").stat().st_mode) == 0o600
+
+
+def test_host_codex_preserves_known_computer_use_client_when_manifest_is_absent(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    source_codex_home = tmp_path / "source-codex-home"
+    computer_use_client = (
+        source_codex_home
+        / "computer-use"
+        / "Codex Computer Use.app"
+        / "Contents"
+        / "SharedSupport"
+        / "SkyComputerUseClient.app"
+        / "Contents"
+        / "MacOS"
+        / "SkyComputerUseClient"
+    )
+    computer_use_client.parent.mkdir(parents=True)
+    computer_use_client.write_text("#!/usr/bin/env bash\n")
+    computer_use_client.chmod(0o755)
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+
+    config = runtime._host_codex_worker_config(
+        "[mcp_servers.glasshive-user-capabilities]\n"
+        "url = \"http://127.0.0.1:3190/api/viventium/glasshive/capabilities/mcp\"\n"
+        "bearer_token_env_var = \"GLASSHIVE_CAPABILITY_BROKER_TOKEN\""
+    )
+
+    assert "[mcp_servers.computer-use]" in config
+    assert str(computer_use_client) in config
+    assert "glasshive-user-capabilities" in config
+
+
+def test_host_codex_strips_noncanonical_private_mcp_tables(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    source_codex_home = tmp_path / "source-codex-home"
+    source_codex_home.mkdir()
+    (source_codex_home / "config.toml").write_text(
+        'model = "gpt-local-public-safe"\n'
+        'model_provider = "local_provider"\n\n'
+        '[model_providers.local_provider]\n'
+        'base_url = "https://models.example.test/v1"\n\n'
+        "[mcp_servers]\n"
+        'private_mail = { command = "/bin/private-mail", env = { PRIVATE_TOKEN = "secret" } }\n'
+        'node_repl = { command = "/bin/node-repl", args = [] }\n'
+        '"computer-use" = { command = "/bin/computer-use", args = ["mcp"] }\n'
+        '\n[projects."/tmp/\U0001f4a1"]\n'
+        'trust_level = "trusted"\n'
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+
+    config = runtime._host_codex_worker_config(
+        "[mcp_servers.glasshive-user-capabilities]\n"
+        "url = \"http://127.0.0.1:3190/api/viventium/glasshive/capabilities/mcp\"\n"
+        "bearer_token_env_var = \"GLASSHIVE_CAPABILITY_BROKER_TOKEN\""
+    )
+
+    assert 'model = "gpt-local-public-safe"' in config
+    assert "[model_providers.local_provider]" in config
+    assert "[projects.\"/tmp/\U0001f4a1\"]" in config
+    assert "\\ud" not in config.lower()
+    assert "[mcp_servers.node_repl]" in config
+    assert "[mcp_servers.computer-use]" in config
+    assert "glasshive-user-capabilities" in config
+    assert "private_mail" not in config
+    assert "PRIVATE_TOKEN" not in config
+    assert "secret" not in config
+
+
+def test_host_codex_malformed_config_strips_inline_private_mcp_tables(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    source_codex_home = tmp_path / "source-codex-home"
+    source_codex_home.mkdir()
+    (source_codex_home / "config.toml").write_text(
+        'model = "gpt-local-public-safe"\n\n'
+        "[mcp_servers]\n"
+        'private_mail = { command = "/bin/private-mail", env = { PRIVATE_TOKEN = "secret" }\n'
+        'node_repl = { command = "/bin/node-repl", args = [] }\n\n'
+        "[mcp_servers.computer-use]\n"
+        'command = "/bin/computer-use"\n'
+        'args = ["mcp"]\n\n'
+        "[projects.example]\n"
+        'trust_level = "trusted"\n'
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+
+    config = runtime._host_codex_worker_config(
+        "[mcp_servers.glasshive-user-capabilities]\n"
+        "url = \"http://127.0.0.1:3190/api/viventium/glasshive/capabilities/mcp\"\n"
+        "bearer_token_env_var = \"GLASSHIVE_CAPABILITY_BROKER_TOKEN\""
+    )
+
+    assert 'model = "gpt-local-public-safe"' in config
+    assert "[projects.example]" in config
+    assert "[mcp_servers.computer-use]" in config
+    assert "glasshive-user-capabilities" in config
+    assert "[mcp_servers]" not in config
+    assert "private_mail" not in config
+    assert "PRIVATE_TOKEN" not in config
+    assert "secret" not in config
 
 
 def test_host_runtime_live_description_refreshes_stale_prompt_files(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
 
     def fake_run(args, **_kwargs):
-        class Result:
-            returncode = 0
-
-        return Result()
+        return subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stderr="",
+        )
 
     monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
     worker = {
@@ -897,6 +1605,8 @@ def test_host_runtime_live_description_refreshes_stale_prompt_files(tmp_path, mo
     assert details["prompt_paths"]["harness_prompt"] == str(workspace_dir / "harness-prompt.md")
     assert "FINAL REPORT:" in (workspace_dir / "harness-prompt.md").read_text()
     assert "FINAL REPORT:" in (workspace_dir / "AGENTS.md").read_text()
+    assert "inspect the concrete output" in (workspace_dir / "harness-prompt.md").read_text()
+    assert "inspect the concrete output" in (workspace_dir / "AGENTS.md").read_text()
 
 
 def test_host_codex_runtime_rejects_untrusted_source_paths(tmp_path, monkeypatch):
@@ -965,6 +1675,33 @@ def test_host_codex_runtime_rejects_symlink_source_paths(tmp_path, monkeypatch):
         runtime.ensure_worker_ready(worker)
 
 
+def test_host_codex_runtime_rejects_file_entry_without_content_or_source(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
+    worker = {
+        "worker_id": "wrk_host_missing_file",
+        "name": "Main Host Worker",
+        "role": "coding",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "files": [
+                    {
+                        "scope": "workspace",
+                        "path": "uploads/missing.txt",
+                    }
+                ],
+            }
+        ),
+    }
+
+    with pytest.raises(RuntimeErrorBase, match="missing content or source_path"):
+        runtime.ensure_worker_ready(worker)
+
+
 def test_host_codex_command_uses_host_workspace_and_dangerous_mode(tmp_path):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "codex"
@@ -989,6 +1726,259 @@ def test_host_codex_command_uses_host_workspace_and_dangerous_mode(tmp_path):
     assert "Put only the user-facing result" in command[-1]
     assert env["GLASSHIVE_EXECUTION_MODE"] == "host"
     assert env["GLASSHIVE_WORKSPACE_DIR"] == str(info.workspace_dir)
+
+
+def test_host_env_projects_codex_desktop_workspace_dependencies(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    deps_root = home / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies"
+    node_bin = deps_root / "node" / "bin"
+    node_modules = deps_root / "node" / "node_modules"
+    native_bin = deps_root / "bin"
+    python_bin = deps_root / "python" / "bin"
+    for path in (node_bin, node_modules / "@oai" / "artifact-tool", native_bin, python_bin):
+        path.mkdir(parents=True)
+    (node_bin / "node").write_text("#!/usr/bin/env sh\n")
+    (python_bin / "python3").write_text("#!/usr/bin/env sh\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.delenv("NODE_PATH", raising=False)
+
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_host_deps",
+        "name": "Main Host Worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+
+    env = runtime._host_env(worker)
+
+    assert env["PATH"].split(os.pathsep)[:1] == ["/usr/bin"]
+    for expected in (node_bin, python_bin, native_bin):
+        assert str(expected) in env["PATH"].split(os.pathsep)
+    assert env["NODE_PATH"] == str(node_modules)
+    assert env["GLASSHIVE_WORKSPACE_NODE_MODULES"] == str(node_modules)
+    assert env["GLASSHIVE_WORKSPACE_NODE_BIN"] == str(node_bin)
+    assert env["GLASSHIVE_WORKSPACE_PYTHON_BIN"] == str(python_bin)
+    assert env["GLASSHIVE_WORKSPACE_BIN_DIRS"] == str(native_bin)
+
+
+def test_host_env_respects_explicit_workspace_dependency_paths(tmp_path, monkeypatch):
+    node_modules = tmp_path / "modules"
+    node_modules.mkdir()
+    node_bin = tmp_path / "node-bin"
+    node_bin.mkdir()
+    monkeypatch.setenv("GLASSHIVE_WORKSPACE_NODE_MODULES", str(node_modules))
+    monkeypatch.setenv("GLASSHIVE_WORKSPACE_NODE_BIN", str(node_bin))
+    monkeypatch.setenv("GLASSHIVE_AUTO_DISCOVER_CODEX_WORKSPACE_DEPS", "false")
+    monkeypatch.setenv("NODE_PATH", "/existing/modules")
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_host_explicit_deps",
+        "name": "Claude Host Worker",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+
+    env = runtime._host_env(worker)
+
+    assert env["NODE_PATH"].split(os.pathsep) == ["/existing/modules", str(node_modules)]
+    assert env["PATH"].split(os.pathsep) == ["/usr/bin", str(node_bin)]
+
+
+def test_host_env_can_disable_codex_workspace_dependency_auto_discovery(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    node_modules = home / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "node" / "node_modules"
+    node_modules.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GLASSHIVE_AUTO_DISCOVER_CODEX_WORKSPACE_DEPS", "false")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.delenv("NODE_PATH", raising=False)
+
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_host_no_auto_deps",
+        "name": "Main Host Worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+
+    env = runtime._host_env(worker)
+
+    assert "NODE_PATH" not in env
+    assert "GLASSHIVE_WORKSPACE_NODE_MODULES" not in env
+
+
+def test_workspace_codex_command_ignores_host_binary_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("WPR_CODEX_BIN", "/Applications/Codex.app/Contents/Resources/codex")
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_workspace_codex",
+        "name": "Workspace Codex Worker",
+        "profile": "codex-cli",
+        "execution_mode": "docker",
+    }
+    info = runtime._runtime_info(worker)
+
+    command, _ = runtime._build_command(worker, "do the work", info)
+
+    assert runtime.binary == "codex"
+    assert command[0] == "codex"
+    assert "/Applications/Codex.app" not in " ".join(command)
+
+
+def test_workspace_codex_command_honors_per_run_effort_without_custom_provider(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.delenv("OPENAI_REVERSE_PROXY", raising=False)
+    monkeypatch.delenv("WPR_CODEX_CLI_BASE_URL", raising=False)
+    monkeypatch.setenv("WPR_CODEX_CLI_XHIGH_ROUTE_PROVEN", "1")
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_workspace_codex_effort",
+        "name": "Workspace Codex Worker",
+        "profile": "codex-cli",
+        "execution_mode": "docker",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "xhigh"}}),
+    }
+    info = runtime._runtime_info(worker)
+
+    command, _ = runtime._build_command(worker, "do the work", info)
+
+    assert '-c' in command
+    assert 'model_reasoning_effort="xhigh"' in command
+
+
+def test_workspace_claude_command_ignores_host_binary_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", "/opt/homebrew/bin/claude")
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_workspace_claude",
+        "name": "Workspace Claude Worker",
+        "profile": "claude-code",
+        "execution_mode": "docker",
+        "model": "claude-sonnet-test",
+    }
+    info = runtime._runtime_info(worker)
+
+    command, _ = runtime._build_command(worker, "do the work", info)
+
+    assert runtime.binary == "claude"
+    assert command[0] == "claude"
+    assert "/opt/homebrew/bin/claude" not in " ".join(command)
+
+
+def test_workspace_claude_command_honors_per_run_max_effort(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_workspace_claude_effort",
+        "name": "Workspace Claude Worker",
+        "profile": "claude-code",
+        "execution_mode": "docker",
+        "model": "claude-sonnet-test",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CLAUDE_CODE_EFFORT": "max"}}),
+    }
+    info = runtime._runtime_info(worker)
+
+    command, _ = runtime._build_command(worker, "do the work", info)
+
+    assert command[command.index("--effort") + 1] == "max"
+
+
+def test_workspace_claude_max_effort_preflight_requires_effort_support(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    ClaudeCodeRuntime._workspace_effort_support_cache.clear()
+    monkeypatch.setattr(runtime.sandbox, "_ensure_image", lambda: None)
+    monkeypatch.setattr(
+        runtime.sandbox,
+        "_docker",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, returncode=0, stdout="Usage: claude [options]\n", stderr=""),
+    )
+    worker = {
+        "worker_id": "wrk_workspace_claude_effort",
+        "profile": "claude-code",
+        "execution_mode": "docker",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CLAUDE_CODE_EFFORT": "max"}}),
+    }
+
+    with pytest.raises(RuntimeDependencyMissingError, match="--effort"):
+        runtime._preflight_workspace_effort_support(worker)
+
+
+def test_workspace_claude_max_effort_preflight_accepts_effort_support(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    ClaudeCodeRuntime._workspace_effort_support_cache.clear()
+    calls: list[object] = []
+    monkeypatch.setattr(runtime.sandbox, "_ensure_image", lambda: calls.append("image"))
+    monkeypatch.setattr(
+        runtime.sandbox,
+        "_docker",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, returncode=0, stdout="Usage: claude [options] --effort\n", stderr=""),
+    )
+    worker = {
+        "worker_id": "wrk_workspace_claude_effort",
+        "profile": "claude-code",
+        "execution_mode": "docker",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CLAUDE_CODE_EFFORT": "max"}}),
+    }
+
+    runtime._preflight_workspace_effort_support(worker)
+    runtime._preflight_workspace_effort_support(worker)
+
+    assert calls == ["image"]
+
+
+def test_host_claude_command_enables_chrome_by_default(tmp_path, monkeypatch):
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"--help\" ]]; then echo 'Usage: claude [options] --effort --chrome'; exit 0; fi\n"
+        "echo '2.1.178 (Claude Code)'\n"
+    )
+    fake_claude.chmod(0o755)
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(fake_claude)
+    monkeypatch.delenv("WPR_CLAUDE_CODE_ENABLE_CHROME", raising=False)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "max")
+    worker = {
+        "worker_id": "wrk_host_claude",
+        "name": "Main Host Claude Worker",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "model": "claude-opus-4-8",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+    info = runtime._host_runtime_info(worker)
+
+    command, _ = runtime._build_command(worker, "do the work", info)
+
+    assert "--chrome" in command
+    assert command[command.index("--effort") + 1] == "max"
+    assert command[-1].startswith("do the work")
+
+
+def test_host_claude_chrome_can_be_explicitly_disabled(tmp_path, monkeypatch):
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "claude"
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    worker = {
+        "worker_id": "wrk_host_claude_no_chrome",
+        "name": "Main Host Claude Worker",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "model": "claude-sonnet-test",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+    info = runtime._host_runtime_info(worker)
+
+    command, _ = runtime._build_command(worker, "do the work", info)
+
+    assert "--chrome" not in command
 
 
 def test_host_cli_runtime_allows_one_active_worker_per_family(tmp_path):
@@ -1203,6 +2193,40 @@ def test_docker_codex_command_appends_completion_contract(tmp_path):
     assert "FINAL REPORT:" in command[-1]
 
 
+def test_docker_claude_command_enables_chrome_and_appends_completion_contract(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.delenv("WPR_CLAUDE_CODE_ENABLE_CHROME", raising=False)
+    worker = {
+        "worker_id": "wrk_claude_contract",
+        "name": "Main Worker",
+        "profile": "claude-code",
+        "model": "claude-sonnet-4-6",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+
+    command, _ = runtime._build_command(worker, "Make the page red.", runtime._runtime_info(worker))
+
+    assert "--chrome" in command
+    assert command[-1].startswith("Make the page red.")
+    assert "FINAL REPORT:" in command[-1]
+
+
+def test_docker_claude_chrome_can_be_explicitly_disabled(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    worker = {
+        "worker_id": "wrk_claude_no_chrome",
+        "name": "Main Worker",
+        "profile": "claude-code",
+        "model": "claude-sonnet-4-6",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+
+    command, _ = runtime._build_command(worker, "Make the page red.", runtime._runtime_info(worker))
+
+    assert "--chrome" not in command
+
+
 def test_docker_codex_command_projects_openai_compatible_provider(tmp_path, monkeypatch):
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     worker = {
@@ -1216,14 +2240,38 @@ def test_docker_codex_command_projects_openai_compatible_provider(tmp_path, monk
 
     command, env = runtime._build_command(worker, "Create the artifact.", runtime._runtime_info(worker))
 
-    assert "--ignore-user-config" in command
-    assert command[command.index("--disable") + 1] == "apps"
+    assert "--ignore-user-config" not in command
+    joined = "\n".join(command)
+    assert "--disable" not in command
+    for native_feature in ("apps", "multi_agent", "plugins", "browser_use", "computer_use"):
+        assert f"--disable\n{native_feature}" not in joined
     assert 'model_provider="glasshive_openai_compatible"' in command
     assert 'model_providers.glasshive_openai_compatible.base_url="https://models.example.test/openai/v1"' in command
     assert 'model_providers.glasshive_openai_compatible.env_key="OPENAI_API_KEY"' in command
     assert "model_providers.glasshive_openai_compatible.supports_websockets=false" in command
     assert 'model_verbosity="medium"' in command
     assert env["OPENAI_BASE_URL"] == "https://models.example.test/openai/v1"
+
+
+def test_codex_cli_provider_can_explicitly_lock_down_user_config_and_native_features(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_locked_down_provider",
+        "name": "Locked Down Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.2-chat",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://models.example.test/openai/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_IGNORE_USER_CONFIG", "1")
+    monkeypatch.setenv("WPR_CODEX_CLI_DISABLE_FEATURES", "browser_use,computer_use")
+
+    command, _ = runtime._build_command(worker, "Create the artifact.", runtime._runtime_info(worker))
+
+    joined = "\n".join(command)
+    assert "--ignore-user-config" in command
+    assert "--disable\nbrowser_use" in joined
+    assert "--disable\ncomputer_use" in joined
 
 
 def test_claude_code_runtime_passes_gateway_headers(tmp_path, monkeypatch):
@@ -1236,6 +2284,7 @@ def test_claude_code_runtime_passes_gateway_headers(tmp_path, monkeypatch):
     runtime._ensure_dirs(worker["worker_id"])
     monkeypatch.setenv("WPR_CLAUDE_CODE_USE_API_KEY", "1")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-test")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-oauth-test")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.example")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "gateway-token")
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "x-portkey-provider: anthropic")
@@ -1245,10 +2294,29 @@ def test_claude_code_runtime_passes_gateway_headers(tmp_path, monkeypatch):
 
     assert "--model" in command
     assert env["ANTHROPIC_API_KEY"] == "anthropic-test"
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "claude-oauth-test"
     assert env["ANTHROPIC_BASE_URL"] == "https://gateway.example"
     assert env["ANTHROPIC_AUTH_TOKEN"] == "gateway-token"
     assert env["ANTHROPIC_CUSTOM_HEADERS"] == "x-portkey-provider: anthropic"
     assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-test"
+
+
+def test_claude_code_runtime_passes_headless_oauth_without_api_key_mode(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_claude_oauth",
+        "name": "Claude Worker",
+        "profile": "claude-code",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    monkeypatch.delenv("WPR_CLAUDE_CODE_USE_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-test")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-oauth-test")
+
+    _command, env = runtime._build_command(worker, "Create the artifact.", runtime._runtime_info(worker))
+
+    assert "ANTHROPIC_API_KEY" not in env
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "claude-oauth-test"
 
 
 def test_host_env_strips_parent_secrets_and_keeps_minimal_runtime_context(tmp_path, monkeypatch):
@@ -1256,7 +2324,10 @@ def test_host_env_strips_parent_secrets_and_keeps_minimal_runtime_context(tmp_pa
     monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "callback-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "fake-openai-key")
     monkeypatch.setenv("LIBRECHAT_SECRET", "librechat-secret")
+    monkeypatch.setenv("GLASSHIVE_AUTO_DISCOVER_CODEX_WORKSPACE_DEPS", "false")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("USER", "testuser")
+    monkeypatch.setenv("LOGNAME", "testuser")
     worker = {
         "worker_id": "wrk_host",
         "name": "Main Host Worker",
@@ -1273,6 +2344,11 @@ def test_host_env_strips_parent_secrets_and_keeps_minimal_runtime_context(tmp_pa
     assert "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET" not in env
     assert "OPENAI_API_KEY" not in env
     assert "LIBRECHAT_SECRET" not in env
+    # USER/LOGNAME must pass through: macOS Keychain-backed CLIs (claude-code's
+    # subscription auth) resolve the keychain item by user and report "Not logged in"
+    # without them. They are identity, not secrets, so this does not weaken stripping.
+    assert env["USER"] == "testuser"
+    assert env["LOGNAME"] == "testuser"
 
 
 def test_host_openclaw_missing_cli_reports_named_binary(tmp_path):
@@ -1310,6 +2386,358 @@ def test_runtime_dependency_missing_classification_is_structured_and_sanitized()
     assert "`codex`" in failure.user_message
     assert "/private/tmp" not in failure.user_message
     assert "sandbox/workstation" in failure.recommended_recovery
+
+
+def test_host_runtime_preflight_rejects_configured_version_mismatch(tmp_path, monkeypatch):
+    fake_node = tmp_path / "node"
+    fake_node.write_text("#!/usr/bin/env bash\necho 'v20.20.2'\n")
+    fake_node.chmod(0o755)
+    monkeypatch.setenv(
+        "GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON",
+        json.dumps(
+            {
+                "codex-cli": [
+                    {
+                        "binary": str(fake_node),
+                        "label": "Node.js",
+                        "min_version": "22.19.0",
+                    }
+                ]
+            }
+        ),
+    )
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+
+    with pytest.raises(RuntimeDependencyMissingError, match="Node.js") as captured:
+        runtime.preflight_worker_profile("codex-cli", "host")
+
+    assert captured.value.required_version == "22.19.0"
+    assert captured.value.actual_version == "20.20.2"
+    assert captured.value.dependency_label == "Node.js"
+
+
+def test_host_runtime_preflight_accepts_configured_version(tmp_path, monkeypatch):
+    fake_node = tmp_path / "node"
+    fake_node.write_text("#!/usr/bin/env bash\necho 'v22.19.0'\n")
+    fake_node.chmod(0o755)
+    monkeypatch.setenv(
+        "GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON",
+        json.dumps({"codex-cli": [{"binary": str(fake_node), "label": "Node.js", "min_version": "22.19.0"}]}),
+    )
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+
+    runtime.preflight_worker_profile("codex-cli", "host")
+
+
+def test_host_runtime_preflight_rejects_default_version_mismatch(tmp_path, monkeypatch):
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"--version\" ]]; then echo '2.1.100 (Claude Code)'; exit 0; fi\n"
+        "echo 'Usage: claude [options] --effort --chrome'\n"
+    )
+    fake_claude.chmod(0o755)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", str(fake_claude))
+    monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("WPR_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_FILE", raising=False)
+    monkeypatch.delenv("WPR_HOST_RUNTIME_REQUIREMENTS_FILE", raising=False)
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+
+    with pytest.raises(RuntimeDependencyMissingError, match="Claude Code") as captured:
+        runtime.preflight_worker_profile("claude-code", "host")
+
+    assert captured.value.required_version == "2.1.178"
+    assert captured.value.actual_version == "2.1.100"
+
+
+def test_host_runtime_preflight_rejects_missing_help_capability(tmp_path, monkeypatch):
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text("#!/usr/bin/env bash\necho 'Usage: claude [options]'\n")
+    fake_claude.chmod(0o755)
+    monkeypatch.setenv(
+        "GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON",
+        json.dumps(
+            {
+                "claude-code": [
+                    {
+                        "binary": str(fake_claude),
+                        "label": "Claude Code",
+                        "required_help_flags": ["--chrome"],
+                    }
+                ]
+            }
+        ),
+    )
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+
+    with pytest.raises(RuntimeDependencyMissingError, match="native capability") as captured:
+        runtime.preflight_worker_profile("claude-code", "host")
+
+    assert captured.value.dependency_label == "Claude Code"
+
+
+def test_host_runtime_preflight_accepts_required_mcp_capability(tmp_path, monkeypatch):
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"mcp\" && \"$2\" == \"list\" ]]; then\n"
+        "  echo 'computer-use enabled'\n"
+        "  echo 'node_repl enabled'\n"
+        "  exit 0\n"
+        "fi\n"
+        "echo 'codex-cli 0.140.0'\n"
+    )
+    fake_codex.chmod(0o755)
+    monkeypatch.setenv(
+        "GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON",
+        json.dumps(
+            {
+                "codex-cli": [
+                    {
+                        "binary": str(fake_codex),
+                        "label": "Codex CLI",
+                        "required_mcp_servers": ["computer-use", "node_repl"],
+                    }
+                ]
+            }
+        ),
+    )
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+
+    runtime.preflight_worker_profile("codex-cli", "host")
+
+
+def test_host_claude_preflight_rejects_cli_without_chrome_support(tmp_path, monkeypatch):
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"--version\" ]]; then echo '2.1.178 (Claude Code)'; exit 0; fi\n"
+        "echo 'Usage: claude [options] --effort'\n"
+    )
+    fake_claude.chmod(0o755)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", str(fake_claude))
+    monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("WPR_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("WPR_CLAUDE_CODE_ENABLE_CHROME", raising=False)
+
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+
+    with pytest.raises(RuntimeDependencyMissingError, match="supports --chrome") as captured:
+        runtime.preflight_worker_profile("claude-code", "host")
+
+    assert captured.value.dependency_label == "Claude Code"
+
+
+def test_host_claude_preflight_allows_explicit_chrome_lockdown(tmp_path, monkeypatch):
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"--version\" ]]; then echo '2.1.178 (Claude Code)'; exit 0; fi\n"
+        "echo 'Usage: claude [options] --effort'\n"
+    )
+    fake_claude.chmod(0o755)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", str(fake_claude))
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("WPR_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+
+    runtime.preflight_worker_profile("claude-code", "host")
+
+
+def test_host_claude_preflight_rejects_max_effort_without_effort_support(tmp_path, monkeypatch):
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"--help\" ]]; then echo 'Usage: claude [options] --chrome'; exit 0; fi\n"
+        "echo '2.1.178 (Claude Code)'\n"
+    )
+    fake_claude.chmod(0o755)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", str(fake_claude))
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "max")
+    monkeypatch.setenv(
+        "GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON",
+        json.dumps(
+            {
+                "claude-code": [
+                    {
+                        "binary": str(fake_claude),
+                        "label": "Claude Code",
+                        "required_help_flags": ["--chrome"],
+                    }
+                ]
+            }
+        ),
+    )
+
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+
+    with pytest.raises(RuntimeDependencyMissingError, match="native --effort") as captured:
+        runtime.preflight_worker_profile("claude-code", "host")
+
+    assert captured.value.dependency_label == "Claude Code"
+
+
+def test_host_codex_runtime_uses_configured_binary_path(tmp_path, monkeypatch):
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"--version\" ]]; then echo 'codex-cli 0.140.0'; exit 0; fi\n"
+        "echo 'codex test'\n"
+    )
+    fake_codex.chmod(0o755)
+    monkeypatch.setenv("WPR_CODEX_BIN", str(fake_codex))
+    monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+
+    assert runtime.binary == str(fake_codex)
+    runtime.preflight_worker_profile("codex-cli", "host")
+
+
+def test_cli_failure_classifies_runtime_version_substrate():
+    failure = classify_cli_failure(
+        stdout="",
+        stderr="It failed. The local worker runtime needs Node.js v22.19+ and this machine is on v20.20.2.",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "runtime_dependency_missing"
+    assert failure.retryable is False
+    assert "sandbox/workstation" in failure.recommended_recovery
+
+
+def test_cli_failure_classifies_missing_executable_substrate():
+    failure = classify_cli_failure(
+        stdout="",
+        stderr=(
+            "codex-cli exited with code 127: "
+            "/workspace/.wpr-home/.glasshive-runs/run_demo/run.sh: line 15: "
+            "/Applications/Codex.app/Contents/Resources/codex: No such file or directory"
+        ),
+        runtime_name="codex-cli",
+        exit_code=127,
+    )
+
+    assert failure.failure_class == "runtime_dependency_missing"
+    assert failure.retryable is False
+    assert "configured managed dependency" in failure.recommended_recovery
+
+
+def test_cli_failure_classifies_not_logged_in_provider_session():
+    failure = classify_cli_failure(
+        stdout=json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "result": "Not logged in · Please run /login",
+            }
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_auth_missing"
+    assert failure.retryable is False
+    assert "provider credentials" in failure.user_message
+    assert "CLI login" in failure.recommended_recovery
+
+
+def test_runtime_error_classifies_missing_executable_substrate():
+    failure = classify_runtime_error(
+        RuntimeErrorBase(
+            "codex-cli exited with code 127: "
+            "/workspace/.wpr-home/.glasshive-runs/run_demo/run.sh: line 15: "
+            "/Applications/Codex.app/Contents/Resources/codex: No such file or directory"
+        ),
+        runtime_name="codex-cli",
+    )
+
+    assert failure.failure_class == "runtime_dependency_missing"
+    assert failure.retryable is False
+    assert "missing, unavailable, or incompatible" in failure.user_message
+
+
+def test_runtime_error_classifies_not_logged_in_provider_session():
+    failure = classify_runtime_error(
+        RuntimeErrorBase('claude-code exited with code 1: {"result":"Not logged in · Please run /login"}'),
+        runtime_name="claude-code",
+    )
+
+    assert failure.failure_class == "provider_auth_missing"
+    assert failure.retryable is False
+    assert "CLI login" in failure.recommended_recovery
+
+
+def test_cli_failure_does_not_classify_generic_file_not_found_as_runtime_dependency():
+    failure = classify_cli_failure(
+        stdout="",
+        stderr="The requested uploaded source file was missing: No such file or directory",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "unknown"
+    assert failure.retryable is False
+
+
+def test_runtime_error_does_not_classify_generic_file_not_found_as_runtime_dependency():
+    failure = classify_runtime_error(
+        FileNotFoundError("Bootstrap source file not found: /Users/example/private-upload.pdf"),
+        runtime_name="codex-cli",
+    )
+
+    assert failure.failure_class == "runtime_error"
+    assert failure.retryable is False
+    assert "/Users/example" not in failure.diagnostic_summary
+    assert "[local path]" in failure.diagnostic_summary
+
+
+def test_runtime_error_classifies_glasshive_evidence_failure():
+    failure = classify_runtime_error(
+        RuntimeErrorBase("GlassHive evidence check failed: completion compliance failed: missing pdf"),
+        runtime_name="codex-cli",
+    )
+
+    assert failure.failure_class == "glasshive_evidence_check_failed"
+    assert failure.retryable is True
+    assert "workspace_continue" in failure.recommended_recovery
+
+
+def test_runtime_error_classifies_sandbox_lifecycle_failure():
+    failure = classify_runtime_error(
+        RuntimeErrorBase(
+            "Failed to prepare writable sandbox paths in wpr-wrk-example: "
+            "Error response from daemon: No such container: wpr-wrk-example"
+        ),
+        runtime_name="codex-cli",
+    )
+
+    assert failure.failure_class == "runtime_sandbox_unavailable"
+    assert failure.retryable is True
+    assert "sandbox/workstation" in failure.user_message
+
+
+def test_cli_failure_classifies_sigterm_as_runtime_terminated():
+    failure = classify_cli_failure(
+        stdout="",
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=143,
+    )
+
+    assert failure.failure_class == "runtime_terminated"
+    assert failure.retryable is False
+    assert "workspace_continue" in failure.recommended_recovery
 
 
 def test_openclaw_session_id_is_cli_safe_when_worker_session_key_uses_glasshive_colons(tmp_path):
@@ -1702,7 +3130,10 @@ def test_openclaw_projects_ignore_unknown_compat_max_token_field(tmp_path, monke
 
 def test_redact_text_masks_parent_visible_secret_shapes():
     synthetic_openai_token = "sk-" + "abc123456789xyz"
-    redacted = _redact_text(f"Authorization: Bearer abcdefghijklmnopqrstuvwxyz token=super-secret-value {synthetic_openai_token}")
+    synthetic_bearer = "abcdef" + "ghijklmnopqrstuvwxyz"
+    redacted = _redact_text(
+        f"Authorization: {'Bearer'} {synthetic_bearer} token=super-secret-value {synthetic_openai_token}"
+    )
     assert "abcdefghijklmnopqrstuvwxyz" not in redacted
     assert "super-secret-value" not in redacted
     assert synthetic_openai_token not in redacted

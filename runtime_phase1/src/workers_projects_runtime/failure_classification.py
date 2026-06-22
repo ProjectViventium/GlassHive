@@ -65,14 +65,35 @@ def classify_cli_failure(
             ),
             diagnostic_summary=diagnostic_summary,
         )
-    if "401" in lowered or "403" in lowered or "unauthorized" in lowered or "invalid api key" in lowered:
+    if _looks_like_provider_service_failure(lowered, structured=bool(evidence)):
+        return FailureClassification(
+            failure_class="provider_response_failed",
+            retryable=True,
+            user_message=(
+                "The model provider was temporarily unavailable or overloaded before the worker could finish."
+            ),
+            recommended_recovery=(
+                "Use workspace_continue to resume from the same workspace after a short wait, preserving "
+                "the original task and any files already produced."
+            ),
+            diagnostic_summary=diagnostic_summary,
+        )
+    if (
+        "401" in lowered
+        or "403" in lowered
+        or "unauthorized" in lowered
+        or "invalid api key" in lowered
+        or "not logged in" in lowered
+        or "please run /login" in lowered
+        or "please run login" in lowered
+    ):
         return FailureClassification(
             failure_class="provider_auth_missing",
             retryable=False,
             user_message="The worker could not use the configured model provider credentials.",
             recommended_recovery=(
-                "Fix the provider key or route configuration, then use workspace_continue to resume the "
-                "same workspace."
+                "Fix the provider key, route configuration, or CLI login projected into this worker, "
+                "then use workspace_continue to resume the same workspace."
             ),
             diagnostic_summary=diagnostic_summary,
         )
@@ -84,6 +105,48 @@ def classify_cli_failure(
             recommended_recovery=(
                 "Use workspace_continue to resume from the same workspace and ask the worker to continue "
                 "from the current files and notes."
+            ),
+            diagnostic_summary=diagnostic_summary,
+        )
+    if _looks_like_sandbox_lifecycle_failure(lowered):
+        return FailureClassification(
+            failure_class="runtime_sandbox_unavailable",
+            retryable=True,
+            user_message=(
+                "GlassHive could not prepare the selected worker sandbox/workstation before the run started."
+            ),
+            recommended_recovery=(
+                "Use workspace_continue after the sandbox service recovers, or choose another available "
+                "execution mode that still gives the worker its native capabilities."
+            ),
+            diagnostic_summary=diagnostic_summary,
+        )
+    if _looks_like_runtime_dependency_or_version_failure(lowered):
+        return FailureClassification(
+            failure_class="runtime_dependency_missing",
+            retryable=False,
+            user_message=(
+                "GlassHive could not complete the run because the selected worker runtime has a "
+                "missing, incompatible, or too-old local prerequisite."
+            ),
+            recommended_recovery=(
+                "Use a configured managed dependency, choose another available worker profile, or "
+                "use sandbox/workstation execution when that still satisfies the user's request. "
+                "Ask the operator to change the host service runtime only when no configured "
+                "recovery path is available."
+            ),
+            diagnostic_summary=diagnostic_summary,
+        )
+    if exit_code in {143, -15} or "sigterm" in lowered or "terminated" in lowered:
+        return FailureClassification(
+            failure_class="runtime_terminated",
+            retryable=False,
+            user_message=(
+                "The worker process was terminated before it could finish and report a result."
+            ),
+            recommended_recovery=(
+                "Open the View / Steer page to inspect any partial workspace state. Use "
+                "workspace_continue only if the work should resume from that state."
             ),
             diagnostic_summary=diagnostic_summary,
         )
@@ -130,21 +193,67 @@ def classify_runtime_error(
     runtime_label = str(getattr(exc, "runtime_name", "") or runtime_name or "worker").strip()
     profile = str(getattr(exc, "profile", "") or "").strip()
     binary = str(getattr(exc, "binary", "") or "").strip()
-    binary_label = binary.replace("\\", "/").rstrip("/").split("/")[-1] or binary
+    dependency_label = str(getattr(exc, "dependency_label", "") or "").strip()
+    binary_label = dependency_label or binary.replace("\\", "/").rstrip("/").split("/")[-1] or binary
+    required_version = str(getattr(exc, "required_version", "") or "").strip()
+    actual_version = str(getattr(exc, "actual_version", "") or "").strip()
+    recovery_hint = str(getattr(exc, "recovery_hint", "") or "").strip()
 
-    if "not installed" in lowered or "not on path" in lowered:
+    if (
+        "401" in lowered
+        or "403" in lowered
+        or "unauthorized" in lowered
+        or "invalid api key" in lowered
+        or "not logged in" in lowered
+        or "please run /login" in lowered
+        or "please run login" in lowered
+    ):
+        return FailureClassification(
+            failure_class="provider_auth_missing",
+            retryable=False,
+            user_message="The worker could not use the configured model provider credentials.",
+            recommended_recovery=(
+                recovery_hint
+                or "Fix the provider key, route, or CLI login projected into this worker, then use "
+                "workspace_continue to resume the same workspace."
+            ),
+            diagnostic_summary=message,
+        )
+    if _looks_like_sandbox_lifecycle_failure(lowered):
+        return FailureClassification(
+            failure_class="runtime_sandbox_unavailable",
+            retryable=True,
+            user_message=(
+                "GlassHive could not prepare the selected worker sandbox/workstation before the run started."
+            ),
+            recommended_recovery=(
+                recovery_hint
+                or "Use workspace_continue after the sandbox service recovers, or choose another available "
+                "execution mode that still gives the worker its native capabilities."
+            ),
+            diagnostic_summary=message,
+        )
+    if required_version or "not installed" in lowered or "not on path" in lowered or _looks_like_runtime_dependency_or_version_failure(lowered):
         binary_hint = f" (`{binary_label}`)" if binary_label else ""
         profile_hint = f" for `{profile}`" if profile else ""
+        version_hint = ""
+        if required_version:
+            version_hint = f" The required version is >= {required_version}."
+            if actual_version:
+                version_hint += f" Current version: {actual_version}."
         return FailureClassification(
             failure_class="runtime_dependency_missing",
             retryable=False,
             user_message=(
                 f"GlassHive could not start the selected worker{profile_hint} because the required "
-                f"host CLI{binary_hint} is not installed or not available to the GlassHive service."
+                f"host runtime dependency{binary_hint} is missing, unavailable, or incompatible."
+                f"{version_hint}"
             ),
             recommended_recovery=(
-                "Choose an available worker profile or sandbox/workstation execution mode, or ask the "
-                "operator to install/configure the missing CLI on the GlassHive service PATH."
+                recovery_hint
+                or "Use a configured managed dependency, choose another available worker profile, or use "
+                "sandbox/workstation execution when that still satisfies the user's request. Ask the "
+                "operator to change the host service runtime only when no configured recovery path is available."
             ),
             diagnostic_summary=message,
         )
@@ -190,6 +299,21 @@ def classify_runtime_error(
             ),
             diagnostic_summary=message,
         )
+    if "glasshive evidence check failed" in lowered:
+        return FailureClassification(
+            failure_class="glasshive_evidence_check_failed",
+            retryable=True,
+            user_message=(
+                f"The {runtime_label} worker finished a provider turn, but GlassHive verification found "
+                "that the result did not satisfy the generic completion or constraint contract."
+            ),
+            recommended_recovery=(
+                "Open the View / Steer page and inspect the artifacts/evidence. Use workspace_continue "
+                "to ask the same worker to repair the missing or invalid deliverables while preserving "
+                "the original request and constraints."
+            ),
+            diagnostic_summary=message,
+        )
 
     return FailureClassification(
         failure_class="runtime_error",
@@ -232,6 +356,8 @@ def _extract_failure_strings(value: Any, *, path: str = "") -> list[str]:
             if isinstance(child, str):
                 if _looks_failure_related(child) or _looks_failure_field(key):
                     results.append(f"{child_path}: {child}")
+            elif _looks_failure_field(key) and child is not None:
+                results.append(f"{child_path}: {child}")
             elif isinstance(child, (dict, list)):
                 results.extend(_extract_failure_strings(child, path=child_path))
     elif isinstance(value, list):
@@ -242,7 +368,63 @@ def _extract_failure_strings(value: Any, *, path: str = "") -> list[str]:
 
 def _looks_failure_field(key: str) -> bool:
     lowered = key.lower()
-    return lowered in {"error", "error_code", "message", "failure", "status_code", "detail"}
+    return lowered in {
+        "api_error_status",
+        "detail",
+        "error",
+        "error_code",
+        "failure",
+        "is_error",
+        "message",
+        "result",
+        "status_code",
+    }
+
+
+def _looks_like_provider_service_failure(lowered: str, *, structured: bool = False) -> bool:
+    if (
+        "api_error_status" in lowered and "529" in lowered
+    ) or (
+        "529" in lowered and "overloaded" in lowered
+    ) or (
+        "503" in lowered and ("service unavailable" in lowered or "temporarily unavailable" in lowered)
+    ):
+        return True
+    if not structured:
+        return False
+    return (
+        "overloaded" in lowered
+        or "server-side issue" in lowered
+        or "service unavailable" in lowered
+        or "temporarily unavailable" in lowered
+    )
+
+
+def _looks_like_runtime_dependency_or_version_failure(lowered: str) -> bool:
+    return (
+        "requires node" in lowered
+        or "needs node" in lowered
+        or "node.js v" in lowered
+        or "node v" in lowered
+        or "unsupported engine" in lowered
+        or "minimum node" in lowered
+        or "minimum version" in lowered
+        or "version mismatch" in lowered
+        or "too old" in lowered
+        or "exited with code 127" in lowered
+        or "executable file not found" in lowered
+    )
+
+
+def _looks_like_sandbox_lifecycle_failure(lowered: str) -> bool:
+    return (
+        "failed to prepare writable sandbox paths" in lowered
+        or "failed to create worker sandbox" in lowered
+        or "failed to start worker sandbox" in lowered
+        or ("worker sandbox" in lowered and "is not running" in lowered)
+        or "no such container" in lowered
+        or ("docker daemon" in lowered and "not running" in lowered)
+    )
 
 
 def _looks_failure_related(value: str) -> bool:
@@ -263,6 +445,14 @@ def _looks_failure_related(value: str) -> bool:
         "invalid api key",
         "response.failed",
         "turn.failed",
+        "api error",
+        "api_error_status",
+        "529",
+        "503",
+        "overloaded",
+        "server-side issue",
+        "service unavailable",
+        "temporarily unavailable",
     )
     return any(marker in lowered for marker in markers)
 
@@ -271,7 +461,9 @@ _FAILURE_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)((?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s\"']{6,}"), r"\1[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
+    (re.compile(r"\b(?:wrk|run|prj)_[A-Za-z0-9_-]{6,}\b"), "[glasshive-id]"),
     (re.compile(r"\b[A-Za-z0-9_]{8,}:[A-Za-z0-9_./+=-]{20,}\b"), "[REDACTED_CREDENTIAL]"),
+    (re.compile(r"(?:~\/|\/Users\/|\/home\/|\/private\/var\/|\/var\/folders\/|[A-Za-z]:\\Users\\)[^\s`'\"<>]+"), "[local path]"),
     (re.compile(r"(?i)data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{256,}"), "[REDACTED_IMAGE_BASE64]"),
     (re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{512,}={0,2}(?![A-Za-z0-9+/=])"), "[REDACTED_LONG_BASE64]"),
 )

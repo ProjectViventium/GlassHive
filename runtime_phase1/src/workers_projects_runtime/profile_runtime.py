@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import base64
+import hashlib
 import logging
 import os
 import re
@@ -11,11 +12,28 @@ import shutil
 import signal
 import subprocess
 import time
-from datetime import datetime
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 compatibility
+    import tomli as tomllib
+from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread
 
-from .bootstrap import refresh_runtime_env_for_worker, resolve_bootstrap_source_path
+from .bootstrap import (
+    GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
+    GLASSHIVE_NATIVE_CAPABILITY_INVENTORY,
+    GLASSHIVE_SAFETY_CHECKPOINT_RULE,
+    GLASSHIVE_WORKER_COMPLETION_CONTRACT,
+    bootstrap_env_for,
+    claude_project_mcp_payload_for_bundle,
+    glasshive_project_claude_md,
+    glasshive_project_codex_md,
+    merge_glasshive_worker_instructions,
+    refresh_project_runtime_files_for_worker,
+    refresh_runtime_env_for_worker,
+    resolve_bootstrap_source_path,
+)
 from .docker_sandbox import DockerSandboxManager
 from .failure_classification import classify_cli_failure
 from .openclaw_runtime import (
@@ -28,19 +46,564 @@ from .openclaw_runtime import (
     WorkerTerminatedError,
     _PROVIDER_ENV_KEYS,
 )
+from .runtime_requirements import host_runtime_requirement_issue
+from .run_evidence import (
+    build_constraint_ledger,
+    build_run_evidence,
+    write_constraint_ledger,
+    write_run_evidence,
+)
 from .terminal_takeover import TerminalTarget
 
 
 logger = logging.getLogger(__name__)
 
-_COMPLETION_CONTRACT = (
-    "GlassHive completion contract:\n"
-    "- Do the requested work before reporting completion.\n"
-    "- Your final assistant message MUST end with a separate section exactly named `FINAL REPORT:`.\n"
-    "- Put only the user-facing result after `FINAL REPORT:`. Include the concrete outcome, key facts, artifact/file names when useful, blockers, or the next decision needed.\n"
-    "- If the user requested a very short answer or an exact string, put only that answer after `FINAL REPORT:`.\n"
-    "- Do not put progress narration after `FINAL REPORT:`."
+_CODEX_MCP_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+_HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
+_FALSEY_ENV_VALUES = {"0", "false", "no", "off", "none", "disabled"}
+
+
+def _codex_mcp_section_server_name(section_name: str) -> str | None:
+    section_name = section_name.strip()
+    if not section_name.startswith("mcp_servers."):
+        return None
+    server = section_name[len("mcp_servers.") :].split(".", 1)[0].strip()
+    return server.strip("\"'") or None
+
+
+def _codex_mcp_server_names(config_text: str) -> set[str]:
+    names: set[str] = set()
+    for line in config_text.splitlines():
+        match = _CODEX_MCP_SECTION_RE.match(line)
+        if not match:
+            continue
+        server = _codex_mcp_section_server_name(match.group(1))
+        if server:
+            names.add(server)
+    return names
+
+
+def _select_codex_mcp_server_blocks(config_text: str, names: set[str]) -> str:
+    if not config_text.strip() or not names:
+        return ""
+    output: list[str] = []
+    keeping = False
+    for line in config_text.splitlines():
+        section = _CODEX_MCP_SECTION_RE.match(line)
+        if section:
+            server = _codex_mcp_section_server_name(section.group(1))
+            keeping = server in names if server else False
+        if keeping:
+            output.append(line)
+    return "\n".join(output).strip()
+
+
+def _strip_codex_mcp_server_blocks(config_text: str, names: set[str]) -> str:
+    if not config_text.strip() or not names:
+        return config_text.rstrip()
+    output: list[str] = []
+    skipping = False
+    for line in config_text.splitlines():
+        section = _CODEX_MCP_SECTION_RE.match(line)
+        if section:
+            server = _codex_mcp_section_server_name(section.group(1))
+            skipping = server in names if server else False
+        if not skipping:
+            output.append(line)
+    return "\n".join(output).rstrip()
+
+
+def _sanitize_malformed_codex_source_config(
+    config_text: str,
+    preserve_names: set[str],
+    append_names: set[str],
+) -> str:
+    output: list[str] = []
+    keeping = True
+    for line in config_text.splitlines():
+        section = _CODEX_MCP_SECTION_RE.match(line)
+        if section:
+            section_name = section.group(1).strip()
+            if section_name == "mcp_servers" or section_name.startswith("mcp_servers."):
+                server = _codex_mcp_section_server_name(section_name)
+                keeping = bool(server and server in preserve_names and server not in append_names)
+            else:
+                keeping = True
+        if keeping:
+            output.append(line)
+    return "\n".join(output).rstrip()
+
+
+def _toml_string(value: object) -> str:
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _path_entries(value: str) -> list[Path]:
+    entries: list[Path] = []
+    for raw in str(value or "").split(os.pathsep):
+        raw = raw.strip()
+        if not raw:
+            continue
+        entries.append(Path(raw).expanduser())
+    return entries
+
+
+def _append_unique_paths(existing: str, additions: list[Path]) -> str:
+    parts = [part for part in str(existing or "").split(os.pathsep) if part]
+    seen = set(parts)
+    for path in additions:
+        value = str(path)
+        if value and value not in seen:
+            parts.append(value)
+            seen.add(value)
+    return os.pathsep.join(parts)
+
+
+def _existing_dirs_from_env(*names: str) -> list[Path]:
+    found: list[Path] = []
+    seen: set[str] = set()
+    for name in names:
+        for path in _path_entries(os.environ.get(name, "")):
+            try:
+                resolved = path.resolve()
+            except OSError:
+                resolved = path
+            key = str(resolved)
+            if key in seen or not path.is_dir():
+                continue
+            seen.add(key)
+            found.append(path)
+    return found
+
+
+def _workspace_dependency_auto_discovery_enabled() -> bool:
+    raw = (
+        os.environ.get("GLASSHIVE_AUTO_DISCOVER_CODEX_WORKSPACE_DEPS", "").strip()
+        or os.environ.get("WPR_AUTO_DISCOVER_CODEX_WORKSPACE_DEPS", "").strip()
+    )
+    return raw.lower() not in _FALSEY_ENV_VALUES
+
+
+def _codex_workspace_dependency_roots() -> list[Path]:
+    roots = _existing_dirs_from_env("GLASSHIVE_CODEX_WORKSPACE_DEPS_ROOT", "WPR_CODEX_WORKSPACE_DEPS_ROOT")
+    if _workspace_dependency_auto_discovery_enabled():
+        default_root = Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies"
+        if default_root.is_dir():
+            roots.append(default_root)
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            key = str(root.resolve())
+        except OSError:
+            key = str(root)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(root)
+    return deduped
+
+
+def _workspace_dependency_paths() -> dict[str, list[Path]]:
+    node_modules = _existing_dirs_from_env("GLASSHIVE_WORKSPACE_NODE_MODULES", "WPR_WORKSPACE_NODE_MODULES")
+    bin_dirs = _existing_dirs_from_env("GLASSHIVE_WORKSPACE_BIN_DIRS", "WPR_WORKSPACE_BIN_DIRS")
+    node_bins = _existing_dirs_from_env("GLASSHIVE_WORKSPACE_NODE_BIN", "WPR_WORKSPACE_NODE_BIN")
+    python_bins = _existing_dirs_from_env("GLASSHIVE_WORKSPACE_PYTHON_BIN", "WPR_WORKSPACE_PYTHON_BIN")
+    for root in _codex_workspace_dependency_roots():
+        candidate_node_modules = root / "node" / "node_modules"
+        if candidate_node_modules.is_dir():
+            node_modules.append(candidate_node_modules)
+        candidate_node_bin = root / "node" / "bin"
+        if candidate_node_bin.is_dir():
+            node_bins.append(candidate_node_bin)
+        candidate_bin = root / "bin"
+        if candidate_bin.is_dir():
+            bin_dirs.append(candidate_bin)
+        candidate_python_bin = root / "python" / "bin"
+        if candidate_python_bin.is_dir():
+            python_bins.append(candidate_python_bin)
+
+    output: dict[str, list[Path]] = {}
+    for key, values in {
+        "node_modules": node_modules,
+        "node_bins": node_bins,
+        "python_bins": python_bins,
+        "bin_dirs": bin_dirs,
+    }.items():
+        deduped: list[Path] = []
+        seen: set[str] = set()
+        for value in values:
+            try:
+                resolved = value.resolve()
+            except OSError:
+                resolved = value
+            path_key = str(resolved)
+            if path_key in seen or not value.is_dir():
+                continue
+            seen.add(path_key)
+            deduped.append(value)
+        output[key] = deduped
+    return output
+
+
+def _project_workspace_dependency_env(env: dict[str, str]) -> None:
+    paths = _workspace_dependency_paths()
+    executable_dirs = [
+        *paths.get("node_bins", []),
+        *paths.get("python_bins", []),
+        *paths.get("bin_dirs", []),
+    ]
+    if executable_dirs:
+        env["PATH"] = _append_unique_paths(env.get("PATH", ""), executable_dirs)
+    node_modules = paths.get("node_modules", [])
+    if node_modules:
+        env["NODE_PATH"] = _append_unique_paths(env.get("NODE_PATH") or os.environ.get("NODE_PATH", ""), node_modules)
+        env["GLASSHIVE_WORKSPACE_NODE_MODULES"] = os.pathsep.join(str(path) for path in node_modules)
+    if paths.get("node_bins"):
+        env["GLASSHIVE_WORKSPACE_NODE_BIN"] = os.pathsep.join(str(path) for path in paths["node_bins"])
+    if paths.get("python_bins"):
+        env["GLASSHIVE_WORKSPACE_PYTHON_BIN"] = os.pathsep.join(str(path) for path in paths["python_bins"])
+    if paths.get("bin_dirs"):
+        env["GLASSHIVE_WORKSPACE_BIN_DIRS"] = os.pathsep.join(str(path) for path in paths["bin_dirs"])
+
+
+def _toml_value(value: object, *, manifest_dir: Path | None = None, key: str = "") -> str | None:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, str):
+        rendered = str(manifest_dir) if key == "cwd" and value == "." and manifest_dir else value
+        return _toml_string(rendered)
+    if isinstance(value, list):
+        rendered_items: list[str] = []
+        for item in value:
+            item_rendered = _toml_value(item)
+            if item_rendered is None:
+                return None
+            rendered_items.append(item_rendered)
+        return "[" + ", ".join(rendered_items) + "]"
+    return None
+
+
+def _toml_table_name(name: str) -> str:
+    return name if re.fullmatch(r"[A-Za-z0-9_-]+", name) else _toml_string(name)
+
+
+def _render_codex_mcp_server_from_json(name: str, config: object, manifest_dir: Path) -> str:
+    if not isinstance(config, dict):
+        return ""
+    root_lines = [f"[mcp_servers.{_toml_table_name(name)}]"]
+    nested: list[tuple[str, dict[str, object]]] = []
+    for key, value in config.items():
+        key_text = str(key).strip()
+        if not key_text:
+            continue
+        if isinstance(value, dict):
+            nested.append((key_text, value))
+            continue
+        rendered = _toml_value(value, manifest_dir=manifest_dir, key=key_text)
+        if rendered is not None:
+            root_lines.append(f"{_toml_table_name(key_text)} = {rendered}")
+    for nested_key, nested_values in nested:
+        nested_lines = [f"[mcp_servers.{_toml_table_name(name)}.{_toml_table_name(nested_key)}]"]
+        for key, value in nested_values.items():
+            rendered = _toml_value(value)
+            if rendered is not None:
+                nested_lines.append(f"{_toml_table_name(str(key))} = {rendered}")
+        if len(nested_lines) > 1:
+            root_lines.extend(["", *nested_lines])
+    return "\n".join(root_lines).strip()
+
+
+def _render_toml_document(data: dict[str, object]) -> str:
+    root_lines: list[str] = []
+    table_blocks: list[str] = []
+    for key, value in data.items():
+        key_text = str(key).strip()
+        if not key_text:
+            continue
+        if isinstance(value, dict):
+            table_blocks.extend(_render_toml_table([key_text], value))
+            continue
+        rendered = _toml_value(value)
+        if rendered is not None:
+            root_lines.append(f"{_toml_table_name(key_text)} = {rendered}")
+    blocks: list[str] = []
+    if root_lines:
+        blocks.append("\n".join(root_lines))
+    blocks.extend(table_blocks)
+    return "\n\n".join(block for block in blocks if block.strip()).strip()
+
+
+def _render_toml_table(path: list[str], table: dict[str, object]) -> list[str]:
+    scalar_lines: list[str] = []
+    nested_blocks: list[str] = []
+    for key, value in table.items():
+        key_text = str(key).strip()
+        if not key_text:
+            continue
+        if isinstance(value, dict):
+            nested_blocks.extend(_render_toml_table([*path, key_text], value))
+            continue
+        rendered = _toml_value(value)
+        if rendered is not None:
+            scalar_lines.append(f"{_toml_table_name(key_text)} = {rendered}")
+    blocks: list[str] = []
+    if scalar_lines:
+        table_name = ".".join(_toml_table_name(part) for part in path)
+        blocks.append("\n".join([f"[{table_name}]", *scalar_lines]))
+    blocks.extend(nested_blocks)
+    return blocks
+
+
+def _sanitize_codex_source_config(config_text: str, preserve_names: set[str], append_names: set[str]) -> str:
+    if not config_text.strip():
+        return ""
+    try:
+        parsed = tomllib.loads(config_text)
+    except Exception:
+        return _sanitize_malformed_codex_source_config(config_text, preserve_names, append_names)
+    if not isinstance(parsed, dict):
+        return ""
+    sanitized: dict[str, object] = {
+        str(key): value
+        for key, value in parsed.items()
+        if str(key) != "mcp_servers"
+    }
+    mcp_servers = parsed.get("mcp_servers")
+    if isinstance(mcp_servers, dict):
+        kept_servers = {
+            str(name): value
+            for name, value in mcp_servers.items()
+            if str(name) in preserve_names and str(name) not in append_names
+        }
+        if kept_servers:
+            sanitized["mcp_servers"] = kept_servers
+    return _render_toml_document(sanitized)
+
+
+# Keep prompt templates near the top. Host-native workers read these through real files in their
+# workspace (`harness-prompt.md`, `AGENTS.md`, `CLAUDE.md`, `CODEX.md`) and through the command-line
+# instruction wrapper. The constants live here so future edits do not require spelunking through the
+# host runtime implementation.
+_COMPLETION_CONTRACT = GLASSHIVE_WORKER_COMPLETION_CONTRACT
+HOST_NATIVE_HARNESS_PROMPT = f"""# GlassHive Host-Native Harness
+
+You are running directly on the user's main computer, not inside a sandbox.
+You may use the local browser, filesystem, shell, and installed OS tools.
+Default execution is no-approval/full-access for this worker class.
+
+{GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS}
+
+Operational requirements:
+- Treat the workspace directory as the primary project root.
+- Keep `work-log.md` current with concise progress, blockers, and completion notes.
+- Write files for the task inside the workspace unless the project definition explicitly requires another path.
+- Before destructive host changes, stop and emit a clear checkpoint request instead of guessing.
+- Destructive host changes include writes outside the workspace, git push, global installs, launch agents, cron, SSH/keychain/browser credentials, killing unrelated processes, and broad network exfiltration.
+- Do not print credentials, tokens, cookies, personal data, or private local paths unless absolutely required for the local operator.
+- When invoking local `.sh` helper scripts from mounted or downloaded tool folders, run them through `bash /path/to/script.sh ...` so macOS quarantine/provenance metadata cannot block direct execution.
+- For screen evidence on macOS, prefer the workspace helper `glasshive-host-tools/capture-front-window.sh` and invoke it with `bash`.
+- For web research or document-generation tasks, prefer `python3 glasshive-host-tools/content-hygiene.py readable <html-file>` before putting page text into structured files, and run `python3 glasshive-host-tools/content-hygiene.py check <csv-or-json-file>...` before final delivery when the output contains sourced research fields.
+- If you create research plans, specs, subagent prompts, or delegation notes, carry the user's source/date/auth/scope constraints forward exactly instead of widening, weakening, or rewriting them.
+- When `glasshive-run/constraint-ledger.json` exists, treat it as the canonical constraint reminder for this run and compare plans, delegated prompts, artifacts, and the final report against it before final delivery.
+- `glasshive-run/` is internal harness evidence, not a user-facing artifact directory.
+- For host browser or desktop tasks, first use the user's existing local app/session when the task asks for the main computer, Chrome, browser profile, local files, or installed OS tools. Do not claim host control is unavailable until you have checked the available local shell/desktop/browser automation paths.
+
+{GLASSHIVE_NATIVE_CAPABILITY_INVENTORY}
+
+{GLASSHIVE_WORKER_COMPLETION_CONTRACT}
+
+{GLASSHIVE_SAFETY_CHECKPOINT_RULE}
+
+Required context files in this workspace:
+- project-definition.md
+- work-log.md
+- harness-prompt.md
+- AGENTS.md (canonical project instructions for Codex-style workers)
+- agents.md (compatibility mirror)
+- CLAUDE.md / claude.md (Claude Code compatibility; should import or mirror AGENTS.md when possible)
+- CODEX.md / codex.md (legacy compatibility mirror only)
+"""
+HOST_DEFAULT_AGENTS_MD = (
+    "Follow these AGENTS.md project instructions and keep `work-log.md` updated.\n"
+    "When the task involves the host browser, desktop, files, shell, or installed apps, operate on the real local machine session unless the project definition explicitly says sandbox.\n"
+    "If `glasshive-run/constraint-ledger.json` exists, use it as the canonical run constraint reminder and keep `glasshive-run/` out of user-facing deliverables.\n"
+    f"{GLASSHIVE_NATIVE_CAPABILITY_INVENTORY}\n"
+    "Before `FINAL REPORT:`, inspect the concrete output, files/artifacts, tool results, or visible state you produced; compare it with the user's request and success criteria; then continue, fix, or report the exact blocker.\n"
+    "End with `FINAL REPORT:` containing the user-facing result in the user's requested form; mention artifacts only when you intentionally created user-facing files and blockers only when they remain.\n"
 )
+HOST_DEFAULT_CLAUDE_MD = (
+    "Claude host worker context. Treat AGENTS.md as the canonical project instruction source and use bypass permission mode only for this GlassHive workspace.\n"
+    "For host browser/desktop tasks, check local automation paths before reporting unavailable. Before `FINAL REPORT:`, inspect the result against the user's request and success criteria. End with `FINAL REPORT:`."
+)
+HOST_DEFAULT_CODEX_MD = (
+    "Codex host worker context. AGENTS.md is the canonical project instruction source; this file is a compatibility mirror.\n"
+    "For host browser/desktop tasks, check local automation paths before reporting unavailable. Before `FINAL REPORT:`, inspect the result against the user's request and success criteria. End with `FINAL REPORT:`."
+)
+HOST_CONTENT_HYGIENE_TOOL = r'''#!/usr/bin/env python3
+"""Small, dependency-free helper for research artifact hygiene.
+
+Usage:
+  python3 glasshive-host-tools/content-hygiene.py readable page.html [output.txt]
+  python3 glasshive-host-tools/content-hygiene.py check file.csv [file.json ...]
+
+The helper is generic on purpose: it strips common page chrome/script noise from HTML and flags
+structured cells that still look like navigation, cookie banners, CSS, JavaScript, or raw page dumps.
+"""
+from __future__ import annotations
+
+import csv
+import html
+import json
+import re
+import sys
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Iterable
+
+
+BAD_TEXT_RE = re.compile(
+    r"skip\s+(?:to\s+)?(?:main\s+)?(?:content|navigation)"
+    r"|cookie\s+(?:settings|preferences|policy)"
+    r"|privacy\s+policy"
+    r"|terms\s+(?:of\s+(?:use|service)|and\s+conditions)"
+    r"|all\s+rights\s+reserved"
+    r"|(?:read|view)\s+(?:more|all)"
+    r"|please\s+enable\s+(?:java\s*)?script|enable\s+js"
+    r"|subscribe\s+to\s+continue|sign\s+in\s+to\s+continue|paywall"
+    r"|are\s+you\s+(?:a\s+)?robot|captcha|bot\s+wall|403\s+forbidden|access\s+denied"
+    r"|lp\s+login|dataroom"
+    r"|sourceurl=|__nuxt__|@layer|tailwindcss"
+    r"|\b(?:window|document)\.[A-Za-z_$]"
+    r"|\bfunction\s+(?:[A-Za-z_$][\w$]*)?\s*\([^)]*\)\s*\{"
+    r"|\bvar\s+[A-Za-z_$][\w$]*\s*="
+    r"|&(?:nbsp|amp|lt|gt|quot|apos);|&#\d+;|&#x[0-9a-f]+;",
+    re.IGNORECASE,
+)
+CHROME_LINE_RE = re.compile(r"^(?:menu|close|follow us:?|linkedin|facebook|instagram|x)$", re.IGNORECASE)
+
+
+class ReadableHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self._chunks: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() in {"script", "style", "noscript", "svg", "template"}:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"script", "style", "noscript", "svg", "template"} and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        text = re.sub(r"\s+", " ", html.unescape(data)).strip()
+        if len(text) >= 2:
+            self._chunks.append(text)
+
+    def text(self) -> str:
+        lines: list[str] = []
+        previous = ""
+        for chunk in self._chunks:
+            if chunk == previous:
+                continue
+            previous = chunk
+            if CHROME_LINE_RE.fullmatch(chunk.strip()):
+                continue
+            if BAD_TEXT_RE.search(chunk) and len(chunk) < 90:
+                continue
+            lines.append(chunk)
+        return "\n".join(lines).strip() + ("\n" if lines else "")
+
+
+def readable(path: Path) -> str:
+    parser = ReadableHTMLParser()
+    parser.feed(path.read_text(encoding="utf-8", errors="ignore"))
+    return parser.text()
+
+
+def iter_structured_values(path: Path) -> Iterable[tuple[str, int, str, str]]:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        with path.open(newline="", encoding="utf-8-sig") as handle:
+            for row_index, row in enumerate(csv.DictReader(handle), start=2):
+                for field, value in row.items():
+                    yield (path.name, row_index, str(field), str(value or ""))
+        return
+    if suffix in {".json", ".jsonl"}:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        records = [json.loads(line) for line in text.splitlines() if line.strip()] if suffix == ".jsonl" else [json.loads(text)]
+        for row_index, record in enumerate(records, start=1):
+            yield from _walk_json(path.name, row_index, "", record)
+
+
+def _walk_json(name: str, row_index: int, prefix: str, value: object) -> Iterable[tuple[str, int, str, str]]:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            next_prefix = f"{prefix}.{key}" if prefix else str(key)
+            yield from _walk_json(name, row_index, next_prefix, nested)
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            yield from _walk_json(name, row_index, f"{prefix}[{index}]", nested)
+    else:
+        yield (name, row_index, prefix, str(value or ""))
+
+
+def check(paths: list[Path]) -> int:
+    failures: list[dict[str, object]] = []
+    for path in paths:
+        for name, row_index, field, value in iter_structured_values(path):
+            text = " ".join(value.split())
+            if not text:
+                continue
+            match = BAD_TEXT_RE.search(text)
+            if match:
+                failures.append(
+                    {
+                        "file": name,
+                        "row": row_index,
+                        "field": field,
+                        "match": match.group(0),
+                        "sample": text[:180],
+                    }
+                )
+            elif len(text) > 900 and not re.search(r"(source|evidence|notes|summary|description|rationale)", field, re.I):
+                failures.append(
+                    {
+                        "file": name,
+                        "row": row_index,
+                        "field": field,
+                        "match": "overlong structured cell",
+                        "sample": text[:180],
+                    }
+                )
+    print(json.dumps({"ok": not failures, "failures": failures[:50], "failure_count": len(failures)}, indent=2))
+    return 1 if failures else 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3 or argv[1] not in {"readable", "check"}:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    command = argv[1]
+    paths = [Path(arg) for arg in argv[2:]]
+    if command == "readable":
+        text = readable(paths[0])
+        if len(paths) > 1:
+            paths[1].write_text(text, encoding="utf-8")
+        else:
+            print(text, end="")
+        return 0
+    return check(paths)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
+'''
 
 
 def _instruction_with_completion_contract(instruction: str) -> str:
@@ -106,6 +669,13 @@ class ProfiledWorkerRuntime:
 
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
         return self._runtime_for_worker(worker).run_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
+
+    def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
+        runtime = self._runtime_for_worker(worker)
+        checker = getattr(runtime, "worker_capacity_error", None)
+        if callable(checker):
+            return checker(worker)
+        return None
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).reconcile_worker(worker)
@@ -235,7 +805,7 @@ class BaseCliWorkerRuntime:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"session_key": session_key}, indent=2))
 
-    def _read_active_session(self, worker_id: str) -> dict[str, str] | None:
+    def _read_active_session(self, worker_id: str) -> dict[str, object] | None:
         path = self._active_session_meta_path(worker_id)
         if not path.exists():
             return None
@@ -252,9 +822,16 @@ class BaseCliWorkerRuntime:
             "stdout_path": str(data.get("stdout_path") or "").strip(),
             "stderr_path": str(data.get("stderr_path") or "").strip(),
             "exit_path": str(data.get("exit_path") or "").strip(),
+            "constraint_ledger_path": str(data.get("constraint_ledger_path") or "").strip(),
+            "model": str(data.get("model") or "").strip(),
+            "argv_for_evidence_json": str(data.get("argv_for_evidence_json") or "").strip(),
+            "started_at": str(data.get("started_at") or "").strip(),
+            "process_pid": data.get("process_pid"),
+            "heartbeat_path": str(data.get("heartbeat_path") or "").strip(),
+            "timeout_seconds": data.get("timeout_seconds"),
         }
 
-    def _write_active_session(self, worker_id: str, payload: dict[str, str]) -> None:
+    def _write_active_session(self, worker_id: str, payload: dict[str, object]) -> None:
         path = self._active_session_meta_path(worker_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2))
@@ -543,6 +1120,18 @@ class BaseCliWorkerRuntime:
     def _parse_output(self, worker: dict, stdout: str, stderr: str, info: RuntimeInfo) -> tuple[str | None, str]:
         raise NotImplementedError
 
+    def _bootstrap_env_value(self, worker: dict, name: str) -> str:
+        try:
+            bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
+        except json.JSONDecodeError:
+            return ""
+        if not isinstance(bundle, dict):
+            return ""
+        env = bundle.get("env")
+        if not isinstance(env, dict):
+            return ""
+        return str(env.get(name) or "").strip()
+
     def _container_env(self, *keys: str) -> dict[str, str]:
         env: dict[str, str] = {
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -623,6 +1212,8 @@ class BaseCliWorkerRuntime:
             "sandbox_state": sandbox["state"],
             "sandbox_image": sandbox["image"],
             "view_url": sandbox.get("view_url"),
+            "view_available": bool(sandbox.get("view_available") or sandbox.get("view_url")),
+            "view_health": sandbox.get("view_health"),
             "novnc_port": sandbox.get("novnc_port"),
             "selenium_port": sandbox.get("selenium_port"),
             "openclaw_port": sandbox.get("openclaw_port"),
@@ -698,10 +1289,22 @@ class BaseCliWorkerRuntime:
         }
         info = self.ensure_worker_ready(worker_for_run)
         refresh_runtime_env_for_worker(self._home_dir(worker_for_run["worker_id"]), worker_for_run)
+        workspace = Path(str(info.workspace_dir or self._workspace_dir(worker_for_run["worker_id"])))
+        refresh_project_runtime_files_for_worker(
+            self._home_dir(worker_for_run["worker_id"]),
+            workspace,
+            worker_for_run,
+        )
         command, env = self._build_command(worker_for_run, instruction, info)
+        constraint_ledger, constraint_ledger_path = _write_constraint_ledger_for_run(
+            worker=worker_for_run,
+            instruction=instruction,
+            workspace=workspace,
+            run_id=effective_run_id,
+        )
         stdout_path, stderr_path = self._log_paths(worker_for_run["worker_id"])
         with stderr_path.open("a") as handle:
-            handle.write(f"$ {self.runtime_name} {shlex.join(command)}\n")
+            handle.write(f"$ {self.runtime_name} {_redacted_command_display(command)}\n")
 
         run_root = self._run_root(worker_for_run["worker_id"], effective_run_id)
         run_root.mkdir(parents=True, exist_ok=True)
@@ -778,16 +1381,49 @@ class BaseCliWorkerRuntime:
                 "stdout_path": str(host_stdout),
                 "stderr_path": str(host_stderr),
                 "exit_path": str(host_exit),
+                "constraint_ledger_path": constraint_ledger_path,
             },
         )
 
-        exit_code = self._wait_for_exit_code(
-            worker_for_run["worker_id"],
-            host_exit,
-            self._run_timeout_sec(timeout_sec),
-            run_id=effective_run_id,
-            stdout_path=host_stdout,
-        )
+        run_timeout_sec = self._run_timeout_sec(timeout_sec)
+        transcript_paths = {
+            "stdout": str(host_stdout),
+            "stderr": str(host_stderr),
+            "exit_code": str(host_exit),
+            "constraint_ledger": constraint_ledger_path,
+        }
+        started_at = time.time()
+        try:
+            exit_code = self._wait_for_exit_code(
+                worker_for_run["worker_id"],
+                host_exit,
+                run_timeout_sec,
+                run_id=effective_run_id,
+                stdout_path=host_stdout,
+            )
+        except Exception as exc:
+            stdout = host_stdout.read_text() if host_stdout.exists() else ""
+            stderr = host_stderr.read_text() if host_stderr.exists() else ""
+            _write_evidence_for_run(
+                worker=worker_for_run,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                command=command,
+                env=env,
+                workspace=workspace,
+                stdout_text=stdout,
+                stderr_text=stderr,
+                output_text="",
+                error_text=str(exc),
+                exit_code=None,
+                timeout_seconds=run_timeout_sec,
+                stop_reason="timeout" if "timed out" in str(exc).lower() else "error",
+                constraint_ledger=constraint_ledger,
+                transcript_paths=transcript_paths,
+                started_at=started_at,
+            )
+            raise
         self.sandbox.ensure_container_writable_paths(
             worker_for_run["worker_id"],
             self.runtime_name,
@@ -808,15 +1444,76 @@ class BaseCliWorkerRuntime:
                 if not stderr.endswith("\n"):
                     handle.write("\n")
 
-        self._finalize_stop_reason(worker_for_run["worker_id"], run_id=effective_run_id)
+        try:
+            self._finalize_stop_reason(worker_for_run["worker_id"], run_id=effective_run_id)
+        except RuntimeErrorBase as exc:
+            _write_evidence_for_run(
+                worker=worker_for_run,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                command=command,
+                env=env,
+                workspace=workspace,
+                stdout_text=stdout,
+                stderr_text=stderr,
+                output_text="",
+                error_text=str(exc),
+                exit_code=exit_code,
+                timeout_seconds=run_timeout_sec,
+                stop_reason=exc.__class__.__name__,
+                constraint_ledger=constraint_ledger,
+                transcript_paths=transcript_paths,
+                started_at=started_at,
+            )
+            raise
 
         if exit_code != 0:
             detail = (stderr or stdout or "").strip()[-2000:]
+            error_text = f"{self.runtime_name} exited with code {exit_code}: {detail}"
+            _write_evidence_for_run(
+                worker=worker_for_run,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                command=command,
+                env=env,
+                workspace=workspace,
+                stdout_text=stdout,
+                stderr_text=stderr,
+                output_text="",
+                error_text=error_text,
+                exit_code=exit_code,
+                timeout_seconds=run_timeout_sec,
+                stop_reason="process_exit",
+                constraint_ledger=constraint_ledger,
+                transcript_paths=transcript_paths,
+                started_at=started_at,
+            )
             raise RuntimeErrorBase(f"{self.runtime_name} exited with code {exit_code}: {detail}")
 
         session_key, output = self._parse_output(worker_for_run, stdout, stderr, info)
         if session_key:
             self._write_session_key(worker_for_run["worker_id"], session_key)
+        _write_evidence_for_run(
+            worker=worker_for_run,
+            run_id=effective_run_id,
+            runtime_name=self.runtime_name,
+            model=str(info.model or ""),
+            command=command,
+            env=env,
+            workspace=workspace,
+            stdout_text=stdout,
+            stderr_text=stderr,
+            output_text=output.strip(),
+            error_text="",
+            exit_code=exit_code,
+            timeout_seconds=run_timeout_sec,
+            stop_reason="process_exit",
+            constraint_ledger=constraint_ledger,
+            transcript_paths=transcript_paths,
+            started_at=started_at,
+        )
         return output.strip()
 
 
@@ -1304,19 +2001,8 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
 class CodexCliRuntime(BaseCliWorkerRuntime):
     runtime_name = "codex-cli"
     worker_root_name = "codex_cli_runtime"
-    binary_env_var = "WPR_CODEX_BIN"
     binary_name = "codex"
-    _default_compatible_provider_disabled_features = (
-        "apps",
-        "plugins",
-        "browser_use",
-        "computer_use",
-        "multi_agent",
-        "image_generation",
-        "workspace_dependencies",
-        "tool_suggest",
-        "hooks",
-    )
+    _default_compatible_provider_disabled_features: tuple[str, ...] = ()
 
     def resolve_model(self, profile: str) -> str:
         if profile == "codex-cli":
@@ -1332,14 +2018,14 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             return
         subprocess.run(["git", "init", "-q"], cwd=workspace_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(
-            ["git", "config", "user.email", "worker@workers-projects-runtime.local"],
+            ["git", "config", "user.email", "worker@glasshive.local"],
             cwd=workspace_dir,
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         subprocess.run(
-            ["git", "config", "user.name", "Workers Projects Runtime"],
+            ["git", "config", "user.name", "GlassHive Runtime"],
             cwd=workspace_dir,
             check=False,
             stdout=subprocess.DEVNULL,
@@ -1395,7 +2081,13 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         raw = os.environ.get("WPR_CODEX_CLI_ALLOWED_REASONING_EFFORTS", "").strip()
         valid = {"none", "minimal", "low", "medium", "high", "xhigh"}
         if not raw:
-            return set(valid)
+            allowed = {"none", "minimal", "low", "medium", "high"}
+            if self._env_flag("WPR_CODEX_CLI_XHIGH_ROUTE_PROVEN", False) or self._env_flag(
+                "GLASSHIVE_CODEX_XHIGH_ROUTE_PROVEN",
+                False,
+            ):
+                allowed.add("xhigh")
+            return allowed
         configured = {item.strip().lower() for item in raw.split(",") if item.strip()}
         return configured & valid or set(valid)
 
@@ -1407,19 +2099,43 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             return "medium"
         return sorted(allowed)[0] if allowed else ""
 
-    def _bootstrap_env_value(self, worker: dict, name: str) -> str:
-        try:
-            bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
-        except json.JSONDecodeError:
-            return ""
-        if not isinstance(bundle, dict):
-            return ""
-        env = bundle.get("env")
-        if not isinstance(env, dict):
-            return ""
-        return str(env.get(name) or "").strip()
+    def _codex_reasoning_effort_for_worker(self, worker: dict) -> str:
+        reasoning_effort = (
+            self._bootstrap_env_value(worker, "WPR_CODEX_CLI_REASONING_EFFORT")
+            or os.environ.get("WPR_CODEX_CLI_REASONING_EFFORT", "")
+        ).strip().lower()
+        allowed_efforts = self._compatible_provider_allowed_reasoning_efforts()
+        if reasoning_effort and reasoning_effort not in allowed_efforts:
+            requested_effort = reasoning_effort
+            reasoning_effort = self._compatible_provider_reasoning_effort_fallback(allowed_efforts)
+            logger.warning(
+                "Codex CLI reasoning effort clamped to provider-route fallback",
+                extra={
+                    "worker_id": str(worker.get("worker_id") or ""),
+                    "profile": str(worker.get("profile") or "codex-cli"),
+                    "model": str(worker.get("model") or self.resolve_model(worker.get("profile", "codex-cli"))),
+                    "requested_effort": requested_effort,
+                    "effective_effort": reasoning_effort,
+                    "allowed_efforts": ",".join(sorted(allowed_efforts)),
+                },
+            )
+        return reasoning_effort
 
-    def _append_codex_compatible_provider_config(self, command: list[str], worker: dict) -> None:
+    def _append_codex_reasoning_effort_config(self, command: list[str], worker: dict) -> None:
+        reasoning_effort = self._codex_reasoning_effort_for_worker(worker)
+        if reasoning_effort in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+            command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
+        if reasoning_effort == "minimal":
+            command.extend(["-c", 'web_search="disabled"'])
+            command.extend(["--disable", "image_generation"])
+
+    def _append_codex_compatible_provider_config(
+        self,
+        command: list[str],
+        worker: dict,
+        *,
+        include_reasoning_effort: bool = True,
+    ) -> None:
         if not self._compatible_provider_enabled():
             return
         base_url = self._compatible_provider_base_url()
@@ -1429,14 +2145,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         provider_name = os.environ.get("WPR_CODEX_CLI_PROVIDER_NAME", "GlassHive OpenAI-compatible").strip()
         wire_api = os.environ.get("WPR_CODEX_CLI_WIRE_API", "responses").strip() or "responses"
         verbosity = os.environ.get("WPR_CODEX_CLI_MODEL_VERBOSITY", "medium").strip()
-        reasoning_effort = (
-            self._bootstrap_env_value(worker, "WPR_CODEX_CLI_REASONING_EFFORT")
-            or os.environ.get("WPR_CODEX_CLI_REASONING_EFFORT", "")
-        ).strip().lower()
-        allowed_efforts = self._compatible_provider_allowed_reasoning_efforts()
-        if reasoning_effort and reasoning_effort not in allowed_efforts:
-            reasoning_effort = self._compatible_provider_reasoning_effort_fallback(allowed_efforts)
-        if self._env_flag("WPR_CODEX_CLI_IGNORE_USER_CONFIG", True):
+        if self._env_flag("WPR_CODEX_CLI_IGNORE_USER_CONFIG", False):
             command.append("--ignore-user-config")
         for feature in self._compatible_provider_disabled_features():
             command.extend(["--disable", feature])
@@ -1460,11 +2169,8 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         )
         if verbosity:
             command.extend(["-c", f'model_verbosity="{verbosity}"'])
-        if reasoning_effort in {"none", "minimal", "low", "medium", "high", "xhigh"}:
-            command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
-        if reasoning_effort == "minimal":
-            command.extend(["-c", 'web_search="disabled"'])
-            command.extend(["--disable", "image_generation"])
+        if include_reasoning_effort:
+            self._append_codex_reasoning_effort_config(command, worker)
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         existing_session = self._read_session_key(worker["worker_id"])
@@ -1480,7 +2186,8 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
                 command.extend(["-c", f'model="{model}"'])
             else:
                 command.extend(["-m", model])
-        self._append_codex_compatible_provider_config(command, worker)
+        self._append_codex_compatible_provider_config(command, worker, include_reasoning_effort=False)
+        self._append_codex_reasoning_effort_config(command, worker)
         if dangerous_mode:
             if is_resume:
                 command.append("--dangerously-bypass-approvals-and-sandbox")
@@ -1591,8 +2298,8 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
 class ClaudeCodeRuntime(BaseCliWorkerRuntime):
     runtime_name = "claude-code"
     worker_root_name = "claude_code_runtime"
-    binary_env_var = "WPR_CLAUDE_CODE_BIN"
     binary_name = "claude"
+    _workspace_effort_support_cache: dict[tuple[str, str], bool] = {}
 
     def resolve_model(self, profile: str) -> str:
         return os.environ.get("WPR_MODEL_CLAUDE_CODE", "claude-sonnet-4-6")
@@ -1604,6 +2311,68 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         if worker.get("session_key") and not str(worker.get("session_key")).startswith("worker:"):
             return str(worker.get("session_key"))
         return f"claude-worker:{worker['worker_id']}"
+
+    def _chrome_enabled(self) -> bool:
+        raw = os.environ.get("WPR_CLAUDE_CODE_ENABLE_CHROME", "").strip().lower()
+        return raw not in {"0", "false", "no", "off", "disabled"}
+
+    def _effort_for_worker(self, worker: dict) -> str:
+        return (
+            self._bootstrap_env_value(worker, "WPR_CLAUDE_CODE_EFFORT")
+            or os.environ.get("WPR_CLAUDE_CODE_EFFORT", "")
+        ).strip().lower()
+
+    def _preflight_workspace_effort_support(self, worker: dict) -> None:
+        if str(worker.get("execution_mode") or "docker") != "docker":
+            return
+        if self._effort_for_worker(worker) != "max":
+            return
+        cache_key = (str(self.sandbox.image), self.binary)
+        if self._workspace_effort_support_cache.get(cache_key):
+            return
+        try:
+            self.sandbox._ensure_image()
+            result = self.sandbox._docker(
+                ["run", "--rm", "--entrypoint", self.binary, self.sandbox.image, "--help"],
+                check=False,
+                capture_output=True,
+                timeout_sec=20,
+            )
+        except Exception as exc:
+            raise RuntimeDependencyMissingError(
+                "Claude Code max effort could not be preflighted in the GlassHive workspace image",
+                binary=self.binary,
+                runtime_name=self.runtime_name,
+                profile=str(worker.get("profile") or "claude-code"),
+                execution_mode="docker",
+                dependency_label="Claude Code --effort support",
+                recovery_hint=(
+                    "Use a GlassHive workspace image with a Claude Code CLI that supports `--effort`, "
+                    "or run this worker without `max` effort until the image is upgraded."
+                ),
+            ) from exc
+        help_text = f"{result.stdout or ''}\n{result.stderr or ''}"
+        if result.returncode != 0 or "--effort" not in help_text:
+            actual = (help_text.strip() or f"exit {result.returncode}")[-400:]
+            raise RuntimeDependencyMissingError(
+                "Claude Code max effort requires workspace image support for `claude --effort`",
+                binary=self.binary,
+                runtime_name=self.runtime_name,
+                profile=str(worker.get("profile") or "claude-code"),
+                execution_mode="docker",
+                required_version="Claude Code CLI with --effort support",
+                actual_version=actual,
+                dependency_label="Claude Code --effort support",
+                recovery_hint=(
+                    "Upgrade the GlassHive workspace image or use default Claude effort for this run. "
+                    "Do not silently project `max` when the active image cannot prove support."
+                ),
+            )
+        self._workspace_effort_support_cache[cache_key] = True
+
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        self._preflight_workspace_effort_support(worker)
+        return super().run_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_key = self._read_session_key(worker["worker_id"])
@@ -1619,11 +2388,22 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             "--model",
             model,
         ]
+        if self._chrome_enabled():
+            command.insert(2, "--chrome")
+        effort = self._effort_for_worker(worker)
+        if effort == "max":
+            command.extend(["--effort", effort])
+        elif effort and effort != "default":
+            logger.warning(
+                "Ignoring unsupported Claude Code effort",
+                extra={"worker_id": str(worker.get("worker_id") or ""), "effort": effort},
+            )
         if session_key and not session_key.startswith("claude-worker:"):
             command.extend(["--resume", session_key])
-        command.append(instruction)
+        command.append(_instruction_with_completion_contract(instruction))
         env = self._container_env(
             "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_CUSTOM_HEADERS",
@@ -1685,6 +2465,239 @@ def _redact_text(value: str, max_chars: int | None = None) -> str:
     if max_chars is not None and len(text) > max_chars:
         return text[-max_chars:]
     return text
+
+
+def _redact_command_arg(value: object) -> str:
+    text = str(value or "")
+    if "\n" in text or len(text) > 600:
+        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+        return f"[REDACTED_LONG_ARG chars={len(text)} sha256={digest}]"
+    return _redact_text(text)
+
+
+def _redacted_command_display(command: list[str]) -> str:
+    return " ".join(shlex.quote(_redact_command_arg(part)) for part in command)
+
+
+def _write_constraint_ledger_for_run(
+    *,
+    worker: dict,
+    instruction: str,
+    workspace: Path,
+    run_id: str,
+) -> tuple[dict[str, object] | None, str]:
+    try:
+        ledger = build_constraint_ledger(instruction=instruction, worker=worker, run_id=run_id)
+        path = write_constraint_ledger(workspace, ledger, run_id)
+        try:
+            relative = path.relative_to(workspace).as_posix()
+        except ValueError:
+            relative = str(path)
+        return ledger, relative
+    except Exception as exc:  # pragma: no cover - evidence must not mask the real worker result
+        logger.warning(
+            "Failed to write GlassHive constraint ledger",
+            extra={"worker_id": str(worker.get("worker_id") or ""), "run_id": run_id, "error": str(exc)},
+        )
+        return None, ""
+
+
+def _write_evidence_for_run(
+    *,
+    worker: dict,
+    run_id: str,
+    runtime_name: str,
+    model: str,
+    command: list[str],
+    env: dict[str, str],
+    workspace: Path,
+    stdout_text: str,
+    stderr_text: str,
+    output_text: str,
+    error_text: str,
+    exit_code: int | None,
+    timeout_seconds: float | None,
+    stop_reason: str,
+    constraint_ledger: dict[str, object] | None,
+    transcript_paths: dict[str, str],
+    started_at: float | None = None,
+    ended_at: float | None = None,
+) -> str:
+    try:
+        evidence = build_run_evidence(
+            worker=worker,
+            run_id=run_id,
+            runtime_name=runtime_name,
+            model=model,
+            command=command,
+            env=env,
+            workspace_dir=workspace,
+            stdout_text=stdout_text,
+            stderr_text=stderr_text,
+            output_text=output_text,
+            error_text=error_text,
+            exit_code=exit_code,
+            timeout_seconds=timeout_seconds,
+            stop_reason=stop_reason,
+            constraint_ledger=constraint_ledger,
+            started_at=started_at,
+            ended_at=ended_at,
+            transcript_paths=transcript_paths,
+        )
+        path = write_run_evidence(workspace, evidence, run_id)
+        try:
+            return path.relative_to(workspace).as_posix()
+        except ValueError:
+            return str(path)
+    except Exception as exc:  # pragma: no cover - evidence must not mask the real worker result
+        logger.warning(
+            "Failed to write GlassHive run evidence",
+            extra={"worker_id": str(worker.get("worker_id") or ""), "run_id": run_id, "error": str(exc)},
+        )
+        return ""
+
+
+def _read_run_evidence_result(workspace: Path, evidence_path: str) -> dict[str, object]:
+    if not evidence_path:
+        return {}
+    target = (workspace / evidence_path).resolve()
+    try:
+        target.relative_to(workspace.resolve())
+    except ValueError:
+        return {}
+    try:
+        payload = json.loads(target.read_text())
+    except Exception:
+        return {}
+    result = payload.get("evidence_result") if isinstance(payload, dict) else {}
+    return result if isinstance(result, dict) else {}
+
+
+def _evidence_reason_preview(reason: object) -> str:
+    if isinstance(reason, dict):
+        label = str(reason.get("reason") or "").strip()
+        extras: list[str] = []
+        issues = reason.get("issues")
+        if isinstance(issues, list):
+            for issue in issues[:3]:
+                if isinstance(issue, dict):
+                    issue_reason = str(issue.get("reason") or "").strip()
+                    if issue_reason:
+                        extras.append(issue_reason)
+                    missing = issue.get("missing_required_artifact_types")
+                    if isinstance(missing, list) and missing:
+                        extras.append("missing " + ", ".join(str(item) for item in missing[:5]))
+                elif issue:
+                    extras.append(str(issue))
+        artifacts = reason.get("artifacts")
+        if isinstance(artifacts, list):
+            paths = [str(item.get("path") or "") for item in artifacts if isinstance(item, dict)]
+            if paths:
+                extras.append("invalid " + ", ".join(paths[:5]))
+        if extras:
+            return f"{label}: {'; '.join(extras)}"
+        return label
+    return str(reason or "").strip()
+
+
+def _evidence_result_message(result: dict[str, object], *, failed: bool) -> str:
+    key = "failure_reasons" if failed else "warning_reasons"
+    reasons = result.get(key) if isinstance(result.get(key), list) else []
+    previews = [_evidence_reason_preview(item) for item in reasons[:5]]
+    previews = [item for item in previews if item]
+    prefix = "GlassHive evidence check failed" if failed else "GlassHive evidence check warning"
+    detail = "; ".join(previews) if previews else "see glasshive-run/evidence.json"
+    return f"{prefix}: {detail}"
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _active_run_status_path(workspace: Path, run_id: str) -> Path:
+    return workspace / "glasshive-run" / "runs" / run_id / "active-run.json"
+
+
+def _write_active_run_status(
+    *,
+    path: Path,
+    worker: dict,
+    run_id: str,
+    runtime_name: str,
+    model: str,
+    state: str,
+    transcript_paths: dict[str, str],
+    started_at: str,
+    process_pid: int | None,
+    timeout_seconds: float | None,
+    exit_code: int | None = None,
+    stop_reason: str = "",
+    evidence_path: str = "",
+) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": "glasshive.active_run.v1",
+            "run_id": run_id,
+            "state": state,
+            "started_at": started_at,
+            "last_heartbeat_at": _utc_iso(),
+            "worker": {
+                "worker_id": str(worker.get("worker_id") or ""),
+                "profile": str(worker.get("profile") or ""),
+                "execution_mode": str(worker.get("execution_mode") or ""),
+                "runtime": str(worker.get("runtime") or ""),
+            },
+            "runtime": runtime_name,
+            "model": model,
+            "process_pid": process_pid,
+            "timeout_seconds": timeout_seconds,
+            "exit_code": exit_code,
+            "stop_reason": stop_reason,
+            "transcript_paths": transcript_paths,
+            "evidence_path": evidence_path,
+        }
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        path.chmod(0o600)
+    except Exception as exc:  # pragma: no cover - heartbeat must not mask the real worker result
+        logger.warning(
+            "Failed to write GlassHive active run status",
+            extra={"worker_id": str(worker.get("worker_id") or ""), "run_id": run_id, "error": str(exc)},
+        )
+
+
+def _start_active_run_heartbeat(
+    *,
+    path: Path,
+    worker: dict,
+    run_id: str,
+    runtime_name: str,
+    model: str,
+    transcript_paths: dict[str, str],
+    started_at: str,
+    process_pid: int | None,
+    timeout_seconds: float | None,
+    stop_event: Event,
+    interval_sec: float = 5.0,
+) -> Thread:
+    def beat() -> None:
+        while not stop_event.wait(interval_sec):
+            _write_active_run_status(
+                path=path,
+                worker=worker,
+                run_id=run_id,
+                runtime_name=runtime_name,
+                model=model,
+                state="running",
+                transcript_paths=transcript_paths,
+                started_at=started_at,
+                process_pid=process_pid,
+                timeout_seconds=timeout_seconds,
+            )
+
+    thread = Thread(target=beat, name=f"glasshive-run-heartbeat-{run_id[:12]}", daemon=True)
+    thread.start()
+    return thread
 
 
 def _safe_slug(value: str) -> str:
@@ -1762,37 +2775,10 @@ class HostNativeCliMixin:
     def _host_harness_prompt(self, worker: dict) -> str:
         bundle = self._bootstrap_bundle_for_worker(worker)
         extra = str(bundle.get("system_instructions") or "").strip()
-        return "\n".join(
-            [
-                "# GlassHive Host-Native Harness",
-                "",
-                "You are running directly on the user's main computer, not inside a sandbox.",
-                "You may use the local browser, filesystem, shell, and installed OS tools.",
-                "Default execution is no-approval/full-access for this worker class.",
-                "",
-                "Operational requirements:",
-                "- Treat the workspace directory as the primary project root.",
-                "- Keep `work-log.md` current with concise progress, blockers, and completion notes.",
-                "- Write files for the task inside the workspace unless the project definition explicitly requires another path.",
-                "- Before destructive host changes, stop and emit a clear checkpoint request instead of guessing.",
-                "- Destructive host changes include writes outside the workspace, git push, global installs, launch agents, cron, SSH/keychain/browser credentials, killing unrelated processes, and broad network exfiltration.",
-                "- Do not print credentials, tokens, cookies, personal data, or private local paths unless absolutely required for the local operator.",
-                "- When invoking local `.sh` helper scripts from mounted or downloaded tool folders, run them through `bash /path/to/script.sh ...` so macOS quarantine/provenance metadata cannot block direct execution.",
-                "- For screen evidence on macOS, prefer the workspace helper `glasshive-host-tools/capture-front-window.sh` and invoke it with `bash`.",
-                "- For host browser or desktop tasks, first use the user's existing local app/session when the task asks for the main computer, Chrome, browser profile, local files, or installed OS tools. Do not claim host control is unavailable until you have checked the available local shell/desktop/browser automation paths.",
-                "- End every run with a `FINAL REPORT:` section. Keep it concise and user-facing: outcome, key result, artifacts/files created, blocker if any, and the next decision needed. Do not end with progress chatter.",
-                "",
-                "Required context files in this workspace:",
-                "- project-definition.md",
-                "- work-log.md",
-                "- harness-prompt.md",
-                "- agents.md / AGENTS.md",
-                "- claude.md / CLAUDE.md",
-                "- codex.md / CODEX.md",
-                "",
-                extra,
-            ]
-        ).strip() + "\n"
+        prompt = HOST_NATIVE_HARNESS_PROMPT.rstrip()
+        if extra:
+            prompt += "\n\nHost-provided instructions:\n" + extra
+        return prompt.strip() + "\n"
 
     def _bootstrap_bundle_for_worker(self, worker: dict) -> dict[str, object]:
         raw = worker.get("bootstrap_bundle_json")
@@ -1846,6 +2832,161 @@ class HostNativeCliMixin:
                 return Path(value).expanduser()
         return None
 
+    def _host_codex_home(self, worker: dict) -> Path:
+        return self._home_dir(worker["worker_id"]) / ".codex"
+
+    def _source_host_codex_home(self) -> Path:
+        return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+
+    def _copy_host_codex_auth(self, target_codex_home: Path) -> None:
+        source_auth = self._source_host_codex_home() / "auth.json"
+        if not source_auth.exists() or not source_auth.is_file():
+            return
+        target_codex_home.mkdir(parents=True, exist_ok=True)
+        target_auth = target_codex_home / "auth.json"
+        shutil.copy2(source_auth, target_auth)
+        target_auth.chmod(0o600)
+
+    def _host_codex_native_mcp_allowlist(self) -> set[str]:
+        raw = os.environ.get(
+            "GLASSHIVE_HOST_CODEX_NATIVE_MCP_ALLOWLIST",
+            os.environ.get("WPR_HOST_CODEX_NATIVE_MCP_ALLOWLIST", ""),
+        ).strip()
+        if not raw:
+            return set(_HOST_CODEX_NATIVE_MCP_ALLOWLIST)
+        if raw.lower() in {"0", "false", "no", "off", "none", "disabled"}:
+            return set()
+        return {
+            item.strip()
+            for item in raw.split(",")
+            if item.strip() and re.fullmatch(r"[A-Za-z0-9_.-]+", item.strip())
+        }
+
+    def _host_codex_plugin_cache_root(self) -> Path:
+        raw = os.environ.get(
+            "GLASSHIVE_HOST_CODEX_PLUGIN_CACHE",
+            os.environ.get("WPR_HOST_CODEX_PLUGIN_CACHE", ""),
+        ).strip()
+        if raw:
+            return Path(raw).expanduser()
+        return self._source_host_codex_home() / "plugins" / "cache"
+
+    def _host_codex_bundled_mcp_config(self, names: set[str]) -> str:
+        if not names:
+            return ""
+        cache_root = self._host_codex_plugin_cache_root()
+        if not cache_root.exists():
+            return ""
+        blocks: list[str] = []
+        found: set[str] = set()
+        for manifest in sorted(cache_root.rglob(".mcp.json")):
+            try:
+                payload = json.loads(manifest.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            servers = payload.get("mcpServers") if isinstance(payload, dict) else None
+            if not isinstance(servers, dict):
+                continue
+            for name in sorted(names - found):
+                if name not in servers:
+                    continue
+                rendered = _render_codex_mcp_server_from_json(name, servers[name], manifest.parent)
+                if rendered:
+                    blocks.append(rendered)
+                    found.add(name)
+            if found >= names:
+                break
+        return "\n\n".join(blocks).strip()
+
+    def _host_codex_known_native_mcp_config(self, names: set[str]) -> str:
+        blocks: list[str] = []
+        if "computer-use" in names:
+            computer_use_client = (
+                self._source_host_codex_home()
+                / "computer-use"
+                / "Codex Computer Use.app"
+                / "Contents"
+                / "SharedSupport"
+                / "SkyComputerUseClient.app"
+                / "Contents"
+                / "MacOS"
+                / "SkyComputerUseClient"
+            )
+            if computer_use_client.exists():
+                blocks.append(
+                    "[mcp_servers.computer-use]\n"
+                    f"command = {_toml_string(computer_use_client)}\n"
+                    "args = [\"mcp\"]"
+                )
+        return "\n\n".join(blocks).strip()
+
+    def _host_codex_worker_config(self, codex_config_append: str) -> str:
+        append = codex_config_append.strip()
+        append_names = _codex_mcp_server_names(append)
+        preserve_names = self._host_codex_native_mcp_allowlist() - append_names
+        source_config_path = self._source_host_codex_home() / "config.toml"
+        preserved = ""
+        if source_config_path.exists() and source_config_path.is_file():
+            try:
+                source_config = source_config_path.read_text()
+            except OSError:
+                source_config = ""
+            preserved = _sanitize_codex_source_config(source_config, preserve_names, append_names)
+        preserved_names = _codex_mcp_server_names(preserved)
+        plugin_preserved = self._host_codex_bundled_mcp_config(preserve_names - preserved_names)
+        plugin_names = _codex_mcp_server_names(plugin_preserved)
+        known_native = self._host_codex_known_native_mcp_config(
+            preserve_names - preserved_names - plugin_names
+        )
+        native = "\n\n".join(
+            part for part in (preserved, plugin_preserved, known_native) if part.strip()
+        ).strip()
+        if append_names:
+            native = _strip_codex_mcp_server_blocks(native, append_names)
+        return "\n\n".join(part for part in (native, append) if part.strip()).strip()
+
+    def _write_host_project_mcp_files(self, worker: dict, workspace: Path, bundle: dict[str, object]) -> None:
+        """Project scoped MCP/client config for host-native workers.
+
+        Example broker projection:
+
+            {
+                "claude_project_mcp": {"glasshive-user-capabilities": {"url": "..."}},
+                "codex_config_append": "[mcp_servers.glasshive-user-capabilities]...",
+                "env": {"GLASSHIVE_CAPABILITY_BROKER_TOKEN": "..."}
+            }
+
+        Files are owner-only because they can contain scoped broker grants or local CLI config.
+        """
+        project_mcp = bundle.get("claude_project_mcp")
+        if isinstance(project_mcp, dict):
+            payload = claude_project_mcp_payload_for_bundle(bundle, project_mcp)
+            target = workspace / ".mcp.json"
+            target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            target.chmod(0o600)
+
+        settings_local = bundle.get("claude_settings_local")
+        if isinstance(settings_local, dict):
+            target = workspace / ".claude" / "settings.local.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(settings_local, indent=2, sort_keys=True) + "\n")
+            target.chmod(0o600)
+
+        codex_config_append = str(bundle.get("codex_config_append") or "").strip()
+        if codex_config_append:
+            codex_config = self._host_codex_worker_config(codex_config_append)
+            target = workspace / ".codex" / "config.toml"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(codex_config + "\n")
+            target.chmod(0o600)
+            codex_home = self._host_codex_home(worker)
+            codex_home.mkdir(parents=True, exist_ok=True)
+            codex_home.chmod(0o700)
+            codex_target = codex_home / "config.toml"
+            codex_target.write_text(codex_config + "\n")
+            codex_target.chmod(0o600)
+            self._copy_host_codex_auth(codex_home)
+
     def _materialize_workspace(self, worker: dict, workspace: Path) -> None:
         root = self._host_workspace_root(worker)
         root.mkdir(parents=True, exist_ok=True)
@@ -1863,28 +3004,15 @@ class HostNativeCliMixin:
             )
         self._write_workspace_file(workspace, "harness-prompt.md", self._host_harness_prompt(worker), overwrite=True)
 
-        agents_md = str(
-            bundle.get("agents_md")
-            or (
-                "Follow AGENTS.md-style project instructions and keep `work-log.md` updated.\n"
-                "When the task involves the host browser, desktop, files, shell, or installed apps, operate on the real local machine session unless the project definition explicitly says sandbox.\n"
-                "End with `FINAL REPORT:` containing only the user-facing result, artifacts, blockers, and next decision.\n"
-            )
-        )
-        claude_md = str(
-            bundle.get("claude_md")
-            or (
-                "Claude host worker context. Use bypass permission mode only for this GlassHive workspace.\n"
-                "For host browser/desktop tasks, check local automation paths before reporting unavailable. End with `FINAL REPORT:`.\n"
-            )
-        )
-        codex_md = str(
-            bundle.get("codex_md")
-            or (
-                "Codex host worker context. Use full-access/no-approval mode only for this GlassHive workspace.\n"
-                "For host browser/desktop tasks, check local automation paths before reporting unavailable. End with `FINAL REPORT:`.\n"
-            )
-        )
+        agents_md = merge_glasshive_worker_instructions(HOST_DEFAULT_AGENTS_MD, bundle.get("agents_md"))
+        claude_bundle = dict(bundle)
+        if not str(claude_bundle.get("claude_md") or "").strip():
+            claude_bundle["claude_md"] = HOST_DEFAULT_CLAUDE_MD
+        claude_md = glasshive_project_claude_md(claude_bundle)
+        codex_bundle = dict(bundle)
+        if not str(codex_bundle.get("codex_md") or "").strip():
+            codex_bundle["codex_md"] = HOST_DEFAULT_CODEX_MD
+        codex_md = glasshive_project_codex_md(codex_bundle)
         for name, content in (
             ("agents.md", agents_md),
             ("AGENTS.md", agents_md),
@@ -1894,6 +3022,7 @@ class HostNativeCliMixin:
             ("CODEX.md", codex_md),
         ):
             self._write_workspace_file(workspace, name, content, overwrite=True)
+        self._write_host_project_mcp_files(worker, workspace, bundle)
 
         self._write_workspace_file(
             workspace,
@@ -1940,9 +3069,17 @@ class HostNativeCliMixin:
             + "\n",
             overwrite=True,
         )
+        self._write_workspace_file(
+            workspace,
+            "glasshive-host-tools/content-hygiene.py",
+            HOST_CONTENT_HYGIENE_TOOL,
+            overwrite=True,
+        )
         capture_helper = workspace / "glasshive-host-tools" / "capture-front-window.sh"
+        content_hygiene_helper = workspace / "glasshive-host-tools" / "content-hygiene.py"
         try:
             capture_helper.chmod(0o755)
+            content_hygiene_helper.chmod(0o755)
         except OSError as exc:
             self._append_work_log(worker, f"WARNING: capture helper chmod failed: {exc}")
         try:
@@ -1979,7 +3116,7 @@ class HostNativeCliMixin:
             if source is not None:
                 self._copy_workspace_source_file(workspace, path, source)
             else:
-                self._write_workspace_file(workspace, path, "", overwrite=True)
+                raise RuntimeErrorBase(f"Bootstrap file {path} is missing content or source_path")
 
     def _append_work_log(self, worker: dict, message: str) -> None:
         path = self._host_workspace_dir(worker) / "work-log.md"
@@ -2009,7 +3146,10 @@ class HostNativeCliMixin:
 
     def _host_env(self, worker: dict, run_id: str | None = None) -> dict[str, str]:
         env: dict[str, str] = {}
-        for key in ("HOME", "PATH", "SHELL", "TERM", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"):
+        # USER/LOGNAME are required for macOS Keychain-backed CLIs (e.g. claude-code's
+        # subscription auth resolves the keychain item by user); without them the worker
+        # reports "Not logged in". Codex is unaffected because it uses a copied auth.json.
+        for key in ("HOME", "PATH", "SHELL", "TERM", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME"):
             value = os.environ.get(key)
             if value:
                 env[key] = value
@@ -2019,11 +3159,13 @@ class HostNativeCliMixin:
         env.setdefault("HOME", str(Path.home()))
         env.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
         env.setdefault("SHELL", os.environ.get("SHELL", "/bin/zsh"))
+        env.update(bootstrap_env_for(worker))
         workspace = self._host_workspace_dir(worker)
         env["GLASSHIVE_WORKER_ID"] = str(worker.get("worker_id") or "")
         env["GLASSHIVE_WORKER_RUNTIME"] = self.runtime_name
         env["GLASSHIVE_EXECUTION_MODE"] = "host"
         env["GLASSHIVE_WORKSPACE_DIR"] = str(workspace)
+        _project_workspace_dependency_env(env)
         if run_id:
             env["GLASSHIVE_RUN_ID"] = run_id
         return env
@@ -2055,6 +3197,19 @@ class HostNativeCliMixin:
                 profile=profile,
                 execution_mode=execution_mode,
             )
+        issue = host_runtime_requirement_issue(profile, self.runtime_name, configured_binary=self.binary)
+        if issue is not None:
+            raise RuntimeDependencyMissingError(
+                issue.user_message,
+                binary=issue.binary,
+                runtime_name=self.runtime_name,
+                profile=profile,
+                execution_mode=execution_mode,
+                required_version=issue.required_version,
+                actual_version=issue.actual_version,
+                dependency_label=issue.label,
+                recovery_hint=issue.recommended_recovery,
+            )
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         self.preflight_worker_profile(
@@ -2077,21 +3232,152 @@ class HostNativeCliMixin:
         )
         return self._host_runtime_info(worker, pid=self._active_pid(worker_id))
 
+    def _active_session_argv_for_evidence(self, active_session: dict[str, object] | None) -> list[str]:
+        raw = str((active_session or {}).get("argv_for_evidence_json") or "").strip()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [str(item or "") for item in parsed]
+            except json.JSONDecodeError:
+                pass
+        return [self.runtime_name]
+
+    def _active_session_constraint_ledger(
+        self,
+        *,
+        workspace: Path,
+        active_session: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        raw = str((active_session or {}).get("constraint_ledger_path") or "").strip()
+        if not raw:
+            return None
+        path = Path(raw)
+        if not path.is_absolute():
+            path = workspace / raw
+        try:
+            payload = json.loads(path.read_text())
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _write_stopped_active_run_evidence(
+        self,
+        worker: dict,
+        *,
+        active_session: dict[str, object] | None,
+        stop_reason: str,
+        error_text: str,
+    ) -> None:
+        if not active_session:
+            return
+        run_id = str(active_session.get("run_id") or "").strip()
+        if not run_id:
+            return
+        workspace = Path(str(worker.get("workspace_dir") or self._host_workspace_dir(worker)))
+        raw_stdout_path = str(active_session.get("stdout_path") or "").strip()
+        raw_stderr_path = str(active_session.get("stderr_path") or "").strip()
+        raw_exit_path = str(active_session.get("exit_path") or "").strip()
+        stdout_path = Path(raw_stdout_path) if raw_stdout_path else None
+        stderr_path = Path(raw_stderr_path) if raw_stderr_path else None
+        exit_path = Path(raw_exit_path) if raw_exit_path else None
+        stdout = stdout_path.read_text() if stdout_path and stdout_path.is_file() else ""
+        stderr = stderr_path.read_text() if stderr_path and stderr_path.is_file() else ""
+        exit_code: int | None = None
+        if exit_path and exit_path.is_file():
+            try:
+                exit_code = int(exit_path.read_text().strip())
+            except ValueError:
+                exit_code = None
+        transcript_paths = {
+            "stdout": raw_stdout_path,
+            "stderr": raw_stderr_path,
+            "exit_code": raw_exit_path,
+            "constraint_ledger": str(active_session.get("constraint_ledger_path") or ""),
+        }
+        evidence_path = _write_evidence_for_run(
+            worker=worker,
+            run_id=run_id,
+            runtime_name=self.runtime_name,
+            model=str(active_session.get("model") or worker.get("model") or self.resolve_model(str(worker.get("profile") or ""))),
+            command=self._active_session_argv_for_evidence(active_session),
+            env={},
+            workspace=workspace,
+            stdout_text=stdout,
+            stderr_text=stderr,
+            output_text="",
+            error_text=error_text,
+            exit_code=exit_code,
+            timeout_seconds=None,
+            stop_reason=stop_reason,
+            constraint_ledger=self._active_session_constraint_ledger(workspace=workspace, active_session=active_session),
+            transcript_paths=transcript_paths,
+        )
+        raw_heartbeat_path = str(active_session.get("heartbeat_path") or "").strip()
+        heartbeat_path = Path(raw_heartbeat_path) if raw_heartbeat_path else _active_run_status_path(workspace, run_id)
+        started_at = str(active_session.get("started_at") or "").strip() or _utc_iso()
+        try:
+            timeout_seconds = (
+                float(active_session["timeout_seconds"])
+                if active_session.get("timeout_seconds") is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            timeout_seconds = None
+        _write_active_run_status(
+            path=heartbeat_path,
+            worker=worker,
+            run_id=run_id,
+            runtime_name=self.runtime_name,
+            model=str(active_session.get("model") or worker.get("model") or self.resolve_model(str(worker.get("profile") or ""))),
+            state=stop_reason,
+            transcript_paths=transcript_paths,
+            started_at=started_at,
+            process_pid=None,
+            timeout_seconds=timeout_seconds,
+            exit_code=exit_code,
+            stop_reason=stop_reason,
+            evidence_path=evidence_path,
+        )
+
     def pause_worker(self, worker: dict) -> RuntimeInfo:
+        active_session = self._read_active_session(worker["worker_id"])
         self._note_stop_reason(worker["worker_id"], "paused")
         self._stop_active_process(worker["worker_id"], worker=worker)
+        self._write_stopped_active_run_evidence(
+            worker,
+            active_session=active_session,
+            stop_reason="paused",
+            error_text="Worker was paused by the operator",
+        )
         self._append_work_log(worker, "Worker paused by operator.")
         return self._host_runtime_info(worker, pid=None)
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
+        active_session = self._read_active_session(worker["worker_id"])
+        if active_session and run_id and active_session.get("run_id") != run_id:
+            active_session = None
         self._note_stop_reason(worker["worker_id"], "interrupted", run_id=run_id)
         self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
+        self._write_stopped_active_run_evidence(
+            worker,
+            active_session=active_session,
+            stop_reason="interrupted",
+            error_text="Worker run was interrupted by the operator",
+        )
         self._append_work_log(worker, "Active run interrupted by operator.")
         return self._host_runtime_info(worker, pid=None)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
+        active_session = self._read_active_session(worker["worker_id"])
         self._note_stop_reason(worker["worker_id"], "terminated")
         self._stop_active_process(worker["worker_id"], worker=worker)
+        self._write_stopped_active_run_evidence(
+            worker,
+            active_session=active_session,
+            stop_reason="terminated",
+            error_text="Worker was terminated by the operator",
+        )
         self._append_work_log(worker, "Worker terminated by operator.")
         return self._host_runtime_info(worker, pid=None)
 
@@ -2131,14 +3417,26 @@ class HostNativeCliMixin:
             return
         worker_id = worker["worker_id"]
         with self._process_lock:
-            active = self._host_active_worker_id
-            active_process = self._active_processes.get(active or "")
-            if active and active != worker_id and (active_process is None or active_process.poll() is None):
-                raise RuntimeErrorBase(
-                    f"Host-native {self.runtime_name} already has an active worker ({active}); "
-                    "v1 allows one active host worker per CLI family."
-                )
+            error = self._host_capacity_error_locked(worker_id)
+            if error is not None:
+                raise error
             self._host_active_worker_id = worker_id
+
+    def _host_capacity_error_locked(self, worker_id: str) -> RuntimeErrorBase | None:
+        active = self._host_active_worker_id
+        active_process = self._active_processes.get(active or "")
+        if active and active != worker_id and (active_process is None or active_process.poll() is None):
+            return RuntimeErrorBase(
+                f"Host-native {self.runtime_name} already has an active worker ({active}); "
+                "v1 allows one active host worker per CLI family."
+            )
+        return None
+
+    def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
+        if os.environ.get("WPR_HOST_ALLOW_CONCURRENT_SAME_CLI", "").strip().lower() in {"1", "true", "yes", "on"}:
+            return None
+        with self._process_lock:
+            return self._host_capacity_error_locked(str(worker["worker_id"]))
 
     def _release_host_slot(self, worker_id: str) -> None:
         with self._process_lock:
@@ -2172,6 +3470,12 @@ class HostNativeCliMixin:
         command, env = self._build_command(worker, instruction, info)
         env["GLASSHIVE_RUN_ID"] = effective_run_id
         workspace = Path(str(info.workspace_dir or self._host_workspace_dir(worker)))
+        constraint_ledger, constraint_ledger_path = _write_constraint_ledger_for_run(
+            worker=worker,
+            instruction=instruction,
+            workspace=workspace,
+            run_id=effective_run_id,
+        )
         self._acquire_host_slot(worker)
 
         run_root = self._run_root(worker["worker_id"], effective_run_id)
@@ -2184,7 +3488,7 @@ class HostNativeCliMixin:
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
         stderr_path.parent.mkdir(parents=True, exist_ok=True)
 
-        command_display = shlex.join(command)
+        command_display = _redacted_command_display(command)
         self._append_work_log(worker, f"Run {effective_run_id} started with host-native {self.runtime_name}.")
         self._write_action_audit(
             worker,
@@ -2192,15 +3496,28 @@ class HostNativeCliMixin:
                 "kind": "run.started",
                 "run_id": effective_run_id,
                 "cwd": str(workspace),
-                "argv_redacted": [_redact_text(part) for part in command],
+                "argv_redacted": [_redact_command_arg(part) for part in command],
                 "env_keys": sorted(env.keys()),
+                "constraint_ledger_path": constraint_ledger_path,
             },
         )
 
         with stderr_path.open("a") as aggregate:
-            aggregate.write(f"$ host {self.runtime_name} {_redact_text(command_display)}\n")
+            aggregate.write(f"$ host {self.runtime_name} {command_display}\n")
             stderr_path.chmod(0o600)
 
+        transcript_paths = {
+            "stdout": str(raw_stdout),
+            "stderr": str(raw_stderr),
+            "exit_code": str(exit_path),
+            "constraint_ledger": constraint_ledger_path,
+        }
+        started_at = time.time()
+        started_at_iso = _utc_iso()
+        run_timeout_sec = self._host_run_timeout_sec(timeout_sec)
+        heartbeat_path = _active_run_status_path(workspace, effective_run_id)
+        heartbeat_stop = Event()
+        heartbeat_thread: Thread | None = None
         with raw_stdout.open("w") as stdout_handle, raw_stderr.open("w") as stderr_handle:
             raw_stdout.chmod(0o600)
             raw_stderr.chmod(0o600)
@@ -2223,20 +3540,93 @@ class HostNativeCliMixin:
                     "stdout_path": str(raw_stdout),
                     "stderr_path": str(raw_stderr),
                     "exit_path": str(exit_path),
+                    "constraint_ledger_path": constraint_ledger_path,
+                    "model": str(info.model or ""),
+                    "argv_for_evidence_json": json.dumps([_redact_command_arg(part) for part in command]),
+                    "started_at": started_at_iso,
+                    "process_pid": process.pid,
+                    "heartbeat_path": str(heartbeat_path),
+                    "timeout_seconds": run_timeout_sec,
                 },
             )
-            run_timeout_sec = self._host_run_timeout_sec(timeout_sec)
+            _write_active_run_status(
+                path=heartbeat_path,
+                worker=worker,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                state="running",
+                transcript_paths=transcript_paths,
+                started_at=started_at_iso,
+                process_pid=process.pid,
+                timeout_seconds=run_timeout_sec,
+            )
+            heartbeat_thread = _start_active_run_heartbeat(
+                path=heartbeat_path,
+                worker=worker,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                transcript_paths=transcript_paths,
+                started_at=started_at_iso,
+                process_pid=process.pid,
+                timeout_seconds=run_timeout_sec,
+                stop_event=heartbeat_stop,
+            )
             try:
                 exit_code = process.wait(timeout=run_timeout_sec)
             except subprocess.TimeoutExpired:
                 self._note_stop_reason(worker["worker_id"], "terminated", run_id=effective_run_id)
                 self._stop_active_process(worker["worker_id"], worker=worker, run_id=effective_run_id)
+                try:
+                    stdout_handle.flush()
+                    stderr_handle.flush()
+                except OSError:
+                    pass
+                timeout_stdout = raw_stdout.read_text() if raw_stdout.exists() else ""
+                timeout_stderr = raw_stderr.read_text() if raw_stderr.exists() else ""
+                evidence_path = _write_evidence_for_run(
+                    worker=worker,
+                    run_id=effective_run_id,
+                    runtime_name=self.runtime_name,
+                    model=str(info.model or ""),
+                    command=command,
+                    env=env,
+                    workspace=workspace,
+                    stdout_text=timeout_stdout,
+                    stderr_text=timeout_stderr,
+                    output_text="",
+                    error_text=f"{self.runtime_name} timed out after {run_timeout_sec:g}s",
+                    exit_code=None,
+                    timeout_seconds=run_timeout_sec,
+                    stop_reason="timeout",
+                    constraint_ledger=constraint_ledger,
+                    transcript_paths=transcript_paths,
+                    started_at=started_at,
+                )
+                _write_active_run_status(
+                    path=heartbeat_path,
+                    worker=worker,
+                    run_id=effective_run_id,
+                    runtime_name=self.runtime_name,
+                    model=str(info.model or ""),
+                    state="timeout",
+                    transcript_paths=transcript_paths,
+                    started_at=started_at_iso,
+                    process_pid=process.pid,
+                    timeout_seconds=run_timeout_sec,
+                    stop_reason="timeout",
+                    evidence_path=evidence_path,
+                )
                 self._append_work_log(
                     worker,
                     f"Run {effective_run_id} exceeded configured host timeout after {run_timeout_sec:g}s.",
                 )
                 raise RuntimeErrorBase(f"{self.runtime_name} timed out after {run_timeout_sec:g}s")
             finally:
+                heartbeat_stop.set()
+                if heartbeat_thread:
+                    heartbeat_thread.join(timeout=1)
                 self._clear_process(worker["worker_id"])
                 self._release_host_slot(worker["worker_id"])
 
@@ -2271,10 +3661,90 @@ class HostNativeCliMixin:
             },
         )
 
-        self._finalize_stop_reason(worker["worker_id"], run_id=effective_run_id)
+        try:
+            self._finalize_stop_reason(worker["worker_id"], run_id=effective_run_id)
+        except RuntimeErrorBase as exc:
+            if isinstance(exc, WorkerPausedError):
+                active_state = "paused"
+            elif isinstance(exc, WorkerInterruptedError):
+                active_state = "interrupted"
+            elif isinstance(exc, WorkerTerminatedError):
+                active_state = "terminated"
+            else:
+                active_state = "failed"
+            evidence_path = _write_evidence_for_run(
+                worker=worker,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                command=command,
+                env=env,
+                workspace=workspace,
+                stdout_text=stdout,
+                stderr_text=stderr,
+                output_text="",
+                error_text=str(exc),
+                exit_code=exit_code,
+                timeout_seconds=run_timeout_sec,
+                stop_reason=exc.__class__.__name__,
+                constraint_ledger=constraint_ledger,
+                transcript_paths=transcript_paths,
+                started_at=started_at,
+            )
+            _write_active_run_status(
+                path=heartbeat_path,
+                worker=worker,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                state=active_state,
+                transcript_paths=transcript_paths,
+                started_at=started_at_iso,
+                process_pid=None,
+                timeout_seconds=run_timeout_sec,
+                exit_code=exit_code,
+                stop_reason=exc.__class__.__name__,
+                evidence_path=evidence_path,
+            )
+            raise
         if exit_code != 0:
             detail = (redacted_stderr or redacted_stdout or "").strip()[-2000:]
             self._append_work_log(worker, f"Run {effective_run_id} failed with exit code {exit_code}.")
+            error_text = f"{self.runtime_name} exited with code {exit_code}: {detail}"
+            evidence_path = _write_evidence_for_run(
+                worker=worker,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                command=command,
+                env=env,
+                workspace=workspace,
+                stdout_text=stdout,
+                stderr_text=stderr,
+                output_text="",
+                error_text=error_text,
+                exit_code=exit_code,
+                timeout_seconds=run_timeout_sec,
+                stop_reason="process_exit",
+                constraint_ledger=constraint_ledger,
+                transcript_paths=transcript_paths,
+                started_at=started_at,
+            )
+            _write_active_run_status(
+                path=heartbeat_path,
+                worker=worker,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                state="failed",
+                transcript_paths=transcript_paths,
+                started_at=started_at_iso,
+                process_pid=None,
+                timeout_seconds=run_timeout_sec,
+                exit_code=exit_code,
+                stop_reason="process_exit",
+                evidence_path=evidence_path,
+            )
             raise RuntimeErrorBase(f"{self.runtime_name} exited with code {exit_code}: {detail}")
 
         session_key, output = self._parse_output(worker, stdout, stderr, info)
@@ -2285,6 +3755,86 @@ class HostNativeCliMixin:
         redacted_output = _redact_text(output.strip())
         if len(redacted_output) > _HOST_RUN_OUTPUT_MAX_CHARS:
             redacted_output = f"{redacted_output[: _HOST_RUN_OUTPUT_MAX_CHARS - 3].rstrip()}..."
+        evidence_path = _write_evidence_for_run(
+            worker=worker,
+            run_id=effective_run_id,
+            runtime_name=self.runtime_name,
+            model=str(info.model or ""),
+            command=command,
+            env=env,
+            workspace=workspace,
+            stdout_text=stdout,
+            stderr_text=stderr,
+            output_text=redacted_output,
+            error_text="",
+            exit_code=exit_code,
+            timeout_seconds=run_timeout_sec,
+            stop_reason="process_exit",
+            constraint_ledger=constraint_ledger,
+            transcript_paths=transcript_paths,
+            started_at=started_at,
+        )
+        evidence_result = _read_run_evidence_result(workspace, evidence_path)
+        evidence_status = str(evidence_result.get("status") or "").lower()
+        if evidence_status == "fail":
+            evidence_message = _evidence_result_message(evidence_result, failed=True)
+            if evidence_path:
+                self._write_action_audit(
+                    worker,
+                    {
+                        "kind": "run.evidence_failed",
+                        "run_id": effective_run_id,
+                        "evidence_path": evidence_path,
+                        "message": evidence_message,
+                    },
+                )
+            _write_active_run_status(
+                path=heartbeat_path,
+                worker=worker,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                state="failed",
+                transcript_paths=transcript_paths,
+                started_at=started_at_iso,
+                process_pid=None,
+                timeout_seconds=run_timeout_sec,
+                exit_code=exit_code,
+                stop_reason="evidence_check_failed",
+                evidence_path=evidence_path,
+            )
+            self._append_work_log(worker, f"Run {effective_run_id} failed evidence check.")
+            raise RuntimeErrorBase(evidence_message)
+        if evidence_status == "warn":
+            warning_message = _evidence_result_message(evidence_result, failed=False)
+            warning_suffix = f"\n\n{warning_message}"
+            if len(redacted_output) + len(warning_suffix) <= _HOST_RUN_OUTPUT_MAX_CHARS:
+                redacted_output = f"{redacted_output}{warning_suffix}"
+            self._append_work_log(worker, f"Run {effective_run_id} completed with evidence warning.")
+        if evidence_path:
+            self._write_action_audit(
+                worker,
+                {
+                    "kind": "run.evidence",
+                    "run_id": effective_run_id,
+                    "evidence_path": evidence_path,
+                },
+            )
+        _write_active_run_status(
+            path=heartbeat_path,
+            worker=worker,
+            run_id=effective_run_id,
+            runtime_name=self.runtime_name,
+            model=str(info.model or ""),
+            state="completed",
+            transcript_paths=transcript_paths,
+            started_at=started_at_iso,
+            process_pid=None,
+            timeout_seconds=run_timeout_sec,
+            exit_code=exit_code,
+            stop_reason="process_exit",
+            evidence_path=evidence_path,
+        )
         self._append_work_log(worker, f"Run {effective_run_id} completed.")
         return redacted_output
 
@@ -2365,6 +3915,7 @@ class HostNativeCliMixin:
 
 class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
     worker_root_name = "host_codex_cli_runtime"
+    binary_env_var = "WPR_CODEX_BIN"
 
     def resolve_model(self, profile: str) -> str:
         if profile != "codex-cli":
@@ -2404,6 +3955,7 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
                 command.extend(["-c", f'model="{model}"'])
             else:
                 command.extend(["-m", model])
+        self._append_codex_reasoning_effort_config(command, worker)
         if dangerous_mode:
             if is_resume:
                 command.append("--dangerously-bypass-approvals-and-sandbox")
@@ -2414,11 +3966,81 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
         if is_resume:
             command.append(existing_session)
         command.append(self._instruction_with_completion_contract(instruction))
-        return command, self._host_env(worker)
+        env = self._host_env(worker)
+        codex_home = self._host_codex_home(worker)
+        if (codex_home / "config.toml").exists():
+            env["CODEX_HOME"] = str(codex_home)
+        return command, env
 
 
 class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
     worker_root_name = "host_claude_code_runtime"
+    binary_env_var = "WPR_CLAUDE_CODE_BIN"
+
+    def _chrome_supported(self) -> bool:
+        return self._help_supports("--chrome")
+
+    def _effort_supported(self) -> bool:
+        return self._help_supports("--effort")
+
+    def _help_supports(self, flag: str) -> bool:
+        resolved = shutil.which(self.binary)
+        if not resolved:
+            return False
+        try:
+            completed = subprocess.run(
+                [resolved, "--help"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            return False
+        return flag in f"{completed.stdout}\n{completed.stderr}"
+
+    def _requires_max_effort(self, worker: dict | None = None) -> bool:
+        worker = worker or {}
+        effort = (
+            self._bootstrap_env_value(worker, "WPR_CLAUDE_CODE_EFFORT")
+            or os.environ.get("WPR_CLAUDE_CODE_EFFORT", "")
+        ).strip().lower()
+        return effort == "max"
+
+    def _raise_missing_effort_support(self, profile: str, execution_mode: str) -> None:
+        raise RuntimeDependencyMissingError(
+            "Claude Code workers requested `max` effort, but the configured Claude Code CLI "
+            "does not expose the native --effort flag.",
+            binary=self.binary,
+            runtime_name=self.runtime_name,
+            profile=profile,
+            execution_mode=execution_mode,
+            dependency_label="Claude Code",
+            recovery_hint=(
+                "Update Claude Code to a version with native --effort support, or use default "
+                "Claude effort only when that lower-effort mode is intended."
+            ),
+        )
+
+    def preflight_worker_profile(self, profile: str, execution_mode: str = "host") -> None:
+        super().preflight_worker_profile(profile, execution_mode)
+        if os.environ.get("WPR_CLAUDE_CODE_EFFORT", "").strip().lower() == "max" and not self._effort_supported():
+            self._raise_missing_effort_support(profile, execution_mode)
+        if self._chrome_enabled() and not self._chrome_supported():
+            raise RuntimeDependencyMissingError(
+                "Claude Code host workers require a Claude Code CLI that supports --chrome, "
+                "or WPR_CLAUDE_CODE_ENABLE_CHROME=0 for an explicit locked-down launch.",
+                binary=self.binary,
+                runtime_name=self.runtime_name,
+                profile=profile,
+                execution_mode=execution_mode,
+                dependency_label="Claude Code",
+                recovery_hint=(
+                    "Update Claude Code to a version with Chrome integration, or explicitly disable "
+                    "host Claude Chrome support only when that locked-down mode is intended."
+                ),
+            )
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_key = self._read_session_key(worker["worker_id"])
@@ -2434,6 +4056,21 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
             "--model",
             model,
         ]
+        if self._chrome_enabled():
+            command.insert(2, "--chrome")
+        effort = (
+            self._bootstrap_env_value(worker, "WPR_CLAUDE_CODE_EFFORT")
+            or os.environ.get("WPR_CLAUDE_CODE_EFFORT", "")
+        ).strip().lower()
+        if effort == "max":
+            if not self._effort_supported():
+                self._raise_missing_effort_support(str(worker.get("profile") or "claude-code"), "host")
+            command.extend(["--effort", effort])
+        elif effort and effort != "default":
+            logger.warning(
+                "Ignoring unsupported Claude Code effort",
+                extra={"worker_id": str(worker.get("worker_id") or ""), "effort": effort},
+            )
         if session_key and not session_key.startswith("claude-worker:"):
             command.extend(["--resume", session_key])
         command.append(self._instruction_with_completion_contract(instruction))
