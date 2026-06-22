@@ -105,6 +105,68 @@ def wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> None:
     raise AssertionError("Condition did not become true before timeout")
 
 
+def test_fresh_user_artifact_deliverable_accepts_standard_deliverable_roots(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    workspace = tmp_path / "workspace"
+    reports_dir = workspace / "reports"
+    output_dir = workspace / "output"
+    reports_dir.mkdir(parents=True)
+    output_dir.mkdir()
+    report_path = reports_dir / "summary.html"
+    output_path = output_dir / "final_screen.csv"
+    companies_path = output_dir / "companies.csv"
+    report_path.write_text("<html><body>FINAL REPORT</body></html>\n")
+    output_path.write_text("name\nAlpha\n")
+    companies_path.write_text("company\nAlpha\n")
+    started = datetime.now(timezone.utc).isoformat()
+    worker = {"worker_id": "wrk_fresh", "workspace_dir": str(workspace)}
+    run = {"run_id": "run_fresh", "started_at": started, "failure_class": "provider_response_failed"}
+
+    assert service._fresh_user_artifact_deliverable(
+        worker,
+        run,
+        {"workspace_path": "reports/summary.html"},
+    )
+    assert service._fresh_user_artifact_deliverable(
+        worker,
+        run,
+        {"workspace_path": "output/final_screen.csv"},
+    )
+    assert service._fresh_user_artifact_deliverable(
+        worker,
+        run,
+        {"workspace_path": "output/companies.csv"},
+    )
+    assert not service._fresh_user_artifact_deliverable(
+        worker,
+        run,
+        {"workspace_path": "glasshive-run/evidence.json"},
+    )
+
+
+def test_fresh_user_artifact_deliverable_rejects_support_dirs(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    workspace = tmp_path / "workspace"
+    research_dir = workspace / "research"
+    research_dir.mkdir(parents=True)
+    dataset_path = research_dir / "companies.csv"
+    dataset_path.write_text("company\nAlpha\n")
+    worker = {"worker_id": "wrk_support", "workspace_dir": str(workspace)}
+    run = {
+        "run_id": "run_support",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "failure_class": "provider_response_failed",
+    }
+
+    assert not service._fresh_user_artifact_deliverable(
+        worker,
+        run,
+        {"workspace_path": "research/companies.csv"},
+    )
+
+
 def assert_link_ref_url(url: str, *, prefix: str, kind: str) -> dict:
     assert url.startswith(prefix)
     assert "/v1/signed-links/" not in url
@@ -1803,6 +1865,59 @@ def test_runtime_sensitive_url_log_filter_installs_for_child_loggers(caplog):
     assert getattr(caplog.records[-1], "target_url") == (
         "https://glasshive.example.test/watch/wrk_1?gh_token=[redacted]&gh_sig=[redacted]"
     )
+
+
+def test_worker_ui_redacts_nested_runtime_paths_unless_diagnostics_enabled(tmp_path):
+    secret_root = tmp_path / "secret-runtime"
+
+    class NestedPathRuntime(StubRuntime):
+        def describe_worker(self, worker: dict) -> dict[str, object]:
+            return {
+                "mode": "stub",
+                "runtime": "openclaw-stub",
+                "prompt_paths": {
+                    "agents_md": str(secret_root / "AGENTS.md"),
+                    "codex_md": str(secret_root / "CODEX.md"),
+                },
+                "nested": {
+                    "status": "ready",
+                    "home_dir": str(secret_root / "home"),
+                    "recent": [str(secret_root / "stdout.log"), "safe-marker"],
+                },
+            }
+
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=NestedPathRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Nested Paths", "goal": "Hide nested internals."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Nested Path Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+
+    page = client.get(f"/ui/workers/{worker['worker_id']}")
+    assert page.status_code == 200
+    assert str(secret_root) not in page.text
+    assert "prompt_paths" not in page.text
+    assert "safe-marker" in page.text
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live").json()
+    assert str(secret_root) not in json.dumps(live)
+    assert "prompt_paths" not in live["runtime_details"]
+
+    diagnostics_page = client.get(f"/ui/workers/{worker['worker_id']}?diagnostics=1")
+    assert diagnostics_page.status_code == 200
+    assert str(secret_root) in diagnostics_page.text
+    diagnostics_live = client.get(f"/v1/workers/{worker['worker_id']}/live?diagnostics=1").json()
+    assert str(secret_root) in json.dumps(diagnostics_live)
 
 
 def test_enterprise_member_ui_redacts_runtime_internals(tmp_path, monkeypatch):
@@ -4285,6 +4400,12 @@ def test_openclaw_worker_exposes_operator_control_surface(tmp_path):
     assert worker["session_key"] in worker_ui.text
     assert "Queue task" in worker_ui.text
     assert "Take over terminal" in worker_ui.text
+    assert "Managed by GlassHive" in worker_ui.text
+    assert str(worker.get("workspace_dir") or "") not in worker_ui.text
+
+    diagnostics_ui = client.get(f"/ui/workers/{worker['worker_id']}?diagnostics=1")
+    assert diagnostics_ui.status_code == 200
+    assert str(worker.get("workspace_dir") or "") in diagnostics_ui.text
 
     terminal_ui = client.get(f"/ui/workers/{worker['worker_id']}/terminal")
     assert terminal_ui.status_code == 200
@@ -5472,6 +5593,23 @@ class RuntimeIoFailureWithDeliverableArtifactRuntime(RuntimeErrorWithDeliverable
         }
 
 
+class EvidenceFailureWithCompletedRecoveryRuntime(RuntimeErrorWithDeliverableArtifactRuntime):
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        _, workspace_dir = self._worker_paths(worker["worker_id"])
+        artifacts_dir = workspace_dir / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (artifacts_dir / "invalid_completion.md").write_text("# Incomplete report\n\nNo required workbook was produced.\n")
+        raise RuntimeErrorBase("GlassHive evidence check failed: completion compliance failed: missing xlsx")
+
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
+        self.collect_run_ids.append(run_id)
+        return {
+            "state": "completed",
+            "output_text": "FINAL REPORT: claimed success despite missing xlsx",
+            "error_text": "",
+        }
+
+
 def test_running_worker_exposes_runtime_paths_before_task_finishes(tmp_path):
     db_path = tmp_path / "runtime.db"
     store = Store(str(db_path))
@@ -5569,6 +5707,35 @@ def test_provider_failure_after_fresh_artifact_is_delivered_as_completed(tmp_pat
     assert any(item["event_type"] == "run.completed" for item in events)
     artifacts = client.get(f"/v1/workers/{worker['worker_id']}/artifacts").json()
     assert any(item["path"] == "artifacts/finished_report.md" for item in artifacts["items"])
+
+
+def test_evidence_failure_is_not_recovered_as_completed(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    db_path = tmp_path / "runtime.db"
+    runtime = EvidenceFailureWithCompletedRecoveryRuntime(tmp_path / "workers")
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Evidence failure", "goal": "Fail missing workbook."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Codex Worker", "role": "research", "profile": "codex-cli"},
+    ).json()
+
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Create a workbook and final report."},
+    ).json()
+    failed = wait_for_run(client, run["run_id"])
+
+    assert failed["state"] == "failed"
+    assert failed["failure_class"] == "glasshive_evidence_check_failed"
+    assert "missing xlsx" in failed["error_text"]
+    assert runtime.collect_run_ids == []
+    events = client.get(f"/v1/workers/{worker['worker_id']}/events").json()["items"]
+    assert any(item["event_type"] == "run.failed" for item in events)
+    assert not any(item["event_type"] == "run.completed" for item in events)
 
 
 def test_provider_failure_after_fresh_nested_index_is_delivered_as_completed(tmp_path, monkeypatch):

@@ -18,10 +18,12 @@ from .deliverables import (
     OLE_ARTIFACT_EXTENSIONS,
     OOXML_ARTIFACT_MARKERS,
     PROFESSIONAL_ARTIFACT_EXTENSIONS,
+    SUPPORT_ARTIFACT_DIR_NAMES,
     candidate_artifact_paths,
     is_user_deliverable_relative_path,
     is_valid_professional_artifact,
 )
+from .failure_classification import classify_cli_failure, has_structured_failure_evidence
 from .runtime_identity import derive_legacy_backend_label
 
 
@@ -40,6 +42,8 @@ _SECRET_KEY_MARKERS = (
     "AUTH",
 )
 _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"/Users/[^/\s\"'`]+(?:/[^\s\"'`]+)+"), "[REDACTED_LOCAL_PATH]"),
+    (re.compile(r"~/[^\s\"'`]+(?:/[^\s\"'`]+)+"), "[REDACTED_LOCAL_PATH]"),
     (re.compile(r"/Users/[^/\s\"']+"), "~"),
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)((?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s\"']{6,}"), r"\1[REDACTED]"),
@@ -47,7 +51,10 @@ _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
     (re.compile(r"\b[A-Za-z0-9_]{8,}:[A-Za-z0-9_./+=-]{20,}\b"), "[REDACTED_CREDENTIAL]"),
 )
-_FINAL_REPORT_RE = re.compile(r"(?m)^[ \t]*FINAL REPORT:\s*")
+_FINAL_REPORT_RE = re.compile(
+    r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*)?(?:[*_]{1,3})?FINAL REPORT\s*:\s*(?:[*_]{1,3})?",
+    re.I,
+)
 
 _MONTHS = {
     "jan": 1,
@@ -107,6 +114,7 @@ _CONTENT_HYGIENE_NEGATIVE_CONTEXT_RE = re.compile(
 _TEXT_FILE_SUFFIXES = {".csv", ".json", ".jsonl", ".md", ".txt", ".html", ".htm", ".tsv"}
 _CONTENT_HYGIENE_TEXT_SUFFIXES = {".csv", ".json", ".jsonl", ".md", ".txt", ".tsv"}
 _HTML_FILE_SUFFIXES = {".html", ".htm"}
+_CONSTRAINT_BINARY_TEXT_SUFFIXES = {".pdf", ".xlsx", ".docx", ".pptx"}
 _OUTPUT_FORMAT_SUFFIXES = (
     "pdf",
     "xlsx",
@@ -138,6 +146,17 @@ _OUTPUT_ACTION_RE = re.compile(
     r"\b(deliver|create|generate|produce|write|save|export|output|artifact|artifacts|deliverable|deliverables|report|reports|file|files)\b",
     re.I,
 )
+_FINAL_ANSWER_ONLY_CONTEXT_RE = re.compile(
+    r"\b(in\s+chat|inline|in\s+(?:the\s+)?final\s+answer|answer\s+(?:here|inline|in\s+chat)|"
+    r"respond\s+(?:here|inline|in\s+chat)|reply\s+(?:here|inline|in\s+chat)|"
+    r"tell\s+me|report\s+back)\b",
+    re.I,
+)
+_FILE_DELIVERABLE_CONTEXT_RE = re.compile(
+    r"\b(file|files|artifact|artifacts|deliverable|deliverables|save|export|download|"
+    r"pdf|xlsx|xls|csv|html|docx|pptx|json|tsv|workbook|spreadsheet|slide\s+deck|deck)\b",
+    re.I,
+)
 _OUTPUT_FORBIDDEN_RE = re.compile(
     r"\b(do\s+not|don't|must\s+not|should\s+not|without|avoid|forbidden|no)\b"
     r"[^.\n;]{0,80}\b(create|generate|produce|write|save|export|output|deliver|artifact|file|report|pdf|xlsx|xls|csv|html|docx|pptx|txt|md|json|tsv)\b",
@@ -147,11 +166,43 @@ _OUTPUT_FORBIDDEN_CLAUSE_RE = re.compile(
     r"\b(?:do\s+not|don't|must\s+not|should\s+not|without|avoid|forbidden|no)\b[^.\n;)]*",
     re.I,
 )
+_COVERAGE_ENTITY_RE = r"(?:firms?|companies|entities|targets?|items|records|rows|entries)"
+_COVERAGE_RANGE_RE = re.compile(
+    rf"\b(?:aim\s+for|target|cover|include|research|score|screen|produce)\b[^.\n;]{{0,100}}"
+    rf"\b(\d{{1,4}})\s*(?:-|–|—|to)\s*(\d{{1,4}})\s+({_COVERAGE_ENTITY_RE})\b",
+    re.I,
+)
+_COVERAGE_RANGE_TOTAL_RE = re.compile(
+    rf"\b(\d{{1,4}})\s*(?:-|–|—|to)\s*(\d{{1,4}})\s+({_COVERAGE_ENTITY_RE})\b"
+    rf"[^.\n;]{{0,80}}\b(?:total|before\s+scoring|scored|screened)\b",
+    re.I,
+)
+_COVERAGE_RANGE_BARE_TOTAL_RE = re.compile(
+    r"\b(?:aim\s+for|target|cover|include|research|score|screen|produce)\b[^.\n;]{0,80}"
+    r"\b(\d{1,4})\s*(?:-|–|—|to)\s*(\d{1,4})\s+(?:total|before\s+scoring|scored|screened)\b",
+    re.I,
+)
+_COVERAGE_MIN_RE = re.compile(
+    rf"\b(?:at\s+least|minimum(?:\s+of)?|min(?:imum)?|no\s+fewer\s+than)\s+(\d{{1,4}})\s+({_COVERAGE_ENTITY_RE})\b",
+    re.I,
+)
+_COVERAGE_PLUS_RE = re.compile(
+    rf"\b(\d{{1,4}})\+\s+({_COVERAGE_ENTITY_RE})\b",
+    re.I,
+)
 _INPUT_FORMAT_CONTEXT_RE = re.compile(
     r"\b(attached|uploaded|input|source|provided|existing|read|compare|analy[sz]e|from|using|use)\b",
     re.I,
 )
-_SUPPORT_ARTIFACT_DIRS = {"research", "planning", "specs", "notes"}
+_SUPPORT_ARTIFACT_DIRS = SUPPORT_ARTIFACT_DIR_NAMES
+_RAW_SUPPORT_CAPTURE_DIRS = {
+    "crawl_cache",
+    "raw_pages",
+    "raw_web",
+    "site_snapshots",
+    "source_snapshots",
+    "web_snapshots",
+}
 _SEED_DESCRIPTOR_WORDS = {
     "companies",
     "entities",
@@ -195,10 +246,28 @@ def _redact_command_arg(value: object) -> str:
     if "\n" in text or len(text) > 600:
         digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
         return f"[REDACTED_LONG_ARG chars={len(text)} sha256={digest}]"
+    if text.startswith("/") or text.startswith("~/"):
+        return Path(text).name or "[REDACTED_PATH]"
     return _redact_text(text)
 
 
 def _stdout_agent_has_final_report(stdout_text: str) -> bool:
+    final_text_keys = {
+        "finalAssistantVisibleText",
+        "final_assistant_visible_text",
+        "finalVisibleText",
+        "final_visible_text",
+    }
+
+    def iter_dicts(value: object) -> Iterable[dict[str, object]]:
+        if isinstance(value, dict):
+            yield value
+            for nested in value.values():
+                yield from iter_dicts(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                yield from iter_dicts(nested)
+
     for line in str(stdout_text or "").splitlines():
         try:
             payload = json.loads(line)
@@ -206,9 +275,14 @@ def _stdout_agent_has_final_report(stdout_text: str) -> bool:
             continue
         if not isinstance(payload, dict):
             continue
+        for item in iter_dicts(payload):
+            for key in final_text_keys:
+                text = str(item.get(key) or "")
+                if _FINAL_REPORT_RE.search(text):
+                    return True
         if str(payload.get("type") or "") == "result":
             result_text = str(payload.get("result") or "")
-            if _FINAL_REPORT_RE.search(result_text) or "FINAL REPORT:" in result_text:
+            if _FINAL_REPORT_RE.search(result_text):
                 return True
         item = payload.get("item")
         if not isinstance(item, dict):
@@ -216,7 +290,7 @@ def _stdout_agent_has_final_report(stdout_text: str) -> bool:
         if str(item.get("type") or "") not in {"agent_message", "assistant_message"}:
             continue
         text = str(item.get("text") or "")
-        if _FINAL_REPORT_RE.search(text) or "FINAL REPORT:" in text:
+        if _FINAL_REPORT_RE.search(text):
             return True
     return False
 
@@ -250,6 +324,60 @@ def _effective_effort(worker: dict[str, object], command: list[str], env: dict[s
         if text == "--effort" and index + 1 < len(command):
             return str(command[index + 1] or "").strip()
     return ""
+
+
+def _transcript_metadata(
+    transcript_paths: dict[str, str] | None,
+    *,
+    workspace_dir: Path | str | None = None,
+    tail_limit_chars: int = 4000,
+) -> dict[str, object]:
+    workspace = Path(workspace_dir) if workspace_dir is not None else None
+    metadata: dict[str, object] = {}
+    for key, raw_path in (transcript_paths or {}).items():
+        path_text = str(raw_path or "").strip()
+        if not path_text:
+            metadata[str(key)] = {"exists": False, "bytes": 0, "tail_limit_chars": tail_limit_chars, "truncated": False}
+            continue
+        path = Path(path_text)
+        if workspace is not None and not path.is_absolute():
+            path = workspace / path
+        try:
+            size = path.stat().st_size if path.is_file() else 0
+            exists = path.is_file()
+        except OSError:
+            size = 0
+            exists = False
+        metadata[str(key)] = {
+            "exists": exists,
+            "bytes": size,
+            "tail_limit_chars": tail_limit_chars if str(key) in {"stdout", "stderr"} else None,
+            "truncated": bool(exists and str(key) in {"stdout", "stderr"} and size > tail_limit_chars),
+            "capture_source": "file" if exists else "missing",
+        }
+    return metadata
+
+
+def _effort_projection(worker: dict[str, object], effective_effort: str) -> dict[str, object]:
+    raw = worker.get("effort_projection")
+    if not isinstance(raw, dict):
+        raw = worker.get("_effort_projection")
+    if isinstance(raw, dict):
+        allowed = raw.get("allowed")
+        return {
+            "requested": str(raw.get("requested") or ""),
+            "effective": str(raw.get("effective") or effective_effort or ""),
+            "allowed": [str(item) for item in allowed] if isinstance(allowed, list) else [],
+            "route_proven": bool(raw.get("route_proven")),
+            "fallback_reason": str(raw.get("fallback_reason") or ""),
+        }
+    return {
+        "requested": effective_effort,
+        "effective": effective_effort,
+        "allowed": [],
+        "route_proven": False,
+        "fallback_reason": "",
+    }
 
 
 def _derived_legacy_backend(worker: dict[str, object]) -> str:
@@ -291,6 +419,98 @@ def _bootstrap_seed_files(worker: dict[str, object]) -> list[str]:
     return files
 
 
+def _is_markdown_heading(line: str) -> bool:
+    text = str(line or "").strip()
+    return bool(re.match(r"^#{1,6}\s+", text) or re.match(r"^\*\*[^*]{2,120}\*\*\s*$", text))
+
+
+def _is_seed_block_heading(line: str) -> bool:
+    text = str(line or "").strip()
+    lower = text.lower()
+    heading_like = _is_markdown_heading(text) or lower.startswith(("seed ", "seed-", "seed_", "seed:"))
+    if not heading_like:
+        return False
+    return "seed" in lower and any(
+        token in lower for token in ("list", "entities", "firms", "companies", "topics", "items", "files", "targets")
+    )
+
+
+def _seed_block_lines(instruction_text: str) -> list[str]:
+    lines = str(instruction_text or "").splitlines()
+    collecting = False
+    collected: list[str] = []
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if _is_seed_block_heading(stripped):
+            collecting = True
+            continue
+        if not collecting:
+            continue
+        if stripped.startswith("---"):
+            collecting = False
+            continue
+        if _is_markdown_heading(stripped):
+            # Category headings inside a seed block are labels, not seed terms.
+            continue
+        lower = stripped.lower()
+        if lower.startswith("(") and "expand beyond" in lower:
+            continue
+        if _contains_any(lower, ("aim for", "do not limit", "before scoring", "total before")):
+            continue
+        if "," in stripped or ";" in stripped or re.search(r"\band\b", stripped, re.I):
+            collected.append(stripped)
+    return collected
+
+
+def _coverage_expectations(instruction_text: str) -> list[dict[str, object]]:
+    expectations: list[dict[str, object]] = []
+    for line in _lines(instruction_text):
+        matches: list[tuple[int, int | None, str]] = []
+        for pattern in (_COVERAGE_RANGE_RE, _COVERAGE_RANGE_TOTAL_RE):
+            for match in pattern.finditer(line):
+                low = int(match.group(1))
+                high = int(match.group(2))
+                if low > high:
+                    low, high = high, low
+                matches.append((low, high, match.group(3).lower()))
+        for match in _COVERAGE_RANGE_BARE_TOTAL_RE.finditer(line):
+            low = int(match.group(1))
+            high = int(match.group(2))
+            if low > high:
+                low, high = high, low
+            matches.append((low, high, "items"))
+        for match in _COVERAGE_MIN_RE.finditer(line):
+            matches.append((int(match.group(1)), None, match.group(2).lower()))
+        if re.search(r"\b(?:aim|target|score|screen|cover|include|research|total)\b", line, re.I):
+            for match in _COVERAGE_PLUS_RE.finditer(line):
+                matches.append((int(match.group(1)), None, match.group(2).lower()))
+        for minimum, maximum, entity in matches:
+            expectations.append(
+                {
+                    "minimum": minimum,
+                    "maximum": maximum,
+                    "entity": entity,
+                    "line": _redact_text(line),
+                }
+            )
+    seen: set[tuple[int, int | None, str, str]] = set()
+    unique: list[dict[str, object]] = []
+    for item in expectations:
+        key = (
+            int(item.get("minimum") or 0),
+            int(item["maximum"]) if item.get("maximum") is not None else None,
+            str(item.get("entity") or ""),
+            str(item.get("line") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
 def build_constraint_ledger(
     *,
     instruction: str,
@@ -322,7 +542,7 @@ def build_constraint_ledger(
             scope_lines.append(line)
         if _contains_any(lower, ("exclude", "do not exclude", "flag", "forbid", "forbidden", "must not", "not allowed")):
             exclusion_lines.append(line)
-        if _contains_any(lower, ("seed", "seed file", "seed entity", "input file", "uploaded file")):
+        if _contains_any(lower, ("seed", "seed file", "seed entity", "input file", "uploaded file")) and not _is_seed_block_heading(line):
             seed_lines.append(line)
         if _line_has_required_output_context(line):
             required_output_lines.append(line)
@@ -332,7 +552,7 @@ def build_constraint_ledger(
     def unique_redacted(values: list[str]) -> list[str]:
         return list(dict.fromkeys(_redact_text(item) for item in values))
 
-    seeds = unique_redacted([*seed_lines, *_bootstrap_seed_files(worker)])
+    seeds = unique_redacted([*seed_lines, *_seed_block_lines(instruction_text), *_bootstrap_seed_files(worker)])
     do_not_widen_or_soften = bool(
         date_lines
         or source_lines
@@ -367,6 +587,7 @@ def build_constraint_ledger(
             "forbidden_format_expectations": _output_formats(forbidden_output_lines),
         },
         "seed_entities_or_files": seeds,
+        "coverage_expectations": _coverage_expectations(instruction_text),
         "do_not_widen_or_soften": do_not_widen_or_soften,
     }
 
@@ -403,6 +624,14 @@ def _line_has_required_output_context(line: str) -> bool:
     text = str(line or "")
     required_fragment = _OUTPUT_FORBIDDEN_CLAUSE_RE.sub(" ", text)
     return bool(_OUTPUT_ACTION_RE.search(required_fragment))
+
+
+def _line_is_final_answer_only_context(line: str) -> bool:
+    text = str(line or "")
+    required_fragment = _OUTPUT_FORBIDDEN_CLAUSE_RE.sub(" ", text)
+    if not _FINAL_ANSWER_ONLY_CONTEXT_RE.search(required_fragment):
+        return False
+    return not bool(_FILE_DELIVERABLE_CONTEXT_RE.search(required_fragment))
 
 
 def _format_mentions(line: str, suffix: str) -> Iterable[re.Match[str]]:
@@ -761,6 +990,8 @@ def _text_artifact_payload(workspace_dir: Path) -> dict[str, str]:
             if path.stat().st_size > _MAX_TEXT_SCAN_BYTES:
                 continue
             rel = _relative_path(path, workspace_dir)
+            if _is_raw_support_capture_path(rel):
+                continue
             text = path.read_text(encoding="utf-8", errors="ignore")
             suffix = path.suffix.lower()
             if suffix in {".csv", ".tsv"}:
@@ -813,6 +1044,200 @@ def _text_artifact_payload(workspace_dir: Path) -> dict[str, str]:
     return payload
 
 
+def _non_empty_csv_rows(path: Path, *, delimiter: str) -> int:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        reader = csv.reader(text.splitlines(), delimiter=delimiter)
+        rows = [row for row in reader if any(str(cell or "").strip() for cell in row)]
+    except (OSError, csv.Error):
+        return 0
+    return max(0, len(rows) - 1) if rows else 0
+
+
+def _json_collection_count(path: Path) -> int:
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if isinstance(parsed, list):
+        return len(parsed)
+    if isinstance(parsed, dict):
+        counts = [len(value) for value in parsed.values() if isinstance(value, list)]
+        return max(counts) if counts else 0
+    return 0
+
+
+def _xlsx_table_counts(path: Path) -> list[dict[str, object]]:
+    try:
+        import openpyxl  # type: ignore
+    except Exception:
+        return []
+    try:
+        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    except Exception:
+        return []
+    counts: list[dict[str, object]] = []
+    try:
+        for sheet in workbook.worksheets:
+            non_empty_rows = 0
+            for row in sheet.iter_rows(values_only=True):
+                if any(str(cell or "").strip() for cell in row):
+                    non_empty_rows += 1
+            counts.append({"sheet": sheet.title, "count": max(0, non_empty_rows - 1)})
+    finally:
+        workbook.close()
+    return counts
+
+
+def _markdown_table_count(path: Path) -> int:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return 0
+    return _markdown_table_count_from_lines(lines)
+
+
+def _markdown_table_count_from_lines(lines: Iterable[str]) -> int:
+    table_rows = [
+        line
+        for line in lines
+        if "|" in line and not re.fullmatch(r"\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*", line)
+    ]
+    if len(table_rows) < 2:
+        return 0
+    return max(0, len(table_rows) - 1)
+
+
+def _html_table_count(path: Path) -> int:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return 0
+    rows = len(re.findall(r"<tr\b", text, re.I))
+    return max(0, rows - 1)
+
+
+def _final_output_coverage_counts(output_text: str) -> list[dict[str, object]]:
+    text = str(output_text or "")
+    if not text.strip():
+        return []
+    lines = text.splitlines()
+    counts: list[dict[str, object]] = []
+    list_count = sum(
+        1
+        for line in lines
+        if re.match(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", line)
+    )
+    if list_count:
+        counts.append({"path": "final_output", "kind": "final_output_list_items", "count": list_count})
+    table_count = _markdown_table_count_from_lines(lines)
+    if table_count:
+        counts.append({"path": "final_output", "kind": "final_output_table_rows", "count": table_count})
+    return counts
+
+
+def _artifact_coverage_counts(workspace_dir: Path, artifacts: dict[str, object], *, output_text: str = "") -> list[dict[str, object]]:
+    items = artifacts.get("items") if isinstance(artifacts, dict) else []
+    if not isinstance(items, list):
+        return []
+    counts: list[dict[str, object]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rel_path = str(item.get("path") or "")
+        if not rel_path or _is_support_artifact_path(rel_path):
+            continue
+        path = workspace_dir / rel_path
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            count = _non_empty_csv_rows(path, delimiter=",")
+            if count:
+                counts.append({"path": rel_path, "kind": "csv_rows", "count": count})
+        elif suffix == ".tsv":
+            count = _non_empty_csv_rows(path, delimiter="\t")
+            if count:
+                counts.append({"path": rel_path, "kind": "tsv_rows", "count": count})
+        elif suffix == ".json":
+            count = _json_collection_count(path)
+            if count:
+                counts.append({"path": rel_path, "kind": "json_items", "count": count})
+        elif suffix == ".xlsx":
+            for sheet_count in _xlsx_table_counts(path):
+                counts.append({"path": rel_path, "kind": "xlsx_rows", **sheet_count})
+        elif suffix == ".md":
+            count = _markdown_table_count(path)
+            if count:
+                counts.append({"path": rel_path, "kind": "markdown_table_rows", "count": count})
+        elif suffix in _HTML_FILE_SUFFIXES:
+            count = _html_table_count(path)
+            if count:
+                counts.append({"path": rel_path, "kind": "html_table_rows", "count": count})
+    counts.extend(_final_output_coverage_counts(output_text))
+    return counts
+
+
+def _coverage_compliance(
+    workspace_dir: Path,
+    artifacts: dict[str, object],
+    ledger: dict[str, object] | None,
+    *,
+    output_text: str = "",
+) -> dict[str, object]:
+    expectations: list[dict[str, object]] = []
+    if isinstance(ledger, dict) and isinstance(ledger.get("coverage_expectations"), list):
+        expectations = [item for item in ledger["coverage_expectations"] if isinstance(item, dict)]
+    counts = _artifact_coverage_counts(workspace_dir, artifacts, output_text=output_text)
+    count_values = [int(item.get("count") or 0) for item in counts]
+    max_count = max(count_values, default=0)
+    matched_count = 0
+    issues: list[dict[str, object]] = []
+    warnings: list[dict[str, object]] = []
+    for expectation in expectations:
+        minimum = int(expectation.get("minimum") or 0)
+        raw_maximum = expectation.get("maximum")
+        maximum = int(raw_maximum) if raw_maximum is not None else None
+        matching_counts = [
+            value
+            for value in count_values
+            if (not minimum or value >= minimum) and (maximum is None or value <= maximum)
+        ]
+        if matching_counts:
+            matched_count = max(matched_count, max(matching_counts))
+            continue
+        if minimum and not any(value >= minimum for value in count_values):
+            payload = {
+                "reason": "coverage count below requested minimum" if count_values else "coverage count could not be verified",
+                "requested_minimum": minimum,
+                "requested_maximum": maximum,
+                "observed_max_count": max_count,
+                "entity": str(expectation.get("entity") or ""),
+                "line": _redact_text(expectation.get("line") or ""),
+            }
+            if count_values:
+                issues.append(payload)
+            else:
+                warnings.append(payload)
+        elif maximum is not None and any(value > maximum for value in count_values):
+            warnings.append(
+                {
+                    "reason": "coverage count above requested maximum",
+                    "requested_minimum": minimum,
+                    "requested_maximum": maximum,
+                    "observed_max_count": max_count,
+                    "entity": str(expectation.get("entity") or ""),
+                    "line": _redact_text(expectation.get("line") or ""),
+                }
+            )
+    return {
+        "status": "fail" if issues else "warn" if warnings else "pass" if expectations else "not_applicable",
+        "expectations": expectations,
+        "counts": counts[:50],
+        "observed_max_count": max_count,
+        "matched_count": matched_count or None,
+        "issues": [*issues, *warnings][:100],
+    }
+
+
 def _iter_scan_files(workspace_dir: Path) -> Iterable[Path]:
     count = 0
     for path in workspace_dir.rglob("*"):
@@ -823,6 +1248,8 @@ def _iter_scan_files(workspace_dir: Path) -> Iterable[Path]:
         try:
             rel = path.relative_to(workspace_dir)
         except ValueError:
+            continue
+        if _is_raw_support_capture_path(rel.as_posix()):
             continue
         lowered_parts = [part.lower() for part in rel.parts]
         if any(part in _SKIP_SCAN_DIRS for part in lowered_parts):
@@ -836,6 +1263,145 @@ def _iter_scan_files(workspace_dir: Path) -> Iterable[Path]:
             continue
         count += 1
         yield path
+
+
+def _extract_xlsx_text(path: Path) -> tuple[str, str | None]:
+    try:
+        import openpyxl  # type: ignore
+    except Exception:
+        return "", "openpyxl unavailable for xlsx constraint scan"
+    values: list[str] = []
+    try:
+        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    except Exception:
+        return "", "xlsx text extraction failed"
+    try:
+        for sheet_name in workbook.sheetnames[:20]:
+            worksheet = workbook[sheet_name]
+            values.append(str(sheet_name))
+            for row_index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+                if row_index > 1000:
+                    break
+                for value in row[:100]:
+                    text = str(value or "").strip()
+                    if text:
+                        values.append(text)
+                    if len(values) >= 5000:
+                        return "\n".join(values), None
+    finally:
+        workbook.close()
+    return "\n".join(values), None
+
+
+def _extract_docx_text(path: Path) -> tuple[str, str | None]:
+    try:
+        import docx  # type: ignore
+    except Exception:
+        return "", "python-docx unavailable for docx constraint scan"
+    try:
+        document = docx.Document(str(path))
+    except Exception:
+        return "", "docx text extraction failed"
+    fragments: list[str] = [paragraph.text for paragraph in document.paragraphs if paragraph.text]
+    for table in document.tables[:50]:
+        for row in table.rows[:1000]:
+            for cell in row.cells[:100]:
+                if cell.text:
+                    fragments.append(cell.text)
+                if len(fragments) >= 5000:
+                    return "\n".join(fragments), None
+    return "\n".join(fragments), None
+
+
+def _extract_pptx_text(path: Path) -> tuple[str, str | None]:
+    try:
+        import pptx  # type: ignore
+    except Exception:
+        return "", "python-pptx unavailable for pptx constraint scan"
+    try:
+        presentation = pptx.Presentation(str(path))
+    except Exception:
+        return "", "pptx text extraction failed"
+    fragments: list[str] = []
+    for slide_index, slide in enumerate(presentation.slides, start=1):
+        if slide_index > 100:
+            break
+        for shape in slide.shapes:
+            text = str(getattr(shape, "text", "") or "").strip()
+            if text:
+                fragments.append(text)
+            if len(fragments) >= 5000:
+                return "\n".join(fragments), None
+    return "\n".join(fragments), None
+
+
+def _extract_pdf_text(path: Path) -> tuple[str, str | None]:
+    binary = shutil.which("pdftotext")
+    if not binary:
+        return "", "pdftotext unavailable for pdf constraint scan"
+    try:
+        completed = subprocess.run(
+            [binary, "-layout", str(path), "-"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return "", "pdf text extraction failed"
+    if completed.returncode != 0:
+        return "", "pdf text extraction failed"
+    return completed.stdout[:_MAX_TEXT_SCAN_BYTES], None
+
+
+def _extract_artifact_text(path: Path) -> tuple[str, str | None]:
+    suffix = path.suffix.lower()
+    try:
+        if path.stat().st_size > _MAX_TEXT_SCAN_BYTES * 4:
+            return "", "binary artifact too large for constraint scan"
+    except OSError:
+        return "", "binary artifact stat failed for constraint scan"
+    if suffix == ".xlsx":
+        return _extract_xlsx_text(path)
+    if suffix == ".docx":
+        return _extract_docx_text(path)
+    if suffix == ".pptx":
+        return _extract_pptx_text(path)
+    if suffix == ".pdf":
+        return _extract_pdf_text(path)
+    return "", None
+
+
+def _constraint_scan_texts(workspace_dir: Path, output_text: str) -> tuple[list[tuple[str, str]], list[dict[str, str]]]:
+    entries: list[tuple[str, str]] = []
+    warnings: list[dict[str, str]] = []
+    if str(output_text or "").strip():
+        entries.append(("<final-output>", str(output_text or "")))
+    seen_paths: set[Path] = set()
+    for path in _iter_scan_files(workspace_dir):
+        seen_paths.add(path.resolve())
+        try:
+            entries.append((_relative_path(path, workspace_dir), path.read_text(encoding="utf-8", errors="ignore")))
+        except OSError:
+            continue
+    for path in candidate_artifact_paths({"workspace_dir": str(workspace_dir)}, max_entries=100):
+        if path.resolve() in seen_paths:
+            continue
+        if path.suffix.lower() not in _CONSTRAINT_BINARY_TEXT_SUFFIXES:
+            continue
+        text, extraction_warning = _extract_artifact_text(path)
+        rel = _relative_path(path, workspace_dir)
+        if extraction_warning:
+            warnings.append(
+                {
+                    "path": rel,
+                    "reason": "constraint text extraction unavailable",
+                    "text": _redact_text(extraction_warning, max_chars=160),
+                }
+            )
+        if text.strip():
+            entries.append((rel, text[:_MAX_TEXT_SCAN_BYTES]))
+    return entries, warnings
 
 
 def _extract_latest_date_limit(ledger: dict[str, object]) -> tuple[int, int] | None:
@@ -870,12 +1436,20 @@ def _month_year_mentions(text: str) -> Iterable[tuple[int, int, str]]:
 
 _REJECTED_OR_OUT_OF_SCOPE_RE = re.compile(
     r"\b("
-    r"rejected|discarded|out[- ]of[- ]scope|outside scope|excluded from evidence|not used|do not use|"
-    r"not relied upon|not supporting|does not support|removed from (?:facts|scoring|deliverables)"
+    r"rejected|discarded|out[- ]of[- ]scope|outside scope|out[- ]of[- ]window|outside\b.{0,80}\bwindow|"
+    r"excluded(?: from (?:evidence|facts|scoring|deliverables|factual record))?|not used|do not use|"
+    r"not usable|not counted|not relied upon|not supporting|does not support|"
+    r"removed from (?:facts|scoring|deliverables)"
     r")\b",
     re.I,
 )
-_CONSTRAINT_PLANNING_DIRS = {"research", "planning", "specs", "notes"}
+_ACCESS_TIMESTAMP_ONLY_RE = re.compile(
+    r"\b(?:access(?:ed)?|retriev(?:ed|al))(?:\s*/\s*(?:access(?:ed)?|retriev(?:ed|al)))?\s+(?:date|timestamp|at|on|=|:|\d{4}-\d{2}|[A-Z][a-z]+ \d{4})\b"
+    r"|\b(?:date|timestamp)\s+(?:of\s+)?(?:access|retrieval)\b",
+    re.I,
+)
+_SOURCE_PUBLICATION_DATE_RE = re.compile(r"\b(?:published|publication|dated|released|filed|announced)\b", re.I)
+_CONSTRAINT_PLANNING_DIRS = {"planning", "specs"}
 _CONSTRAINT_PLANNING_NAMES = {"spec", "plan", "prompt", "subagent", "delegation", "constraint", "ledger"}
 _SOFTENING_RE = re.compile(r"\b(wherever possible|if possible|best effort|when available|roughly|approximately)\b", re.I)
 _CONSTRAINT_CONTEXT_RE = re.compile(
@@ -905,13 +1479,18 @@ def _is_rejected_or_out_of_scope_line(line: str) -> bool:
     return bool(_REJECTED_OR_OUT_OF_SCOPE_RE.search(line))
 
 
+def _is_access_timestamp_only_line(line: str) -> bool:
+    text = str(line or "")
+    return bool(_ACCESS_TIMESTAMP_ONLY_RE.search(text)) and not bool(_SOURCE_PUBLICATION_DATE_RE.search(text))
+
+
 def _line_uses_date_as_source_evidence(line: str, mention: str) -> bool:
     escaped = re.escape(str(mention or ""))
     if not escaped:
         return False
     text = str(line or "")
     source_word = r"(?:source|sources|sourced|data source|citation|cited|evidence|dataset|primary source)"
-    date_action = r"(?:published|dated|accessed|released|filed|retrieved)"
+    date_action = r"(?:published|dated|released|filed|announced)"
     patterns = (
         rf"\b{source_word}\b[^.\n;]{{0,80}}\b{date_action}\b[^.\n;]{{0,40}}\b{escaped}\b",
         rf"\b{date_action}\b[^.\n;]{{0,40}}\b{escaped}\b",
@@ -929,6 +1508,16 @@ def _is_constraint_planning_file(rel_path: str) -> bool:
     )
 
 
+def _is_constraint_propagation_file(rel_path: str) -> bool:
+    path = Path(rel_path)
+    lowered_parts = [part.lower() for part in path.parts]
+    stem = path.stem.lower()
+    return bool(
+        any(part in {"planning", "specs"} for part in lowered_parts)
+        or any(token in stem for token in {"spec", "plan", "prompt", "subagent", "delegation"})
+    )
+
+
 def _softening_lines(text: str, *, rel_path: str) -> list[str]:
     lines: list[str] = []
     if not _is_constraint_planning_file(rel_path):
@@ -941,29 +1530,85 @@ def _softening_lines(text: str, *, rel_path: str) -> list[str]:
     return lines
 
 
-def _constraint_compliance(workspace_dir: Path, ledger: dict[str, object] | None) -> dict[str, object]:
+def _source_date_constraint_lines(ledger: dict[str, object]) -> list[str]:
+    constraints = ledger.get("constraints")
+    if not isinstance(constraints, dict):
+        return []
+    lines: list[str] = []
+    for key in ("source", "date"):
+        values = constraints.get(key)
+        if isinstance(values, list):
+            lines.extend(str(item or "").strip() for item in values if str(item or "").strip())
+    return list(dict.fromkeys(lines))
+
+
+def _planning_file_preserves_source_date_constraints(text: str, constraint_lines: list[str]) -> bool:
+    normalized_text = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not normalized_text:
+        return False
+    if "constraint-ledger" in normalized_text or "constraint ledger" in normalized_text:
+        return True
+    for line in constraint_lines:
+        normalized_line = re.sub(r"\s+", " ", str(line or "")).strip().lower()
+        if len(normalized_line) >= 20 and normalized_line in normalized_text:
+            return True
+        mentions = [mention.lower() for _year, _month, mention in _month_year_mentions(line)]
+        if mentions and all(mention in normalized_text for mention in mentions):
+            if "source" not in normalized_line or "source" in normalized_text:
+                return True
+    return False
+
+
+def _constraint_compliance(workspace_dir: Path, ledger: dict[str, object] | None, *, output_text: str = "") -> dict[str, object]:
     if not ledger:
         return {"status": "not_available", "issues": []}
     issues: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = []
     latest_limit = _extract_latest_date_limit(ledger)
     strict = bool(ledger.get("do_not_widen_or_soften"))
-    for path in _iter_scan_files(workspace_dir):
-        rel = _relative_path(path, workspace_dir)
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
+    strict_source_date_lines = _source_date_constraint_lines(ledger) if strict else []
+    scanned_sources: list[str] = []
+    scan_entries, scan_warnings = _constraint_scan_texts(workspace_dir, output_text)
+    warnings.extend(scan_warnings)
+    for rel, text in scan_entries:
+        scanned_sources.append(rel)
+        if (
+            strict_source_date_lines
+            and _is_constraint_propagation_file(rel)
+            and not _planning_file_preserves_source_date_constraints(text, strict_source_date_lines)
+        ):
+            issues.append(
+                {
+                    "path": rel,
+                    "reason": "strict source/date constraints not referenced in planning file",
+                    "text": "Planning/spec/delegation file should reference constraint-ledger or restate strict source/date constraints.",
+                }
+            )
         if latest_limit:
             for year, month, mention, line in _month_year_mentions_with_context(text):
-                if (
+                out_of_window = (
                     (year, month) > latest_limit
-                    and _line_uses_date_as_source_evidence(line, mention)
                     and not _is_rejected_or_out_of_scope_line(line)
-                ):
+                    and not _is_access_timestamp_only_line(line)
+                )
+                if out_of_window and _line_uses_date_as_source_evidence(line, mention):
                     issues.append(
                         {
                             "path": rel,
                             "reason": "date/source window widened past ledger limit",
+                            "text": _redact_text(line.strip() or mention),
+                        }
+                    )
+                elif (
+                    strict
+                    and out_of_window
+                    and _is_constraint_propagation_file(rel)
+                    and _CONSTRAINT_CONTEXT_RE.search(line)
+                ):
+                    issues.append(
+                        {
+                            "path": rel,
+                            "reason": "planning source/date window widened past ledger limit",
                             "text": _redact_text(line.strip() or mention),
                         }
                     )
@@ -979,8 +1624,9 @@ def _constraint_compliance(workspace_dir: Path, ledger: dict[str, object] | None
         if len(issues) >= 100:
             break
     return {
-        "status": "fail" if issues else "pass",
-        "issues": issues,
+        "status": "fail" if issues else "warn" if warnings else "pass",
+        "issues": [*issues, *warnings][:100],
+        "scanned_sources": scanned_sources[:100],
     }
 
 
@@ -1010,6 +1656,21 @@ def _required_artifact_types(ledger: dict[str, object] | None) -> list[str]:
     return [item for item in dict.fromkeys(required) if item and not (_format_aliases(item) & forbidden_aliases)]
 
 
+def _has_required_deliverable_intent(ledger: dict[str, object] | None) -> bool:
+    if not ledger:
+        return False
+    outputs = ledger.get("outputs")
+    if not isinstance(outputs, dict):
+        return False
+    raw_lines = outputs.get("required")
+    if isinstance(raw_lines, list):
+        required_lines = [str(item or "").strip() for item in raw_lines if str(item or "").strip()]
+        if any(not _line_is_final_answer_only_context(line) for line in required_lines):
+            return True
+    raw_formats = outputs.get("format_expectations")
+    return bool(isinstance(raw_formats, list) and any(str(item or "").strip() for item in raw_formats))
+
+
 def _format_aliases(format_name: str) -> set[str]:
     normalized = str(format_name or "").strip().lower().lstrip(".")
     return _OUTPUT_FORMAT_ALIASES.get(normalized, {normalized})
@@ -1032,6 +1693,11 @@ def _delivered_artifact_types(artifacts: dict[str, object]) -> list[str]:
 def _is_support_artifact_path(path: str) -> bool:
     parts = Path(str(path or "")).parts
     return bool(parts and parts[0].lower() in _SUPPORT_ARTIFACT_DIRS)
+
+
+def _is_raw_support_capture_path(path: str) -> bool:
+    parts = [part.lower() for part in Path(str(path or "")).parts]
+    return bool(parts and parts[0] in _SUPPORT_ARTIFACT_DIRS and any(part in _RAW_SUPPORT_CAPTURE_DIRS for part in parts[1:]))
 
 
 def _artifact_path_summary(artifacts: dict[str, object]) -> dict[str, object]:
@@ -1173,6 +1839,7 @@ def _completion_compliance(
     output_text: str,
 ) -> dict[str, object]:
     required = _required_artifact_types(ledger)
+    deliverable_intent = _has_required_deliverable_intent(ledger)
     delivered = _delivered_artifact_types(artifacts)
     delivered_set = set(delivered)
     missing = [fmt for fmt in required if not (_format_aliases(fmt) & delivered_set)]
@@ -1189,7 +1856,7 @@ def _completion_compliance(
                 "missing_required_artifact_types": missing,
             }
         )
-    if notes_only and (required or not has_final_report):
+    if notes_only and (required or deliverable_intent or not has_final_report):
         issues.append({"reason": "only support notes/planning artifacts were found"})
     if seed_coverage.get("status") == "warn":
         issues.append(
@@ -1208,6 +1875,7 @@ def _completion_compliance(
     return {
         "status": status,
         "required_artifact_types": required,
+        "required_deliverable_intent": deliverable_intent,
         "delivered_artifact_types": delivered,
         "missing_required_artifact_types": missing,
         "notes_only": notes_only,
@@ -1247,6 +1915,19 @@ def summarize_run_evidence_result(evidence: dict[str, object]) -> dict[str, obje
     failure_reasons: list[dict[str, object]] = []
     warning_reasons: list[dict[str, object]] = []
 
+    failure_classification = evidence.get("failure_classification")
+    if isinstance(failure_classification, dict):
+        failure_class = str(failure_classification.get("failure_class") or "").strip()
+        if failure_class and failure_class not in {"none", "unknown"}:
+            failure_reasons.append(
+                {
+                    "reason": "worker failure classified",
+                    "failure_class": failure_class,
+                    "retryable": bool(failure_classification.get("retryable")),
+                    "user_message": _redact_text(failure_classification.get("user_message") or ""),
+                }
+            )
+
     final_output = evidence.get("final_output")
     if isinstance(final_output, dict) and not final_output.get("has_final_report"):
         failure_reasons.append({"reason": "final report marker missing"})
@@ -1259,6 +1940,15 @@ def summarize_run_evidence_result(evidence: dict[str, object]) -> dict[str, obje
             failure_reasons.append({"reason": "completion compliance failed", "issues": issues[:10]})
         elif completion_status == "warn":
             warning_reasons.append({"reason": "completion compliance warning", "issues": issues[:10]})
+
+    coverage = evidence.get("coverage_compliance")
+    if isinstance(coverage, dict):
+        coverage_status = str(coverage.get("status") or "").lower()
+        issues = coverage.get("issues") if isinstance(coverage.get("issues"), list) else []
+        if coverage_status == "fail":
+            failure_reasons.append({"reason": "coverage compliance failed", "issues": issues[:10]})
+        elif coverage_status == "warn":
+            warning_reasons.append({"reason": "coverage compliance warning", "issues": issues[:10]})
 
     constraint = evidence.get("constraint_compliance")
     if isinstance(constraint, dict):
@@ -1302,6 +1992,36 @@ def summarize_run_evidence_result(evidence: dict[str, object]) -> dict[str, obje
     }
 
 
+def _failure_classification_summary(
+    *,
+    stdout_text: str,
+    stderr_text: str,
+    runtime_name: str,
+    exit_code: int | None,
+    error_text: str,
+) -> dict[str, object]:
+    if (
+        exit_code == 0
+        and not str(error_text or "").strip()
+        and not has_structured_failure_evidence(stdout_text or "", stderr_text or "")
+    ):
+        return {"status": "not_applicable"}
+    classification = classify_cli_failure(
+        stdout=stdout_text or "",
+        stderr=stderr_text or error_text or "",
+        runtime_name=runtime_name,
+        exit_code=exit_code,
+    )
+    return {
+        "status": "classified",
+        "failure_class": classification.failure_class,
+        "retryable": classification.retryable,
+        "user_message": _redact_text(classification.user_message),
+        "recommended_recovery": _redact_text(classification.recommended_recovery),
+        "diagnostic_summary": _redact_text(classification.diagnostic_summary, max_chars=1200),
+    }
+
+
 def build_run_evidence(
     *,
     worker: dict[str, object],
@@ -1334,7 +2054,6 @@ def build_run_evidence(
         exit_source = normalized_stop_reason or "unknown"
     has_final_report = bool(
         _FINAL_REPORT_RE.search(output_text)
-        or "FINAL REPORT:" in str(output_text or "")
         or _stdout_agent_has_final_report(stdout_text)
     )
     final_output = {
@@ -1343,6 +2062,7 @@ def build_run_evidence(
         "error_present": bool(str(error_text or "").strip()),
         "status": "ok" if exit_code == 0 and not str(error_text or "").strip() else "failed",
     }
+    effective_effort = _effective_effort(worker, command, env)
     evidence: dict[str, object] = {
         "schema": "glasshive.run.evidence.v1",
         "run_id": run_id,
@@ -1358,7 +2078,8 @@ def build_run_evidence(
         },
         "runtime": runtime_name,
         "model": model,
-        "effort": _effective_effort(worker, command, env),
+        "effort": effective_effort,
+        "effort_projection": _effort_projection(worker, effective_effort),
         "command": {
             "argv_redacted": [_redact_command_arg(part) for part in command],
             "display_redacted": " ".join(_redact_command_arg(part) for part in command),
@@ -1372,13 +2093,20 @@ def build_run_evidence(
         },
         "transcript": {
             "paths": transcript_paths or {},
+            "metadata": _transcript_metadata(transcript_paths, workspace_dir=workspace),
             "stdout_tail": _redact_text(stdout_text, max_chars=4000),
             "stderr_tail": _redact_text(stderr_text, max_chars=4000),
         },
         "artifacts": artifacts,
         "visual_render_evidence": _visual_render_summary(artifacts),
         "content_hygiene": check_content_hygiene(_text_artifact_payload(workspace)),
-        "constraint_compliance": _constraint_compliance(workspace, constraint_ledger),
+        "constraint_compliance": _constraint_compliance(workspace, constraint_ledger, output_text=output_text),
+        "coverage_compliance": _coverage_compliance(
+            workspace,
+            artifacts,
+            constraint_ledger,
+            output_text=output_text,
+        ),
         "completion_compliance": _completion_compliance(
             workspace,
             artifacts,
@@ -1387,6 +2115,13 @@ def build_run_evidence(
             output_text=output_text,
         ),
         "final_output": final_output,
+        "failure_classification": _failure_classification_summary(
+            stdout_text=stdout_text,
+            stderr_text=stderr_text,
+            runtime_name=runtime_name,
+            exit_code=exit_code,
+            error_text=error_text,
+        ),
         "exit_code": exit_code,
     }
     evidence["evidence_result"] = summarize_run_evidence_result(evidence)

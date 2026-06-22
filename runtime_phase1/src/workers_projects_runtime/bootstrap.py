@@ -58,7 +58,7 @@ GLASSHIVE_WORKER_COMPLETION_CONTRACT = (
     "GlassHive completion contract:\n"
     "- Do the requested work before reporting completion.\n"
     "- Before `FINAL REPORT:`, inspect the concrete output/artifacts/tool results/visible state you produced against the user's request and success criteria, constraints, and files, and keep working or remediate if they do not match. Report a concrete blocker only when you cannot complete it.\n"
-    "- For research/source-gathering work, preserve citations and evidence, respect the user's source/date/auth/scope constraints, and do not dump large raw webpages, docs, logs, or command outputs into the conversation context. If a source/date/auth/scope constraint excludes an item, do not use that item to support facts, scoring, or deliverables; record it only as rejected or out-of-scope evidence when useful. If `glasshive-run/constraint-ledger.json` exists, read it before planning, delegation, source collection, and final delivery. If you create research plans, specs, subagent prompts, or delegation notes, carry the user's constraints forward literally and exactly instead of widening, weakening, summarizing away, or rewriting them. If a plan/spec/delegation conflicts with the ledger, correct that file before continuing. Save working notes/excerpts to files when useful and bring back concise source-grounded summaries so the task can continue without overflowing or destabilizing the provider route.\n"
+    "- For research/source-gathering work, preserve citations and evidence, respect the user's source/date/auth/scope constraints, and do not dump large raw webpages, docs, logs, or command outputs into the conversation context. If a source/date/auth/scope constraint excludes an item, do not use that item to support facts, scoring, or deliverables; record it only as rejected or out-of-scope evidence when useful. Keep source publication/evidence dates distinct from retrieval/access timestamps; an access date must not widen or replace a user-limited source window. If `glasshive-run/constraint-ledger.json` exists, read it before planning, delegation, source collection, and final delivery. If you create research plans, specs, subagent prompts, or delegation notes, carry the user's constraints forward literally and exactly instead of widening, weakening, summarizing away, or rewriting them. If a plan/spec/delegation conflicts with the ledger, correct that file before continuing. Save working notes/excerpts to files when useful and bring back concise source-grounded summaries so the task can continue without overflowing or destabilizing the provider route.\n"
     "- For long-running work, keep durable checkpoints in workspace files and prioritize a usable core result before optional expansion. If time, tool, auth, or dependency limits prevent the full requested deliverable, stop with an honest partial artifact/report and the exact blocker instead of spending the entire run on private notes.\n"
     "- When the request calls for a report, document, deck, client deliverable, or other shareable work product and the user did not ask for a technical/source format, make the primary user-facing output a polished ordinary end-user artifact such as PDF, DOCX, PPTX, spreadsheet, or another appropriate professional format. Markdown, HTML, or source files may be included as supporting artifacts, but should not be the only default deliverable for that class of work unless the runtime cannot create a professional artifact; if blocked, say so concretely.\n"
     "- For visual/shareable artifacts such as PDFs, slide decks, screenshots, or HTML reports, open or render the final artifact itself and verify that key text, tables, images, and pages are readable, not clipped, and not overlapped. Fix the layout or state the specific remaining limitation before `FINAL REPORT:`.\n"
@@ -71,6 +71,7 @@ GLASSHIVE_NATIVE_CAPABILITY_INVENTORY = """Native capability discovery (choose w
 
 - You may have worker-native CLI, browser/computer-use, MCP, plugin, and skill surfaces. Inspect what is actually available before saying a capability is unavailable, and do not claim to have used a capability unless you have evidence.
 - For deep research and document-generation work, use available research, browser, spreadsheet, PDF, document, deck, notebook, rendering, or verification tools when they materially improve the result. Prefer loading or invoking capabilities on demand instead of assuming a fixed skill catalog.
+- Before writing scripts that import non-stdlib packages or call optional CLIs, verify the package/tool is available in this worker environment; otherwise use an available alternative or report the concrete dependency blocker.
 - Do not overfit to examples, force a specific provider/tool/workflow, invent installed skills, or replace the worker's own planning and review with host-authored workflows. Plan, execute, inspect, identify gaps/issues/misalignments, and fix them before the final delivery.
 """
 GLASSHIVE_WORKER_PROJECT_CONTRACT = f"""# GlassHive Worker Contract
@@ -560,6 +561,16 @@ def _write_project_files(
 
     Enterprise source copies require a signed path token scoped to the same tenant/user.
     """
+    def allows_empty(entry: dict[str, Any]) -> bool:
+        value = entry.get("allow_empty")
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def require_non_empty(rel_path: str, size: int, entry: dict[str, Any]) -> None:
+        if size <= 0 and not allows_empty(entry):
+            raise ValueError(f"Bootstrap file {rel_path} is empty; set allow_empty=true to materialize an empty file")
+
     files = bundle.get("files")
     if not isinstance(files, list):
         return
@@ -580,12 +591,16 @@ def _write_project_files(
         if str(entry.get("encoding") or "").strip().lower() == "base64" or "content_base64" in entry:
             raw = str(entry.get("content_base64") or entry.get("content") or "")
             try:
-                target.write_bytes(base64.b64decode(raw, validate=True))
+                decoded = base64.b64decode(raw, validate=True)
             except Exception as exc:
                 raise ValueError(f"Invalid base64 bootstrap content for {rel_path}") from exc
+            require_non_empty(rel_path, len(decoded), entry)
+            target.write_bytes(decoded)
             continue
         if "content" in entry:
-            target.write_text(str(entry.get("content") or ""))
+            content = str(entry.get("content") or "")
+            require_non_empty(rel_path, len(content.encode("utf-8")), entry)
+            target.write_text(content)
             continue
         source = _source_path_from_entry(entry)
         if source is None:
@@ -598,6 +613,7 @@ def _write_project_files(
         if source.is_dir():
             copy_tree(source, target)
         else:
+            require_non_empty(rel_path, source.stat().st_size, entry)
             copy_file(source, target)
 
 

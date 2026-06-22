@@ -15,6 +15,7 @@ from workers_projects_runtime.bootstrap import GLASSHIVE_CRITICAL_OPERATING_INST
 from workers_projects_runtime.failure_classification import classify_cli_failure, classify_runtime_error
 from workers_projects_runtime.openclaw_runtime import RuntimeDependencyMissingError, RuntimeErrorBase, WorkerTerminatedError
 from workers_projects_runtime.profile_runtime import BaseCliWorkerRuntime, ClaudeCodeRuntime, CodexCliRuntime, HostClaudeCodeRuntime, HostCodexCliRuntime, HostOpenClawRuntime, OpenClawWorkstationRuntime, ProfiledWorkerRuntime, _redact_text
+from workers_projects_runtime.run_evidence import build_constraint_ledger, write_constraint_ledger
 
 
 def _patch_host_codex_requirement_probe(monkeypatch):
@@ -27,6 +28,32 @@ def _patch_host_codex_requirement_probe(monkeypatch):
             stderr="",
         ),
     )
+
+
+def _write_pass_evidence(runtime, worker_id: str, run_id: str) -> None:
+    evidence_dir = runtime._workspace_dir(worker_id) / "glasshive-run" / "runs" / run_id
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    (evidence_dir / "constraint-ledger.json").write_text(
+        json.dumps(
+            {
+                "schema": "glasshive.run.constraint-ledger.v1",
+                "run_id": run_id,
+                "worker": {"worker_id": worker_id, "profile": "codex-cli", "execution_mode": "host"},
+                "original_request": "Synthetic recovered run test.",
+                "constraints": {"date": [], "source": [], "auth": [], "scope": [], "exclusion_or_flag": []},
+                "outputs": {
+                    "required": [],
+                    "forbidden": [],
+                    "format_expectations": [],
+                    "forbidden_format_expectations": [],
+                },
+                "seed_entities_or_files": [],
+                "do_not_widen_or_soften": False,
+            }
+        )
+        + "\n"
+    )
+    (evidence_dir / "evidence.json").write_text(json.dumps({"evidence_result": {"status": "pass"}}) + "\n")
 
 
 def test_terminal_target_uses_inferred_job_session_when_metadata_missing(tmp_path):
@@ -72,13 +99,14 @@ def test_collect_completed_run_recovers_from_latest_run_artifacts(tmp_path):
         "\n".join(
             [
                 json.dumps({"type": "thread.started", "thread_id": "thread_123"}),
-                json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "HELLO WORLD"}}),
+                json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "FINAL REPORT:\nHELLO WORLD"}}),
             ]
         )
         + "\n"
     )
     (run_root / "stderr.log").write_text("")
     (run_root / "exit_code").write_text("0")
+    _write_pass_evidence(runtime, worker["worker_id"], run_id)
 
     runtime.reconcile_worker = lambda worker: runtime._runtime_info(worker, pid=1234)  # type: ignore[method-assign]
 
@@ -87,6 +115,109 @@ def test_collect_completed_run_recovers_from_latest_run_artifacts(tmp_path):
     assert recovered["state"] == "completed"
     assert recovered["output_text"] == "HELLO WORLD"
     assert json.loads(runtime._session_meta_path(worker["worker_id"]).read_text())["session_key"] == "thread_123"
+
+
+def test_collect_completed_run_fails_when_recovered_success_missing_constraint_ledger(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_missing_ledger",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+
+    run_id = "run_missingledger"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text(
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "FINAL REPORT:\nDone"}}) + "\n"
+    )
+    (run_root / "stderr.log").write_text("")
+    (run_root / "exit_code").write_text("0")
+    _write_pass_evidence(runtime, worker["worker_id"], run_id)
+    (runtime._workspace_dir(worker["worker_id"]) / "glasshive-run" / "runs" / run_id / "constraint-ledger.json").unlink()
+
+    runtime.reconcile_worker = lambda worker: runtime._runtime_info(worker, pid=1234)  # type: ignore[method-assign]
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+    assert recovered is not None
+    assert recovered["state"] == "failed"
+    assert "constraint ledger was not readable" in recovered["error_text"]
+    assert recovered["failure_class"] == "glasshive_evidence_check_failed"
+    assert recovered["failure_retryable"] == 1
+
+
+def test_collect_completed_run_preserves_evidence_warning(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_warn_recovery",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+
+    run_id = "run_warnrecovery"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text(
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "FINAL REPORT:\nDone"}}) + "\n"
+    )
+    (run_root / "stderr.log").write_text("")
+    (run_root / "exit_code").write_text("0")
+    _write_pass_evidence(runtime, worker["worker_id"], run_id)
+    evidence_path = runtime._workspace_dir(worker["worker_id"]) / "glasshive-run" / "runs" / run_id / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "evidence_result": {
+                    "status": "warn",
+                    "warning_reasons": [{"reason": "content hygiene warning", "failure_count": 1}],
+                }
+            }
+        )
+        + "\n"
+    )
+
+    runtime.reconcile_worker = lambda worker: runtime._runtime_info(worker, pid=1234)  # type: ignore[method-assign]
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+    assert recovered is not None
+    assert recovered["state"] == "completed"
+    assert recovered["output_text"].startswith("Done")
+    assert "GlassHive evidence check warning: content hygiene warning" in recovered["output_text"]
+
+
+def test_collect_completed_run_rejects_hollow_constraint_ledger(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_hollow_ledger",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+
+    run_id = "run_hollowledger"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text(
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "FINAL REPORT:\nDone"}}) + "\n"
+    )
+    (run_root / "stderr.log").write_text("")
+    (run_root / "exit_code").write_text("0")
+    _write_pass_evidence(runtime, worker["worker_id"], run_id)
+    ledger_path = runtime._workspace_dir(worker["worker_id"]) / "glasshive-run" / "runs" / run_id / "constraint-ledger.json"
+    ledger_path.write_text("{}\n")
+
+    runtime.reconcile_worker = lambda worker: runtime._runtime_info(worker, pid=1234)  # type: ignore[method-assign]
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+    assert recovered is not None
+    assert recovered["state"] == "failed"
+    assert recovered["failure_class"] == "glasshive_evidence_check_failed"
+    assert "canonical schema" in recovered["error_text"]
 
 
 def test_collect_completed_run_classifies_and_redacts_provider_rate_limit(tmp_path):
@@ -433,29 +564,128 @@ def test_collect_completed_run_with_explicit_run_id_ignores_previous_finished_ru
     assert runtime.collect_completed_run(worker, run_id=active_run_id) is None
 
     (active_root / "exit_code").write_text("0")
+    _write_pass_evidence(runtime, worker["worker_id"], active_run_id)
     recovered = runtime.collect_completed_run(worker, run_id=active_run_id)
     assert recovered is not None
     assert recovered["state"] == "completed"
     assert recovered["output_text"] == "NEW"
 
 
-def test_openclaw_command_includes_completion_contract(tmp_path):
+def test_openclaw_command_uses_private_instruction_file_pointer(tmp_path):
     runtime = OpenClawWorkstationRuntime(base_dir=str(tmp_path))
     worker = {
         "worker_id": "wrk_openclaw_contract",
         "name": "Main Worker",
         "profile": "openclaw-general",
         "model": "openai/gpt-5.2",
+        "_active_run_id": "run_openclaw_contract",
     }
     runtime._ensure_dirs(worker["worker_id"])
 
     command, _env = runtime._build_command(worker, "do the work", runtime._runtime_info(worker))
 
     assert "-m" in command
-    instruction = command[command.index("-m") + 1]
-    assert instruction.startswith("do the work")
-    assert "FINAL REPORT:" in instruction
-    assert "Put only the user-facing result" in instruction
+    pointer = command[command.index("-m") + 1]
+    assert "do the work" not in pointer
+    assert "FINAL REPORT:" not in pointer
+    assert "/workspace/.wpr-home/.glasshive-runs/run_openclaw_contract/instruction.stdin" in pointer
+    stdin_text = runtime._command_stdin_text(worker, "do the work", runtime._runtime_info(worker))
+    assert stdin_text and stdin_text.startswith("do the work")
+    assert "FINAL REPORT:" in stdin_text
+    assert "Put only the user-facing result" in stdin_text
+
+
+def test_host_openclaw_command_uses_private_instruction_file_pointer(tmp_path):
+    runtime = HostOpenClawRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_host_openclaw_contract",
+        "name": "Host OpenClaw Worker",
+        "profile": "openclaw-general",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+        "_active_run_id": "run_host_openclaw_contract",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+
+    command, _env = runtime._build_command(worker, "do the private work", runtime._host_runtime_info(worker))
+
+    assert "-m" in command
+    pointer = command[command.index("-m") + 1]
+    assert "do the private work" not in pointer
+    assert "FINAL REPORT:" not in pointer
+    assert "run_host_openclaw_contract/instruction.stdin" in pointer
+    stdin_text = runtime._command_stdin_text(worker, "do the private work", runtime._host_runtime_info(worker))
+    assert stdin_text and stdin_text.startswith("do the private work")
+    assert "FINAL REPORT:" in stdin_text
+
+
+def test_host_openclaw_run_writes_private_instruction_file_for_pointer(tmp_path, monkeypatch):
+    runtime = HostOpenClawRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.host_runtime_requirement_issue", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.subprocess.run",
+        lambda args, **kwargs: subprocess.CompletedProcess(args, returncode=0, stdout="", stderr=""),
+    )
+    captured: dict[str, object] = {}
+
+    class OpenClawProcess:
+        pid = 24680
+        returncode = 0
+
+        def __init__(self, command, **kwargs):
+            captured["command"] = list(command)
+            captured["stdin_pipe"] = kwargs["stdin"] == subprocess.PIPE
+            self.stdout_handle = kwargs["stdout"]
+
+        def communicate(self, input=None, timeout=None):
+            captured["stdin"] = input
+            self.stdout_handle.write(
+                json.dumps(
+                    {
+                        "finalAssistantVisibleText": "FINAL REPORT:\nDone.",
+                        "completion": {"stopReason": "stop"},
+                    }
+                )
+            )
+            self.stdout_handle.flush()
+            return None, None
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = 130
+
+        def kill(self):
+            self.returncode = 130
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.Popen", OpenClawProcess)
+    worker = {
+        "worker_id": "wrk_host_openclaw_run_pointer",
+        "name": "Host OpenClaw Run Pointer",
+        "profile": "openclaw-general",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+
+    output = runtime.run_task(worker, "Sensitive OpenClaw task.", timeout_sec=5, run_id="run_host_openclaw_pointer")
+
+    assert output == "Done."
+    command = captured["command"]
+    assert isinstance(command, list)
+    pointer = command[command.index("-m") + 1]
+    assert "Sensitive OpenClaw task" not in pointer
+    assert "run_host_openclaw_pointer/instruction.stdin" in pointer
+    stdin_path = runtime._run_root(worker["worker_id"], "run_host_openclaw_pointer") / "instruction.stdin"
+    assert stdin_path.exists()
+    assert stdin_path.read_text().startswith("Sensitive OpenClaw task.")
+    assert oct(stdin_path.stat().st_mode & 0o777) == "0o600"
+    assert captured["stdin_pipe"] is True
+    assert str(captured["stdin"]).startswith("Sensitive OpenClaw task.")
 
 
 def test_openclaw_parser_prefers_final_visible_text(tmp_path):
@@ -547,8 +777,19 @@ def test_openclaw_collect_completed_run_recovers_final_json_without_exit_file(tm
             "stdout_path": str(run_root / "stdout.log"),
             "stderr_path": str(run_root / "stderr.log"),
             "exit_path": str(run_root / "exit_code"),
+            "constraint_ledger_path": f"glasshive-run/runs/{run_id}/constraint-ledger.json",
+            "instruction": "Create a recovered final report.",
         },
     )
+    active_session_text = runtime._active_session_meta_path(worker["worker_id"]).read_text()
+    assert "Create a recovered final report." not in active_session_text
+    assert json.loads(active_session_text)["instruction_redacted"] is True
+    ledger = build_constraint_ledger(
+        instruction="Create a recovered final report.",
+        worker=worker,
+        run_id=run_id,
+    )
+    write_constraint_ledger(runtime._workspace_dir(worker["worker_id"]), ledger, run_id)
     stopped: list[str] = []
     terminated: list[str] = []
     runtime.sandbox.stop_screen_session = (  # type: ignore[method-assign]
@@ -565,6 +806,9 @@ def test_openclaw_collect_completed_run_recovers_final_json_without_exit_file(tm
     assert recovered["state"] == "completed"
     assert recovered["output_text"] == "Recovered result."
     assert (run_root / "exit_code").read_text() == "0"
+    assert (runtime._workspace_dir(worker["worker_id"]) / "glasshive-run" / "runs" / run_id / "constraint-ledger.json").exists()
+    evidence = json.loads((runtime._workspace_dir(worker["worker_id"]) / "glasshive-run" / "runs" / run_id / "evidence.json").read_text())
+    assert evidence["evidence_result"]["status"] == "pass"
     assert stopped == [runtime._session_name_for_run_id(run_id)]
     assert terminated == [run_id]
 
@@ -755,6 +999,9 @@ def test_host_runtime_content_hygiene_helper_strips_and_flags_page_chrome(tmp_pa
     assert "carry the user's source/date/auth/scope constraints forward exactly" in (
         workspace_dir / "harness-prompt.md"
     ).read_text()
+    assert "source publication/evidence dates distinct from retrieval/access timestamps" in (
+        workspace_dir / "harness-prompt.md"
+    ).read_text()
 
 
 def test_host_codex_model_can_differ_from_docker_provider_model(tmp_path, monkeypatch):
@@ -870,12 +1117,20 @@ def test_codex_cli_provider_config_clamps_xhigh_without_route_proof(tmp_path, mo
     monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "xhigh")
 
     command: list[str] = []
+    worker = {"worker_id": "wrk_effort", "profile": "codex-cli"}
     caplog.set_level(logging.WARNING, logger="workers_projects_runtime.profile_runtime")
-    runtime._append_codex_compatible_provider_config(command, {"worker_id": "wrk_effort", "profile": "codex-cli"})
+    runtime._append_codex_compatible_provider_config(command, worker)
 
     joined = "\n".join(command)
     assert 'model_reasoning_effort="medium"' in joined
     assert 'model_reasoning_effort="xhigh"' not in joined
+    assert worker["_effort_projection"] == {
+        "requested": "xhigh",
+        "effective": "medium",
+        "allowed": ["high", "low", "medium", "minimal", "none"],
+        "route_proven": False,
+        "fallback_reason": "xhigh_route_not_proven",
+    }
     assert any(record.message == "Codex CLI reasoning effort clamped to provider-route fallback" for record in caplog.records)
 
 
@@ -999,7 +1254,7 @@ def test_codex_cli_provider_config_ignores_invalid_allowed_reasoning_efforts(tmp
     assert 'model_reasoning_effort="low"' in joined
 
 
-def test_host_cli_run_closes_stdin_for_noninteractive_workers(tmp_path, monkeypatch):
+def test_host_cli_run_uses_stdin_pipe_for_private_instruction(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
     _patch_host_codex_requirement_probe(monkeypatch)
@@ -1007,6 +1262,7 @@ def test_host_cli_run_closes_stdin_for_noninteractive_workers(tmp_path, monkeypa
 
     class FakeProcess:
         pid = 12345
+        returncode = 0
 
         def __init__(self, command, **kwargs):
             captured["stdin"] = kwargs.get("stdin")
@@ -1019,8 +1275,12 @@ def test_host_cli_run_closes_stdin_for_noninteractive_workers(tmp_path, monkeypa
         def wait(self, timeout=None):
             return 0
 
-            def poll(self):
-                return 0
+        def communicate(self, input=None, timeout=None):
+            captured["input"] = input
+            return None, None
+
+        def poll(self):
+            return 0
 
     monkeypatch.setattr(
         "workers_projects_runtime.profile_runtime.subprocess.run",
@@ -1041,7 +1301,8 @@ def test_host_cli_run_closes_stdin_for_noninteractive_workers(tmp_path, monkeypa
     }
 
     assert runtime.run_task(worker, "create marker", run_id="run_no_stdin") == "Done"
-    assert captured["stdin"] is subprocess.DEVNULL
+    assert captured["stdin"] is subprocess.PIPE
+    assert str(captured["input"]).startswith("create marker")
 
 
 def test_host_cli_run_writes_constraint_ledger_and_evidence(tmp_path, monkeypatch):
@@ -1052,6 +1313,7 @@ def test_host_cli_run_writes_constraint_ledger_and_evidence(tmp_path, monkeypatc
 
     class FakeProcess:
         pid = 12345
+        returncode = 0
 
         def __init__(self, _command, **kwargs):
             cwd = Path(kwargs["cwd"])
@@ -1066,6 +1328,9 @@ def test_host_cli_run_writes_constraint_ledger_and_evidence(tmp_path, monkeypatc
 
         def wait(self, timeout=None):
             return 0
+
+        def communicate(self, input=None, timeout=None):
+            return None, None
 
         def poll(self):
             return 0
@@ -1120,6 +1385,7 @@ def test_host_cli_run_fails_when_evidence_contract_fails(tmp_path, monkeypatch):
 
     class FakeProcess:
         pid = 12345
+        returncode = 0
 
         def __init__(self, _command, **kwargs):
             stdout = kwargs["stdout"]
@@ -1130,6 +1396,9 @@ def test_host_cli_run_fails_when_evidence_contract_fails(tmp_path, monkeypatch):
 
         def wait(self, timeout=None):
             return 0
+
+        def communicate(self, input=None, timeout=None):
+            return None, None
 
         def poll(self):
             return 0
@@ -1183,6 +1452,10 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
                 return 130
             raise subprocess.TimeoutExpired(["fake-codex"], timeout)
 
+        def communicate(self, input=None, timeout=None):
+            self.wait(timeout=timeout)
+            return None, None
+
         def poll(self):
             return 130 if self.terminated else None
 
@@ -1220,10 +1493,163 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
     assert evidence["timeout"]["exit_source"] == "timeout"
     assert evidence["timeout"]["stop_reason"] == "timeout"
     assert evidence["transcript"]["stdout_tail"].strip() == "working before timeout"
+    assert evidence["transcript"]["metadata"]["stdout"]["exists"] is True
+    assert evidence["transcript"]["metadata"]["stdout"]["bytes"] > 0
     assert evidence["final_output"]["status"] == "failed"
     assert active_status["state"] == "timeout"
     assert active_status["stop_reason"] == "timeout"
     assert active_status["timeout_seconds"] == 0.01
+    assert active_status["heartbeat_sequence"] >= 1
+    assert active_status["transcript_progress"]["files"]["stdout"]["bytes"] > 0
+    assert active_status["transcript_progress"]["last_output_at"]
+    assert active_status["transcript_progress"]["quiet_seconds"] is not None
+
+
+def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
+    workspace = tmp_path / "workspace"
+
+    class ForegroundServerProcess:
+        pid = 12345
+
+        def __init__(self, _command, **kwargs):
+            self.terminated = False
+            stdout = kwargs["stdout"]
+            stderr = kwargs["stderr"]
+            stdout.write("Serving HTTP on 127.0.0.1 port 8000 ...\n")
+            stderr.write("OSError: [Errno 48] Address already in use\n")
+            stdout.flush()
+            stderr.flush()
+
+        def wait(self, timeout=None):
+            if self.terminated:
+                return 130
+            raise subprocess.TimeoutExpired(["fake-codex"], timeout)
+
+        def communicate(self, input=None, timeout=None):
+            self.wait(timeout=timeout)
+            return None, None
+
+        def poll(self):
+            return 130 if self.terminated else None
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.terminated = True
+
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.subprocess.run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.Popen", ForegroundServerProcess)
+    worker = {
+        "worker_id": "wrk_foreground_server_evidence",
+        "name": "Foreground Server Evidence Worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_dir": str(workspace),
+    }
+
+    with pytest.raises(RuntimeErrorBase, match="timed out"):
+        runtime.run_task(worker, "Create and inspect a local HTML artifact.", timeout_sec=0.01, run_id="run_foreground_server_evidence")
+
+    evidence = json.loads((workspace / "glasshive-run" / "evidence.json").read_text())
+    active_status = json.loads(
+        (workspace / "glasshive-run" / "runs" / "run_foreground_server_evidence" / "active-run.json").read_text()
+    )
+    assert evidence["timeout"]["exit_source"] == "timeout"
+    assert "Serving HTTP" in evidence["transcript"]["stdout_tail"]
+    assert "Address already in use" in evidence["transcript"]["stderr_tail"]
+    assert evidence["transcript"]["metadata"]["stderr"]["bytes"] > 0
+    assert evidence["final_output"]["status"] == "failed"
+    assert active_status["state"] == "timeout"
+    assert active_status["transcript_progress"]["files"]["stdout"]["bytes"] > 0
+    assert active_status["transcript_progress"]["files"]["stderr"]["bytes"] > 0
+    assert active_status["transcript_progress"]["files"]["stdout"]["tail_sha256"]
+    assert active_status["transcript_progress"]["last_output_at"]
+
+
+def test_host_codex_run_sends_instruction_via_stdin_not_argv(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
+    workspace = tmp_path / "workspace"
+    captured: dict[str, object] = {}
+
+    class StdinProcess:
+        pid = 12345
+        returncode = 0
+
+        def __init__(self, command, **kwargs):
+            captured["command"] = list(command)
+            captured["stdin_pipe"] = kwargs["stdin"] == subprocess.PIPE
+            stdout = kwargs["stdout"]
+            stdout.write(
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "FINAL REPORT:\nDone."},
+                    }
+                )
+                + "\n"
+            )
+            stdout.flush()
+
+        def communicate(self, input=None, timeout=None):
+            captured["stdin"] = input
+            return None, None
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = 130
+
+        def kill(self):
+            self.returncode = 130
+
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.subprocess.run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.Popen", StdinProcess)
+    worker = {
+        "worker_id": "wrk_stdin_privacy",
+        "name": "Stdin Privacy Worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_dir": str(workspace),
+    }
+
+    output = runtime.run_task(worker, "Sensitive private instruction.", timeout_sec=5, run_id="run_stdin_privacy")
+
+    assert output == "Done."
+    command_text = " ".join(captured["command"])  # type: ignore[arg-type]
+    assert "Sensitive private instruction" not in command_text
+    assert str(captured["command"][-1]) == "-"  # type: ignore[index]
+    assert captured["stdin_pipe"] is True
+    assert str(captured["stdin"]).startswith("Sensitive private instruction.")
+    evidence = json.loads((workspace / "glasshive-run" / "evidence.json").read_text())
+    assert all("Sensitive private instruction" not in arg for arg in evidence["command"]["argv_redacted"])
+    assert evidence["command"]["argv_redacted"][0] == "echo"
+    assert "/bin/echo" not in evidence["command"]["display_redacted"]
 
 
 def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
@@ -1241,6 +1667,7 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
             processes.append(self)
             stdout = kwargs["stdout"]
             stdout.write("working before interrupt\n")
+            stdout.write("debug path /Users/example/private-workspace/tmp/preview.png\n")
             stdout.flush()
 
         def wait(self, timeout=None):
@@ -1250,6 +1677,10 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
             if self.terminated:
                 return -15
             raise subprocess.TimeoutExpired(["fake-codex"], timeout)
+
+        def communicate(self, input=None, timeout=None):
+            self.wait(timeout=timeout)
+            return None, None
 
         def poll(self):
             return -15 if self.terminated else None
@@ -1287,7 +1718,12 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
 
     def run_worker():
         try:
-            runtime.run_task(worker, "Do long work.\n" + ("private detail " * 80), run_id="run_interrupt_evidence")
+            runtime.run_task(
+                worker,
+                "Do long work.\n" + ("synthetic sensitive segment " * 80),
+                timeout_sec=60,
+                run_id="run_interrupt_evidence",
+            )
         except Exception as exc:
             errors.append(exc)
 
@@ -1306,11 +1742,15 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
     active_status = json.loads((workspace / "glasshive-run" / "runs" / "run_interrupt_evidence" / "active-run.json").read_text())
     assert evidence["run_id"] == "run_interrupt_evidence"
     assert evidence["final_output"]["status"] == "failed"
+    assert evidence["timeout"]["seconds"] == 60
     assert "working before interrupt" in evidence["transcript"]["stdout_tail"]
+    assert "[REDACTED_LOCAL_PATH]" in evidence["transcript"]["stdout_tail"]
+    assert "/Users/example" not in evidence["transcript"]["stdout_tail"]
+    assert evidence["transcript"]["metadata"]["stdout"]["exists"] is True
     assert evidence["artifacts"]["count"] == 0
     display = evidence["command"]["display_redacted"]
-    assert "private detail" not in display
-    assert "[REDACTED_LONG_ARG" in display
+    assert "synthetic sensitive segment" not in display
+    assert display.endswith(" -")
     assert active_status["state"] == "interrupted"
     assert active_status["stop_reason"] in {"interrupted", "WorkerInterruptedError"}
 
@@ -1702,6 +2142,39 @@ def test_host_codex_runtime_rejects_file_entry_without_content_or_source(tmp_pat
         runtime.ensure_worker_ready(worker)
 
 
+def test_host_codex_runtime_rejects_empty_projected_source_file(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    empty = trusted / "empty.txt"
+    empty.write_text("")
+    monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", str(trusted))
+    worker = {
+        "worker_id": "wrk_host_empty_file",
+        "name": "Main Host Worker",
+        "role": "coding",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "files": [
+                    {
+                        "scope": "workspace",
+                        "path": "uploads/empty.txt",
+                        "source_path": str(empty),
+                    }
+                ],
+            }
+        ),
+    }
+
+    with pytest.raises(RuntimeErrorBase, match="empty"):
+        runtime.ensure_worker_ready(worker)
+
+
 def test_host_codex_command_uses_host_workspace_and_dangerous_mode(tmp_path):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "codex"
@@ -1721,9 +2194,12 @@ def test_host_codex_command_uses_host_workspace_and_dangerous_mode(tmp_path):
     assert str(info.workspace_dir) in command
     assert "danger-full-access" in command
     assert "--dangerously-bypass-approvals-and-sandbox" in command
-    assert command[-1].startswith("do the work")
-    assert "FINAL REPORT:" in command[-1]
-    assert "Put only the user-facing result" in command[-1]
+    assert command[-1] == "-"
+    assert "do the work" not in " ".join(command)
+    stdin_text = runtime._command_stdin_text(worker, "do the work", info)
+    assert stdin_text and stdin_text.startswith("do the work")
+    assert "FINAL REPORT:" in stdin_text
+    assert "Put only the user-facing result" in stdin_text
     assert env["GLASSHIVE_EXECUTION_MODE"] == "host"
     assert env["GLASSHIVE_WORKSPACE_DIR"] == str(info.workspace_dir)
 
@@ -1959,7 +2435,10 @@ def test_host_claude_command_enables_chrome_by_default(tmp_path, monkeypatch):
 
     assert "--chrome" in command
     assert command[command.index("--effort") + 1] == "max"
-    assert command[-1].startswith("do the work")
+    assert "do the work" not in " ".join(command)
+    stdin_text = runtime._command_stdin_text(worker, "do the work", info)
+    assert stdin_text and stdin_text.startswith("do the work")
+    assert "FINAL REPORT:" in stdin_text
 
 
 def test_host_claude_chrome_can_be_explicitly_disabled(tmp_path, monkeypatch):
@@ -2133,7 +2612,7 @@ def test_docker_cli_runtime_sources_runtime_and_openclaw_env_files(tmp_path):
             return ["printf", "ok"], {}
 
         def _parse_output(self, worker, stdout, stderr, info):
-            return None, stdout
+            return None, stdout.strip()
 
     runtime = CaptureRuntime(base_dir=str(tmp_path / "data"))
     worker = {"worker_id": "wrk_capture", "name": "Capture Worker", "profile": "openclaw-general"}
@@ -2163,18 +2642,170 @@ def test_docker_cli_runtime_sources_runtime_and_openclaw_env_files(tmp_path):
         assert '$HOME/.wpr-openclaw/openclaw.env' in script
         assert "GLASSHIVE_ACTIVE_RUN_ID=run_capture" in script
         assert "GLASSHIVE_ACTIVE_WORKER_ID=wrk_capture" in script
-        (run_root / "stdout.log").write_text("ok")
+        (run_root / "stdout.log").write_text("FINAL REPORT:\nok")
         (run_root / "stderr.log").write_text("")
         (run_root / "exit_code").write_text("0")
         return subprocess.CompletedProcess(["screen"], returncode=0, stdout="", stderr="")
 
     runtime.sandbox.start_screen_session = fake_start_screen_session  # type: ignore[method-assign]
 
-    assert runtime.run_task(worker, "do it", run_id=run_id) == "ok"
+    assert runtime.run_task(worker, "do it", run_id=run_id) == "FINAL REPORT:\nok"
     assert writable_repairs == [
         [f"{runtime.sandbox.home_mount}/.glasshive-runs/{run_id}"],
         [runtime.sandbox.workspace_mount, f"{runtime.sandbox.home_mount}/.glasshive-runs/{run_id}"]
     ]
+
+
+def test_docker_cli_runtime_redirects_private_instruction_from_stdin_file(tmp_path):
+    class StdinRuntime(BaseCliWorkerRuntime):
+        runtime_name = "codex-cli"
+        worker_root_name = "stdin_runtime"
+
+        def resolve_model(self, profile: str) -> str:
+            return "capture/model"
+
+        def _build_command(self, worker, instruction, info):
+            return ["fake-cli", "-"], {}
+
+        def _command_stdin_text(self, worker, instruction, info):
+            return self._instruction_with_completion_contract(instruction)
+
+        def _parse_output(self, worker, stdout, stderr, info):
+            return None, stdout.strip()
+
+    runtime = StdinRuntime(base_dir=str(tmp_path / "data"))
+    worker = {"worker_id": "wrk_docker_stdin", "name": "Stdin Worker", "profile": "codex-cli"}
+    run_id = "run_docker_stdin"
+
+    class FakeSandbox:
+        container_name = "wpr-capture"
+        pid = 123
+
+    runtime.sandbox.ensure_ready = lambda worker, runtime_name, **kwargs: FakeSandbox()  # type: ignore[method-assign]
+    runtime.sandbox.inspect = lambda worker_id: None  # type: ignore[method-assign]
+    runtime.sandbox.list_screen_sessions = lambda *args, **kwargs: []  # type: ignore[method-assign]
+    runtime.sandbox._ensure_container_writable_paths = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    runtime.sandbox.ensure_container_writable_paths = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+    def fake_start_screen_session(worker_id, runtime_name, session_name, command, *, env=None, worker=None):
+        run_root = runtime._run_root(worker_id, run_id)
+        script = (run_root / "run.sh").read_text()
+        stdin_path = run_root / "instruction.stdin"
+        assert stdin_path.exists()
+        assert stdin_path.read_text().startswith("Sensitive docker instruction.")
+        assert oct(stdin_path.stat().st_mode & 0o777) == "0o600"
+        assert "Sensitive docker instruction" not in script
+        assert f"fake-cli - < {runtime.sandbox.home_mount}/.glasshive-runs/{run_id}/instruction.stdin" in script
+        (run_root / "stdout.log").write_text("FINAL REPORT:\nok")
+        (run_root / "stderr.log").write_text("")
+        (run_root / "exit_code").write_text("0")
+        return subprocess.CompletedProcess(["screen"], returncode=0, stdout="", stderr="")
+
+    runtime.sandbox.start_screen_session = fake_start_screen_session  # type: ignore[method-assign]
+
+    assert runtime.run_task(worker, "Sensitive docker instruction.", run_id=run_id) == "FINAL REPORT:\nok"
+
+
+def _install_fake_successful_docker_run(runtime: BaseCliWorkerRuntime, run_id: str, stdout_text: str) -> None:
+    class FakeSandbox:
+        container_name = "wpr-capture"
+        pid = 123
+
+    runtime.sandbox.ensure_ready = lambda worker, runtime_name, **kwargs: FakeSandbox()  # type: ignore[method-assign]
+    runtime.sandbox.inspect = lambda worker_id: None  # type: ignore[method-assign]
+    runtime.sandbox.list_screen_sessions = lambda *args, **kwargs: []  # type: ignore[method-assign]
+    runtime.sandbox._ensure_container_writable_paths = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    runtime.sandbox.ensure_container_writable_paths = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+    def fake_start_screen_session(worker_id, runtime_name, session_name, command, *, env=None, worker=None):
+        run_root = runtime._run_root(worker_id, run_id)
+        (run_root / "stdout.log").write_text(stdout_text)
+        (run_root / "stderr.log").write_text("")
+        (run_root / "exit_code").write_text("0")
+        return subprocess.CompletedProcess(["screen"], returncode=0, stdout="", stderr="")
+
+    runtime.sandbox.start_screen_session = fake_start_screen_session  # type: ignore[method-assign]
+
+
+def test_docker_cli_run_fails_when_evidence_contract_fails(tmp_path):
+    class CaptureRuntime(BaseCliWorkerRuntime):
+        runtime_name = "openclaw"
+        worker_root_name = "capture_runtime"
+
+        def resolve_model(self, profile: str) -> str:
+            return "capture/model"
+
+        def _build_command(self, worker, instruction, info):
+            return ["printf", "ok"], {}
+
+        def _parse_output(self, worker, stdout, stderr, info):
+            return None, "Done"
+
+    runtime = CaptureRuntime(base_dir=str(tmp_path / "data"))
+    run_id = "run_docker_evidence_fail"
+    _install_fake_successful_docker_run(runtime, run_id, "FINAL REPORT:\nDone\n")
+    worker = {"worker_id": "wrk_docker_evidence_fail", "name": "Capture Worker", "profile": "openclaw-general"}
+
+    with pytest.raises(RuntimeErrorBase, match="GlassHive evidence check failed"):
+        runtime.run_task(worker, "Deliver a PDF report.", run_id=run_id)
+
+    evidence = json.loads((runtime._workspace_dir(worker["worker_id"]) / "glasshive-run" / "evidence.json").read_text())
+    assert evidence["evidence_result"]["status"] == "fail"
+    assert evidence["completion_compliance"]["missing_required_artifact_types"] == ["pdf"]
+
+
+def test_docker_cli_run_fails_when_success_evidence_cannot_be_written(tmp_path, monkeypatch):
+    class CaptureRuntime(BaseCliWorkerRuntime):
+        runtime_name = "openclaw"
+        worker_root_name = "capture_runtime"
+
+        def resolve_model(self, profile: str) -> str:
+            return "capture/model"
+
+        def _build_command(self, worker, instruction, info):
+            return ["printf", "ok"], {}
+
+        def _parse_output(self, worker, stdout, stderr, info):
+            return None, "Done"
+
+    runtime = CaptureRuntime(base_dir=str(tmp_path / "data"))
+    run_id = "run_docker_evidence_write_fail"
+    _install_fake_successful_docker_run(runtime, run_id, "FINAL REPORT:\nDone\n")
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.write_run_evidence",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("synthetic evidence write failure")),
+    )
+    worker = {"worker_id": "wrk_docker_evidence_write_fail", "name": "Capture Worker", "profile": "openclaw-general"}
+
+    with pytest.raises(RuntimeErrorBase, match="run evidence was not written"):
+        runtime.run_task(worker, "Do the work.", run_id=run_id)
+
+
+def test_docker_cli_run_fails_when_success_constraint_ledger_cannot_be_written(tmp_path, monkeypatch):
+    class CaptureRuntime(BaseCliWorkerRuntime):
+        runtime_name = "openclaw"
+        worker_root_name = "capture_runtime"
+
+        def resolve_model(self, profile: str) -> str:
+            return "capture/model"
+
+        def _build_command(self, worker, instruction, info):
+            return ["printf", "ok"], {}
+
+        def _parse_output(self, worker, stdout, stderr, info):
+            return None, "Done"
+
+    runtime = CaptureRuntime(base_dir=str(tmp_path / "data"))
+    run_id = "run_docker_ledger_write_fail"
+    _install_fake_successful_docker_run(runtime, run_id, "FINAL REPORT:\nDone\n")
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.write_constraint_ledger",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("synthetic ledger write failure")),
+    )
+    worker = {"worker_id": "wrk_docker_ledger_write_fail", "name": "Capture Worker", "profile": "openclaw-general"}
+
+    with pytest.raises(RuntimeErrorBase, match="constraint ledger was not written"):
+        runtime.run_task(worker, "Do the work.", run_id=run_id)
 
 
 def test_docker_codex_command_appends_completion_contract(tmp_path):
@@ -2189,8 +2820,11 @@ def test_docker_codex_command_appends_completion_contract(tmp_path):
 
     command, _ = runtime._build_command(worker, "Make the page red.", runtime._runtime_info(worker))
 
-    assert command[-1].startswith("Make the page red.")
-    assert "FINAL REPORT:" in command[-1]
+    assert command[-1] == "-"
+    assert "Make the page red." not in " ".join(command)
+    stdin_text = runtime._command_stdin_text(worker, "Make the page red.", runtime._runtime_info(worker))
+    assert stdin_text and stdin_text.startswith("Make the page red.")
+    assert "FINAL REPORT:" in stdin_text
 
 
 def test_docker_claude_command_enables_chrome_and_appends_completion_contract(tmp_path, monkeypatch):
@@ -2207,8 +2841,10 @@ def test_docker_claude_command_enables_chrome_and_appends_completion_contract(tm
     command, _ = runtime._build_command(worker, "Make the page red.", runtime._runtime_info(worker))
 
     assert "--chrome" in command
-    assert command[-1].startswith("Make the page red.")
-    assert "FINAL REPORT:" in command[-1]
+    assert "Make the page red." not in " ".join(command)
+    stdin_text = runtime._command_stdin_text(worker, "Make the page red.", runtime._runtime_info(worker))
+    assert stdin_text and stdin_text.startswith("Make the page red.")
+    assert "FINAL REPORT:" in stdin_text
 
 
 def test_docker_claude_chrome_can_be_explicitly_disabled(tmp_path, monkeypatch):
@@ -2678,6 +3314,17 @@ def test_runtime_error_classifies_not_logged_in_provider_session():
     assert "CLI login" in failure.recommended_recovery
 
 
+def test_runtime_error_classifies_unsupported_runtime_configuration():
+    failure = classify_runtime_error(
+        RuntimeErrorBase("host-native workers are disabled in this deployment"),
+        runtime_name="codex-cli",
+    )
+
+    assert failure.failure_class == "unsupported_runtime_configuration"
+    assert failure.retryable is False
+    assert "host-native workers are disabled" in failure.user_message
+
+
 def test_cli_failure_does_not_classify_generic_file_not_found_as_runtime_dependency():
     failure = classify_cli_failure(
         stdout="",
@@ -2688,6 +3335,23 @@ def test_cli_failure_does_not_classify_generic_file_not_found_as_runtime_depende
 
     assert failure.failure_class == "unknown"
     assert failure.retryable is False
+
+
+def test_cli_failure_classifies_missing_python_module_as_runtime_dependency():
+    failure = classify_cli_failure(
+        stdout=(
+            "Traceback (most recent call last):\n"
+            "  File \"<stdin>\", line 1, in <module>\n"
+            "ModuleNotFoundError: No module named 'requests'\n"
+        ),
+        stderr="",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "runtime_dependency_missing"
+    assert failure.retryable is False
+    assert "managed dependency" in failure.recommended_recovery
 
 
 def test_runtime_error_does_not_classify_generic_file_not_found_as_runtime_dependency():

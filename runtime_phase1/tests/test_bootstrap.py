@@ -46,6 +46,8 @@ def test_bootstrap_materializes_canonical_worker_operating_contract(tmp_path):
     assert "never leave a foreground server blocking final delivery or wasting compute" in agents_text
     assert "source/date/auth/scope constraints" in agents_text
     assert "do not use that item to support facts, scoring, or deliverables" in agents_text
+    assert "source publication/evidence dates distinct from retrieval/access timestamps" in agents_text
+    assert "access date must not widen or replace a user-limited source window" in agents_text
     assert "rejected or out-of-scope evidence" in agents_text
     assert "read it before planning, delegation, source collection, and final delivery" in agents_text
     assert "carry the user's constraints forward literally and exactly" in agents_text
@@ -56,6 +58,7 @@ def test_bootstrap_materializes_canonical_worker_operating_contract(tmp_path):
     assert "Native capability discovery" in agents_text
     assert "Inspect what is actually available" in agents_text
     assert "use available research, browser, spreadsheet, PDF, document, deck, notebook, rendering, or verification tools" in agents_text
+    assert "verify the package/tool is available" in agents_text
     assert "Do not overfit to examples" in agents_text
 
 
@@ -469,6 +472,58 @@ def test_bootstrap_materializes_base64_uploaded_file(tmp_path):
     )
 
     assert (workspace / "uploads" / "report.bin").read_bytes() == b"\x00\x01\x02Hello"
+
+
+def test_bootstrap_rejects_empty_uploaded_file_unless_explicitly_allowed(tmp_path):
+    workspace = tmp_path / "workspace"
+
+    with pytest.raises(ValueError, match="empty"):
+        apply_bootstrap(
+            home_dir=tmp_path / "home",
+            workspace_dir=workspace,
+            runtime_name="codex-cli",
+            worker={
+                "bootstrap_bundle_json": json.dumps(
+                    {
+                        "files": [
+                            {
+                                "scope": "workspace",
+                                "path": "uploads/empty.bin",
+                                "encoding": "base64",
+                                "content_base64": "",
+                            }
+                        ]
+                    }
+                )
+            },
+            copy_file=lambda source, target: None,
+            copy_tree=lambda source, target: None,
+        )
+
+    apply_bootstrap(
+        home_dir=tmp_path / "home",
+        workspace_dir=workspace,
+        runtime_name="codex-cli",
+        worker={
+            "bootstrap_bundle_json": json.dumps(
+                {
+                    "files": [
+                        {
+                            "scope": "workspace",
+                            "path": "uploads/empty-allowed.bin",
+                            "encoding": "base64",
+                            "content_base64": "",
+                            "allow_empty": True,
+                        }
+                    ]
+                }
+            )
+        },
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+    )
+
+    assert (workspace / "uploads" / "empty-allowed.bin").read_bytes() == b""
 
 
 def test_bootstrap_rejects_file_entry_without_content_or_source(tmp_path):

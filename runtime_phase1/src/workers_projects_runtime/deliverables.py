@@ -60,6 +60,7 @@ USER_DELIVERABLE_DIR_PRIORITY = {
     "reports": 1,
     "output": 2,
 }
+SUPPORT_ARTIFACT_DIR_NAMES = {"research", "planning", "specs", "notes"}
 PROFESSIONAL_ARTIFACT_EXTENSIONS = {
     ".doc",
     ".docx",
@@ -117,6 +118,11 @@ def candidate_html_paths(worker: dict, max_entries: int = 20) -> list[Path]:
             rel = path.relative_to(root)
         except ValueError:
             continue
+        try:
+            if path.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
         if not is_user_deliverable_relative_path(rel):
             continue
         candidates.append(path)
@@ -139,6 +145,11 @@ def candidate_artifact_paths(worker: dict, max_entries: int = 50) -> list[Path]:
         try:
             rel = path.relative_to(root)
         except ValueError:
+            continue
+        try:
+            if path.stat().st_size <= 0:
+                continue
+        except OSError:
             continue
         if not is_user_deliverable_relative_path(rel):
             continue

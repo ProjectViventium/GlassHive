@@ -24,6 +24,10 @@ class FailureClassification:
         }
 
 
+def has_structured_failure_evidence(*texts: str) -> bool:
+    return any(_collect_structured_failure_evidence(text or "") for text in texts)
+
+
 def classify_cli_failure(
     *,
     stdout: str,
@@ -62,6 +66,24 @@ def classify_cli_failure(
             recommended_recovery=(
                 "Use workspace_continue to resume the same workspace after a short wait, preserving the "
                 "original task and any files already produced."
+            ),
+            diagnostic_summary=diagnostic_summary,
+        )
+    if (
+        "request rejected" in lowered
+        or "invalid_request_error" in lowered
+        or "invalid request" in lowered
+        or ("400" in lowered and "bad request" in lowered)
+    ):
+        return FailureClassification(
+            failure_class="provider_request_rejected",
+            retryable=False,
+            user_message=(
+                "The model provider rejected the worker request before it could finish."
+            ),
+            recommended_recovery=(
+                "Inspect the provider diagnostic and continue the same workspace only after correcting "
+                "the provider route, request shape, or unsupported option that caused the rejection."
             ),
             diagnostic_summary=diagnostic_summary,
         )
@@ -342,28 +364,63 @@ def _collect_structured_failure_evidence(text: str) -> list[str]:
     return evidence
 
 
-def _extract_failure_strings(value: Any, *, path: str = "") -> list[str]:
+def _extract_failure_strings(value: Any, *, path: str = "", failure_context: bool = False) -> list[str]:
     results: list[str] = []
     if isinstance(value, dict):
         event_type = str(value.get("type") or value.get("event") or value.get("name") or "")
         status = str(value.get("status") or value.get("code") or value.get("error_code") or "")
-        if event_type and _looks_failure_related(event_type):
+        event_is_failure = bool(event_type and _looks_failure_related(event_type))
+        status_is_failure = bool(status and _looks_failure_related(status))
+        if event_is_failure:
             results.append(f"{path or 'event'} type={event_type}")
-        if status and _looks_failure_related(status):
+        if status_is_failure:
             results.append(f"{path or 'event'} status={status}")
+        child_context = failure_context or event_is_failure or status_is_failure or _dict_has_failure_signal(value)
         for key, child in value.items():
             child_path = f"{path}.{key}" if path else str(key)
+            key_context = child_context or _failure_key_creates_context(key)
             if isinstance(child, str):
-                if _looks_failure_related(child) or _looks_failure_field(key):
+                if key_context and (_looks_failure_field(key) or _looks_failure_related(child)):
+                    if _looks_failure_field(key) and not _failure_scalar_has_value(child):
+                        continue
                     results.append(f"{child_path}: {child}")
-            elif _looks_failure_field(key) and child is not None:
+            elif _looks_failure_field(key) and _failure_scalar_has_value(child):
                 results.append(f"{child_path}: {child}")
             elif isinstance(child, (dict, list)):
-                results.extend(_extract_failure_strings(child, path=child_path))
+                results.extend(_extract_failure_strings(child, path=child_path, failure_context=key_context))
     elif isinstance(value, list):
         for index, child in enumerate(value):
-            results.extend(_extract_failure_strings(child, path=f"{path}[{index}]"))
+            results.extend(_extract_failure_strings(child, path=f"{path}[{index}]", failure_context=failure_context))
     return results
+
+
+def _dict_has_failure_signal(value: dict[str, Any]) -> bool:
+    if value.get("is_error") is True:
+        return True
+    for key in ("api_error_status", "status_code", "error_code"):
+        if _failure_scalar_has_value(value.get(key)):
+            return True
+    return any(key in value and _failure_scalar_has_value(value.get(key)) for key in ("error", "failure"))
+
+
+def _failure_scalar_has_value(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip()) and value.strip().lower() not in {"false", "0", "no", "none", "null"}
+    return True
+
+
+def _failure_key_creates_context(key: str) -> bool:
+    return key.lower() in {
+        "api_error_status",
+        "detail",
+        "error",
+        "error_code",
+        "failure",
+        "is_error",
+        "status_code",
+    }
 
 
 def _looks_failure_field(key: str) -> bool:
@@ -413,6 +470,8 @@ def _looks_like_runtime_dependency_or_version_failure(lowered: str) -> bool:
         or "too old" in lowered
         or "exited with code 127" in lowered
         or "executable file not found" in lowered
+        or "modulenotfounderror" in lowered
+        or "no module named" in lowered
     )
 
 

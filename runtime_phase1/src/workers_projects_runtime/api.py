@@ -1043,6 +1043,52 @@ def create_app(
             if key in allowed and value is not None and value != "" and value != []
         }
 
+    def _runtime_detail_key_is_pathlike(key: object) -> bool:
+        lowered = str(key or "").strip().lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "path",
+                "paths",
+                "dir",
+                "directory",
+                "root",
+                "home",
+                "workspace",
+                "log",
+                "logs",
+            )
+        )
+
+    def _runtime_detail_value_is_local_path(value: object) -> bool:
+        text = str(value or "").strip()
+        return text.startswith(("/", "~/")) or text.startswith("file:///")
+
+    def _runtime_details_without_paths(value: object, *, key: object = "") -> object:
+        if _runtime_detail_key_is_pathlike(key):
+            return None
+        if isinstance(value, dict):
+            cleaned: dict[str, object] = {}
+            for nested_key, nested_value in value.items():
+                safe_value = _runtime_details_without_paths(nested_value, key=nested_key)
+                if safe_value is not None and safe_value != "" and safe_value != [] and safe_value != {}:
+                    cleaned[str(nested_key)] = safe_value
+            return cleaned
+        if isinstance(value, list):
+            cleaned_items = [
+                item
+                for item in (_runtime_details_without_paths(item, key=key) for item in value)
+                if item is not None and item != "" and item != [] and item != {}
+            ]
+            return cleaned_items
+        if isinstance(value, str) and _runtime_detail_value_is_local_path(value):
+            return None
+        return value
+
+    def _runtime_details_for_display(details: dict[str, object]) -> dict[str, object]:
+        cleaned = _runtime_details_without_paths(details)
+        return cleaned if isinstance(cleaned, dict) else {}
+
     def _redact_run_for_member(run: dict) -> dict[str, object]:
         return {
             key: value
@@ -1105,6 +1151,19 @@ def create_app(
             for item in workspace_items
             if len(str(item.get("path") or "").split("/")) <= 3
         ][:120]
+        show_diagnostics = show_internal and request is not None and str(request.query_params.get("diagnostics") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        runtime_details_payload = (
+            runtime_details
+            if show_diagnostics
+            else _runtime_details_for_display(runtime_details)
+            if show_internal
+            else _redact_runtime_details(runtime_details)
+        )
         return {
             "worker": _sanitize_worker(worker) if show_internal else _redact_worker_for_member(worker),
             "latest_run": latest_run if show_internal or latest_run is None else _redact_run_for_member(latest_run),
@@ -1112,14 +1171,14 @@ def create_app(
             "runs": runs if show_internal else [_redact_run_for_member(run) for run in runs],
             "project_runs": project_runs if show_internal else [_redact_run_for_member(run) for run in project_runs],
             "events": events if show_internal else [_redact_event_for_member(event) for event in events],
-            "runtime_details": runtime_details if show_internal else _redact_runtime_details(runtime_details),
+            "runtime_details": runtime_details_payload,
             "console": {
                 "stdout": stdout_text if show_internal else "",
                 "stderr": stderr_text if show_internal else "",
             },
-            **(host_visibility if show_internal else {}),
+            **(host_visibility if show_internal and show_diagnostics else {}),
             "workspace": {
-                "root": worker.get("workspace_dir") or "" if show_internal else "",
+                "root": worker.get("workspace_dir") or "" if show_diagnostics else "",
                 "items": workspace_summary_items,
             },
             "artifacts": {
@@ -2396,6 +2455,12 @@ def create_app(
         workspace = live["workspace"]
         runtime_details = live["runtime_details"]
         show_internal = _can_show_internal_details(ctx)
+        show_raw_paths = show_internal and str(request.query_params.get("diagnostics") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         is_host_worker = str(worker.get("execution_mode") or "docker") == "host"
         artifacts = live["artifacts"]
         latest_run_marker = escape(str((latest_run or {}).get("ended_at") or (latest_run or {}).get("started_at") or ""), quote=True)
@@ -2445,20 +2510,26 @@ def create_app(
                 return f"<ul>{nested}</ul>" if nested else "None"
             return escape(str(value))
 
+        runtime_details_for_page = dict(runtime_details) if show_raw_paths else _runtime_details_for_display(runtime_details)
         detail_items = "".join(
             f"<li><strong>{escape(str(key).replace('_', ' ').title())}:</strong> {detail_value_html(value)}</li>"
-            for key, value in runtime_details.items()
+            for key, value in runtime_details_for_page.items()
             if value is not None and value != "" and value != []
         ) or "<li>No runtime details yet</li>"
         worker_id_row = f"<p><strong>Worker ID:</strong> {escape(worker['worker_id'])}</p>" if show_internal else ""
+        workspace_row = (
+            f"<p><strong>Workspace:</strong> <code id=\"workspace-root\">{escape(worker.get('workspace_dir') or '')}</code></p>"
+            if show_raw_paths
+            else '<p><strong>Workspace:</strong> <span id="workspace-root">Managed by GlassHive</span></p>'
+        )
         diagnostic_rows = (
             f"""
                 <p><strong>Gateway:</strong> {escape(worker.get('gateway_url') or '')}</p>
                 <p><strong>Session Key:</strong> <code>{escape(worker.get('session_key') or '')}</code></p>
-                <p><strong>Workspace:</strong> <code id="workspace-root">{escape(worker.get('workspace_dir') or '')}</code></p>
+                {workspace_row}
             """
             if show_internal
-            else '<p><strong>Workspace:</strong> <span id="workspace-root">Managed by GlassHive</span></p>'
+            else workspace_row
         )
         stdout_console = escape(console["stdout"] or "No stdout yet.") if show_internal else "Diagnostics hidden in enterprise member view."
         stderr_console = escape(console["stderr"] or "No stderr yet.") if show_internal else "Diagnostics hidden in enterprise member view."
@@ -2678,6 +2749,7 @@ def create_app(
               }}
 
               const signedQuery = {signed_query_json};
+              const diagnosticsEnabled = {str(bool(show_raw_paths)).lower()};
               function withSignedQuery(url) {{
                 if (!signedQuery) return url;
                 return `${{url}}${{url.includes('?') ? '&' : '?'}}${{signedQuery}}`;
@@ -2685,7 +2757,8 @@ def create_app(
 
               async function refreshLive() {{
                 try {{
-                  const res = await fetch(withSignedQuery(`/v1/workers/{escape(worker_id)}/live`));
+                  const liveUrl = diagnosticsEnabled ? `/v1/workers/{escape(worker_id)}/live?diagnostics=1` : `/v1/workers/{escape(worker_id)}/live`;
+                  const res = await fetch(withSignedQuery(liveUrl));
                   if (!res.ok) return;
                   const live = await res.json();
                   document.getElementById('worker-state').textContent = live.worker.state || '';

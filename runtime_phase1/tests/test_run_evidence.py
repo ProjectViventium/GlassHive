@@ -4,8 +4,11 @@ import json
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from workers_projects_runtime.deliverables import candidate_artifact_paths
 from workers_projects_runtime.runtime_identity import derive_legacy_backend_label
+import workers_projects_runtime.run_evidence as run_evidence
 from workers_projects_runtime.run_evidence import (
     _text_artifact_payload,
     build_constraint_ledger,
@@ -74,7 +77,7 @@ def test_run_evidence_recursively_validates_artifacts_and_flags_date_drift(tmp_p
         env={"GLASSHIVE_RUN_ID": "run_artifacts", "SECRET_TOKEN": "private"},
         workspace_dir=tmp_path,
         stdout_text="FINAL REPORT:\ncreated files",
-        stderr_text="",
+        stderr_text="debug image path /Users/example/private-workspace/tmp/preview.png",
         output_text="FINAL REPORT:\ncreated files",
         error_text="",
         exit_code=0,
@@ -100,6 +103,101 @@ def test_run_evidence_recursively_validates_artifacts_and_flags_date_drift(tmp_p
     latest = write_run_evidence(tmp_path, evidence, "run_artifacts")
     assert json.loads(latest.read_text())["run_id"] == "run_artifacts"
     assert (tmp_path / "glasshive-run" / "runs" / "run_artifacts" / "evidence.json").exists()
+
+
+def _write_minimal_pdf(path: Path, title: str = "GlassHive test PDF") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = f"BT /F1 18 Tf 72 720 Td ({title}) Tj ET".encode("utf-8")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+    ]
+    body = b"%PDF-1.4\n"
+    offsets = [0]
+    for index, obj in enumerate(objects, start=1):
+        offsets.append(len(body))
+        body += f"{index} 0 obj\n".encode("ascii") + obj + b"\nendobj\n"
+    xref_offset = len(body)
+    body += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("ascii")
+    for offset in offsets[1:]:
+        body += f"{offset:010d} 00000 n \n".encode("ascii")
+    body += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n"
+    ).encode("ascii")
+    path.write_bytes(body)
+
+
+def test_run_evidence_transcript_metadata_resolves_workspace_relative_paths(tmp_path):
+    ledger = build_constraint_ledger(
+        instruction="Deliver a short Markdown note.",
+        worker={"worker_id": "wrk_transcript_meta", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_transcript_meta",
+    )
+    ledger_path = write_constraint_ledger(tmp_path, ledger, "run_transcript_meta")
+    stdout_path = tmp_path / "stdout.log"
+    stdout_path.write_text("FINAL REPORT:\nDone.\n")
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_transcript_meta", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_transcript_meta",
+        runtime_name="codex-cli",
+        model="gpt-5.4",
+        command=["codex", "exec"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_path.read_text(),
+        stderr_text="debug image path /Users/example/private-workspace/tmp/preview.png",
+        output_text="FINAL REPORT:\nDone.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="",
+        constraint_ledger=ledger,
+        transcript_paths={
+            "constraint_ledger": ledger_path.relative_to(tmp_path).as_posix(),
+            "stdout": str(stdout_path),
+        },
+    )
+
+    metadata = evidence["transcript"]["metadata"]
+    assert metadata["constraint_ledger"]["exists"] is True
+    assert metadata["constraint_ledger"]["bytes"] > 0
+    assert metadata["constraint_ledger"]["capture_source"] == "file"
+    assert metadata["stdout"]["exists"] is True
+
+
+def test_run_evidence_detects_openclaw_final_visible_text_marker(tmp_path):
+    stdout_text = json.dumps(
+        {
+            "finalAssistantVisibleText": "FINAL REPORT:\nRecovered result.",
+            "completion": {"stopReason": "stop"},
+        }
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_openclaw_final", "profile": "openclaw-general", "execution_mode": "docker"},
+        run_id="run_openclaw_final",
+        runtime_name="openclaw",
+        model="openai/gpt-5.2",
+        command=["openclaw"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text,
+        stderr_text="",
+        output_text="Recovered result.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    assert evidence["final_output"]["has_final_report"] is True
+    assert evidence["completion_compliance"]["status"] == "pass"
 
 
 def test_pdf_render_sample_uses_temp_output_without_orphaning_artifact(tmp_path, monkeypatch):
@@ -130,7 +228,7 @@ def test_pdf_render_sample_uses_temp_output_without_orphaning_artifact(tmp_path,
         env={},
         workspace_dir=tmp_path,
         stdout_text="FINAL REPORT:\nDone",
-        stderr_text="",
+        stderr_text="debug image path /Users/example/private-workspace/tmp/preview.png",
         output_text="Done",
         error_text="",
         exit_code=0,
@@ -209,11 +307,22 @@ def test_run_evidence_derives_backend_from_profile_not_stale_worker_field(tmp_pa
 
 def test_run_evidence_records_effective_effort_from_command_and_env(tmp_path):
     codex = build_run_evidence(
-        worker={"worker_id": "wrk_effort", "profile": "codex-cli", "execution_mode": "host"},
+        worker={
+            "worker_id": "wrk_effort",
+            "profile": "codex-cli",
+            "execution_mode": "host",
+            "_effort_projection": {
+                "requested": "xhigh",
+                "effective": "medium",
+                "allowed": ["high", "low", "medium"],
+                "route_proven": False,
+                "fallback_reason": "xhigh_route_not_proven",
+            },
+        },
         run_id="run_effort_codex",
         runtime_name="codex-cli",
         model="gpt-test",
-        command=["codex", "exec", "-c", 'model_reasoning_effort="xhigh"', "Do it."],
+        command=["codex", "exec", "-c", 'model_reasoning_effort="medium"', "Do it."],
         env={},
         workspace_dir=tmp_path,
         stdout_text="FINAL REPORT:\nDone",
@@ -243,11 +352,19 @@ def test_run_evidence_records_effective_effort_from_command_and_env(tmp_path):
         constraint_ledger=None,
     )
 
-    assert codex["effort"] == "xhigh"
+    assert codex["effort"] == "medium"
+    assert codex["effort_projection"] == {
+        "requested": "xhigh",
+        "effective": "medium",
+        "allowed": ["high", "low", "medium"],
+        "route_proven": False,
+        "fallback_reason": "xhigh_route_not_proven",
+    }
     assert claude["effort"] == "max"
+    assert claude["effort_projection"]["effective"] == "max"
 
 
-def test_run_evidence_redacts_long_command_prompt_and_local_home_path(tmp_path):
+def test_run_evidence_redacts_long_command_prompt_and_local_command_paths(tmp_path):
     long_prompt = "Private benchmark prompt\n" + ("sensitive details " * 80)
     evidence = build_run_evidence(
         worker={"worker_id": "wrk_redact", "profile": "codex-cli", "execution_mode": "host"},
@@ -258,7 +375,7 @@ def test_run_evidence_redacts_long_command_prompt_and_local_home_path(tmp_path):
         env={},
         workspace_dir=tmp_path,
         stdout_text="FINAL REPORT:\nDone",
-        stderr_text="",
+        stderr_text="debug image path /Users/example/private-workspace/tmp/preview.png",
         output_text="Done",
         error_text="",
         exit_code=0,
@@ -270,11 +387,14 @@ def test_run_evidence_redacts_long_command_prompt_and_local_home_path(tmp_path):
     argv = evidence["command"]["argv_redacted"]
     display = evidence["command"]["display_redacted"]
 
-    assert argv[0] == "~/bin/codex"
-    assert argv[3] == "~/private-workspace"
+    assert argv[0] == "codex"
+    assert argv[3] == "private-workspace"
     assert argv[-1].startswith("[REDACTED_LONG_ARG chars=")
     assert "sensitive details" not in display
     assert "/Users/example" not in display
+    assert "~/bin" not in display
+    assert "[REDACTED_LOCAL_PATH]" in evidence["transcript"]["stderr_tail"]
+    assert "/Users/example" not in evidence["transcript"]["stderr_tail"]
 
 
 def test_run_evidence_final_report_ignores_instruction_only_transcript_marker(tmp_path):
@@ -298,6 +418,362 @@ def test_run_evidence_final_report_ignores_instruction_only_transcript_marker(tm
 
     assert evidence["final_output"]["has_final_report"] is False
     assert evidence["final_output"]["status"] == "failed"
+
+
+def test_run_evidence_final_report_ignores_structured_progress_marker(tmp_path):
+    stdout_text = json.dumps(
+        {
+            "type": "result",
+            "subtype": "interrupted",
+            "result": "Progress note: instructions say to end with FINAL REPORT:, but no final answer was captured.",
+        }
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_structured_final_marker", "profile": "claude-code", "execution_mode": "host"},
+        run_id="run_structured_final_marker",
+        runtime_name="claude-code",
+        model="claude-test",
+        command=["claude", "-p", "Do it."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text,
+        stderr_text="",
+        output_text="Status: no FINAL REPORT: was captured.",
+        error_text="Interrupted by timeout",
+        exit_code=None,
+        timeout_seconds=300,
+        stop_reason="timeout",
+        constraint_ledger=None,
+    )
+
+    assert evidence["final_output"]["has_final_report"] is False
+    assert evidence["evidence_result"]["status"] == "fail"
+
+
+def test_run_evidence_classifies_structured_provider_rate_limit(tmp_path):
+    stdout_text = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "api_error_status": 429,
+            "result": "You've hit your session limit; resets later.",
+        }
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_provider_429", "profile": "claude-code", "execution_mode": "host"},
+        run_id="run_provider_429",
+        runtime_name="claude-code",
+        model="claude-test",
+        command=["claude", "-p", "--output-format", "json"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text + "\n",
+        stderr_text="",
+        output_text="",
+        error_text="claude-code exited with code 1",
+        exit_code=1,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    classification = evidence["failure_classification"]
+    assert classification["failure_class"] == "provider_rate_limited"
+    assert classification["retryable"] is True
+    assert "workspace_continue" in classification["recommended_recovery"]
+    assert "api_error_status: 429" in classification["diagnostic_summary"]
+    assert any(
+        reason.get("failure_class") == "provider_rate_limited"
+        for reason in evidence["evidence_result"]["failure_reasons"]
+    )
+
+
+def test_run_evidence_classifies_structured_provider_overload(tmp_path):
+    stdout_text = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "api_error_status": 529,
+            "result": "API Error: 529 Overloaded. This is usually temporary.",
+        }
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_provider_529", "profile": "claude-code", "execution_mode": "host"},
+        run_id="run_provider_529",
+        runtime_name="claude-code",
+        model="claude-test",
+        command=["claude", "-p", "--output-format", "json"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text + "\n",
+        stderr_text="",
+        output_text="",
+        error_text="claude-code exited with code 1",
+        exit_code=1,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    classification = evidence["failure_classification"]
+    assert classification["failure_class"] == "provider_response_failed"
+    assert classification["retryable"] is True
+    assert "api_error_status: 529" in classification["diagnostic_summary"]
+
+
+def test_run_evidence_classifies_structured_provider_content_filter(tmp_path):
+    stdout_text = json.dumps(
+        {
+            "type": "turn.failed",
+            "error": {
+                "code": "content_filter",
+                "message": "content_filter",
+            },
+        }
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_provider_filter", "profile": "claude-code", "execution_mode": "host"},
+        run_id="run_provider_filter",
+        runtime_name="claude-code",
+        model="claude-test",
+        command=["claude", "-p", "--output-format", "json"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text + "\n",
+        stderr_text="",
+        output_text="",
+        error_text="claude-code exited with code 1",
+        exit_code=1,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    classification = evidence["failure_classification"]
+    assert classification["failure_class"] == "provider_content_filter"
+    assert classification["retryable"] is False
+    assert any(
+        reason.get("failure_class") == "provider_content_filter"
+        for reason in evidence["evidence_result"]["failure_reasons"]
+    )
+
+
+def test_run_evidence_classifies_structured_provider_auth_missing(tmp_path):
+    stdout_text = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "api_error_status": 401,
+            "result": "Not logged in. Please run /login.",
+        }
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_provider_auth", "profile": "claude-code", "execution_mode": "host"},
+        run_id="run_provider_auth",
+        runtime_name="claude-code",
+        model="claude-test",
+        command=["claude", "-p", "--output-format", "json"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text + "\n",
+        stderr_text="",
+        output_text="",
+        error_text="claude-code exited with code 1",
+        exit_code=1,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    classification = evidence["failure_classification"]
+    assert classification["failure_class"] == "provider_auth_missing"
+    assert classification["retryable"] is False
+    assert "api_error_status: 401" in classification["diagnostic_summary"]
+
+
+def test_run_evidence_classifies_structured_provider_request_rejected(tmp_path):
+    stdout_text = json.dumps(
+        {
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "api_error_status": 400,
+            "error_code": "invalid_request_error",
+            "result": "400 Bad Request: request rejected because the route does not support this option.",
+        }
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_provider_400", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_provider_400",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text + "\n",
+        stderr_text="",
+        output_text="",
+        error_text="codex-cli exited with code 1",
+        exit_code=1,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    classification = evidence["failure_classification"]
+    assert classification["failure_class"] == "provider_request_rejected"
+    assert classification["retryable"] is False
+    assert "unsupported option" in classification["recommended_recovery"]
+
+
+def test_run_evidence_classifies_zero_exit_structured_provider_error(tmp_path):
+    stdout_text = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "api_error_status": 429,
+            "result": "Too Many Requests",
+        }
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_provider_zero_exit", "profile": "claude-code", "execution_mode": "host"},
+        run_id="run_provider_zero_exit",
+        runtime_name="claude-code",
+        model="claude-test",
+        command=["claude", "-p", "--output-format", "json"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text + "\n",
+        stderr_text="",
+        output_text="",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    classification = evidence["failure_classification"]
+    assert classification["failure_class"] == "provider_rate_limited"
+    assert classification["retryable"] is True
+    assert any(
+        reason.get("failure_class") == "provider_rate_limited"
+        for reason in evidence["evidence_result"]["failure_reasons"]
+    )
+
+
+def test_run_evidence_does_not_classify_benign_provider_terms_in_success_output(tmp_path):
+    stdout_text = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": (
+                    "FINAL REPORT:\n"
+                    "The research mentions rate limit, HTTP 429, and content filter topics as domain facts, "
+                    "not as provider failures."
+                ),
+            },
+        }
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_provider_terms", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_provider_terms",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text + "\n",
+        stderr_text="",
+        output_text=(
+            "FINAL REPORT:\n"
+            "The research mentions rate limit, HTTP 429, and content filter topics as domain facts."
+        ),
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    assert evidence["failure_classification"]["status"] == "not_applicable"
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_run_evidence_does_not_classify_false_structured_error_fields(tmp_path):
+    stdout_text = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": "false",
+            "error": "none",
+            "failure": "false",
+            "result": "FINAL REPORT:\nCompleted successfully.",
+        }
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_false_error_fields", "profile": "claude-code", "execution_mode": "host"},
+        run_id="run_false_error_fields",
+        runtime_name="claude-code",
+        model="claude-test",
+        command=["claude", "-p", "--output-format", "json"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text + "\n",
+        stderr_text="",
+        output_text="FINAL REPORT:\nCompleted successfully.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    assert evidence["failure_classification"]["status"] == "not_applicable"
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_run_evidence_accepts_markdown_decorated_final_report_marker(tmp_path):
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_decorated_final", "profile": "claude-code", "execution_mode": "host"},
+        run_id="run_decorated_final",
+        runtime_name="claude-code",
+        model="claude-test",
+        command=["claude", "-p"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "result": "### FINAL REPORT:\nDone.",
+            }
+        ),
+        stderr_text="",
+        output_text="**FINAL REPORT:**\nDone.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    assert evidence["final_output"]["has_final_report"] is True
+    assert evidence["evidence_result"]["status"] == "pass"
 
 
 def test_run_evidence_detects_claude_result_final_report_marker(tmp_path):
@@ -399,6 +875,329 @@ def test_constraint_compliance_avoids_generic_future_and_approximate_false_posit
 
     assert evidence["timeout"]["exit_source"] == "process"
     assert evidence["constraint_compliance"]["status"] == "pass"
+
+
+def test_constraint_compliance_fails_when_planning_file_omits_strict_source_window(tmp_path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "report.md").write_text("FINAL REPORT:\nThe final answer used in-window sources.\n")
+    specs_dir = tmp_path / "specs"
+    specs_dir.mkdir()
+    (specs_dir / "SPEC.md").write_text("Plan: gather public evidence and write the report.\n")
+    ledger = build_constraint_ledger(
+        instruction="Use sources from January 2024 through May 2026 only.",
+        worker={"worker_id": "wrk_spec_warning", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_spec_warning",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_spec_warning", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_spec_warning",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Analyze."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nDone",
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "fail"
+    assert any(
+        issue["reason"] == "strict source/date constraints not referenced in planning file"
+        for issue in evidence["constraint_compliance"]["issues"]
+    )
+    assert evidence["evidence_result"]["status"] == "fail"
+
+
+def test_constraint_compliance_scans_final_output_for_source_window_drift(tmp_path):
+    ledger = build_constraint_ledger(
+        instruction="Use sources from January 2024 through May 2026 only.",
+        worker={"worker_id": "wrk_final_window", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_final_window",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_final_window", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_final_window",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Analyze."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nDone",
+        stderr_text="",
+        output_text="FINAL REPORT:\nUsed a primary source published June 2026 for the score.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "fail"
+    assert any(issue["path"] == "<final-output>" for issue in evidence["constraint_compliance"]["issues"])
+
+
+def test_constraint_compliance_allows_access_timestamp_without_widening_source_window(tmp_path):
+    ledger = build_constraint_ledger(
+        instruction="Use sources from January 2024 through May 2026 only.",
+        worker={"worker_id": "wrk_access_date", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_access_date",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_access_date", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_access_date",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Analyze."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nDone",
+        stderr_text="",
+        output_text="FINAL REPORT:\nSource publication date is March 2026. Access date: 2026-06-22.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "pass"
+
+
+def test_constraint_compliance_allows_explicitly_excluded_out_of_window_note(tmp_path):
+    ledger = build_constraint_ledger(
+        instruction="Use sources from January 2024 through May 2026 only.",
+        worker={"worker_id": "wrk_excluded_date", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_excluded_date",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_excluded_date", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_excluded_date",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Analyze."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nDone",
+        stderr_text="",
+        output_text=(
+            "FINAL REPORT:\n"
+            "June 2026 article is OUT-OF-WINDOW and excluded from scoring; "
+            "a July 2026 filing is outside January 2024-May 2026 window and not used; "
+            "in-window facts use March 2026 sources."
+        ),
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "pass"
+
+
+def test_constraint_compliance_does_not_treat_research_notes_as_planning_softening(tmp_path):
+    research_dir = tmp_path / "research"
+    research_dir.mkdir()
+    (research_dir / "firm-notes.md").write_text(
+        "Evidence note: figure is likely blended and should be flagged for human review, "
+        "but the final score uses in-window primary sources only.\n"
+    )
+    ledger = build_constraint_ledger(
+        instruction="Use sources from January 2024 through May 2026 only.",
+        worker={"worker_id": "wrk_research_note", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_research_note",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_research_note", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_research_note",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Analyze."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nDone",
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "pass"
+
+
+def test_constraint_compliance_scans_xlsx_artifact_text_for_source_window_drift(tmp_path):
+    openpyxl = pytest.importorskip("openpyxl")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Sources"
+    worksheet.append(["Entity", "Source note"])
+    worksheet.append(["ExampleCo", "Primary source published June 2026; used for scoring."])
+    workbook.save(output_dir / "source-ledger.xlsx")
+    (output_dir / "report.md").write_text("FINAL REPORT:\nSee the workbook.\n")
+    ledger = build_constraint_ledger(
+        instruction="Use sources from January 2024 through May 2026 only.",
+        worker={"worker_id": "wrk_xlsx_window", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_xlsx_window",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_xlsx_window", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_xlsx_window",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Analyze."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nDone",
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "fail"
+    assert any(issue["path"] == "output/source-ledger.xlsx" for issue in evidence["constraint_compliance"]["issues"])
+    assert "output/source-ledger.xlsx" in evidence["constraint_compliance"]["scanned_sources"]
+
+
+def test_constraint_compliance_warns_when_binary_text_extraction_is_unavailable(tmp_path, monkeypatch):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "source-ledger.xlsx").write_bytes(b"synthetic workbook bytes")
+    ledger = build_constraint_ledger(
+        instruction="Use sources from January 2024 through May 2026 only.",
+        worker={"worker_id": "wrk_xlsx_unavailable", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_xlsx_unavailable",
+    )
+    monkeypatch.setattr(
+        run_evidence,
+        "_extract_xlsx_text",
+        lambda _path: ("", "openpyxl unavailable for xlsx constraint scan"),
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_xlsx_unavailable", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_xlsx_unavailable",
+        runtime_name="codex-cli",
+        model="gpt-5.4",
+        command=["codex", "exec", "-"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\ncreated files",
+        stderr_text="",
+        output_text="FINAL REPORT:\ncreated files",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "warn"
+    assert any(
+        issue["path"] == "output/source-ledger.xlsx"
+        and issue["reason"] == "constraint text extraction unavailable"
+        for issue in evidence["constraint_compliance"]["issues"]
+    )
+
+
+def test_constraint_compliance_fails_when_planning_file_widens_source_window(tmp_path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "report.md").write_text("FINAL REPORT:\nThe final answer used in-window sources.\n")
+    research_dir = tmp_path / "research"
+    research_dir.mkdir()
+    (research_dir / "SPEC.md").write_text(
+        "Research plan: use primary sources from January 2024 through June 2026.\n"
+        "Deliver the final table after scoring.\n"
+    )
+    ledger = build_constraint_ledger(
+        instruction="Use primary sources from January 2024 through May 2026 only. Deliver a final table.",
+        worker={"worker_id": "wrk_plan_widen", "profile": "claude-code", "execution_mode": "host"},
+        run_id="run_plan_widen",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_plan_widen", "profile": "claude-code", "execution_mode": "host"},
+        run_id="run_plan_widen",
+        runtime_name="claude-code",
+        model="claude-test",
+        command=["claude", "-p"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text='{"type":"result","result":"FINAL REPORT:\\nDone"}',
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "fail"
+    assert any(
+        issue["reason"] == "planning source/date window widened past ledger limit"
+        for issue in evidence["constraint_compliance"]["issues"]
+    )
+    assert evidence["evidence_result"]["status"] == "fail"
+
+
+def test_constraint_compliance_accepts_planning_file_that_references_ledger(tmp_path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "report.md").write_text("FINAL REPORT:\nThe final answer used in-window sources.\n")
+    planning_dir = tmp_path / "planning"
+    planning_dir.mkdir()
+    (planning_dir / "delegate-plan.md").write_text(
+        "Read glasshive-run/constraint-ledger.json before delegating source work.\n"
+    )
+    ledger = build_constraint_ledger(
+        instruction="Use sources from January 2024 through May 2026 only.",
+        worker={"worker_id": "wrk_spec_pass", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_spec_pass",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_spec_pass", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_spec_pass",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Analyze."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nDone",
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "pass"
 
 
 def test_constraint_compliance_allows_official_future_subject_when_sources_remain_in_window(tmp_path):
@@ -504,6 +1303,59 @@ def test_constraint_compliance_still_flags_out_of_window_sources_only_marked_fla
     assert "June 2026" in evidence["constraint_compliance"]["issues"][0]["text"]
 
 
+def test_constraint_compliance_skips_raw_support_snapshots_but_scans_research_notes(tmp_path):
+    raw_support_dir = tmp_path / "research" / "site_snapshots" / "example.test"
+    raw_support_dir.mkdir(parents=True)
+    (raw_support_dir / "pages.json").write_text(
+        json.dumps({"source": "Primary source published June 2026 and preserved only as a raw capture."})
+    )
+    ledger = build_constraint_ledger(
+        instruction="Use sources from January 2024 through May 2026 only.",
+        worker={"worker_id": "wrk_raw_support_source", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_raw_support_source",
+    )
+
+    clean_evidence = build_run_evidence(
+        worker={"worker_id": "wrk_raw_support_source", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_raw_support_source",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Analyze."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nDone",
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+    assert clean_evidence["constraint_compliance"]["status"] == "pass"
+
+    (tmp_path / "research" / "notes.md").write_text("Primary source published June 2026 appears in notes.\n")
+    dirty_evidence = build_run_evidence(
+        worker={"worker_id": "wrk_raw_support_source", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_raw_support_source_dirty",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Analyze."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nDone",
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+    assert dirty_evidence["constraint_compliance"]["status"] == "fail"
+    assert dirty_evidence["constraint_compliance"]["issues"][0]["path"] == "research/notes.md"
+
+
 def test_candidate_artifact_paths_sorts_before_max_entry_cap(tmp_path):
     for index in range(25):
         (tmp_path / f"root-{index:02d}.txt").write_text("lower priority")
@@ -586,14 +1438,97 @@ def test_run_evidence_flags_notes_only_when_required_artifacts_are_missing(tmp_p
     assert evidence["evidence_result"]["status"] == "fail"
 
 
+def test_run_evidence_flags_notes_only_when_deliverable_intent_has_no_extension(tmp_path):
+    workspace = tmp_path / "workspace"
+    research_dir = workspace / "research"
+    research_dir.mkdir(parents=True)
+    (research_dir / "batch-01.md").write_text("Research notes only; no user-facing report was produced.\n")
+    ledger = build_constraint_ledger(
+        instruction=(
+            "### OUTPUT FORMAT\n"
+            "Section 1 - Master Summary Table. All targets, sortable by weighted fit score.\n"
+            "Section 2 - Deep Profiles. For each Tier 1 candidate, provide a narrative profile.\n"
+            "Section 3 - Recommendation. Deliver the final report to the user."
+        ),
+        worker={"worker_id": "wrk_notes_only_intent", "profile": "claude-code", "execution_mode": "host"},
+        run_id="run_notes_only_intent",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_notes_only_intent", "profile": "claude-code", "execution_mode": "host"},
+        run_id="run_notes_only_intent",
+        runtime_name="claude-code",
+        model="claude-test",
+        command=["claude", "-p"],
+        env={},
+        workspace_dir=workspace,
+        stdout_text='{"type":"result","result":"FINAL REPORT:\\nDone"}',
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    completion = evidence["completion_compliance"]
+    assert completion["required_artifact_types"] == []
+    assert completion["required_deliverable_intent"] is True
+    assert completion["notes_only"] is True
+    assert completion["status"] == "fail"
+    assert any(issue["reason"] == "only support notes/planning artifacts were found" for issue in completion["issues"])
+    assert evidence["evidence_result"]["status"] == "fail"
+
+
+def test_run_evidence_allows_internal_notes_when_final_answer_requested_in_chat(tmp_path):
+    workspace = tmp_path / "workspace"
+    notes_dir = workspace / "notes"
+    notes_dir.mkdir(parents=True)
+    (notes_dir / "scratch.md").write_text("Internal notes used to prepare the answer.\n")
+    ledger = build_constraint_ledger(
+        instruction="Report back with the answer in chat. Do not create files.",
+        worker={"worker_id": "wrk_chat_answer", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_chat_answer",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_chat_answer", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_chat_answer",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec"],
+        env={},
+        workspace_dir=workspace,
+        stdout_text='{"type":"item.completed","item":{"type":"agent_message","text":"FINAL REPORT:\\nAnswer delivered inline."}}',
+        stderr_text="",
+        output_text="FINAL REPORT:\nAnswer delivered inline.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    completion = evidence["completion_compliance"]
+    assert completion["notes_only"] is True
+    assert completion["required_deliverable_intent"] is False
+    assert completion["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
 def test_run_evidence_completion_compliance_passes_for_requested_deliverables(tmp_path):
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     (output_dir / "summary.csv").write_text("name,notes\nAlpha Capital,done\nBeta Partners,done\n")
-    (output_dir / "report.pdf").write_bytes(b"%PDF-1.7\n% synthetic\n")
-    with zipfile.ZipFile(output_dir / "screen.xlsx", "w") as archive:
-        archive.writestr("[Content_Types].xml", "<Types></Types>")
-        archive.writestr("xl/workbook.xml", "<workbook></workbook>")
+    _write_minimal_pdf(output_dir / "report.pdf")
+    openpyxl = pytest.importorskip("openpyxl")
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(["name", "notes"])
+    sheet.append(["Alpha Capital", "done"])
+    sheet.append(["Beta Partners", "done"])
+    workbook.save(output_dir / "screen.xlsx")
     ledger = build_constraint_ledger(
         instruction="Include seed firms Alpha Capital and Beta Partners. Deliver PDF, XLSX, and CSV artifacts.",
         worker={"worker_id": "wrk_complete", "profile": "codex-cli", "execution_mode": "host"},
@@ -769,6 +1704,40 @@ def test_completion_compliance_subtracts_explicitly_forbidden_output_format(tmp_
     assert evidence["evidence_result"]["status"] == "pass"
 
 
+def test_completion_compliance_does_not_count_zero_byte_required_artifact(tmp_path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "results.csv").write_text("")
+    ledger = build_constraint_ledger(
+        instruction="Deliver a CSV report.",
+        worker={"worker_id": "wrk_empty_csv", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_empty_csv",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_empty_csv", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_empty_csv",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Create CSV."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nDone",
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["artifacts"]["items"] == []
+    assert evidence["completion_compliance"]["missing_required_artifact_types"] == ["csv"]
+    assert evidence["completion_compliance"]["status"] == "fail"
+    assert evidence["evidence_result"]["status"] == "fail"
+
+
 def test_completion_compliance_requires_output_format_but_not_uploaded_input_format(tmp_path):
     output_dir = tmp_path / "output"
     output_dir.mkdir()
@@ -836,6 +1805,29 @@ def test_completion_compliance_ignores_seed_section_heading(tmp_path):
     assert not any("FIRM LIST" in str(issue) for issue in completion["issues"])
 
 
+def test_constraint_ledger_extracts_seed_block_terms_without_heading_noise():
+    ledger = build_constraint_ledger(
+        instruction=(
+            "### SEED TARGET LIST\n"
+            "(Expand beyond this list - do not limit to it. Aim for 50-75 total before scoring.)\n\n"
+            "**Large Targets**\n"
+            "Alpha Capital, Beta Partners, Gamma Growth\n"
+            "**Focused Targets**\n"
+            "Delta Health; Epsilon Software and Zeta Services\n"
+        ),
+        worker={"worker_id": "wrk_seed_block", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_seed_block",
+    )
+
+    seeds = ledger["seed_entities_or_files"]
+    assert "Alpha Capital, Beta Partners, Gamma Growth" in seeds
+    assert "Delta Health; Epsilon Software and Zeta Services" in seeds
+    assert not any("SEED TARGET LIST" in seed for seed in seeds)
+    assert not any("Aim for" in seed for seed in seeds)
+    assert ledger["coverage_expectations"][0]["minimum"] == 50
+    assert ledger["coverage_expectations"][0]["maximum"] == 75
+
+
 def test_completion_compliance_handles_seed_topic_descriptor(tmp_path):
     workspace = tmp_path / "workspace"
     output = workspace / "output"
@@ -874,6 +1866,202 @@ def test_completion_compliance_handles_seed_topic_descriptor(tmp_path):
     assert completion["seed_entity_coverage"]["missing"] == []
     assert completion["status"] == "pass"
     assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_coverage_compliance_fails_when_table_rows_below_requested_range(tmp_path):
+    workspace = tmp_path / "workspace"
+    output = workspace / "output"
+    output.mkdir(parents=True)
+    with (output / "screen.csv").open("w", encoding="utf-8") as handle:
+        handle.write("entity,score\n")
+        for index in range(36):
+            handle.write(f"Entity {index},4.{index % 10}\n")
+    ledger = build_constraint_ledger(
+        instruction="Expand beyond the seed list. Aim for 50-75 firms total before scoring. Deliver CSV screen.",
+        worker={"worker_id": "wrk_coverage_low", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_coverage_low",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_coverage_low", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_coverage_low",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec"],
+        env={},
+        workspace_dir=workspace,
+        stdout_text='{"type":"item.completed","item":{"type":"agent_message","text":"FINAL REPORT:\\nDone"}}',
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    coverage = evidence["coverage_compliance"]
+    assert coverage["status"] == "fail"
+    assert coverage["observed_max_count"] == 36
+    assert any(issue["reason"] == "coverage count below requested minimum" for issue in coverage["issues"])
+    assert evidence["evidence_result"]["status"] == "fail"
+
+
+def test_coverage_compliance_passes_when_table_rows_match_requested_range(tmp_path):
+    workspace = tmp_path / "workspace"
+    output = workspace / "output"
+    output.mkdir(parents=True)
+    _write_xlsx_test_path = output / "screen.xlsx"
+    try:
+        import openpyxl  # type: ignore
+    except Exception:
+        pytest.skip("openpyxl unavailable")
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Master"
+    sheet.append(["entity", "score"])
+    for index in range(63):
+        sheet.append([f"Entity {index}", 4.0])
+    workbook.save(_write_xlsx_test_path)
+    ledger = build_constraint_ledger(
+        instruction="Expand beyond the seed list. Aim for 50-75 firms total before scoring. Deliver XLSX workbook.",
+        worker={"worker_id": "wrk_coverage_pass", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_coverage_pass",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_coverage_pass", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_coverage_pass",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec"],
+        env={},
+        workspace_dir=workspace,
+        stdout_text='{"type":"item.completed","item":{"type":"agent_message","text":"FINAL REPORT:\\nDone"}}',
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    coverage = evidence["coverage_compliance"]
+    assert coverage["status"] == "pass"
+    assert coverage["observed_max_count"] == 63
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_coverage_compliance_passes_when_any_deliverable_table_matches_requested_range(tmp_path):
+    workspace = tmp_path / "workspace"
+    output = workspace / "output"
+    output.mkdir(parents=True)
+    with (output / "screen.csv").open("w", encoding="utf-8") as handle:
+        handle.write("entity,score\n")
+        for index in range(50):
+            handle.write(f"Entity {index},4.{index % 10}\n")
+    html_rows = "\n".join(f"<tr><td>Other {index}</td></tr>" for index in range(80))
+    (output / "appendix.html").write_text(f"<table>{html_rows}</table>\n", encoding="utf-8")
+    ledger = build_constraint_ledger(
+        instruction="Expand beyond the seed list. Aim for 50-75 firms total before scoring. Deliver CSV screen.",
+        worker={"worker_id": "wrk_coverage_any_match", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_coverage_any_match",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_coverage_any_match", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_coverage_any_match",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec"],
+        env={},
+        workspace_dir=workspace,
+        stdout_text='{"type":"item.completed","item":{"type":"agent_message","text":"FINAL REPORT:\\nDone"}}',
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    coverage = evidence["coverage_compliance"]
+    assert coverage["status"] == "pass"
+    assert coverage["observed_max_count"] > 75
+    assert coverage["matched_count"] == 50
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_coverage_compliance_counts_structured_final_answer_items(tmp_path):
+    ledger = build_constraint_ledger(
+        instruction="Produce at least 3 items in the final answer. Answer in chat.",
+        worker={"worker_id": "wrk_final_items", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_final_items",
+    )
+    output_text = "FINAL REPORT:\n1. Alpha\n2. Beta\n3. Gamma\n"
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_final_items", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_final_items",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text='{"type":"item.completed","item":{"type":"agent_message","text":"FINAL REPORT:\\n1. Alpha\\n2. Beta\\n3. Gamma"}}',
+        stderr_text="",
+        output_text=output_text,
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    coverage = evidence["coverage_compliance"]
+    assert coverage["status"] == "pass"
+    assert coverage["matched_count"] == 3
+    assert any(item["kind"] == "final_output_list_items" for item in coverage["counts"])
+    assert evidence["completion_compliance"]["required_deliverable_intent"] is False
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_coverage_compliance_warns_when_count_unverifiable_in_professional_artifact(tmp_path):
+    workspace = tmp_path / "workspace"
+    output = workspace / "output"
+    output.mkdir(parents=True)
+    _write_minimal_pdf(output / "executive_briefing.pdf")
+    ledger = build_constraint_ledger(
+        instruction="Research 40-50 firms and deliver a PDF executive briefing.",
+        worker={"worker_id": "wrk_coverage_pdf", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_coverage_pdf",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_coverage_pdf", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_coverage_pdf",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec"],
+        env={},
+        workspace_dir=workspace,
+        stdout_text='{"type":"item.completed","item":{"type":"agent_message","text":"FINAL REPORT:\\nResearched 45 firms and created the PDF."}}',
+        stderr_text="",
+        output_text="FINAL REPORT:\nResearched 45 firms and created the PDF.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    coverage = evidence["coverage_compliance"]
+    assert coverage["status"] == "warn"
+    assert any(item["reason"] == "coverage count could not be verified" for item in coverage["issues"])
+    assert evidence["completion_compliance"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "warn"
 
 
 def test_completion_compliance_does_not_treat_seed_reference_sentence_as_seed_path(tmp_path):
@@ -1044,3 +2232,23 @@ def test_text_artifact_payload_walks_json_leaves_for_hygiene(tmp_path):
 
     assert "research/dataset.json" not in payload
     assert result["status"] == "pass"
+
+
+def test_text_artifact_payload_skips_raw_support_snapshots_but_scans_deliverables(tmp_path):
+    workspace = tmp_path / "workspace"
+    raw_support_dir = workspace / "research" / "site_snapshots" / "example.test"
+    output_dir = workspace / "output"
+    raw_support_dir.mkdir(parents=True)
+    output_dir.mkdir(parents=True)
+    (raw_support_dir / "pages.json").write_text(
+        json.dumps({"page": "Skip to main content. Privacy Policy. Please enable JavaScript."})
+    )
+    (output_dir / "findings.csv").write_text("entity,notes\nAlpha,Privacy Policy copied into the final cell\n")
+
+    payload = _text_artifact_payload(workspace)
+    result = check_content_hygiene(payload)
+
+    assert all("research/site_snapshots" not in path for path in payload)
+    assert any(path.startswith("output/findings.csv") for path in payload)
+    assert result["status"] == "warn"
+    assert result["issues"][0]["path"].startswith("output/findings.csv")
