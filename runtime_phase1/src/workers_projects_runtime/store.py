@@ -909,6 +909,18 @@ class Store:
 
     def cancel_pending_runs(self, worker_id: str, error_text: str, state: str = "cancelled") -> int:
         with self._connect() as conn:
+            schedule_state = "cancelled" if state == "cancelled" else "failed"
+            conn.execute(
+                """
+                UPDATE scheduled_runs
+                SET state = ?, last_error = ?, updated_at = ?
+                WHERE queued_run_id IN (
+                    SELECT run_id FROM runs WHERE worker_id = ? AND state IN ('queued', 'running')
+                )
+                  AND state IN ('queued', 'running')
+                """,
+                (schedule_state, error_text, utc_now(), worker_id),
+            )
             cur = conn.execute(
                 "UPDATE runs SET state = ?, ended_at = ?, error_text = ? WHERE worker_id = ? AND state IN ('queued', 'running')",
                 (state, utc_now(), error_text, worker_id),
@@ -1041,7 +1053,7 @@ class Store:
                 """
                 UPDATE scheduled_runs
                 SET state = ?, queued_run_id = ?, last_error = ?, updated_at = ?
-                WHERE schedule_id = ?
+                WHERE schedule_id = ? AND state NOT IN ('completed', 'failed', 'cancelled')
                 """,
                 (state, queued_run_id, last_error, utc_now(), schedule_id),
             )

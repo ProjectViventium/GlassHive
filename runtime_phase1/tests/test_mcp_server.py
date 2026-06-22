@@ -23,6 +23,10 @@ def _fake_runtime_for_profile(profile: str) -> str:
     return "openclaw" if profile.startswith("openclaw") else profile
 
 
+def _patch_host_runtime_requirements_ok(monkeypatch):
+    monkeypatch.setattr(mcp_server, "host_runtime_requirement_issue", lambda _profile, _runtime_name: None)
+
+
 class FakeApiClient:
     def list_projects(self, owner_id: str | None = None):
         items = [
@@ -1485,6 +1489,7 @@ def test_worker_takeover_omits_operator_url_for_non_web_surface(monkeypatch, sur
 def test_worker_delegate_once_creates_resumes_and_runs_without_listing(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
     monkeypatch.setenv("WPR_CODEX_BIN", "/bin/sh")
+    _patch_host_runtime_requirements_ok(monkeypatch)
     monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "http://127.0.0.1:8780")
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
     monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", "http://127.0.0.1:3180/api/viventium/glasshive/callback")
@@ -1813,6 +1818,7 @@ def test_worker_schedule_and_workspace_schedule_are_glasshive_native(monkeypatch
 def test_worker_delegate_once_exposes_diagnostics_only_when_requested(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
     monkeypatch.setenv("WPR_CODEX_BIN", "/bin/sh")
+    _patch_host_runtime_requirements_ok(monkeypatch)
     monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", "http://127.0.0.1:3180/api/viventium/glasshive/callback")
     monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "public-safe-test-secret")
     monkeypatch.setattr(mcp_server, "get_http_headers", _callback_headers)
@@ -1847,6 +1853,7 @@ def test_worker_delegate_once_exposes_diagnostics_only_when_requested(monkeypatc
 def test_worker_delegate_once_dispatches_without_callback_by_default(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
     monkeypatch.setenv("WPR_CODEX_BIN", "/bin/sh")
+    _patch_host_runtime_requirements_ok(monkeypatch)
     monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", raising=False)
     monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", raising=False)
     monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
@@ -1884,6 +1891,7 @@ def test_worker_delegate_once_dispatches_without_callback_by_default(monkeypatch
 def test_worker_delegate_once_can_require_callback_for_host_apps(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
     monkeypatch.setenv("WPR_CODEX_BIN", "/bin/sh")
+    _patch_host_runtime_requirements_ok(monkeypatch)
     monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", raising=False)
     monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", raising=False)
     monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})

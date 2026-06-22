@@ -43,14 +43,23 @@ def test_bootstrap_materializes_canonical_worker_operating_contract(tmp_path):
     assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in agents_text
     assert "FINAL REPORT:" in agents_text
     assert "polished ordinary end-user artifact" in agents_text
+    assert "never leave a foreground server blocking final delivery or wasting compute" in agents_text
+    assert "source/date/auth/scope constraints" in agents_text
+    assert "do not use that item to support facts, scoring, or deliverables" in agents_text
+    assert "source publication/evidence dates distinct from retrieval/access timestamps" in agents_text
+    assert "access date must not widen or replace a user-limited source window" in agents_text
+    assert "rejected or out-of-scope evidence" in agents_text
+    assert "read it before planning, delegation, source collection, and final delivery" in agents_text
+    assert "carry the user's constraints forward literally and exactly" in agents_text
+    assert "correct that file before continuing" in agents_text
+    assert "prioritize a usable core result before optional expansion" in agents_text
+    assert "not clipped" in agents_text
     assert "Do not force a download" in agents_text
-    assert "Native capability inventory" in agents_text
-    assert "Claude Code skill families" in agents_text
-    assert "Codex skill families" in agents_text
-    assert "daymade deep-research" in agents_text
-    assert "openai pdf" in agents_text
-    assert "anthropic document-skills" in agents_text
-    assert "Use these capabilities when relevant" in agents_text
+    assert "Native capability discovery" in agents_text
+    assert "Inspect what is actually available" in agents_text
+    assert "use available research, browser, spreadsheet, PDF, document, deck, notebook, rendering, or verification tools" in agents_text
+    assert "verify the package/tool is available" in agents_text
+    assert "Do not overfit to examples" in agents_text
 
 
 def test_enterprise_bootstrap_filters_worker_env_and_projects_provider_env(monkeypatch):
@@ -155,6 +164,7 @@ def test_enterprise_bootstrap_keeps_provider_secrets_out_of_interactive_runtime_
             {
                 "env": {
                     "OPENAI_API_KEY": "synthetic-openai-key-not-for-shell",
+                    "CLAUDE_CODE_OAUTH_TOKEN": "synthetic-claude-oauth-token-not-for-shell",
                     "PORTKEY_VIRTUAL_KEY": "pk-test-not-for-shell",
                     "OPENAI_BASE_URL": "https://provider.example.com/v1",
                 }
@@ -177,10 +187,12 @@ def test_enterprise_bootstrap_keeps_provider_secrets_out_of_interactive_runtime_
 
     assert "OPENAI_BASE_URL" in runtime_env
     assert "OPENAI_API_KEY" not in runtime_env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in runtime_env
     assert "PORTKEY_VIRTUAL_KEY" not in runtime_env
     assert "OPENAI_API_KEY" in secret_env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in secret_env
     assert "PORTKEY_VIRTUAL_KEY" in secret_env
-    assert set(secret_keys) == {"OPENAI_API_KEY", "PORTKEY_VIRTUAL_KEY"}
+    assert set(secret_keys) == {"CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "PORTKEY_VIRTUAL_KEY"}
     assert oct((tmp_path / "home" / ".glasshive" / "secret-runtime.env").stat().st_mode & 0o777) == "0o600"
     assert oct((tmp_path / "home" / ".glasshive" / "secret-runtime.keys").stat().st_mode & 0o777) == "0o600"
 
@@ -460,3 +472,82 @@ def test_bootstrap_materializes_base64_uploaded_file(tmp_path):
     )
 
     assert (workspace / "uploads" / "report.bin").read_bytes() == b"\x00\x01\x02Hello"
+
+
+def test_bootstrap_rejects_empty_uploaded_file_unless_explicitly_allowed(tmp_path):
+    workspace = tmp_path / "workspace"
+
+    with pytest.raises(ValueError, match="empty"):
+        apply_bootstrap(
+            home_dir=tmp_path / "home",
+            workspace_dir=workspace,
+            runtime_name="codex-cli",
+            worker={
+                "bootstrap_bundle_json": json.dumps(
+                    {
+                        "files": [
+                            {
+                                "scope": "workspace",
+                                "path": "uploads/empty.bin",
+                                "encoding": "base64",
+                                "content_base64": "",
+                            }
+                        ]
+                    }
+                )
+            },
+            copy_file=lambda source, target: None,
+            copy_tree=lambda source, target: None,
+        )
+
+    apply_bootstrap(
+        home_dir=tmp_path / "home",
+        workspace_dir=workspace,
+        runtime_name="codex-cli",
+        worker={
+            "bootstrap_bundle_json": json.dumps(
+                {
+                    "files": [
+                        {
+                            "scope": "workspace",
+                            "path": "uploads/empty-allowed.bin",
+                            "encoding": "base64",
+                            "content_base64": "",
+                            "allow_empty": True,
+                        }
+                    ]
+                }
+            )
+        },
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+    )
+
+    assert (workspace / "uploads" / "empty-allowed.bin").read_bytes() == b""
+
+
+def test_bootstrap_rejects_file_entry_without_content_or_source(tmp_path):
+    workspace = tmp_path / "workspace"
+
+    with pytest.raises(ValueError, match="missing content or source_path"):
+        apply_bootstrap(
+            home_dir=tmp_path / "home",
+            workspace_dir=workspace,
+            runtime_name="codex-cli",
+            worker={
+                "bootstrap_bundle_json": json.dumps(
+                    {
+                        "files": [
+                            {
+                                "scope": "workspace",
+                                "path": "uploads/missing.txt",
+                            }
+                        ]
+                    }
+                )
+            },
+            copy_file=lambda source, target: None,
+            copy_tree=lambda source, target: None,
+        )
+
+    assert not (workspace / "uploads" / "missing.txt").exists()

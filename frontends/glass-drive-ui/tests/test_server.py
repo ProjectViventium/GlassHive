@@ -25,6 +25,11 @@ from glass_drive_ui.signed_links import (
 )
 
 
+def worker_cookie_name(worker_id: str) -> str:
+    digest = sha256(str(worker_id).encode("utf-8")).hexdigest()[:24]
+    return f"glasshive_gh_token_{digest}"
+
+
 @pytest.fixture(autouse=True)
 def clear_glasshive_ui_env(monkeypatch, tmp_path):
     for name in (
@@ -78,6 +83,7 @@ class FakeRuntimeClient:
         self.steer_requests = []
         self.lifecycle_requests = []
         self.worker_live_requests = []
+        self.worker_view_open_requests = []
 
     def health(self):
         return {"status": "ok"}
@@ -194,6 +200,10 @@ class FakeRuntimeClient:
         self.lifecycle_requests.append({"worker_id": worker_id, "action": action})
         return {"status": action}
 
+    def record_worker_view_open(self, worker_id: str):
+        self.worker_view_open_requests.append(worker_id)
+        return {}
+
 
 def signed_worker_token(secret: str, *, worker_id: str = "wrk_1", tenant_id: str = "tenant-alpha", owner_id: str = "user-a") -> str:
     payload = {
@@ -301,7 +311,7 @@ def test_ui_loads_enterprise_service_auth_from_runtime_env_file(tmp_path, monkey
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     assert os.environ["GLASSHIVE_LINK_REF_STATE_PATH"] == str(link_ref_state)
     assert fake.header_contexts[0]["X-WPR-Token"] == "service-secret"
     assert fake.header_contexts[0]["X-Viventium-User-Id"] == "qa-user"
@@ -563,7 +573,7 @@ def test_preference_endpoint_proxies_saved_defaults():
         json={"default_worker_profile": "codex-cli", "codex_reasoning_effort": "xhigh"},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     assert runtime.preference_requests == [
         {"default_worker_profile": "codex-cli", "codex_reasoning_effort": "xhigh"}
     ]
@@ -1283,7 +1293,8 @@ def test_signed_watch_sets_worker_scoped_cookie(monkeypatch):
 
     assert response.status_code == 200
     set_cookie = response.headers["set-cookie"]
-    assert "glasshive_gh_token_wrk_1=" in set_cookie
+    assert f"{worker_cookie_name('wrk_1')}=" in set_cookie
+    assert "glasshive_gh_token_wrk_1=" not in set_cookie
     assert "HttpOnly" in set_cookie
     assert "SameSite=lax" in set_cookie
     assert response.headers["referrer-policy"] == "same-origin"
@@ -1306,12 +1317,74 @@ def test_short_worker_view_ref_redirects_and_sets_worker_cookie(monkeypatch):
     assert "gh_token=" not in response.headers["location"]
     assert f"/r/{ref_id}" not in target_url
     set_cookie = response.headers["set-cookie"]
-    assert "glasshive_gh_token_wrk_1=" in set_cookie
+    assert f"{worker_cookie_name('wrk_1')}=" in set_cookie
+    assert "glasshive_gh_token_wrk_1=" not in set_cookie
     assert "HttpOnly" in set_cookie
     assert "SameSite=lax" in set_cookie
 
 
-def test_enterprise_short_worker_view_ref_requires_authenticated_owner_and_refreshes_expired_token(monkeypatch):
+def test_short_worker_view_ref_rejects_unconfigured_absolute_redirect_target(monkeypatch):
+    secret = "ui-signed-link-secret"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    token = signed_worker_token(secret)
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"https://unexpected.example.test/watch/wrk_1?gh_token={token}",
+    )
+
+    response = client.get(f"/r/{ref_id}", follow_redirects=False)
+
+    assert response.status_code == 403
+    assert "target is not allowed" in response.text
+
+
+@pytest.mark.parametrize(
+    "target_url",
+    [
+        "//unexpected.example.test/watch/wrk_1",
+        "////unexpected.example.test/watch/wrk_1",
+        r"/\unexpected.example.test/watch/wrk_1",
+    ],
+)
+def test_short_worker_view_ref_rejects_relative_redirect_bypass_targets(monkeypatch, target_url):
+    secret = "ui-signed-link-secret"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    token = signed_worker_token(secret)
+    ref_id = create_signed_link_ref(token=token, target_url=target_url)
+
+    response = client.get(f"/r/{ref_id}", follow_redirects=False)
+
+    assert response.status_code == 400
+    assert "target path is not allowed" in response.text
+
+
+def test_short_worker_view_ref_allows_explicit_redirect_host_allowlist(monkeypatch):
+    secret = "ui-signed-link-secret"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_REDIRECT_HOSTS", "allowed.example.test, https://other.example.test")
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    token = signed_worker_token(secret)
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"https://allowed.example.test/watch/wrk_1?surface=desktop&gh_token={token}",
+    )
+
+    response = client.get(f"/r/{ref_id}", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "https://allowed.example.test/watch/wrk_1?surface=desktop"
+    assert "gh_token=" not in response.headers["location"]
+
+
+def test_enterprise_short_worker_view_ref_bootstraps_direct_link_and_rechecks_asserted_owner(monkeypatch):
     secret = "ui-signed-link-secret"
     set_enterprise_ui_env(monkeypatch, signed_secret=secret)
     monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
@@ -1335,7 +1408,11 @@ def test_enterprise_short_worker_view_ref_requires_authenticated_owner_and_refre
     assert ref_id
 
     now["value"] = 2_000
-    assert client.get(f"/r/{ref_id}", follow_redirects=False).status_code == 401
+    direct_response = client.get(f"/r/{ref_id}", follow_redirects=False)
+    assert direct_response.status_code == 307
+    assert direct_response.headers["location"] == "http://testserver/watch/wrk_1?surface=desktop"
+    assert "gh_token=" not in direct_response.headers["location"]
+    assert runtime.worker_view_open_requests == ["wrk_1"]
     wrong_user = {
         "X-GlassHive-Tenant-Id": "tenant-alpha",
         "X-GlassHive-User-Id": "user-b",
@@ -1354,12 +1431,15 @@ def test_enterprise_short_worker_view_ref_requires_authenticated_owner_and_refre
     assert response.status_code == 307
     assert response.headers["location"] == "http://testserver/watch/wrk_1?surface=desktop"
     set_cookie = response.headers["set-cookie"]
-    cookie_value = set_cookie.split("glasshive_gh_token_wrk_1=", 1)[1].split(";", 1)[0]
+    cookie_value = set_cookie.split(f"{worker_cookie_name('wrk_1')}=", 1)[1].split(";", 1)[0]
     assert cookie_value != token
     refreshed_payload = server_module.verify_signed_link_token(cookie_value)
     assert refreshed_payload is not None
     assert refreshed_payload["worker_id"] == "wrk_1"
     assert refreshed_payload["owner_id"] == "user-a"
+    assert runtime.worker_view_open_requests == ["wrk_1", "wrk_1"]
+    assert runtime.header_contexts[-1]["X-Viventium-Tenant-Id"] == "tenant-alpha"
+    assert runtime.header_contexts[-1]["X-Viventium-User-Id"] == "user-a"
 
 
 def test_ui_resolves_runtime_created_short_ref_when_state_path_is_shared(monkeypatch):
@@ -1427,12 +1507,15 @@ def test_ui_sensitive_url_log_filter_redacts_signed_tokens():
         'GET /v1/signed-links/opaque-token?download=1'
     )
 
-    cookie = "Set-Cookie: glasshive_gh_token_wrk_1=worker-secret; HttpOnly; SameSite=lax"
+    cookie = f"Set-Cookie: {worker_cookie_name('wrk_1')}=worker-secret; HttpOnly; SameSite=lax"
 
     assert redact_sensitive_url_text(f"{raw} {cookie}") == (
         'GET /novnc/wrk_1/websockify?gh_token=[redacted]&gh_sig=[redacted]&gh_exp=[redacted] '
         'GET /v1/signed-links/[redacted]?download=1 '
-        'Set-Cookie: glasshive_gh_token_wrk_1=[redacted]; HttpOnly; SameSite=lax'
+        f"Set-Cookie: {worker_cookie_name('wrk_1')}=[redacted]; HttpOnly; SameSite=lax"
+    )
+    assert redact_sensitive_url_text("gh_sig=signature&gh_token=secret-token") == (
+        "gh_sig=[redacted]&gh_token=[redacted]"
     )
     record = logging.LogRecord(
         name="uvicorn.access",
@@ -1448,7 +1531,7 @@ def test_ui_sensitive_url_log_filter_redacts_signed_tokens():
     assert "opaque-token" not in record.args[0]
     assert "worker-secret" not in record.args[0]
     assert "gh_token=[redacted]" in record.args[0]
-    assert "glasshive_gh_token_wrk_1=[redacted]" in record.args[0]
+    assert f"{worker_cookie_name('wrk_1')}=[redacted]" in record.args[0]
 
 
 def test_ui_sensitive_url_log_filter_installs_for_child_loggers(caplog):
@@ -1507,7 +1590,7 @@ def test_novnc_submodule_imports_can_inherit_signed_token_from_cookie(monkeypatc
 
     monkeypatch.setattr(server_module.httpx, 'Client', FakeHttpxClient)
     token = signed_worker_token(secret)
-    client.cookies.set("glasshive_gh_token_wrk_1", token)
+    client.cookies.set(worker_cookie_name("wrk_1"), token)
     response = client.get('/novnc/wrk_1/core/input/util.js')
 
     assert response.status_code == 200
@@ -1695,7 +1778,7 @@ def test_enterprise_signed_artifact_link_proxies_without_user_assertion(monkeypa
 
     response = client.get(f"/v1/signed-links/{token}")
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     assert response.content == b"artifact bytes"
     assert response.headers["content-disposition"] == 'attachment; filename="report.txt"'
     assert captured["url"] == f"http://runtime.test/v1/signed-links/{token}"
@@ -1751,6 +1834,69 @@ def test_enterprise_signed_artifact_open_link_proxies_without_user_assertion(mon
     assert captured["headers"]["X-Viventium-User-Role"] == "member"
 
 
+def test_enterprise_artifact_link_ref_uses_worker_cookie_identity(monkeypatch):
+    service_secret = "ui-service-secret"
+    signed_secret = "ui-signed-link-secret"
+    set_enterprise_ui_env(monkeypatch, service_secret=service_secret, signed_secret=signed_secret)
+    monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
+    captured = {}
+
+    class FakeUpstreamResponse:
+        status_code = 200
+        content = b"artifact bytes"
+        headers = {"content-type": "text/plain"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            captured.update({"method": method, "url": url, "headers": headers or {}, "content": content})
+            return FakeUpstreamResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    app = create_app(runtime_client=FakeRuntimeClient())
+    artifact_token = signed_artifact_token(signed_secret, kind="artifact_open")
+    artifact_ref_id = create_signed_link_ref(
+        token=artifact_token,
+        target_url=f"http://testserver/v1/signed-links/{artifact_token}",
+    )
+
+    unauthenticated_client = TestClient(app)
+    assert unauthenticated_client.get(f"/v1/link-refs/{artifact_ref_id}").status_code == 401
+    assert captured == {}
+
+    authenticated_client = TestClient(app)
+    worker_token = signed_worker_token(signed_secret)
+    worker_ref_id = create_signed_link_ref(
+        token=worker_token,
+        target_url=f"http://testserver/watch/wrk_1?surface=desktop&gh_token={worker_token}",
+    )
+    short_response = authenticated_client.get(f"/r/{worker_ref_id}", follow_redirects=False)
+    assert short_response.status_code == 307
+    set_cookie = short_response.headers["set-cookie"]
+    assert f"{worker_cookie_name('wrk_1')}=" in set_cookie
+    assert "glasshive_gh_token_wrk_1=" not in set_cookie
+    cookie_value = set_cookie.split(f"{worker_cookie_name('wrk_1')}=", 1)[1].split(";", 1)[0]
+    authenticated_client.cookies.set(worker_cookie_name("wrk_1"), cookie_value)
+
+    response = authenticated_client.get(f"/v1/link-refs/{artifact_ref_id}")
+
+    assert response.status_code == 200, response.text
+    assert response.content == b"artifact bytes"
+    assert captured["url"] == f"http://runtime.test/v1/link-refs/{artifact_ref_id}"
+    assert captured["headers"]["X-WPR-Token"] == service_secret
+    assert captured["headers"]["X-Viventium-Tenant-Id"] == "tenant-alpha"
+    assert captured["headers"]["X-Viventium-User-Id"] == "user-a"
+    assert captured["headers"]["X-Viventium-User-Role"] == "member"
+
+
 def test_signed_runtime_proxy_sets_worker_scoped_cookie(monkeypatch):
     service_secret = "ui-service-secret"
     signed_secret = "ui-signed-link-secret"
@@ -1781,7 +1927,88 @@ def test_signed_runtime_proxy_sets_worker_scoped_cookie(monkeypatch):
     response = client.get(f"/ui/projects/prj_1?worker_id=wrk_1&gh_token={token}")
 
     assert response.status_code == 200
-    assert "glasshive_gh_token_wrk_1=" in response.headers["set-cookie"]
+    assert f"{worker_cookie_name('wrk_1')}=" in response.headers["set-cookie"]
+    assert "glasshive_gh_token_wrk_1=" not in response.headers["set-cookie"]
+
+
+def test_signed_runtime_proxy_refreshes_worker_cookie_expiry(monkeypatch):
+    service_secret = "ui-service-secret"
+    signed_secret = "ui-signed-link-secret"
+    set_enterprise_ui_env(monkeypatch, service_secret=service_secret, signed_secret=signed_secret)
+    now = {"value": 1_000}
+    monkeypatch.setattr(server_module.time, "time", lambda: now["value"])
+    monkeypatch.setattr(server_module.sign_link_token.__globals__["time"], "time", lambda: now["value"])
+    old_token = server_module.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        ttl_seconds=60,
+    )
+
+    class FakeUpstreamResponse:
+        status_code = 200
+        content = b"<html>project</html>"
+        headers = {"content-type": "text/html"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            return FakeUpstreamResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    now["value"] = 1_040
+    client.cookies.set(worker_cookie_name("wrk_1"), old_token)
+
+    response = client.get("/ui/projects/prj_1?worker_id=wrk_1")
+
+    assert response.status_code == 200
+    set_cookie = response.headers["set-cookie"]
+    refreshed = set_cookie.split(f"{worker_cookie_name('wrk_1')}=", 1)[1].split(";", 1)[0]
+    assert refreshed != old_token
+    refreshed_payload = server_module.verify_signed_link_token(refreshed)
+    assert refreshed_payload is not None
+    assert refreshed_payload["exp"] > 1_060
+
+
+def test_worker_live_poll_refreshes_worker_cookie_expiry(monkeypatch):
+    service_secret = "ui-service-secret"
+    signed_secret = "ui-signed-link-secret"
+    set_enterprise_ui_env(monkeypatch, service_secret=service_secret, signed_secret=signed_secret)
+    now = {"value": 1_000}
+    monkeypatch.setattr(server_module.time, "time", lambda: now["value"])
+    monkeypatch.setattr(server_module.sign_link_token.__globals__["time"], "time", lambda: now["value"])
+    old_token = server_module.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        ttl_seconds=60,
+    )
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    now["value"] = 1_040
+    client.cookies.set(worker_cookie_name("wrk_1"), old_token)
+
+    response = client.get("/api/worker/wrk_1/live")
+
+    assert response.status_code == 200
+    set_cookie = response.headers["set-cookie"]
+    refreshed = set_cookie.split(f"{worker_cookie_name('wrk_1')}=", 1)[1].split(";", 1)[0]
+    assert refreshed != old_token
+    refreshed_payload = server_module.verify_signed_link_token(refreshed)
+    assert refreshed_payload is not None
+    assert refreshed_payload["exp"] > 1_060
+    assert runtime.header_contexts[-1]["X-Viventium-User-Id"] == "user-a"
 
 
 def test_enterprise_signed_artifact_link_cannot_open_workspace_shell(monkeypatch):

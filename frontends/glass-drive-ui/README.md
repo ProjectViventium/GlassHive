@@ -39,7 +39,7 @@ Env:
 - `GLASSHIVE_RUNTIME_BASE_URL` default: `http://127.0.0.1:8766`
 - `GLASSHIVE_DEFAULT_OWNER_ID` default: `demo-owner`
 - `WPR_API_TOKEN` optional: service token used by enterprise UI calls to the runtime
-- `GLASSHIVE_SIGNED_LINK_SECRET` optional: HMAC secret for bounded `/watch/{worker}?gh_token=...`
+- `GLASSHIVE_SIGNED_LINK_SECRET` optional: HMAC secret for bounded signed watch
   links; defaults to `WPR_API_TOKEN` when omitted
 - `GLASSHIVE_LINK_REF_TTL_SECONDS` default: `0`, meaning `/r/{ref}` short links do not expire;
   use a positive number of seconds only when user-facing short refs should expire

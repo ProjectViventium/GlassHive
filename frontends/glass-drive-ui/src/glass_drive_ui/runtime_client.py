@@ -26,6 +26,8 @@ class RuntimeClient:
                 headers=self.headers or None,
             )
             response.raise_for_status()
+            if response.status_code == 204 or not response.content:
+                return {}
             return response.json()
 
     def with_headers(self, headers: dict[str, str]) -> "RuntimeClient":
@@ -56,6 +58,9 @@ class RuntimeClient:
 
     def worker_live(self, worker_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/workers/{worker_id}/live")
+
+    def record_worker_view_open(self, worker_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/v1/workers/{worker_id}/view-opened")
 
     def create_project(self, owner_id: str, title: str, goal: str, default_worker_profile: str) -> dict[str, Any]:
         return self._request(

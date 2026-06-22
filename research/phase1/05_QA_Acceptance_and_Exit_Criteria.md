@@ -27,15 +27,15 @@ Current external blocker:
 
 Live proof worker:
 
-- project: `prj_628f867ee7`
-- worker: `wrk_36c6a9936c`
-- run: `run_c475ac8409`
+- project: `<project-id>`
+- worker: `<worker-id>`
+- run: `<run-id>`
 
 Saved artifacts:
 
-- `<private-research-root>/workers_projects_runtime/runtime_phase1/data/docker_sandboxes/workers/wrk_36c6a9936c/state/workspace/demo_form_run.py`
-- `<private-research-root>/workers_projects_runtime/runtime_phase1/data/docker_sandboxes/workers/wrk_36c6a9936c/state/workspace/demo_form_result.txt`
-- `<private-research-root>/workers_projects_runtime/runtime_phase1/data/docker_sandboxes/workers/wrk_36c6a9936c/state/workspace/demo_form_result.png`
+- `<private-research-root>/workers_projects_runtime/runtime_phase1/data/docker_sandboxes/workers/<worker-id>/state/workspace/demo_form_run.py`
+- `<private-research-root>/workers_projects_runtime/runtime_phase1/data/docker_sandboxes/workers/<worker-id>/state/workspace/demo_form_result.txt`
+- `<private-research-root>/workers_projects_runtime/runtime_phase1/data/docker_sandboxes/workers/<worker-id>/state/workspace/demo_form_result.png`
 
 Observable proof points:
 
@@ -47,8 +47,8 @@ Observable proof points:
 
 Additional workstation proof from the generalized sandbox path:
 
-- project: `prj_9456a21400`
-- worker: `wrk_da2c2a526e`
+- project: `<project-id>`
+- worker: `<worker-id>`
 - workstation image: `workers-projects-runtime-workstation:phase1`
 - delivered UI proof:
   - project page now exposes `Workstation Tools`

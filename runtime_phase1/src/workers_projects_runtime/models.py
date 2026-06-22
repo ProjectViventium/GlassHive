@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from .runtime_identity import derive_legacy_backend_label
+
 ProjectStatus = Literal["active", "paused", "completed", "archived", "failed"]
 WorkerState = Literal[
     "created",
@@ -101,6 +103,7 @@ class WorkerResponse(BaseModel):
     favorite: bool = False
     compute_released_at: str | None = None
     last_run_id: str | None = None
+    current_run_id: str | None = None
     last_error: str | None = None
     created_at: str
     updated_at: str
@@ -110,17 +113,17 @@ class WorkerResponse(BaseModel):
     def derive_legacy_backend_from_profile(cls, data):
         if not isinstance(data, dict):
             return data
-        profile = str(data.get("profile") or "").strip()
-        runtime = str(data.get("runtime") or "").strip()
-        if profile in {"codex-cli", "claude-code"}:
+        backend = derive_legacy_backend_label(
+            profile=data.get("profile"),
+            runtime=data.get("runtime"),
+            backend=data.get("backend"),
+        )
+        if backend:
             data = dict(data)
-            data["backend"] = profile
-        elif profile.startswith("openclaw"):
+            data["backend"] = backend
+        if not data.get("current_run_id") and data.get("state") in {"running", "paused"}:
             data = dict(data)
-            data["backend"] = "openclaw"
-        elif runtime:
-            data = dict(data)
-            data["backend"] = runtime
+            data["current_run_id"] = data.get("last_run_id") or None
         return data
 
 

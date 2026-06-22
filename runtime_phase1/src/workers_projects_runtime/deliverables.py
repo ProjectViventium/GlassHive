@@ -47,6 +47,7 @@ NON_DELIVERABLE_DIR_NAMES = {
     "__pycache__",
     "chrome-user-data",
     "chromium-user-data",
+    "glasshive-run",
     "glasshive-host-tools",
     "node_modules",
 }
@@ -59,6 +60,7 @@ USER_DELIVERABLE_DIR_PRIORITY = {
     "reports": 1,
     "output": 2,
 }
+SUPPORT_ARTIFACT_DIR_NAMES = {"research", "planning", "specs", "notes"}
 PROFESSIONAL_ARTIFACT_EXTENSIONS = {
     ".doc",
     ".docx",
@@ -116,6 +118,11 @@ def candidate_html_paths(worker: dict, max_entries: int = 20) -> list[Path]:
             rel = path.relative_to(root)
         except ValueError:
             continue
+        try:
+            if path.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
         if not is_user_deliverable_relative_path(rel):
             continue
         candidates.append(path)
@@ -139,11 +146,14 @@ def candidate_artifact_paths(worker: dict, max_entries: int = 50) -> list[Path]:
             rel = path.relative_to(root)
         except ValueError:
             continue
+        try:
+            if path.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
         if not is_user_deliverable_relative_path(rel):
             continue
         candidates.append(path)
-        if len(candidates) >= max_entries:
-            break
 
     def priority(path: Path) -> tuple[int, float, str]:
         try:
@@ -156,7 +166,7 @@ def candidate_artifact_paths(worker: dict, max_entries: int = 50) -> list[Path]:
             directory_priority = 3 if len(rel.parts) == 1 else 4
         return (directory_priority, -path.stat().st_mtime, rel.as_posix())
 
-    return sorted(candidates, key=priority)
+    return sorted(candidates, key=priority)[:max_entries]
 
 
 def is_valid_professional_artifact(path: Path) -> bool:

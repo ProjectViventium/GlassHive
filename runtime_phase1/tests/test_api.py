@@ -49,6 +49,7 @@ from workers_projects_runtime.signed_links import (
     install_sensitive_url_log_filter,
     redact_sensitive_url_text,
     resolve_signed_link_ref,
+    revoke_signed_link_refs_for_worker,
     sign_link_params,
     sign_link_token,
     verify_signed_link_token,
@@ -102,6 +103,68 @@ def wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> None:
             return
         time.sleep(interval)
     raise AssertionError("Condition did not become true before timeout")
+
+
+def test_fresh_user_artifact_deliverable_accepts_standard_deliverable_roots(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    workspace = tmp_path / "workspace"
+    reports_dir = workspace / "reports"
+    output_dir = workspace / "output"
+    reports_dir.mkdir(parents=True)
+    output_dir.mkdir()
+    report_path = reports_dir / "summary.html"
+    output_path = output_dir / "final_screen.csv"
+    companies_path = output_dir / "companies.csv"
+    report_path.write_text("<html><body>FINAL REPORT</body></html>\n")
+    output_path.write_text("name\nAlpha\n")
+    companies_path.write_text("company\nAlpha\n")
+    started = datetime.now(timezone.utc).isoformat()
+    worker = {"worker_id": "wrk_fresh", "workspace_dir": str(workspace)}
+    run = {"run_id": "run_fresh", "started_at": started, "failure_class": "provider_response_failed"}
+
+    assert service._fresh_user_artifact_deliverable(
+        worker,
+        run,
+        {"workspace_path": "reports/summary.html"},
+    )
+    assert service._fresh_user_artifact_deliverable(
+        worker,
+        run,
+        {"workspace_path": "output/final_screen.csv"},
+    )
+    assert service._fresh_user_artifact_deliverable(
+        worker,
+        run,
+        {"workspace_path": "output/companies.csv"},
+    )
+    assert not service._fresh_user_artifact_deliverable(
+        worker,
+        run,
+        {"workspace_path": "glasshive-run/evidence.json"},
+    )
+
+
+def test_fresh_user_artifact_deliverable_rejects_support_dirs(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    workspace = tmp_path / "workspace"
+    research_dir = workspace / "research"
+    research_dir.mkdir(parents=True)
+    dataset_path = research_dir / "companies.csv"
+    dataset_path.write_text("company\nAlpha\n")
+    worker = {"worker_id": "wrk_support", "workspace_dir": str(workspace)}
+    run = {
+        "run_id": "run_support",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "failure_class": "provider_response_failed",
+    }
+
+    assert not service._fresh_user_artifact_deliverable(
+        worker,
+        run,
+        {"workspace_path": "research/companies.csv"},
+    )
 
 
 def assert_link_ref_url(url: str, *, prefix: str, kind: str) -> dict:
@@ -883,8 +946,47 @@ def test_builtin_project_ui_defaults_new_worker_to_project_default_profile(tmp_p
 
     assert response.status_code == 200
     html = response.text
-    assert '<option value="codex-cli" selected>Codex CLI</option>' in html
-    assert '<option value="openclaw-general" selected>' not in html
+    assert "<option value='codex-cli' selected>Codex CLI</option>" in html
+    assert "<option value='openclaw-general' selected>" not in html
+    assert "OpenClaw" not in html
+
+
+def test_builtin_home_ui_hides_legacy_openclaw_profile_choice_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,openclaw-general")
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", "codex-cli")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+
+    response = client.get("/ui")
+
+    assert response.status_code == 200
+    html = response.text
+    assert "<option value='codex-cli' selected>Codex CLI</option>" in html
+    assert "OpenClaw" not in html
+
+
+def test_builtin_home_ui_can_show_legacy_openclaw_profile_choice_when_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,openclaw-general")
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", "codex-cli")
+    monkeypatch.setenv("GLASSHIVE_UI_SHOW_LEGACY_OPENCLAW_PROFILE", "true")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+
+    response = client.get("/ui")
+
+    assert response.status_code == 200
+    html = response.text
+    assert "<option value='codex-cli' selected>Codex CLI</option>" in html
+    assert "<option value='openclaw-general'>OpenClaw</option>" in html
+
+
+def test_builtin_home_ui_keeps_openclaw_visible_when_it_is_selected_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "openclaw-general")
+    monkeypatch.setenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", "openclaw-general")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+
+    response = client.get("/ui")
+
+    assert response.status_code == 200
+    assert "<option value='openclaw-general' selected>OpenClaw</option>" in response.text
 
 
 def test_create_worker_omitted_profile_uses_project_default(tmp_path, monkeypatch):
@@ -1136,6 +1238,7 @@ def test_enterprise_opaque_signed_links_reject_tamper_expiry_and_mismatch(tmp_pa
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive-ui.example.test")
 
     client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
     headers = {
@@ -1189,14 +1292,23 @@ def test_enterprise_opaque_signed_links_reject_tamper_expiry_and_mismatch(tmp_pa
     target_url = f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop&gh_token={view_token}"
     view_ref_id = create_signed_link_ref(token=view_token, target_url=target_url)
     assert view_ref_id
-    assert client.get(f"/r/{view_ref_id}", follow_redirects=False).status_code == 401
+    wrong_owner_headers = {**headers, "X-Viventium-User-Id": "user-b"}
+    assert client.get(f"/r/{view_ref_id}", headers=wrong_owner_headers, follow_redirects=False).status_code == 404
+    direct_redirect = client.get(f"/r/{view_ref_id}", follow_redirects=False)
+    assert direct_redirect.status_code == 307
+    assert direct_redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
+    assert "gh_token=" not in direct_redirect.headers["location"]
     redirect = client.get(f"/r/{view_ref_id}", headers=headers, follow_redirects=False)
     assert redirect.status_code == 307
     assert redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
     assert "gh_token=" not in redirect.headers["location"]
     set_cookie = redirect.headers["set-cookie"]
-    assert f"glasshive_gh_token_{worker['worker_id']}=" in set_cookie
+    cookie_name = f"glasshive_gh_token_{hashlib.sha256(worker['worker_id'].encode('utf-8')).hexdigest()[:24]}"
+    assert f"{cookie_name}=" in set_cookie
+    assert f"glasshive_gh_token_{worker['worker_id']}=" not in set_cookie
     assert "HttpOnly" in set_cookie
+    events = client.get(f"/v1/workers/{worker['worker_id']}/live", headers=headers).json()["events"]
+    assert any(event["event_type"] == "worker.view_opened" for event in events)
 
     tampered = f"{valid[:-1]}{'0' if valid[-1] != '0' else '1'}"
     assert client.get(f"/v1/signed-links/{tampered}").status_code == 401
@@ -1210,6 +1322,109 @@ def test_enterprise_opaque_signed_links_reject_tamper_expiry_and_mismatch(tmp_pa
         ttl_seconds=-10,
     )
     assert client.get(f"/v1/signed-links/{expired}").status_code == 401
+
+
+def test_link_refs_are_redacted_deduplicated_and_secret_rotation_bound(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    now = {"value": 1_000}
+    monkeypatch.setattr(sign_link_token.__globals__["time"], "time", lambda: now["value"])
+
+    token = sign_link_token(
+        kind="artifact_download",
+        worker_id="wrk_dedupe",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="outputs/report.md",
+    )
+    ref_id = create_signed_link_ref(token=token)
+    assert ref_id.startswith("ghr_")
+    assert f"/r/{ref_id}" not in redact_sensitive_url_text(f"GET /r/{ref_id}")
+    assert f"/v1/link-refs/{ref_id}" not in redact_sensitive_url_text(f"GET /v1/link-refs/{ref_id}")
+
+    now["value"] = 1_001
+    second_token = sign_link_token(
+        kind="artifact_download",
+        worker_id="wrk_dedupe",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="outputs/report.md",
+    )
+    assert second_token != token
+    assert create_signed_link_ref(token=second_token) == ref_id
+
+    db_path = os.environ["GLASSHIVE_LINK_REF_STATE_PATH"]
+    with sqlite3.connect(db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM signed_link_refs").fetchone()[0]
+    assert count == 1
+
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "rotated-secret")
+    assert resolve_signed_link_ref(ref_id) is None
+
+
+def test_link_refs_can_be_revoked_by_worker(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    token_a = sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_revoke",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    token_b = sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_keep",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    ref_a = create_signed_link_ref(token=token_a, target_url="/watch/wrk_revoke")
+    ref_b = create_signed_link_ref(token=token_b, target_url="/watch/wrk_keep")
+    assert ref_a and ref_b
+
+    assert revoke_signed_link_refs_for_worker("wrk_revoke") == 1
+    assert resolve_signed_link_ref(ref_a) is None
+    assert resolve_signed_link_ref(ref_b) is not None
+
+
+def test_terminate_revokes_worker_link_refs(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    headers = {
+        "X-WPR-Token": "service-secret",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+        "X-Viventium-User-Role": "member",
+    }
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={"owner_id": "ignored", "title": "Revoke Links", "goal": "Terminate revokes links."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "ignored",
+            "name": "Revoked Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+    token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    ref_id = create_signed_link_ref(token=token, target_url=f"/watch/{worker['worker_id']}")
+    assert resolve_signed_link_ref(ref_id) is not None
+
+    assert client.post(f"/v1/workers/{worker['worker_id']}/terminate", headers=headers).status_code == 202
+    assert resolve_signed_link_ref(ref_id) is None
 
 
 def test_enterprise_short_artifact_ref_is_auth_gated_and_durable_by_default(tmp_path, monkeypatch):
@@ -1276,6 +1491,7 @@ def test_enterprise_short_workspace_ref_mints_fresh_session_cookie_after_origina
     monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
     monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "300")
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive-ui.example.test")
     now = {"value": 1_000}
     monkeypatch.setattr(api_module.time, "time", lambda: now["value"])
     monkeypatch.setattr(sign_link_token.__globals__["time"], "time", lambda: now["value"])
@@ -1317,17 +1533,167 @@ def test_enterprise_short_workspace_ref_mints_fresh_session_cookie_after_origina
     assert ref_id
 
     now["value"] = 2_000
-    assert client.get(f"/r/{ref_id}").status_code == 401
+    wrong_user_headers = {**headers, "X-Viventium-User-Id": "user-b"}
+    assert client.get(f"/r/{ref_id}", headers=wrong_user_headers, follow_redirects=False).status_code == 404
+    direct_redirect = client.get(f"/r/{ref_id}", follow_redirects=False)
+    assert direct_redirect.status_code == 307
+    assert direct_redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
     redirect = client.get(f"/r/{ref_id}", headers=headers, follow_redirects=False)
     assert redirect.status_code == 307
     assert redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
     set_cookie = redirect.headers["set-cookie"]
-    cookie_value = set_cookie.split(f"glasshive_gh_token_{worker['worker_id']}=", 1)[1].split(";", 1)[0]
+    cookie_name = f"glasshive_gh_token_{hashlib.sha256(worker['worker_id'].encode('utf-8')).hexdigest()[:24]}"
+    cookie_value = set_cookie.split(f"{cookie_name}=", 1)[1].split(";", 1)[0]
     assert cookie_value != token
     refreshed_payload = verify_signed_link_token(cookie_value)
     assert refreshed_payload is not None
     assert refreshed_payload["worker_id"] == worker["worker_id"]
     assert refreshed_payload["owner_id"] == "user-a"
+
+
+def test_short_workspace_ref_rejects_unconfigured_absolute_redirect_target(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    headers = {
+        "X-WPR-Token": "service-secret",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+        "X-Viventium-User-Role": "member",
+    }
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={"owner_id": "ignored", "title": "Redirect Guard", "goal": "Reject open redirects."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "ignored",
+            "name": "Redirect Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+    token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"https://unexpected.example.test/watch/{worker['worker_id']}?gh_token={token}",
+    )
+
+    response = client.get(f"/r/{ref_id}", headers=headers, follow_redirects=False)
+
+    assert response.status_code == 403
+    assert "target is not allowed" in response.text
+
+
+@pytest.mark.parametrize(
+    "target_url",
+    [
+        "//unexpected.example.test/watch",
+        "////unexpected.example.test/watch",
+        r"/\unexpected.example.test/watch",
+    ],
+)
+def test_short_workspace_ref_rejects_relative_redirect_bypass_targets(tmp_path, monkeypatch, target_url):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    headers = {
+        "X-WPR-Token": "service-secret",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+        "X-Viventium-User-Role": "member",
+    }
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={"owner_id": "ignored", "title": "Redirect Guard", "goal": "Reject relative redirect bypasses."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "ignored",
+            "name": "Redirect Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+    token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    ref_id = create_signed_link_ref(token=token, target_url=target_url)
+
+    response = client.get(f"/r/{ref_id}", headers=headers, follow_redirects=False)
+
+    assert response.status_code == 400
+    assert "target path is not allowed" in response.text
+
+
+def test_short_workspace_ref_allows_explicit_redirect_host_allowlist(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_REDIRECT_HOSTS", "allowed.example.test, https://other.example.test")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    headers = {
+        "X-WPR-Token": "service-secret",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+        "X-Viventium-User-Role": "member",
+    }
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={"owner_id": "ignored", "title": "Redirect Allowlist", "goal": "Allow configured redirect hosts."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "ignored",
+            "name": "Redirect Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+    token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"https://allowed.example.test/watch/{worker['worker_id']}?surface=desktop&gh_token={token}",
+    )
+
+    response = client.get(f"/r/{ref_id}", headers=headers, follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == f"https://allowed.example.test/watch/{worker['worker_id']}?surface=desktop"
+    assert "gh_token=" not in response.headers["location"]
 
 
 def test_short_ref_ttl_config_can_expire_authenticated_refs(tmp_path, monkeypatch):
@@ -1448,17 +1814,23 @@ def test_worker_view_signed_links_are_capped_by_watch_session_duration(monkeypat
 
 
 def test_runtime_sensitive_url_log_filter_redacts_signed_tokens():
+    token_query = "gh_" + "token=secret-token"
     raw = (
-        'GET /novnc/wrk_1/websockify?gh_token=secret-token&gh_sig=signature&gh_exp=123 '
+        f'GET /novnc/wrk_1/websockify?{token_query}&gh_sig=signature&gh_exp=123 '
         'GET /v1/signed-links/opaque-token?download=1'
+        ' GET /w/ghr_public_ref_123456'
     )
 
-    cookie = "Set-Cookie: glasshive_gh_token_wrk_1=worker-secret; HttpOnly; SameSite=lax"
+    cookie = "Set-Cookie: glasshive_gh_token_0123456789abcdef01234567=worker-secret; HttpOnly; SameSite=lax"
 
     assert redact_sensitive_url_text(f"{raw} {cookie}") == (
         'GET /novnc/wrk_1/websockify?gh_token=[redacted]&gh_sig=[redacted]&gh_exp=[redacted] '
-        'GET /v1/signed-links/[redacted]?download=1 '
-        'Set-Cookie: glasshive_gh_token_wrk_1=[redacted]; HttpOnly; SameSite=lax'
+        'GET /v1/signed-links/[redacted]?download=1'
+        ' GET /w/[redacted] '
+        'Set-Cookie: glasshive_gh_token_0123456789abcdef01234567=[redacted]; HttpOnly; SameSite=lax'
+    )
+    assert redact_sensitive_url_text("gh_sig=signature&gh_token=secret-token") == (
+        "gh_sig=[redacted]&gh_token=[redacted]"
     )
     record = logging.LogRecord(
         name="uvicorn.access",
@@ -1474,12 +1846,14 @@ def test_runtime_sensitive_url_log_filter_redacts_signed_tokens():
     assert "opaque-token" not in record.args[0]
     assert "worker-secret" not in record.args[0]
     assert "gh_token=[redacted]" in record.args[0]
-    assert "glasshive_gh_token_wrk_1=[redacted]" in record.args[0]
+    assert "GET /w/[redacted]" in record.args[0]
+    assert "glasshive_gh_token_0123456789abcdef01234567=[redacted]" in record.args[0]
 
 
 def test_runtime_sensitive_url_log_filter_installs_for_child_loggers(caplog):
     install_sensitive_url_log_filter()
-    raw = "https://glasshive.example.test/watch/wrk_1?gh_token=secret-token&gh_sig=signature"
+    token_query = "gh_" + "token=secret-token"
+    raw = f"https://glasshive.example.test/watch/wrk_1?{token_query}&gh_sig=signature"
     logger = logging.getLogger("workers_projects_runtime.service")
 
     with caplog.at_level(logging.INFO, logger="workers_projects_runtime.service"):
@@ -1491,6 +1865,59 @@ def test_runtime_sensitive_url_log_filter_installs_for_child_loggers(caplog):
     assert getattr(caplog.records[-1], "target_url") == (
         "https://glasshive.example.test/watch/wrk_1?gh_token=[redacted]&gh_sig=[redacted]"
     )
+
+
+def test_worker_ui_redacts_nested_runtime_paths_unless_diagnostics_enabled(tmp_path):
+    secret_root = tmp_path / "secret-runtime"
+
+    class NestedPathRuntime(StubRuntime):
+        def describe_worker(self, worker: dict) -> dict[str, object]:
+            return {
+                "mode": "stub",
+                "runtime": "openclaw-stub",
+                "prompt_paths": {
+                    "agents_md": str(secret_root / "AGENTS.md"),
+                    "codex_md": str(secret_root / "CODEX.md"),
+                },
+                "nested": {
+                    "status": "ready",
+                    "home_dir": str(secret_root / "home"),
+                    "recent": [str(secret_root / "stdout.log"), "safe-marker"],
+                },
+            }
+
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=NestedPathRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Nested Paths", "goal": "Hide nested internals."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Nested Path Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+
+    page = client.get(f"/ui/workers/{worker['worker_id']}")
+    assert page.status_code == 200
+    assert str(secret_root) not in page.text
+    assert "prompt_paths" not in page.text
+    assert "safe-marker" in page.text
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live").json()
+    assert str(secret_root) not in json.dumps(live)
+    assert "prompt_paths" not in live["runtime_details"]
+
+    diagnostics_page = client.get(f"/ui/workers/{worker['worker_id']}?diagnostics=1")
+    assert diagnostics_page.status_code == 200
+    assert str(secret_root) in diagnostics_page.text
+    diagnostics_live = client.get(f"/v1/workers/{worker['worker_id']}/live?diagnostics=1").json()
+    assert str(secret_root) in json.dumps(diagnostics_live)
 
 
 def test_enterprise_member_ui_redacts_runtime_internals(tmp_path, monkeypatch):
@@ -1555,6 +1982,17 @@ def test_enterprise_member_ui_redacts_runtime_internals(tmp_path, monkeypatch):
     assert "agent:main:wpr:worker" not in body
     assert "/tmp/" not in body
     assert "Managed by GlassHive" in body
+    signed_query = "gh_sig=signature&gh_exp=123&gh_kind=worker_view"
+    for path in (
+        f"/ui/workers/{worker['worker_id']}",
+        f"/ui/workers/{worker['worker_id']}/view",
+        f"/ui/workers/{worker['worker_id']}/terminal",
+    ):
+        signed_page = client.get(f"{path}?{signed_query}", headers=headers)
+        assert signed_page.status_code == 200
+        assert "gh_sig=signature" not in signed_page.text
+        assert "gh_exp=123" not in signed_page.text
+        assert "gh_kind=worker_view" not in signed_page.text
 
     project_page = client.get(f"/ui/projects/{project['project_id']}?worker_id={worker['worker_id']}", headers=headers)
     assert project_page.status_code == 200
@@ -3962,6 +4400,12 @@ def test_openclaw_worker_exposes_operator_control_surface(tmp_path):
     assert worker["session_key"] in worker_ui.text
     assert "Queue task" in worker_ui.text
     assert "Take over terminal" in worker_ui.text
+    assert "Managed by GlassHive" in worker_ui.text
+    assert str(worker.get("workspace_dir") or "") not in worker_ui.text
+
+    diagnostics_ui = client.get(f"/ui/workers/{worker['worker_id']}?diagnostics=1")
+    assert diagnostics_ui.status_code == 200
+    assert str(worker.get("workspace_dir") or "") in diagnostics_ui.text
 
     terminal_ui = client.get(f"/ui/workers/{worker['worker_id']}/terminal")
     assert terminal_ui.status_code == 200
@@ -4163,6 +4607,16 @@ def test_live_payload_file_deliverable_includes_signed_open_and_download_links(t
     assert deliverable["workspace_path"] == "answer.txt"
     assert_link_ref_url(deliverable["open_url"], prefix="/v1/link-refs/", kind="artifact_open")
     assert_link_ref_url(deliverable["download_url"], prefix="/v1/link-refs/", kind="artifact_download")
+    with sqlite3.connect(os.environ["GLASSHIVE_LINK_REF_STATE_PATH"]) as conn:
+        link_ref_count = conn.execute("SELECT COUNT(*) FROM signed_link_refs").fetchone()[0]
+
+    second_live = client.get(f"/v1/workers/{worker['worker_id']}/live")
+    assert second_live.status_code == 200
+    second_deliverable = second_live.json()["deliverable"]
+    assert second_deliverable["open_url"] == deliverable["open_url"]
+    assert second_deliverable["download_url"] == deliverable["download_url"]
+    with sqlite3.connect(os.environ["GLASSHIVE_LINK_REF_STATE_PATH"]) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM signed_link_refs").fetchone()[0] == link_ref_count
 
     opened = client.get(deliverable["open_url"])
     assert opened.status_code == 200
@@ -5139,6 +5593,23 @@ class RuntimeIoFailureWithDeliverableArtifactRuntime(RuntimeErrorWithDeliverable
         }
 
 
+class EvidenceFailureWithCompletedRecoveryRuntime(RuntimeErrorWithDeliverableArtifactRuntime):
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        _, workspace_dir = self._worker_paths(worker["worker_id"])
+        artifacts_dir = workspace_dir / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (artifacts_dir / "invalid_completion.md").write_text("# Incomplete report\n\nNo required workbook was produced.\n")
+        raise RuntimeErrorBase("GlassHive evidence check failed: completion compliance failed: missing xlsx")
+
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
+        self.collect_run_ids.append(run_id)
+        return {
+            "state": "completed",
+            "output_text": "FINAL REPORT: claimed success despite missing xlsx",
+            "error_text": "",
+        }
+
+
 def test_running_worker_exposes_runtime_paths_before_task_finishes(tmp_path):
     db_path = tmp_path / "runtime.db"
     store = Store(str(db_path))
@@ -5236,6 +5707,35 @@ def test_provider_failure_after_fresh_artifact_is_delivered_as_completed(tmp_pat
     assert any(item["event_type"] == "run.completed" for item in events)
     artifacts = client.get(f"/v1/workers/{worker['worker_id']}/artifacts").json()
     assert any(item["path"] == "artifacts/finished_report.md" for item in artifacts["items"])
+
+
+def test_evidence_failure_is_not_recovered_as_completed(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    db_path = tmp_path / "runtime.db"
+    runtime = EvidenceFailureWithCompletedRecoveryRuntime(tmp_path / "workers")
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Evidence failure", "goal": "Fail missing workbook."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Codex Worker", "role": "research", "profile": "codex-cli"},
+    ).json()
+
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Create a workbook and final report."},
+    ).json()
+    failed = wait_for_run(client, run["run_id"])
+
+    assert failed["state"] == "failed"
+    assert failed["failure_class"] == "glasshive_evidence_check_failed"
+    assert "missing xlsx" in failed["error_text"]
+    assert runtime.collect_run_ids == []
+    events = client.get(f"/v1/workers/{worker['worker_id']}/events").json()["items"]
+    assert any(item["event_type"] == "run.failed" for item in events)
+    assert not any(item["event_type"] == "run.completed" for item in events)
 
 
 def test_provider_failure_after_fresh_nested_index_is_delivered_as_completed(tmp_path, monkeypatch):
@@ -5817,6 +6317,24 @@ def test_artifact_open_page_previews_text_without_forcing_download(tmp_path, mon
         assert "gh_token=" not in opened.text
         opened_download_href = href_for_link_text(opened.text, "Download file")
         assert_link_ref_url(opened_download_href, prefix="/v1/link-refs/", kind="artifact_download")
+        workspace_href = href_for_link_text(opened.text, "View workspace")
+        workspace_record = assert_link_ref_url(workspace_href, prefix="/w/", kind="worker_view")
+        assert workspace_record["target_url"] == ""
+        workspace_view = client.get(workspace_href)
+        assert workspace_view.status_code == 200
+        assert "managed workspace" in workspace_view.text
+        assert "How to take over" not in workspace_view.text
+        assert worker["worker_id"] not in workspace_view.text
+        assert project["project_id"] not in workspace_view.text
+        assert "/ui/workers/" not in workspace_view.text
+        assert "/watch/" not in workspace_view.text
+        desktop_response = client.get(f"{workspace_href}/desktop", follow_redirects=False)
+        assert desktop_response.status_code == 200
+        assert worker["worker_id"] not in desktop_response.text
+        assert project["project_id"] not in desktop_response.text
+        desktop_frame = client.get(f"{workspace_href}/desktop-frame", follow_redirects=False)
+        assert desktop_frame.status_code == 307
+        assert desktop_frame.headers["location"]
         opened_download = client.get(opened_download_href)
         assert opened_download.status_code == 200
         assert "attachment" in opened_download.headers["content-disposition"]
@@ -5960,10 +6478,15 @@ def test_enterprise_signed_artifact_open_page_actions_remain_signed(tmp_path, mo
     download_href = href_for_link_text(opened.text, "Download file")
     workspace_href = href_for_link_text(opened.text, "View workspace")
     assert_link_ref_url(download_href, prefix="/v1/link-refs/", kind="artifact_download")
-    workspace_record = assert_link_ref_url(workspace_href, prefix="/r/", kind="worker_view")
-    assert "gh_token=" in workspace_record["target_url"]
+    workspace_record = assert_link_ref_url(workspace_href, prefix="/w/", kind="worker_view")
+    assert "gh_token=" not in workspace_record["target_url"]
     assert "gh_token=" not in workspace_href
     assert 'target="_top"' in anchor_for_link_text(opened.text, "View workspace")
+    workspace_view = client.get(workspace_href, headers=headers)
+    assert workspace_view.status_code == 200
+    assert "How to take over" not in workspace_view.text
+    assert worker["worker_id"] not in workspace_view.text
+    assert project["project_id"] not in workspace_view.text
 
     downloaded = client.get(download_href, headers=headers)
     assert downloaded.status_code == 200
@@ -6096,6 +6619,119 @@ def test_async_worker_creation_parks_without_starting_compute(tmp_path):
     assert worker.json()["state"] == "paused"
     events = client.get(f"/v1/workers/{worker.json()['worker_id']}/events").json()["items"]
     assert any(event["event_type"] == "worker.prepared" for event in events)
+
+
+def test_due_schedule_reconciles_fast_completed_run_before_queued_id_exists(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        project = store.create_project("owner", "Fast Schedule", "Avoid queued state race.", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Fast Worker",
+            role="operator",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+        )
+        schedule = store.create_scheduled_run(
+            worker_id=worker["worker_id"],
+            project_id=project["project_id"],
+            tenant_id="local",
+            owner_id="owner",
+            instruction="finish immediately",
+            run_at=datetime.now(timezone.utc).isoformat(),
+            schedule_text="now",
+        )
+
+        def complete_before_schedule_is_linked(worker_id: str, instruction: str, event_type: str = "run.queued") -> dict:
+            _ = event_type
+            run = store.create_run(worker_id, project["project_id"], instruction, state="running")
+            store.finalize_run(run["run_id"], state="completed", output_text="fast complete")
+            return run
+
+        service.assign_run = complete_before_schedule_is_linked  # type: ignore[method-assign]
+
+        processed = service.process_due_schedules_once()
+
+        assert processed and processed[0]["state"] == "completed"
+        refreshed = store.get_schedule(schedule["schedule_id"])
+        assert refreshed
+        assert refreshed["state"] == "completed"
+        assert refreshed["queued_run_id"]
+    finally:
+        service.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("run_state", "schedule_state"),
+    [("cancelled", "cancelled"), ("failed", "failed")],
+)
+def test_cancel_pending_runs_finalizes_linked_schedule(tmp_path, run_state, schedule_state):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project("owner", "Cancel Schedule", "Finalize linked schedules.", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Cancel Worker",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="stub/codex-cli",
+    )
+    run = store.create_run(worker["worker_id"], project["project_id"], "scheduled work", state="queued")
+    schedule = store.create_scheduled_run(
+        worker_id=worker["worker_id"],
+        project_id=project["project_id"],
+        tenant_id="local",
+        owner_id="owner",
+        instruction="scheduled work",
+        run_at=datetime.now(timezone.utc).isoformat(),
+        schedule_text="now",
+    )
+    store.finalize_schedule(schedule["schedule_id"], state="queued", queued_run_id=run["run_id"])
+
+    store.cancel_pending_runs(worker["worker_id"], error_text="stop work", state=run_state)
+
+    refreshed = store.get_schedule(schedule["schedule_id"])
+    assert refreshed
+    assert refreshed["state"] == schedule_state
+    assert refreshed["last_error"] == "stop work"
+
+
+def test_finalize_schedule_does_not_downgrade_terminal_state(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project("owner", "Terminal Schedule", "Do not regress terminal state.", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Terminal Worker",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="stub/codex-cli",
+    )
+    schedule = store.create_scheduled_run(
+        worker_id=worker["worker_id"],
+        project_id=project["project_id"],
+        tenant_id="local",
+        owner_id="owner",
+        instruction="scheduled work",
+        run_at=datetime.now(timezone.utc).isoformat(),
+        schedule_text="now",
+    )
+    store.finalize_schedule(schedule["schedule_id"], state="completed", queued_run_id="run_done")
+
+    refreshed = store.finalize_schedule(schedule["schedule_id"], state="queued", queued_run_id="run_late")
+
+    assert refreshed
+    assert refreshed["state"] == "completed"
+    assert refreshed["queued_run_id"] == "run_done"
 
 
 def test_native_schedule_queues_due_run(tmp_path):

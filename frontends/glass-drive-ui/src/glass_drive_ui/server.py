@@ -3,9 +3,11 @@ from __future__ import annotations
 import os
 import re
 import asyncio
+import logging
 import shlex
 import sqlite3
 import time
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, parse_qsl, urlencode, unquote, urlparse
@@ -14,7 +16,7 @@ import httpx
 import websockets
 from fastapi import Body, FastAPI, HTTPException, Request, WebSocket
 from starlette.websockets import WebSocketDisconnect
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -61,6 +63,7 @@ RUNTIME_ENV_KEYS = {
 _NOVNC_VIEW_URL_CACHE: dict[str, tuple[float, str]] = {}
 _NOVNC_ASSET_CACHE: dict[str, tuple[float, int, bytes, str]] = {}
 _NOVNC_HTTP_CLIENT: httpx.Client | None = None
+logger = logging.getLogger(__name__)
 
 
 def _watch_session_cap_seconds() -> int:
@@ -280,6 +283,39 @@ def _strip_signed_query_params(url: str) -> str:
         [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key not in SIGNED_QUERY_KEYS]
     )
     return parsed._replace(query=query).geturl()
+
+
+def _configured_redirect_hosts(request: Request) -> set[str]:
+    hosts = {str(request.url.netloc or "").lower(), str(request.base_url.netloc or "").lower()}
+    for name in ("GLASSHIVE_OPERATOR_BASE_URL", "GLASSHIVE_RUNTIME_BASE_URL"):
+        value = str(os.environ.get(name) or "").strip()
+        if value:
+            parsed = urlparse(value)
+            if parsed.netloc:
+                hosts.add(parsed.netloc.lower())
+    for name in ("GLASSHIVE_ALLOWED_REDIRECT_HOSTS", "WPR_ALLOWED_REDIRECT_HOSTS"):
+        raw = str(os.environ.get(name) or "").strip()
+        for item in raw.split(","):
+            value = item.strip()
+            if not value:
+                continue
+            parsed = urlparse(value)
+            hosts.add((parsed.netloc or value).strip().rstrip("/").lower())
+    return {host for host in hosts if host}
+
+
+def _validate_short_ref_redirect_target(target_url: str, request: Request) -> str:
+    target = str(target_url or "").strip()
+    if "\\" in target or target.startswith("//"):
+        raise HTTPException(status_code=400, detail="GlassHive workspace link target path is not allowed")
+    parsed = urlparse(target)
+    if not parsed.scheme and not parsed.netloc:
+        return target
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="GlassHive workspace link target scheme is not allowed")
+    if str(parsed.netloc or "").lower() not in _configured_redirect_hosts(request):
+        raise HTTPException(status_code=403, detail="GlassHive workspace link target is not allowed")
+    return target
 
 
 def _worker_view_token(worker_id: str, identity: dict[str, str] | None) -> str:
@@ -682,9 +718,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     def _worker_cookie_name(worker_id: str) -> str:
         if not SAFE_WORKER_ID_RE.match(str(worker_id or "")):
             raise HTTPException(status_code=400, detail="Invalid worker id")
-        return f"glasshive_gh_token_{worker_id}"
+        digest = sha256(str(worker_id).encode("utf-8")).hexdigest()[:24]
+        return f"glasshive_gh_token_{digest}"
 
-    def _signed_token_from_request(request: Request) -> str:
+    def _signed_token_from_request(request: Request | WebSocket, worker_id: str | None = None) -> str:
         token = str(request.query_params.get("gh_token") or "").strip()
         if token:
             return token
@@ -693,9 +730,9 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             token = unquote(path.removeprefix("/v1/signed-links/")).strip()
             if token:
                 return token
-        worker_id = str(request.path_params.get("worker_id") or "").strip()
-        if worker_id:
-            token = str(request.cookies.get(_worker_cookie_name(worker_id)) or "").strip()
+        cookie_worker_id = str(worker_id or request.path_params.get("worker_id") or "").strip()
+        if cookie_worker_id:
+            token = str(request.cookies.get(_worker_cookie_name(cookie_worker_id)) or "").strip()
             if token:
                 return token
         referer = str(request.headers.get("referer") or "").strip()
@@ -709,13 +746,14 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         return request.url.scheme == "https" or forwarded_proto == "https" or _truthy_env("GLASSHIVE_COOKIE_SECURE")
 
     def _set_signed_worker_cookie(response: Response, request: Request, worker_id: str) -> None:
-        token = _signed_token_from_request(request)
+        token = _signed_token_from_request(request, worker_id)
         payload = verify_signed_link_token(token) if token else None
         if (
             payload
             and str(payload.get("kind") or "") == "worker_view"
             and str(payload.get("worker_id") or "").strip() == str(worker_id or "").strip()
         ):
+            token, payload = _fresh_worker_view_token_from_payload(worker_id, payload)
             try:
                 cookie_max_age = max(1, min(30 * 60, int(payload.get("exp") or 0) - int(time.time())))
             except (TypeError, ValueError):
@@ -735,6 +773,11 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         _set_signed_worker_cookie(response, request, worker_id)
         return response
 
+    def _json_response_with_signed_cookie(request: Request, worker_id: str, payload: dict[str, Any]) -> JSONResponse:
+        response = JSONResponse(payload)
+        _set_signed_worker_cookie(response, request, worker_id)
+        return response
+
     def _allowed_signed_link_kinds(request: Request | WebSocket) -> set[str]:
         path = str(request.url.path or "")
         if path.startswith("/v1/signed-links/"):
@@ -742,7 +785,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         return {"worker_view"}
 
     def _signed_link_payload(request: Request | WebSocket, worker_id: str | None = None) -> dict[str, object] | None:
-        token = _signed_token_from_request(request)
+        token = _signed_token_from_request(request, worker_id)
         if not token:
             return None
         payload = verify_signed_link_token(token)
@@ -846,12 +889,16 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         if _truthy_env("GLASSHIVE_TRUST_INBOUND_IDENTITY"):
             asserted_tenant = _incoming_identity_header(request, "X-Viventium-Tenant-Id")
             asserted_user = _incoming_identity_header(request, "X-Viventium-User-Id")
+            asserted_email = _incoming_identity_header(request, "X-Viventium-User-Email")
+            asserted_role = _incoming_identity_header(request, "X-Viventium-User-Role")
+            if not any((asserted_tenant, asserted_user, asserted_email, asserted_role)):
+                return None
             if asserted_tenant and tenant_id and asserted_tenant != tenant_id:
                 raise HTTPException(status_code=401, detail="GlassHive tenant assertion does not match this deployment")
             tenant_id = asserted_tenant or tenant_id
             user_id = asserted_user or (user_id if _allow_default_owner() else "")
         elif not _allow_default_owner():
-            user_id = ""
+            return None
         if not user_id:
             raise HTTPException(
                 status_code=401,
@@ -917,6 +964,20 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         headers = _runtime_headers_for_request(request, worker_id, role_override=role_override)
         if not headers or not hasattr(client, "with_headers"):
             return client
+        return client.with_headers(headers)
+
+    def _client_for_short_ref_payload(payload: dict[str, object]) -> RuntimeClient:
+        api_token = str(os.environ.get("WPR_API_TOKEN") or "").strip()
+        if not api_token or not hasattr(client, "with_headers"):
+            return client
+        headers = {"X-WPR-Token": api_token}
+        tenant_id = str(payload.get("tenant_id") or "").strip()
+        owner_id = str(payload.get("owner_id") or "").strip()
+        if tenant_id:
+            headers["X-Viventium-Tenant-Id"] = tenant_id
+        if owner_id:
+            headers["X-Viventium-User-Id"] = owner_id
+        headers["X-Viventium-User-Role"] = "viewer"
         return client.with_headers(headers)
 
     def _require_ui_auth(request: Request, worker_id: str | None = None) -> None:
@@ -1045,6 +1106,13 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         parts = [part for part in str(path or "").split("/") if part]
         if parts and parts[0] == "workers" and len(parts) >= 2:
             return parts[1]
+        if len(parts) >= 2 and parts[0] == "link-refs":
+            record = resolve_signed_link_ref(parts[1])
+            payload = record.get("payload") if record else None
+            if isinstance(payload, dict):
+                worker_id = str(payload.get("worker_id") or "").strip()
+                if worker_id:
+                    return worker_id
         query_worker_id = str(request.query_params.get("worker_id") or "").strip()
         return query_worker_id or None
 
@@ -1106,10 +1174,17 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         deployment_tenant_id = _enterprise_tenant_id()
         if _enterprise_mode_enabled() and deployment_tenant_id and token_tenant_id != deployment_tenant_id:
             raise HTTPException(status_code=401, detail="GlassHive workspace link is for a different tenant")
-        target_url = _strip_signed_query_params(str(record.get("target_url") or "").strip())
+        target_url = _validate_short_ref_redirect_target(
+            _strip_signed_query_params(str(record.get("target_url") or "").strip()),
+            request,
+        )
         if not target_url:
             raise HTTPException(status_code=400, detail="GlassHive workspace link has no target")
         _ensure_signed_worker_watch_session(worker_id, payload)
+        try:
+            _client_for_short_ref_payload(payload).record_worker_view_open(worker_id)
+        except Exception as exc:
+            logger.warning("Failed to audit GlassHive worker view open for %s: %s", worker_id, exc)
         response = RedirectResponse(target_url, status_code=307)
         session_token, session_payload = _fresh_worker_view_token_from_payload(worker_id, payload)
         try:
@@ -1262,13 +1337,13 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         }
 
     @app.get("/api/worker/{worker_id}/live")
-    def worker_live(request: Request, worker_id: str) -> dict[str, Any]:
+    def worker_live(request: Request, worker_id: str) -> JSONResponse:
         active_client = _client_for_request(request, worker_id, internal_details=True)
         payload = _worker_live_or_http(active_client, worker_id)
         worker = payload.get("worker") or {}
         project_id = str(worker.get("project_id") or "")
         payload["project_title"] = _project_title_for_worker(active_client, project_id) if project_id else ""
-        return _browser_live_payload(payload)
+        return _json_response_with_signed_cookie(request, worker_id, _browser_live_payload(payload))
 
     @app.get("/novnc/{worker_id}/{asset_path:path}")
     def novnc_asset(request: Request, worker_id: str, asset_path: str) -> Response:
