@@ -12,7 +12,7 @@ const queueShortcutLabel = isApplePlatform ? '⌘+Enter' : 'Ctrl+Enter';
 const LONG_PRESS_MS = 550;
 const ACTIVE_REFRESH_MS = 2000;
 const IDLE_REFRESH_MS = 10000;
-const GLASSHIVE_UI_REV = '20260616a';
+const GLASSHIVE_UI_REV = '20260623a';
 
 const frame = document.getElementById('desktop-frame');
 const overlay = document.getElementById('stage-overlay');
@@ -637,12 +637,10 @@ function setOverlay(state, detail) {
 
   if (state === 'paused') {
     if (overlayLabel) {
-      overlayLabel.textContent = 'Workspace resuming';
+      overlayLabel.textContent = 'Workspace paused';
     }
-    overlayTitle.textContent = 'Workspace resuming…';
-    overlayDetail.textContent = activeSurface === 'desktop'
-      ? 'The worker is already moving. The desktop will attach automatically when the workspace is ready.'
-      : 'The worker is already moving. The exact live session will attach automatically when the workspace is ready.';
+    overlayTitle.textContent = 'Workspace paused';
+    overlayDetail.textContent = 'Compute is stopped for this workspace. Use Resume to continue from the same state.';
     return;
   }
 

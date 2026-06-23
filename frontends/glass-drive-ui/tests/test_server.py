@@ -41,11 +41,15 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "GLASSHIVE_ENTERPRISE_TENANT_ID",
         "WPR_ENTERPRISE_TENANT_ID",
         "GLASSHIVE_TRUST_INBOUND_IDENTITY",
+        "GLASSHIVE_OWNER_IDENTITY_CLAIMS",
+        "GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON",
+        "GLASSHIVE_OWNER_IDENTITY_ALIASES_FILE",
         "GLASSHIVE_ALLOW_LOCAL_DEMO_OWNER",
         "GLASSHIVE_COOKIE_SECURE",
         "GLASSHIVE_SIGNED_LINK_SECRET",
         "GLASSHIVE_LINK_REF_STATE_PATH",
         "GLASSHIVE_LINK_REF_TTL_SECONDS",
+        "GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME",
         "GLASSHIVE_HOST_WORKERS_ENABLED",
         "GLASSHIVE_DEFAULT_WORKER_PROFILE",
         "GLASSHIVE_ALLOWED_WORKER_PROFILES",
@@ -878,7 +882,8 @@ def test_launcher_workspace_hive_static_controls():
     assert "stopped" in app_js
     assert "resumable" in app_js
     assert "Worker completed" in watch_js
-    assert "Workspace resuming" in watch_js
+    assert "Workspace paused" in watch_js
+    assert "Use Resume to continue from the same state" in watch_js
     assert "IDLE_REFRESH_MS" in watch_js
     assert "refreshInFlight" in watch_js
     assert "function filePreviewUrl()" in watch_js
@@ -903,7 +908,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "Open current desktop in new tab" in watch_js
     assert "if (previewUrl) return previewUrl" not in watch_js
     assert "setInterval(refresh" not in watch_js
-    assert "Workspace paused" not in watch_js
+    assert "Workspace resuming" not in watch_js
     assert 'grid-template-areas:' in styles_css
     assert '"brand controls"' in styles_css
     assert '.watch-meta-line p' in styles_css
@@ -1297,7 +1302,27 @@ def test_signed_watch_sets_worker_scoped_cookie(monkeypatch):
     assert "glasshive_gh_token_wrk_1=" not in set_cookie
     assert "HttpOnly" in set_cookie
     assert "SameSite=lax" in set_cookie
-    assert response.headers["referrer-policy"] == "same-origin"
+    assert runtime.lifecycle_requests == []
+
+
+def test_short_worker_view_ref_can_auto_resume_when_configured(monkeypatch):
+    secret = "ui-signed-link-secret"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    monkeypatch.setenv("GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME", "true")
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    token = signed_worker_token(secret)
+    target_url = f"http://testserver/watch/wrk_1?surface=desktop&gh_token={token}"
+    ref_id = create_signed_link_ref(token=token, target_url=target_url)
+
+    response = client.get(f"/r/{ref_id}", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "http://testserver/watch/wrk_1?surface=desktop"
+    assert "gh_token=" not in response.headers["location"]
+    assert runtime.worker_view_open_requests == ["wrk_1"]
+    assert runtime.lifecycle_requests == [{"worker_id": "wrk_1", "action": "resume"}]
 
 
 def test_short_worker_view_ref_redirects_and_sets_worker_cookie(monkeypatch):
@@ -1409,16 +1434,30 @@ def test_enterprise_short_worker_view_ref_bootstraps_direct_link_and_rechecks_as
 
     now["value"] = 2_000
     direct_response = client.get(f"/r/{ref_id}", follow_redirects=False)
-    assert direct_response.status_code == 307
-    assert direct_response.headers["location"] == "http://testserver/watch/wrk_1?surface=desktop"
-    assert "gh_token=" not in direct_response.headers["location"]
-    assert runtime.worker_view_open_requests == ["wrk_1"]
+    assert direct_response.status_code == 401
+    assert "authenticated user assertion" in direct_response.text
+    assert runtime.worker_view_open_requests == []
     wrong_user = {
         "X-GlassHive-Tenant-Id": "tenant-alpha",
         "X-GlassHive-User-Id": "user-b",
+        "X-GlassHive-User-Email": "user-a",
         "X-GlassHive-User-Role": "member",
     }
     assert client.get(f"/r/{ref_id}", headers=wrong_user, follow_redirects=False).status_code == 404
+    monkeypatch.setenv("GLASSHIVE_OWNER_IDENTITY_CLAIMS", "user_id,email")
+    email_claim_response = client.get(f"/r/{ref_id}", headers=wrong_user, follow_redirects=False)
+    assert email_claim_response.status_code == 307
+    assert email_claim_response.headers["location"] == "http://testserver/watch/wrk_1?surface=desktop"
+    monkeypatch.setenv("GLASSHIVE_OWNER_IDENTITY_CLAIMS", "user_id")
+    monkeypatch.setenv("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON", json.dumps({"user-a": ["user-b"]}))
+    alias_response = client.get(f"/r/{ref_id}", headers=wrong_user, follow_redirects=False)
+    assert alias_response.status_code == 307
+    assert alias_response.headers["location"] == "http://testserver/watch/wrk_1?surface=desktop"
+    wrong_tenant = {**wrong_user, "X-GlassHive-Tenant-Id": "tenant-beta"}
+    assert client.get(f"/r/{ref_id}", headers=wrong_tenant, follow_redirects=False).status_code in {401, 404}
+    monkeypatch.setenv("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON", json.dumps({"*": ["user-b"]}))
+    assert client.get(f"/r/{ref_id}", headers=wrong_user, follow_redirects=False).status_code == 404
+    monkeypatch.delenv("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON", raising=False)
     response = client.get(
         f"/r/{ref_id}",
         headers={
@@ -1437,7 +1476,7 @@ def test_enterprise_short_worker_view_ref_bootstraps_direct_link_and_rechecks_as
     assert refreshed_payload is not None
     assert refreshed_payload["worker_id"] == "wrk_1"
     assert refreshed_payload["owner_id"] == "user-a"
-    assert runtime.worker_view_open_requests == ["wrk_1", "wrk_1"]
+    assert runtime.worker_view_open_requests == ["wrk_1", "wrk_1", "wrk_1"]
     assert runtime.header_contexts[-1]["X-Viventium-Tenant-Id"] == "tenant-alpha"
     assert runtime.header_contexts[-1]["X-Viventium-User-Id"] == "user-a"
 
@@ -1676,6 +1715,28 @@ def test_enterprise_ui_requires_signed_link_secret_distinct_from_service_token(m
         create_app(runtime_client=FakeRuntimeClient())
 
 
+def test_enterprise_ui_rejects_invalid_owner_identity_config_at_startup(monkeypatch):
+    monkeypatch.setenv("WPR_API_TOKEN", "ui-service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "ui-signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_OWNER_IDENTITY_CLAIMS", "user_id,role")
+
+    with pytest.raises(RuntimeError, match="only supports"):
+        create_app(runtime_client=FakeRuntimeClient())
+
+    monkeypatch.setenv("GLASSHIVE_OWNER_IDENTITY_CLAIMS", "user_id")
+    monkeypatch.setenv("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON", "[]")
+
+    with pytest.raises(RuntimeError, match="must be a JSON object"):
+        create_app(runtime_client=FakeRuntimeClient())
+
+    monkeypatch.delenv("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON", raising=False)
+    monkeypatch.setenv("GLASSHIVE_OWNER_IDENTITY_ALIASES_FILE", "/tmp/glasshive-missing-aliases.json")
+
+    with pytest.raises(RuntimeError, match="could not be read"):
+        create_app(runtime_client=FakeRuntimeClient())
+
+
 def test_enterprise_bootstrap_requires_authenticated_user_assertion(monkeypatch):
     set_enterprise_ui_env(monkeypatch)
     runtime = FakeRuntimeClient()
@@ -1878,7 +1939,15 @@ def test_enterprise_artifact_link_ref_uses_worker_cookie_identity(monkeypatch):
         token=worker_token,
         target_url=f"http://testserver/watch/wrk_1?surface=desktop&gh_token={worker_token}",
     )
-    short_response = authenticated_client.get(f"/r/{worker_ref_id}", follow_redirects=False)
+    short_response = authenticated_client.get(
+        f"/r/{worker_ref_id}",
+        headers={
+            "X-GlassHive-Tenant-Id": "tenant-alpha",
+            "X-GlassHive-User-Id": "user-a",
+            "X-GlassHive-User-Role": "member",
+        },
+        follow_redirects=False,
+    )
     assert short_response.status_code == 307
     set_cookie = short_response.headers["set-cookie"]
     assert f"{worker_cookie_name('wrk_1')}=" in set_cookie

@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import stat
 import subprocess
 import time
+from pathlib import Path
 
-from workers_projects_runtime.docker_sandbox import DockerSandboxManager, SandboxInfo, _safe_docker_exec_env
+from workers_projects_runtime.docker_sandbox import (
+    DockerSandboxManager,
+    SandboxInfo,
+    _ai_worker_browser_extension_check_script,
+    _ai_worker_browser_native_host_bootstrap_script,
+    _safe_docker_exec_env,
+)
 from workers_projects_runtime.bootstrap import GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS, GLASSHIVE_SAFETY_CHECKPOINT_RULE
 
 
@@ -574,6 +582,7 @@ def test_browser_desktop_action_uses_clean_chromium_profile_and_no_no_sandbox(tm
     assert "--no-first-run" in launch_script
     assert "--no-default-browser-check" in launch_script
     assert "/usr/bin/chromium-base" in launch_script
+    assert "glasshive-browser-native-host-bootstrap" in launch_script
     assert "--start-maximized" in launch_script
     assert "--new-tab" in launch_script
     assert "bookmark_bar" in launch_script
@@ -602,6 +611,7 @@ def test_prime_idle_desktop_uses_clean_chromium_profile_and_no_no_sandbox(tmp_pa
     assert "--disable-dev-shm-usage" in script
     assert "--new-window" in script
     assert "nohup /usr/bin/chromium-base" in script
+    assert "glasshive-browser-native-host-bootstrap" in script
     assert "bookmark_bar" in script
     assert "show_on_all_tabs" in script
     assert "wmctrl -xa chromium.Chromium" in script
@@ -809,7 +819,7 @@ def test_ensure_image_includes_document_delivery_toolchain(tmp_path):
     assert "/usr/bin/locale-check" in dockerfile
 
 
-def test_ensure_image_installs_ai_worker_browser_extension_policy(tmp_path):
+def test_ensure_image_defaults_to_no_forced_ai_worker_browser_extensions(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
 
     def fake_docker(args: list[str], *, check: bool = True, capture_output: bool = False, timeout_sec=None):
@@ -822,17 +832,207 @@ def test_ensure_image_installs_ai_worker_browser_extension_policy(tmp_path):
     manager._ensure_image()
 
     dockerfile = (manager.build_root / "Dockerfile").read_text()
-    assert manager.image.endswith(":phase1-node22-docs4")
-    assert "@openai/codex@0.140.0" in dockerfile
-    assert "@anthropic-ai/claude-code@2.1.178" in dockerfile
+    assert manager.image.endswith(":phase1-node22-docs6")
+    assert "@openai/codex@0.142.0" in dockerfile
+    assert "@anthropic-ai/claude-code@2.1.186" in dockerfile
     assert "--cache /tmp/glasshive-npm-cache" in dockerfile
     assert "rm -rf /tmp/glasshive-npm-cache /root/.npm /home/seluser/.npm" in dockerfile
     assert "/etc/chromium/policies/managed/glasshive-ai-worker-extensions.json" in dockerfile
     assert "/etc/opt/chrome/policies/managed/glasshive-ai-worker-extensions.json" in dockerfile
     assert "ExtensionInstallForcelist" in dockerfile
+    assert "ExtensionInstallForcelist\":[]" in dockerfile
+    assert "fcoeoabgfenejglbffodgkkbkcdhcgfn;https://clients2.google.com/service/update2/crx" not in dockerfile
+    assert "hehggadaopoacecdllhhajmbjkdcmajg;https://clients2.google.com/service/update2/crx" not in dockerfile
+    assert "glasshive-browser-extension-check" in dockerfile
+    assert "glasshive-browser-native-host-bootstrap" in dockerfile
+
+
+def test_ensure_image_can_opt_in_to_ai_worker_browser_extension_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("WPR_AI_WORKER_BROWSER_EXTENSIONS", "all")
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+
+    def fake_docker(args: list[str], *, check: bool = True, capture_output: bool = False, timeout_sec=None):
+        if args[:2] == ["image", "inspect"]:
+            return subprocess.CompletedProcess(["docker", *args], returncode=1, stdout="", stderr="")
+        return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="", stderr="")
+
+    manager._docker = fake_docker  # type: ignore[method-assign]
+
+    manager._ensure_image()
+
+    dockerfile = (manager.build_root / "Dockerfile").read_text()
     assert "fcoeoabgfenejglbffodgkkbkcdhcgfn;https://clients2.google.com/service/update2/crx" in dockerfile
     assert "hehggadaopoacecdllhhajmbjkdcmajg;https://clients2.google.com/service/update2/crx" in dockerfile
     assert "glasshive-browser-extension-check" in dockerfile
+    assert "glasshive-browser-native-host-bootstrap" in dockerfile
+    assert "com.anthropic.claude_code_browser_extension" in dockerfile
+    assert "com.openai.codexextension" in dockerfile
+
+
+def test_ai_worker_browser_native_host_scripts_default_to_disabled(tmp_path):
+    bootstrap_script = _ai_worker_browser_native_host_bootstrap_script()
+    check_script = _ai_worker_browser_extension_check_script()
+    for script in (bootstrap_script, check_script):
+        syntax = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
+        assert syntax.returncode == 0, syntax.stderr
+
+    result = subprocess.run(
+        ["bash", "-c", bootstrap_script],
+        env={
+            **os.environ,
+            "HOME": str(tmp_path / "home"),
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "claude-code native-host disabled" in result.stdout
+    assert "codex native-host disabled" in result.stdout
+    assert not (tmp_path / "home" / ".config" / "chromium" / "NativeMessagingHosts").exists()
+
+
+def test_ai_worker_browser_native_host_scripts_are_valid_and_install_claude_manifest(monkeypatch, tmp_path):
+    monkeypatch.setenv("WPR_AI_WORKER_BROWSER_EXTENSIONS", "claude,codex")
+    bootstrap_script = _ai_worker_browser_native_host_bootstrap_script()
+    check_script = _ai_worker_browser_extension_check_script()
+    for script in (bootstrap_script, check_script):
+        syntax = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
+        assert syntax.returncode == 0, syntax.stderr
+        script_path = tmp_path / "roundtrip-script"
+        dockerfile_lines = " ".join(shlex.quote(line) for line in script.splitlines())
+        roundtrip = subprocess.run(
+            ["bash", "-lc", f"printf '%s\\n' {dockerfile_lines} > {shlex.quote(str(script_path))}; bash -n {shlex.quote(str(script_path))}"],
+            text=True,
+            capture_output=True,
+        )
+        assert roundtrip.returncode == 0, roundtrip.stderr
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_claude = fake_bin / "claude"
+    fake_claude.write_text("#!/usr/bin/env sh\nexit 0\n")
+    fake_claude.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", "-c", bootstrap_script],
+        env={
+            **os.environ,
+            "HOME": str(tmp_path / "home"),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "claude-code native-host installed" in result.stdout
+
+    wrapper = tmp_path / "home" / ".claude" / "chrome" / "chrome-native-host"
+    assert wrapper.exists()
+    assert os.access(wrapper, os.X_OK)
+    assert str(fake_claude) in wrapper.read_text()
+    assert "--chrome-native-host" in wrapper.read_text()
+
+    for browser in ("chromium", "google-chrome"):
+        manifest = (
+            tmp_path
+            / "home"
+            / ".config"
+            / browser
+            / "NativeMessagingHosts"
+            / "com.anthropic.claude_code_browser_extension.json"
+        )
+        data = json.loads(manifest.read_text())
+        assert data["name"] == "com.anthropic.claude_code_browser_extension"
+        assert data["path"] == str(wrapper)
+        assert data["type"] == "stdio"
+        assert data["allowed_origins"] == ["chrome-extension://fcoeoabgfenejglbffodgkkbkcdhcgfn/"]
+
+    codex_manifest = (
+        tmp_path
+        / "home"
+        / ".config"
+        / "chromium"
+        / "NativeMessagingHosts"
+        / "com.openai.codexextension.json"
+    )
+    assert not codex_manifest.exists()
+    assert "codex native-host pending: extension-host bundle not found" in result.stdout
+
+
+def test_desktop_env_forwards_codex_native_host_provisioning(monkeypatch, tmp_path):
+    monkeypatch.setenv("WPR_CODEX_CHROME_PLUGIN_ROOT", "/opt/codex-chrome")
+    monkeypatch.setenv("CODEX_CHROME_PLUGIN_ROOT", "/workspace/.wpr-home/.codex/chrome")
+    monkeypatch.setenv("WPR_CODEX_NODE_REPL_PATH", "/opt/codex-node-repl")
+    monkeypatch.setenv("CODEX_NODE_REPL_PATH", "/workspace/.wpr-home/.codex/node_repl")
+
+    env = DockerSandboxManager(base_dir=str(tmp_path))._desktop_env()
+
+    assert env["WPR_CODEX_CHROME_PLUGIN_ROOT"] == "/opt/codex-chrome"
+    assert env["CODEX_CHROME_PLUGIN_ROOT"] == "/workspace/.wpr-home/.codex/chrome"
+    assert env["WPR_CODEX_NODE_REPL_PATH"] == "/opt/codex-node-repl"
+    assert env["CODEX_NODE_REPL_PATH"] == "/workspace/.wpr-home/.codex/node_repl"
+
+
+def test_ai_worker_browser_native_host_bootstrap_installs_codex_manifest_when_bundle_exists(monkeypatch, tmp_path):
+    monkeypatch.setenv("WPR_AI_WORKER_BROWSER_EXTENSIONS", "claude,codex")
+    bootstrap_script = _ai_worker_browser_native_host_bootstrap_script()
+    syntax = subprocess.run(["bash", "-n"], input=bootstrap_script, text=True, capture_output=True)
+    assert syntax.returncode == 0, syntax.stderr
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name in ("claude", "codex", "node"):
+        fake = fake_bin / name
+        fake.write_text("#!/usr/bin/env sh\nexit 0\n")
+        fake.chmod(0o755)
+    fake_node_repl = tmp_path / "node_repl"
+    fake_node_repl.write_text("#!/usr/bin/env sh\nexit 0\n")
+    fake_node_repl.chmod(0o755)
+
+    plugin_root = tmp_path / "home" / ".codex" / "plugins" / "cache" / "openai-bundled" / "chrome" / "26.616.71553"
+    for arch in ("arm64", "x64"):
+        extension_host = plugin_root / "extension-host" / "linux" / arch / "extension-host"
+        extension_host.parent.mkdir(parents=True, exist_ok=True)
+        extension_host.write_text("#!/usr/bin/env sh\nexit 0\n")
+        extension_host.chmod(0o755)
+    (plugin_root / "scripts").mkdir(parents=True, exist_ok=True)
+    (plugin_root / "scripts" / "browser-client.mjs").write_text("export {};\n")
+
+    result = subprocess.run(
+        ["bash", "-c", bootstrap_script],
+        env={
+            **os.environ,
+            "HOME": str(tmp_path / "home"),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            "WPR_CODEX_NODE_REPL_PATH": str(fake_node_repl),
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "codex native-host installed" in result.stdout
+
+    manifest = (
+        tmp_path
+        / "home"
+        / ".config"
+        / "chromium"
+        / "NativeMessagingHosts"
+        / "com.openai.codexextension.json"
+    )
+    data = json.loads(manifest.read_text())
+    assert data["name"] == "com.openai.codexextension"
+    assert data["type"] == "stdio"
+    assert data["allowed_origins"] == ["chrome-extension://hehggadaopoacecdllhhajmbjkdcmajg/"]
+    assert data["path"].startswith(str(plugin_root / "extension-host" / "linux"))
+
+    config = json.loads((Path(data["path"]).with_name("extension-host-config.json")).read_text())
+    assert config["schemaVersion"] == 1
+    assert config["browserClientPath"] == str(plugin_root / "scripts" / "browser-client.mjs")
+    assert config["codexCliPath"] == str(fake_bin / "codex")
+    assert config["nodePath"] == str(fake_bin / "node")
+    assert config["nodeReplPath"] == str(fake_node_repl)
+    assert config["extensionId"] == "hehggadaopoacecdllhhajmbjkdcmajg"
 
 
 def test_start_screen_session_prepares_runtime_dir_and_detaches(tmp_path):

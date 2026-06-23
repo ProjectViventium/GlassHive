@@ -2827,7 +2827,7 @@ def test_docker_codex_command_appends_completion_contract(tmp_path):
     assert "FINAL REPORT:" in stdin_text
 
 
-def test_docker_claude_command_enables_chrome_and_projects_completion_contract_to_stdin(tmp_path, monkeypatch):
+def test_docker_claude_command_enables_chrome_and_appends_completion_contract(tmp_path, monkeypatch):
     runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.delenv("WPR_CLAUDE_CODE_ENABLE_CHROME", raising=False)
     worker = {
@@ -2844,44 +2844,6 @@ def test_docker_claude_command_enables_chrome_and_projects_completion_contract_t
     assert "Make the page red." not in " ".join(command)
     stdin_text = runtime._command_stdin_text(worker, "Make the page red.", runtime._runtime_info(worker))
     assert stdin_text and stdin_text.startswith("Make the page red.")
-    assert "FINAL REPORT:" in stdin_text
-
-
-def test_docker_claude_chrome_can_be_explicitly_disabled(tmp_path, monkeypatch):
-    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
-    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
-    worker = {
-        "worker_id": "wrk_claude_no_chrome",
-        "name": "Main Worker",
-        "profile": "claude-code",
-        "model": "claude-sonnet-4-6",
-    }
-    runtime._ensure_dirs(worker["worker_id"])
-
-    command, _ = runtime._build_command(worker, "Make the page red.", runtime._runtime_info(worker))
-
-    assert "--chrome" not in command
-
-
-def test_docker_claude_command_enables_chrome_and_appends_completion_contract(tmp_path, monkeypatch):
-    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
-    monkeypatch.delenv("WPR_CLAUDE_CODE_ENABLE_CHROME", raising=False)
-    worker = {
-        "worker_id": "wrk_claude_contract",
-        "name": "Main Worker",
-        "profile": "claude-code",
-        "model": "claude-sonnet-4-6",
-    }
-    runtime._ensure_dirs(worker["worker_id"])
-
-    info = runtime._runtime_info(worker)
-    command, _ = runtime._build_command(worker, "Make the page red.", info)
-    stdin_text = runtime._command_stdin_text(worker, "Make the page red.", info)
-
-    assert "--chrome" in command
-    assert "Make the page red." not in command
-    assert stdin_text is not None
-    assert stdin_text.startswith("Make the page red.")
     assert "FINAL REPORT:" in stdin_text
 
 

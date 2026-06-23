@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import asyncio
+import json
 import logging
 import shlex
 import sqlite3
@@ -54,10 +55,14 @@ RUNTIME_ENV_KEYS = {
     "GLASSHIVE_SIGNED_LINK_SECRET",
     "GLASSHIVE_LINK_REF_STATE_PATH",
     "GLASSHIVE_LINK_REF_TTL_SECONDS",
+    "GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME",
     "WPR_LINK_REF_TTL_SECONDS",
     "GLASSHIVE_WATCH_SESSION_STATE_PATH",
     "GLASSHIVE_MAX_WATCH_SESSION_DURATION_S",
     "GLASSHIVE_TRUST_INBOUND_IDENTITY",
+    "GLASSHIVE_OWNER_IDENTITY_CLAIMS",
+    "GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON",
+    "GLASSHIVE_OWNER_IDENTITY_ALIASES_FILE",
     "WPR_API_TOKEN",
 }
 _NOVNC_VIEW_URL_CACHE: dict[str, tuple[float, str]] = {}
@@ -423,6 +428,10 @@ def _truthy_env(name: str) -> bool:
     return _env_flag(name, False)
 
 
+def _workspace_link_auto_resume_enabled() -> bool:
+    return _env_flag("GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME", False)
+
+
 def _validate_enterprise_startup() -> None:
     enterprise = _truthy_env("GLASSHIVE_ENTERPRISE_MODE") or _truthy_env("WPR_ENTERPRISE_MODE")
     if not enterprise:
@@ -435,6 +444,138 @@ def _validate_enterprise_startup() -> None:
         raise RuntimeError("GlassHive enterprise UI requires GLASSHIVE_SIGNED_LINK_SECRET")
     if signed_link_secret == api_token:
         raise RuntimeError("GlassHive enterprise UI requires GLASSHIVE_SIGNED_LINK_SECRET to differ from WPR_API_TOKEN")
+    try:
+        _validate_owner_identity_config()
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+OWNER_IDENTITY_CLAIM_NAMES = {"user_id", "email"}
+DEFAULT_OWNER_IDENTITY_CLAIMS = ("user_id",)
+
+
+def _sanitize_identity_value(value: object) -> str:
+    text = str(value or "").strip()
+    if text.startswith("{{") and text.endswith("}}"):
+        return ""
+    if text.startswith("${") and text.endswith("}"):
+        return ""
+    return text[:512]
+
+
+def _identity_values_match(expected: object, actual: object) -> bool:
+    expected_text = _sanitize_identity_value(expected)
+    actual_text = _sanitize_identity_value(actual)
+    if not expected_text or not actual_text:
+        return False
+    if expected_text == actual_text:
+        return True
+    if "@" in expected_text and "@" in actual_text:
+        return expected_text.casefold() == actual_text.casefold()
+    return False
+
+
+def _parse_owner_identity_claims(raw: str, *, strict: bool = False) -> tuple[str, ...]:
+    value = str(raw or "").strip()
+    if not value:
+        return DEFAULT_OWNER_IDENTITY_CLAIMS
+    claims: list[str] = []
+    invalid: list[str] = []
+    for item in re.split(r"[, ]+", value):
+        claim = item.strip().lower()
+        if not claim:
+            continue
+        if claim not in OWNER_IDENTITY_CLAIM_NAMES:
+            invalid.append(claim)
+            continue
+        if claim not in claims:
+            claims.append(claim)
+    if invalid and strict:
+        raise ValueError(
+            "GLASSHIVE_OWNER_IDENTITY_CLAIMS only supports: "
+            + ", ".join(sorted(OWNER_IDENTITY_CLAIM_NAMES))
+        )
+    return tuple(claims) or DEFAULT_OWNER_IDENTITY_CLAIMS
+
+
+def _owner_identity_claims() -> tuple[str, ...]:
+    return _parse_owner_identity_claims(os.environ.get("GLASSHIVE_OWNER_IDENTITY_CLAIMS", ""))
+
+
+def _owner_identity_aliases_payload(*, strict: bool = False) -> str:
+    raw = os.environ.get("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON", "").strip()
+    if raw:
+        return raw
+    path = os.environ.get("GLASSHIVE_OWNER_IDENTITY_ALIASES_FILE", "").strip()
+    if not path:
+        return ""
+    try:
+        return Path(path).expanduser().read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        if strict:
+            raise ValueError("GLASSHIVE_OWNER_IDENTITY_ALIASES_FILE could not be read") from exc
+        return ""
+
+
+def _parse_owner_identity_aliases(*, strict: bool = False) -> dict[str, tuple[str, ...]]:
+    raw = _owner_identity_aliases_payload(strict=strict)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        if strict:
+            raise ValueError("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON must be valid JSON") from exc
+        return {}
+    if not isinstance(parsed, dict):
+        if strict:
+            raise ValueError("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON must be a JSON object")
+        return {}
+    aliases: dict[str, tuple[str, ...]] = {}
+    for owner, values in parsed.items():
+        owner_id = _sanitize_identity_value(owner)
+        if not owner_id:
+            continue
+        if isinstance(values, str):
+            raw_values = [values]
+        elif isinstance(values, list):
+            raw_values = values
+        else:
+            if strict:
+                raise ValueError("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON values must be strings or lists")
+            continue
+        clean_values: list[str] = []
+        for value in raw_values:
+            clean = _sanitize_identity_value(value)
+            if clean and clean not in clean_values:
+                clean_values.append(clean)
+        if clean_values:
+            aliases[owner_id] = tuple(clean_values)
+    return aliases
+
+
+def _validate_owner_identity_config() -> None:
+    _parse_owner_identity_claims(os.environ.get("GLASSHIVE_OWNER_IDENTITY_CLAIMS", ""), strict=True)
+    _parse_owner_identity_aliases(strict=True)
+
+
+def _owner_matches_identity(owner_id: object, identity: dict[str, str]) -> bool:
+    owner = _sanitize_identity_value(owner_id)
+    if not owner:
+        return False
+    claim_values = {
+        "user_id": identity.get("user_id", ""),
+        "email": identity.get("email", ""),
+    }
+    candidates = [claim_values.get(claim, "") for claim in _owner_identity_claims()]
+    if any(_identity_values_match(owner, candidate) for candidate in candidates):
+        return True
+    for canonical_owner, aliases in _parse_owner_identity_aliases().items():
+        if not _identity_values_match(owner, canonical_owner):
+            continue
+        if any(_identity_values_match(alias, candidate) for alias in aliases for candidate in candidates):
+            return True
+    return False
 
 
 def _default_launch_surface() -> str:
@@ -886,25 +1027,37 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             return None
         tenant_id = _enterprise_tenant_id()
         user_id = str(os.environ.get("GLASSHIVE_DEFAULT_OWNER_ID") or "demo-owner").strip()
+        asserted_email = ""
         if _truthy_env("GLASSHIVE_TRUST_INBOUND_IDENTITY"):
             asserted_tenant = _incoming_identity_header(request, "X-Viventium-Tenant-Id")
             asserted_user = _incoming_identity_header(request, "X-Viventium-User-Id")
             asserted_email = _incoming_identity_header(request, "X-Viventium-User-Email")
             asserted_role = _incoming_identity_header(request, "X-Viventium-User-Role")
             if not any((asserted_tenant, asserted_user, asserted_email, asserted_role)):
-                return None
+                if not _allow_default_owner():
+                    raise HTTPException(
+                        status_code=401,
+                        detail="GlassHive enterprise UI requires an authenticated user assertion from the trusted proxy",
+                    )
             if asserted_tenant and tenant_id and asserted_tenant != tenant_id:
                 raise HTTPException(status_code=401, detail="GlassHive tenant assertion does not match this deployment")
             tenant_id = asserted_tenant or tenant_id
             user_id = asserted_user or (user_id if _allow_default_owner() else "")
         elif not _allow_default_owner():
-            return None
+            raise HTTPException(
+                status_code=401,
+                detail="GlassHive enterprise UI requires an authenticated user assertion from the trusted proxy",
+            )
         if not user_id:
             raise HTTPException(
                 status_code=401,
                 detail="GlassHive enterprise UI requires an authenticated user assertion from the trusted proxy",
             )
-        return {"tenant_id": tenant_id, "user_id": user_id}
+        return {
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "email": asserted_email,
+        }
 
     def _require_short_ref_owner(payload: dict[str, object], request: Request) -> None:
         identity = _trusted_proxy_identity_for_short_ref(request)
@@ -912,7 +1065,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             return
         tenant_id = str(payload.get("tenant_id") or "").strip()
         owner_id = str(payload.get("owner_id") or "").strip()
-        if tenant_id != str(identity.get("tenant_id") or "").strip() or owner_id != str(identity.get("user_id") or "").strip():
+        if tenant_id != str(identity.get("tenant_id") or "").strip() or not _owner_matches_identity(owner_id, identity):
             raise HTTPException(status_code=404, detail="GlassHive workspace link not found for this user")
 
     def _fresh_worker_view_token_from_payload(worker_id: str, payload: dict[str, object]) -> tuple[str, dict[str, object]]:
@@ -979,6 +1132,19 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             headers["X-Viventium-User-Id"] = owner_id
         headers["X-Viventium-User-Role"] = "viewer"
         return client.with_headers(headers)
+
+    def _record_workspace_link_open(payload: dict[str, object], worker_id: str) -> None:
+        scoped_client = _client_for_short_ref_payload(payload)
+        try:
+            scoped_client.record_worker_view_open(worker_id)
+        except Exception as exc:
+            logger.warning("Failed to audit GlassHive worker view open for %s: %s", worker_id, exc)
+        if not _workspace_link_auto_resume_enabled():
+            return
+        try:
+            scoped_client.lifecycle(worker_id, "resume")
+        except Exception as exc:
+            logger.warning("Failed to auto-resume GlassHive workspace from short link for %s: %s", worker_id, exc)
 
     def _require_ui_auth(request: Request, worker_id: str | None = None) -> None:
         _runtime_headers_for_request(request, worker_id)
@@ -1181,10 +1347,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         if not target_url:
             raise HTTPException(status_code=400, detail="GlassHive workspace link has no target")
         _ensure_signed_worker_watch_session(worker_id, payload)
-        try:
-            _client_for_short_ref_payload(payload).record_worker_view_open(worker_id)
-        except Exception as exc:
-            logger.warning("Failed to audit GlassHive worker view open for %s: %s", worker_id, exc)
+        _record_workspace_link_open(payload, worker_id)
         response = RedirectResponse(target_url, status_code=307)
         session_token, session_payload = _fresh_worker_view_token_from_payload(worker_id, payload)
         try:

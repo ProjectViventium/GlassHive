@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 
 DEFAULT_TENANT_ID = "local"
@@ -20,6 +22,8 @@ IDENTITY_HEADER_ALIASES = {
     "x-viventium-user-email": ("x-glasshive-user-email", "x-librechat-user-email"),
     "x-viventium-user-role": ("x-glasshive-user-role", "x-librechat-user-role"),
 }
+OWNER_IDENTITY_CLAIM_NAMES = {"user_id", "email"}
+DEFAULT_OWNER_IDENTITY_CLAIMS = ("user_id",)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -55,6 +59,102 @@ def normalize_identity_segment(value: object, fallback: str) -> str:
     return text[:160] or fallback
 
 
+def _identity_values_match(expected: object, actual: object) -> bool:
+    expected_text = sanitize_identity_value(expected)
+    actual_text = sanitize_identity_value(actual)
+    if not expected_text or not actual_text:
+        return False
+    if expected_text == actual_text:
+        return True
+    if "@" in expected_text and "@" in actual_text:
+        return expected_text.casefold() == actual_text.casefold()
+    return False
+
+
+def _parse_owner_identity_claims(raw: str, *, strict: bool = False) -> tuple[str, ...]:
+    value = str(raw or "").strip()
+    if not value:
+        return DEFAULT_OWNER_IDENTITY_CLAIMS
+    claims: list[str] = []
+    invalid: list[str] = []
+    for item in re.split(r"[, ]+", value):
+        claim = item.strip().lower()
+        if not claim:
+            continue
+        if claim not in OWNER_IDENTITY_CLAIM_NAMES:
+            invalid.append(claim)
+            continue
+        if claim not in claims:
+            claims.append(claim)
+    if invalid and strict:
+        raise ValueError(
+            "GLASSHIVE_OWNER_IDENTITY_CLAIMS only supports: "
+            + ", ".join(sorted(OWNER_IDENTITY_CLAIM_NAMES))
+        )
+    return tuple(claims) or DEFAULT_OWNER_IDENTITY_CLAIMS
+
+
+def owner_identity_claims() -> tuple[str, ...]:
+    return _parse_owner_identity_claims(os.environ.get("GLASSHIVE_OWNER_IDENTITY_CLAIMS", ""))
+
+
+def _owner_identity_aliases_payload(*, strict: bool = False) -> str:
+    raw = os.environ.get("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON", "").strip()
+    if raw:
+        return raw
+    path = os.environ.get("GLASSHIVE_OWNER_IDENTITY_ALIASES_FILE", "").strip()
+    if not path:
+        return ""
+    try:
+        return Path(path).expanduser().read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        if strict:
+            raise ValueError("GLASSHIVE_OWNER_IDENTITY_ALIASES_FILE could not be read") from exc
+        return ""
+
+
+def _parse_owner_identity_aliases(*, strict: bool = False) -> dict[str, tuple[str, ...]]:
+    raw = _owner_identity_aliases_payload(strict=strict)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        if strict:
+            raise ValueError("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON must be valid JSON") from exc
+        return {}
+    if not isinstance(parsed, dict):
+        if strict:
+            raise ValueError("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON must be a JSON object")
+        return {}
+    aliases: dict[str, tuple[str, ...]] = {}
+    for owner, values in parsed.items():
+        owner_id = sanitize_identity_value(owner)
+        if not owner_id:
+            continue
+        if isinstance(values, str):
+            raw_values = [values]
+        elif isinstance(values, list):
+            raw_values = values
+        else:
+            if strict:
+                raise ValueError("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON values must be strings or lists")
+            continue
+        clean_values: list[str] = []
+        for value in raw_values:
+            clean = sanitize_identity_value(value)
+            if clean and clean not in clean_values:
+                clean_values.append(clean)
+        if clean_values:
+            aliases[owner_id] = tuple(clean_values)
+    return aliases
+
+
+def validate_owner_identity_config() -> None:
+    _parse_owner_identity_claims(os.environ.get("GLASSHIVE_OWNER_IDENTITY_CLAIMS", ""), strict=True)
+    _parse_owner_identity_aliases(strict=True)
+
+
 @dataclass(frozen=True)
 class AuthContext:
     tenant_id: str = DEFAULT_TENANT_ID
@@ -71,6 +171,25 @@ class AuthContext:
     @property
     def is_user_scoped(self) -> bool:
         return bool(self.enterprise and self.user_id)
+
+
+def owner_matches_auth_context(owner_id: object, ctx: AuthContext) -> bool:
+    owner = sanitize_identity_value(owner_id)
+    if not owner:
+        return False
+    claim_values = {
+        "user_id": ctx.user_id,
+        "email": ctx.email,
+    }
+    candidates = [claim_values.get(claim, "") for claim in owner_identity_claims()]
+    if any(_identity_values_match(owner, candidate) for candidate in candidates):
+        return True
+    for canonical_owner, aliases in _parse_owner_identity_aliases().items():
+        if not _identity_values_match(owner, canonical_owner):
+            continue
+        if any(_identity_values_match(alias, candidate) for alias in aliases for candidate in candidates):
+            return True
+    return False
 
 
 class GlassHiveAuthError(RuntimeError):
@@ -119,6 +238,10 @@ class EnterpriseAuthSettings:
                 "GLASSHIVE_AUTH_MODE values other than first_party_assertion require an external "
                 "token validator before the runtime can trust OAuth/OIDC identity assertions"
             )
+        try:
+            validate_owner_identity_config()
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     def context_from_headers(self, headers: dict[str, str]) -> AuthContext:
         if not self.enterprise:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import mimetypes
 import os
 import hmac
@@ -16,7 +17,14 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from .auth import AuthContext, EnterpriseAuthSettings, GlassHiveAuthError, header_identity_value, scoped_alias
+from .auth import (
+    AuthContext,
+    EnterpriseAuthSettings,
+    GlassHiveAuthError,
+    header_identity_value,
+    owner_matches_auth_context,
+    scoped_alias,
+)
 from .deliverables import deliverable_payload, is_user_deliverable_relative_path
 from .failure_classification import classify_runtime_error
 from .models import (
@@ -70,6 +78,7 @@ load_viventium_runtime_env()
 install_sensitive_url_log_filter()
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "runtime_phase1.db"
+logger = logging.getLogger(__name__)
 TEXT_ARTIFACT_PREVIEW_EXTENSIONS = {
     ".css",
     ".csv",
@@ -114,6 +123,15 @@ def _build_runtime(runtime_backend: str, db_path: str, runtime: WorkerRuntime | 
     if runtime_backend == "stub":
         return StubRuntime()
     return ProfiledWorkerRuntime(base_dir=str(Path(db_path).resolve().parent))
+
+
+def _workspace_link_auto_resume_enabled() -> bool:
+    return str(os.environ.get("GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def create_app(
@@ -904,61 +922,6 @@ def create_app(
                 break
         return items
 
-    def _deliverable_with_action_urls(worker: dict, deliverable: dict[str, object] | None) -> dict[str, object] | None:
-        if not deliverable:
-            return None
-        payload = dict(deliverable)
-        workspace_path = str(payload.get("workspace_path") or "").strip().lstrip("/")
-        if payload.get("kind") == "file" and workspace_path and is_user_deliverable_relative_path(workspace_path):
-            payload["open_url"] = _signed_artifact_action_url(
-                worker,
-                workspace_path,
-                kind="artifact_open",
-                fallback_action="open",
-            )
-            payload["download_url"] = _signed_artifact_action_url(
-                worker,
-                workspace_path,
-                kind="artifact_download",
-                fallback_action="download",
-            )
-        return payload
-
-    def _artifact_items_with_action_urls(
-        worker: dict,
-        workspace_items: list[dict[str, object]] | None = None,
-        *,
-        max_entries: int = 100,
-    ) -> list[dict[str, object]]:
-        items: list[dict[str, object]] = []
-        source_items = workspace_items if workspace_items is not None else _workspace_items(worker, max_entries=max_entries, max_depth=8)
-        for item in source_items:
-            if item.get("is_dir"):
-                continue
-            workspace_path = str(item.get("path") or "").strip().lstrip("/")
-            if not workspace_path or not is_user_deliverable_relative_path(workspace_path):
-                continue
-            items.append(
-                {
-                    **item,
-                    "open_url": _signed_artifact_action_url(
-                        worker,
-                        workspace_path,
-                        kind="artifact_open",
-                        fallback_action="open",
-                    ),
-                    "download_url": _signed_artifact_action_url(
-                        worker,
-                        workspace_path,
-                        kind="artifact_download",
-                        fallback_action="download",
-                    ),
-                }
-            )
-            if len(items) >= max_entries:
-                break
-        return items
-
     def _artifact_mime_type(target: Path) -> str:
         guessed, _ = mimetypes.guess_type(target.name)
         if guessed:
@@ -1585,7 +1548,7 @@ def create_app(
             return
         tenant_id = str(payload.get("tenant_id") or "")
         owner_id = str(payload.get("owner_id") or "")
-        if tenant_id != ctx.tenant_id or owner_id != ctx.owner_id:
+        if tenant_id != ctx.tenant_id or not owner_matches_auth_context(owner_id, ctx):
             raise HTTPException(status_code=404, detail="GlassHive link not found for this user")
 
     def _require_authenticated_short_ref_scope_if_asserted(payload: dict[str, object], request: Request) -> None:
@@ -1602,14 +1565,17 @@ def create_app(
             )
         )
         if not has_identity_assertion:
-            return
+            raise HTTPException(
+                status_code=401,
+                detail="GlassHive enterprise runtime requires an authenticated user assertion from the trusted proxy",
+            )
         try:
             ctx = auth_settings.context_from_headers(headers)
         except GlassHiveAuthError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
         tenant_id = str(payload.get("tenant_id") or "")
         owner_id = str(payload.get("owner_id") or "")
-        if tenant_id != ctx.tenant_id or owner_id != ctx.owner_id:
+        if tenant_id != ctx.tenant_id or not owner_matches_auth_context(owner_id, ctx):
             raise HTTPException(status_code=404, detail="GlassHive workspace link not found for this user")
 
     def _fresh_worker_view_token(payload: dict[str, object]) -> tuple[str, dict[str, object]]:
@@ -1690,6 +1656,11 @@ def create_app(
             raise HTTPException(status_code=400, detail="Signed link reference has no target")
         worker = service.require_worker(worker_id)
         store.add_event(worker["project_id"], worker_id, None, "worker.view_opened", "Worker view opened")
+        if _workspace_link_auto_resume_enabled():
+            try:
+                service.resume_worker(worker_id)
+            except Exception as exc:
+                logger.warning("Failed to auto-resume GlassHive workspace from short link for %s: %s", worker_id, exc)
         response = RedirectResponse(target_url, status_code=307)
         session_token, session_payload = _fresh_worker_view_token(payload)
         _set_signed_worker_cookie(
