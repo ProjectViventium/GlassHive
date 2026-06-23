@@ -23,6 +23,7 @@ from starlette.websockets import WebSocketDisconnect
 
 import workers_projects_runtime.api as api_module
 from workers_projects_runtime.api import create_app
+from workers_projects_runtime.auth import AuthContext, owner_matches_auth_context
 from workers_projects_runtime.deliverables import (
     deliverable_payload,
     is_deliverable_url,
@@ -1295,9 +1296,8 @@ def test_enterprise_opaque_signed_links_reject_tamper_expiry_and_mismatch(tmp_pa
     wrong_owner_headers = {**headers, "X-Viventium-User-Id": "user-b"}
     assert client.get(f"/r/{view_ref_id}", headers=wrong_owner_headers, follow_redirects=False).status_code == 404
     direct_redirect = client.get(f"/r/{view_ref_id}", follow_redirects=False)
-    assert direct_redirect.status_code == 307
-    assert direct_redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
-    assert "gh_token=" not in direct_redirect.headers["location"]
+    assert direct_redirect.status_code == 401
+    assert "authenticated user assertion" in direct_redirect.text
     redirect = client.get(f"/r/{view_ref_id}", headers=headers, follow_redirects=False)
     assert redirect.status_code == 307
     assert redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
@@ -1309,6 +1309,7 @@ def test_enterprise_opaque_signed_links_reject_tamper_expiry_and_mismatch(tmp_pa
     assert "HttpOnly" in set_cookie
     events = client.get(f"/v1/workers/{worker['worker_id']}/live", headers=headers).json()["events"]
     assert any(event["event_type"] == "worker.view_opened" for event in events)
+    assert not any(event["event_type"] == "worker.resumed" for event in events)
 
     tampered = f"{valid[:-1]}{'0' if valid[-1] != '0' else '1'}"
     assert client.get(f"/v1/signed-links/{tampered}").status_code == 401
@@ -1322,6 +1323,62 @@ def test_enterprise_opaque_signed_links_reject_tamper_expiry_and_mismatch(tmp_pa
         ttl_seconds=-10,
     )
     assert client.get(f"/v1/signed-links/{expired}").status_code == 401
+
+
+def test_enterprise_short_worker_view_ref_can_auto_resume_when_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME", "true")
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive-ui.example.test")
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    headers = {
+        "X-WPR-Token": "service-secret",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+        "X-Viventium-User-Role": "member",
+    }
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={"owner_id": "ignored", "title": "Auto Resume", "goal": "Resume from link."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "ignored",
+            "name": "Signed Link Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+    paused = client.post(f"/v1/workers/{worker['worker_id']}/pause", headers=headers)
+    assert paused.status_code == 202
+    assert paused.json()["state"] == "paused"
+
+    view_token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    target_url = f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop&gh_token={view_token}"
+    view_ref_id = create_signed_link_ref(token=view_token, target_url=target_url)
+
+    redirect = client.get(f"/r/{view_ref_id}", headers=headers, follow_redirects=False)
+
+    assert redirect.status_code == 307
+    assert redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
+    assert "gh_token=" not in redirect.headers["location"]
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live", headers=headers).json()
+    assert live["worker"]["state"] == "ready"
+    assert any(event["event_type"] == "worker.view_opened" for event in live["events"])
+    assert any(event["event_type"] == "worker.resumed" for event in live["events"])
 
 
 def test_link_refs_are_redacted_deduplicated_and_secret_rotation_bound(monkeypatch):
@@ -1536,8 +1593,8 @@ def test_enterprise_short_workspace_ref_mints_fresh_session_cookie_after_origina
     wrong_user_headers = {**headers, "X-Viventium-User-Id": "user-b"}
     assert client.get(f"/r/{ref_id}", headers=wrong_user_headers, follow_redirects=False).status_code == 404
     direct_redirect = client.get(f"/r/{ref_id}", follow_redirects=False)
-    assert direct_redirect.status_code == 307
-    assert direct_redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
+    assert direct_redirect.status_code == 401
+    assert "authenticated user assertion" in direct_redirect.text
     redirect = client.get(f"/r/{ref_id}", headers=headers, follow_redirects=False)
     assert redirect.status_code == 307
     assert redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
@@ -1549,6 +1606,165 @@ def test_enterprise_short_workspace_ref_mints_fresh_session_cookie_after_origina
     assert refreshed_payload is not None
     assert refreshed_payload["worker_id"] == worker["worker_id"]
     assert refreshed_payload["owner_id"] == "user-a"
+
+
+def test_enterprise_short_refs_can_authorize_configured_email_claim(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive-ui.example.test")
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    owner_headers = {
+        "X-WPR-Token": "service-secret",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "worker-owner@example.com",
+        "X-Viventium-User-Email": "worker-owner@example.com",
+        "X-Viventium-User-Role": "member",
+    }
+    browser_headers = {
+        **owner_headers,
+        "X-Viventium-User-Id": "browser-subject",
+        "X-Viventium-User-Email": "worker-owner@example.com",
+    }
+    project = client.post(
+        "/v1/projects",
+        headers=owner_headers,
+        json={"owner_id": "ignored", "title": "Email Claim", "goal": "Open through configured email claim."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=owner_headers,
+        json={
+            "owner_id": "ignored",
+            "name": "Email Claim Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+    result_path = Path(worker["workspace_dir"]) / "result.txt"
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text("email claim artifact", encoding="utf-8")
+    artifact_token = sign_link_token(
+        kind="artifact_download",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="worker-owner@example.com",
+        path="result.txt",
+    )
+    artifact_ref = create_signed_link_ref(token=artifact_token)
+    view_token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="worker-owner@example.com",
+    )
+    view_ref = create_signed_link_ref(
+        token=view_token,
+        target_url=f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?gh_token={view_token}",
+    )
+
+    assert client.get(f"/v1/link-refs/{artifact_ref}", headers=browser_headers).status_code == 404
+    assert client.get(f"/r/{view_ref}", headers=browser_headers, follow_redirects=False).status_code == 404
+
+    monkeypatch.setenv("GLASSHIVE_OWNER_IDENTITY_CLAIMS", "user_id,email")
+    artifact_response = client.get(f"/v1/link-refs/{artifact_ref}", headers=browser_headers)
+    assert artifact_response.status_code == 200
+    assert artifact_response.text == "email claim artifact"
+    workspace_response = client.get(f"/r/{view_ref}", headers=browser_headers, follow_redirects=False)
+    assert workspace_response.status_code == 307
+    assert workspace_response.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}"
+
+
+def test_enterprise_short_refs_can_authorize_configured_owner_alias(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive-ui.example.test")
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    owner_headers = {
+        "X-WPR-Token": "service-secret",
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "worker-owner@example.com",
+        "X-Viventium-User-Role": "member",
+    }
+    alias_headers = {
+        **owner_headers,
+        "X-Viventium-User-Id": "browser-login-alias@example.com",
+        "X-Viventium-User-Email": "browser-login-alias@example.com",
+    }
+    project = client.post(
+        "/v1/projects",
+        headers=owner_headers,
+        json={"owner_id": "ignored", "title": "Owner Alias", "goal": "Open through configured alias."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=owner_headers,
+        json={
+            "owner_id": "ignored",
+            "name": "Owner Alias Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+        },
+    ).json()
+    result_path = Path(worker["workspace_dir"]) / "result.txt"
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text("alias artifact", encoding="utf-8")
+    artifact_ref = create_signed_link_ref(
+        token=sign_link_token(
+            kind="artifact_download",
+            worker_id=worker["worker_id"],
+            tenant_id="tenant-alpha",
+            owner_id="worker-owner@example.com",
+            path="result.txt",
+        )
+    )
+    view_token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id="tenant-alpha",
+        owner_id="worker-owner@example.com",
+    )
+    view_ref = create_signed_link_ref(
+        token=view_token,
+        target_url=f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?gh_token={view_token}",
+    )
+    monkeypatch.setenv(
+        "GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON",
+        json.dumps({"worker-owner@example.com": ["browser-login-alias@example.com"]}),
+    )
+
+    artifact_response = client.get(f"/v1/link-refs/{artifact_ref}", headers=alias_headers)
+    assert artifact_response.status_code == 200
+    assert artifact_response.text == "alias artifact"
+    workspace_response = client.get(f"/r/{view_ref}", headers=alias_headers, follow_redirects=False)
+    assert workspace_response.status_code == 307
+    assert workspace_response.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}"
+
+    wrong_tenant_headers = {
+        **alias_headers,
+        "X-Viventium-Tenant-Id": "tenant-beta",
+    }
+    assert client.get(f"/v1/link-refs/{artifact_ref}", headers=wrong_tenant_headers).status_code in {401, 404}
+    assert client.get(f"/r/{view_ref}", headers=wrong_tenant_headers, follow_redirects=False).status_code in {401, 404}
+
+    monkeypatch.setenv("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON", json.dumps({"*": ["browser-login-alias@example.com"]}))
+    wildcard_alias_ctx = AuthContext(
+        tenant_id="tenant-alpha",
+        user_id="browser-login-alias@example.com",
+        email="browser-login-alias@example.com",
+        role="member",
+        enterprise=True,
+    )
+    assert not owner_matches_auth_context("worker-owner@example.com", wildcard_alias_ctx)
 
 
 def test_short_workspace_ref_rejects_unconfigured_absolute_redirect_target(tmp_path, monkeypatch):
@@ -2143,6 +2359,30 @@ def test_enterprise_mode_requires_signed_link_secret_distinct_from_service_token
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "same-secret")
 
     with pytest.raises(RuntimeError, match="must be distinct"):
+        create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime())
+
+
+def test_enterprise_mode_rejects_invalid_owner_identity_config_at_startup(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_OWNER_IDENTITY_CLAIMS", "user_id,role")
+
+    with pytest.raises(RuntimeError, match="only supports"):
+        create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime())
+
+    monkeypatch.setenv("GLASSHIVE_OWNER_IDENTITY_CLAIMS", "user_id")
+    monkeypatch.setenv("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON", "[]")
+
+    with pytest.raises(RuntimeError, match="must be a JSON object"):
+        create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime())
+
+    monkeypatch.delenv("GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON", raising=False)
+    monkeypatch.setenv("GLASSHIVE_OWNER_IDENTITY_ALIASES_FILE", str(tmp_path / "missing-aliases.json"))
+
+    with pytest.raises(RuntimeError, match="could not be read"):
         create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime())
 
 

@@ -44,6 +44,10 @@ SAFE_DOCKER_EXEC_ENV_KEYS = {
     "WPR_CODEX_CLI_MODEL_PROVIDER",
     "WPR_CODEX_CLI_USE_CUSTOM_PROVIDER",
     "WPR_CODEX_CLI_WIRE_API",
+    "WPR_CODEX_CHROME_PLUGIN_ROOT",
+    "CODEX_CHROME_PLUGIN_ROOT",
+    "WPR_CODEX_NODE_REPL_PATH",
+    "CODEX_NODE_REPL_PATH",
     "WPR_OPENCLAW_BASE_URL",
     "WPR_OPENCLAW_ENV_KEY",
     "WPR_OPENCLAW_MODEL_PROVIDER",
@@ -55,28 +59,64 @@ SAFE_DOCKER_EXEC_ENV_KEYS = {
 }
 
 AI_WORKER_BROWSER_EXTENSION_UPDATE_URL = "https://clients2.google.com/service/update2/crx"
-AI_WORKER_BROWSER_EXTENSIONS = {
+AI_WORKER_BROWSER_EXTENSION_IDS = {
     "claude": "fcoeoabgfenejglbffodgkkbkcdhcgfn",
     "codex": "hehggadaopoacecdllhhajmbjkdcmajg",
+}
+AI_WORKER_BROWSER_NATIVE_HOSTS = {
+    "claude": "com.anthropic.claude_code_browser_extension",
+    "codex": "com.openai.codexextension",
 }
 AI_WORKER_BROWSER_EXTENSION_POLICY_PATHS = (
     "/etc/chromium/policies/managed/glasshive-ai-worker-extensions.json",
     "/etc/opt/chrome/policies/managed/glasshive-ai-worker-extensions.json",
 )
-AI_WORKER_CODEX_NPM_SPEC = os.environ.get("WPR_SANDBOX_CODEX_NPM_SPEC", "@openai/codex@0.140.0").strip() or "@openai/codex@0.140.0"
+AI_WORKER_CODEX_NPM_SPEC = os.environ.get("WPR_SANDBOX_CODEX_NPM_SPEC", "@openai/codex@0.142.0").strip() or "@openai/codex@0.142.0"
 AI_WORKER_CLAUDE_CODE_NPM_SPEC = (
-    os.environ.get("WPR_SANDBOX_CLAUDE_CODE_NPM_SPEC", "@anthropic-ai/claude-code@2.1.178").strip()
-    or "@anthropic-ai/claude-code@2.1.178"
+    os.environ.get("WPR_SANDBOX_CLAUDE_CODE_NPM_SPEC", "@anthropic-ai/claude-code@2.1.186").strip()
+    or "@anthropic-ai/claude-code@2.1.186"
 )
 AI_WORKER_OPENCLAW_NPM_SPEC = os.environ.get("WPR_SANDBOX_OPENCLAW_NPM_SPEC", "openclaw@latest").strip() or "openclaw@latest"
 
 
+def _enabled_ai_worker_browser_extension_names() -> tuple[str, ...]:
+    raw = (
+        os.environ.get("GLASSHIVE_AI_WORKER_BROWSER_EXTENSIONS")
+        or os.environ.get("WPR_AI_WORKER_BROWSER_EXTENSIONS")
+        or "none"
+    ).strip()
+    if not raw or raw.lower() in {"0", "false", "no", "none", "off"}:
+        return ()
+    if raw.lower() in {"1", "true", "yes", "all", "on"}:
+        return tuple(AI_WORKER_BROWSER_EXTENSION_IDS)
+    names: list[str] = []
+    unknown: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if name not in AI_WORKER_BROWSER_EXTENSION_IDS:
+            unknown.append(name)
+            continue
+        if name not in names:
+            names.append(name)
+    if unknown:
+        known = ", ".join(sorted(AI_WORKER_BROWSER_EXTENSION_IDS))
+        raise ValueError(f"Unknown AI worker browser extension(s): {', '.join(unknown)}. Expected one of: {known}, all, none")
+    return tuple(names)
+
+
+def _enabled_ai_worker_browser_extensions() -> dict[str, str]:
+    return {name: AI_WORKER_BROWSER_EXTENSION_IDS[name] for name in _enabled_ai_worker_browser_extension_names()}
+
+
 def _ai_worker_browser_extension_policy_json() -> str:
+    extensions = _enabled_ai_worker_browser_extensions()
     return json.dumps(
         {
             "ExtensionInstallForcelist": [
                 f"{extension_id};{AI_WORKER_BROWSER_EXTENSION_UPDATE_URL}"
-                for extension_id in AI_WORKER_BROWSER_EXTENSIONS.values()
+                for extension_id in extensions.values()
             ]
         },
         separators=(",", ":"),
@@ -85,13 +125,19 @@ def _ai_worker_browser_extension_policy_json() -> str:
 
 
 def _ai_worker_browser_extension_check_script() -> str:
-    extension_ids = " ".join(shlex.quote(extension_id) for extension_id in AI_WORKER_BROWSER_EXTENSIONS.values())
+    extensions = _enabled_ai_worker_browser_extensions()
+    extension_ids = " ".join(shlex.quote(extension_id) for extension_id in extensions.values())
+    native_host_pairs = " ".join(
+        shlex.quote(f"{AI_WORKER_BROWSER_NATIVE_HOSTS[name]}:{extension_id}")
+        for name, extension_id in extensions.items()
+    )
     policy_paths = " ".join(shlex.quote(path) for path in AI_WORKER_BROWSER_EXTENSION_POLICY_PATHS)
     return "\n".join(
         [
             "#!/usr/bin/env bash",
             "set -euo pipefail",
             f"extension_ids=({extension_ids})",
+            f"native_host_pairs=({native_host_pairs})",
             f"policy_paths=({policy_paths})",
             "require_profile=0",
             'if [ "${1:-}" = "--require-profile" ]; then require_profile=1; fi',
@@ -112,8 +158,170 @@ def _ai_worker_browser_extension_check_script() -> str:
             "    missing=1",
             "  fi",
             "done",
+            'home_dir="${HOME:-/workspace/.wpr-home}"',
+            'native_host_dir="${home_dir}/.config/chromium/NativeMessagingHosts"',
+            'for pair in "${native_host_pairs[@]}"; do',
+            '  host_name="${pair%%:*}"',
+            '  extension_id="${pair#*:}"',
+            '  manifest="${native_host_dir}/${host_name}.json"',
+            '  if [ -f "$manifest" ]; then',
+            '    path_value="$(python3 - "$manifest" "$host_name" "$extension_id" <<\'PY\' || true',
+            "import json, sys",
+            "manifest, host_name, extension_id = sys.argv[1:4]",
+            "try:",
+            "    data = json.load(open(manifest, encoding='utf-8'))",
+            "except Exception:",
+            "    data = {}",
+            "allowed = data.get('allowed_origins') if isinstance(data, dict) else []",
+            "expected_origin = f'chrome-extension://{extension_id}/'",
+            "if data.get('name') == host_name and expected_origin in (allowed or []):",
+            "    print(data.get('path') or '')",
+            "PY",
+            ')"',
+            '    if [ -n "$path_value" ] && [ -x "$path_value" ]; then',
+            '      printf "%s native-host-installed\\n" "$host_name"',
+            "    else",
+            '      printf "%s native-host-manifest-present host-path-pending\\n" "$host_name"',
+            "    fi",
+            "  else",
+            '    printf "%s native-host-pending\\n" "$host_name"',
+            "  fi",
+            "done",
             'if [ "$require_profile" = "1" ] && [ "$missing" = "1" ]; then exit 2; fi',
             'printf "glasshive browser extension policy ok\\n"',
+        ]
+    )
+
+
+def _ai_worker_browser_native_host_bootstrap_script() -> str:
+    enabled = set(_enabled_ai_worker_browser_extension_names())
+    install_claude = "1" if "claude" in enabled else "0"
+    install_codex = "1" if "codex" in enabled else "0"
+    claude_extension_id = shlex.quote(AI_WORKER_BROWSER_EXTENSION_IDS["claude"])
+    codex_extension_id = shlex.quote(AI_WORKER_BROWSER_EXTENSION_IDS["codex"])
+    claude_host_name = shlex.quote(AI_WORKER_BROWSER_NATIVE_HOSTS["claude"])
+    codex_host_name = shlex.quote(AI_WORKER_BROWSER_NATIVE_HOSTS["codex"])
+    return "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            f"claude_extension_id={claude_extension_id}",
+            f"codex_extension_id={codex_extension_id}",
+            f"claude_host_name={claude_host_name}",
+            f"codex_host_name={codex_host_name}",
+            f"install_claude_native_host={install_claude}",
+            f"install_codex_native_host={install_codex}",
+            'home_dir="${HOME:-/workspace/.wpr-home}"',
+            'native_host_dirs=("${home_dir}/.config/chromium/NativeMessagingHosts" "${home_dir}/.config/google-chrome/NativeMessagingHosts")',
+            "write_manifest() {",
+            '  local manifest_path="$1" host_name="$2" description="$3" host_path="$4" extension_id="$5"',
+            '  mkdir -p "$(dirname "$manifest_path")"',
+            '  python3 - "$manifest_path" "$host_name" "$description" "$host_path" "$extension_id" <<\'PY\'',
+            "import json, sys",
+            "from pathlib import Path",
+            "manifest_path, host_name, description, host_path, extension_id = sys.argv[1:6]",
+            "data = {",
+            "    'name': host_name,",
+            "    'description': description,",
+            "    'path': host_path,",
+            "    'type': 'stdio',",
+            "    'allowed_origins': [f'chrome-extension://{extension_id}/'],",
+            "}",
+            "Path(manifest_path).write_text(json.dumps(data, indent=2) + '\\n', encoding='utf-8')",
+            "PY",
+            "}",
+            "install_claude_native_host() {",
+            '  local claude_bin="${WPR_CLAUDE_CODE_BIN:-}"',
+            '  if [ -z "$claude_bin" ]; then claude_bin="$(command -v claude || true)"; fi',
+            '  if [ -z "$claude_bin" ] || [ ! -x "$claude_bin" ]; then',
+            '    printf "claude-code native-host pending: claude binary not found\\n"',
+            "    return 0",
+            "  fi",
+            '  local host_path="${home_dir}/.claude/chrome/chrome-native-host"',
+            '  mkdir -p "$(dirname "$host_path")"',
+            '  python3 - "$host_path" "$claude_bin" <<\'PY\'',
+            "import shlex, sys",
+            "from pathlib import Path",
+            "host_path, claude_bin = sys.argv[1:3]",
+            "Path(host_path).write_text('#!/usr/bin/env sh\\nexec ' + shlex.quote(claude_bin) + ' --chrome-native-host\\n', encoding='utf-8')",
+            "PY",
+            '  chmod 0755 "$host_path"',
+            '  for native_dir in "${native_host_dirs[@]}"; do',
+            '    write_manifest "${native_dir}/${claude_host_name}.json" "$claude_host_name" "Claude Code Browser Extension Native Host" "$host_path" "$claude_extension_id"',
+            "  done",
+            '  printf "claude-code native-host installed\\n"',
+            "}",
+            "codex_arch_dir() {",
+            '  case "$(uname -m)" in',
+            "    x86_64|amd64) printf 'x64' ;;",
+            "    aarch64|arm64) printf 'arm64' ;;",
+            "    *) return 1 ;;",
+            "  esac",
+            "}",
+            "find_codex_extension_host() {",
+            '  local arch_dir; arch_dir="$(codex_arch_dir)" || return 1',
+            "  local roots=()",
+            '  if [ -n "${WPR_CODEX_CHROME_PLUGIN_ROOT:-}" ]; then roots+=("${WPR_CODEX_CHROME_PLUGIN_ROOT}"); fi',
+            '  if [ -n "${CODEX_CHROME_PLUGIN_ROOT:-}" ]; then roots+=("${CODEX_CHROME_PLUGIN_ROOT}"); fi',
+            '  if [ -n "${CODEX_HOME:-}" ]; then roots+=("${CODEX_HOME}/plugins/cache/openai-bundled/chrome/latest"); fi',
+            '  roots+=("${home_dir}/.codex/plugins/cache/openai-bundled/chrome/latest")',
+            '  roots+=("/usr/local/share/glasshive/openai-bundled/chrome/latest")',
+            '  roots+=("/opt/openai-bundled/chrome/latest")',
+            '  if [ -n "${CODEX_HOME:-}" ]; then roots+=("${CODEX_HOME}/plugins/cache/openai-bundled/chrome/"*); fi',
+            '  roots+=("${home_dir}/.codex/plugins/cache/openai-bundled/chrome/"*)',
+            '  roots+=("/usr/local/share/glasshive/openai-bundled/chrome/"*)',
+            '  roots+=("/opt/openai-bundled/chrome/"*)',
+            '  local root host',
+            '  for root in "${roots[@]}"; do',
+            '    host="${root}/extension-host/linux/${arch_dir}/extension-host"',
+            '    if [ -x "$host" ]; then printf "%s\\n" "$host"; return 0; fi',
+            "  done",
+            "  return 1",
+            "}",
+            "write_codex_extension_host_config() {",
+            '  local host_path="$1"',
+            '  local root; root="$(cd "$(dirname "$host_path")/../../.." && pwd)"',
+            '  local codex_bin="${WPR_CODEX_BIN:-}"',
+            '  if [ -z "$codex_bin" ]; then codex_bin="$(command -v codex || true)"; fi',
+            '  local node_bin; node_bin="$(command -v node || true)"',
+            '  local node_repl="${WPR_CODEX_NODE_REPL_PATH:-${CODEX_NODE_REPL_PATH:-}}"',
+            '  if [ -z "$node_repl" ]; then node_repl="$(command -v node_repl || true)"; fi',
+            '  if [ -z "$codex_bin" ] || [ -z "$node_bin" ] || [ -z "$node_repl" ]; then',
+            '    printf "codex native-host config pending: codex/node/node_repl path missing\\n"',
+            "    return 1",
+            "  fi",
+            '  python3 - "$host_path" "$root" "$codex_bin" "$node_bin" "$node_repl" "$codex_extension_id" <<\'PY\'',
+            "import json, sys",
+            "from pathlib import Path",
+            "host_path, root, codex_bin, node_bin, node_repl, extension_id = sys.argv[1:7]",
+            "data = {",
+            "    'schemaVersion': 1,",
+            "    'channel': 'prod',",
+            "    'browserClientPath': str(Path(root) / 'scripts' / 'browser-client.mjs'),",
+            "    'codexCliPath': codex_bin,",
+            "    'extensionId': extension_id,",
+            "    'nodePath': node_bin,",
+            "    'nodeReplPath': node_repl,",
+            "    'proxyHost': '127.0.0.1',",
+            "    'proxyPort': 0,",
+            "}",
+            "Path(host_path).with_name('extension-host-config.json').write_text(json.dumps(data, indent=2) + '\\n', encoding='utf-8')",
+            "PY",
+            "}",
+            "install_codex_native_host() {",
+            "  local host_path",
+            '  if ! host_path="$(find_codex_extension_host)"; then',
+            '    printf "codex native-host pending: extension-host bundle not found\\n"',
+            "    return 0",
+            "  fi",
+            '  if ! write_codex_extension_host_config "$host_path"; then return 0; fi',
+            '  for native_dir in "${native_host_dirs[@]}"; do',
+            '    write_manifest "${native_dir}/${codex_host_name}.json" "$codex_host_name" "Codex chrome native messaging host" "$host_path" "$codex_extension_id"',
+            "  done",
+            '  printf "codex native-host installed\\n"',
+            "}",
+            'if [ "$install_claude_native_host" = "1" ]; then install_claude_native_host; else printf "claude-code native-host disabled\\n"; fi',
+            'if [ "$install_codex_native_host" = "1" ]; then install_codex_native_host; else printf "codex native-host disabled\\n"; fi',
         ]
     )
 
@@ -143,7 +351,7 @@ def _safe_docker_exec_env(env: dict[str, str] | None) -> dict[str, str]:
 
 class DockerSandboxManager:
     _build_lock = Lock()
-    _default_image = "workers-projects-runtime-workstation:phase1-node22-docs4"
+    _default_image = "workers-projects-runtime-workstation:phase1-node22-docs6"
 
     def __init__(self, base_dir: str | None = None) -> None:
         self.base_dir = Path(base_dir) if base_dir else Path(__file__).resolve().parents[2] / "data"
@@ -744,6 +952,7 @@ class DockerSandboxManager:
         preferences_path = f"{self._browser_config_dir()}/chromium/Default/Preferences"
         return "\n".join(
             [
+                "if command -v glasshive-browser-native-host-bootstrap >/dev/null 2>&1; then glasshive-browser-native-host-bootstrap; fi",
                 f"mkdir -p {shlex.quote(str(Path(preferences_path).parent))}",
                 "python3 - <<'PY'",
                 "import json",
@@ -849,7 +1058,7 @@ class DockerSandboxManager:
         ]
 
     def _desktop_env(self) -> dict[str, str]:
-        return {
+        env = {
             "HOME": self.home_mount,
             "TERM": self.term_value,
             "DISPLAY": self.display_value,
@@ -857,6 +1066,16 @@ class DockerSandboxManager:
             "XDG_CACHE_HOME": self._browser_cache_dir(),
             "XDG_CONFIG_HOME": self._browser_config_dir(),
         }
+        for key in (
+            "WPR_CODEX_CHROME_PLUGIN_ROOT",
+            "CODEX_CHROME_PLUGIN_ROOT",
+            "WPR_CODEX_NODE_REPL_PATH",
+            "CODEX_NODE_REPL_PATH",
+        ):
+            value = os.environ.get(key)
+            if value:
+                env[key] = value
+        return env
 
     def _container_name(self, worker_id: str) -> str:
         token = worker_id.replace("_", "-").lower()
@@ -979,6 +1198,10 @@ class DockerSandboxManager:
                 shlex.quote(line)
                 for line in _ai_worker_browser_extension_check_script().splitlines()
             )
+            native_host_bootstrap_script_lines = " ".join(
+                shlex.quote(line)
+                for line in _ai_worker_browser_native_host_bootstrap_script().splitlines()
+            )
             npm_worker_specs = " ".join(
                 shlex.quote(spec)
                 for spec in (
@@ -1000,6 +1223,7 @@ class DockerSandboxManager:
                         "RUN pip3 install --no-cache-dir selenium beautifulsoup4 markdown matplotlib openpyxl pdf2image pillow PyMuPDF PyPDF2 python-docx python-pptx reportlab requests xlsxwriter",
                         f"RUN mkdir -p {extension_policy_dirs} && {extension_policy_writes}",
                         f"RUN printf '%s\\n' {extension_check_script_lines} > /usr/local/bin/glasshive-browser-extension-check && chmod +x /usr/local/bin/glasshive-browser-extension-check && glasshive-browser-extension-check",
+                        f"RUN printf '%s\\n' {native_host_bootstrap_script_lines} > /usr/local/bin/glasshive-browser-native-host-bootstrap && chmod +x /usr/local/bin/glasshive-browser-native-host-bootstrap",
                         "RUN mkdir -p /workspace/project /workspace/.wpr-home",
                         "USER seluser",
                         "WORKDIR /workspace/project",

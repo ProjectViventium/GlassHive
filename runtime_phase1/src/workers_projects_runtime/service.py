@@ -1366,12 +1366,6 @@ class WorkersProjectsService:
             default="worker",
         )
 
-    def _legacy_backend_label(self, profile: str, execution_mode: str, requested_backend: str) -> str:
-        runtime_label = self._initial_runtime_label(profile, execution_mode)
-        if runtime_label:
-            return runtime_label
-        return str(requested_backend or "").strip() or "worker"
-
     def create_worker(
         self,
         project_id: str,
