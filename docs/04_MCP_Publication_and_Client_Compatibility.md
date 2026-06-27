@@ -54,7 +54,8 @@ standalone/plain LibreChat deployments must still work without them by using:
 
 - `workspace_status` for non-blocking follow-up checks
 - `workspace_wait` for explicit blocking waits
-- `workspace_artifacts` and `workspace_artifact_download` for generated files and signed downloads
+- `workspace_artifacts` and `workspace_artifact_download` for generated files, default signed
+  downloads, and preview/open links
 - `workspace_preferences_get` and `workspace_preferences_set` for per-user worker and effort
   defaults
 - the returned View / Steer URL for operator visibility and takeover
@@ -65,6 +66,15 @@ View / Steer short link when available; raw project/worker/run ids and live diag
 returned only when the caller explicitly requests diagnostics. MCP outputs must not expose raw
 `gh_token` URLs or opaque signed-link tokens; they should expose `/r/{ref}` and `/v1/link-refs/{ref}`
 indirection instead.
+
+For generated file delivery, `signed_download_url`/`default_url` is the default chat-facing artifact
+link and should be labeled `Download file`. The MCP payload should also preserve `signed_open_url`
+or a View / Steer workspace link so the user can inspect previews and all workspace deliveries
+without exposing raw worker paths, raw `gh_token` URLs, or whole generated file contents in chat.
+Preview pages are part of that contract: their `Download file` action should download through a
+scoped artifact short ref, and their `View workspace` action should use the same authenticated
+`/r/{ref}` workspace short-ref path as chat View / Steer links, redirecting to a tokenless watch URL
+after minting a bounded session cookie.
 
 Short refs are the durable user-facing link contract. `GLASSHIVE_LINK_REF_TTL_SECONDS` defaults to
 `0` (`never`/`none`/`disabled`/`off`/`false`/`no` are equivalent), so a completed artifact or
@@ -88,6 +98,24 @@ code path when GlassHive has already produced a signed artifact link.
 recent-dispatch resolution. If the requested run is older than the worker's latest run,
 diagnostic status/wait responses preserve both the requested run outcome and the latest effective
 run so an operator can explain the lineage without exposing raw ids in normal user-facing payloads.
+Blocking waits should stay below common chat/Redis/proxy idle windows. When a bounded wait reaches
+its deadline while the worker is still running but user-facing files already exist in delivery
+locations such as `output/`, `deliverables/`, `reports/`, `artifacts/`, or `out/report`/`out/data`,
+`workspace_wait` may return `status=deliverable_ready` with signed links. That is a user-delivery
+state, not a claim that the process row is completed; callers should deliver the files and use
+`workspace_status` later only if the user asks for a final status refresh. MCP progress notifications
+are best-effort and bounded; a stale progress/SSE channel must not block the tool's status payload.
+
+Fresh `workspace_launch` calls must not accidentally resume stale workspaces. A supplied
+`workspace_alias` is honored only when `reuse_existing_workspace=true`; otherwise GlassHive creates a
+fresh one-off project/worker for the new request. Use explicit reuse only when the user asked to
+resume or reuse that existing workspace. Deliberate operator-level reuse remains available through
+`worker_find_or_resume`, `workspace_continue`, and explicit lifecycle tools.
+
+The same rule applies to lower-level `worker_delegate_once` calls. A supplied `alias` or existing
+`project_id` does not imply reuse for a fresh one-off task; GlassHive creates a fresh worker alias
+unless `reuse_existing_workspace=true` is set. This keeps model-selected fallback paths from
+reintroducing stale worker history after `workspace_launch` has already been made fresh-by-default.
 
 When no `profile` is supplied, MCP tools must use the authenticated user's saved preference first
 and then the deployment default from `GLASSHIVE_DEFAULT_WORKER_PROFILE`. Enterprise deployments
@@ -99,7 +127,25 @@ For upload byte transfer, the host should provide every supported file/request h
 `X-GlassHive-Request-Files`, `X-GlassHive-Request-Attachments`, `X-GlassHive-Tool-Resources`, and
 `X-GlassHive-File-Ids`. In enterprise shared-storage deployments, file metadata should point to
 owner-scoped virtual paths such as `/uploads/<authenticated-user-id>/<file>` so GlassHive can copy
-the bytes into the worker workspace under `uploads/<safe-filename>`.
+the bytes into the worker workspace under `uploads/<safe-filename>`. When a host authenticates users
+by SSO/email but stores uploads under an internal user id, it must also send
+`X-GlassHive-Storage-User-Id` (or `X-Viventium-Storage-User-Id`) with the internal storage owner.
+GlassHive uses that value only for upload byte lookup; the authenticated user id still owns the
+workspace, callbacks, and signed links.
+
+Some older LibreChat-compatible hosts can pass authenticated user/message headers but cannot project
+`files` or `attachments` into MCP request headers without a LibreChat image upgrade. For those hosts,
+GlassHive provides an opt-in compatibility fallback:
+`GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_FALLBACK=true`. The fallback is disabled by default. When enabled,
+it only runs in enterprise mode, only with `X-GlassHive-Storage-User-Id`, `X-GlassHive-Conversation-Id`,
+and `X-GlassHive-Message-Id` present, and only scans that storage owner's upload folder under the
+configured upload roots. It materializes files modified within
+`GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_RECENT_SECONDS` (default `900`, clamped to 5 seconds through 24
+hours), capped by `GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_MAX_FILES` (default `8`, max `32`). Prefer real
+request-file headers whenever the host supports them; the compatibility fallback is for legacy
+bridges, not the primary contract. Keep the fallback window close to expected upload-to-dispatch
+latency and monitor its log event; long windows can pick unrelated recent uploads from the same
+storage owner because the fallback cannot prove exact message membership.
 
 ### Claude / Claude Code
 Support:

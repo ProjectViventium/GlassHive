@@ -59,6 +59,8 @@ def signed_link_secret() -> str:
 
 def signed_link_ttl_seconds() -> int:
     raw = os.environ.get("GLASSHIVE_SIGNED_LINK_TTL_S", "").strip()
+    if raw.lower() in {"0", "none", "never", "disabled", "off", "false", "no"}:
+        return 0
     try:
         value = int(raw) if raw else DEFAULT_TTL_SECONDS
     except ValueError:
@@ -87,6 +89,8 @@ def signed_link_ttl_for_kind(kind: str, ttl_seconds: int | None = None) -> int:
     ttl = int(ttl_seconds) if explicit else signed_link_ttl_seconds()
     if explicit and ttl <= 0:
         return ttl
+    if not explicit and ttl <= 0:
+        return 0
     if kind == "worker_view":
         raw = os.environ.get("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "").strip()
         try:
@@ -137,7 +141,11 @@ def sign_link_params(
     secret = signed_link_secret()
     if not secret:
         return {}
-    resolved_expires_at = int(expires_at) if expires_at else int(time.time()) + signed_link_ttl_for_kind(kind, ttl_seconds)
+    if expires_at is not None:
+        resolved_expires_at = int(expires_at)
+    else:
+        ttl = signed_link_ttl_for_kind(kind, ttl_seconds)
+        resolved_expires_at = 0 if ttl == 0 else int(time.time()) + ttl
     message = _message(
         kind=kind,
         worker_id=worker_id,
@@ -439,7 +447,7 @@ def verify_signed_link(
         exp_int = int(str(expires_at or ""))
     except ValueError:
         return False
-    if exp_int < int(time.time()):
+    if exp_int > 0 and exp_int < int(time.time()):
         return False
     message = _message(
         kind=kind,
@@ -474,6 +482,7 @@ def sign_link_token(
     secret = signed_link_secret()
     if not secret:
         return ""
+    ttl = signed_link_ttl_for_kind(kind, ttl_seconds)
     payload = {
         "v": 1,
         "kind": str(kind or ""),
@@ -482,7 +491,7 @@ def sign_link_token(
         "owner_id": str(owner_id or ""),
         "path": str(path or ""),
         "iat": int(time.time()),
-        "exp": int(time.time()) + signed_link_ttl_for_kind(kind, ttl_seconds),
+        "exp": 0 if ttl == 0 else int(time.time()) + ttl,
     }
     encoded = _base64url_encode(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     return f"{encoded}.{_signature(secret, encoded)}"
@@ -508,7 +517,7 @@ def _decode_signed_link_token(token: str, *, allow_expired: bool = False) -> dic
         expires_at = int(payload.get("exp") or 0)
     except (TypeError, ValueError):
         return None
-    if expires_at < int(time.time()) and not allow_expired:
+    if expires_at > 0 and expires_at < int(time.time()) and not allow_expired:
         return None
     return payload
 

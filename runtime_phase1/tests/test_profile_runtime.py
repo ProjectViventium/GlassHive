@@ -1127,7 +1127,7 @@ def test_codex_cli_provider_config_clamps_xhigh_without_route_proof(tmp_path, mo
     assert worker["_effort_projection"] == {
         "requested": "xhigh",
         "effective": "medium",
-        "allowed": ["high", "low", "medium", "minimal", "none"],
+        "allowed": ["high", "low", "medium", "none"],
         "route_proven": False,
         "fallback_reason": "xhigh_route_not_proven",
     }
@@ -1137,6 +1137,7 @@ def test_codex_cli_provider_config_clamps_xhigh_without_route_proof(tmp_path, mo
 def test_codex_cli_provider_config_disables_web_search_for_minimal_effort(tmp_path, monkeypatch):
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_ALLOWED_REASONING_EFFORTS", "none,minimal,low,medium,high")
     worker = {
         "worker_id": "wrk_effort",
         "bootstrap_bundle_json": json.dumps({"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "minimal"}}),
@@ -1150,6 +1151,31 @@ def test_codex_cli_provider_config_disables_web_search_for_minimal_effort(tmp_pa
     assert 'web_search="disabled"' in joined
     assert "--disable\nimage_generation" in joined
     assert "--disable\nweb_search" not in joined
+
+
+def test_codex_cli_provider_config_clamps_minimal_without_route_allowlist(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
+    worker = {
+        "worker_id": "wrk_effort",
+        "profile": "codex-cli",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "minimal"}}),
+    }
+
+    command: list[str] = []
+    runtime._append_codex_compatible_provider_config(command, worker)
+
+    joined = "\n".join(command)
+    assert 'model_reasoning_effort="medium"' in joined
+    assert 'model_reasoning_effort="minimal"' not in joined
+    assert 'web_search="disabled"' not in joined
+    assert worker["_effort_projection"] == {
+        "requested": "minimal",
+        "effective": "medium",
+        "allowed": ["high", "low", "medium", "none"],
+        "route_proven": False,
+        "fallback_reason": "requested_effort_not_allowed",
+    }
 
 
 def test_codex_cli_provider_config_supports_none_reasoning_effort(tmp_path, monkeypatch):

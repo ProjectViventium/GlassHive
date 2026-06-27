@@ -230,6 +230,19 @@ def _ai_worker_browser_native_host_bootstrap_script() -> str:
             "Path(manifest_path).write_text(json.dumps(data, indent=2) + '\\n', encoding='utf-8')",
             "PY",
             "}",
+            "remove_disabled_extension_state() {",
+            '  local extension_id="$1" host_name="$2"',
+            '  local profile_root',
+            '  for profile_root in "${home_dir}/.config/chromium" "${home_dir}/.config/google-chrome"; do',
+            '    if [ -d "$profile_root" ]; then',
+            '      find "$profile_root" -path "*/Extensions/${extension_id}" -prune -exec rm -rf {} + 2>/dev/null || true',
+            "    fi",
+            "  done",
+            '  local native_dir',
+            '  for native_dir in "${native_host_dirs[@]}"; do',
+            '    rm -f "${native_dir}/${host_name}.json" 2>/dev/null || true',
+            "  done",
+            "}",
             "install_claude_native_host() {",
             '  local claude_bin="${WPR_CLAUDE_CODE_BIN:-}"',
             '  if [ -z "$claude_bin" ]; then claude_bin="$(command -v claude || true)"; fi',
@@ -320,8 +333,8 @@ def _ai_worker_browser_native_host_bootstrap_script() -> str:
             "  done",
             '  printf "codex native-host installed\\n"',
             "}",
-            'if [ "$install_claude_native_host" = "1" ]; then install_claude_native_host; else printf "claude-code native-host disabled\\n"; fi',
-            'if [ "$install_codex_native_host" = "1" ]; then install_codex_native_host; else printf "codex native-host disabled\\n"; fi',
+            'if [ "$install_claude_native_host" = "1" ]; then install_claude_native_host; else remove_disabled_extension_state "$claude_extension_id" "$claude_host_name"; printf "claude-code native-host disabled\\n"; fi',
+            'if [ "$install_codex_native_host" = "1" ]; then install_codex_native_host; else remove_disabled_extension_state "$codex_extension_id" "$codex_host_name"; printf "codex native-host disabled\\n"; fi',
         ]
     )
 
@@ -351,7 +364,7 @@ def _safe_docker_exec_env(env: dict[str, str] | None) -> dict[str, str]:
 
 class DockerSandboxManager:
     _build_lock = Lock()
-    _default_image = "workers-projects-runtime-workstation:phase1-node22-docs6"
+    _default_image = "workers-projects-runtime-workstation:phase1-node22-docs7"
 
     def __init__(self, base_dir: str | None = None) -> None:
         self.base_dir = Path(base_dir) if base_dir else Path(__file__).resolve().parents[2] / "data"

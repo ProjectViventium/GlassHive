@@ -12,7 +12,8 @@ const queueShortcutLabel = isApplePlatform ? '⌘+Enter' : 'Ctrl+Enter';
 const LONG_PRESS_MS = 550;
 const ACTIVE_REFRESH_MS = 2000;
 const IDLE_REFRESH_MS = 10000;
-const GLASSHIVE_UI_REV = '20260623a';
+const GLASSHIVE_UI_REV = '20260626a';
+const workspaceApiBase = `/api/workspace/${workerId}`;
 
 const frame = document.getElementById('desktop-frame');
 const overlay = document.getElementById('stage-overlay');
@@ -338,6 +339,31 @@ function setSurface(surface, { force = false } = {}) {
   setOverlay(state || 'starting');
 }
 
+function redactLiveProgressText(value) {
+  return String(value || '')
+    .replace(/([?&](?:gh_token|gh_sig|token|signature|sig)=)[^\s&"'<>)]*/gi, '$1[redacted]')
+    .replace(/(ghr_)[A-Za-z0-9_-]+/g, '$1[redacted]');
+}
+
+function liveProgressText(data) {
+  const consolePayload = data?.console || {};
+  const raw = String(consolePayload.stdout || consolePayload.stderr || '').trim();
+  if (!raw) return '';
+  const redacted = redactLiveProgressText(raw).trim();
+  if (redacted.length <= 2400) return redacted;
+  return `...\n${redacted.slice(-2400)}`;
+}
+
+function summarizeLiveProgress(text) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const line = lines[lines.length - 1] || '';
+  if (!line) return '';
+  return line.length <= 180 ? line : `${line.slice(0, 177)}...`;
+}
+
 function summarizeOutput(data) {
   const runState = String(data.latest_run?.state || '').trim();
   const raw = String(data.latest_output || '').trim();
@@ -382,14 +408,16 @@ function summarizeOutput(data) {
     const summary = activeSurface === 'desktop'
       ? 'Workspace is actively executing. You are watching the live desktop for this run.'
       : 'Workspace is actively executing. You are attached to the exact live session for this run.';
+    const progressText = liveProgressText(data);
+    const progressSummary = summarizeLiveProgress(progressText);
     const full = raw || (activeSurface === 'desktop'
       ? 'Workspace is actively executing. You are watching the live desktop. Switch to Watch exact live session from the menu if you want the raw terminal session.'
       : 'Workspace is actively executing. Open the current view or steer the workspace from the ribbon controls if you need to intervene.');
     return {
       label: 'Live status',
       panelTitle: 'Live session details',
-      summary,
-      full,
+      summary: progressSummary ? `Live progress: ${progressSummary}` : summary,
+      full: raw || progressText || full,
     };
   }
 
@@ -577,7 +605,7 @@ function renderOutput(data) {
 }
 
 async function postAction(action, payload) {
-  const response = await fetch(withAuth(`/api/worker/${workerId}/${action.startsWith('action:') ? 'action/' + action.split(':', 2)[1] : action}`), {
+  const response = await fetch(withAuth(`${workspaceApiBase}/${action.startsWith('action:') ? 'action/' + action.split(':', 2)[1] : action}`), {
     method: 'POST',
     headers: payload ? { 'Content-Type': 'application/json' } : {},
     body: payload ? JSON.stringify(payload) : undefined,
@@ -593,7 +621,7 @@ async function submitFooterInstruction(mode) {
   if (!message) return;
   const path = mode === 'queue' ? 'message' : 'steer';
   try {
-    const response = await fetch(withAuth(`/api/worker/${workerId}/${path}`), {
+    const response = await fetch(withAuth(`${workspaceApiBase}/${path}`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message }),
@@ -626,7 +654,8 @@ async function submitFooterInstruction(mode) {
 }
 
 function setOverlay(state, detail) {
-  const connecting = attachStartedAt && !frameReady && Date.now() - attachStartedAt < 12000;
+  const completed = state === 'completed';
+  const connecting = !completed && attachStartedAt && !frameReady && Date.now() - attachStartedAt < 12000;
   const filePreviewActive = activeSurface === 'desktop' && Boolean(filePreviewUrl());
   const waiting = state === 'starting' || state === 'paused' || state === 'idle' || state === 'idle_terminated' || state === 'stopped' || connecting;
   overlay.hidden = !waiting;
@@ -692,7 +721,7 @@ async function refresh() {
   }
   refreshInFlight = true;
   try {
-    const response = await fetch(withAuth(`/api/worker/${workerId}/live`));
+    const response = await fetch(withAuth(`${workspaceApiBase}/live`));
     if (!response.ok) return;
     const data = await response.json();
     const worker = data.worker;

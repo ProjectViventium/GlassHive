@@ -2195,7 +2195,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         raw = os.environ.get("WPR_CODEX_CLI_ALLOWED_REASONING_EFFORTS", "").strip()
         valid = {"none", "minimal", "low", "medium", "high", "xhigh"}
         if not raw:
-            allowed = {"none", "minimal", "low", "medium", "high"}
+            allowed = {"none", "low", "medium", "high"}
             if self._codex_xhigh_route_proven():
                 allowed.add("xhigh")
             return allowed

@@ -52,6 +52,7 @@ NON_DELIVERABLE_DIR_NAMES = {
     "node_modules",
 }
 NON_DELIVERABLE_PATH_PREFIXES = {
+    ("scheduled-prompt",),
     ("tmp",),
     ("uploads",),
 }

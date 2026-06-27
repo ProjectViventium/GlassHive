@@ -1499,6 +1499,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             "watch_url": _append_signed_worker_token(watch_url, str(worker_id), identity),
         }
 
+    @app.get("/api/workspace/{worker_id}/live")
     @app.get("/api/worker/{worker_id}/live")
     def worker_live(request: Request, worker_id: str) -> JSONResponse:
         active_client = _client_for_request(request, worker_id, internal_details=True)
@@ -1598,14 +1599,17 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             except Exception:
                 return
 
+    @app.post("/api/workspace/{worker_id}/message")
     @app.post("/api/worker/{worker_id}/message")
     def worker_message(request: Request, worker_id: str, payload: MessageRequest) -> dict[str, Any]:
         return _client_for_request(request, worker_id).message(worker_id, payload.message)
 
+    @app.post("/api/workspace/{worker_id}/steer")
     @app.post("/api/worker/{worker_id}/steer")
     def worker_steer(request: Request, worker_id: str, payload: MessageRequest) -> dict[str, Any]:
         return _client_for_request(request, worker_id).steer(worker_id, payload.message)
 
+    @app.api_route("/api/workspace/{worker_id}/metadata", methods=["POST", "PATCH"])
     @app.api_route("/api/worker/{worker_id}/metadata", methods=["POST", "PATCH"])
     def worker_metadata(request: Request, worker_id: str, payload: MetadataRequest) -> dict[str, Any]:
         payload_dict = (
@@ -1618,6 +1622,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             payload_dict,
         )
 
+    @app.post("/api/workspace/{worker_id}/action/{action}")
     @app.post("/api/worker/{worker_id}/action/{action}")
     def worker_action(
         request: Request,
