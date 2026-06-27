@@ -53,6 +53,7 @@ from workers_projects_runtime.signed_links import (
     revoke_signed_link_refs_for_worker,
     sign_link_params,
     sign_link_token,
+    verify_signed_link,
     verify_signed_link_token,
 )
 from workers_projects_runtime.store import Store
@@ -518,15 +519,22 @@ def test_completed_file_callback_adds_signed_open_download_and_watch_links(tmp_p
         assert completed["deliverable"]["workspace_path"] == "answer.txt"
         assert "/v1/signed-links/" not in completed["message"]
         assert "gh_token=" not in completed["message"]
-        assert "File: [Open GlassHive file](https://glasshive-api.example.test/v1/link-refs/" in completed["message"]
-        assert "Download: [Download file]" not in completed["message"]
+        assert "File: [Download file](https://glasshive-api.example.test/v1/link-refs/" in completed["message"]
+        assert "Preview: [Open GlassHive file](https://glasshive-api.example.test/v1/link-refs/" in completed["message"]
         assert "View / Steer: [Open GlassHive workspace](https://glasshive-ui.example.test/r/" in completed["message"]
-        assert completed["message"].index("File: [Open GlassHive file]") < completed["message"].index("View / Steer:")
-        artifact_match = re.search(r"https://glasshive-api\.example\.test/v1/link-refs/([A-Za-z0-9_-]+)", completed["message"])
-        assert artifact_match
-        artifact_record = resolve_signed_link_ref(artifact_match.group(1))
-        assert artifact_record is not None
-        assert artifact_record["kind"] == "artifact_open"
+        assert completed["message"].index("File: [Download file]") < completed["message"].index("Preview:")
+        assert completed["message"].index("Preview:") < completed["message"].index("View / Steer:")
+        artifact_matches = re.findall(
+            r"https://glasshive-api\.example\.test/v1/link-refs/([A-Za-z0-9_-]+)",
+            completed["message"],
+        )
+        assert len(artifact_matches) >= 2
+        download_record = resolve_signed_link_ref(artifact_matches[0])
+        assert download_record is not None
+        assert download_record["kind"] == "artifact_download"
+        preview_record = resolve_signed_link_ref(artifact_matches[1])
+        assert preview_record is not None
+        assert preview_record["kind"] == "artifact_open"
         watch_match = re.search(r"https://glasshive-ui\.example\.test/r/([A-Za-z0-9_-]+)", completed["message"])
         assert watch_match
         watch_record = resolve_signed_link_ref(watch_match.group(1))
@@ -2027,6 +2035,46 @@ def test_worker_view_signed_links_are_capped_by_watch_session_duration(monkeypat
 
     assert payload is not None
     assert int(payload["exp"]) - now <= 121
+
+
+def test_signed_link_ttl_zero_means_non_expiring_opaque_token(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_TTL_S", "0")
+
+    token = sign_link_token(
+        kind="artifact_download",
+        worker_id="wrk_publicsafe",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="artifacts/report.txt",
+    )
+    payload = verify_signed_link_token(token)
+
+    assert payload is not None
+    assert payload["exp"] == 0
+
+
+def test_legacy_signed_link_exp_zero_means_non_expiring(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    params = sign_link_params(
+        kind="artifact_download",
+        worker_id="wrk_publicsafe",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="artifacts/report.txt",
+        expires_at=0,
+    )
+
+    assert params["gh_exp"] == "0"
+    assert verify_signed_link(
+        kind="artifact_download",
+        worker_id="wrk_publicsafe",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="artifacts/report.txt",
+        expires_at=params["gh_exp"],
+        signature=params["gh_sig"],
+    )
 
 
 def test_runtime_sensitive_url_log_filter_redacts_signed_tokens():
@@ -3743,6 +3791,48 @@ def test_reconcile_collects_completed_run_before_orphaning_missing_process(tmp_p
     payload = json.loads(callbacks[0]["payload_json"])
     assert payload["event"] == "run.completed"
     assert payload["run_state"] == "completed"
+
+
+def test_reconcile_collects_completed_run_even_when_takeover_session_has_pid(tmp_path):
+    class CompletedStillAttachedRuntime(StubRuntime):
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            info = super().reconcile_worker(worker)
+            info.pid = 4242
+            return info
+
+        def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
+            return {
+                "state": "completed",
+                "output_text": "FINAL REPORT:\nRecovered from attached completed session.",
+            }
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, CompletedStillAttachedRuntime())
+    try:
+        project = store.create_project("owner", "Attached Recovery", "Collect completed attached run", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Worker",
+            role="worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+        run = store.create_run(worker["worker_id"], project["project_id"], "Attached task", state="running")
+
+        service.reconcile_all_workers()
+    finally:
+        service.shutdown()
+
+    recovered_run = store.get_run(run["run_id"])
+    assert recovered_run["state"] == "completed"
+    assert "attached completed session" in recovered_run["output_text"]
+    assert store.get_worker(worker["worker_id"])["state"] == "ready"
+    assert store.metrics()["active_runs"] == 0
+    assert not any(event["event_type"] == "run.orphaned" for event in store.list_events(worker["worker_id"]))
 
 
 def test_reconcile_continues_when_one_completed_run_collection_raises(tmp_path):
@@ -5951,6 +6041,21 @@ def test_provider_failure_after_fresh_artifact_is_delivered_as_completed(tmp_pat
 
 def test_evidence_failure_is_not_recovered_as_completed(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive-ui.example.test")
+    payloads: list[dict] = []
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def capture_post(url, *, content, headers, timeout):
+        _ = url, headers, timeout
+        payloads.append(json.loads(content.decode("utf-8")))
+        return Response()
+
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", capture_post)
     db_path = tmp_path / "runtime.db"
     runtime = EvidenceFailureWithCompletedRecoveryRuntime(tmp_path / "workers")
     client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
@@ -5960,7 +6065,22 @@ def test_evidence_failure_is_not_recovered_as_completed(tmp_path, monkeypatch):
     ).json()
     worker = client.post(
         f"/v1/projects/{project['project_id']}/workers",
-        json={"owner_id": "demo-owner", "name": "Codex Worker", "role": "research", "profile": "codex-cli"},
+        json={
+            "owner_id": "demo-owner",
+            "name": "Codex Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "bootstrap_bundle": {
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                    "conversation_id": "conv-1",
+                    "parent_message_id": "msg-user",
+                    "message_id": "msg-assistant",
+                    "surface": "web",
+                }
+            },
+        },
     ).json()
 
     run = client.post(
@@ -5973,6 +6093,13 @@ def test_evidence_failure_is_not_recovered_as_completed(tmp_path, monkeypatch):
     assert failed["failure_class"] == "glasshive_evidence_check_failed"
     assert "missing xlsx" in failed["error_text"]
     assert runtime.collect_run_ids == []
+    wait_until(lambda: any(payload.get("event") == "run.failed" for payload in payloads), timeout=3.0)
+    failed_payload = next(payload for payload in payloads if payload.get("event") == "run.failed")
+    assert failed_payload["failure_code"] == "glasshive_evidence_check_failed"
+    assert failed_payload["failure_class"] == "glasshive_evidence_check_failed"
+    assert failed_payload["deliverable"]["workspace_path"] == "artifacts/invalid_completion.md"
+    assert "Preview: [Open GlassHive file](" in failed_payload["message"]
+    assert "Download file" in failed_payload["message"]
     events = client.get(f"/v1/workers/{worker['worker_id']}/events").json()["items"]
     assert any(item["event_type"] == "run.failed" for item in events)
     assert not any(item["event_type"] == "run.completed" for item in events)
@@ -6509,10 +6636,11 @@ def test_completed_web_callback_includes_operator_url_and_deliverable(tmp_path, 
         assert payload["deliverable"]["browser_url"] == "file:///workspace/project/index.html"
         assert "/v1/signed-links/" not in payload["message"]
         assert "gh_token=" not in payload["message"]
-        assert "File: [Open GlassHive file](http://127.0.0.1:8780/v1/link-refs/" in payload["message"]
-        assert "Download: [Download file]" not in payload["message"]
+        assert "File: [Download file](http://127.0.0.1:8780/v1/link-refs/" in payload["message"]
+        assert "Preview: [Open GlassHive file](http://127.0.0.1:8780/v1/link-refs/" in payload["message"]
         assert "View / Steer: [Open GlassHive workspace]" in payload["message"]
-        assert payload["message"].index("File: [Open GlassHive file]") < payload["message"].index("View / Steer:")
+        assert payload["message"].index("File: [Download file]") < payload["message"].index("Preview:")
+        assert payload["message"].index("Preview:") < payload["message"].index("View / Steer:")
 
 
 def test_artifact_open_page_previews_text_without_forcing_download(tmp_path, monkeypatch):
@@ -6558,23 +6686,23 @@ def test_artifact_open_page_previews_text_without_forcing_download(tmp_path, mon
         opened_download_href = href_for_link_text(opened.text, "Download file")
         assert_link_ref_url(opened_download_href, prefix="/v1/link-refs/", kind="artifact_download")
         workspace_href = href_for_link_text(opened.text, "View workspace")
-        workspace_record = assert_link_ref_url(workspace_href, prefix="/w/", kind="worker_view")
-        assert workspace_record["target_url"] == ""
-        workspace_view = client.get(workspace_href)
-        assert workspace_view.status_code == 200
-        assert "managed workspace" in workspace_view.text
+        workspace_record = assert_link_ref_url(workspace_href, prefix="/r/", kind="worker_view")
+        assert workspace_record["target_url"].startswith(f"/watch/{worker['worker_id']}?")
+        assert "gh_token=" in workspace_record["target_url"]
+        workspace_view = client.get(workspace_href, follow_redirects=False)
+        assert workspace_view.status_code == 307
+        assert workspace_view.headers["location"].startswith(f"/watch/{worker['worker_id']}?")
+        assert "gh_token=" not in workspace_view.headers["location"]
+        workspace_cookie = next(
+            (cookie for cookie in workspace_view.headers.get_list("set-cookie") if cookie.startswith("glasshive_gh_token_")),
+            "",
+        )
+        assert workspace_cookie
         assert "How to take over" not in workspace_view.text
         assert worker["worker_id"] not in workspace_view.text
         assert project["project_id"] not in workspace_view.text
         assert "/ui/workers/" not in workspace_view.text
         assert "/watch/" not in workspace_view.text
-        desktop_response = client.get(f"{workspace_href}/desktop", follow_redirects=False)
-        assert desktop_response.status_code == 200
-        assert worker["worker_id"] not in desktop_response.text
-        assert project["project_id"] not in desktop_response.text
-        desktop_frame = client.get(f"{workspace_href}/desktop-frame", follow_redirects=False)
-        assert desktop_frame.status_code == 307
-        assert desktop_frame.headers["location"]
         opened_download = client.get(opened_download_href)
         assert opened_download.status_code == 200
         assert "attachment" in opened_download.headers["content-disposition"]
@@ -6718,12 +6846,16 @@ def test_enterprise_signed_artifact_open_page_actions_remain_signed(tmp_path, mo
     download_href = href_for_link_text(opened.text, "Download file")
     workspace_href = href_for_link_text(opened.text, "View workspace")
     assert_link_ref_url(download_href, prefix="/v1/link-refs/", kind="artifact_download")
-    workspace_record = assert_link_ref_url(workspace_href, prefix="/w/", kind="worker_view")
-    assert "gh_token=" not in workspace_record["target_url"]
+    workspace_record = assert_link_ref_url(workspace_href, prefix="/r/", kind="worker_view")
+    assert workspace_record["target_url"].startswith(f"/watch/{worker['worker_id']}?")
+    assert "gh_token=" in workspace_record["target_url"]
     assert "gh_token=" not in workspace_href
     assert 'target="_top"' in anchor_for_link_text(opened.text, "View workspace")
-    workspace_view = client.get(workspace_href, headers=headers)
-    assert workspace_view.status_code == 200
+    workspace_view = client.get(workspace_href, headers=headers, follow_redirects=False)
+    assert workspace_view.status_code == 307
+    assert workspace_view.headers["location"].startswith(f"/watch/{worker['worker_id']}?")
+    assert "gh_token=" not in workspace_view.headers["location"]
+    assert any(cookie.startswith("glasshive_gh_token_") for cookie in workspace_view.headers.get_list("set-cookie"))
     assert "How to take over" not in workspace_view.text
     assert worker["worker_id"] not in workspace_view.text
     assert project["project_id"] not in workspace_view.text

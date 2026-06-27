@@ -85,6 +85,14 @@ def _bounded_float_env(name: str, default: float, *, min_value: float, max_value
     return max(min_value, min(value, max_value))
 
 
+def _env_truthy(name: str) -> bool:
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _enterprise_mode_enabled() -> bool:
+    return _env_truthy("GLASSHIVE_ENTERPRISE_MODE") or _env_truthy("WPR_ENTERPRISE_MODE")
+
+
 class HostWorkersDisabledError(RuntimeError):
     pass
 
@@ -259,7 +267,13 @@ def merge_bootstrap_bundle(existing: dict | None, incoming: dict | None) -> dict
 
 
 class WorkersProjectsService:
-    def __init__(self, store: Store, runtime: WorkerRuntime, max_workers: int = 8) -> None:
+    def __init__(
+        self,
+        store: Store,
+        runtime: WorkerRuntime,
+        max_workers: int = 8,
+        reconcile_on_startup: bool | None = None,
+    ) -> None:
         self.store = store
         self.runtime = runtime
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="wpr-runner")
@@ -270,7 +284,10 @@ class WorkersProjectsService:
         self._worker_create_lock = Lock()
         self._deliverable_promotions_lock = Lock()
         self._deliverable_promotions: set[str] = set()
-        self.reconcile_all_workers()
+        if reconcile_on_startup is None:
+            reconcile_on_startup = not _enterprise_mode_enabled()
+        if reconcile_on_startup:
+            self.reconcile_all_workers()
         self.executor.submit(self._replay_pending_callbacks)
         self._callback_retry_thread = Thread(
             target=self._callback_retry_loop,
@@ -703,9 +720,12 @@ class WorkersProjectsService:
         links: list[str] = []
         workspace_path = str((deliverable or {}).get("workspace_path") or "").strip()
         if deliverable and workspace_path:
+            download_url = self._signed_artifact_download_url(worker, workspace_path)
+            if download_url:
+                links.append(f"File: [Download file]({download_url})")
             open_url = self._signed_artifact_open_url(worker, workspace_path)
             if open_url:
-                links.append(f"File: [Open GlassHive file]({open_url})")
+                links.append(f"Preview: [Open GlassHive file]({open_url})")
         watch_url = self._signed_watch_url(worker, callbacks)
         if watch_url:
             links.append(f"View / Steer: [Open GlassHive workspace]({watch_url})")
@@ -777,6 +797,11 @@ class WorkersProjectsService:
             "telegram_user_id": callbacks.get("telegram_user_id"),
             "telegram_message_id": callbacks.get("telegram_message_id"),
         }
+        failure_class = str((run or {}).get("failure_class") or "").strip()
+        if failure_class:
+            payload["failure_code"] = failure_class
+            payload["failure_class"] = failure_class
+            payload["failure_retryable"] = bool((run or {}).get("failure_retryable"))
         if deliverable:
             payload["deliverable"] = deliverable
         if operator_url:
@@ -1827,65 +1852,61 @@ class WorkersProjectsService:
     def _reconcile_worker_row(self, worker: dict) -> None:
         if worker["state"] == "terminated":
             return
+        active_run = self.store.get_active_run(worker["worker_id"])
+        if active_run:
+            recovered = self._collect_completed_run(worker, active_run)
+            if recovered:
+                self._apply_recovered_run(worker, active_run, recovered)
+                return
         if worker["state"] == "paused":
-            active_run = self.store.get_active_run(worker["worker_id"])
             if active_run:
-                recovered = self._collect_completed_run(worker, active_run)
-                if recovered:
-                    self._apply_recovered_run(worker, active_run, recovered)
-                else:
-                    orphaned_run = self.store.finalize_run_if_state(
+                orphaned_run = self.store.finalize_run_if_state(
+                    active_run["run_id"],
+                    "running",
+                    "interrupted",
+                    error_text="Worker was paused during reconcile",
+                )
+                if orphaned_run:
+                    self.store.add_event(
+                        worker["project_id"],
+                        worker["worker_id"],
                         active_run["run_id"],
-                        "running",
-                        "interrupted",
-                        error_text="Worker was paused during reconcile",
+                        "run.orphaned",
+                        "Active run interrupted because the worker was paused during reconcile",
                     )
-                    if orphaned_run:
-                        self.store.add_event(
-                            worker["project_id"],
-                            worker["worker_id"],
-                            active_run["run_id"],
-                            "run.orphaned",
-                            "Active run interrupted because the worker was paused during reconcile",
-                        )
-                        self._emit_callback(
-                            worker,
-                            "run.interrupted",
-                            run=orphaned_run,
-                            message="Worker was paused during reconcile",
-                        )
+                    self._emit_callback(
+                        worker,
+                        "run.interrupted",
+                        run=orphaned_run,
+                        message="Worker was paused during reconcile",
+                    )
             return
         info = self.runtime.reconcile_worker(worker)
         state = worker["state"]
         if state in {"running", "ready", "starting"}:
             state = "ready" if info.pid else "paused"
         if not info.pid:
-            active_run = self.store.get_active_run(worker["worker_id"])
             if active_run:
-                recovered = self._collect_completed_run(worker, active_run)
-                if recovered:
-                    self._apply_recovered_run(worker, active_run, recovered)
-                else:
-                    orphaned_run = self.store.finalize_run_if_state(
+                orphaned_run = self.store.finalize_run_if_state(
+                    active_run["run_id"],
+                    "running",
+                    "interrupted",
+                    error_text="Worker process was not running during reconcile",
+                )
+                if orphaned_run:
+                    self.store.add_event(
+                        worker["project_id"],
+                        worker["worker_id"],
                         active_run["run_id"],
-                        "running",
-                        "interrupted",
-                        error_text="Worker process was not running during reconcile",
+                        "run.orphaned",
+                        "Active run interrupted because the worker process was not running",
                     )
-                    if orphaned_run:
-                        self.store.add_event(
-                            worker["project_id"],
-                            worker["worker_id"],
-                            active_run["run_id"],
-                            "run.orphaned",
-                            "Active run interrupted because the worker process was not running",
-                        )
-                        self._emit_callback(
-                            worker,
-                            "run.interrupted",
-                            run=orphaned_run,
-                            message="Worker process was not running during reconcile",
-                        )
+                    self._emit_callback(
+                        worker,
+                        "run.interrupted",
+                        run=orphaned_run,
+                        message="Worker process was not running during reconcile",
+                    )
         self._apply_runtime_info(worker["worker_id"], info, state=state, last_error=worker.get("last_error") or "")
 
     def require_project(self, project_id: str) -> dict:

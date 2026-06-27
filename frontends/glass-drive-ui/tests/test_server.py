@@ -843,6 +843,7 @@ def test_launcher_workspace_hive_static_controls():
     styles_css = (static_dir / "styles.css").read_text(encoding="utf-8")
     watch_html = (static_dir / "watch.html").read_text(encoding="utf-8")
     watch_js = (static_dir / "watch.js").read_text(encoding="utf-8")
+    desktop_html = (static_dir / "desktop.html").read_text(encoding="utf-8")
     assert "workspace-live-frame" in app_js
     assert "MAX_LIVE_TILE_IFRAMES" in app_js
     assert "RETAINED_TILE_REFRESH_MS" in app_js
@@ -871,6 +872,15 @@ def test_launcher_workspace_hive_static_controls():
     assert "runtime.view_available" in desktop_js
     assert "desktopRefreshInFlight" in desktop_js
     assert "scheduleDesktopRefresh" in desktop_js
+    assert "isSettledWorkspaceState" in desktop_js
+    assert "viewHealthHealthy" in desktop_js
+    assert "ACTIVE_WORKER_STATES" in desktop_js
+    assert "showSettledWorkspaceStatus" in desktop_js
+    assert "settledDesktopSuppressed" in desktop_js
+    assert "Workspace complete" in desktop_js
+    assert "The latest output and workspace files are available from the status panel" in desktop_js
+    assert "Clipboard sync: inactive until workspace resumes" in desktop_js
+    assert "desktop.js?v=20260625a" in desktop_html
     assert "}, 5000);" not in desktop_js
     assert 'id="project-files"' in index_html
     assert 'id="schedule-text"' in index_html
@@ -886,6 +896,11 @@ def test_launcher_workspace_hive_static_controls():
     assert "Use Resume to continue from the same state" in watch_js
     assert "IDLE_REFRESH_MS" in watch_js
     assert "refreshInFlight" in watch_js
+    assert "const GLASSHIVE_UI_REV = '20260626a'" in watch_js
+    assert "const workspaceApiBase = `/api/workspace/${workerId}`" in watch_js
+    assert "/api/worker/${workerId}/live" not in watch_js
+    assert '@app.get("/api/workspace/{worker_id}/live")' in (Path(server_module.__file__).read_text(encoding="utf-8"))
+    assert "const connecting = !completed && attachStartedAt" in watch_js
     assert "function filePreviewUrl()" in watch_js
     assert "function fileDeliverableKey(deliverable, runId)" in watch_js
     assert "function isFilePreviewUrl(url)" in watch_js
@@ -895,8 +910,13 @@ def test_launcher_workspace_hive_static_controls():
     assert "syncResultActions(currentDeliverable)" in watch_js
     assert 'id="artifact-list"' in watch_html
     assert "function syncArtifactList(items)" in watch_js
+    assert "function liveProgressText(data)" in watch_js
+    assert "consolePayload.stdout || consolePayload.stderr" in watch_js
+    assert "Live progress:" in watch_js
+    assert "gh_token|gh_sig|token|signature|sig" in watch_js
     assert "data.artifacts?.items || []" in watch_js
     assert "Workspace files" in watch_js
+    assert "watch.js?v=20260626a" in watch_html
     assert ".artifact-row" in styles_css
     assert "artifact-list-more" in watch_js
     assert ".artifact-list-more" in styles_css

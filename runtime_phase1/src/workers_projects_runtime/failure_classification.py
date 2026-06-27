@@ -56,7 +56,7 @@ def classify_cli_failure(
             ),
             diagnostic_summary=diagnostic_summary,
         )
-    if "too many requests" in lowered or "rate limit" in lowered or "rate_limit" in lowered or "429" in lowered:
+    if _looks_like_rate_limit_failure(lowered):
         return FailureClassification(
             failure_class="provider_rate_limited",
             retryable=True,
@@ -73,7 +73,7 @@ def classify_cli_failure(
         "request rejected" in lowered
         or "invalid_request_error" in lowered
         or "invalid request" in lowered
-        or ("400" in lowered and "bad request" in lowered)
+        or (_has_contextual_status_code(lowered, ("400",)) and "bad request" in lowered)
     ):
         return FailureClassification(
             failure_class="provider_request_rejected",
@@ -100,15 +100,7 @@ def classify_cli_failure(
             ),
             diagnostic_summary=diagnostic_summary,
         )
-    if (
-        "401" in lowered
-        or "403" in lowered
-        or "unauthorized" in lowered
-        or "invalid api key" in lowered
-        or "not logged in" in lowered
-        or "please run /login" in lowered
-        or "please run login" in lowered
-    ):
+    if _looks_like_provider_auth_failure(lowered):
         return FailureClassification(
             failure_class="provider_auth_missing",
             retryable=False,
@@ -221,15 +213,7 @@ def classify_runtime_error(
     actual_version = str(getattr(exc, "actual_version", "") or "").strip()
     recovery_hint = str(getattr(exc, "recovery_hint", "") or "").strip()
 
-    if (
-        "401" in lowered
-        or "403" in lowered
-        or "unauthorized" in lowered
-        or "invalid api key" in lowered
-        or "not logged in" in lowered
-        or "please run /login" in lowered
-        or "please run login" in lowered
-    ):
+    if _looks_like_provider_auth_failure(lowered):
         return FailureClassification(
             failure_class="provider_auth_missing",
             retryable=False,
@@ -370,7 +354,16 @@ def _extract_failure_strings(value: Any, *, path: str = "", failure_context: boo
         event_type = str(value.get("type") or value.get("event") or value.get("name") or "")
         status = str(value.get("status") or value.get("code") or value.get("error_code") or "")
         event_is_failure = bool(event_type and _looks_failure_related(event_type))
-        status_is_failure = bool(status and _looks_failure_related(status))
+        # Agent transcripts can contain failed exploratory sub-steps (for example a
+        # shell command probing whether a path exists) even when the overall turn
+        # completes successfully. Those are not provider/runtime failures; the
+        # run evidence verifier separately checks final output, artifacts, and
+        # constraints.
+        status_is_failure = bool(
+            status
+            and _looks_failure_related(status)
+            and not _is_agent_substep_status(value, event_type=event_type, path=path)
+        )
         if event_is_failure:
             results.append(f"{path or 'event'} type={event_type}")
         if status_is_failure:
@@ -392,6 +385,25 @@ def _extract_failure_strings(value: Any, *, path: str = "", failure_context: boo
         for index, child in enumerate(value):
             results.extend(_extract_failure_strings(child, path=f"{path}[{index}]", failure_context=failure_context))
     return results
+
+
+def _is_agent_substep_status(value: dict[str, Any], *, event_type: str, path: str) -> bool:
+    if not path:
+        return False
+    item_type = event_type.lower()
+    if item_type not in {
+        "command_execution",
+        "file_change",
+        "tool_call",
+        "tool_result",
+        "browser_action",
+        "computer_action",
+    }:
+        return False
+    if "item" not in path.split("."):
+        return False
+    # Keep structured provider errors visible even when nested.
+    return not _dict_has_failure_signal(value)
 
 
 def _dict_has_failure_signal(value: dict[str, Any]) -> bool:
@@ -457,6 +469,45 @@ def _looks_like_provider_service_failure(lowered: str, *, structured: bool = Fal
     )
 
 
+def _has_contextual_status_code(lowered: str, codes: tuple[str, ...]) -> bool:
+    for code in codes:
+        status_after_label = re.search(
+            rf"\b(?:api_error_status|status_code|status\s+code|http\s+status|response\s+status|http|status|code)"
+            rf"\D{{0,24}}{re.escape(code)}\b",
+            lowered,
+        )
+        status_before_reason = re.search(
+            rf"\b{re.escape(code)}\b\D{{0,48}}"
+            r"(?:unauthorized|forbidden|bad request|invalid request|too many requests|rate limit|"
+            r"overloaded|service unavailable|temporarily unavailable)",
+            lowered,
+        )
+        if status_after_label or status_before_reason:
+            return True
+    return False
+
+
+def _looks_like_rate_limit_failure(lowered: str) -> bool:
+    return (
+        "too many requests" in lowered
+        or "rate limit" in lowered
+        or "rate_limit" in lowered
+        or _has_contextual_status_code(lowered, ("429",))
+    )
+
+
+def _looks_like_provider_auth_failure(lowered: str) -> bool:
+    return (
+        "unauthorized" in lowered
+        or "forbidden" in lowered
+        or "invalid api key" in lowered
+        or "not logged in" in lowered
+        or "please run /login" in lowered
+        or "please run login" in lowered
+        or _has_contextual_status_code(lowered, ("401", "403"))
+    )
+
+
 def _looks_like_runtime_dependency_or_version_failure(lowered: str) -> bool:
     return (
         "requires node" in lowered
@@ -497,23 +548,22 @@ def _looks_failure_related(value: str) -> bool:
         "too many requests",
         "rate limit",
         "rate_limit",
-        "429",
-        "401",
-        "403",
         "unauthorized",
+        "forbidden",
         "invalid api key",
         "response.failed",
         "turn.failed",
         "api error",
         "api_error_status",
-        "529",
-        "503",
         "overloaded",
         "server-side issue",
         "service unavailable",
         "temporarily unavailable",
     )
-    return any(marker in lowered for marker in markers)
+    return any(marker in lowered for marker in markers) or _has_contextual_status_code(
+        lowered,
+        ("400", "401", "403", "429", "503", "529"),
+    )
 
 
 _FAILURE_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (

@@ -832,7 +832,7 @@ def test_ensure_image_defaults_to_no_forced_ai_worker_browser_extensions(tmp_pat
     manager._ensure_image()
 
     dockerfile = (manager.build_root / "Dockerfile").read_text()
-    assert manager.image.endswith(":phase1-node22-docs6")
+    assert manager.image.endswith(":phase1-node22-docs7")
     assert "@openai/codex@0.142.0" in dockerfile
     assert "@anthropic-ai/claude-code@2.1.186" in dockerfile
     assert "--cache /tmp/glasshive-npm-cache" in dockerfile
@@ -889,6 +889,35 @@ def test_ai_worker_browser_native_host_scripts_default_to_disabled(tmp_path):
     assert "claude-code native-host disabled" in result.stdout
     assert "codex native-host disabled" in result.stdout
     assert not (tmp_path / "home" / ".config" / "chromium" / "NativeMessagingHosts").exists()
+
+
+def test_ai_worker_browser_native_host_scripts_remove_disabled_managed_extension_state(tmp_path):
+    bootstrap_script = _ai_worker_browser_native_host_bootstrap_script()
+    home = tmp_path / "home"
+    for extension_id in ("fcoeoabgfenejglbffodgkkbkcdhcgfn", "hehggadaopoacecdllhhajmbjkdcmajg"):
+        stale = home / ".config" / "chromium" / "Default" / "Extensions" / extension_id / "1.0_0"
+        stale.mkdir(parents=True)
+        (stale / "manifest.json").write_text("{}\n")
+    native_dir = home / ".config" / "chromium" / "NativeMessagingHosts"
+    native_dir.mkdir(parents=True)
+    for host in ("com.anthropic.claude_code_browser_extension", "com.openai.codexextension"):
+        (native_dir / f"{host}.json").write_text("{}\n")
+
+    result = subprocess.run(
+        ["bash", "-c", bootstrap_script],
+        env={
+            **os.environ,
+            "HOME": str(home),
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not (home / ".config" / "chromium" / "Default" / "Extensions" / "fcoeoabgfenejglbffodgkkbkcdhcgfn").exists()
+    assert not (home / ".config" / "chromium" / "Default" / "Extensions" / "hehggadaopoacecdllhhajmbjkdcmajg").exists()
+    assert not (native_dir / "com.anthropic.claude_code_browser_extension.json").exists()
+    assert not (native_dir / "com.openai.codexextension.json").exists()
 
 
 def test_ai_worker_browser_native_host_scripts_are_valid_and_install_claude_manifest(monkeypatch, tmp_path):

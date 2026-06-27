@@ -5,12 +5,14 @@ import asyncio
 import base64
 import hmac
 import json
+import logging
 import math
 import os
 import re
 import shutil
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -18,7 +20,7 @@ from typing import Annotated, Any, Literal
 from urllib.parse import quote, urlparse
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -50,6 +52,8 @@ except Exception:  # pragma: no cover - optional dependency path differs by Fast
     get_http_headers = None  # type: ignore[assignment]
 
 load_viventium_runtime_env()
+
+LOGGER = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = os.environ.get("WPR_MCP_BASE_URL", "http://127.0.0.1:8766").rstrip("/")
 DEFAULT_HOST = os.environ.get("WPR_MCP_HOST", "127.0.0.1")
@@ -100,11 +104,11 @@ class GlassHiveBlockedError(RuntimeError):
 
 
 def _blocking_wait_max_seconds() -> float:
-    return max(0.0, float(os.environ.get("WPR_MCP_BLOCKING_WAIT_MAX_SEC", "1800") or "1800"))
+    return max(0.0, float(os.environ.get("WPR_MCP_BLOCKING_WAIT_MAX_SEC", "45") or "45"))
 
 
 def _blocking_wait_default_seconds() -> float:
-    configured = float(os.environ.get("WPR_MCP_BLOCKING_WAIT_DEFAULT_SEC", "1800") or "1800")
+    configured = float(os.environ.get("WPR_MCP_BLOCKING_WAIT_DEFAULT_SEC", "45") or "45")
     return max(0.0, min(configured, _blocking_wait_max_seconds()))
 
 
@@ -182,6 +186,25 @@ def _host_profile_available(profile: str) -> bool:
 def _runtime_dependency_blocked_payload(*, profile: str, execution_mode: str) -> dict[str, Any] | None:
     if execution_mode != "host":
         return None
+    if not _host_workers_enabled():
+        profile_hint = f" for `{profile}`" if profile else ""
+        return {
+            "status": "blocked",
+            "failure_class": "runtime_dependency_missing",
+            "failure_retryable": False,
+            "failure_user_message": (
+                f"GlassHive cannot start the selected host worker{profile_hint} because "
+                "host-native workers are disabled in this deployment."
+            ),
+            "failure_recommended_recovery": (
+                "Use sandbox/workstation execution when that still satisfies the user's request. "
+                "Ask the operator to enable host-native workers only when real local computer/session "
+                "access is required."
+            ),
+            "failure_diagnostic_summary": f"Host-native workers disabled for profile={profile} execution_mode={execution_mode}",
+            "profile": profile,
+            "execution_mode": execution_mode,
+        }
     binary = _host_profile_binary(profile)
     if shutil.which(binary) is None:
         label = binary.replace("\\", "/").rstrip("/").split("/")[-1] or binary
@@ -243,6 +266,7 @@ def _worker_capability_summary() -> str:
 
 
 HEADER_USER_ID = "x-viventium-user-id"
+HEADER_STORAGE_USER_ID = "x-viventium-storage-user-id"
 HEADER_TENANT_ID = "x-viventium-tenant-id"
 HEADER_USER_EMAIL = "x-viventium-user-email"
 HEADER_USER_ROLE = "x-viventium-user-role"
@@ -265,6 +289,7 @@ HEADER_FILE_IDS = "x-viventium-file-ids"
 HEADER_SERVICE_TOKEN = "x-wpr-token"
 HEADER_ALIASES = {
     HEADER_USER_ID: ("x-glasshive-user-id", "x-librechat-user-id"),
+    HEADER_STORAGE_USER_ID: ("x-glasshive-storage-user-id", "x-librechat-storage-user-id"),
     HEADER_TENANT_ID: ("x-glasshive-tenant-id", "x-librechat-tenant-id"),
     HEADER_USER_EMAIL: ("x-glasshive-user-email", "x-librechat-user-email"),
     HEADER_USER_ROLE: ("x-glasshive-user-role", "x-librechat-user-role"),
@@ -703,13 +728,13 @@ def glasshive_workers_server_instructions() -> str:
     )
 
 
-def _resolve_execution_mode(value: str | None) -> str:
+def _resolve_execution_mode(value: str | None, *, allow_disabled_host: bool = False) -> str:
     mode = str(value or "").strip().lower()
     if not mode:
         mode = _default_execution_mode()
     if mode not in {"docker", "host"}:
         raise ValueError("execution_mode must be either 'docker' or 'host'")
-    if mode == "host" and not _host_workers_enabled():
+    if mode == "host" and not allow_disabled_host and not _host_workers_enabled():
         raise ValueError("host-native GlassHive workers are disabled by GlassHive config")
     return mode
 
@@ -949,7 +974,12 @@ def _upload_root_candidates() -> list[Path]:
     return deduped
 
 
-def _trusted_virtual_upload_source(value: str, *, owner_id: str | None = None) -> str:
+def _trusted_virtual_upload_source(
+    value: str,
+    *,
+    owner_id: str | None = None,
+    storage_owner_id: str | None = None,
+) -> str:
     roots = _upload_root_candidates()
     if not roots or not value.startswith("/uploads/"):
         return ""
@@ -963,9 +993,9 @@ def _trusted_virtual_upload_source(value: str, *, owner_id: str | None = None) -
     if ".." in relative_path.split(os.path.sep):
         return ""
     if _enterprise_mode_enabled():
-        clean_owner = _safe_owner_path_component(owner_id)
+        allowed_owners = _upload_owner_path_components(owner_id, storage_owner_id)
         first_part = relative_path.split(os.path.sep, 1)[0]
-        if not clean_owner or first_part != clean_owner:
+        if not allowed_owners or first_part not in allowed_owners:
             return ""
     candidates = [root / relative_path for root in roots]
     for candidate in candidates:
@@ -990,6 +1020,166 @@ def _safe_owner_path_component(value: object) -> str:
     return clean
 
 
+def _upload_owner_path_components(*values: object) -> list[str]:
+    components: list[str] = []
+    for value in values:
+        clean = _safe_owner_path_component(value)
+        if clean and clean not in components:
+            components.append(clean)
+    return components
+
+
+def _env_truthy(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _env_float(name: str, *, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _env_int(name: str, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _progress_notify_timeout_seconds() -> float:
+    return _env_float("WPR_MCP_PROGRESS_NOTIFY_TIMEOUT_SEC", default=1.0, minimum=0.0, maximum=10.0)
+
+
+def _diagnostic_payloads_enabled() -> bool:
+    for name in ("GLASSHIVE_MCP_DIAGNOSTIC_PAYLOADS_ENABLED", "WPR_MCP_DIAGNOSTIC_PAYLOADS_ENABLED"):
+        if os.environ.get(name) is not None:
+            return _env_truthy(name)
+    return not _enterprise_mode_enabled()
+
+
+def _effective_diagnostics_requested(requested: bool, *, tool_name: str) -> bool:
+    if not requested:
+        return False
+    if _diagnostic_payloads_enabled():
+        return True
+    LOGGER.info(
+        "%s diagnostic payload suppressed; set GLASSHIVE_MCP_DIAGNOSTIC_PAYLOADS_ENABLED=true to allow raw diagnostics",
+        tool_name,
+    )
+    return False
+
+
+def _legacy_upload_fallback_enabled() -> bool:
+    return _env_truthy("GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_FALLBACK", default=False)
+
+
+def _stored_upload_display_filename(value: object, fallback: str) -> str:
+    name = str(value or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if "__" in name:
+        prefix, suffix = name.split("__", 1)
+        if len(prefix) >= 8 and re.fullmatch(r"[0-9A-Fa-f-]+", prefix):
+            name = suffix
+    return _safe_upload_filename(name, fallback)
+
+
+def _dedupe_workspace_upload_path(filename: str, used_paths: set[str]) -> str:
+    safe = _safe_upload_filename(filename, "upload")
+    stem, ext = os.path.splitext(safe)
+    candidate = f"uploads/{safe}"
+    index = 2
+    while candidate in used_paths:
+        candidate = f"uploads/{stem}-{index}{ext}"
+        index += 1
+    used_paths.add(candidate)
+    return candidate
+
+
+def _owner_recent_upload_entries(
+    *,
+    tenant_id: str | None,
+    owner_id: str | None,
+    storage_owner_id: str | None,
+    conversation_id: str | None,
+    message_id: str | None,
+) -> list[dict[str, Any]]:
+    """Compatibility projection for older LibreChat builds that cannot header-project upload metadata."""
+    if not _enterprise_mode_enabled() or not _legacy_upload_fallback_enabled():
+        return []
+    if not (storage_owner_id and conversation_id and message_id):
+        return []
+    roots = _upload_root_candidates()
+    owner_components = _upload_owner_path_components(storage_owner_id)
+    if not roots or not owner_components:
+        return []
+
+    window_seconds = _env_float(
+        "GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_RECENT_SECONDS",
+        default=900.0,
+        minimum=5.0,
+        maximum=24 * 60 * 60.0,
+    )
+    max_files = _env_int("GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_MAX_FILES", default=8, minimum=1, maximum=32)
+    min_mtime = time.time() - window_seconds
+    candidates: list[tuple[float, str, int, Path]] = []
+
+    for root in roots:
+        for owner_component in owner_components:
+            owner_root = root / owner_component
+            if not owner_root.exists() or not owner_root.is_dir():
+                continue
+            try:
+                resolved_owner_root = owner_root.resolve()
+            except OSError:
+                continue
+            try:
+                for candidate in owner_root.rglob("*"):
+                    try:
+                        if not candidate.is_file():
+                            continue
+                        resolved_candidate = candidate.resolve()
+                        resolved_candidate.relative_to(resolved_owner_root)
+                        stat = candidate.stat()
+                    except (OSError, ValueError):
+                        continue
+                    if stat.st_size <= 0 or stat.st_mtime < min_mtime:
+                        continue
+                    candidates.append((stat.st_mtime, os.fspath(candidate), stat.st_size, candidate))
+            except OSError:
+                continue
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    projected: list[dict[str, Any]] = []
+    used_paths: set[str] = set()
+    for _mtime, _path_key, size, candidate in candidates[:max_files]:
+        filename = _stored_upload_display_filename(candidate.name, f"upload-{len(projected) + 1}")
+        workspace_path = _dedupe_workspace_upload_path(filename, used_paths)
+        source_path = os.fspath(candidate)
+        token = sign_bootstrap_source_path(source_path, tenant_id=tenant_id, owner_id=owner_id)
+        projected.append(
+            {
+                "scope": "workspace",
+                "path": workspace_path,
+                "source_path": source_path,
+                **({BOOTSTRAP_SOURCE_TOKEN_KEY: token} if token else {}),
+                "filename": filename,
+                "bytes": size,
+                "source": "librechat_owner_recent_upload_compat",
+                "materialized_from": "librechat_owner_recent_upload_compat",
+                "storage_user_id": storage_owner_id,
+            }
+        )
+    return projected
+
+
 def _origin_from_url(url: str) -> str:
     parsed = urlparse(str(url or ""))
     if not parsed.scheme or not parsed.netloc:
@@ -1009,25 +1199,31 @@ def _normalize_worker_backend(worker: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
-def _owner_scoped_upload_source_for_filename(filename: str, *, owner_id: str | None = None) -> str:
+def _owner_scoped_upload_source_for_filename(
+    filename: str,
+    *,
+    owner_id: str | None = None,
+    storage_owner_id: str | None = None,
+) -> str:
     roots = _upload_root_candidates()
-    clean_owner = _safe_owner_path_component(owner_id)
+    owner_components = _upload_owner_path_components(owner_id, storage_owner_id)
     target_key = _normalized_upload_filename_key(filename)
-    if not roots or not clean_owner or not target_key:
+    if not roots or not owner_components or not target_key:
         return ""
     candidates: list[Path] = []
     for root in roots:
-        owner_root = root / clean_owner
-        if not owner_root.exists() or not owner_root.is_dir():
-            continue
-        try:
-            for candidate in owner_root.rglob("*"):
-                if not candidate.is_file():
-                    continue
-                if _normalized_upload_filename_key(candidate.name) == target_key:
-                    candidates.append(candidate)
-        except OSError:
-            continue
+        for owner_component in owner_components:
+            owner_root = root / owner_component
+            if not owner_root.exists() or not owner_root.is_dir():
+                continue
+            try:
+                for candidate in owner_root.rglob("*"):
+                    if not candidate.is_file():
+                        continue
+                    if _normalized_upload_filename_key(candidate.name) == target_key:
+                        candidates.append(candidate)
+            except OSError:
+                continue
     if not candidates:
         return ""
     candidates.sort(key=lambda item: (item.stat().st_mtime_ns, os.fspath(item)), reverse=True)
@@ -1138,10 +1334,20 @@ def _artifact_listing_payload(
         path = _clean_artifact_relative_path(str(item.get("path") or ""))
         if not path:
             continue
+        open_url = _signed_artifact_open_url(worker, path) if include_open_links else None
+        download_url = _signed_artifact_download_url(worker, path) if include_download_links else None
         if include_open_links:
-            item["signed_open_url"] = _signed_artifact_open_url(worker, path)
+            item["signed_open_url"] = open_url
         if include_download_links:
-            item["signed_download_url"] = _signed_artifact_download_url(worker, path)
+            item["signed_download_url"] = download_url
+        if download_url:
+            item["default_url"] = download_url
+            item["default_link_kind"] = "download"
+            item["default_link_label"] = "Download file"
+        elif open_url:
+            item["default_url"] = open_url
+            item["default_link_kind"] = "open"
+            item["default_link_label"] = "Open GlassHive file"
         items.append(item)
     return {
         "status": "ok",
@@ -1151,13 +1357,166 @@ def _artifact_listing_payload(
         "download_links_signed": bool(include_download_links),
         "download_link_ttl_seconds": signed_link_ttl_seconds(),
         "next_action_guidance": (
-            "Use relevant signed_open_url values as user-facing file links only when the user asked "
-            "for files/artifacts or the worker output references user-facing files. Use "
-            "signed_download_url only when the user explicitly asked for a raw download. Do not "
-            "invent file links, and do not paste whole generated files into chat when GlassHive "
-            "provides scoped file links."
+            "Use relevant signed_download_url/default_url values as the default user-facing file "
+            "links when the user asked for files/artifacts or the worker output references "
+            "user-facing files. Also include signed_open_url preview links or the View / Steer "
+            "workspace link when useful so the user can inspect all deliveries. Do not invent file "
+            "links, and do not paste whole generated files into chat when GlassHive provides "
+            "scoped file links."
         ),
     }
+
+
+_STATUS_ARTIFACT_LINK_ITEM_LIMIT = 5
+
+
+def _output_referenced_artifact_paths(text: str) -> list[str]:
+    """Return workspace-relative artifact paths mentioned by a worker final message."""
+    if not text:
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"/workspace/(?:project/)?([^\s)>\]\"']+)", text):
+        clean = _clean_artifact_relative_path(match.group(1).rstrip(".,;:"))
+        if clean and clean not in seen:
+            seen.add(clean)
+            paths.append(clean)
+    return paths
+
+
+def _professional_artifact_rank(path: str) -> int:
+    suffix = PurePosixPath(path).suffix.lower()
+    if suffix == ".pdf":
+        return 0
+    if suffix in {".docx", ".pptx", ".xlsx"}:
+        return 1
+    if suffix in {".html", ".htm"}:
+        return 2
+    if suffix in {".csv", ".json", ".md", ".txt"}:
+        return 3
+    return 4
+
+
+def _prioritized_status_artifact_items(items: list[Any], preferred_paths: list[str] | None) -> list[Any]:
+    preferred = {path: index for index, path in enumerate(preferred_paths or [])}
+
+    def rank(item: Any) -> tuple[int, int, int, str]:
+        if not isinstance(item, dict):
+            return (9, 9, 9, "")
+        path = _clean_artifact_relative_path(str(item.get("path") or ""))
+        if path in preferred:
+            return (0, preferred[path], _professional_artifact_rank(path), path)
+        return (1, 0, _professional_artifact_rank(path), path)
+
+    return sorted(items, key=rank)
+
+
+def _compact_status_artifact_links(
+    payload: dict[str, Any],
+    *,
+    preferred_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    compact = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"worker_id", "next_action_guidance"}
+    }
+    items = compact.get("items")
+    if not isinstance(items, list):
+        return compact
+    total_count = len(items)
+    visible_items = _prioritized_status_artifact_items(items, preferred_paths)[:_STATUS_ARTIFACT_LINK_ITEM_LIMIT]
+    compact["items"] = visible_items
+    compact["count"] = total_count
+    compact["visible_item_count"] = len(visible_items)
+    compact["truncated"] = total_count > len(visible_items)
+    if total_count > len(visible_items):
+        compact["remaining_item_count"] = total_count - len(visible_items)
+        compact["full_inventory_available"] = True
+        compact["full_inventory_tool"] = "workspace_artifacts"
+    return compact
+
+
+_WAIT_DELIVERABLE_READY_DIRS = {"artifacts", "deliverables", "output", "outputs", "reports"}
+_WAIT_DELIVERABLE_READY_OUT_DIRS = {"artifact", "artifacts", "data", "deliverable", "deliverables", "report", "reports"}
+_WAIT_DELIVERABLE_READY_EXTENSIONS = {
+    ".csv",
+    ".doc",
+    ".docx",
+    ".html",
+    ".md",
+    ".pdf",
+    ".ppt",
+    ".pptx",
+    ".rtf",
+    ".xls",
+    ".xlsx",
+}
+
+
+def _wait_deliverable_ready_path(path: str) -> bool:
+    clean = _clean_artifact_relative_path(path)
+    if not clean:
+        return False
+    relative = PurePosixPath(clean)
+    parts = [part.lower() for part in relative.parts]
+    if not parts:
+        return False
+    if parts[0] in _WAIT_DELIVERABLE_READY_DIRS:
+        return True
+    if len(parts) >= 2 and parts[0] == "out" and parts[1] in _WAIT_DELIVERABLE_READY_OUT_DIRS:
+        return True
+    return len(parts) > 1 and relative.suffix.lower() in _WAIT_DELIVERABLE_READY_EXTENSIONS
+
+
+async def _report_workspace_wait_progress(
+    ctx: Context | None,
+    *,
+    elapsed_seconds: float,
+    timeout_seconds: float,
+    attempts: int,
+    status: str,
+    run_state: object,
+) -> None:
+    if ctx is None:
+        return
+    total = max(1.0, timeout_seconds)
+    progress = total if status in {"completed", "terminal", "still_running"} else min(elapsed_seconds, total)
+    state_text = str(run_state or "running").strip() or "running"
+    message = (
+        f"GlassHive workspace {status}; waited {int(max(0.0, elapsed_seconds))}s; "
+        f"run state: {state_text}; check {attempts}."
+    )
+    notify_timeout = _progress_notify_timeout_seconds()
+    if notify_timeout <= 0:
+        LOGGER.debug("workspace_wait progress notification skipped because timeout is disabled")
+        return
+    task = asyncio.create_task(ctx.report_progress(progress=progress, total=total, message=message))
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=notify_timeout)
+        if task in done:
+            task.result()
+            return
+        task.cancel()
+        task.add_done_callback(_consume_progress_notification_result)
+        LOGGER.warning(
+            "workspace_wait progress notification timed out after %.3fs status=%s run_state=%s attempts=%s",
+            notify_timeout,
+            status,
+            run_state,
+            attempts,
+        )
+    except Exception:
+        LOGGER.debug("workspace_wait progress notification failed", exc_info=True)
+
+
+def _consume_progress_notification_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        LOGGER.debug("workspace_wait progress notification failed after timeout", exc_info=True)
 
 
 def _dispatch_follow_up_context(
@@ -1179,6 +1538,13 @@ def _dispatch_follow_up_context(
             "artifacts": "workspace_artifacts",
         },
         "completion_wait_timeout_seconds": _blocking_wait_default_seconds(),
+        "completion_polling_guidance": (
+            "When the user requested a completed result, deliverable, or answer in this turn, "
+            "continue calling workspace_wait until it returns a terminal result, a non-retryable "
+            "failure, or the host tool budget is genuinely exhausted. A bounded still_running "
+            "response means the worker is healthy but not done yet; do not ask the user to say "
+            "'keep waiting' merely because one wait chunk ended."
+        ),
         "view_steer": {
             "label": "View / Steer GlassHive workspace",
             "url": view_steer_url,
@@ -1257,7 +1623,7 @@ def _can_recover_blocked_host_dispatch_to_docker(
         return False
     if resolved_execution_mode != "host":
         return False
-    if str(requested_execution_mode or "").strip():
+    if str(requested_execution_mode or "").strip() and _host_workers_enabled():
         return False
     if str(workspace_root or "").strip():
         return False
@@ -1284,6 +1650,7 @@ def _project_upload_file_entry(
     *,
     tenant_id: str | None = None,
     owner_id: str | None = None,
+    storage_owner_id: str | None = None,
 ) -> dict[str, Any] | None:
     file_id = str(file_obj.get("file_id") or file_obj.get("id") or "").strip()
     filename = _safe_upload_filename(
@@ -1303,9 +1670,17 @@ def _project_upload_file_entry(
             break
     if source_ref:
         metadata["source_ref"] = source_ref
-    trusted_source = _trusted_virtual_upload_source(source_ref, owner_id=owner_id)
+    trusted_source = _trusted_virtual_upload_source(
+        source_ref,
+        owner_id=owner_id,
+        storage_owner_id=storage_owner_id,
+    )
     if not trusted_source:
-        trusted_source = _owner_scoped_upload_source_for_filename(filename, owner_id=owner_id)
+        trusted_source = _owner_scoped_upload_source_for_filename(
+            filename,
+            owner_id=owner_id,
+            storage_owner_id=storage_owner_id,
+        )
     if trusted_source:
         token = sign_bootstrap_source_path(trusted_source, tenant_id=tenant_id, owner_id=owner_id)
         return {
@@ -1351,6 +1726,7 @@ def _project_upload_files(
     *,
     tenant_id: str | None = None,
     owner_id: str | None = None,
+    storage_owner_id: str | None = None,
 ) -> list[dict[str, Any]]:
     projected: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -1360,6 +1736,7 @@ def _project_upload_files(
             len(projected) + 1,
             tenant_id=tenant_id,
             owner_id=owner_id,
+            storage_owner_id=storage_owner_id,
         )
         if not entry:
             continue
@@ -1496,6 +1873,11 @@ def _slugify_alias(*parts: str) -> str:
     raw = "-".join(part for part in parts if str(part or "").strip())
     slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
     return slug[:80] or "glasshive-task"
+
+
+def _fresh_worker_alias(alias: str) -> str:
+    base = (alias or "glasshive-task").strip("-")[:67].strip("-") or "glasshive-task"
+    return f"{base}-{uuid.uuid4().hex[:12]}"
 
 
 def _default_project_definition(*, title: str, goal: str, instruction: str) -> str:
@@ -1642,6 +2024,7 @@ def _merge_request_context(bundle: dict[str, Any] | None) -> dict[str, Any] | No
     context = {
         "tenant_id": _header_value(headers, HEADER_TENANT_ID),
         "user_id": _header_value(headers, HEADER_USER_ID),
+        "storage_user_id": _header_value(headers, HEADER_STORAGE_USER_ID),
         "agent_id": _header_value(headers, HEADER_AGENT_ID),
         "conversation_id": _header_value(headers, HEADER_CONVERSATION_ID),
         "parent_message_id": _header_value(headers, HEADER_PARENT_MESSAGE_ID),
@@ -1685,17 +2068,51 @@ def _merge_request_context(bundle: dict[str, Any] | None) -> dict[str, Any] | No
     if context:
         merged.setdefault("glasshive_context", context)
         merged.setdefault("viventium_context", context)
+
+    projected: list[dict[str, Any]] = []
     if upload_context:
-        merged["glasshive_upload_context"] = upload_context
-        merged["viventium_upload_context"] = upload_context
         projected = _project_upload_files(
             upload_context,
             tenant_id=context.get("tenant_id"),
             owner_id=context.get("user_id"),
+            storage_owner_id=context.get("storage_user_id"),
+        )
+    if not projected:
+        projected = _owner_recent_upload_entries(
+            tenant_id=context.get("tenant_id"),
+            owner_id=context.get("user_id"),
+            storage_owner_id=context.get("storage_user_id"),
+            conversation_id=context.get("conversation_id"),
+            message_id=context.get("message_id"),
         )
         if projected:
-            merged["files"] = _merge_bundle_files(merged.get("files"), projected)
-            _append_materialized_uploads_instruction(merged, projected)
+            LOGGER.info(
+                "GlassHive legacy LibreChat upload compatibility fallback materialized %d file(s); "
+                "prefer request-file headers when supported",
+                len(projected),
+            )
+            upload_context = dict(upload_context)
+            upload_context["legacy_owner_recent_uploads"] = [
+                {
+                    key: entry.get(key)
+                    for key in (
+                        "path",
+                        "filename",
+                        "bytes",
+                        "source",
+                        "materialized_from",
+                        "storage_user_id",
+                    )
+                    if entry.get(key) is not None
+                }
+                for entry in projected
+            ]
+    if upload_context:
+        merged["glasshive_upload_context"] = upload_context
+        merged["viventium_upload_context"] = upload_context
+    if projected:
+        merged["files"] = _merge_bundle_files(merged.get("files"), projected)
+        _append_materialized_uploads_instruction(merged, projected)
     return merged
 
 
@@ -1705,6 +2122,7 @@ def _merge_explicit_uploaded_files(
     *,
     tenant_id: str | None = None,
     owner_id: str | None = None,
+    storage_owner_id: str | None = None,
 ) -> dict[str, Any]:
     if uploaded_files in (None, "", [], {}):
         return dict(bundle or {})
@@ -1721,6 +2139,7 @@ def _merge_explicit_uploaded_files(
         upload_context,
         tenant_id=tenant_id,
         owner_id=owner_id,
+        storage_owner_id=storage_owner_id,
     )
     if projected:
         for entry in projected:
@@ -1762,7 +2181,17 @@ class WorkersProjectsApiClient:
     timeout_sec: float = DEFAULT_TIMEOUT_SEC
     api_token: str = DEFAULT_API_TOKEN
 
+    def _validated_request_path(self, path: str) -> str:
+        clean = str(path or "")
+        route = clean.split("?", 1)[0]
+        if not clean.startswith("/") or "\\" in route:
+            raise ValueError("GlassHive API path must be an absolute local route")
+        if any(segment in {"", ".", ".."} for segment in route.split("/")[1:]):
+            raise ValueError("GlassHive API path contains an invalid empty or relative segment")
+        return clean
+
     def _request(self, method: str, path: str, *, json_body: dict[str, Any] | None = None) -> Any:
+        path = self._validated_request_path(path)
         url = f"{self.base_url}{path}"
         headers: dict[str, str] = {}
         if self.api_token:
@@ -1793,6 +2222,14 @@ class WorkersProjectsApiClient:
             raise ValueError("owner_id is required for this operation")
         return resolved
 
+    def _path_id(self, value: str, label: str) -> str:
+        clean = str(value or "").strip()
+        if not clean:
+            raise ValueError(f"{label} is required")
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,256}", clean):
+            raise ValueError(f"{label} must be a simple id")
+        return quote(clean, safe="")
+
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/health")
 
@@ -1821,16 +2258,20 @@ class WorkersProjectsApiClient:
         )
 
     def get_project(self, project_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/projects/{project_id}")
+        project_path_id = self._path_id(project_id, "project_id")
+        return self._request("GET", f"/v1/projects/{project_path_id}")
 
     def list_project_runs(self, project_id: str) -> list[dict[str, Any]]:
-        return self._request("GET", f"/v1/projects/{project_id}/runs").get("items", [])
+        project_path_id = self._path_id(project_id, "project_id")
+        return self._request("GET", f"/v1/projects/{project_path_id}/runs").get("items", [])
 
     def list_project_events(self, project_id: str) -> list[dict[str, Any]]:
-        return self._request("GET", f"/v1/projects/{project_id}/events").get("items", [])
+        project_path_id = self._path_id(project_id, "project_id")
+        return self._request("GET", f"/v1/projects/{project_path_id}/events").get("items", [])
 
     def list_workers(self, project_id: str) -> list[dict[str, Any]]:
-        return self._request("GET", f"/v1/projects/{project_id}/workers").get("items", [])
+        project_path_id = self._path_id(project_id, "project_id")
+        return self._request("GET", f"/v1/projects/{project_path_id}/workers").get("items", [])
 
     def find_worker_by_alias_across_projects(
         self,
@@ -1885,7 +2326,8 @@ class WorkersProjectsApiClient:
         }
         if backend:
             payload["backend"] = backend
-        return self._request("POST", f"/v1/projects/{project_id}/workers", json_body=payload)
+        project_path_id = self._path_id(project_id, "project_id")
+        return self._request("POST", f"/v1/projects/{project_path_id}/workers", json_body=payload)
 
     def find_or_resume_worker(
         self,
@@ -1917,22 +2359,28 @@ class WorkersProjectsApiClient:
         }
         if backend:
             payload["backend"] = backend
-        return self._request("POST", f"/v1/projects/{project_id}/workers/find-or-resume", json_body=payload)
+        project_path_id = self._path_id(project_id, "project_id")
+        return self._request("POST", f"/v1/projects/{project_path_id}/workers/find-or-resume", json_body=payload)
 
     def get_worker(self, worker_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/workers/{worker_id}")
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        return self._request("GET", f"/v1/workers/{worker_path_id}")
 
     def worker_live(self, worker_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/workers/{worker_id}/live")
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        return self._request("GET", f"/v1/workers/{worker_path_id}/live")
 
     def list_artifacts(self, worker_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/workers/{worker_id}/artifacts")
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        return self._request("GET", f"/v1/workers/{worker_path_id}/artifacts")
 
     def worker_runs(self, worker_id: str) -> list[dict[str, Any]]:
-        return self._request("GET", f"/v1/workers/{worker_id}/runs").get("items", [])
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        return self._request("GET", f"/v1/workers/{worker_path_id}/runs").get("items", [])
 
     def worker_events(self, worker_id: str) -> list[dict[str, Any]]:
-        return self._request("GET", f"/v1/workers/{worker_id}/events").get("items", [])
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        return self._request("GET", f"/v1/workers/{worker_path_id}/events").get("items", [])
 
     def assign_run(
         self,
@@ -1947,10 +2395,18 @@ class WorkersProjectsApiClient:
             payload["effort"] = effort
         if bootstrap_bundle is not None:
             payload["bootstrap_bundle"] = bootstrap_bundle
-        return self._request("POST", f"/v1/workers/{worker_id}/assign", json_body=payload)
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        return self._request("POST", f"/v1/workers/{worker_path_id}/assign", json_body=payload)
 
     def send_message(self, worker_id: str, message: str) -> dict[str, Any]:
-        return self._request("POST", f"/v1/workers/{worker_id}/message", json_body={"message": message})
+        clean_worker_id = str(worker_id or "").strip()
+        clean_message = str(message or "").strip()
+        if not clean_worker_id:
+            raise ValueError("worker_id is required to send a worker message")
+        if not clean_message:
+            raise ValueError("message is required to send a worker message")
+        worker_path_id = self._path_id(clean_worker_id, "worker_id")
+        return self._request("POST", f"/v1/workers/{worker_path_id}/message", json_body={"message": clean_message})
 
     def schedule_run(
         self,
@@ -1971,29 +2427,39 @@ class WorkersProjectsApiClient:
             payload["delay_seconds"] = delay_seconds
         if bootstrap_bundle is not None:
             payload["bootstrap_bundle"] = bootstrap_bundle
-        return self._request("POST", f"/v1/workers/{worker_id}/schedule", json_body=payload)
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        return self._request("POST", f"/v1/workers/{worker_path_id}/schedule", json_body=payload)
 
     def worker_schedules(self, worker_id: str, include_done: bool = False) -> list[dict[str, Any]]:
         suffix = "?include_done=true" if include_done else ""
-        return self._request("GET", f"/v1/workers/{worker_id}/schedules{suffix}").get("items", [])
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        return self._request("GET", f"/v1/workers/{worker_path_id}/schedules{suffix}").get("items", [])
 
     def get_schedule(self, schedule_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/schedules/{schedule_id}")
+        schedule_path_id = self._path_id(schedule_id, "schedule_id")
+        return self._request("GET", f"/v1/schedules/{schedule_path_id}")
 
     def lifecycle(self, worker_id: str, action: str) -> dict[str, Any]:
-        return self._request("POST", f"/v1/workers/{worker_id}/{action}")
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        clean_action = str(action or "").strip()
+        if clean_action not in {"pause", "resume", "interrupt", "terminate"}:
+            raise ValueError("action must be a supported worker lifecycle action")
+        return self._request("POST", f"/v1/workers/{worker_path_id}/{clean_action}")
 
     def desktop_action(self, worker_id: str, action: str, url: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"action": action}
         if url:
             payload["url"] = url
-        return self._request("POST", f"/v1/workers/{worker_id}/desktop-action", json_body=payload)
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        return self._request("POST", f"/v1/workers/{worker_path_id}/desktop-action", json_body=payload)
 
     def takeover(self, worker_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/workers/{worker_id}/takeover")
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        return self._request("GET", f"/v1/workers/{worker_path_id}/takeover")
 
     def get_run(self, run_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/runs/{run_id}")
+        run_path_id = self._path_id(run_id, "run_id")
+        return self._request("GET", f"/v1/runs/{run_path_id}")
 
     def metrics(self) -> dict[str, Any]:
         return self._request("GET", "/v1/metrics/summary")
@@ -2172,8 +2638,9 @@ def create_mcp_server(
         description=(
             "Save the authenticated user's default GlassHive worker and effort preferences. Use this "
             "when the user says to make Codex, Claude Code, or OpenClaw their default, or asks future "
-            "GlassHive runs to use a specific effort. Allowed Codex efforts: none, minimal, low, medium, "
-            "high, xhigh. Claude: max. OpenClaw: high or max."
+            "GlassHive runs to use a specific effort. Allowed Codex efforts: none, low, medium, "
+            "high, xhigh; minimal is for explicitly allowlisted deployments only. Claude: max. "
+            "OpenClaw: high or max."
         ),
         structured_output=True,
     )
@@ -2184,7 +2651,7 @@ def create_mcp_server(
         ] = None,
         codex_reasoning_effort: Annotated[
             str | None,
-            Field(description="Optional Codex default effort: none, minimal, low, medium, high, xhigh, or empty to use deployment default."),
+            Field(description="Optional Codex default effort: none, low, medium, high, xhigh, or empty to use deployment default; use minimal only when the deployment explicitly allowlists it."),
         ] = None,
         claude_effort: Annotated[
             str | None,
@@ -2224,7 +2691,8 @@ def create_mcp_server(
         description=(
             "One-call task delegation for GlassHive when the caller already has a precise title and instruction. For normal user-facing launches, prefer workspace_launch because it mirrors the documented GlassHive UI fields. Use this for new host/browser/desktop/local-file tasks "
             "instead of manually listing projects and chaining project_create, worker_create, and worker_run. "
-            "It creates a human-named project when project_id is omitted, finds or resumes a worker by alias, "
+            "It creates a human-named project when project_id is omitted, creates a fresh worker by default, "
+            "and finds/resumes by alias only when reuse_existing_workspace is true. "
             "merges optional callback/upload context, queues the run, and returns one clean non-blocking dispatch result. "
             "Callbacks are optional; plain LibreChat or standalone deployments can use workspace_status for non-blocking checks and workspace_wait when the user explicitly wants to wait. "
             "For attached/uploaded-file tasks, use uploaded_files when the file content is visible in the current model context, for example [{'filename':'brief.txt','text':'...'}]. "
@@ -2252,6 +2720,15 @@ def create_mcp_server(
         worker_name: str | None = None,
         worker_role: str | None = None,
         alias: str | None = None,
+        reuse_existing_workspace: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Set true only when the user explicitly asked to resume/reuse the named alias. "
+                    "Leave false for fresh one-off tasks so stale worker history cannot slow or distort the result."
+                )
+            ),
+        ] = False,
         profile: ProfileParam = "",
         backend: BackendParam = None,
         execution_mode: ExecutionModeParam = None,
@@ -2274,7 +2751,8 @@ def create_mcp_server(
             str | None,
             Field(
                 description=(
-                    "Optional per-run effort override. Codex accepts none/minimal/low/medium/high/xhigh; "
+                    "Optional per-run effort override. Codex accepts none/low/medium/high/xhigh; "
+                    "minimal is for explicitly allowlisted deployments only. "
                     "Claude Code accepts max; OpenClaw accepts high/max. Omit to use the user's saved default. "
                     + HIGH_EFFORT_SELECTION_GUIDANCE
                 )
@@ -2283,9 +2761,13 @@ def create_mcp_server(
         require_callback: bool = False,
         expose_diagnostics: bool = False,
     ) -> dict[str, Any]:
+        expose_diagnostics = _effective_diagnostics_requested(
+            expose_diagnostics,
+            tool_name="worker_delegate_once",
+        )
         resolved_owner_id = _request_owner_id(owner_id)
         requested_execution_mode = str(execution_mode or "").strip()
-        resolved_execution_mode = _resolve_execution_mode(execution_mode)
+        resolved_execution_mode = _resolve_execution_mode(execution_mode, allow_disabled_host=True)
         try:
             preferences = _normalize_preferences(client.get_preferences())
         except Exception:
@@ -2305,7 +2787,8 @@ def create_mcp_server(
                 f"User-visible success condition:\n{explicit_goal}"
             )
         worker_instruction = _with_worker_host_side_orchestration_rule(worker_instruction_body)
-        resolved_alias = (alias or _slugify_alias(resolved_profile, clean_title)).strip()
+        reusable_alias = (alias or _slugify_alias(resolved_profile, clean_title)).strip()
+        resolved_alias = reusable_alias if reuse_existing_workspace else _fresh_worker_alias(reusable_alias)
         blocked = _runtime_dependency_blocked_payload(
             profile=resolved_profile,
             execution_mode=resolved_execution_mode,
@@ -2346,11 +2829,13 @@ def create_mcp_server(
         request_context = bundle.get("glasshive_context") if isinstance(bundle, dict) else None
         context_tenant_id = request_context.get("tenant_id") if isinstance(request_context, dict) else None
         context_owner_id = request_context.get("user_id") if isinstance(request_context, dict) else None
+        context_storage_owner_id = request_context.get("storage_user_id") if isinstance(request_context, dict) else None
         bundle = _merge_explicit_uploaded_files(
             bundle,
             uploaded_files,
             tenant_id=context_tenant_id,
             owner_id=context_owner_id or resolved_owner_id,
+            storage_owner_id=context_storage_owner_id,
         )
         bundle = _apply_effort_to_bundle(bundle, profile=resolved_profile, effort=resolved_effort)
         bundle, worker_instruction = _apply_connected_account_intent_guard(
@@ -2381,10 +2866,10 @@ def create_mcp_server(
             }
 
         existing_workspace = None
-        if not project_id and alias:
+        if reuse_existing_workspace and not project_id and alias:
             existing_workspace = client.find_worker_by_alias_across_projects(
                 owner_id=resolved_owner_id,
-                alias=resolved_alias,
+                alias=reusable_alias,
                 execution_mode=resolved_execution_mode,
             )
         project = (
@@ -2502,8 +2987,11 @@ def create_mcp_server(
             "Connected-account read authorization comes from the host-signed broker grant when reviewed host policy projects content-read scope; connected_account_content_intent is only a compatibility hint for missing-broker warnings, not a required authorization switch. The flag alone does not unlock content reads or writes. "
             f"{HOST_SIDE_ORCHESTRATION_GUIDANCE} "
             "Do not chain project_create, worker_create, and worker_run for routine tasks. Do not expose project/worker/run IDs unless expose_diagnostics is true. "
-            "Returns a clean non-blocking dispatch result with view_steer_url and result_tools; raw ids are hidden unless expose_diagnostics is true. "
-            "Callbacks are optional; for plain LibreChat or standalone deployments without callback wiring, "
+        "Returns a clean non-blocking dispatch result with view_steer_url and result_tools; raw ids are hidden unless expose_diagnostics is true. "
+        "For ordinary fresh launches, create a fresh workspace even if the host suggests a convenient alias. "
+        "Reuse a stable alias only when the user explicitly asks to resume/reuse an existing workspace and "
+        "reuse_existing_workspace is true; otherwise stale worker history can slow or distort one-off work. "
+        "Callbacks are optional; for plain LibreChat or standalone deployments without callback wiring, "
             "use workspace_status for non-blocking follow-up checks and workspace_wait when the user "
             "explicitly wants a blocking wait. For attached/uploaded-file requests, set uploaded_files "
             "when file text is visible to the current model context, and include file names/references "
@@ -2546,8 +3034,12 @@ def create_mcp_server(
         ] = None,
         workspace_alias: Annotated[
             str | None,
-            Field(description="Optional stable workspace alias to resume. Omit for a new one-off workspace."),
+            Field(description="Optional stable workspace alias. Honored only when reuse_existing_workspace is true; omit for a new one-off workspace."),
         ] = None,
+        reuse_existing_workspace: Annotated[
+            bool,
+            Field(description="Set true only when the user explicitly asked to resume/reuse the named workspace_alias. Leave false for fresh one-off tasks."),
+        ] = False,
         profile: ProfileParam = "",
         execution_mode: ExecutionModeParam = None,
         connected_account_content_intent: Annotated[
@@ -2567,7 +3059,8 @@ def create_mcp_server(
             str | None,
             Field(
                 description=(
-                    "Optional per-run effort override. Codex accepts none/minimal/low/medium/high/xhigh; "
+                    "Optional per-run effort override. Codex accepts none/low/medium/high/xhigh; "
+                    "minimal is for explicitly allowlisted deployments only. "
                     "Claude Code accepts max; OpenClaw accepts high/max. Omit to use saved user preferences or deployment default. "
                     + HIGH_EFFORT_SELECTION_GUIDANCE
                 )
@@ -2613,11 +3106,13 @@ def create_mcp_server(
             ]
         )
         title = clean_description.splitlines()[0].strip()[:120] or "GlassHive workspace"
+        delegate_alias = workspace_alias if reuse_existing_workspace else None
         return worker_delegate_once(
             title=title,
             instruction="\n".join(brief_sections),
             goal=clean_success_criteria,
-            alias=workspace_alias,
+            alias=delegate_alias,
+            reuse_existing_workspace=reuse_existing_workspace,
             profile=profile,
             execution_mode=execution_mode,
             bootstrap_bundle_json=bootstrap_bundle_json,
@@ -2740,7 +3235,7 @@ def create_mcp_server(
         scheduled_instruction = "\n".join(brief_sections)
 
         resolved_owner_id = _request_owner_id(None)
-        resolved_execution_mode = _resolve_execution_mode(execution_mode)
+        resolved_execution_mode = _resolve_execution_mode(execution_mode, allow_disabled_host=True)
         try:
             preferences = _normalize_preferences(client.get_preferences())
         except Exception:
@@ -2787,11 +3282,13 @@ def create_mcp_server(
         request_context = bundle.get("glasshive_context") if isinstance(bundle, dict) else None
         context_tenant_id = request_context.get("tenant_id") if isinstance(request_context, dict) else None
         context_owner_id = request_context.get("user_id") if isinstance(request_context, dict) else None
+        context_storage_owner_id = request_context.get("storage_user_id") if isinstance(request_context, dict) else None
         bundle = _merge_explicit_uploaded_files(
             bundle,
             uploaded_files,
             tenant_id=context_tenant_id,
             owner_id=context_owner_id or resolved_owner_id,
+            storage_owner_id=context_storage_owner_id,
         )
         bundle = _apply_effort_to_bundle(bundle, profile=resolved_profile, effort=resolved_effort)
         bundle, scheduled_instruction = _apply_connected_account_intent_guard(
@@ -3181,7 +3678,13 @@ def create_mcp_server(
         structured_output=True,
     )
     def worker_message(worker_id: str, message: str) -> dict[str, Any]:
-        return client.send_message(worker_id, message)
+        clean_worker_id = str(worker_id or "").strip()
+        clean_message = str(message or "").strip()
+        if not clean_worker_id:
+            raise ValueError("worker_id is required to send a worker message")
+        if not clean_message:
+            raise ValueError("message is required to send a worker message")
+        return client.send_message(clean_worker_id, clean_message)
 
     @server.tool(
         name="worker_pause",
@@ -3327,6 +3830,9 @@ def create_mcp_server(
             "timeout",
         }
 
+    def _run_state(run: dict[str, Any] | None) -> str:
+        return str((run or {}).get("state") or "").strip().lower()
+
     def _run_failure_payload(run: dict[str, Any] | None) -> dict[str, Any]:
         if not run or str(run.get("state") or "").strip().lower() != "failed":
             return {
@@ -3422,6 +3928,7 @@ def create_mcp_server(
         worker_id: str | None = None,
         include_live: bool = True,
         include_diagnostics: bool = False,
+        prefer_active_newer_run: bool = False,
     ) -> dict[str, Any]:
         clean_run_id = str(run_id or "").strip()
         clean_worker_id = str(worker_id or "").strip()
@@ -3462,6 +3969,31 @@ def create_mcp_server(
             _require_enterprise_payload_scope(live_worker, label="live worker", tenant_id=tenant_id, owner_id=owner_id)
         if live_worker:
             worker = live_worker
+        live_requested_run: dict[str, Any] | None = None
+        if run and clean_run_id and isinstance(live, dict):
+            for key in ("runs", "project_runs"):
+                raw_runs = live.get(key)
+                if not isinstance(raw_runs, list):
+                    continue
+                live_requested_run = next(
+                    (
+                        item
+                        for item in raw_runs
+                        if isinstance(item, dict) and str(item.get("run_id") or "").strip() == clean_run_id
+                    ),
+                    None,
+                )
+                if live_requested_run:
+                    break
+        if live_requested_run and _run_state(live_requested_run) != _run_state(run):
+            # Fetching live state can heal a completed run from runtime evidence.
+            # Refetch before computing terminal status so the same wait/status call does
+            # not return a stale pre-heal "running" row.
+            refreshed_run = client.get_run(clean_run_id)
+            if enterprise_scope:
+                tenant_id, _owner_id = enterprise_scope
+                _require_enterprise_payload_scope(refreshed_run, label="run", tenant_id=tenant_id)
+            run = refreshed_run
         newer_run = _newer_worker_run(requested_run=run, worker=worker, live=live) if clean_worker_id else None
         if enterprise_scope and newer_run:
             tenant_id, _owner_id = enterprise_scope
@@ -3470,10 +4002,17 @@ def create_mcp_server(
             if newer_worker_id and clean_worker_id and newer_worker_id != clean_worker_id:
                 raise PermissionError("GlassHive latest run is not scoped to the requested worker")
         requested_run_stale = bool(run and _run_is_newer(newer_run, run))
-        if run and _terminal_run_state(run) and newer_run and not _terminal_run_state(newer_run):
-            effective_run = run
-        elif newer_run and (not run or _run_is_newer(newer_run, run)):
-            effective_run = newer_run
+        if newer_run and (not run or _run_is_newer(newer_run, run)):
+            if (
+                run
+                and _terminal_run_state(run)
+                and not _terminal_run_state(newer_run)
+                and _run_state(run) != "interrupted"
+                and not prefer_active_newer_run
+            ):
+                effective_run = run
+            else:
+                effective_run = newer_run
         else:
             effective_run = run
         if effective_run and not clean_worker_id:
@@ -3500,7 +4039,7 @@ def create_mcp_server(
                     worker=artifact_worker,
                     artifacts=artifacts,
                     include_open_links=True,
-                    include_download_links=False,
+                    include_download_links=True,
                 )
             except Exception as exc:
                 artifact_links = {
@@ -3509,11 +4048,10 @@ def create_mcp_server(
                     "error": _audit_preview(str(exc), max_chars=220),
                 }
         if artifact_links and not include_diagnostics:
-            artifact_links = {
-                key: value
-                for key, value in artifact_links.items()
-                if key not in {"worker_id", "next_action_guidance"}
-            }
+            artifact_links = _compact_status_artifact_links(
+                artifact_links,
+                preferred_paths=_output_referenced_artifact_paths(str((effective_run or {}).get("output_text") or "")),
+            )
         payload: dict[str, Any] = {
             "status": "ok",
             "mode": "non_blocking",
@@ -3554,6 +4092,103 @@ def create_mcp_server(
             )
         return payload
 
+    def _deliverable_ready_quiet_seconds() -> float:
+        raw = os.environ.get("GLASSHIVE_DELIVERABLE_READY_QUIET_SEC", "2.0").strip()
+        try:
+            parsed = float(raw)
+        except ValueError:
+            return 2.0
+        return max(parsed, 0.0)
+
+    def _artifact_modified_at_epoch(item: dict[str, Any]) -> float | None:
+        for key in ("modified_at", "mtime", "updated_at", "created_at"):
+            raw = item.get(key)
+            if raw is None:
+                continue
+            if isinstance(raw, (int, float)):
+                return float(raw)
+            text = str(raw).strip()
+            if not text:
+                continue
+            try:
+                return float(text)
+            except ValueError:
+                pass
+            try:
+                return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+        return None
+
+    def _ready_artifact_is_fresh_for_wait(
+        item: dict[str, Any],
+        *,
+        wait_started_at: float | None,
+        now_epoch: float | None = None,
+    ) -> bool:
+        if wait_started_at is None:
+            return True
+        modified_at = _artifact_modified_at_epoch(item)
+        if modified_at is None:
+            return False
+        now = time.time() if now_epoch is None else now_epoch
+        return (
+            modified_at >= wait_started_at - 2.0
+            and modified_at <= now - _deliverable_ready_quiet_seconds()
+        )
+
+    def _deliverable_ready_artifact_links(
+        *,
+        worker_id: str,
+        include_diagnostics: bool = False,
+        wait_started_at: float | None = None,
+    ) -> dict[str, Any] | None:
+        clean_worker_id = str(worker_id or "").strip()
+        if not clean_worker_id:
+            return None
+        try:
+            artifact_worker = client.get_worker(clean_worker_id)
+            if _enterprise_mode_enabled():
+                tenant_id, owner_id = _enterprise_request_scope()
+                _require_enterprise_payload_scope(
+                    artifact_worker,
+                    label="artifact worker",
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                )
+            artifacts = client.list_artifacts(clean_worker_id)
+            raw_items = artifacts.get("items", []) if isinstance(artifacts, dict) else []
+            ready_items = [
+                item
+                for item in raw_items
+                if isinstance(item, dict) and _wait_deliverable_ready_path(str(item.get("path") or ""))
+                and _ready_artifact_is_fresh_for_wait(item, wait_started_at=wait_started_at)
+            ]
+            if not ready_items:
+                return None
+            artifacts = dict(artifacts or {})
+            artifacts["items"] = ready_items
+            artifact_links = _artifact_listing_payload(
+                worker=artifact_worker,
+                artifacts=artifacts,
+                include_open_links=True,
+                include_download_links=True,
+            )
+        except Exception as exc:
+            LOGGER.debug(
+                "workspace_wait deliverable readiness artifact listing failed worker_id=%s error=%s",
+                clean_worker_id,
+                exc,
+            )
+            return None
+        artifact_links = dict(artifact_links)
+        artifact_links["status"] = "ok"
+        artifact_links["ready_before_run_terminal"] = True
+        artifact_links["ready_item_count"] = len(artifact_links.get("items", []))
+        if not include_diagnostics:
+            artifact_links = _compact_status_artifact_links(artifact_links)
+        return artifact_links
+
     @server.tool(
         name="workspace_status",
         title="Check GlassHive Workspace Status",
@@ -3575,6 +4210,10 @@ def create_mcp_server(
         include_live: Annotated[bool, Field(description="Include worker live details when worker_id is available.")] = True,
         include_diagnostics: Annotated[bool, Field(description="Include raw run/workspace ids and live diagnostic snapshots.")] = False,
     ) -> dict[str, Any]:
+        include_diagnostics = _effective_diagnostics_requested(
+            include_diagnostics,
+            tool_name="workspace_status",
+        )
         return _workspace_status_payload(
             run_id=run_id,
             worker_id=worker_id,
@@ -3593,9 +4232,10 @@ def create_mcp_server(
             "turn, first surface the View / Steer link returned by workspace_launch/worker_delegate_once "
             "when the chat protocol allows assistant text before another tool call, then call "
             "workspace_wait so the user is not left guessing where to watch progress. When timeout_seconds is omitted, GlassHive uses "
-            "WPR_MCP_BLOCKING_WAIT_DEFAULT_SEC capped by WPR_MCP_BLOCKING_WAIT_MAX_SEC so serious "
-            "research, coding, and file-work runs are not misreported as failed just because a short "
-            "poll expired. If a "
+            "WPR_MCP_BLOCKING_WAIT_DEFAULT_SEC capped by WPR_MCP_BLOCKING_WAIT_MAX_SEC. The default is "
+            "intentionally bounded below common chat/proxy request timeouts; if this tool returns "
+            "status=still_running and the user asked you to wait, immediately call workspace_wait again "
+            "in the same conversation instead of leaving the user with a stale spinner. If a "
             "same-conversation follow-up call omits ids, GlassHive resolves the most "
             "recent launch scoped to the authenticated user/conversation. This does not require "
             "LibreChat or host-app callback wiring. Omit poll_interval_seconds for normal work; "
@@ -3613,7 +4253,12 @@ def create_mcp_server(
         poll_interval_seconds: Annotated[float | None, Field(description="Optional polling interval in seconds. Omit for the configured efficient default.")] = None,
         include_live: Annotated[bool, Field(description="Include worker live details in the final response when available.")] = True,
         include_diagnostics: Annotated[bool, Field(description="Include raw run/workspace ids and live diagnostic snapshots.")] = False,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
+        include_diagnostics = _effective_diagnostics_requested(
+            include_diagnostics,
+            tool_name="workspace_wait",
+        )
         clean_run_id = str(run_id or "").strip()
         clean_worker_id = str(worker_id or "").strip()
         resolved_recent_context: RecentDispatchContext | None = None
@@ -3644,7 +4289,20 @@ def create_mcp_server(
         interval = max(default_interval, min(requested_interval, 30.0))
         adaptive_polling = poll_interval_seconds is None
         deadline = time.monotonic() + timeout
+        wait_started = time.monotonic()
+        wait_started_wall = time.time()
         attempts = 0
+        LOGGER.info(
+            "workspace_wait start run_id=%s worker_id=%s timeout_seconds=%.3f requested_timeout_seconds=%.3f "
+            "poll_interval_seconds=%.3f include_live=%s include_diagnostics=%s",
+            clean_run_id,
+            clean_worker_id,
+            timeout,
+            requested_timeout,
+            interval,
+            include_live,
+            include_diagnostics,
+        )
         while True:
             attempts += 1
             payload = await asyncio.to_thread(
@@ -3653,6 +4311,7 @@ def create_mcp_server(
                 worker_id=clean_worker_id,
                 include_live=include_live,
                 include_diagnostics=include_diagnostics,
+                prefer_active_newer_run=True,
             )
             if resolved_recent_context and include_diagnostics:
                 payload.update(
@@ -3665,9 +4324,28 @@ def create_mcp_server(
                     }
                 )
             if payload.get("terminal"):
+                elapsed = time.monotonic() - wait_started
+                terminal_status = "completed" if payload.get("run_state") == "completed" else "terminal"
+                await _report_workspace_wait_progress(
+                    ctx,
+                    elapsed_seconds=elapsed,
+                    timeout_seconds=timeout,
+                    attempts=attempts,
+                    status=terminal_status,
+                    run_state=payload.get("run_state"),
+                )
+                LOGGER.info(
+                    "workspace_wait terminal run_id=%s worker_id=%s status=%s run_state=%s attempts=%s elapsed_seconds=%.3f",
+                    clean_run_id,
+                    clean_worker_id,
+                    terminal_status,
+                    payload.get("run_state"),
+                    attempts,
+                    elapsed,
+                )
                 payload.update(
                     {
-                        "status": "completed" if payload.get("run_state") == "completed" else "terminal",
+                        "status": terminal_status,
                         "mode": "blocking_wait",
                         "waited": True,
                         "attempts": attempts,
@@ -3675,7 +4353,126 @@ def create_mcp_server(
                     }
                 )
                 return payload
+            ready_artifact_links = _deliverable_ready_artifact_links(
+                worker_id=clean_worker_id or str(payload.get("worker_id") or ""),
+                include_diagnostics=include_diagnostics,
+                wait_started_at=wait_started_wall,
+            )
+            if ready_artifact_links:
+                elapsed = time.monotonic() - wait_started
+                ready_count = ready_artifact_links.get("count") or ready_artifact_links.get("ready_item_count")
+                await _report_workspace_wait_progress(
+                    ctx,
+                    elapsed_seconds=elapsed,
+                    timeout_seconds=timeout,
+                    attempts=attempts,
+                    status="deliverable_ready",
+                    run_state=payload.get("run_state"),
+                )
+                LOGGER.info(
+                    "workspace_wait deliverable_ready run_id=%s worker_id=%s run_state=%s attempts=%s elapsed_seconds=%.3f ready_items=%s",
+                    clean_run_id,
+                    clean_worker_id,
+                    payload.get("run_state"),
+                    attempts,
+                    elapsed,
+                    ready_count,
+                )
+                payload.update(
+                    {
+                        "status": "deliverable_ready",
+                        "mode": "blocking_wait",
+                        "terminal": True,
+                        "waited": True,
+                        "attempts": attempts,
+                        "timed_out": False,
+                        "wait_deadline_reached": False,
+                        "worker_finalization_pending": True,
+                        "completion_class": "deliverables_ready_worker_finalizing",
+                        "artifact_links": ready_artifact_links,
+                        "output_text": payload.get("output_text")
+                        or (
+                            "GlassHive has produced user-facing deliverables and signed download "
+                            "links are ready. The worker may still be finishing final self-checks; "
+                            "deliver these files to the user now instead of leaving the chat waiting."
+                        ),
+                        "recommended_next_tool": "workspace_status",
+                        "recommended_next_action": (
+                            "Deliver the signed artifact links to the user now. Mention that the "
+                            "workspace may still be finalizing, and use workspace_status later only "
+                            "if the user asks for a final status refresh."
+                        ),
+                    }
+                )
+                return payload
+            elapsed = time.monotonic() - wait_started
+            await _report_workspace_wait_progress(
+                ctx,
+                elapsed_seconds=elapsed,
+                timeout_seconds=timeout,
+                attempts=attempts,
+                status="running",
+                run_state=payload.get("run_state"),
+            )
             if time.monotonic() >= deadline:
+                LOGGER.info(
+                    "workspace_wait timeout run_id=%s worker_id=%s run_state=%s attempts=%s elapsed_seconds=%.3f",
+                    clean_run_id,
+                    clean_worker_id,
+                    payload.get("run_state"),
+                    attempts,
+                    elapsed,
+                )
+                await _report_workspace_wait_progress(
+                    ctx,
+                    elapsed_seconds=elapsed,
+                    timeout_seconds=timeout,
+                    attempts=attempts,
+                    status="still_running",
+                    run_state=payload.get("run_state"),
+                )
+                ready_artifact_links = _deliverable_ready_artifact_links(
+                    worker_id=clean_worker_id or str(payload.get("worker_id") or ""),
+                    include_diagnostics=include_diagnostics,
+                    wait_started_at=wait_started_wall,
+                )
+                if ready_artifact_links:
+                    ready_count = ready_artifact_links.get("count") or ready_artifact_links.get("ready_item_count")
+                    LOGGER.info(
+                        "workspace_wait deliverable_ready run_id=%s worker_id=%s run_state=%s attempts=%s ready_items=%s",
+                        clean_run_id,
+                        clean_worker_id,
+                        payload.get("run_state"),
+                        attempts,
+                        ready_count,
+                    )
+                    payload.update(
+                        {
+                            "status": "deliverable_ready",
+                            "mode": "blocking_wait",
+                            "terminal": True,
+                            "waited": True,
+                            "attempts": attempts,
+                            "timed_out": False,
+                            "wait_deadline_reached": True,
+                            "worker_finalization_pending": True,
+                            "completion_class": "deliverables_ready_worker_finalizing",
+                            "artifact_links": ready_artifact_links,
+                            "output_text": payload.get("output_text")
+                            or (
+                                "GlassHive has produced user-facing deliverables and signed download "
+                                "links are ready. The worker may still be finishing final self-checks; "
+                                "deliver these files to the user now instead of leaving the chat waiting."
+                            ),
+                            "recommended_next_tool": "workspace_status",
+                            "recommended_next_action": (
+                                "Deliver the signed artifact links to the user now. Mention that the "
+                                "workspace may still be finalizing, and use workspace_status later only "
+                                "if the user asks for a final status refresh."
+                            ),
+                        }
+                    )
+                    return payload
                 payload.update(
                     {
                         "status": "still_running",
@@ -3683,6 +4480,18 @@ def create_mcp_server(
                         "waited": True,
                         "attempts": attempts,
                         "timed_out": True,
+                        "wait_again_recommended": True,
+                        "completion_still_pending": True,
+                        "do_not_ask_user_to_keep_waiting": True,
+                        "recommended_next_tool": "workspace_wait",
+                        "recommended_next_action": (
+                            "The worker is still running. If the user asked to wait, call "
+                            "workspace_wait again in this same conversation so the chat gets the "
+                            "completed result without holding one HTTP request past infrastructure "
+                            "timeouts. Do not ask the user to say 'keep waiting' unless the host tool "
+                            "budget is genuinely exhausted or a non-retryable failure is returned. "
+                            "Include the View / Steer link if you answer before waiting again."
+                        ),
                     }
                 )
                 return payload
@@ -3781,13 +4590,19 @@ def create_mcp_server(
             str | None,
             Field(
                 description=(
-                    "Optional effort override for this continuation. Codex accepts none/minimal/low/medium/high/xhigh; "
+                    "Optional effort override for this continuation. Codex accepts none/low/medium/high/xhigh; "
+                    "minimal is for explicitly allowlisted deployments only. "
                     "Claude Code accepts max; OpenClaw accepts high/max. Omit to use the user's saved default. "
                     + HIGH_EFFORT_SELECTION_GUIDANCE
                 )
             ),
         ] = None,
+        include_diagnostics: Annotated[bool, Field(description="Include raw run/workspace ids and continuation diagnostics.")] = False,
     ) -> dict[str, Any]:
+        include_diagnostics = _effective_diagnostics_requested(
+            include_diagnostics,
+            tool_name="workspace_continue",
+        )
         clean_run_id = str(run_id or "").strip()
         if not clean_run_id:
             raise ValueError("run_id is required")
@@ -3854,20 +4669,26 @@ def create_mcp_server(
             project_id=str(worker.get("project_id") or previous_run.get("project_id") or ""),
             run=new_run,
         )
-        return {
+        payload = {
             "status": "queued",
-            "previous_run_id": clean_run_id,
             "previous_run_state": previous_state,
             "previous_failure_class": str(previous_run.get("failure_class") or "") or None,
             "effort": resolved_effort,
-            "run": new_run,
-            "continuation_instruction_preview": _audit_preview(instruction, max_chars=900),
             "acknowledgement_guidance": (
                 "Tell the user GlassHive is continuing in the same workspace, include the View / Steer "
                 "link when present, and use the returned result_tools for later status or wait."
             ),
             **dispatch_context,
         }
+        if include_diagnostics:
+            payload.update(
+                {
+                    "previous_run_id": clean_run_id,
+                    "run": new_run,
+                    "continuation_instruction_preview": _audit_preview(instruction, max_chars=900),
+                }
+            )
+        return payload
 
     @server.tool(
         name="workspace_artifacts",
@@ -3876,9 +4697,10 @@ def create_mcp_server(
             "Use after workspace_status/workspace_wait or when the user asks for generated files, "
             "downloads, artifacts, or delivery files from a GlassHive worker. Returns workspace file "
             "artifacts with short-lived signed_open_url preview links and signed_download_url raw-download "
-            "links when GlassHive can safely expose them. Prefer signed_open_url as the default user-facing "
-            "file link; use signed_download_url only when the user explicitly wants a download. Prefer this "
-            "instead of pasting generated file contents into chat. Do not use it "
+            "links when GlassHive can safely expose them. Prefer signed_download_url/default_url as the "
+            "default user-facing file link, and include signed_open_url or the View / Steer workspace "
+            "link when the user needs to inspect previews or all deliveries. Prefer this instead of "
+            "pasting generated file contents into chat. Do not use it "
             "before the worker has produced files unless the user asks for diagnostics."
         ),
         structured_output=True,
@@ -3938,9 +4760,9 @@ def create_mcp_server(
             "signed_download_url": download_url,
             "download_link_ttl_seconds": signed_link_ttl_seconds(),
             "next_action_guidance": (
-                "Use signed_open_url as the user-facing file link when present. Use signed_download_url "
-                "only when the user explicitly wants the raw artifact/download. "
-                "If unavailable, call workspace_artifacts or include the View / Steer link for manual access."
+                "Use signed_download_url as the default user-facing file link when present. Also include "
+                "signed_open_url or the View / Steer link when the user needs preview/manual access or "
+                "wants to inspect all workspace deliveries. If unavailable, call workspace_artifacts."
             ),
         }
 

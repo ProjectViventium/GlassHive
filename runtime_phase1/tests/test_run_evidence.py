@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from workers_projects_runtime.deliverables import candidate_artifact_paths
+from workers_projects_runtime.deliverables import candidate_artifact_paths, is_user_deliverable_relative_path
 from workers_projects_runtime.runtime_identity import derive_legacy_backend_label
 import workers_projects_runtime.run_evidence as run_evidence
 from workers_projects_runtime.run_evidence import (
@@ -46,6 +46,247 @@ def test_constraint_ledger_extracts_generic_source_date_and_flag_rules(tmp_path)
     assert latest == tmp_path / "glasshive-run" / "constraint-ledger.json"
     assert json.loads(latest.read_text())["run_id"] == "run_ledger"
     assert (tmp_path / "glasshive-run" / "runs" / "run_ledger" / "constraint-ledger.json").exists()
+
+
+def test_constraint_ledger_does_not_treat_uploaded_as_date_constraint():
+    ledger = build_constraint_ledger(
+        instruction=(
+            "Inspect the uploaded PDF directly inside the workspace under uploads/<filename>. "
+            "Create a concise artifact named upload-fallback-ui-smoke.txt that states whether the first "
+            "bytes are the PDF signature %PDF. Keep working until the user's request is satisfied."
+        ),
+        worker={
+            "worker_id": "wrk_upload_ledger",
+            "profile": "codex-cli",
+            "execution_mode": "host",
+        },
+        run_id="run_upload_ledger",
+    )
+
+    assert ledger["constraints"]["date"] == []
+    assert ledger["outputs"]["format_expectations"] == ["txt"]
+    assert all("<filename>" not in seed for seed in ledger["seed_entities_or_files"])
+
+
+def test_run_evidence_accepts_uploaded_pdf_input_with_text_artifact(tmp_path):
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    (uploads / "input-smoke.pdf").write_bytes(b"%PDF-1.4\n% synthetic\n")
+    (tmp_path / "upload-fallback-ui-smoke.txt").write_text(
+        "uploaded file name: input-smoke.pdf\n"
+        "byte size: 21\n"
+        "first bytes are %PDF: yes\n"
+        "workspace path: uploads/input-smoke.pdf\n"
+    )
+    worker = {
+        "worker_id": "wrk_upload_evidence",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "bootstrap_bundle_json": json.dumps({"files": [{"path": "uploads/input-smoke.pdf"}]}),
+    }
+    ledger = build_constraint_ledger(
+        instruction=(
+            "Inspect the uploaded PDF directly inside the workspace under uploads/<filename>. "
+            "Create a concise artifact named upload-fallback-ui-smoke.txt that states whether the first "
+            "bytes are the PDF signature %PDF."
+        ),
+        worker=worker,
+        run_id="run_upload_evidence",
+    )
+
+    evidence = build_run_evidence(
+        worker=worker,
+        run_id="run_upload_evidence",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Inspect upload."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nCreated upload-fallback-ui-smoke.txt",
+        stderr_text="",
+        output_text="FINAL REPORT:\nCreated upload-fallback-ui-smoke.txt",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["completion_compliance"]["required_artifact_types"] == ["txt"]
+    assert evidence["completion_compliance"]["seed_entity_coverage"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_run_evidence_does_not_require_original_upload_format_when_html_requested(tmp_path):
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    (uploads / "input-smoke.pdf").write_bytes(b"%PDF-1.4\n% synthetic\n")
+    (tmp_path / "upload-smoke.html").write_text(
+        "FINAL REPORT:\n"
+        "filename: input-smoke.pdf\n"
+        "byte size: 21\n"
+        "first bytes: %PDF-\n"
+        "marker: GH_UPLOAD_SMOKE_A\n"
+    )
+    worker = {
+        "worker_id": "wrk_upload_html_evidence",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "bootstrap_bundle_json": json.dumps({"files": [{"path": "uploads/input-smoke.pdf"}]}),
+    }
+    ledger = build_constraint_ledger(
+        instruction=(
+            "Use GlassHive on the attached PDF. Verify the actual uploaded PDF bytes are present "
+            "in the worker workspace uploads folder. Create an HTML artifact named upload-smoke.html "
+            "containing filename, byte size, %PDF first-byte check, exact marker GH_UPLOAD_SMOKE_A, "
+            "and one visual redesign note. Return the artifact link. If the original PDF bytes are "
+            "missing, say that as the blocker. "
+            "Attached file reference: input-smoke.pdf. Known marker embedded in the PDF: GH_UPLOAD_SMOKE_A. "
+            "Please create the requested HTML artifact only if the bytes are present and verifiable. "
+            "Attached/uploaded file reference: input-smoke.pdf. The known embedded marker is GH_UPLOAD_SMOKE_A. "
+            "The uploaded file content visible in chat context includes: 'Synthetic PDF proves byte-level "
+            "upload materialization. Expected worker behavior: read this PDF from uploads/ and create an artifact.' "
+            "Preserve the user's exact constraint: create the requested HTML artifact only if the bytes are "
+            "present and verifiable. Keep working until the user's request is satisfied."
+        ),
+        worker=worker,
+        run_id="run_upload_html_evidence",
+    )
+
+    assert ledger["constraints"]["date"] == []
+    assert ledger["outputs"]["format_expectations"] == ["html"]
+    assert "Preserve the user" not in run_evidence._seed_terms_from_ledger(ledger)
+
+    evidence = build_run_evidence(
+        worker=worker,
+        run_id="run_upload_html_evidence",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Inspect upload."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nCreated upload-smoke.html",
+        stderr_text="",
+        output_text="FINAL REPORT:\nCreated upload-smoke.html",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    completion = evidence["completion_compliance"]
+    assert completion["required_artifact_types"] == ["html"]
+    assert "pdf" not in completion["required_artifact_types"]
+    assert completion["missing_required_artifact_types"] == []
+    assert completion["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_run_evidence_fails_when_verified_artifact_lacks_final_marker(tmp_path):
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    (uploads / "input-smoke.pdf").write_bytes(b"%PDF-1.4\n% synthetic\n")
+    (tmp_path / "upload-smoke.html").write_text(
+        "filename: input-smoke.pdf\n"
+        "byte size: 21\n"
+        "first bytes: %PDF-\n"
+        "marker: GH_UPLOAD_SMOKE_A\n"
+    )
+    worker = {
+        "worker_id": "wrk_upload_html_no_final",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "bootstrap_bundle_json": json.dumps({"files": [{"path": "uploads/input-smoke.pdf"}]}),
+    }
+    ledger = build_constraint_ledger(
+        instruction=(
+            "Use the attached PDF and create an HTML artifact named upload-smoke.html containing "
+            "filename, byte size, %PDF first-byte check, and exact marker GH_UPLOAD_SMOKE_A. "
+            "Attached/uploaded file reference: input-smoke.pdf. Expected worker behavior: read this "
+            "PDF from uploads/ and create an artifact."
+        ),
+        worker=worker,
+        run_id="run_upload_html_no_final",
+    )
+
+    evidence = build_run_evidence(
+        worker=worker,
+        run_id="run_upload_html_no_final",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Inspect upload."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="Created upload-smoke.html",
+        stderr_text="",
+        output_text="Created upload-smoke.html",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    completion = evidence["completion_compliance"]
+    assert completion["required_artifact_types"] == ["html"]
+    assert completion["missing_required_artifact_types"] == []
+    assert completion["status"] == "fail"
+    assert evidence["evidence_result"]["status"] == "fail"
+    assert any(
+        reason["reason"] == "final report marker missing"
+        for reason in evidence["evidence_result"]["failure_reasons"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("instruction", "expected"),
+    [
+        ("Create an HTML summary of the attached PDF.", ["html"]),
+        ("Build an xlsx workbook from the uploaded csv source.", ["xlsx"]),
+        ("Write a docx summary referencing the original pdf.", ["docx"]),
+        ("Save the result as dashboard.html using the attached pdf.", ["html"]),
+        ("Create a PDF report from the attached spreadsheet.", ["pdf"]),
+    ],
+)
+def test_constraint_ledger_keeps_requested_output_formats_without_requiring_input_formats(instruction, expected):
+    ledger = build_constraint_ledger(
+        instruction=instruction,
+        worker={"worker_id": "wrk_output_formats", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_output_formats",
+    )
+
+    assert ledger["outputs"]["format_expectations"] == expected
+
+
+def test_constraint_ledger_ignores_mime_and_pdf_bytes_host_upload_guidance():
+    instruction = "\n".join(
+        [
+            (
+                "Use GlassHive on the attached PDF. Verify the actual uploaded PDF bytes are present in "
+                "the worker workspace uploads folder. Create an HTML artifact named upload-final-smoke.html "
+                "containing filename, byte size, %PDF first-byte check, exact marker GH_UPLOAD_SMOKE_A, "
+                "and one visual redesign note. Return the artifact link. If the original PDF bytes are "
+                "missing, say that as the blocker."
+            ),
+            (
+                "Attached file reference: upload-smoke.pdf (application/pdf). The worker should inspect the "
+                "workspace uploads folder directly and verify actual bytes, not metadata only. If available, "
+                "verify the file starts with %PDF and check for the exact marker string GH_UPLOAD_SMOKE_A in "
+                "the PDF bytes/content. Then create the requested HTML artifact named upload-final-smoke.html "
+                "and provide its artifact link. If the PDF bytes are missing or inaccessible, report that as "
+                "the blocker rather than fabricating results."
+            ),
+        ]
+    )
+
+    ledger = build_constraint_ledger(
+        instruction=instruction,
+        worker={"worker_id": "wrk_host_upload_guidance", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_host_upload_guidance",
+    )
+
+    assert ledger["outputs"]["format_expectations"] == ["html"]
 
 
 def test_run_evidence_recursively_validates_artifacts_and_flags_date_drift(tmp_path):
@@ -451,6 +692,36 @@ def test_run_evidence_final_report_ignores_structured_progress_marker(tmp_path):
     assert evidence["evidence_result"]["status"] == "fail"
 
 
+def test_run_evidence_accepts_plain_stdout_final_report(tmp_path):
+    stdout_text = (
+        "worker progress before final output\n"
+        "FINAL REPORT:\n"
+        "Created and visually verified the requested PDF report.\n"
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_plain_stdout_final", "profile": "codex-cli", "execution_mode": "docker"},
+        run_id="run_plain_stdout_final",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Do it."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text,
+        stderr_text="",
+        output_text="",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=7200,
+        stop_reason="process",
+        constraint_ledger=None,
+    )
+
+    assert evidence["final_output"]["has_final_report"] is True
+    assert evidence["completion_compliance"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
 def test_run_evidence_classifies_structured_provider_rate_limit(tmp_path):
     stdout_text = json.dumps(
         {
@@ -599,6 +870,41 @@ def test_run_evidence_classifies_structured_provider_auth_missing(tmp_path):
     assert "api_error_status: 401" in classification["diagnostic_summary"]
 
 
+def test_run_evidence_still_classifies_structured_provider_403_auth_missing(tmp_path):
+    stdout_text = json.dumps(
+        {
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "api_error_status": 403,
+            "result": "403 Forbidden: provider credentials are not authorized.",
+        }
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_provider_403", "profile": "claude-code", "execution_mode": "host"},
+        run_id="run_provider_403",
+        runtime_name="claude-code",
+        model="claude-test",
+        command=["claude", "-p", "--output-format", "json"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text + "\n",
+        stderr_text="",
+        output_text="",
+        error_text="claude-code exited with code 1",
+        exit_code=1,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    classification = evidence["failure_classification"]
+    assert classification["failure_class"] == "provider_auth_missing"
+    assert classification["retryable"] is False
+    assert "api_error_status: 403" in classification["diagnostic_summary"]
+
+
 def test_run_evidence_classifies_structured_provider_request_rejected(tmp_path):
     stdout_text = json.dumps(
         {
@@ -736,6 +1042,144 @@ def test_run_evidence_does_not_classify_false_structured_error_fields(tmp_path):
         stdout_text=stdout_text + "\n",
         stderr_text="",
         output_text="FINAL REPORT:\nCompleted successfully.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    assert evidence["failure_classification"]["status"] == "not_applicable"
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_run_evidence_does_not_treat_browser_snapshot_node_ids_as_provider_status(tmp_path):
+    stdout_text = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "result": (
+                "browser accessibility snapshot\n"
+                "401 menu item\n"
+                "403 close button\n"
+                "FINAL REPORT:\nChrome is open on the requested page."
+            ),
+        }
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_browser_snapshot_ids", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_browser_snapshot_ids",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text + "\n",
+        stderr_text="",
+        output_text="FINAL REPORT:\nChrome is open on the requested page.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    classification = evidence["failure_classification"]
+    assert classification["status"] == "not_applicable"
+    assert "provider_auth_missing" not in json.dumps(evidence)
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+@pytest.mark.parametrize(
+    "status_like_text, forbidden_failure_class",
+    [
+        ("400 Bad Request banner in the page body", "provider_request_rejected"),
+        ("429 Too Many Requests heading on the site", "provider_rate_limited"),
+        ("503 Service Unavailable page from the target site", "provider_response_failed"),
+        ("529 overloaded label in a browser snapshot", "provider_response_failed"),
+    ],
+)
+def test_run_evidence_success_final_report_ignores_browser_page_status_like_text(
+    tmp_path,
+    status_like_text,
+    forbidden_failure_class,
+):
+    stdout_text = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "result": (
+                "browser accessibility snapshot\n"
+                f"{status_like_text}\n"
+                "FINAL REPORT:\nThe browser state was inspected and the task is complete."
+            ),
+        }
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_browser_status_text", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_browser_status_text",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text + "\n",
+        stderr_text="",
+        output_text="FINAL REPORT:\nThe browser state was inspected and the task is complete.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    assert evidence["failure_classification"]["status"] == "not_applicable"
+    assert forbidden_failure_class not in json.dumps(evidence)
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_run_evidence_does_not_classify_failed_agent_substep_after_final_report(tmp_path):
+    stdout_text = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "ls missing-path",
+                        "aggregated_output": "ls: missing-path: No such file or directory",
+                        "exit_code": 2,
+                        "status": "failed",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": "FINAL REPORT:\nRecovered from the probe and completed successfully.",
+                    },
+                }
+            ),
+        ]
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_failed_substep", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_failed_substep",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text + "\n",
+        stderr_text="",
+        output_text="FINAL REPORT:\nRecovered from the probe and completed successfully.",
         error_text="",
         exit_code=0,
         timeout_seconds=None,
@@ -914,6 +1358,330 @@ def test_constraint_compliance_fails_when_planning_file_omits_strict_source_wind
         for issue in evidence["constraint_compliance"]["issues"]
     )
     assert evidence["evidence_result"]["status"] == "fail"
+
+
+def test_constraint_compliance_allows_final_answer_only_scheduled_prompt_operational_evidence(tmp_path):
+    instruction = (
+        "You are executing a Prompt Workbench scheduled prompt.\n"
+        "Use the rendered prompt and provided snapshot files as the source of truth.\n"
+        "Memory write mode: off.\n"
+        "If memory write mode is off, do not modify account memory.\n"
+        "If memory write mode is propose, write governed memory proposals only.\n"
+        "For memory proposals, write UTF-8 JSON under the scratchpad folder named memory-proposals-yyyymmddHHmm.json with an actions array of set/delete objects.\n"
+        "Do not inspect or modify private memories, conversations, files, email, or accounts.\n"
+        "Capture evidence of the completed scheduled prompt only in the final report.\n"
+        "Report back in the final answer only.\n"
+        "End with exactly: FINAL REPORT: QA_OK QA_WORKBENCH_EXECUTOR_SYNTHETIC"
+    )
+    (tmp_path / "prompt.md").write_text(instruction)
+    scheduled_prompt_dir = tmp_path / "scheduled-prompt"
+    scheduled_prompt_dir.mkdir()
+    (scheduled_prompt_dir / "utf8_static_server.py").write_text(
+        "# Infrastructure preview helper, not a user deliverable.\n"
+        "COMMENT = 'strict constraints should be followed wherever possible'\n"
+    )
+    assert not is_user_deliverable_relative_path("scheduled-prompt/utf8_static_server.py")
+    worker = {
+        "worker_id": "wrk_scheduled_prompt",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "files": [
+                    {"path": "scheduled-prompt/rendered-prompt.md"},
+                    {"path": "scheduled-prompt/variable-snapshot.json"},
+                    {"path": "scheduled-prompt/run-contract.md"},
+                ]
+            }
+        ),
+    }
+    ledger = build_constraint_ledger(
+        instruction=instruction,
+        worker=worker,
+        run_id="run_scheduled_prompt",
+    )
+
+    evidence = build_run_evidence(
+        worker=worker,
+        run_id="run_scheduled_prompt",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", instruction],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT: QA_OK QA_WORKBENCH_EXECUTOR_SYNTHETIC",
+        stderr_text="",
+        output_text="FINAL REPORT: QA_OK QA_WORKBENCH_EXECUTOR_SYNTHETIC",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_completion_compliance_counts_scheduled_prompt_private_scratchpad_artifacts(tmp_path):
+    my_folder = tmp_path / "private-my-folder"
+    my_folder.mkdir()
+    scratchpad = my_folder / "202606250300.md"
+    proposals = my_folder / "memory-proposals-202606250300.json"
+    scratchpad.write_text("FINAL REPORT:\nSynthetic scheduled prompt notes.\n", encoding="utf-8")
+    proposals.write_text('{"actions":[{"action":"set","key":"working","value":"synthetic"}]}', encoding="utf-8")
+    scheduled_prompt_dir = tmp_path / "scheduled-prompt"
+    scheduled_prompt_dir.mkdir()
+    (scheduled_prompt_dir / "variable-snapshot.json").write_text(
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "placeholder": "local.viventium.my_folder",
+                        "wrapper": "local.viventium.my_folder",
+                        "kind": "path",
+                        "value": str(my_folder),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    instruction = (
+        "You are executing a Prompt Workbench scheduled prompt.\n"
+        "Memory write mode: propose.\n"
+        "Write a markdown private scratchpad file named yyyymmddHHmm.md.\n"
+        "For memory proposals, write UTF-8 JSON under that folder named "
+        "memory-proposals-yyyymmddHHmm.json with an actions array of set/delete objects.\n"
+        "End every run with a concise `FINAL REPORT:` section."
+    )
+    ledger = build_constraint_ledger(
+        instruction=instruction,
+        worker={"worker_id": "wrk_scheduled_prompt_private_artifacts", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_scheduled_prompt_private_artifacts",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_scheduled_prompt_private_artifacts", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_scheduled_prompt_private_artifacts",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", instruction],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nCompleted synthetic scheduled prompt.",
+        stderr_text="",
+        output_text="FINAL REPORT:\nCompleted synthetic scheduled prompt.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    completion = evidence["completion_compliance"]
+    assert set(completion["required_artifact_types"]) == {"json", "md"}
+    assert completion["missing_required_artifact_types"] == []
+    assert completion["status"] == "pass"
+    assert "private-scratchpad/202606250300.md" in completion["deliverable_artifact_paths"]
+    assert "private-scratchpad/memory-proposals-202606250300.json" in completion["deliverable_artifact_paths"]
+    assert str(my_folder) not in json.dumps(evidence["artifacts"])
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_constraint_compliance_allows_user_facing_root_plan_deliverable_without_ledger_link(tmp_path):
+    (tmp_path / "research-implementation-plan.md").write_text(
+        "# Research Implementation Plan\n\n"
+        "FINAL REPORT:\n"
+        "This plan uses cited in-window sources and is the requested user-facing markdown deliverable.\n"
+    )
+    ledger = build_constraint_ledger(
+        instruction=(
+            "Use sources from January 2024 through May 2026 only. "
+            "Produce a markdown implementation plan in the project folder."
+        ),
+        worker={"worker_id": "wrk_root_plan", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_root_plan",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_root_plan", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_root_plan",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Analyze."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nCreated the plan.",
+        stderr_text="",
+        output_text="FINAL REPORT:\nCreated the plan.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "output/research-implementation-plan.md",
+        "artifacts/research-plan.md",
+        "reports/research-spec.md",
+    ],
+)
+def test_constraint_compliance_allows_user_facing_deliverable_roots_named_plan_or_spec(tmp_path, relative_path):
+    artifact_path = tmp_path / relative_path
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        "# Research Deliverable\n\n"
+        "FINAL REPORT:\n"
+        "This requested deliverable uses cited in-window sources.\n"
+    )
+    ledger = build_constraint_ledger(
+        instruction=(
+            "Use sources from January 2024 through May 2026 only. "
+            "Produce a markdown implementation plan in the project folder."
+        ),
+        worker={"worker_id": "wrk_deliverable_roots", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_deliverable_roots",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_deliverable_roots", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_deliverable_roots",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Analyze."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nCreated the requested deliverable.",
+        stderr_text="",
+        output_text="FINAL REPORT:\nCreated the requested deliverable.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_constraint_compliance_still_requires_internal_named_root_files_to_preserve_constraints(tmp_path):
+    (tmp_path / "delegation-notes.md").write_text(
+        "# Delegation Notes\n\n"
+        "Ask a helper to research the topic and return findings.\n"
+    )
+    ledger = build_constraint_ledger(
+        instruction="Use sources from January 2024 through May 2026 only.",
+        worker={"worker_id": "wrk_internal_named_root", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_internal_named_root",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_internal_named_root", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_internal_named_root",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Analyze."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nDone.",
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "fail"
+    assert any(
+        issue["reason"] == "strict source/date constraints not referenced in planning file"
+        for issue in evidence["constraint_compliance"]["issues"]
+    )
+
+
+def test_constraint_compliance_still_flags_softened_constraints_in_root_plan_deliverable(tmp_path):
+    (tmp_path / "research-implementation-plan.md").write_text(
+        "# Research Implementation Plan\n\n"
+        "Must use sources from January 2024 through May 2026 only wherever possible.\n"
+    )
+    ledger = build_constraint_ledger(
+        instruction="Use sources from January 2024 through May 2026 only.",
+        worker={"worker_id": "wrk_root_plan_softened", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_root_plan_softened",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_root_plan_softened", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_root_plan_softened",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Analyze."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nCreated the plan.",
+        stderr_text="",
+        output_text="FINAL REPORT:\nCreated the plan.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "fail"
+    assert any(
+        issue["reason"] == "strict constraint softened in workspace file"
+        for issue in evidence["constraint_compliance"]["issues"]
+    )
+
+
+def test_constraint_compliance_still_scans_root_plan_deliverable_for_source_date_drift(tmp_path):
+    (tmp_path / "research-implementation-plan.md").write_text(
+        "# Research Implementation Plan\n\n"
+        "A cited source published June 2026 supports the plan.\n"
+    )
+    ledger = build_constraint_ledger(
+        instruction=(
+            "Use sources from January 2024 through May 2026 only. "
+            "Produce a markdown implementation plan in the project folder."
+        ),
+        worker={"worker_id": "wrk_root_plan_drift", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_root_plan_drift",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_root_plan_drift", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_root_plan_drift",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Analyze."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nCreated the plan.",
+        stderr_text="",
+        output_text="FINAL REPORT:\nCreated the plan.",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert evidence["constraint_compliance"]["status"] == "fail"
+    assert any(
+        issue["reason"] == "date/source window widened past ledger limit"
+        for issue in evidence["constraint_compliance"]["issues"]
+    )
 
 
 def test_constraint_compliance_scans_final_output_for_source_window_drift(tmp_path):
@@ -1665,6 +2433,123 @@ def test_completion_compliance_does_not_require_attached_input_format_as_output(
 
     assert ledger["outputs"]["format_expectations"] == []
     assert "csv" not in evidence["completion_compliance"]["required_artifact_types"]
+    assert evidence["completion_compliance"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_completion_compliance_does_not_require_uploads_path_input_format_as_output(tmp_path):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "glasshive-upload-smoke-result.txt").write_text(
+        "FINAL REPORT:\nPDF bytes verified; HTML report created.\n",
+        encoding="utf-8",
+    )
+    (artifacts / "glasshive-upload-smoke-report.html").write_text(
+        "<!doctype html><title>Upload smoke</title><p>PDF bytes verified.</p>\n",
+        encoding="utf-8",
+    )
+    ledger = build_constraint_ledger(
+        instruction=(
+            "Read uploads/glasshive-live-upload-smoke.pdf from the workspace. "
+            "Create artifacts/glasshive-upload-smoke-result.txt and "
+            "artifacts/glasshive-upload-smoke-report.html."
+        ),
+        worker={"worker_id": "wrk_upload_path_pdf", "profile": "codex-cli", "execution_mode": "docker"},
+        run_id="run_upload_path_pdf",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_upload_path_pdf", "profile": "codex-cli", "execution_mode": "docker"},
+        run_id="run_upload_path_pdf",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Verify uploaded PDF bytes."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nDone",
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert set(ledger["outputs"]["format_expectations"]) == {"txt", "html"}
+    assert "pdf" not in evidence["completion_compliance"]["required_artifact_types"]
+    assert evidence["completion_compliance"]["missing_required_artifact_types"] == []
+    assert evidence["completion_compliance"]["status"] == "pass"
+
+
+def test_completion_compliance_accepts_context_named_input_pdf_with_txt_html_outputs(tmp_path):
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    (uploads / "glasshive-ui-upload-smoke.pdf").write_bytes(
+        b"%PDF-1.4\nGLASSHIVE_UPLOAD_STORAGE_OWNER_SMOKE_20260624\n"
+    )
+    (tmp_path / "upload-inspection-report.txt").write_text(
+        "FINAL REPORT:\n"
+        "Filename: glasshive-ui-upload-smoke.pdf\n"
+        "Byte count: 58\n"
+        "Starts with %PDF: yes\n"
+        "Marker: GLASSHIVE_UPLOAD_STORAGE_OWNER_SMOKE_20260624\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "upload-inspection-report.html").write_text(
+        "<!doctype html><title>Upload inspection</title>"
+        "<p>glasshive-ui-upload-smoke.pdf starts with %PDF and contains "
+        "GLASSHIVE_UPLOAD_STORAGE_OWNER_SMOKE_20260624.</p>\n",
+        encoding="utf-8",
+    )
+    worker = {
+        "worker_id": "wrk_context_named_input_pdf",
+        "profile": "codex-cli",
+        "execution_mode": "docker",
+        "bootstrap_bundle_json": json.dumps(
+            {"files": [{"path": "uploads/glasshive-ui-upload-smoke.pdf"}]}
+        ),
+    }
+    ledger = build_constraint_ledger(
+        instruction=(
+            "Project description:\n"
+            "Inspect the attached PDF file inside the GlassHive workspace and confirm whether the uploaded file is available there. "
+            "Create a small TXT artifact and HTML artifact that report: filename, byte count, sha256, whether it starts with %PDF, "
+            "and whether it contains marker GLASSHIVE_UPLOAD_STORAGE_OWNER_SMOKE_20260624. Return the results as generated artifacts in the workspace.\n\n"
+            "Context:\n"
+            "The attached uploaded file is named glasshive-ui-upload-smoke.pdf. The worker must verify that the uploaded file is actually available inside the GlassHive workspace, "
+            "ideally by locating and reading the materialized uploaded file under uploads/glasshive-ui-upload-smoke.pdf or the host-provided upload location available in the workspace. "
+            "Inspect the real file bytes rather than relying only on extracted text. Report in both a TXT artifact and an HTML artifact: filename, byte count, sha256, "
+            "whether the file starts with the bytes/string %PDF, and whether it contains the marker string GLASSHIVE_UPLOAD_STORAGE_OWNER_SMOKE_20260624. "
+            "Also include confirmation in the output about whether the uploaded file was available inside the GlassHive workspace. "
+            "After generating the TXT and HTML files, keep them in the workspace as artifacts for download."
+        ),
+        worker=worker,
+        run_id="run_context_named_input_pdf",
+    )
+
+    evidence = build_run_evidence(
+        worker=worker,
+        run_id="run_context_named_input_pdf",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Inspect upload."],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text="FINAL REPORT:\nCreated upload-inspection-report.txt and upload-inspection-report.html",
+        stderr_text="",
+        output_text="FINAL REPORT:\nCreated upload-inspection-report.txt and upload-inspection-report.html",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert set(ledger["outputs"]["format_expectations"]) == {"txt", "html"}
+    assert "pdf" not in evidence["completion_compliance"]["required_artifact_types"]
+    assert evidence["completion_compliance"]["missing_required_artifact_types"] == []
+    assert "confirmation in the" not in evidence["completion_compliance"]["seed_entity_coverage"].get("missing", [])
     assert evidence["completion_compliance"]["status"] == "pass"
     assert evidence["evidence_result"]["status"] == "pass"
 

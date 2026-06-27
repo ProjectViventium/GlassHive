@@ -143,7 +143,8 @@ _OUTPUT_FORMAT_ALIASES = {
     "md": {"md"},
 }
 _OUTPUT_ACTION_RE = re.compile(
-    r"\b(deliver|create|generate|produce|write|save|export|output|artifact|artifacts|deliverable|deliverables|report|reports|file|files)\b",
+    r"\b(deliver|create|generate|produce|write|save|export|output|return|build|prepare|compose|draft|render|"
+    r"artifact|artifacts|deliverable|deliverables|report|reports|file|files)\b",
     re.I,
 )
 _FINAL_ANSWER_ONLY_CONTEXT_RE = re.compile(
@@ -191,7 +192,8 @@ _COVERAGE_PLUS_RE = re.compile(
     re.I,
 )
 _INPUT_FORMAT_CONTEXT_RE = re.compile(
-    r"\b(attached|uploaded|input|source|provided|existing|read|compare|analy[sz]e|from|using|use)\b",
+    r"\b(attached|uploaded|input|source|provided|existing|original|reference|marker|embedded|"
+    r"bytes?|signature|header|first[-\s]*byte|workspace|read|compare|analy[sz]e|from|using|use)\b",
     re.I,
 )
 _SUPPORT_ARTIFACT_DIRS = SUPPORT_ARTIFACT_DIR_NAMES
@@ -204,18 +206,23 @@ _RAW_SUPPORT_CAPTURE_DIRS = {
     "web_snapshots",
 }
 _SEED_DESCRIPTOR_WORDS = {
+    "attached",
     "companies",
     "entities",
     "examples",
     "firm",
     "files",
     "firms",
+    "input",
     "inputs",
     "items",
     "list",
+    "provided",
+    "source",
     "targets",
     "topic",
     "topics",
+    "uploaded",
 }
 _SKIP_SCAN_DIRS = {
     ".git",
@@ -292,7 +299,7 @@ def _stdout_agent_has_final_report(stdout_text: str) -> bool:
         text = str(item.get("text") or "")
         if _FINAL_REPORT_RE.search(text):
             return True
-    return False
+    return bool(_FINAL_REPORT_RE.search(str(stdout_text or "")))
 
 
 def _safe_env_keys(env: dict[str, str] | None) -> list[str]:
@@ -397,6 +404,50 @@ def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in lower for needle in needles)
 
 
+_DATE_WORD_RE = re.compile(r"\b(?:date|dated)\b", re.I)
+_DATE_RANGE_WORD_RE = re.compile(r"\b(?:through|until|no later than|from|between)\b", re.I)
+_YEAR_RE = re.compile(r"\b20\d{2}\b")
+_SOURCE_DATE_PLANNING_CONTEXT_RE = re.compile(
+    r"\b(?:sources|citation|citations|cited|primary|official|publication|published|dataset)\b",
+    re.I,
+)
+_EVIDENCE_SOURCE_CONTEXT_RE = re.compile(
+    r"\b(?:public|web|official|primary|external|published|cited)\s+evidence\b|\bevidence\s+(?:from|in|published|dated|cited)\b",
+    re.I,
+)
+
+
+def _line_has_date_constraint_context(line: str) -> bool:
+    text = str(line or "")
+    has_date_value = bool(_MONTH_YEAR_RE.search(text) or _ISO_YEAR_MONTH_RE.search(text) or _YEAR_RE.search(text))
+    return bool(_DATE_WORD_RE.search(text) or (_DATE_RANGE_WORD_RE.search(text) and has_date_value))
+
+
+def _line_requires_source_date_planning_preservation(line: str) -> bool:
+    text = str(line or "")
+    return bool(
+        _line_has_date_constraint_context(text)
+        or _SOURCE_DATE_PLANNING_CONTEXT_RE.search(text)
+        or _EVIDENCE_SOURCE_CONTEXT_RE.search(text)
+    )
+
+
+def _memory_write_mode_is_off(text: str) -> bool:
+    return bool(re.search(r"\bmemory\s+write\s+mode\s*:\s*off\b", str(text or ""), re.I))
+
+
+def _line_is_memory_proposal_output_context(line: str) -> bool:
+    return bool(re.search(r"\bmemory[-\s]+proposals?\b", str(line or ""), re.I))
+
+
+def _is_internal_scheduled_prompt_snapshot_path(path: str) -> bool:
+    try:
+        parts = Path(str(path or "")).parts
+    except TypeError:
+        return False
+    return bool(parts and parts[0].lower() == "scheduled-prompt")
+
+
 def _bootstrap_seed_files(worker: dict[str, object]) -> list[str]:
     try:
         bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
@@ -414,8 +465,8 @@ def _bootstrap_seed_files(worker: dict[str, object]) -> list[str]:
                 candidate = str(item.get("path") or item.get("name") or item.get("relative_path") or "").strip()
             else:
                 candidate = str(item or "").strip()
-            if candidate:
-                files.append(candidate)
+            if candidate and not _is_internal_scheduled_prompt_snapshot_path(candidate):
+                files.append(f"uploaded file {candidate}")
     return files
 
 
@@ -529,10 +580,11 @@ def build_constraint_ledger(
     required_output_lines: list[str] = []
     forbidden_output_lines: list[str] = []
     seed_lines: list[str] = []
+    memory_write_mode_off = _memory_write_mode_is_off(instruction_text)
 
     for line in _lines(instruction_text):
         lower = line.lower()
-        if _contains_any(lower, ("date", "dated", "through", "until", "no later than", "from ", "between ")) or _MONTH_YEAR_RE.search(line):
+        if _line_has_date_constraint_context(line):
             date_lines.append(line)
         if _contains_any(lower, ("source", "citation", "primary", "official", "public source", "web source", "evidence")):
             source_lines.append(line)
@@ -544,7 +596,9 @@ def build_constraint_ledger(
             exclusion_lines.append(line)
         if _contains_any(lower, ("seed", "seed file", "seed entity", "input file", "uploaded file")) and not _is_seed_block_heading(line):
             seed_lines.append(line)
-        if _line_has_required_output_context(line):
+        if _line_has_required_output_context(line) and not (
+            memory_write_mode_off and _line_is_memory_proposal_output_context(line)
+        ):
             required_output_lines.append(line)
         if _line_forbids_output(line):
             forbidden_output_lines.extend(_forbidden_output_fragments(line))
@@ -638,13 +692,121 @@ def _format_mentions(line: str, suffix: str) -> Iterable[re.Match[str]]:
     return re.finditer(rf"\b{re.escape(suffix)}\b", str(line or ""), re.I)
 
 
+def _format_looks_like_filename_extension(line: str, match: re.Match[str]) -> bool:
+    text = str(line or "")
+    if match.start() == 0 or text[match.start() - 1] != ".":
+        return False
+    prefix = text[max(0, match.start() - 100) : match.start()]
+    if not re.search(r"(?:^|[\s\"'`(<\[])[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.$", prefix):
+        return False
+    stem_prefix = prefix[:-1]
+    clause = re.split(r"[;\n]|(?<=[.!?])\s+", stem_prefix)[-1]
+    direct_name = re.search(r"\b(named|called|as|to)\s+[A-Za-z0-9][A-Za-z0-9._-]{0,80}$", clause, re.I)
+    output_action = re.search(
+        r"\b(create|generate|produce|write|save|export|deliver|return|output|build|prepare|render)\b",
+        clause,
+        re.I,
+    )
+    input_descriptor = re.search(r"\b(attached|uploaded|input|source|provided|existing|original|reference)\b", clause, re.I)
+    input_named_file = re.search(
+        r"\b(attached|uploaded|input|source|provided|existing|original|reference)\b"
+        r"[^;\n]{0,80}\b(file|attachment|document|spreadsheet|workbook)\b"
+        r"[^;\n]{0,35}\b(?:is\s+)?(?:named|called)\s+[A-Za-z0-9][A-Za-z0-9._-]{0,80}$",
+        clause,
+        re.I,
+    )
+    if input_named_file:
+        return False
+    return bool(direct_name or (output_action and not input_descriptor))
+
+
+def _format_looks_like_input_filename_extension(line: str, match: re.Match[str]) -> bool:
+    text = str(line or "")
+    if match.start() == 0 or text[match.start() - 1] != ".":
+        return False
+    prefix = text[max(0, match.start() - 120) : match.start()]
+    if not re.search(r"(?:^|[\s\"'`(<\[])[A-Za-z0-9][A-Za-z0-9._-]{0,100}\.$", prefix):
+        return False
+    stem_prefix = prefix[:-1]
+    clause = re.split(r"[;\n]|(?<=[.!?])\s+", stem_prefix)[-1]
+    return bool(
+        re.search(
+            r"\b(attached|uploaded|input|source|provided|existing|original|reference)\b"
+            r"[^;\n]{0,80}\b(file|attachment|document|spreadsheet|workbook)\b"
+            r"[^;\n]{0,35}\b(?:is\s+)?(?:named|called)\s+[A-Za-z0-9][A-Za-z0-9._-]{0,100}$",
+            clause,
+            re.I,
+        )
+    )
+
+
 def _is_input_format_mention(line: str, match: re.Match[str]) -> bool:
     line_text = str(line or "")
     before = line_text[max(0, match.start() - 60) : match.start()]
     after = line_text[match.end() : min(len(line_text), match.end() + 60)]
     nearby = f"{before} {after}"
     immediate = f"{before[-45:]} {after[:20]}"
-    if re.search(r"\b(attached|uploaded|input|source|provided|existing)\b", immediate, re.I):
+    suffix = str(match.group(0) or "").lower()
+    if match.start() > 0 and line_text[match.start() - 1] == ".":
+        path_prefix = line_text[max(0, match.start() - 120) : match.start()]
+        if re.search(
+            r"(?:^|[\s\"'`(<\[])(?:uploads?|inputs?|sources?|provided|existing|original|reference|workspace)"
+            r"[/\\][^\s\"'`),;]*\.$",
+            path_prefix,
+            re.I,
+        ):
+            return True
+    if _format_looks_like_input_filename_extension(line_text, match):
+        return True
+    if _format_looks_like_filename_extension(line_text, match):
+        return False
+    if match.start() > 0 and line_text[match.start() - 1] == "/" and re.search(
+        r"\b(application|image|audio|video|text|multipart)\s*/\s*$",
+        before,
+        re.I,
+    ):
+        return True
+    if suffix:
+        if suffix == "pdf" and (before.rstrip().endswith("%") or re.search(r"\bsignature\b", nearby, re.I)):
+            return True
+    if re.search(r"^\s*(bytes?|content|data)\b", after, re.I) and not re.search(
+        r"\b(create|generate|produce|write|save|export|deliver|return|build|prepare|compose|draft|render)\b[^.\n;]{0,35}$",
+        before,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"\b(?:of|from|using|with|based\s+on)?\s*(?:the\s+)?"
+        r"(attached|uploaded|input|source|provided|existing|original|reference|embedded)\s*$",
+        before[-70:],
+        re.I,
+    ):
+        return True
+    if suffix == "pdf" and re.search(r"\b(bytes?|signature|header|first[-\s]*byte)\b", nearby, re.I) and re.search(
+        r"\b(attached|uploaded|input|source|provided|existing|original|workspace)\b", nearby, re.I
+    ):
+        return True
+    if re.search(r"\b(read|inspect|analy[sz]e|parse|verify|use)\b[^.\n;]{0,45}$", before, re.I) and re.search(
+        r"^\s*(?:from|in|inside|under|within|at)\b|\buploads?/|\bworkspace\b",
+        after,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"\b(from|using|with|based\s+on)\b[^.\n;]{0,45}\b(attached|uploaded|input|source|provided|existing|original)?\s*$",
+        before,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"\b(create|generate|produce|write|save|export|deliver|return|build|prepare|compose|draft|render)\b[^.\n;]{0,35}$",
+        before,
+        re.I,
+    ):
+        return False
+    if re.search(r"^\s*(?:artifact|artifacts|file|files|report|reports|deliverable|deliverables)\b", after, re.I):
+        return False
+    if re.search(r"\b(attached|uploaded|input|source|provided|existing|original|reference|embedded)\b", immediate, re.I):
         return True
     if re.search(r"\b(output|outputs|artifact|artifacts|deliverable|deliverables|report|reports)\b", nearby, re.I):
         return False
@@ -866,7 +1028,76 @@ def _ooxml_library_validation(path: Path, suffix: str) -> dict[str, object]:
     return {"status": "not_applicable"}
 
 
-def _artifact_inventory(workspace_dir: Path) -> dict[str, object]:
+def _scheduled_prompt_private_scratchpad_dir(workspace_dir: Path) -> Path | None:
+    snapshot_path = workspace_dir / "scheduled-prompt" / "variable-snapshot.json"
+    if not snapshot_path.is_file():
+        return None
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        marker = str(item.get("placeholder") or item.get("wrapper") or "").strip()
+        if marker not in {
+            "local.viventium.my_folder",
+            "local.viventium.local_machine_glasshive.my_folder",
+        }:
+            continue
+        value = str(item.get("value") or "").strip()
+        if not value:
+            continue
+        path = Path(value).expanduser()
+        try:
+            if path.is_dir():
+                return path
+        except OSError:
+            return None
+    return None
+
+
+def _private_scratchpad_artifact_paths(
+    workspace_dir: Path,
+    *,
+    started_at: float | None = None,
+    ended_at: float | None = None,
+) -> list[Path]:
+    root = _scheduled_prompt_private_scratchpad_dir(workspace_dir)
+    if root is None:
+        return []
+    lower_bound = (started_at - 300) if started_at is not None else None
+    upper_bound = (ended_at + 300) if ended_at is not None else None
+    candidates: list[Path] = []
+    for path in sorted(root.iterdir()):
+        if not path.is_file():
+            continue
+        if not (
+            re.fullmatch(r"\d{12}\.md", path.name)
+            or re.fullmatch(r"memory-proposals-\d{12}\.json", path.name)
+        ):
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if lower_bound is not None and mtime < lower_bound:
+            continue
+        if upper_bound is not None and mtime > upper_bound:
+            continue
+        candidates.append(path)
+    return candidates[-20:]
+
+
+def _artifact_inventory(
+    workspace_dir: Path,
+    *,
+    started_at: float | None = None,
+    ended_at: float | None = None,
+) -> dict[str, object]:
     items: list[dict[str, object]] = []
     for path in candidate_artifact_paths({"workspace_dir": str(workspace_dir)}, max_entries=200):
         try:
@@ -884,6 +1115,21 @@ def _artifact_inventory(workspace_dir: Path) -> dict[str, object]:
         )
         if path.suffix.lower() in _HTML_FILE_SUFFIXES:
             items[-1]["html_validation"] = _html_browser_validation(path)
+    for path in _private_scratchpad_artifact_paths(workspace_dir, started_at=started_at, ended_at=ended_at):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        items.append(
+            {
+                "path": f"private-scratchpad/{path.name}",
+                "bytes": stat.st_size,
+                "mtime": stat.st_mtime,
+                "suffix": path.suffix.lower(),
+                "source": "scheduled_prompt_private_scratchpad",
+                "document_validation": _document_validation(path),
+            }
+        )
     return {
         "count": len(items),
         "items": items,
@@ -1450,7 +1696,9 @@ _ACCESS_TIMESTAMP_ONLY_RE = re.compile(
 )
 _SOURCE_PUBLICATION_DATE_RE = re.compile(r"\b(?:published|publication|dated|released|filed|announced)\b", re.I)
 _CONSTRAINT_PLANNING_DIRS = {"planning", "specs"}
-_CONSTRAINT_PLANNING_NAMES = {"spec", "plan", "prompt", "subagent", "delegation", "constraint", "ledger"}
+_CONSTRAINT_SUPPORT_DIRS = _SUPPORT_ARTIFACT_DIRS
+_CONSTRAINT_INTERNAL_NAMES = {"prompt", "subagent", "delegation", "constraint", "ledger"}
+_CONSTRAINT_SUPPORT_NAMES = {"spec", "plan", "prompt", "subagent", "delegation", "constraint", "ledger"}
 _SOFTENING_RE = re.compile(r"\b(wherever possible|if possible|best effort|when available|roughly|approximately)\b", re.I)
 _CONSTRAINT_CONTEXT_RE = re.compile(
     r"\b(constraint|must|only|through|until|no later than|required|forbidden|exclude|flag)\b",
@@ -1504,7 +1752,8 @@ def _is_constraint_planning_file(rel_path: str) -> bool:
     stem = path.stem.lower()
     return bool(
         any(part in _CONSTRAINT_PLANNING_DIRS for part in lowered_parts)
-        or any(token in stem for token in _CONSTRAINT_PLANNING_NAMES)
+        or any(token in stem for token in _CONSTRAINT_INTERNAL_NAMES)
+        or any(token in stem for token in _CONSTRAINT_SUPPORT_NAMES)
     )
 
 
@@ -1512,9 +1761,11 @@ def _is_constraint_propagation_file(rel_path: str) -> bool:
     path = Path(rel_path)
     lowered_parts = [part.lower() for part in path.parts]
     stem = path.stem.lower()
+    support_dir = any(part in _CONSTRAINT_SUPPORT_DIRS for part in lowered_parts[:-1])
     return bool(
-        any(part in {"planning", "specs"} for part in lowered_parts)
-        or any(token in stem for token in {"spec", "plan", "prompt", "subagent", "delegation"})
+        any(part in _CONSTRAINT_PLANNING_DIRS for part in lowered_parts)
+        or any(token in stem for token in {"prompt", "subagent", "delegation"})
+        or (support_dir and any(token in stem for token in {"spec", "plan"}))
     )
 
 
@@ -1535,10 +1786,16 @@ def _source_date_constraint_lines(ledger: dict[str, object]) -> list[str]:
     if not isinstance(constraints, dict):
         return []
     lines: list[str] = []
-    for key in ("source", "date"):
-        values = constraints.get(key)
-        if isinstance(values, list):
-            lines.extend(str(item or "").strip() for item in values if str(item or "").strip())
+    date_values = constraints.get("date")
+    if isinstance(date_values, list):
+        lines.extend(str(item or "").strip() for item in date_values if str(item or "").strip())
+    source_values = constraints.get("source")
+    if isinstance(source_values, list):
+        lines.extend(
+            str(item or "").strip()
+            for item in source_values
+            if str(item or "").strip() and _line_requires_source_date_planning_preservation(str(item or ""))
+        )
     return list(dict.fromkeys(lines))
 
 
@@ -1725,6 +1982,8 @@ def _artifact_path_summary(artifacts: dict[str, object]) -> dict[str, object]:
 
 def _clean_seed_term(value: str) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip(" \t\n\r:;,.()[]{}")
+    if re.fullmatch(r"<[^<>]{1,80}>", text):
+        return ""
     text = re.sub(
         r"(?i)\b(?:in|with|for)\s+(?:the\s+)?(?:final\s+)?(?:report|output|artifact|deliverable)s?.*$",
         "",
@@ -1740,8 +1999,10 @@ def _seed_terms_from_line(line: str) -> list[str]:
     text = re.sub(r"\s+", " ", str(line or "")).strip()
     if not text:
         return []
+    if re.match(r'^\s*"[A-Za-z_][A-Za-z0-9_.-]*"\s*:', text):
+        return []
     candidates: list[str] = []
-    quoted = re.findall(r"[\"']([^\"']{2,80})[\"']", text)
+    quoted = re.findall(r"(?<!\w)[\"']([^\"']{2,80})[\"'](?!\w)", text)
     candidates.extend(quoted)
 
     body = ""
@@ -1777,6 +2038,8 @@ def _seed_terms_from_line(line: str) -> list[str]:
         lower = cleaned.lower()
         if lower in _SEED_DESCRIPTOR_WORDS or lower in {"seed", "include", "cover"}:
             continue
+        if lower == "confirmation" or lower.startswith("confirmation in "):
+            continue
         terms.append(cleaned)
     return list(dict.fromkeys(terms))
 
@@ -1811,6 +2074,19 @@ def _seed_entity_coverage(workspace_dir: Path, ledger: dict[str, object] | None,
         }
     fragments = [str(output_text or "")]
     scanned_paths: list[str] = []
+    uploads_dir = workspace_dir / "uploads"
+    if uploads_dir.is_dir():
+        upload_fragments: list[str] = []
+        for upload_path in sorted(uploads_dir.rglob("*"))[:100]:
+            if not upload_path.is_file():
+                continue
+            try:
+                rel = upload_path.relative_to(workspace_dir).as_posix()
+            except ValueError:
+                rel = upload_path.name
+            upload_fragments.extend([rel, upload_path.name, upload_path.stem])
+        if upload_fragments:
+            fragments.append("\n".join(dict.fromkeys(upload_fragments)))
     for path in _iter_scan_files(workspace_dir):
         try:
             fragments.append(path.read_text(encoding="utf-8", errors="ignore"))
@@ -1866,7 +2142,11 @@ def _completion_compliance(
             }
         )
 
-    fail_reasons = {"final report marker missing", "required artifact types missing", "only support notes/planning artifacts were found"}
+    fail_reasons = {
+        "final report marker missing",
+        "required artifact types missing",
+        "only support notes/planning artifacts were found",
+    }
     status = "pass"
     if any(str(issue.get("reason") or "") in fail_reasons for issue in issues):
         status = "fail"
@@ -1928,11 +2208,11 @@ def summarize_run_evidence_result(evidence: dict[str, object]) -> dict[str, obje
                 }
             )
 
+    completion = evidence.get("completion_compliance")
     final_output = evidence.get("final_output")
     if isinstance(final_output, dict) and not final_output.get("has_final_report"):
         failure_reasons.append({"reason": "final report marker missing"})
 
-    completion = evidence.get("completion_compliance")
     if isinstance(completion, dict):
         completion_status = str(completion.get("status") or "").lower()
         issues = completion.get("issues") if isinstance(completion.get("issues"), list) else []
@@ -1999,11 +2279,12 @@ def _failure_classification_summary(
     runtime_name: str,
     exit_code: int | None,
     error_text: str,
+    has_final_report: bool,
 ) -> dict[str, object]:
     if (
         exit_code == 0
         and not str(error_text or "").strip()
-        and not has_structured_failure_evidence(stdout_text or "", stderr_text or "")
+        and (has_final_report or not has_structured_failure_evidence(stdout_text or "", stderr_text or ""))
     ):
         return {"status": "not_applicable"}
     classification = classify_cli_failure(
@@ -2044,7 +2325,7 @@ def build_run_evidence(
     transcript_paths: dict[str, str] | None = None,
 ) -> dict[str, object]:
     workspace = Path(workspace_dir)
-    artifacts = _artifact_inventory(workspace)
+    artifacts = _artifact_inventory(workspace, started_at=started_at, ended_at=ended_at)
     normalized_stop_reason = str(stop_reason or "").strip()
     if normalized_stop_reason == "timeout":
         exit_source = "timeout"
@@ -2121,6 +2402,7 @@ def build_run_evidence(
             runtime_name=runtime_name,
             exit_code=exit_code,
             error_text=error_text,
+            has_final_report=has_final_report,
         ),
         "exit_code": exit_code,
     }

@@ -186,6 +186,12 @@ redirect to a tokenless watch/project/desktop URL, so the browser address bar an
 polling do not retain `gh_token`. Do not store valid signed links in reports, logs, or public
 artifacts.
 
+Artifact delivery should expose the scoped download short ref as the default chat-facing file link,
+labeled `Download file`, while preserving a preview/open short ref or View / Steer workspace link
+for inspection and all-deliveries access. A direct download default is a UX choice, not a weaker
+security boundary: enterprise `/v1/link-refs/{ref}` download routes still require the authenticated
+tenant/user to match the signed ref payload before returning bytes.
+
 Signed-link TTL is not enough by itself. If a user opens a watch session before the link expires,
 the browser can keep an active websocket open. `GLASSHIVE_MAX_WATCH_SESSION_DURATION_S` must also
 close that live websocket after the configured duration. In plain terms: link expiry stops a new
@@ -201,7 +207,22 @@ Upload/data-plane QA is part of the enterprise contract, not a separate convenie
 LibreChat integrations, the worker must receive actual uploaded bytes through a read-only shared
 upload mount such as `WPR_LIBRECHAT_UPLOADS_ROOT`, and enterprise mode requires owner-scoped
 metadata paths shaped like `/uploads/<authenticated-user-id>/<file>`. Filename metadata alone is
-not a passing upload result for binary/PDF/workbook work.
+not a passing upload result for binary/PDF/workbook work. If the host authenticates a human by
+email/SSO while the upload share is keyed by an internal LibreChat user id, the host must send the
+internal id as `X-GlassHive-Storage-User-Id` or `X-Viventium-Storage-User-Id`. That storage identity
+is authorized only for upload byte lookup and must not replace the authenticated owner used for
+workspace/link access.
+
+If a legacy host cannot project request `files`/`attachments` without changing its LibreChat image,
+`GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_FALLBACK=true` may be enabled as a bounded compatibility mode.
+It must stay owner-scoped to the storage id, request-context-gated by conversation/message headers,
+and time-bounded by `GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_RECENT_SECONDS` (default `900`). Without real
+file metadata or an approved DB resolver, the fallback cannot prove per-message file membership, so
+the normal upload-header contract remains the preferred architecture. It must never scan a global
+upload folder, pick another owner's file, or replace the normal upload-header contract when that
+contract is available. Keep the time window close to real upload-to-dispatch latency and require an
+operator-visible fallback-use log; broad windows can copy unrelated same-owner uploads into a worker
+and violate literal file-input expectations.
 
 Status/wait QA must also cover stale requested runs. If a user asks about an older failed run after
 the same worker later completed, GlassHive must preserve the requested run outcome while surfacing

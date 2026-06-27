@@ -18,6 +18,17 @@ let rfbImportAttempt = 0;
 let desktopRefreshTimer = 0;
 let desktopRefreshInFlight = false;
 let desktopRefreshDelayMs = 5000;
+let latestLivePayload = null;
+let settledDesktopSuppressed = false;
+
+const ACTIVE_RUN_STATES = new Set(['queued', 'running']);
+const SETTLED_RUN_STATES = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+const ACTIVE_WORKER_STATES = new Set(['created', 'starting', 'ready', 'running', 'resuming', 'interrupting']);
+const PARKED_WORKER_STATES = new Set(['paused', 'terminated', 'failed']);
+
+function normalizedState(value) {
+  return String(value || '').trim().toLowerCase();
+}
 
 function withAuth(url) {
   if (!signedToken || /(?:^|[?&])gh_token=/.test(String(url || ''))) return url;
@@ -42,11 +53,75 @@ function buildDesktopTitle(workerName, projectTitle) {
 
 function refreshDelayForLiveState(data) {
   if (document.hidden) return 15000;
-  const workerState = String(data?.worker?.state || '').trim().toLowerCase();
-  const runState = String(data?.latest_run?.state || '').trim().toLowerCase();
-  return ['queued', 'running'].includes(runState) || ['created', 'starting', 'resuming'].includes(workerState)
+  const workerState = normalizedState(data?.worker?.state);
+  const runState = normalizedState(data?.latest_run?.state);
+  return ACTIVE_RUN_STATES.has(runState) || ['created', 'starting', 'resuming', 'interrupting'].includes(workerState)
     ? 5000
     : 15000;
+}
+
+function viewHealthHealthy(data) {
+  const healthy = data?.runtime_details?.view_health?.healthy;
+  return typeof healthy === 'boolean' ? healthy : null;
+}
+
+function isSettledWorkspaceState(data) {
+  const workerState = normalizedState(data?.worker?.state);
+  const runState = normalizedState(data?.latest_run?.state);
+  if (ACTIVE_RUN_STATES.has(runState)) {
+    return false;
+  }
+  if (SETTLED_RUN_STATES.has(runState)) {
+    return true;
+  }
+  if (ACTIVE_WORKER_STATES.has(workerState)) {
+    return false;
+  }
+  return PARKED_WORKER_STATES.has(workerState);
+}
+
+function settledWorkspaceStatus(data) {
+  const workerState = normalizedState(data?.worker?.state);
+  const runState = normalizedState(data?.latest_run?.state);
+  const hasFiles = Boolean(data?.artifacts?.items?.length || data?.deliverable);
+
+  if (runState === 'completed') {
+    return {
+      title: 'Workspace complete',
+      detail: hasFiles
+        ? 'The latest output and workspace files are available from the status panel. Continue this workspace when you want fresh compute.'
+        : 'The latest result is available from the status panel. Continue this workspace when you want fresh compute.',
+    };
+  }
+  if (workerState === 'paused') {
+    return {
+      title: 'Workspace paused',
+      detail: 'Compute is stopped for this workspace. Resume or send follow-up work to reattach a fresh desktop session.',
+    };
+  }
+  if (workerState === 'terminated') {
+    return {
+      title: 'Workspace parked',
+      detail: 'Compute is stopped to save resources. The workspace files remain available, and GlassHive will resume when you send more work.',
+    };
+  }
+  if (['failed', 'cancelled', 'interrupted'].includes(runState) || workerState === 'failed') {
+    return {
+      title: 'Workspace needs attention',
+      detail: 'The live desktop is not running. Open the status panel for the last result and blocker details.',
+    };
+  }
+  return {
+    title: 'Desktop unavailable',
+    detail: 'The live desktop is not running for this workspace. Open the status panel for the latest result.',
+  };
+}
+
+function showSettledWorkspaceStatus(data) {
+  const status = settledWorkspaceStatus(data);
+  stopClipboardSync();
+  setClipboardStatus('Clipboard sync: inactive until workspace resumes');
+  setStatus(status.title, status.detail);
 }
 
 function scheduleDesktopRefresh(delayMs = desktopRefreshDelayMs) {
@@ -126,13 +201,24 @@ async function connectDesktop() {
       return;
     }
     const data = await response.json();
+    latestLivePayload = data;
     desktopRefreshDelayMs = refreshDelayForLiveState(data);
     const runtime = data.runtime_details || {};
     const viewAvailable = Boolean(runtime.view_available || runtime.view_url);
+    const settledWorkspace = isSettledWorkspaceState(data);
+    if (!settledWorkspace) settledDesktopSuppressed = false;
     buildDesktopTitle(data.worker?.name, data.project_title);
 
     if (!viewAvailable) {
-      setStatus('Desktop unavailable', 'This worker does not currently expose a live desktop surface.');
+      if (settledWorkspace) {
+        showSettledWorkspaceStatus(data);
+      } else {
+        setStatus('Desktop unavailable', 'This worker does not currently expose a live desktop surface.');
+      }
+      return;
+    }
+    if (settledWorkspace && (settledDesktopSuppressed || viewHealthHealthy(data) === false)) {
+      showSettledWorkspaceStatus(data);
       return;
     }
 
@@ -155,6 +241,12 @@ async function connectDesktop() {
       ({ default: RFB } = await import(modulePath));
     } catch (error) {
       rfbImportAttempt += 1;
+      if (settledWorkspace) {
+        settledDesktopSuppressed = true;
+        showSettledWorkspaceStatus(data);
+        console.debug('rfb import skipped for settled workspace', error);
+        return;
+      }
       setStatus(
         'Desktop reconnecting…',
         'GlassHive is refreshing the live desktop client and will attach again automatically.',
@@ -162,6 +254,7 @@ async function connectDesktop() {
       console.debug('rfb import failed', error);
       return;
     }
+    settledDesktopSuppressed = false;
 
     if (rfb) {
       try {
@@ -191,6 +284,15 @@ async function connectDesktop() {
     });
 
     rfb.addEventListener('disconnect', (event) => {
+      rfb = null;
+      currentWsUrl = '';
+      currentPassword = '';
+      stopClipboardSync();
+      if (isSettledWorkspaceState(latestLivePayload)) {
+        settledDesktopSuppressed = true;
+        showSettledWorkspaceStatus(latestLivePayload);
+        return;
+      }
       setStatus(
         event.detail.clean ? 'Desktop disconnected' : 'Desktop reconnecting…',
         event.detail.clean

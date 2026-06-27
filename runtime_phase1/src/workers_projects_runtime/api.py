@@ -855,6 +855,7 @@ def create_app(
 
     def _signed_watch_action_url(worker: dict) -> str:
         worker_id = str(worker.get("worker_id") or "")
+        project_id = str(worker.get("project_id") or "")
         token = sign_link_token(
             kind="worker_view",
             worker_id=worker_id,
@@ -862,9 +863,15 @@ def create_app(
             owner_id=str(worker.get("owner_id") or ""),
         )
         if token:
-            ref_id = create_signed_link_ref(token=token, target_url="")
-            return signed_link_ref_url("", ref_id, route="/w") if ref_id else ""
-        project_id = str(worker.get("project_id") or "")
+            watch_query = {"surface": "desktop"}
+            if project_id:
+                watch_query["project_id"] = project_id
+            target_url = append_signed_query(
+                f"/watch/{quote(worker_id, safe='')}?{urlencode(watch_query)}",
+                {"gh_token": token},
+            )
+            ref_id = create_signed_link_ref(token=token, target_url=target_url)
+            return signed_link_ref_url("", ref_id, route="/r") if ref_id else ""
         return f"/ui/workers/{quote(worker_id)}/view?project_id={quote(project_id)}"
 
     def _deliverable_with_action_urls(worker: dict, deliverable: dict[str, object] | None) -> dict[str, object] | None:
