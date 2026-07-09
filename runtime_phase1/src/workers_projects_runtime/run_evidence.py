@@ -1141,11 +1141,11 @@ def _html_browser_validation(path: Path) -> dict[str, object]:
     if enabled not in {"1", "true", "yes", "on"}:
         return {
             "status": "unavailable",
-            "reason": "disabled; set GLASSHIVE_EVIDENCE_HTML_PLAYWRIGHT=1",
+            "reason": "disabled; set GLASSHIVE_EVIDENCE_HTML_PLAYWRIGHT=1 and provide Node Playwright to enable real browser HTML smoke validation",
         }
     node = shutil.which("node")
     if not node:
-        return {"status": "unavailable", "reason": "node not found"}
+        return {"status": "unavailable", "reason": "node not found; Node plus the playwright package are required for HTML browser smoke validation"}
     script = r"""
 const target = process.argv[1];
 (async () => {
@@ -1153,7 +1153,7 @@ const target = process.argv[1];
   try {
     chromium = require("playwright").chromium;
   } catch (error) {
-    console.log(JSON.stringify({ status: "unavailable", reason: "playwright not installed" }));
+    console.log(JSON.stringify({ status: "unavailable", reason: "playwright package not installed in the evidence runtime" }));
     return;
   }
   const browser = await chromium.launch({ headless: true });

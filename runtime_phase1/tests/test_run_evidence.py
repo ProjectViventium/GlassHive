@@ -2165,6 +2165,8 @@ def test_run_evidence_records_html_browser_smoke_prerequisite(tmp_path, monkeypa
 
     html = next(item for item in evidence["artifacts"]["items"] if item["path"] == "output/index.html")
     assert html["html_validation"]["status"] == "unavailable"
+    assert "GLASSHIVE_EVIDENCE_HTML_PLAYWRIGHT=1" in html["html_validation"]["reason"]
+    assert "Node Playwright" in html["html_validation"]["reason"]
     assert evidence["visual_render_evidence"]["status"] == "unavailable"
     assert evidence["content_hygiene"]["status"] == "pass"
 

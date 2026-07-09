@@ -8,6 +8,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 from workers_projects_runtime.docker_sandbox import (
     DockerSandboxManager,
     SandboxInfo,
@@ -15,7 +17,11 @@ from workers_projects_runtime.docker_sandbox import (
     _ai_worker_browser_native_host_bootstrap_script,
     _safe_docker_exec_env,
 )
-from workers_projects_runtime.bootstrap import GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS, GLASSHIVE_SAFETY_CHECKPOINT_RULE
+from workers_projects_runtime.bootstrap import (
+    GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
+    GLASSHIVE_NATIVE_CAPABILITY_INVENTORY,
+    GLASSHIVE_SAFETY_CHECKPOINT_RULE,
+)
 
 
 def test_safe_docker_exec_env_preserves_claude_headless_oauth_only():
@@ -45,6 +51,9 @@ def test_seed_bootstrap_writes_default_worker_contract_without_bundle(tmp_path):
     assert "GlassHive Worker Contract" in agents_text
     assert GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS in agents_text
     assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in agents_text
+    assert GLASSHIVE_NATIVE_CAPABILITY_INVENTORY in agents_text
+    assert "WebDriver/Selenium endpoint" in agents_text
+    assert "Use the visible workstation surface" in agents_text
     assert "Less is more" in agents_text
     assert "Do not force a download" in agents_text
     assert "@AGENTS.md" in (workspace_dir / "CLAUDE.md").read_text()
@@ -1096,6 +1105,28 @@ def test_start_screen_session_prepares_runtime_dir_and_detaches(tmp_path):
     assert calls[1][3]["OPENAI_API_KEY"] == "secret"
 
 
+def test_screen_session_pid_reads_matching_screen_socket(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[list[str]] = []
+
+    class FakeSandbox:
+        container_name = "wpr-test"
+
+    manager.inspect = lambda worker_id: FakeSandbox()  # type: ignore[method-assign]
+
+    def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
+        calls.append(command)
+        if command[:2] == ["bash", "-lc"]:
+            assert command[-1] == "job-run_123456"
+            return subprocess.CompletedProcess(["docker"], returncode=0, stdout="12345\n", stderr="")
+        return subprocess.CompletedProcess(["docker"], returncode=0, stdout="", stderr="")
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+
+    assert manager.screen_session_pid("wrk_test", "codex-cli", "job-run_123456") == 12345
+    assert any("mkdir -p /run/screen" in command[-1] for command in calls)
+
+
 def test_start_screen_session_revalidates_projected_worker_without_container_evidence(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     calls: list[tuple[str, list[str], bool, bool]] = []
@@ -1325,9 +1356,103 @@ def test_ensure_ready_primes_idle_desktop_when_container_is_new(tmp_path):
     manager._seed_bootstrap = lambda *args, **kwargs: None  # type: ignore[method-assign]
     manager._create_container = lambda *args, **kwargs: calls.append("create")  # type: ignore[method-assign]
     manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("writable")  # type: ignore[method-assign]
+    manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
     manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
     manager._prime_idle_desktop = lambda container_name: calls.append("prime")  # type: ignore[method-assign]
     manager.inspect = lambda worker_id: sandbox_states.pop(0)  # type: ignore[method-assign]
 
     manager.ensure_ready({"worker_id": "wrk_test"}, "codex-cli")
-    assert calls == ["create", "writable", "background", "prime"]
+    assert calls == ["create", "writable", "harden", "background", "prime"]
+    marker = json.loads((manager._paths("wrk_test")["state_dir"] / "desktop-prime.json").read_text())
+    assert marker["schema"] == "glasshive.desktop_prime.v1"
+    assert marker["status"] == "launched"
+    assert marker["container_name"] == "wpr-test"
+    assert marker["default_browser_url"].startswith("data:text/html")
+
+
+def test_ensure_ready_records_idle_desktop_prime_failure(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[str] = []
+
+    class FakeSandbox:
+        def __init__(self, state: str):
+            self.container_name = "wpr-test"
+            self.state = state
+            self.container_id = "cid"
+            self.workspace_dir = str(tmp_path / "workspace")
+            self.home_dir = str(tmp_path / "home")
+            self.pid = 1234
+            self.image = "img"
+            self.novnc_port = 57900
+            self.selenium_port = 57901
+            self.openclaw_port = 57902
+
+    sandbox_states = [None, FakeSandbox("running")]
+
+    manager._require_docker = lambda: None  # type: ignore[method-assign]
+    manager._ensure_image = lambda: None  # type: ignore[method-assign]
+    manager._ensure_host_dirs = lambda paths: None  # type: ignore[method-assign]
+    manager._seed_bootstrap = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    manager._create_container = lambda *args, **kwargs: calls.append("create")  # type: ignore[method-assign]
+    manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("writable")  # type: ignore[method-assign]
+    manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
+    manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
+
+    def fail_prime(container_name):
+        calls.append("prime")
+        raise RuntimeError("prime failed")
+
+    manager._prime_idle_desktop = fail_prime  # type: ignore[method-assign]
+    manager.inspect = lambda worker_id: sandbox_states.pop(0)  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="prime failed"):
+        manager.ensure_ready({"worker_id": "wrk_test"}, "codex-cli")
+
+    marker = json.loads((manager._paths("wrk_test")["state_dir"] / "desktop-prime.json").read_text())
+    assert calls == ["create", "writable", "harden", "background", "prime"]
+    assert marker["status"] == "failed"
+    assert "prime failed" in marker["detail"]
+
+
+def test_ensure_ready_records_idle_desktop_prime_nonzero_return_as_failure(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[str] = []
+
+    class FakeSandbox:
+        def __init__(self, state: str):
+            self.container_name = "wpr-test"
+            self.state = state
+            self.container_id = "cid"
+            self.workspace_dir = str(tmp_path / "workspace")
+            self.home_dir = str(tmp_path / "home")
+            self.pid = 1234
+            self.image = "img"
+            self.novnc_port = 57900
+            self.selenium_port = 57901
+            self.openclaw_port = 57902
+
+    sandbox_states = [None, FakeSandbox("running")]
+
+    manager._require_docker = lambda: None  # type: ignore[method-assign]
+    manager._ensure_image = lambda: None  # type: ignore[method-assign]
+    manager._ensure_host_dirs = lambda paths: None  # type: ignore[method-assign]
+    manager._seed_bootstrap = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    manager._create_container = lambda *args, **kwargs: calls.append("create")  # type: ignore[method-assign]
+    manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("writable")  # type: ignore[method-assign]
+    manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
+    manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
+    manager.inspect = lambda worker_id: sandbox_states.pop(0)  # type: ignore[method-assign]
+
+    def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
+        calls.append("prime")
+        return subprocess.CompletedProcess(["docker"], returncode=42, stdout="", stderr="wmctrl failed")
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="Idle desktop prime failed"):
+        manager.ensure_ready({"worker_id": "wrk_test"}, "codex-cli")
+
+    marker = json.loads((manager._paths("wrk_test")["state_dir"] / "desktop-prime.json").read_text())
+    assert calls == ["create", "writable", "harden", "background", "prime"]
+    assert marker["status"] == "failed"
+    assert "wmctrl failed" in marker["detail"]
