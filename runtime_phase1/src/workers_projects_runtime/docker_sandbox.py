@@ -16,6 +16,10 @@ from urllib.request import Request, urlopen
 from .bootstrap import apply_bootstrap
 
 
+def _utc_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 SAFE_DOCKER_EXEC_ENV_KEYS = {
     "PATH",
     "SHELL",
@@ -478,7 +482,12 @@ class DockerSandboxManager:
         if needs_idle_prime:
             self._set_plain_background(sandbox.container_name)
         if needs_idle_prime and self._env_flag("WPR_IDLE_DESKTOP_PRIME_BROWSER", True):
-            self._prime_idle_desktop(sandbox.container_name)
+            try:
+                self._prime_idle_desktop(sandbox.container_name)
+            except Exception as exc:
+                self._record_idle_desktop_prime(worker["worker_id"], sandbox, status="failed", detail=str(exc))
+                raise
+            self._record_idle_desktop_prime(worker["worker_id"], sandbox, status="launched")
         return sandbox
 
     def inspect(self, worker_id: str) -> SandboxInfo | None:
@@ -649,6 +658,45 @@ class DockerSandboxManager:
                 continue
             sessions.append(head.split(".", 1)[1].strip())
         return sessions
+
+    def screen_session_pid(
+        self,
+        worker_id: str,
+        runtime_name: str,
+        session_name: str,
+        *,
+        worker: dict | None = None,
+    ) -> int | None:
+        resolved_worker = worker or {"worker_id": worker_id}
+        sandbox = self.fast_sandbox_from_worker(resolved_worker) or self.inspect(worker_id)
+        if sandbox is None:
+            return None
+        self._ensure_screen_runtime_dir(sandbox.container_name)
+        script = r"""
+target="$1"
+screen -ls | awk -v target="$target" '
+  /^[[:space:]]*[0-9]+[.]/ {
+    socket=$1;
+    split(socket, parts, ".");
+    name=socket;
+    sub(/^[0-9]+[.]/, "", name);
+    if (name == target) { print parts[1]; exit; }
+  }
+'
+"""
+        result = self._docker_exec(
+            sandbox.container_name,
+            ["bash", "-lc", script, "bash", session_name],
+            env=self._desktop_env(),
+            cwd=self.workspace_mount,
+        )
+        if result.returncode != 0:
+            return None
+        lines = (result.stdout or "").strip().splitlines()
+        if not lines:
+            return None
+        candidate = lines[0].strip()
+        return int(candidate) if candidate.isdigit() else None
 
     def start_screen_session(
         self,
@@ -849,6 +897,7 @@ class DockerSandboxManager:
             "view_url": view_url,
             "view_available": bool(view_url),
             "view_health": view_health,
+            "desktop_prime": self._read_idle_desktop_prime(worker_id),
         }
 
     def view_url(self, worker_id: str) -> str | None:
@@ -1505,12 +1554,53 @@ class DockerSandboxManager:
                 "wmctrl -xa chromium.Chromium || wmctrl -a Chromium || true",
             ]
         )
-        self._docker_exec(
+        result = self._docker_exec(
             container_name,
             ["bash", "-lc", launch_script],
             env=self._desktop_env(),
             cwd=self.workspace_mount,
         )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[-800:]
+            raise RuntimeError(f"Idle desktop prime failed: {detail or f'exit code {result.returncode}'}")
+
+    def _idle_desktop_prime_marker_path(self, worker_id: str) -> Path:
+        return self._paths(worker_id)["state_dir"] / "desktop-prime.json"
+
+    def _record_idle_desktop_prime(
+        self,
+        worker_id: str,
+        sandbox: SandboxInfo,
+        *,
+        status: str,
+        detail: str = "",
+    ) -> None:
+        payload = {
+            "schema": "glasshive.desktop_prime.v1",
+            "status": status,
+            "updated_at": _utc_iso(),
+            "container_name": sandbox.container_name,
+            "container_id": sandbox.container_id,
+            "image": sandbox.image,
+            "default_browser_url": self._default_browser_url(),
+        }
+        if detail:
+            payload["detail"] = detail[-800:]
+        path = self._idle_desktop_prime_marker_path(worker_id)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            path.chmod(0o600)
+        except OSError:
+            return
+
+    def _read_idle_desktop_prime(self, worker_id: str) -> dict[str, object] | None:
+        path = self._idle_desktop_prime_marker_path(worker_id)
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def _desktop_action_command(
         self,

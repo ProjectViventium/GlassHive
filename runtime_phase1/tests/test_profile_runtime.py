@@ -1398,7 +1398,7 @@ def test_host_cli_run_writes_constraint_ledger_and_evidence(tmp_path, monkeypatc
     assert "glasshive-run/constraint-ledger.json" not in {item["path"] for item in evidence["artifacts"]["items"]}
     assert active_status["state"] == "completed"
     assert active_status["run_id"] == "run_evidence"
-    assert active_status["process_pid"] is None
+    assert active_status["process_pid"] == 12345
     assert active_status["transcript_paths"]["stdout"].endswith("/stdout.log")
     assert active_status["evidence_path"] == "glasshive-run/evidence.json"
 
@@ -2626,6 +2626,31 @@ def test_docker_cli_runtime_uses_configured_run_timeout(tmp_path, monkeypatch):
     assert runtime._run_timeout_sec() == 1200
 
 
+def test_docker_cli_runtime_description_exposes_desktop_prime_marker(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {"worker_id": "wrk_describe_prime", "name": "Prime Worker", "profile": "codex-cli"}
+    runtime.sandbox.describe = lambda worker_id: {  # type: ignore[method-assign]
+        "workspace_dir": str(tmp_path / "workspace"),
+        "home_dir": str(tmp_path / "home"),
+        "container_name": "wpr-describe-prime",
+        "container_id": "cid",
+        "state": "running",
+        "image": "workers-projects-runtime-workstation:phase1-node22-docs7",
+        "view_url": "http://127.0.0.1:7900",
+        "view_available": True,
+        "view_health": {"healthy": True},
+        "novnc_port": 57900,
+        "selenium_port": 57901,
+        "openclaw_port": 57902,
+        "desktop_prime": {"schema": "glasshive.desktop_prime.v1", "status": "launched"},
+        "pid": 1234,
+    }
+
+    details = runtime.describe_worker(worker)
+
+    assert details["desktop_prime"] == {"schema": "glasshive.desktop_prime.v1", "status": "launched"}
+
+
 def test_docker_cli_runtime_sources_runtime_and_openclaw_env_files(tmp_path):
     class CaptureRuntime(BaseCliWorkerRuntime):
         runtime_name = "openclaw"
@@ -2674,12 +2699,82 @@ def test_docker_cli_runtime_sources_runtime_and_openclaw_env_files(tmp_path):
         return subprocess.CompletedProcess(["screen"], returncode=0, stdout="", stderr="")
 
     runtime.sandbox.start_screen_session = fake_start_screen_session  # type: ignore[method-assign]
+    runtime.sandbox.screen_session_pid = lambda *args, **kwargs: 4321  # type: ignore[method-assign]
 
     assert runtime.run_task(worker, "do it", run_id=run_id) == "FINAL REPORT:\nok"
     assert writable_repairs == [
         [f"{runtime.sandbox.home_mount}/.glasshive-runs/{run_id}"],
         [runtime.sandbox.workspace_mount, f"{runtime.sandbox.home_mount}/.glasshive-runs/{run_id}"]
     ]
+    workspace = runtime._workspace_dir(worker["worker_id"])
+    active_status = json.loads((workspace / "glasshive-run" / "runs" / run_id / "active-run.json").read_text())
+    assert active_status["state"] == "completed"
+    assert active_status["runtime"] == "openclaw"
+    assert active_status["worker"]["execution_mode"] == ""
+    assert active_status["process_pid"] == 4321
+    assert active_status["heartbeat_sequence"] >= 1
+    assert active_status["transcript_progress"]["files"]["stdout"]["exists"] is True
+    assert active_status["transcript_progress"]["files"]["stdout"]["bytes"] > 0
+    assert active_status["evidence_path"] == "glasshive-run/evidence.json"
+    active_session_text = runtime._active_session_meta_path(worker["worker_id"]).read_text()
+    assert "do it" not in active_session_text
+    active_session = json.loads(active_session_text)
+    assert active_session["instruction_redacted"] is True
+    assert active_session["process_pid"] == 4321
+
+
+def test_docker_cli_run_writes_timeout_active_run_status(tmp_path, monkeypatch):
+    class CaptureRuntime(BaseCliWorkerRuntime):
+        runtime_name = "openclaw"
+        worker_root_name = "capture_runtime"
+
+        def resolve_model(self, profile: str) -> str:
+            return "capture/model"
+
+        def _build_command(self, worker, instruction, info):
+            return ["sleep", "60"], {}
+
+        def _parse_output(self, worker, stdout, stderr, info):
+            return None, stdout.strip()
+
+    runtime = CaptureRuntime(base_dir=str(tmp_path / "data"))
+    worker = {"worker_id": "wrk_docker_timeout", "name": "Timeout Worker", "profile": "openclaw-general"}
+    run_id = "run_docker_timeout"
+
+    class FakeSandbox:
+        container_name = "wpr-timeout"
+        pid = 123
+        state = "running"
+
+    runtime.sandbox.ensure_ready = lambda worker, runtime_name, **kwargs: FakeSandbox()  # type: ignore[method-assign]
+    runtime.sandbox.inspect = lambda worker_id: FakeSandbox()  # type: ignore[method-assign]
+    runtime.sandbox.list_screen_sessions = lambda *args, **kwargs: []  # type: ignore[method-assign]
+    runtime.sandbox._ensure_container_writable_paths = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    runtime.sandbox.ensure_container_writable_paths = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    runtime.sandbox.stop_screen_session = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    runtime.sandbox.terminate_run_processes = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    runtime.sandbox.screen_session_pid = lambda *args, **kwargs: 9876  # type: ignore[method-assign]
+    monkeypatch.setenv("WPR_RUN_WAIT_INSPECT_INTERVAL_SEC", "60")
+
+    def fake_start_screen_session(worker_id, runtime_name, session_name, command, *, env=None, worker=None):
+        run_root = runtime._run_root(worker_id, run_id)
+        (run_root / "stdout.log").write_text("Started but still working.\n")
+        (run_root / "stderr.log").write_text("")
+        return subprocess.CompletedProcess(["screen"], returncode=0, stdout="", stderr="")
+
+    runtime.sandbox.start_screen_session = fake_start_screen_session  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeErrorBase, match="timed out"):
+        runtime.run_task(worker, "Do long work.", timeout_sec=0.01, run_id=run_id)
+
+    active_status = json.loads(
+        (runtime._workspace_dir(worker["worker_id"]) / "glasshive-run" / "runs" / run_id / "active-run.json").read_text()
+    )
+    assert active_status["state"] == "timeout"
+    assert active_status["stop_reason"] == "timeout"
+    assert active_status["process_pid"] == 9876
+    assert active_status["transcript_progress"]["files"]["stdout"]["exists"] is True
+    assert active_status["evidence_path"] == "glasshive-run/evidence.json"
 
 
 def test_docker_cli_runtime_redirects_private_instruction_from_stdin_file(tmp_path):
@@ -2728,6 +2823,7 @@ def test_docker_cli_runtime_redirects_private_instruction_from_stdin_file(tmp_pa
         return subprocess.CompletedProcess(["screen"], returncode=0, stdout="", stderr="")
 
     runtime.sandbox.start_screen_session = fake_start_screen_session  # type: ignore[method-assign]
+    runtime.sandbox.screen_session_pid = lambda *args, **kwargs: 2468  # type: ignore[method-assign]
 
     assert runtime.run_task(worker, "Sensitive docker instruction.", run_id=run_id) == "FINAL REPORT:\nok"
 
@@ -2751,6 +2847,7 @@ def _install_fake_successful_docker_run(runtime: BaseCliWorkerRuntime, run_id: s
         return subprocess.CompletedProcess(["screen"], returncode=0, stdout="", stderr="")
 
     runtime.sandbox.start_screen_session = fake_start_screen_session  # type: ignore[method-assign]
+    runtime.sandbox.screen_session_pid = lambda *args, **kwargs: 1357  # type: ignore[method-assign]
 
 
 def test_docker_cli_run_fails_when_evidence_contract_fails(tmp_path):

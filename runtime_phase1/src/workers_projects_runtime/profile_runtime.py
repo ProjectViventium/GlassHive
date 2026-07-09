@@ -1251,6 +1251,7 @@ class BaseCliWorkerRuntime:
             "novnc_port": sandbox.get("novnc_port"),
             "selenium_port": sandbox.get("selenium_port"),
             "openclaw_port": sandbox.get("openclaw_port"),
+            "desktop_prime": sandbox.get("desktop_prime"),
             "pid": sandbox["pid"],
         }
 
@@ -1462,18 +1463,11 @@ class BaseCliWorkerRuntime:
         if start_result.returncode != 0:
             detail = (start_result.stderr or start_result.stdout or "").strip()[-1600:]
             raise RuntimeErrorBase(f"Failed to start attached {self.runtime_name} session: {detail}")
-
-        self._write_active_session(
+        process_pid = self.sandbox.screen_session_pid(
             worker_for_run["worker_id"],
-            {
-                "session_name": session_name,
-                "run_id": effective_run_id,
-                "stdout_path": str(host_stdout),
-                "stderr_path": str(host_stderr),
-                "exit_path": str(host_exit),
-                "constraint_ledger_path": constraint_ledger_path,
-                "instruction": instruction,
-            },
+            self.runtime_name,
+            session_name,
+            worker=worker_for_run,
         )
 
         run_timeout_sec = self._run_timeout_sec(timeout_sec)
@@ -1484,6 +1478,52 @@ class BaseCliWorkerRuntime:
             "constraint_ledger": constraint_ledger_path,
         }
         started_at = time.time()
+        started_at_iso = _utc_iso()
+        heartbeat_path = _active_run_status_path(workspace, effective_run_id)
+        heartbeat_stop = Event()
+        heartbeat_thread: Thread | None = None
+        self._write_active_session(
+            worker_for_run["worker_id"],
+            {
+                "session_name": session_name,
+                "run_id": effective_run_id,
+                "stdout_path": str(host_stdout),
+                "stderr_path": str(host_stderr),
+                "exit_path": str(host_exit),
+                "constraint_ledger_path": constraint_ledger_path,
+                "model": str(info.model or ""),
+                "argv_for_evidence_json": json.dumps([_redact_command_arg(part) for part in command]),
+                "started_at": started_at_iso,
+                "process_pid": process_pid,
+                "heartbeat_path": str(heartbeat_path),
+                "timeout_seconds": run_timeout_sec,
+                "instruction": instruction,
+            },
+        )
+        _write_active_run_status(
+            path=heartbeat_path,
+            worker=worker_for_run,
+            run_id=effective_run_id,
+            runtime_name=self.runtime_name,
+            model=str(info.model or ""),
+            state="running",
+            transcript_paths=transcript_paths,
+            started_at=started_at_iso,
+            process_pid=process_pid,
+            timeout_seconds=run_timeout_sec,
+        )
+        heartbeat_thread = _start_active_run_heartbeat(
+            path=heartbeat_path,
+            worker=worker_for_run,
+            run_id=effective_run_id,
+            runtime_name=self.runtime_name,
+            model=str(info.model or ""),
+            transcript_paths=transcript_paths,
+            started_at=started_at_iso,
+            process_pid=process_pid,
+            timeout_seconds=run_timeout_sec,
+            stop_event=heartbeat_stop,
+        )
         try:
             exit_code = self._wait_for_exit_code(
                 worker_for_run["worker_id"],
@@ -1495,7 +1535,8 @@ class BaseCliWorkerRuntime:
         except Exception as exc:
             stdout = host_stdout.read_text() if host_stdout.exists() else ""
             stderr = host_stderr.read_text() if host_stderr.exists() else ""
-            _write_evidence_for_run(
+            stop_reason = "timeout" if "timed out" in str(exc).lower() else "error"
+            evidence_path = _write_evidence_for_run(
                 worker=worker_for_run,
                 run_id=effective_run_id,
                 runtime_name=self.runtime_name,
@@ -1509,12 +1550,30 @@ class BaseCliWorkerRuntime:
                 error_text=str(exc),
                 exit_code=None,
                 timeout_seconds=run_timeout_sec,
-                stop_reason="timeout" if "timed out" in str(exc).lower() else "error",
+                stop_reason=stop_reason,
                 constraint_ledger=constraint_ledger,
                 transcript_paths=transcript_paths,
                 started_at=started_at,
             )
+            _write_active_run_status(
+                path=heartbeat_path,
+                worker=worker_for_run,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                state="timeout" if stop_reason == "timeout" else "failed",
+                transcript_paths=transcript_paths,
+                started_at=started_at_iso,
+                process_pid=process_pid,
+                timeout_seconds=run_timeout_sec,
+                stop_reason=stop_reason,
+                evidence_path=evidence_path,
+            )
             raise
+        finally:
+            heartbeat_stop.set()
+            if heartbeat_thread:
+                heartbeat_thread.join(timeout=1)
         self.sandbox.ensure_container_writable_paths(
             worker_for_run["worker_id"],
             self.runtime_name,
@@ -1538,7 +1597,15 @@ class BaseCliWorkerRuntime:
         try:
             self._finalize_stop_reason(worker_for_run["worker_id"], run_id=effective_run_id)
         except RuntimeErrorBase as exc:
-            _write_evidence_for_run(
+            if isinstance(exc, WorkerPausedError):
+                active_state = "paused"
+            elif isinstance(exc, WorkerInterruptedError):
+                active_state = "interrupted"
+            elif isinstance(exc, WorkerTerminatedError):
+                active_state = "terminated"
+            else:
+                active_state = "failed"
+            evidence_path = _write_evidence_for_run(
                 worker=worker_for_run,
                 run_id=effective_run_id,
                 runtime_name=self.runtime_name,
@@ -1557,12 +1624,27 @@ class BaseCliWorkerRuntime:
                 transcript_paths=transcript_paths,
                 started_at=started_at,
             )
+            _write_active_run_status(
+                path=heartbeat_path,
+                worker=worker_for_run,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                state=active_state,
+                transcript_paths=transcript_paths,
+                started_at=started_at_iso,
+                process_pid=process_pid,
+                timeout_seconds=run_timeout_sec,
+                exit_code=exit_code,
+                stop_reason=exc.__class__.__name__,
+                evidence_path=evidence_path,
+            )
             raise
 
         if exit_code != 0:
             detail = (stderr or stdout or "").strip()[-2000:]
             error_text = f"{self.runtime_name} exited with code {exit_code}: {detail}"
-            _write_evidence_for_run(
+            evidence_path = _write_evidence_for_run(
                 worker=worker_for_run,
                 run_id=effective_run_id,
                 runtime_name=self.runtime_name,
@@ -1580,6 +1662,21 @@ class BaseCliWorkerRuntime:
                 constraint_ledger=constraint_ledger,
                 transcript_paths=transcript_paths,
                 started_at=started_at,
+            )
+            _write_active_run_status(
+                path=heartbeat_path,
+                worker=worker_for_run,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                state="failed",
+                transcript_paths=transcript_paths,
+                started_at=started_at_iso,
+                process_pid=process_pid,
+                timeout_seconds=run_timeout_sec,
+                exit_code=exit_code,
+                stop_reason="process_exit",
+                evidence_path=evidence_path,
             )
             raise RuntimeErrorBase(f"{self.runtime_name} exited with code {exit_code}: {detail}")
 
@@ -1605,17 +1702,50 @@ class BaseCliWorkerRuntime:
             transcript_paths=transcript_paths,
             started_at=started_at,
         )
-        _status, warning_message = _require_successful_run_evidence(
-            workspace=workspace,
-            evidence_path=evidence_path,
-            constraint_ledger_path=constraint_ledger_path,
-            run_id=effective_run_id,
-        )
+        try:
+            _status, warning_message = _require_successful_run_evidence(
+                workspace=workspace,
+                evidence_path=evidence_path,
+                constraint_ledger_path=constraint_ledger_path,
+                run_id=effective_run_id,
+            )
+        except RuntimeErrorBase:
+            _write_active_run_status(
+                path=heartbeat_path,
+                worker=worker_for_run,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                state="failed",
+                transcript_paths=transcript_paths,
+                started_at=started_at_iso,
+                process_pid=process_pid,
+                timeout_seconds=run_timeout_sec,
+                exit_code=exit_code,
+                stop_reason="evidence_check_failed",
+                evidence_path=evidence_path,
+            )
+            raise
         output_text = output.strip()
         if warning_message:
             suffix = f"\n\n{warning_message}"
             if len(output_text) + len(suffix) <= _HOST_RUN_OUTPUT_MAX_CHARS:
                 output_text = f"{output_text}{suffix}"
+        _write_active_run_status(
+            path=heartbeat_path,
+            worker=worker_for_run,
+            run_id=effective_run_id,
+            runtime_name=self.runtime_name,
+            model=str(info.model or ""),
+            state="completed",
+            transcript_paths=transcript_paths,
+            started_at=started_at_iso,
+            process_pid=process_pid,
+            timeout_seconds=run_timeout_sec,
+            exit_code=exit_code,
+            stop_reason="process_exit",
+            evidence_path=evidence_path,
+        )
         return output_text
 
 
@@ -3944,6 +4074,7 @@ class HostNativeCliMixin:
                 start_new_session=True,
             )
             self._register_process(worker["worker_id"], process)
+            process_pid = process.pid
             self._write_active_session(
                 worker["worker_id"],
                 {
@@ -4117,7 +4248,7 @@ class HostNativeCliMixin:
                 state=active_state,
                 transcript_paths=transcript_paths,
                 started_at=started_at_iso,
-                process_pid=None,
+                process_pid=process_pid,
                 timeout_seconds=run_timeout_sec,
                 exit_code=exit_code,
                 stop_reason=exc.__class__.__name__,
@@ -4156,7 +4287,7 @@ class HostNativeCliMixin:
                 state="failed",
                 transcript_paths=transcript_paths,
                 started_at=started_at_iso,
-                process_pid=None,
+                process_pid=process_pid,
                 timeout_seconds=run_timeout_sec,
                 exit_code=exit_code,
                 stop_reason="process_exit",
@@ -4219,7 +4350,7 @@ class HostNativeCliMixin:
                 state="failed",
                 transcript_paths=transcript_paths,
                 started_at=started_at_iso,
-                process_pid=None,
+                process_pid=process_pid,
                 timeout_seconds=run_timeout_sec,
                 exit_code=exit_code,
                 stop_reason="evidence_check_failed",
@@ -4250,7 +4381,7 @@ class HostNativeCliMixin:
             state="completed",
             transcript_paths=transcript_paths,
             started_at=started_at_iso,
-            process_pid=None,
+            process_pid=process_pid,
             timeout_seconds=run_timeout_sec,
             exit_code=exit_code,
             stop_reason="process_exit",
