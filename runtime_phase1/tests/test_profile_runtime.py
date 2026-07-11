@@ -24,7 +24,7 @@ def _patch_host_codex_requirement_probe(monkeypatch):
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.140.0\n",
+            stdout="codex-cli 0.144.1\n",
             stderr="",
         ),
     )
@@ -871,7 +871,7 @@ def test_host_codex_runtime_materializes_required_workspace_files(tmp_path, monk
 
     def fake_run(args, **_kwargs):
         if "--version" in args:
-            return subprocess.CompletedProcess(args, returncode=0, stdout="codex-cli 0.140.0\n", stderr="")
+            return subprocess.CompletedProcess(args, returncode=0, stdout="codex-cli 0.144.1\n", stderr="")
         xattr_calls.append(args)
         return subprocess.CompletedProcess(args, returncode=0, stdout="", stderr="")
 
@@ -945,7 +945,7 @@ def test_host_runtime_content_hygiene_helper_strips_and_flags_page_chrome(tmp_pa
         return subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
             stderr="",
         )
 
@@ -1012,11 +1012,13 @@ def test_host_codex_model_can_differ_from_docker_provider_model(tmp_path, monkey
     assert runtime.resolve_model("codex-cli") == "gpt-5.4"
 
 
-def test_host_codex_defaults_to_local_codex_config_instead_of_provider_model(tmp_path, monkeypatch):
+def test_host_codex_does_not_invent_automation_model_or_effort(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.setenv("WPR_MODEL_CODEX_CLI", "gpt-5.4")
     monkeypatch.delenv("WPR_MODEL_HOST_CODEX_CLI", raising=False)
     monkeypatch.delenv("CODEX_MODEL", raising=False)
+    monkeypatch.delenv("WPR_CODEX_CLI_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("WPR_CODEX_CLI_DEFAULT_REASONING_EFFORT", raising=False)
     monkeypatch.delenv("GLASSHIVE_HOST_CODEX_INHERIT_PROVIDER_MODEL", raising=False)
     worker = {
         "worker_id": "wrk_host_model_default",
@@ -1028,8 +1030,10 @@ def test_host_codex_defaults_to_local_codex_config_instead_of_provider_model(tmp
 
     command, _env = runtime._build_command(worker, "create the marker", runtime._host_runtime_info(worker))
 
+    joined = "\n".join(command)
     assert runtime.resolve_model("codex-cli") == ""
     assert "-m" not in command
+    assert "model_reasoning_effort" not in joined
 
 
 def test_host_codex_can_explicitly_inherit_provider_model_when_configured(tmp_path, monkeypatch):
@@ -1069,6 +1073,69 @@ def test_host_codex_command_honors_per_run_reasoning_effort(tmp_path, monkeypatc
     joined = "\n".join(command)
     assert 'model_reasoning_effort="xhigh"' in joined
     assert "-m\ngpt-5.4" in joined
+
+
+def test_host_codex_command_projects_managed_bootstrap_tuple_and_ignores_user_config(
+    tmp_path, monkeypatch
+):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.delenv("WPR_MODEL_HOST_CODEX_CLI", raising=False)
+    monkeypatch.delenv("WPR_CODEX_CLI_REASONING_EFFORT", raising=False)
+    monkeypatch.setenv("WPR_CODEX_CLI_XHIGH_ROUTE_PROVEN", "true")
+    worker = {
+        "worker_id": "wrk_host_effort_default",
+        "name": "Host Effort Default Worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "env": {
+                    "WPR_MODEL_HOST_CODEX_CLI": "gpt-managed-test",
+                    "WPR_CODEX_CLI_REASONING_EFFORT": "xhigh",
+                    "WPR_CODEX_CLI_IGNORE_USER_CONFIG": "true",
+                }
+            }
+        ),
+    }
+
+    command, _env = runtime._build_command(
+        worker,
+        "create the marker",
+        runtime._host_runtime_info(worker),
+    )
+
+    joined = "\n".join(command)
+    assert 'model_reasoning_effort="xhigh"' in joined
+    assert "-m\ngpt-managed-test" in joined
+    assert "--ignore-user-config" in command
+
+
+def test_docker_codex_bootstrap_can_ignore_user_config_without_custom_provider(
+    tmp_path, monkeypatch
+):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_managed_bootstrap",
+        "name": "Managed Worker",
+        "profile": "codex-cli",
+        "model": "gpt-test",
+        "bootstrap_bundle_json": json.dumps(
+            {"env": {"WPR_CODEX_CLI_IGNORE_USER_CONFIG": "true"}}
+        ),
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("WPR_CODEX_CLI_BASE_URL", raising=False)
+    monkeypatch.delenv("WPR_CODEX_CLI_IGNORE_USER_CONFIG", raising=False)
+
+    command, _env = runtime._build_command(
+        worker,
+        "Create the artifact.",
+        runtime._runtime_info(worker),
+    )
+
+    assert "--ignore-user-config" in command
 
 
 def test_profiled_runtime_resolves_host_codex_model_by_execution_mode(tmp_path, monkeypatch):
@@ -1194,6 +1261,42 @@ def test_codex_cli_provider_config_supports_none_reasoning_effort(tmp_path, monk
     assert 'web_search="disabled"' not in joined
 
 
+def test_codex_effort_projection_reports_requested_and_effective_values(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_effort",
+        "profile": "codex-cli",
+        "bootstrap_bundle_json": json.dumps(
+            {"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "xhigh"}}
+        ),
+    }
+
+    projection = runtime.effort_projection_for_worker(worker)
+
+    assert projection["requested"] == "xhigh"
+    assert projection["effective"] == "medium"
+    assert projection["fallback_reason"] == "xhigh_route_not_proven"
+
+
+def test_profiled_runtime_delegates_codex_effort_projection(tmp_path, monkeypatch):
+    runtime = ProfiledWorkerRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_CODEX_CLI_XHIGH_ROUTE_PROVEN", "1")
+    worker = {
+        "worker_id": "wrk_effort",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "bootstrap_bundle_json": json.dumps(
+            {"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "xhigh"}}
+        ),
+    }
+
+    projection = runtime.effort_projection_for_worker(worker)
+
+    assert projection["requested"] == "xhigh"
+    assert projection["effective"] == "xhigh"
+    assert projection["fallback_reason"] == ""
+
+
 def test_codex_cli_provider_config_coerces_unsupported_reasoning_effort(tmp_path, monkeypatch):
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
@@ -1313,7 +1416,7 @@ def test_host_cli_run_uses_stdin_pipe_for_private_instruction(tmp_path, monkeypa
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
             stderr="",
         ),
     )
@@ -1366,7 +1469,7 @@ def test_host_cli_run_writes_constraint_ledger_and_evidence(tmp_path, monkeypatc
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
             stderr="",
         ),
     )
@@ -1434,7 +1537,7 @@ def test_host_cli_run_fails_when_evidence_contract_fails(tmp_path, monkeypatch):
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
             stderr="",
         ),
     )
@@ -1496,7 +1599,7 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
             stderr="",
         ),
     )
@@ -1572,7 +1675,7 @@ def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monke
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
             stderr="",
         ),
     )
@@ -1651,7 +1754,7 @@ def test_host_codex_run_sends_instruction_via_stdin_not_argv(tmp_path, monkeypat
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
             stderr="",
         ),
     )
@@ -1726,7 +1829,7 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
             stderr="",
         ),
     )
@@ -1790,7 +1893,7 @@ def test_host_codex_runtime_default_prompts_require_final_report(tmp_path, monke
         return subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
             stderr="",
         )
 
@@ -1872,7 +1975,7 @@ def test_host_runtime_materializes_project_mcp_bootstrap_with_owner_only_files(t
         return subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
             stderr="",
         )
 
@@ -2047,7 +2150,7 @@ def test_host_runtime_live_description_refreshes_stale_prompt_files(tmp_path, mo
         return subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.140.0\n" if "--version" in args else "",
+            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
             stderr="",
         )
 
@@ -3190,6 +3293,27 @@ def test_host_runtime_preflight_accepts_configured_version(tmp_path, monkeypatch
     runtime.preflight_worker_profile("codex-cli", "host")
 
 
+def test_host_runtime_preflight_rejects_codex_too_old_for_default_automation_model(
+    tmp_path, monkeypatch
+):
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text("#!/usr/bin/env bash\necho 'codex-cli 0.140.0'\n")
+    fake_codex.chmod(0o755)
+    monkeypatch.setenv("WPR_CODEX_BIN", str(fake_codex))
+    monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("WPR_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_FILE", raising=False)
+    monkeypatch.delenv("WPR_HOST_RUNTIME_REQUIREMENTS_FILE", raising=False)
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+
+    with pytest.raises(RuntimeDependencyMissingError, match="Codex CLI") as captured:
+        runtime.preflight_worker_profile("codex-cli", "host")
+
+    assert captured.value.required_version == "0.144.1"
+    assert captured.value.actual_version == "0.140.0"
+    assert "codex update" in captured.value.recovery_hint
+
+
 def test_host_runtime_preflight_rejects_default_version_mismatch(tmp_path, monkeypatch):
     fake_claude = tmp_path / "claude"
     fake_claude.write_text(
@@ -3248,7 +3372,7 @@ def test_host_runtime_preflight_accepts_required_mcp_capability(tmp_path, monkey
         "  echo 'node_repl enabled'\n"
         "  exit 0\n"
         "fi\n"
-        "echo 'codex-cli 0.140.0'\n"
+        "echo 'codex-cli 0.144.1'\n"
     )
     fake_codex.chmod(0o755)
     monkeypatch.setenv(
@@ -3347,7 +3471,7 @@ def test_host_codex_runtime_uses_configured_binary_path(tmp_path, monkeypatch):
     fake_codex = tmp_path / "codex"
     fake_codex.write_text(
         "#!/usr/bin/env bash\n"
-        "if [[ \"$1\" == \"--version\" ]]; then echo 'codex-cli 0.140.0'; exit 0; fi\n"
+        "if [[ \"$1\" == \"--version\" ]]; then echo 'codex-cli 0.144.1'; exit 0; fi\n"
         "echo 'codex test'\n"
     )
     fake_codex.chmod(0o755)

@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread, Timer
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 
 import httpx
 
@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 TERMINAL_CALLBACK_MESSAGE_LIMIT = 4000
 FINAL_REPORT_PATTERN = re.compile(r"(?m)^[ \t]*FINAL REPORT:\s*")
 VIVENTIUM_CALLBACK_PATH = "/api/viventium/glasshive/callback"
+SCHEDULING_CORTEX_CALLBACK_PATH = "/internal/scheduled-prompts/glasshive-callback"
 ACTIONABLE_CALLBACK_LINK_EVENTS = {"run.failed", "run.paused", "run.interrupted", "run.cancelled"}
 PARENT_VISIBLE_CALLBACK_FIELDS = ("user_id", "conversation_id", "parent_message_id", "message_id")
 CALLBACK_DEAD_LETTER_IMMEDIATE_STATUS_CODES = {400, 401, 403, 404, 410, 422, 501}
@@ -87,6 +88,31 @@ def _bounded_float_env(name: str, default: float, *, min_value: float, max_value
 
 def _env_truthy(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _is_local_scheduling_cortex_callback_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return (
+        parsed.path == SCHEDULING_CORTEX_CALLBACK_PATH
+        and parsed.scheme in {"http", "https"}
+        and host in {"localhost", "127.0.0.1", "::1"}
+    )
+
+
+def _is_callback_status_retryable(status_code: int, url: str) -> bool:
+    if status_code in CALLBACK_RETRYABLE_STATUS_CODES:
+        return True
+    return status_code == 404 and _is_local_scheduling_cortex_callback_url(url)
+
+
+def _is_callback_status_immediate_dead_letter(status_code: int, url: str) -> bool:
+    if _is_callback_status_retryable(status_code, url):
+        return False
+    return status_code in CALLBACK_DEAD_LETTER_IMMEDIATE_STATUS_CODES
 
 
 def _enterprise_mode_enabled() -> bool:
@@ -507,7 +533,7 @@ class WorkersProjectsService:
             except httpx.HTTPStatusError as exc:
                 last_exc = exc
                 status_code = exc.response.status_code if exc.response is not None else 0
-                if status_code in CALLBACK_DEAD_LETTER_IMMEDIATE_STATUS_CODES:
+                if _is_callback_status_immediate_dead_letter(status_code, url):
                     self._dead_letter_callback(
                         worker,
                         record,
@@ -517,7 +543,7 @@ class WorkersProjectsService:
                         reason=f"callback endpoint returned terminal HTTP {status_code}",
                     )
                     return
-                if 400 <= status_code < 500 and status_code not in CALLBACK_RETRYABLE_STATUS_CODES:
+                if 400 <= status_code < 500 and not _is_callback_status_retryable(status_code, url):
                     break
             except Exception as exc:
                 last_exc = exc
@@ -802,6 +828,18 @@ class WorkersProjectsService:
             payload["failure_code"] = failure_class
             payload["failure_class"] = failure_class
             payload["failure_retryable"] = bool((run or {}).get("failure_retryable"))
+        projection_resolver = getattr(self.runtime, "effort_projection_for_worker", None)
+        if callable(projection_resolver):
+            try:
+                effort_projection = projection_resolver(worker)
+            except Exception:
+                effort_projection = {}
+            if isinstance(effort_projection, dict) and effort_projection:
+                payload["effort_projection"] = {
+                    "requested": str(effort_projection.get("requested") or "")[:32],
+                    "effective": str(effort_projection.get("effective") or "")[:32],
+                    "fallback_reason": str(effort_projection.get("fallback_reason") or "")[:64],
+                }
         if deliverable:
             payload["deliverable"] = deliverable
         if operator_url:

@@ -16,7 +16,7 @@ DEFAULT_HOST_RUNTIME_REQUIREMENTS: dict[str, list[dict[str, Any]]] = {
             "binary": "codex",
             "use_configured_binary": True,
             "label": "Codex CLI",
-            "min_version": "0.140.0",
+            "min_version": "0.144.1",
             "recovery_hint": "Run `codex update` when supported, or update the Codex app/CLI, then restart GlassHive.",
         }
     ],

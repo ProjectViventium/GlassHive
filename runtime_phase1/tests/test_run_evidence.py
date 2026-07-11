@@ -1428,8 +1428,17 @@ def test_completion_compliance_counts_scheduled_prompt_private_scratchpad_artifa
     my_folder.mkdir()
     scratchpad = my_folder / "202606250300.md"
     proposals = my_folder / "memory-proposals-202606250300.json"
+    periphery_dir = my_folder / "periphery" / "risk_radar" / "2026" / "06"
+    periphery_dir.mkdir(parents=True)
+    risk_radar_md = periphery_dir / "20260625T030030Z.risk_radar.md"
+    risk_radar_json = periphery_dir / "20260625T030030Z.risk_radar.json"
     scratchpad.write_text("FINAL REPORT:\nSynthetic scheduled prompt notes.\n", encoding="utf-8")
     proposals.write_text('{"actions":[{"action":"set","key":"working","value":"synthetic"}]}', encoding="utf-8")
+    risk_radar_md.write_text("FINAL REPORT:\nSynthetic no-result risk radar.\n", encoding="utf-8")
+    risk_radar_json.write_text(
+        '{"schemaVersion":"v1","moduleId":"risk_radar","observations":[],"risks":[]}\n',
+        encoding="utf-8",
+    )
     scheduled_prompt_dir = tmp_path / "scheduled-prompt"
     scheduled_prompt_dir.mkdir()
     (scheduled_prompt_dir / "variable-snapshot.json").write_text(
@@ -1485,6 +1494,14 @@ def test_completion_compliance_counts_scheduled_prompt_private_scratchpad_artifa
     assert completion["status"] == "pass"
     assert "private-scratchpad/202606250300.md" in completion["deliverable_artifact_paths"]
     assert "private-scratchpad/memory-proposals-202606250300.json" in completion["deliverable_artifact_paths"]
+    assert (
+        "private-scratchpad/periphery/risk_radar/2026/06/20260625T030030Z.risk_radar.md"
+        in completion["deliverable_artifact_paths"]
+    )
+    assert (
+        "private-scratchpad/periphery/risk_radar/2026/06/20260625T030030Z.risk_radar.json"
+        in completion["deliverable_artifact_paths"]
+    )
     assert str(my_folder) not in json.dumps(evidence["artifacts"])
     assert evidence["evidence_result"]["status"] == "pass"
 
@@ -2437,6 +2454,78 @@ def test_completion_compliance_does_not_require_attached_input_format_as_output(
     assert "csv" not in evidence["completion_compliance"]["required_artifact_types"]
     assert evidence["completion_compliance"]["status"] == "pass"
     assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_completion_compliance_ignores_passive_memory_snapshot_output_formats(tmp_path):
+    workspace = tmp_path / "workspace"
+    scratchpad = workspace / "private-scratchpad"
+    scratchpad.mkdir(parents=True)
+    (scratchpad / "memory-proposals-202607101535.json").write_text('{"actions":[]}\n', encoding="utf-8")
+    (scratchpad / "risk_radar.json").write_text('{"summary":"low signal","risks":[]}\n', encoding="utf-8")
+    (scratchpad / "risk_radar.md").write_text("FINAL REPORT:\nNo governed memory changes proposed.\n", encoding="utf-8")
+    ledger = build_constraint_ledger(
+        instruction=(
+            "Use the rendered prompt and provided snapshot files as the source of truth.\n"
+            "Memory write mode: propose.\n"
+            "For memory proposals, write UTF-8 JSON under private-scratchpad named "
+            "memory-proposals-yyyymmddHHmm.json with an actions array.\n"
+            "Write private-scratchpad/risk_radar.md and private-scratchpad/risk_radar.json.\n"
+            "End every run with a concise FINAL REPORT section.\n"
+            "<user.memories>\n"
+            "[\n"
+            '  "value": "Historical cleanup: top-1000 enriched CSV approved; a prior report was parked; do not resume it."\n'
+            "]\n"
+            "</user.memories>\n"
+        ),
+        worker={"worker_id": "wrk_memory_snapshot", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_memory_snapshot",
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_memory_snapshot", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_memory_snapshot",
+        runtime_name="codex-cli",
+        model="gpt-test",
+        command=["codex", "exec", "Run scheduled memory reflection."],
+        env={},
+        workspace_dir=workspace,
+        stdout_text="FINAL REPORT:\nDone",
+        stderr_text="",
+        output_text="FINAL REPORT:\nDone",
+        error_text="",
+        exit_code=0,
+        timeout_seconds=300,
+        stop_reason="process_exit",
+        constraint_ledger=ledger,
+    )
+
+    assert set(ledger["outputs"]["format_expectations"]) == {"json", "md"}
+    assert "csv" not in ledger["outputs"]["format_expectations"]
+    assert all("Historical cleanup" not in line for line in ledger["outputs"]["required"])
+    assert evidence["completion_compliance"]["required_artifact_types"] == ["json", "md"]
+    assert evidence["completion_compliance"]["missing_required_artifact_types"] == []
+    assert evidence["completion_compliance"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_constraint_ledger_keeps_explicit_structured_task_output_format():
+    ledger = build_constraint_ledger(
+        instruction='{"task": "Create output/screen.csv with two synthetic rows."}',
+        worker={"worker_id": "wrk_structured_task", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_structured_task",
+    )
+
+    assert ledger["outputs"]["format_expectations"] == ["csv"]
+
+
+def test_constraint_ledger_keeps_explicit_structured_output_format_key():
+    ledger = build_constraint_ledger(
+        instruction='{"output_format": "xlsx", "task": "Create the requested synthetic workbook."}',
+        worker={"worker_id": "wrk_structured_output_format", "profile": "codex-cli", "execution_mode": "host"},
+        run_id="run_structured_output_format",
+    )
+
+    assert ledger["outputs"]["format_expectations"] == ["xlsx"]
 
 
 def test_completion_compliance_does_not_require_uploads_path_input_format_as_output(tmp_path):

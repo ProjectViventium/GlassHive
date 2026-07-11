@@ -2856,7 +2856,13 @@ def test_callbacks_sign_utf8_canonical_json_for_unicode_messages(tmp_path, monke
 
     monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
     store = Store(str(tmp_path / "runtime.db"))
-    service = WorkersProjectsService(store, StubRuntime())
+    runtime = StubRuntime()
+    runtime.effort_projection_for_worker = lambda _worker: {
+        "requested": "xhigh",
+        "effective": "medium",
+        "fallback_reason": "xhigh_route_not_proven",
+    }
+    service = WorkersProjectsService(store, runtime)
     try:
         project = store.create_project("owner", "Callbacks", "Verify callback signatures", "codex-cli")
         worker = store.create_worker(
@@ -2897,6 +2903,11 @@ def test_callbacks_sign_utf8_canonical_json_for_unicode_messages(tmp_path, monke
     assert payload["stream_id"] == "stream-123"
     assert payload["voice_call_session_id"] == "call-123"
     assert payload["telegram_chat_id"] == "chat-123"
+    assert payload["effort_projection"] == {
+        "requested": "xhigh",
+        "effective": "medium",
+        "fallback_reason": "xhigh_route_not_proven",
+    }
     binding = f"{payload['worker_id']}:{payload['run_id']}".encode("utf-8")
     derived_secret = hmac.new(b"callback-secret", binding, hashlib.sha256).hexdigest().encode("utf-8")
     expected = "sha256=" + hmac.new(derived_secret, content, hashlib.sha256).hexdigest()
@@ -3441,6 +3452,89 @@ def test_terminal_404_callback_dead_letters_immediately(tmp_path, monkeypatch):
     assert row["attempts"] == 1
     assert "terminal HTTP 404" in row["last_error"]
     assert len(attempts) == 1
+
+
+def test_local_scheduling_callback_404_is_retryable(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    class Response:
+        def __init__(self, status_code: int):
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "http://localhost:7110/internal/scheduled-prompts/glasshive-callback")
+            response = httpx.Response(self.status_code, request=request)
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError("callback error", request=request, response=response)
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        return Response(404 if len(attempts) == 1 else 200)
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "3")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(
+            store,
+            url="http://localhost:7110/internal/scheduled-prompts/glasshive-callback",
+        )
+        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "delivered"
+    assert row["attempts"] == 2
+    assert row["last_error"] == ""
+    assert len(attempts) == 2
+
+
+def test_persistent_local_scheduling_callback_404_dead_letters_after_budget(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    class Response:
+        status_code = 404
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "http://localhost:7110/internal/scheduled-prompts/glasshive-callback")
+            response = httpx.Response(404, request=request)
+            raise httpx.HTTPStatusError("not found", request=request, response=response)
+
+    def fake_post(url, *, content, headers, timeout):
+        _ = url, content, headers, timeout
+        attempts.append(1)
+        return Response()
+
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_MAX_TOTAL_ATTEMPTS", "3")
+    monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "3600")
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        _project, worker, _run, record = _create_callback_outbox_record(
+            store,
+            url="http://localhost:7110/internal/scheduled-prompts/glasshive-callback",
+        )
+        for _ in range(3):
+            pending = store.list_pending_callbacks()
+            if not pending:
+                break
+            service._deliver_callback_record(worker, pending[0], service._callback_config_for(worker))
+    finally:
+        service.shutdown()
+
+    row = _callback_row(store, record["callback_id"])
+    assert row["status"] == "dead_lettered"
+    assert row["attempts"] == 3
+    assert "retry budget exhausted after 3 attempts" in row["last_error"]
+    assert len(attempts) == 3
 
 
 def test_invalid_callback_payload_dead_letters_without_http(tmp_path, monkeypatch):

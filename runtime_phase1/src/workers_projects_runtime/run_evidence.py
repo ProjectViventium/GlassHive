@@ -147,6 +147,33 @@ _OUTPUT_ACTION_RE = re.compile(
     r"artifact|artifacts|deliverable|deliverables|report|reports|file|files)\b",
     re.I,
 )
+_STRUCTURED_CONTEXT_KEY_RE = re.compile(r"^\s*[\[{,]?\s*[\"']([A-Za-z_][A-Za-z0-9_.-]*)[\"']\s*:")
+_STRUCTURED_INSTRUCTION_KEYS = {
+    "deliverable",
+    "deliverables",
+    "expected_output",
+    "expected_outputs",
+    "file_format",
+    "file_formats",
+    "format",
+    "formats",
+    "goal",
+    "instruction",
+    "instructions",
+    "objective",
+    "output",
+    "output_format",
+    "output_formats",
+    "outputs",
+    "prompt",
+    "project_description",
+    "request",
+    "required",
+    "task",
+    "user_prompt",
+    "user_request",
+    "user_task",
+}
 _FINAL_ANSWER_ONLY_CONTEXT_RE = re.compile(
     r"\b(in\s+chat|inline|in\s+(?:the\s+)?final\s+answer|answer\s+(?:here|inline|in\s+chat)|"
     r"respond\s+(?:here|inline|in\s+chat)|reply\s+(?:here|inline|in\s+chat)|"
@@ -486,6 +513,14 @@ def _is_seed_block_heading(line: str) -> bool:
     )
 
 
+def _line_is_passive_structured_context(line: str) -> bool:
+    match = _STRUCTURED_CONTEXT_KEY_RE.match(str(line or ""))
+    if not match:
+        return False
+    key = match.group(1).strip().lower().replace("-", "_").replace(".", "_")
+    return key not in _STRUCTURED_INSTRUCTION_KEYS
+
+
 def _seed_block_lines(instruction_text: str) -> list[str]:
     lines = str(instruction_text or "").splitlines()
     collecting = False
@@ -583,6 +618,8 @@ def build_constraint_ledger(
     memory_write_mode_off = _memory_write_mode_is_off(instruction_text)
 
     for line in _lines(instruction_text):
+        if _line_is_passive_structured_context(line):
+            continue
         lower = line.lower()
         if _line_has_date_constraint_context(line):
             date_lines.append(line)
@@ -1072,23 +1109,32 @@ def _private_scratchpad_artifact_paths(
     lower_bound = (started_at - 300) if started_at is not None else None
     upper_bound = (ended_at + 300) if ended_at is not None else None
     candidates: list[Path] = []
-    for path in sorted(root.iterdir()):
+    def add_candidate(path: Path) -> None:
         if not path.is_file():
-            continue
+            return
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return
+        if lower_bound is not None and mtime < lower_bound:
+            return
+        if upper_bound is not None and mtime > upper_bound:
+            return
+        candidates.append(path)
+
+    for path in sorted(root.iterdir()):
         if not (
             re.fullmatch(r"\d{12}\.md", path.name)
             or re.fullmatch(r"memory-proposals-\d{12}\.json", path.name)
         ):
             continue
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            continue
-        if lower_bound is not None and mtime < lower_bound:
-            continue
-        if upper_bound is not None and mtime > upper_bound:
-            continue
-        candidates.append(path)
+        add_candidate(path)
+    periphery_root = root / "periphery"
+    if periphery_root.is_dir():
+        for path in sorted(periphery_root.rglob("*")):
+            if path.suffix.lower() not in {".json", ".md"}:
+                continue
+            add_candidate(path)
     return candidates[-20:]
 
 
@@ -1115,14 +1161,19 @@ def _artifact_inventory(
         )
         if path.suffix.lower() in _HTML_FILE_SUFFIXES:
             items[-1]["html_validation"] = _html_browser_validation(path)
+    private_root = _scheduled_prompt_private_scratchpad_dir(workspace_dir)
     for path in _private_scratchpad_artifact_paths(workspace_dir, started_at=started_at, ended_at=ended_at):
         try:
             stat = path.stat()
         except OSError:
             continue
+        try:
+            rel_path = path.relative_to(private_root).as_posix() if private_root else path.name
+        except ValueError:
+            rel_path = path.name
         items.append(
             {
-                "path": f"private-scratchpad/{path.name}",
+                "path": f"private-scratchpad/{rel_path}",
                 "bytes": stat.st_size,
                 "mtime": stat.st_mtime,
                 "suffix": path.suffix.lower(),
