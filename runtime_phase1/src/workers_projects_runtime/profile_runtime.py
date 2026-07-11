@@ -718,6 +718,14 @@ class ProfiledWorkerRuntime:
             "state_dir": str(worker.get("state_dir") or ""),
         }
 
+    def effort_projection_for_worker(self, worker: dict) -> dict[str, object]:
+        runtime = self._runtime_for_worker(worker)
+        resolver = getattr(runtime, "effort_projection_for_worker", None)
+        if not callable(resolver):
+            return {}
+        projection = resolver(worker)
+        return dict(projection) if isinstance(projection, dict) else {}
+
     def collect_completed_run(
         self,
         worker: dict,
@@ -2287,6 +2295,23 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             return default
         return raw in {"1", "true", "yes", "on", "enabled"}
 
+    def _worker_env_flag(self, worker: dict, name: str, default: bool = False) -> bool:
+        raw = (
+            self._bootstrap_env_value(worker, name)
+            or str(os.environ.get(name, ""))
+        ).strip().lower()
+        if not raw:
+            return default
+        return raw in {"1", "true", "yes", "on", "enabled"}
+
+    def _codex_model_for_worker(self, worker: dict, env_name: str) -> str:
+        return str(
+            self._bootstrap_env_value(worker, env_name)
+            or worker.get("model")
+            or self.resolve_model(worker.get("profile", "codex-cli"))
+            or ""
+        ).strip()
+
     def _compatible_provider_base_url(self) -> str:
         return (
             os.environ.get("WPR_CODEX_CLI_BASE_URL", "").strip()
@@ -2350,6 +2375,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         reasoning_effort = (
             self._bootstrap_env_value(worker, "WPR_CODEX_CLI_REASONING_EFFORT")
             or os.environ.get("WPR_CODEX_CLI_REASONING_EFFORT", "")
+            or os.environ.get("WPR_CODEX_CLI_DEFAULT_REASONING_EFFORT", "")
         ).strip().lower()
         requested_effort = reasoning_effort
         allowed_efforts = self._compatible_provider_allowed_reasoning_efforts()
@@ -2382,6 +2408,14 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             }
         return reasoning_effort
 
+    def effort_projection_for_worker(self, worker: dict) -> dict[str, object]:
+        if str(worker.get("profile") or "").strip() != "codex-cli":
+            return {}
+        candidate = dict(worker)
+        self._codex_reasoning_effort_for_worker(candidate)
+        projection = candidate.get("_effort_projection")
+        return dict(projection) if isinstance(projection, dict) else {}
+
     def _append_codex_reasoning_effort_config(self, command: list[str], worker: dict) -> None:
         reasoning_effort = self._codex_reasoning_effort_for_worker(worker)
         if reasoning_effort in {"none", "minimal", "low", "medium", "high", "xhigh"}:
@@ -2389,6 +2423,10 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         if reasoning_effort == "minimal":
             command.extend(["-c", 'web_search="disabled"'])
             command.extend(["--disable", "image_generation"])
+
+    def _append_codex_user_config_policy(self, command: list[str], worker: dict) -> None:
+        if self._worker_env_flag(worker, "WPR_CODEX_CLI_IGNORE_USER_CONFIG", False):
+            command.append("--ignore-user-config")
 
     def _append_codex_compatible_provider_config(
         self,
@@ -2406,8 +2444,6 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         provider_name = os.environ.get("WPR_CODEX_CLI_PROVIDER_NAME", "GlassHive OpenAI-compatible").strip()
         wire_api = os.environ.get("WPR_CODEX_CLI_WIRE_API", "responses").strip() or "responses"
         verbosity = os.environ.get("WPR_CODEX_CLI_MODEL_VERBOSITY", "medium").strip()
-        if self._env_flag("WPR_CODEX_CLI_IGNORE_USER_CONFIG", False):
-            command.append("--ignore-user-config")
         for feature in self._compatible_provider_disabled_features():
             command.extend(["--disable", feature])
         command.extend(
@@ -2435,7 +2471,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         existing_session = self._read_session_key(worker["worker_id"])
-        model = worker.get("model") or self.resolve_model(worker.get("profile", "codex-cli"))
+        model = self._codex_model_for_worker(worker, "WPR_MODEL_CODEX_CLI")
         is_resume = bool(existing_session and not existing_session.startswith("codex-worker:"))
         dangerous_mode = os.environ.get("WPR_CODEX_DANGEROUS", "1").strip().lower() in {"1", "true", "yes", "on"}
         if is_resume:
@@ -2447,6 +2483,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
                 command.extend(["-c", f'model="{model}"'])
             else:
                 command.extend(["-m", model])
+        self._append_codex_user_config_policy(command, worker)
         self._append_codex_compatible_provider_config(command, worker, include_reasoning_effort=False)
         self._append_codex_reasoning_effort_config(command, worker)
         if dangerous_mode:
@@ -4495,7 +4532,7 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         existing_session = self._read_session_key(worker["worker_id"])
-        model = worker.get("model") or self.resolve_model(worker.get("profile", "codex-cli"))
+        model = self._codex_model_for_worker(worker, "WPR_MODEL_HOST_CODEX_CLI")
         is_resume = bool(existing_session and not existing_session.startswith("codex-worker:"))
         dangerous_mode = os.environ.get("WPR_CODEX_DANGEROUS", "1").strip().lower() in {"1", "true", "yes", "on"}
         if is_resume:
@@ -4507,6 +4544,7 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
                 command.extend(["-c", f'model="{model}"'])
             else:
                 command.extend(["-m", model])
+        self._append_codex_user_config_policy(command, worker)
         self._append_codex_reasoning_effort_config(command, worker)
         if dangerous_mode:
             if is_resume:
