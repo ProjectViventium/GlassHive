@@ -489,6 +489,8 @@ def _bootstrap_seed_files(worker: dict[str, object]) -> list[str]:
             continue
         for item in raw:
             if isinstance(item, dict):
+                if item.get("evidence_seed") is False:
+                    continue
                 candidate = str(item.get("path") or item.get("name") or item.get("relative_path") or "").strip()
             else:
                 candidate = str(item or "").strip()
