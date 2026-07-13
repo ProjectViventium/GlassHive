@@ -4,21 +4,21 @@ version = "0.3.0"
 description = "Glass Hive phase-1 runtime for persistent workstation-backed workers and sandboxes"
 requires-python = ">=3.11"
 dependencies = [
-  "fastapi>=0.115,<1.0",
-  "fastmcp>=2.14,<3.0",
+  "fastapi>=0.139,<1.0",
+  "fastmcp>=3.2,<4.0",
   "httpx>=0.28,<1.0",
   "mcp>=1.26,<2.0",
   "openpyxl>=3.1,<4.0",
   "python-docx>=1.1,<2.0",
   "python-pptx>=1.0,<2.0",
   "uvicorn>=0.34,<1.0",
-  "websockets>=15.0,<16.0",
+  "websockets>=16.1,<17.0",
   "wsproto>=1.2,<2.0",
 ]
 
 [dependency-groups]
 dev = [
-  "pytest>=8.3,<9.0",
+  "pytest>=9.1,<10.0",
 ]
 
 [build-system]

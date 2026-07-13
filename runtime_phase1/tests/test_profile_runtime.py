@@ -82,6 +82,23 @@ def test_terminal_target_uses_inferred_job_session_when_metadata_missing(tmp_pat
     assert target.subtitle == "codex-cli active run"
 
 
+def test_host_terminal_target_preserves_shell_fallback_expression(tmp_path):
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_host_terminal",
+        "name": "Host Claude",
+        "profile": "claude-code",
+        "execution_mode": "host",
+    }
+    runtime.ensure_worker_ready = lambda worker: runtime._runtime_info(worker, pid=1234)  # type: ignore[method-assign]
+    runtime._infer_active_session = lambda worker: None  # type: ignore[method-assign]
+
+    target = runtime.terminal_target(worker)
+
+    assert target.command[-1].endswith("exec ${SHELL:-/bin/bash}")
+    assert target.title == "Host Claude host terminal"
+
+
 def test_collect_completed_run_recovers_from_latest_run_artifacts(tmp_path):
     runtime = CodexCliRuntime(base_dir=str(tmp_path))
     worker = {

@@ -4431,7 +4431,7 @@ class HostNativeCliMixin:
         info = self.ensure_worker_ready(worker)
         active = self._infer_active_session(worker)
         stdout = str((active or {}).get("stdout_path") or "")
-        command = ["bash", "-lc", f"cd {shlex.quote(str(info.workspace_dir or ''))} && tail -n 80 -f {shlex.quote(stdout)}"] if stdout else ["bash", "-lc", f"cd {shlex.quote(str(info.workspace_dir or ''))} && exec ${SHELL:-/bin/bash}"]
+        command = ["bash", "-lc", f"cd {shlex.quote(str(info.workspace_dir or ''))} && tail -n 80 -f {shlex.quote(stdout)}"] if stdout else ["bash", "-lc", f"cd {shlex.quote(str(info.workspace_dir or ''))} && exec ${{SHELL:-/bin/bash}}"]
         return TerminalTarget(
             command=command,
             cwd=str(info.workspace_dir or ""),
