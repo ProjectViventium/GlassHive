@@ -65,7 +65,6 @@ from .signed_links import (
     create_signed_link_ref,
     install_sensitive_url_log_filter,
     resolve_signed_link_ref,
-    sign_link_params,
     signed_link_ref_url,
     sign_link_token,
     verify_signed_link,
@@ -954,7 +953,6 @@ def create_app(
         return visible.decode("utf-8", errors="replace"), truncated
 
     def _artifact_open_page(worker: dict, target: Path, relative_path: str, request: Request) -> HTMLResponse:
-        worker_id = str(worker.get("worker_id") or "")
         download_url = _signed_artifact_action_url(
             worker,
             relative_path,
@@ -1506,7 +1504,7 @@ def create_app(
 
     @app.post("/v1/workers/{worker_id}/desktop-action", response_model=DesktopActionResponse, status_code=202)
     def desktop_action(worker_id: str, payload: DesktopActionRequest, request: Request) -> DesktopActionResponse:
-        worker = require_worker(worker_id, request)
+        require_worker(worker_id, request)
         try:
             launched = service.desktop_action(worker_id, payload.action, url=payload.url, run_id=payload.run_id)
         except RuntimeError as exc:

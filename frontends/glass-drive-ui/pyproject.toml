@@ -4,15 +4,16 @@ version = "0.1.0"
 description = "Minimal unified operator UI for Glass Hive"
 requires-python = ">=3.11"
 dependencies = [
-  "fastapi>=0.115,<1.0",
-  "httpx>=0.28,<1.0",
-  "uvicorn>=0.34,<1.0",
-  "websockets>=15,<16",
+  "fastapi>=0.139,<1.0",
+  "httpx>=0.28.1,<1.0",
+  "starlette>=1.3.1,<2.0",
+  "uvicorn>=0.51,<1.0",
+  "websockets>=16,<17",
 ]
 
 [dependency-groups]
 dev = [
-  "pytest>=8.3,<9.0",
+  "pytest>=9.1.1,<10.0",
 ]
 
 [build-system]

@@ -3077,7 +3077,6 @@ def create_mcp_server(
         clean_context = (context or "").strip()
         if not clean_description:
             raise ValueError("description is required")
-        requested_execution_mode = str(execution_mode or "").strip()
         brief_sections = [
             "Project description:",
             clean_description,
