@@ -230,6 +230,7 @@ def test_ensure_ready_creates_container_when_only_projected_paths_exist(tmp_path
     manager.inspect = fake_inspect  # type: ignore[method-assign]
     manager._create_container = lambda container_name, paths: created.append(container_name)  # type: ignore[method-assign]
     manager._ensure_container_writable_paths = lambda container_name, paths: None  # type: ignore[method-assign]
+    manager._repair_provider_temp_ownership = lambda container_name: None  # type: ignore[method-assign]
     manager._harden_secret_runtime_files = lambda container_name: None  # type: ignore[method-assign]
     manager._set_plain_background = lambda container_name: None  # type: ignore[method-assign]
     manager._prime_idle_desktop = lambda container_name: None  # type: ignore[method-assign]
@@ -299,6 +300,7 @@ def test_ensure_ready_recreates_ready_container_missing_chromium_userns(tmp_path
     manager._ensure_image = lambda: calls.append("image")  # type: ignore[method-assign]
     manager._create_container = fake_create_container  # type: ignore[method-assign]
     manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("writable")  # type: ignore[method-assign]
+    manager._repair_provider_temp_ownership = lambda container_name: calls.append("provider_tmp")  # type: ignore[method-assign]
     manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
     manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
     manager._prime_idle_desktop = lambda container_name: calls.append("prime")  # type: ignore[method-assign]
@@ -307,7 +309,19 @@ def test_ensure_ready_recreates_ready_container_missing_chromium_userns(tmp_path
 
     assert sandbox.container_id == "container-new"
     assert sandbox.security_options == ("seccomp=unconfined",)
-    assert calls == ["require", "host_dirs", "seed", "rm", "image", "create:wpr-wrk-test", "writable", "harden", "background", "prime"]
+    assert calls == [
+        "require",
+        "host_dirs",
+        "seed",
+        "rm",
+        "image",
+        "create:wpr-wrk-test",
+        "writable",
+        "provider_tmp",
+        "harden",
+        "background",
+        "prime",
+    ]
 
 
 def test_inspect_uses_short_cache_and_stale_fallback(tmp_path):
@@ -386,6 +400,7 @@ def test_terminate_invalidates_inspect_cache_before_idle_resume(tmp_path):
     manager._ensure_image = lambda: calls.append("image")  # type: ignore[method-assign]
     manager._create_container = fake_create_container  # type: ignore[method-assign]
     manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("repair")  # type: ignore[method-assign]
+    manager._repair_provider_temp_ownership = lambda container_name: calls.append("provider_tmp")  # type: ignore[method-assign]
     manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
     manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
     manager._prime_idle_desktop = lambda container_name: calls.append("prime")  # type: ignore[method-assign]
@@ -646,6 +661,7 @@ def test_desktop_action_skips_heavy_path_repair_for_running_container(tmp_path):
     manager._ensure_host_dirs = lambda paths: None  # type: ignore[method-assign]
     manager._seed_bootstrap = lambda *args, **kwargs: None  # type: ignore[method-assign]
     manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("writable")  # type: ignore[method-assign]
+    manager._repair_provider_temp_ownership = lambda container_name: calls.append("provider_tmp")  # type: ignore[method-assign]
     manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
     manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
     manager.inspect = lambda worker_id: FakeSandbox()  # type: ignore[method-assign]
@@ -661,7 +677,7 @@ def test_desktop_action_skips_heavy_path_repair_for_running_container(tmp_path):
 
     assert launched["status"] == "launched"
     assert "writable" not in calls
-    assert calls == ["harden", "exec:True:True:bash"]
+    assert calls == ["provider_tmp", "harden", "exec:True:True:bash"]
     assert envs[-1]["TMPDIR"] == manager._browser_tmp_dir()
     assert envs[-1]["XDG_CACHE_HOME"] == manager._browser_cache_dir()
     assert envs[-1]["XDG_CONFIG_HOME"] == manager._browser_config_dir()
@@ -722,11 +738,13 @@ def test_ensure_ready_skips_image_probe_for_existing_container(tmp_path):
     manager._ensure_host_dirs = lambda paths: calls.append("host_dirs")  # type: ignore[method-assign]
     manager._seed_bootstrap = lambda *args, **kwargs: calls.append("seed")  # type: ignore[method-assign]
     manager.inspect = lambda worker_id: FakeSandbox()  # type: ignore[method-assign]
+    manager._repair_provider_temp_ownership = lambda container_name: calls.append("provider_tmp")  # type: ignore[method-assign]
+    manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
 
     sandbox = manager.ensure_ready({"worker_id": "wrk_test"}, "codex-cli")
 
     assert sandbox.container_name == "wpr-test"
-    assert calls == ["require", "host_dirs", "seed"]
+    assert calls == ["require", "host_dirs", "seed", "provider_tmp", "harden"]
 
 
 def test_ensure_ready_builds_container_when_projected_worker_inspect_misses(tmp_path):
@@ -757,6 +775,7 @@ def test_ensure_ready_builds_container_when_projected_worker_inspect_misses(tmp_
     manager._ensure_image = lambda: calls.append("image")  # type: ignore[method-assign]
     manager._create_container = lambda container_name, paths: calls.append(f"create:{container_name}")  # type: ignore[method-assign]
     manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("writable")  # type: ignore[method-assign]
+    manager._repair_provider_temp_ownership = lambda container_name: calls.append("provider_tmp")  # type: ignore[method-assign]
     manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
     manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
     manager._prime_idle_desktop = lambda container_name: calls.append("prime")  # type: ignore[method-assign]
@@ -765,7 +784,18 @@ def test_ensure_ready_builds_container_when_projected_worker_inspect_misses(tmp_
 
     assert sandbox.container_name == "wpr-wrk-test"
     assert sandbox.state == "running"
-    assert calls == ["require", "host_dirs", "seed", "image", "create:wpr-wrk-test", "writable", "harden", "background", "prime"]
+    assert calls == [
+        "require",
+        "host_dirs",
+        "seed",
+        "image",
+        "create:wpr-wrk-test",
+        "writable",
+        "provider_tmp",
+        "harden",
+        "background",
+        "prime",
+    ]
 
 
 def test_ensure_image_uses_short_probe_and_caches_success(tmp_path):
@@ -1263,8 +1293,9 @@ def test_ensure_ready_repairs_bind_mount_ownership_before_prime(tmp_path):
         "find /workspace/project /workspace/.wpr-home /workspace/.wpr-home/tmp "
         "/workspace/.wpr-home/.cache /workspace/.wpr-home/.config -type d -exec setfacl"
     ) in calls[1]
-    assert calls[2].startswith("root:set -e; for file in /workspace/.wpr-home/.glasshive/secret-runtime.env")
-    assert calls[3:] == ["background", "prime"]
+    assert calls[2].startswith("root:set -e; runtime_uid=$(id -u seluser)")
+    assert calls[3].startswith("root:set -e; for file in /workspace/.wpr-home/.glasshive/secret-runtime.env")
+    assert calls[4:] == ["background", "prime"]
 
 
 def test_ensure_container_writable_paths_repairs_specific_run_dir(tmp_path):
@@ -1302,6 +1333,26 @@ def test_ensure_container_writable_paths_repairs_specific_run_dir(tmp_path):
             ],
         )
     ]
+
+
+def test_repair_provider_temp_ownership_restores_claude_runtime_directory(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[tuple[str | None, list[str]]] = []
+
+    def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
+        calls.append((user, command))
+        return subprocess.CompletedProcess(["docker"], returncode=0, stdout="", stderr="")
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+
+    manager._repair_provider_temp_ownership("wpr-test")
+
+    assert len(calls) == 1
+    assert calls[0][0] == "root"
+    script = calls[0][1][-1]
+    assert "provider_tmp=/workspace/.wpr-home/tmp/claude-${runtime_uid}" in script
+    assert 'chown -R "${runtime_uid}:${runtime_gid}" "$provider_tmp"' in script
+    assert 'chmod 700 "$provider_tmp"' in script
 
 
 def test_create_container_applies_default_resource_caps(tmp_path):
@@ -1356,13 +1407,14 @@ def test_ensure_ready_primes_idle_desktop_when_container_is_new(tmp_path):
     manager._seed_bootstrap = lambda *args, **kwargs: None  # type: ignore[method-assign]
     manager._create_container = lambda *args, **kwargs: calls.append("create")  # type: ignore[method-assign]
     manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("writable")  # type: ignore[method-assign]
+    manager._repair_provider_temp_ownership = lambda container_name: calls.append("provider_tmp")  # type: ignore[method-assign]
     manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
     manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
     manager._prime_idle_desktop = lambda container_name: calls.append("prime")  # type: ignore[method-assign]
     manager.inspect = lambda worker_id: sandbox_states.pop(0)  # type: ignore[method-assign]
 
     manager.ensure_ready({"worker_id": "wrk_test"}, "codex-cli")
-    assert calls == ["create", "writable", "harden", "background", "prime"]
+    assert calls == ["create", "writable", "provider_tmp", "harden", "background", "prime"]
     marker = json.loads((manager._paths("wrk_test")["state_dir"] / "desktop-prime.json").read_text())
     assert marker["schema"] == "glasshive.desktop_prime.v1"
     assert marker["status"] == "launched"
@@ -1395,6 +1447,7 @@ def test_ensure_ready_records_idle_desktop_prime_failure(tmp_path):
     manager._seed_bootstrap = lambda *args, **kwargs: None  # type: ignore[method-assign]
     manager._create_container = lambda *args, **kwargs: calls.append("create")  # type: ignore[method-assign]
     manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("writable")  # type: ignore[method-assign]
+    manager._repair_provider_temp_ownership = lambda container_name: calls.append("provider_tmp")  # type: ignore[method-assign]
     manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
     manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
 
@@ -1409,7 +1462,7 @@ def test_ensure_ready_records_idle_desktop_prime_failure(tmp_path):
         manager.ensure_ready({"worker_id": "wrk_test"}, "codex-cli")
 
     marker = json.loads((manager._paths("wrk_test")["state_dir"] / "desktop-prime.json").read_text())
-    assert calls == ["create", "writable", "harden", "background", "prime"]
+    assert calls == ["create", "writable", "provider_tmp", "harden", "background", "prime"]
     assert marker["status"] == "failed"
     assert "prime failed" in marker["detail"]
 
@@ -1439,6 +1492,7 @@ def test_ensure_ready_records_idle_desktop_prime_nonzero_return_as_failure(tmp_p
     manager._seed_bootstrap = lambda *args, **kwargs: None  # type: ignore[method-assign]
     manager._create_container = lambda *args, **kwargs: calls.append("create")  # type: ignore[method-assign]
     manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("writable")  # type: ignore[method-assign]
+    manager._repair_provider_temp_ownership = lambda container_name: calls.append("provider_tmp")  # type: ignore[method-assign]
     manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
     manager._set_plain_background = lambda container_name: calls.append("background")  # type: ignore[method-assign]
     manager.inspect = lambda worker_id: sandbox_states.pop(0)  # type: ignore[method-assign]
@@ -1453,6 +1507,6 @@ def test_ensure_ready_records_idle_desktop_prime_nonzero_return_as_failure(tmp_p
         manager.ensure_ready({"worker_id": "wrk_test"}, "codex-cli")
 
     marker = json.loads((manager._paths("wrk_test")["state_dir"] / "desktop-prime.json").read_text())
-    assert calls == ["create", "writable", "harden", "background", "prime"]
+    assert calls == ["create", "writable", "provider_tmp", "harden", "background", "prime"]
     assert marker["status"] == "failed"
     assert "wmctrl failed" in marker["detail"]
