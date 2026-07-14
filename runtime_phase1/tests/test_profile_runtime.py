@@ -500,6 +500,30 @@ def test_codex_parser_accepts_inline_final_report_section(tmp_path):
     assert output == "Only this inline result should be posted."
 
 
+def test_codex_parser_accepts_backtick_wrapped_final_report_section(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_backtick_final_report",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    stdout = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "Done.\n\n`FINAL REPORT:`\n\nOnly this final result should be posted.",
+            },
+        }
+    )
+
+    _, output = runtime._parse_output(worker, stdout, "", runtime._runtime_info(worker))
+
+    assert output == "Only this final result should be posted."
+
+
 def test_codex_parser_strips_plain_resume_final_report(tmp_path):
     runtime = CodexCliRuntime(base_dir=str(tmp_path))
     worker = {

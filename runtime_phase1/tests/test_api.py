@@ -298,6 +298,13 @@ def test_terminal_callback_message_accepts_inline_final_report_marker():
     assert terminal_callback_message(output) == "Captured 42 rows."
 
 
+def test_terminal_callback_message_accepts_backtick_wrapped_final_report_marker():
+    output = "Progress that should not surface.\n\n`FINAL REPORT:`\n\nCaptured 42 rows."
+
+    assert terminal_callback_message(output) == "Captured 42 rows."
+    assert terminal_callback_full_message(output) == "Captured 42 rows."
+
+
 def test_terminal_callback_message_uses_tail_without_mid_word_fragment():
     output = "\n\n".join(
         [

@@ -50,7 +50,11 @@ from .store import Store
 
 logger = logging.getLogger(__name__)
 TERMINAL_CALLBACK_MESSAGE_LIMIT = 4000
-FINAL_REPORT_PATTERN = re.compile(r"(?m)^[ \t]*FINAL REPORT:\s*")
+FINAL_REPORT_PATTERN = re.compile(
+    r"(?mi)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*)?"
+    r"(?:(?:[*_]{1,3}|`{1,3})[ \t]*)?FINAL REPORT\s*:\s*"
+    r"(?:(?:[*_]{1,3}|`{1,3})[ \t]*)?"
+)
 VIVENTIUM_CALLBACK_PATH = "/api/viventium/glasshive/callback"
 SCHEDULING_CORTEX_CALLBACK_PATH = "/internal/scheduled-prompts/glasshive-callback"
 ACTIONABLE_CALLBACK_LINK_EVENTS = {"run.failed", "run.paused", "run.interrupted", "run.cancelled"}

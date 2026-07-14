@@ -1244,6 +1244,31 @@ def test_run_evidence_accepts_markdown_decorated_final_report_marker(tmp_path):
     assert evidence["evidence_result"]["status"] == "pass"
 
 
+def test_run_evidence_accepts_backtick_wrapped_final_report_marker(tmp_path):
+    result = "Confirmed the artifacts.\n\n`FINAL REPORT:`\n\nAll outputs are ready."
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_backtick_final", "profile": "claude-code", "execution_mode": "docker"},
+        run_id="run_backtick_final",
+        runtime_name="claude-code",
+        model="claude-test",
+        command=["claude", "-p"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=json.dumps({"type": "result", "subtype": "success", "result": result}),
+        stderr_text="",
+        output_text=result,
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    assert evidence["final_output"]["has_final_report"] is True
+    assert evidence["completion_compliance"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
 def test_run_evidence_detects_claude_result_final_report_marker(tmp_path):
     stdout_text = json.dumps(
         {
