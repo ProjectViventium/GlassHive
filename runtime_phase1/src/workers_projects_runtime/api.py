@@ -1430,6 +1430,7 @@ def create_app(
         if ctx.auth_mode == "signed_link" and payload.bootstrap_bundle:
             raise HTTPException(status_code=403, detail="Signed workspace links cannot modify worker bootstrap context")
         worker = require_worker(worker_id, request)
+        normalized_effort = str(payload.effort or "").strip().lower()
         run = service.assign_run(
             worker_id,
             payload.instruction,
@@ -1438,7 +1439,7 @@ def create_app(
                 payload.bootstrap_bundle,
             ),
         )
-        return RunResponse(**run)
+        return RunResponse(**run, effort=normalized_effort)
 
     @app.post("/v1/workers/{worker_id}/message", response_model=RunResponse, status_code=202)
     def send_message(worker_id: str, payload: SendMessageRequest, request: Request) -> RunResponse:

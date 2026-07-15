@@ -4393,6 +4393,7 @@ def test_assign_run_effort_updates_codex_worker_bootstrap_bundle(tmp_path):
     )
     assert run.status_code == 202
     assert run.json()["state"] == "queued"
+    assert run.json()["effort"] == "medium"
 
     stored_worker = Store(str(db_path)).get_worker(worker["worker_id"])
     bundle = json.loads(stored_worker["bootstrap_bundle_json"])
@@ -4436,6 +4437,7 @@ def test_assign_run_effort_updates_claude_worker_bootstrap_bundle(tmp_path):
     )
     assert run.status_code == 202
     assert run.json()["state"] == "queued"
+    assert run.json()["effort"] == "max"
 
     stored_worker = Store(str(db_path)).get_worker(worker["worker_id"])
     bundle = json.loads(stored_worker["bootstrap_bundle_json"])
