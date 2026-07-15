@@ -416,6 +416,33 @@ def test_terminate_invalidates_inspect_cache_before_idle_resume(tmp_path):
     assert calls.count("inspect") >= 3
 
 
+def test_terminate_fails_if_docker_leaves_the_container_running(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    running = json.dumps(
+        [
+            {
+                "Id": "abc123",
+                "State": {"Status": "running", "Paused": False, "Pid": 4242},
+                "HostConfig": {},
+                "NetworkSettings": {"Ports": {}},
+            }
+        ]
+    )
+
+    def fake_docker(args: list[str], *, check: bool = True, capture_output: bool = False, **kwargs):
+        _ = check, capture_output, kwargs
+        if args[:1] == ["inspect"]:
+            return subprocess.CompletedProcess(["docker", *args], 0, running, "")
+        if args[:2] == ["rm", "-f"]:
+            return subprocess.CompletedProcess(["docker", *args], 1, "", "removal failed")
+        raise AssertionError(f"unexpected docker call: {args}")
+
+    manager._docker = fake_docker  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="still running after termination"):
+        manager.terminate("wrk_test")
+
+
 def test_docker_exec_timeout_returns_failed_result(tmp_path, monkeypatch):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
 

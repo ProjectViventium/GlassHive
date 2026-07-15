@@ -46,6 +46,15 @@ Every enterprise deployment must configure and QA these controls before users ar
 - `WPR_SANDBOX_CPUS`, `WPR_SANDBOX_MEMORY`, `WPR_SANDBOX_MEMORY_SWAP`,
   `WPR_SANDBOX_PIDS_LIMIT`, and `WPR_SANDBOX_SHM_SIZE`: Docker worker resource caps.
 
+Termination is verified, not assumed. Docker removal must be followed by a fresh inspect proving the
+container is gone, the service rejects a termination result that still reports active compute, and
+the always-on orphan reconciler removes any container left behind a terminated or failed worker
+record, including paused or exited containers. Set `GLASSHIVE_ORPHAN_REAPER_ENABLED=false` only when
+an external reconciler provides the same guarantee. Stop reasons are scoped to the active run so an
+idle pause, interrupt, cleanup, or prior termination cannot poison a later resumed task. If a stop
+marker races with successful process completion, GlassHive recovers the completed run evidence
+before applying the stale marker.
+
 The v1 SQLite deployment should run one runtime service process per GlassHive VM. The runtime uses
 an in-process create lock for quota check plus worker insert; multi-process or multi-replica service
 scale-out requires a DB-level transaction/constraint design before it is supported.
@@ -242,7 +251,10 @@ The Standard GlassHive QA cases must include:
 - unauthenticated/wrong-token/wrong-tenant probes
 - artifact traversal probes
 - signed-link tamper and expiry probes
-- lifecycle reaper checks for idle, paused, and max-duration runs
+- lifecycle reaper checks for idle, paused, max-duration, and terminal-worker orphan compute,
+  including failed records and non-running containers with timeout thresholds otherwise disabled
+- active-run termination race checks proving a background processor cannot resurrect a terminated
+  worker or leak a pause, interrupt, or termination reason into a later run
 - resource quota checks for per-user, per-tenant, and profile allowlist limits
 - provider secret exposure checks that interactive shell startup files do not contain raw keys
 - Azure metadata blocking checks for Docker workers in cloud deployments

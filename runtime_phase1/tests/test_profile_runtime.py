@@ -904,6 +904,57 @@ def test_global_stop_reason_still_applies_to_current_run(tmp_path):
         runtime._finalize_stop_reason("wrk_test", run_id="run_any")
 
 
+def test_idle_worker_termination_does_not_poison_later_run(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    runtime.sandbox.terminate = lambda worker_id: None  # type: ignore[method-assign]
+    worker = {
+        "worker_id": "wrk_test",
+        "name": "Idle Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+        "state": "ready",
+    }
+
+    runtime.terminate_worker(worker)
+
+    runtime._finalize_stop_reason(worker["worker_id"], run_id="run_later")
+
+
+def test_idle_worker_interrupt_does_not_poison_later_run(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    runtime.sandbox.inspect = lambda worker_id: None  # type: ignore[method-assign]
+    worker = {
+        "worker_id": "wrk_test",
+        "name": "Idle Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+        "state": "ready",
+    }
+
+    runtime.interrupt_worker(worker)
+
+    runtime._finalize_stop_reason(worker["worker_id"], run_id="run_later")
+
+
+def test_worker_termination_reason_is_scoped_to_active_run(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    runtime.sandbox.terminate = lambda worker_id: None  # type: ignore[method-assign]
+    worker = {
+        "worker_id": "wrk_test",
+        "name": "Active Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+        "state": "running",
+        "_active_run_id": "run_active",
+    }
+
+    runtime.terminate_worker(worker)
+
+    runtime._finalize_stop_reason(worker["worker_id"], run_id="run_later")
+    with pytest.raises(WorkerTerminatedError):
+        runtime._finalize_stop_reason(worker["worker_id"], run_id="run_active")
+
+
 def test_host_codex_runtime_materializes_required_workspace_files(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
@@ -2836,6 +2887,7 @@ def test_docker_cli_runtime_sources_runtime_and_openclaw_env_files(tmp_path):
         assert '$HOME/.glasshive/runtime.env' in script
         assert '$HOME/.wpr-openclaw/openclaw.env' in script
         assert "GLASSHIVE_ACTIVE_RUN_ID=run_capture" in script
+        assert "GLASSHIVE_RUN_ID=run_capture" in script
         assert "GLASSHIVE_ACTIVE_WORKER_ID=wrk_capture" in script
         (run_root / "stdout.log").write_text("FINAL REPORT:\nok")
         (run_root / "stderr.log").write_text("")

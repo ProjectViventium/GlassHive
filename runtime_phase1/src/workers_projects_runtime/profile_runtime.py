@@ -694,6 +694,13 @@ class ProfiledWorkerRuntime:
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).reconcile_worker(worker)
 
+    def worker_compute_present(self, worker: dict) -> bool:
+        runtime = self._runtime_for_worker(worker)
+        checker = getattr(runtime, "worker_compute_present", None)
+        if callable(checker):
+            return bool(checker(worker))
+        return bool(runtime.reconcile_worker(worker).pid)
+
     def terminal_target(self, worker: dict) -> TerminalTarget:
         runtime = self._runtime_for_worker(worker)
         if hasattr(runtime, "terminal_target"):
@@ -1050,16 +1057,22 @@ class BaseCliWorkerRuntime:
         return self._runtime_info(worker, pid=None)
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
-        self._note_stop_reason(worker["worker_id"], "interrupted", run_id=run_id)
-        self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
+        worker_id = worker["worker_id"]
+        active_run_id = str(run_id or worker.get("_active_run_id") or "").strip() or None
+        if active_run_id or self._active_pid(worker_id):
+            self._note_stop_reason(worker_id, "interrupted", run_id=active_run_id)
+            self._stop_active_process(worker_id, worker=worker, run_id=active_run_id)
         sandbox = self.sandbox.inspect(worker["worker_id"])
         pid = sandbox.pid if sandbox and sandbox.state == "running" else None
         return self._runtime_info(worker, pid=pid)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
-        self._note_stop_reason(worker["worker_id"], "terminated")
-        self._stop_active_process(worker["worker_id"])
-        self.sandbox.terminate(worker["worker_id"])
+        worker_id = worker["worker_id"]
+        active_run_id = str(worker.get("_active_run_id") or "").strip() or None
+        if active_run_id or self._active_pid(worker_id):
+            self._note_stop_reason(worker_id, "terminated", run_id=active_run_id)
+        self._stop_active_process(worker_id, worker=worker, run_id=active_run_id)
+        self.sandbox.terminate(worker_id)
         return self._runtime_info(worker, pid=None)
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
@@ -1067,6 +1080,9 @@ class BaseCliWorkerRuntime:
         active_pid = self._active_pid(worker["worker_id"])
         pid = active_pid or (sandbox.pid if sandbox and sandbox.state == "running" else None)
         return self._runtime_info(worker, pid=pid)
+
+    def worker_compute_present(self, worker: dict) -> bool:
+        return self.sandbox.inspect(worker["worker_id"]) is not None
 
     def _log_paths(self, worker_id: str) -> tuple[Path, Path]:
         return (
@@ -1435,13 +1451,14 @@ class BaseCliWorkerRuntime:
                 "abort_run() { write_exit \"${1:-130}\"; exit \"${1:-130}\"; }",
                 "trap 'abort_run 130' HUP INT TERM",
                 f"cd {shlex.quote(self.sandbox.workspace_mount)} || exit 1",
-                f"export GLASSHIVE_ACTIVE_RUN_ID={shlex.quote(effective_run_id)}",
-                f"export GLASSHIVE_ACTIVE_WORKER_ID={shlex.quote(worker_for_run['worker_id'])}",
                 'if [ -f "$HOME/.glasshive/runtime.env" ]; then set -a; source "$HOME/.glasshive/runtime.env"; set +a; fi',
                 'GLASSHIVE_SECRET_ENV_KEYS_FILE="$HOME/.glasshive/secret-runtime.keys"',
                 'GLASSHIVE_SECRET_ENV_FILE="$HOME/.glasshive/secret-runtime.env"',
                 'if [ -f "$GLASSHIVE_SECRET_ENV_FILE" ]; then set -a; source "$GLASSHIVE_SECRET_ENV_FILE"; set +a; rm -f "$GLASSHIVE_SECRET_ENV_FILE"; fi',
                 'if [ -f "$HOME/.wpr-openclaw/openclaw.env" ]; then set -a; source "$HOME/.wpr-openclaw/openclaw.env"; set +a; fi',
+                f"export GLASSHIVE_ACTIVE_RUN_ID={shlex.quote(effective_run_id)}",
+                f"export GLASSHIVE_RUN_ID={shlex.quote(effective_run_id)}",
+                f"export GLASSHIVE_ACTIVE_WORKER_ID={shlex.quote(worker_for_run['worker_id'])}",
                 f"{command_invocation} > >(tee -a {shlex.quote(container_stdout)}) 2> >(tee -a {shlex.quote(container_stderr)} >&2)",
                 "status=$?",
                 'if [ -f "$GLASSHIVE_SECRET_ENV_KEYS_FILE" ]; then while IFS= read -r key; do [ -n "$key" ] && unset "$key"; done < "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; rm -f "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; fi',
@@ -2122,17 +2139,22 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
         return self._runtime_info(worker, pid=None)
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
-        if str(worker.get("state") or "") == "running":
-            self._note_stop_reason(worker["worker_id"], "interrupted", run_id=run_id)
-        self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
+        worker_id = worker["worker_id"]
+        active_run_id = str(run_id or worker.get("_active_run_id") or "").strip() or None
+        if active_run_id or self._active_pid(worker_id):
+            self._note_stop_reason(worker_id, "interrupted", run_id=active_run_id)
+            self._stop_active_process(worker_id, worker=worker, run_id=active_run_id)
         sandbox = self.sandbox.inspect(worker["worker_id"])
         pid = sandbox.pid if sandbox and sandbox.state == "running" else None
         return self._runtime_info(worker, pid=pid)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
-        self._note_stop_reason(worker["worker_id"], "terminated")
-        self._stop_active_process(worker["worker_id"])
-        self.sandbox.terminate(worker["worker_id"])
+        worker_id = worker["worker_id"]
+        active_run_id = str(worker.get("_active_run_id") or "").strip() or None
+        if active_run_id or self._active_pid(worker_id):
+            self._note_stop_reason(worker_id, "terminated", run_id=active_run_id)
+        self._stop_active_process(worker_id, worker=worker, run_id=active_run_id)
+        self.sandbox.terminate(worker_id)
         return self._runtime_info(worker, pid=None)
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
@@ -3914,8 +3936,12 @@ class HostNativeCliMixin:
 
     def pause_worker(self, worker: dict) -> RuntimeInfo:
         active_session = self._read_active_session(worker["worker_id"])
-        self._note_stop_reason(worker["worker_id"], "paused")
-        self._stop_active_process(worker["worker_id"], worker=worker)
+        active_run_id = str(worker.get("_active_run_id") or "").strip() or None
+        if not active_run_id and active_session and self._active_pid(worker["worker_id"]):
+            active_run_id = str(active_session.get("run_id") or "").strip() or None
+        if active_run_id:
+            self._note_stop_reason(worker["worker_id"], "paused", run_id=active_run_id)
+        self._stop_active_process(worker["worker_id"], worker=worker, run_id=active_run_id)
         self._write_stopped_active_run_evidence(
             worker,
             active_session=active_session,
@@ -3929,8 +3955,12 @@ class HostNativeCliMixin:
         active_session = self._read_active_session(worker["worker_id"])
         if active_session and run_id and active_session.get("run_id") != run_id:
             active_session = None
-        self._note_stop_reason(worker["worker_id"], "interrupted", run_id=run_id)
-        self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
+        active_run_id = str(run_id or worker.get("_active_run_id") or "").strip() or None
+        if not active_run_id and active_session and self._active_pid(worker["worker_id"]):
+            active_run_id = str(active_session.get("run_id") or "").strip() or None
+        if active_run_id or self._active_pid(worker["worker_id"]):
+            self._note_stop_reason(worker["worker_id"], "interrupted", run_id=active_run_id)
+            self._stop_active_process(worker["worker_id"], worker=worker, run_id=active_run_id)
         self._write_stopped_active_run_evidence(
             worker,
             active_session=active_session,
@@ -3942,8 +3972,12 @@ class HostNativeCliMixin:
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
         active_session = self._read_active_session(worker["worker_id"])
-        self._note_stop_reason(worker["worker_id"], "terminated")
-        self._stop_active_process(worker["worker_id"], worker=worker)
+        active_run_id = str(worker.get("_active_run_id") or "").strip() or None
+        if not active_run_id and active_session and self._active_pid(worker["worker_id"]):
+            active_run_id = str(active_session.get("run_id") or "").strip() or None
+        if active_run_id:
+            self._note_stop_reason(worker["worker_id"], "terminated", run_id=active_run_id)
+        self._stop_active_process(worker["worker_id"], worker=worker, run_id=active_run_id)
         self._write_stopped_active_run_evidence(
             worker,
             active_session=active_session,
@@ -3955,6 +3989,9 @@ class HostNativeCliMixin:
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         return self._host_runtime_info(worker, pid=self._active_pid(worker["worker_id"]))
+
+    def worker_compute_present(self, worker: dict) -> bool:
+        return self._active_pid(worker["worker_id"]) is not None
 
     def _stop_active_process(self, worker_id: str, *, worker: dict | None = None, run_id: str | None = None) -> None:
         with self._process_lock:

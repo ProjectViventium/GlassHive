@@ -916,8 +916,16 @@ class WorkersProjectsService:
         return _bounded_int_env("GLASSHIVE_IDLE_REAPER_INTERVAL_S", 60, min_value=1, max_value=3600)
 
     def _lifecycle_reaper_enabled(self) -> bool:
+        orphan_reaper_enabled = str(os.environ.get("GLASSHIVE_ORPHAN_REAPER_ENABLED", "true")).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+            "disabled",
+        }
         return (
-            self._idle_terminate_after_s() > 0
+            orphan_reaper_enabled
+            or self._idle_terminate_after_s() > 0
             or self._paused_terminate_after_s() > 0
             or self._max_run_duration_s() > 0
         )
@@ -977,6 +985,62 @@ class WorkersProjectsService:
                 )
             except Exception as exc:
                 logger.warning("Failed to reap idle GlassHive worker %s: %s", worker_id, exc)
+        return reaped
+
+    def _reconcile_terminated_worker_compute(self, worker: dict) -> dict[str, object] | None:
+        worker_id = str(worker.get("worker_id") or "")
+        worker_state = str(worker.get("state") or "")
+        if not worker_id or worker_state not in {"terminated", "failed"}:
+            return None
+        if self.store.get_active_run(worker_id) or self.store.has_queued_runs(worker_id):
+            return None
+        compute_checker = getattr(self.runtime, "worker_compute_present", None)
+        compute_present = bool(compute_checker(worker)) if callable(compute_checker) else bool(self.runtime.reconcile_worker(worker).pid)
+        if not compute_present:
+            return None
+        runtime_worker = {
+            **worker,
+            "_active_run_id": "",
+        }
+        self._invalidate_worker_processor(worker_id)
+        self.store.cancel_pending_runs(
+            worker_id,
+            error_text="Worker terminated by operator",
+            state="cancelled",
+        )
+        info = self.runtime.terminate_worker(runtime_worker)
+        if info.pid:
+            raise RuntimeError(f"Worker compute is still active after termination (pid={info.pid})")
+        self._apply_runtime_info(
+            worker_id,
+            info,
+            state=worker_state,
+            last_error=str(worker.get("last_error") or ""),
+            compute_released_at=worker.get("compute_released_at") or utc_now(),
+        )
+        event_type = "worker.terminated_compute_reconciled" if worker_state == "terminated" else "worker.failed_compute_reconciled"
+        self.store.add_event(
+            str(worker.get("project_id") or ""),
+            worker_id,
+            None,
+            event_type,
+            f"Orphaned compute removed for a worker already marked {worker_state}.",
+        )
+        return {"worker_id": worker_id, "project_id": worker.get("project_id")}
+
+    def reap_terminated_workers_once(self) -> list[dict[str, object]]:
+        reaped: list[dict[str, object]] = []
+        for worker in self.store.list_all_workers():
+            try:
+                reconciled = self._reconcile_terminated_worker_compute(worker)
+                if reconciled:
+                    reaped.append(reconciled)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to reconcile terminated GlassHive worker compute %s: %s",
+                    str(worker.get("worker_id") or ""),
+                    exc,
+                )
         return reaped
 
     def reap_paused_workers_once(self) -> list[dict[str, object]]:
@@ -1105,6 +1169,7 @@ class WorkersProjectsService:
     def _idle_reaper_loop(self) -> None:
         interval = self._idle_reaper_interval_s()
         while not self._shutdown_event.wait(interval):
+            self.reap_terminated_workers_once()
             self.reap_idle_workers_once()
             self.reap_paused_workers_once()
             self.reap_expired_runs_once()
@@ -1818,7 +1883,12 @@ class WorkersProjectsService:
 
     def pause_worker(self, worker_id: str) -> dict:
         worker = self.require_worker(worker_id)
-        info = self.runtime.pause_worker(worker)
+        active_run = self.store.get_active_run(worker_id)
+        runtime_worker = {
+            **worker,
+            "_active_run_id": str((active_run or {}).get("run_id") or ""),
+        }
+        info = self.runtime.pause_worker(runtime_worker)
         updated = self._apply_runtime_info(worker_id, info, state="paused", last_error=worker.get("last_error") or "")
         active_run = self.store.get_active_run(worker_id)
         self.store.add_event(worker["project_id"], worker_id, active_run["run_id"] if active_run else None, "worker.paused", "Worker paused")
@@ -1861,8 +1931,28 @@ class WorkersProjectsService:
 
     def terminate_worker(self, worker_id: str) -> dict:
         worker = self.require_worker(worker_id)
-        info = self.runtime.terminate_worker(worker)
+        active_run = self.store.get_active_run(worker_id)
+        runtime_worker = {
+            **worker,
+            "_active_run_id": str((active_run or {}).get("run_id") or ""),
+        }
+        self._invalidate_worker_processor(worker_id)
         self.store.cancel_pending_runs(worker_id, error_text="Worker terminated by operator", state="cancelled")
+        try:
+            info = self.runtime.terminate_worker(runtime_worker)
+            if info.pid:
+                raise RuntimeError(f"Worker compute is still active after termination (pid={info.pid})")
+        except Exception as exc:
+            message = public_callback_message_text(str(exc)) or "Worker compute termination failed"
+            self.store.update_worker(worker_id, state="failed", last_error=message)
+            self.store.add_event(
+                worker["project_id"],
+                worker_id,
+                None,
+                "worker.termination_failed",
+                message,
+            )
+            raise
         updated = self._apply_runtime_info(
             worker_id,
             info,
@@ -1892,7 +1982,8 @@ class WorkersProjectsService:
                 )
 
     def _reconcile_worker_row(self, worker: dict) -> None:
-        if worker["state"] == "terminated":
+        if worker["state"] in {"terminated", "failed"}:
+            self._reconcile_terminated_worker_compute(worker)
             return
         active_run = self.store.get_active_run(worker["worker_id"])
         if active_run:
@@ -2359,6 +2450,10 @@ class WorkersProjectsService:
                 except WorkerInterruptedError as exc:
                     if not self._processor_is_current(worker_id, generation):
                         return
+                    recovered = self._collect_completed_run(worker, run)
+                    if recovered:
+                        self._apply_recovered_run(worker, run, recovered)
+                        continue
                     self.store.finalize_run(run["run_id"], state="interrupted", error_text=str(exc))
                     self.store.finalize_schedule_for_run(run["run_id"], state="failed", last_error=str(exc))
                     self.store.update_worker_state(worker_id, "ready", last_error="")

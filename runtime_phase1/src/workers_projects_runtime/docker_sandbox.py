@@ -566,8 +566,17 @@ class DockerSandboxManager:
     def terminate(self, worker_id: str) -> SandboxInfo:
         sandbox = self.inspect(worker_id)
         if sandbox is not None:
-            self._docker(["rm", "-f", sandbox.container_name], check=False)
-            self._invalidate_inspect_cache(worker_id)
+            remaining = sandbox
+            for _attempt in range(2):
+                self._docker(["rm", "-f", sandbox.container_name], check=False)
+                self._invalidate_inspect_cache(worker_id)
+                remaining = self.inspect(worker_id)
+                if remaining is None:
+                    break
+            if remaining is not None:
+                raise RuntimeError(
+                    f"Docker sandbox {sandbox.container_name} is still running after termination"
+                )
         return SandboxInfo(
             container_name=self._container_name(worker_id),
             container_id=None,
