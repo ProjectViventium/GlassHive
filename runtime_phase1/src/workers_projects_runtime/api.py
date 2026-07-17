@@ -461,8 +461,8 @@ def create_app(
             normalized["codex_reasoning_effort"] = effort
         if payload.claude_effort is not None:
             effort = payload.claude_effort.strip().lower()
-            if effort and effort not in {"default", "max"}:
-                raise HTTPException(status_code=400, detail="claude_effort must be default or max")
+            if effort and effort not in {"default", "max", "xhigh"}:
+                raise HTTPException(status_code=400, detail="claude_effort must be default, max, or xhigh")
             normalized["claude_effort"] = "" if effort == "default" else effort
         if payload.openclaw_effort is not None:
             effort = payload.openclaw_effort.strip().lower()
@@ -481,8 +481,8 @@ def create_app(
                 raise HTTPException(status_code=400, detail="Codex effort must be none, minimal, low, medium, high, or xhigh")
             return {"env": {"WPR_CODEX_CLI_REASONING_EFFORT": effort}}
         if profile == "claude-code":
-            if effort not in {"default", "max"}:
-                raise HTTPException(status_code=400, detail="Claude effort must be default or max")
+            if effort not in {"default", "max", "xhigh"}:
+                raise HTTPException(status_code=400, detail="Claude effort must be default, max, or xhigh")
             if effort == "default":
                 return None
             return {"env": {"WPR_CLAUDE_CODE_EFFORT": effort}}

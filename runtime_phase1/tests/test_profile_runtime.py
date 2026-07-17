@@ -2587,6 +2587,22 @@ def test_workspace_claude_command_honors_per_run_max_effort(tmp_path, monkeypatc
     assert command[command.index("--effort") + 1] == "max"
 
 
+def test_workspace_claude_command_honors_per_run_xhigh_effort(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_workspace_claude_xhigh",
+        "name": "Workspace Claude Worker",
+        "profile": "claude-code",
+        "execution_mode": "docker",
+        "model": "claude-opus-4-8",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CLAUDE_CODE_EFFORT": "xhigh"}}),
+    }
+
+    command, _ = runtime._build_command(worker, "do the work", runtime._runtime_info(worker))
+
+    assert command[command.index("--effort") + 1] == "xhigh"
+
+
 def test_workspace_claude_max_effort_preflight_requires_effort_support(tmp_path, monkeypatch):
     runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
     ClaudeCodeRuntime._workspace_effort_support_cache.clear()
@@ -2615,7 +2631,12 @@ def test_workspace_claude_max_effort_preflight_accepts_effort_support(tmp_path, 
     monkeypatch.setattr(
         runtime.sandbox,
         "_docker",
-        lambda *args, **kwargs: subprocess.CompletedProcess(args, returncode=0, stdout="Usage: claude [options] --effort\n", stderr=""),
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="Usage: claude [options] --effort <level> (low, medium, high, xhigh, max)\n",
+            stderr="",
+        ),
     )
     worker = {
         "worker_id": "wrk_workspace_claude_effort",
@@ -2628,6 +2649,31 @@ def test_workspace_claude_max_effort_preflight_accepts_effort_support(tmp_path, 
     runtime._preflight_workspace_effort_support(worker)
 
     assert calls == ["image"]
+
+
+def test_workspace_claude_xhigh_effort_preflight_rejects_older_effort_contract(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    ClaudeCodeRuntime._workspace_effort_support_cache.clear()
+    monkeypatch.setattr(runtime.sandbox, "_ensure_image", lambda: None)
+    monkeypatch.setattr(
+        runtime.sandbox,
+        "_docker",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="Usage: claude [options] --effort <level> (low, medium, high, max)\n",
+            stderr="",
+        ),
+    )
+    worker = {
+        "worker_id": "wrk_workspace_claude_xhigh_unsupported",
+        "profile": "claude-code",
+        "execution_mode": "docker",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CLAUDE_CODE_EFFORT": "xhigh"}}),
+    }
+
+    with pytest.raises(RuntimeDependencyMissingError, match="xhigh"):
+        runtime._preflight_workspace_effort_support(worker)
 
 
 def test_host_claude_command_enables_chrome_by_default(tmp_path, monkeypatch):
@@ -2660,6 +2706,57 @@ def test_host_claude_command_enables_chrome_by_default(tmp_path, monkeypatch):
     stdin_text = runtime._command_stdin_text(worker, "do the work", info)
     assert stdin_text and stdin_text.startswith("do the work")
     assert "FINAL REPORT:" in stdin_text
+
+
+def test_host_claude_command_honors_xhigh_effort(tmp_path, monkeypatch):
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"--help\" ]]; then echo 'Usage: claude [options] --effort <level> (low, medium, high, xhigh, max)'; exit 0; fi\n"
+        "echo '2.1.207 (Claude Code)'\n"
+    )
+    fake_claude.chmod(0o755)
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(fake_claude)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "xhigh")
+    worker = {
+        "worker_id": "wrk_host_claude_xhigh",
+        "name": "Host Claude Worker",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "model": "claude-opus-4-8",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+
+    command, _ = runtime._build_command(worker, "do the work", runtime._host_runtime_info(worker))
+
+    assert command[command.index("--effort") + 1] == "xhigh"
+
+
+def test_host_claude_xhigh_effort_rejects_older_effort_contract(tmp_path, monkeypatch):
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"--help\" ]]; then echo 'Usage: claude [options] --effort <level> (low, medium, high, max)'; exit 0; fi\n"
+        "echo '2.1.178 (Claude Code)'\n"
+    )
+    fake_claude.chmod(0o755)
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(fake_claude)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "xhigh")
+    worker = {
+        "worker_id": "wrk_host_claude_xhigh_unsupported",
+        "name": "Host Claude Worker",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "model": "claude-opus-4-8",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+
+    with pytest.raises(RuntimeDependencyMissingError, match="xhigh"):
+        runtime._build_command(worker, "do the work", runtime._host_runtime_info(worker))
 
 
 def test_host_claude_chrome_can_be_explicitly_disabled(tmp_path, monkeypatch):

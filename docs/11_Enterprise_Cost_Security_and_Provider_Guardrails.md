@@ -112,10 +112,11 @@ Codex supports global default reasoning through `WPR_CODEX_CLI_REASONING_EFFORT`
 `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`, subject to the active provider route's tested
 allowlist. Enterprise deep-work deployments should prove and use `high` by default for Codex; `xhigh`
 is reserved for explicitly hard work once direct route probes and real worker runs prove it.
-Claude Code effort is selected by model/provider configuration plus the native `--effort max` flag
-when a run asks for `max`. GlassHive must project that through `WPR_CLAUDE_CODE_EFFORT=max` in the
-worker bootstrap env for MCP, UI, and direct API assignments, the generated worker command must show
-`--effort max`, and host-native preflight/command generation must fail closed if the configured
+Claude Code effort is selected by model/provider configuration plus the native `--effort` flag when
+a run asks for `max` or `xhigh`. GlassHive must project the exact requested value through
+`WPR_CLAUDE_CODE_EFFORT` in the worker bootstrap env for MCP, UI, and direct API assignments, the
+generated worker command must preserve that value, and host-native preflight/command generation must
+fail closed if the configured
 Claude CLI does not expose `--effort`. Claude Code workers should also preserve native
 Chrome/browser substrate with `--chrome` by default when the CLI supports it.
 Codex feature lockdown is opt-in only: `WPR_CODEX_CLI_DISABLE_FEATURES` must be unset by default so
@@ -125,8 +126,8 @@ GlassHive also stores per-user defaults for default worker profile and per-profi
 through authenticated preferences, so a user can make Codex, OpenClaw, or any other profile present
 in `GLASSHIVE_ALLOWED_WORKER_PROFILES` the default without affecting other users. Per-run effort
 overrides must stay allowlisted by runtime profile:
-Codex accepts `none`/`minimal`/`low`/`medium`/`high`/`xhigh`; Claude Code currently accepts `default` or
-`max`; OpenClaw currently accepts `default`, `high`, or `max`.
+Codex accepts `none`/`minimal`/`low`/`medium`/`high`/`xhigh`; Claude Code accepts `default`, `max`, or
+`xhigh` on the pinned current CLI; OpenClaw currently accepts `default`, `high`, or `max`.
 
 Portkey can be used in more than one shape, and each shape must be validated separately:
 

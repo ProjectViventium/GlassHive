@@ -711,8 +711,8 @@ def _bootstrap_bundle_with_effort(bundle: dict[str, Any] | None, profile: str, e
         next_bundle["env"] = env
         return next_bundle
     if profile == "claude-code":
-        if clean_effort not in {"default", "max"}:
-            raise HTTPException(status_code=400, detail="Claude effort must be default or max")
+        if clean_effort not in {"default", "max", "xhigh"}:
+            raise HTTPException(status_code=400, detail="Claude effort must be default, max, or xhigh")
         if clean_effort == "default":
             return next_bundle
         env = dict(next_bundle.get("env") or {})

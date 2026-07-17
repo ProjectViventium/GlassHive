@@ -91,7 +91,7 @@ CAPABILITY_BROKER_CONTENT_READ_SCOPE = "content_read"
 HIGH_EFFORT_SELECTION_GUIDANCE = (
     "For complex multi-source research, deep research, critical analysis, large file transformation, "
     "coding, comparison, or executive-quality deliverables, choose a higher effort setting: Codex "
-    "high/xhigh, Claude max, OpenClaw high/max, or the configured equivalent, unless the user clearly "
+    "high/xhigh, Claude max/xhigh, OpenClaw high/max, or the configured equivalent, unless the user clearly "
     "asks for a quick/cheap pass. For ordinary bounded tasks, omit effort unless the user explicitly "
     "asks for a cheaper/faster pass; user preferences and deployment defaults own the baseline."
 )
@@ -447,8 +447,8 @@ def _apply_effort_to_bundle(bundle: dict[str, Any], *, profile: str, effort: str
         next_bundle["env"] = env
         return next_bundle
     if profile == "claude-code":
-        if clean_effort not in {"default", "max"}:
-            raise ValueError("Claude effort must be default or max")
+        if clean_effort not in {"default", "max", "xhigh"}:
+            raise ValueError("Claude effort must be default, max, or xhigh")
         if clean_effort == "default":
             return next_bundle
         env = dict(next_bundle.get("env") or {})
@@ -2639,7 +2639,7 @@ def create_mcp_server(
             "Save the authenticated user's default GlassHive worker and effort preferences. Use this "
             "when the user says to make Codex, Claude Code, or OpenClaw their default, or asks future "
             "GlassHive runs to use a specific effort. Allowed Codex efforts: none, low, medium, "
-            "high, xhigh; minimal is for explicitly allowlisted deployments only. Claude: max. "
+            "high, xhigh; minimal is for explicitly allowlisted deployments only. Claude: max or xhigh. "
             "OpenClaw: high or max."
         ),
         structured_output=True,
@@ -2655,7 +2655,7 @@ def create_mcp_server(
         ] = None,
         claude_effort: Annotated[
             str | None,
-            Field(description="Optional Claude Code default effort: max, or empty/default to use deployment default."),
+            Field(description="Optional Claude Code default effort: max, xhigh, or empty/default to use deployment default."),
         ] = None,
         openclaw_effort: Annotated[
             str | None,
@@ -2753,7 +2753,7 @@ def create_mcp_server(
                 description=(
                     "Optional per-run effort override. Codex accepts none/low/medium/high/xhigh; "
                     "minimal is for explicitly allowlisted deployments only. "
-                    "Claude Code accepts max; OpenClaw accepts high/max. Omit to use the user's saved default. "
+                    "Claude Code accepts max/xhigh; OpenClaw accepts high/max. Omit to use the user's saved default. "
                     + HIGH_EFFORT_SELECTION_GUIDANCE
                 )
             ),
@@ -3061,7 +3061,7 @@ def create_mcp_server(
                 description=(
                     "Optional per-run effort override. Codex accepts none/low/medium/high/xhigh; "
                     "minimal is for explicitly allowlisted deployments only. "
-                    "Claude Code accepts max; OpenClaw accepts high/max. Omit to use saved user preferences or deployment default. "
+                    "Claude Code accepts max/xhigh; OpenClaw accepts high/max. Omit to use saved user preferences or deployment default. "
                     + HIGH_EFFORT_SELECTION_GUIDANCE
                 )
             ),
@@ -4591,7 +4591,7 @@ def create_mcp_server(
                 description=(
                     "Optional effort override for this continuation. Codex accepts none/low/medium/high/xhigh; "
                     "minimal is for explicitly allowlisted deployments only. "
-                    "Claude Code accepts max; OpenClaw accepts high/max. Omit to use the user's saved default. "
+                    "Claude Code accepts max/xhigh; OpenClaw accepts high/max. Omit to use the user's saved default. "
                     + HIGH_EFFORT_SELECTION_GUIDANCE
                 )
             ),

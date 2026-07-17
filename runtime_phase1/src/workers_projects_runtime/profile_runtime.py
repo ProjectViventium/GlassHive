@@ -63,6 +63,15 @@ _HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off", "none", "disabled"}
 
 
+def _claude_effort_help_supports(help_text: str, effort: str) -> bool:
+    marker = help_text.find("--effort")
+    if marker < 0:
+        return False
+    if effort != "xhigh":
+        return True
+    return re.search(r"\bxhigh\b", help_text[marker : marker + 320], flags=re.IGNORECASE) is not None
+
+
 def _codex_mcp_section_server_name(section_name: str) -> str | None:
     section_name = section_name.strip()
     if not section_name.startswith("mcp_servers."):
@@ -2619,7 +2628,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
     runtime_name = "claude-code"
     worker_root_name = "claude_code_runtime"
     binary_name = "claude"
-    _workspace_effort_support_cache: dict[tuple[str, str], bool] = {}
+    _workspace_effort_support_cache: dict[tuple[str, str, str], bool] = {}
 
     def resolve_model(self, profile: str) -> str:
         return os.environ.get("WPR_MODEL_CLAUDE_CODE", "claude-sonnet-4-6")
@@ -2648,9 +2657,10 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
     def _preflight_workspace_effort_support(self, worker: dict) -> None:
         if str(worker.get("execution_mode") or "docker") != "docker":
             return
-        if self._effort_for_worker(worker) != "max":
+        effort = self._effort_for_worker(worker)
+        if effort not in {"max", "xhigh"}:
             return
-        cache_key = (str(self.sandbox.image), self.binary)
+        cache_key = (str(self.sandbox.image), self.binary, effort)
         if self._workspace_effort_support_cache.get(cache_key):
             return
         try:
@@ -2663,7 +2673,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             )
         except Exception as exc:
             raise RuntimeDependencyMissingError(
-                "Claude Code max effort could not be preflighted in the GlassHive workspace image",
+                f"Claude Code {effort} effort could not be preflighted in the GlassHive workspace image",
                 binary=self.binary,
                 runtime_name=self.runtime_name,
                 profile=str(worker.get("profile") or "claude-code"),
@@ -2671,14 +2681,14 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                 dependency_label="Claude Code --effort support",
                 recovery_hint=(
                     "Use a GlassHive workspace image with a Claude Code CLI that supports `--effort`, "
-                    "or run this worker without `max` effort until the image is upgraded."
+                    "or use default effort until the image is upgraded."
                 ),
             ) from exc
         help_text = f"{result.stdout or ''}\n{result.stderr or ''}"
-        if result.returncode != 0 or "--effort" not in help_text:
+        if result.returncode != 0 or not _claude_effort_help_supports(help_text, effort):
             actual = (help_text.strip() or f"exit {result.returncode}")[-400:]
             raise RuntimeDependencyMissingError(
-                "Claude Code max effort requires workspace image support for `claude --effort`",
+                f"Claude Code {effort} effort requires workspace image support for `claude --effort`",
                 binary=self.binary,
                 runtime_name=self.runtime_name,
                 profile=str(worker.get("profile") or "claude-code"),
@@ -2688,7 +2698,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                 dependency_label="Claude Code --effort support",
                 recovery_hint=(
                     "Upgrade the GlassHive workspace image or use default Claude effort for this run. "
-                    "Do not silently project `max` when the active image cannot prove support."
+                    "Do not silently project a native effort when the active image cannot prove support."
                 ),
             )
         self._workspace_effort_support_cache[cache_key] = True
@@ -2714,7 +2724,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         if self._chrome_enabled():
             command.insert(2, "--chrome")
         effort = self._effort_for_worker(worker)
-        if effort == "max":
+        if effort in {"max", "xhigh"}:
             command.extend(["--effort", effort])
         elif effort and effort != "default":
             logger.warning(
@@ -4611,13 +4621,14 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
     def _chrome_supported(self) -> bool:
         return self._help_supports("--chrome")
 
-    def _effort_supported(self) -> bool:
-        return self._help_supports("--effort")
+    def _effort_supported(self, effort: str = "") -> bool:
+        help_text = self._help_text()
+        return bool(help_text) and _claude_effort_help_supports(help_text, effort)
 
-    def _help_supports(self, flag: str) -> bool:
+    def _help_text(self) -> str:
         resolved = shutil.which(self.binary)
         if not resolved:
-            return False
+            return ""
         try:
             completed = subprocess.run(
                 [resolved, "--help"],
@@ -4628,8 +4639,11 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
                 timeout=5,
             )
         except Exception:
-            return False
-        return flag in f"{completed.stdout}\n{completed.stderr}"
+            return ""
+        return f"{completed.stdout}\n{completed.stderr}"
+
+    def _help_supports(self, flag: str) -> bool:
+        return flag in self._help_text()
 
     def _requires_max_effort(self, worker: dict | None = None) -> bool:
         worker = worker or {}
@@ -4639,10 +4653,10 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
         ).strip().lower()
         return effort == "max"
 
-    def _raise_missing_effort_support(self, profile: str, execution_mode: str) -> None:
+    def _raise_missing_effort_support(self, profile: str, execution_mode: str, effort: str) -> None:
         raise RuntimeDependencyMissingError(
-            "Claude Code workers requested `max` effort, but the configured Claude Code CLI "
-            "does not expose the native --effort flag.",
+            f"Claude Code workers requested `{effort}` effort, but the configured Claude Code CLI "
+            "does not advertise that native --effort capability.",
             binary=self.binary,
             runtime_name=self.runtime_name,
             profile=profile,
@@ -4656,8 +4670,9 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
 
     def preflight_worker_profile(self, profile: str, execution_mode: str = "host") -> None:
         super().preflight_worker_profile(profile, execution_mode)
-        if os.environ.get("WPR_CLAUDE_CODE_EFFORT", "").strip().lower() == "max" and not self._effort_supported():
-            self._raise_missing_effort_support(profile, execution_mode)
+        effort = os.environ.get("WPR_CLAUDE_CODE_EFFORT", "").strip().lower()
+        if effort in {"max", "xhigh"} and not self._effort_supported(effort):
+            self._raise_missing_effort_support(profile, execution_mode, effort)
         if self._chrome_enabled() and not self._chrome_supported():
             raise RuntimeDependencyMissingError(
                 "Claude Code host workers require a Claude Code CLI that supports --chrome, "
@@ -4693,9 +4708,11 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
             self._bootstrap_env_value(worker, "WPR_CLAUDE_CODE_EFFORT")
             or os.environ.get("WPR_CLAUDE_CODE_EFFORT", "")
         ).strip().lower()
-        if effort == "max":
-            if not self._effort_supported():
-                self._raise_missing_effort_support(str(worker.get("profile") or "claude-code"), "host")
+        if effort in {"max", "xhigh"}:
+            if not self._effort_supported(effort):
+                self._raise_missing_effort_support(
+                    str(worker.get("profile") or "claude-code"), "host", effort
+                )
             command.extend(["--effort", effort])
         elif effort and effort != "default":
             logger.warning(

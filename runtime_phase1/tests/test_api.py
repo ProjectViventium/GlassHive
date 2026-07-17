@@ -4581,6 +4581,42 @@ def test_assign_run_effort_updates_claude_worker_bootstrap_bundle(tmp_path):
     assert "Claude effort" in rejected.json()["detail"]
 
 
+def test_assign_run_effort_accepts_claude_xhigh(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub"))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Claude xhigh effort",
+            "goal": "Verify the current Claude CLI effort handoff.",
+            "default_worker_profile": "claude-code",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Claude Worker",
+            "role": "research",
+            "profile": "claude-code",
+            "backend": "openclaw",
+            "start_synchronously": False,
+        },
+    ).json()
+
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Continue with an xhigh effort pass.", "effort": "xhigh"},
+    )
+
+    assert run.status_code == 202
+    assert run.json()["effort"] == "xhigh"
+    stored_worker = Store(str(db_path)).get_worker(worker["worker_id"])
+    bundle = json.loads(stored_worker["bootstrap_bundle_json"])
+    assert bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == "xhigh"
+
+
 def test_signed_worker_view_cannot_inject_bootstrap_bundle_on_assign(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
     monkeypatch.setenv("WPR_API_TOKEN", "api-token")
