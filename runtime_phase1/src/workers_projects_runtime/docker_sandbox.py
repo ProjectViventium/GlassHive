@@ -478,6 +478,7 @@ class DockerSandboxManager:
             raise RuntimeError("Failed to start worker sandbox")
         if needs_path_repair or (repair_paths and self._env_flag("WPR_REPAIR_RUNNING_CONTAINER_ROOTS", False)):
             self._ensure_container_writable_paths(sandbox.container_name, self._default_writable_container_paths())
+        self._repair_provider_temp_ownership(sandbox.container_name)
         self._harden_secret_runtime_files(sandbox.container_name)
         if needs_idle_prime:
             self._set_plain_background(sandbox.container_name)
@@ -565,8 +566,17 @@ class DockerSandboxManager:
     def terminate(self, worker_id: str) -> SandboxInfo:
         sandbox = self.inspect(worker_id)
         if sandbox is not None:
-            self._docker(["rm", "-f", sandbox.container_name], check=False)
-            self._invalidate_inspect_cache(worker_id)
+            remaining = sandbox
+            for _attempt in range(2):
+                self._docker(["rm", "-f", sandbox.container_name], check=False)
+                self._invalidate_inspect_cache(worker_id)
+                remaining = self.inspect(worker_id)
+                if remaining is None:
+                    break
+            if remaining is not None:
+                raise RuntimeError(
+                    f"Docker sandbox {sandbox.container_name} is still running after termination"
+                )
         return SandboxInfo(
             container_name=self._container_name(worker_id),
             container_id=None,
@@ -1481,6 +1491,33 @@ screen -ls | awk -v target="$target" '
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()[-1200:]
             raise RuntimeError(f"Failed to prepare writable sandbox paths in {container_name}: {detail}")
+
+    def _repair_provider_temp_ownership(self, container_name: str) -> None:
+        runtime_user = shlex.quote(self.user.split(":", 1)[0] or self.user)
+        temp_root = shlex.quote(self._browser_tmp_dir())
+        script = (
+            "set -e; "
+            f"runtime_uid=$(id -u {runtime_user}); "
+            f"runtime_gid=$(id -g {runtime_user}); "
+            f"provider_tmp={temp_root}/claude-${{runtime_uid}}; "
+            'if [ -d "$provider_tmp" ]; then '
+            'chown -R "${runtime_uid}:${runtime_gid}" "$provider_tmp"; '
+            'chmod 700 "$provider_tmp"; '
+            "fi"
+        )
+        result = self._docker_exec(
+            container_name,
+            ["bash", "-c", script],
+            env={
+                "HOME": self.home_mount,
+                "TERM": self.term_value,
+            },
+            cwd=self.workspace_mount,
+            user="root",
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[-1200:]
+            raise RuntimeError(f"Failed to repair provider temp ownership in {container_name}: {detail}")
 
     def _harden_secret_runtime_files(self, container_name: str) -> None:
         user = shlex.quote(self.user)

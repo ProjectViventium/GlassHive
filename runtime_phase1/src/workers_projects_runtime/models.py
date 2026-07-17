@@ -194,6 +194,10 @@ class RunResponse(BaseModel):
     failure_user_message: str = ""
     failure_recommended_recovery: str = ""
     failure_diagnostic_summary: str = ""
+    effort: str = Field(
+        default="",
+        description="Normalized per-assignment effort accepted by the runtime.",
+    )
 
 
 class ScheduleResponse(BaseModel):

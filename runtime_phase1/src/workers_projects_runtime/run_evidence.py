@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import tempfile
 import time
-import zipfile
 from pathlib import Path
 from typing import Iterable
 
@@ -52,7 +51,9 @@ _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b[A-Za-z0-9_]{8,}:[A-Za-z0-9_./+=-]{20,}\b"), "[REDACTED_CREDENTIAL]"),
 )
 _FINAL_REPORT_RE = re.compile(
-    r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*)?(?:[*_]{1,3})?FINAL REPORT\s*:\s*(?:[*_]{1,3})?",
+    r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*)?"
+    r"(?:(?:[*_]{1,3}|`{1,3})[ \t]*)?FINAL REPORT\s*:\s*"
+    r"(?:(?:[*_]{1,3}|`{1,3})[ \t]*)?",
     re.I,
 )
 
@@ -489,6 +490,8 @@ def _bootstrap_seed_files(worker: dict[str, object]) -> list[str]:
             continue
         for item in raw:
             if isinstance(item, dict):
+                if item.get("evidence_seed") is False:
+                    continue
                 candidate = str(item.get("path") or item.get("name") or item.get("relative_path") or "").strip()
             else:
                 candidate = str(item or "").strip()

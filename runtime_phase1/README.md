@@ -34,6 +34,11 @@ Each worker can now carry:
     - `agents_md`
     - `system_instructions`
 
+Bootstrap `files` are evidence seeds by default. A reference, tool, or Skill
+file that supports the worker but is not expected to appear in the final
+deliverable can set `"evidence_seed": false`; the file is still copied into the
+workspace but is excluded from output seed-coverage warnings.
+
 Current behavior:
 
 - existing host-projection defaults remain backward-compatible

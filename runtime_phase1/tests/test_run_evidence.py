@@ -68,6 +68,30 @@ def test_constraint_ledger_does_not_treat_uploaded_as_date_constraint():
     assert all("<filename>" not in seed for seed in ledger["seed_entities_or_files"])
 
 
+def test_constraint_ledger_excludes_support_files_from_evidence_seeds():
+    worker = {
+        "worker_id": "wrk_support_files",
+        "profile": "claude-code",
+        "execution_mode": "docker",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "files": [
+                    {"path": "input/invoice.pdf"},
+                    {"path": ".claude/skills/invoice/SKILL.md", "evidence_seed": False},
+                ]
+            }
+        ),
+    }
+
+    ledger = build_constraint_ledger(
+        instruction="Process the invoice and return the result.",
+        worker=worker,
+        run_id="run_support_files",
+    )
+
+    assert ledger["seed_entities_or_files"] == ["uploaded file input/invoice.pdf"]
+
+
 def test_run_evidence_accepts_uploaded_pdf_input_with_text_artifact(tmp_path):
     uploads = tmp_path / "uploads"
     uploads.mkdir()
@@ -1217,6 +1241,31 @@ def test_run_evidence_accepts_markdown_decorated_final_report_marker(tmp_path):
     )
 
     assert evidence["final_output"]["has_final_report"] is True
+    assert evidence["evidence_result"]["status"] == "pass"
+
+
+def test_run_evidence_accepts_backtick_wrapped_final_report_marker(tmp_path):
+    result = "Confirmed the artifacts.\n\n`FINAL REPORT:`\n\nAll outputs are ready."
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_backtick_final", "profile": "claude-code", "execution_mode": "docker"},
+        run_id="run_backtick_final",
+        runtime_name="claude-code",
+        model="claude-test",
+        command=["claude", "-p"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=json.dumps({"type": "result", "subtype": "success", "result": result}),
+        stderr_text="",
+        output_text=result,
+        error_text="",
+        exit_code=0,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    assert evidence["final_output"]["has_final_report"] is True
+    assert evidence["completion_compliance"]["status"] == "pass"
     assert evidence["evidence_result"]["status"] == "pass"
 
 

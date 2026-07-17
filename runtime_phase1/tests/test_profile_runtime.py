@@ -82,6 +82,23 @@ def test_terminal_target_uses_inferred_job_session_when_metadata_missing(tmp_pat
     assert target.subtitle == "codex-cli active run"
 
 
+def test_host_terminal_target_preserves_shell_fallback_expression(tmp_path):
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_host_terminal",
+        "name": "Host Claude",
+        "profile": "claude-code",
+        "execution_mode": "host",
+    }
+    runtime.ensure_worker_ready = lambda worker: runtime._runtime_info(worker, pid=1234)  # type: ignore[method-assign]
+    runtime._infer_active_session = lambda worker: None  # type: ignore[method-assign]
+
+    target = runtime.terminal_target(worker)
+
+    assert target.command[-1].endswith("exec ${SHELL:-/bin/bash}")
+    assert target.title == "Host Claude host terminal"
+
+
 def test_collect_completed_run_recovers_from_latest_run_artifacts(tmp_path):
     runtime = CodexCliRuntime(base_dir=str(tmp_path))
     worker = {
@@ -483,6 +500,30 @@ def test_codex_parser_accepts_inline_final_report_section(tmp_path):
     assert output == "Only this inline result should be posted."
 
 
+def test_codex_parser_accepts_backtick_wrapped_final_report_section(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_backtick_final_report",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    stdout = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "Done.\n\n`FINAL REPORT:`\n\nOnly this final result should be posted.",
+            },
+        }
+    )
+
+    _, output = runtime._parse_output(worker, stdout, "", runtime._runtime_info(worker))
+
+    assert output == "Only this final result should be posted."
+
+
 def test_codex_parser_strips_plain_resume_final_report(tmp_path):
     runtime = CodexCliRuntime(base_dir=str(tmp_path))
     worker = {
@@ -861,6 +902,57 @@ def test_global_stop_reason_still_applies_to_current_run(tmp_path):
 
     with pytest.raises(WorkerTerminatedError):
         runtime._finalize_stop_reason("wrk_test", run_id="run_any")
+
+
+def test_idle_worker_termination_does_not_poison_later_run(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    runtime.sandbox.terminate = lambda worker_id: None  # type: ignore[method-assign]
+    worker = {
+        "worker_id": "wrk_test",
+        "name": "Idle Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+        "state": "ready",
+    }
+
+    runtime.terminate_worker(worker)
+
+    runtime._finalize_stop_reason(worker["worker_id"], run_id="run_later")
+
+
+def test_idle_worker_interrupt_does_not_poison_later_run(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    runtime.sandbox.inspect = lambda worker_id: None  # type: ignore[method-assign]
+    worker = {
+        "worker_id": "wrk_test",
+        "name": "Idle Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+        "state": "ready",
+    }
+
+    runtime.interrupt_worker(worker)
+
+    runtime._finalize_stop_reason(worker["worker_id"], run_id="run_later")
+
+
+def test_worker_termination_reason_is_scoped_to_active_run(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    runtime.sandbox.terminate = lambda worker_id: None  # type: ignore[method-assign]
+    worker = {
+        "worker_id": "wrk_test",
+        "name": "Active Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+        "state": "running",
+        "_active_run_id": "run_active",
+    }
+
+    runtime.terminate_worker(worker)
+
+    runtime._finalize_stop_reason(worker["worker_id"], run_id="run_later")
+    with pytest.raises(WorkerTerminatedError):
+        runtime._finalize_stop_reason(worker["worker_id"], run_id="run_active")
 
 
 def test_host_codex_runtime_materializes_required_workspace_files(tmp_path, monkeypatch):
@@ -2795,6 +2887,7 @@ def test_docker_cli_runtime_sources_runtime_and_openclaw_env_files(tmp_path):
         assert '$HOME/.glasshive/runtime.env' in script
         assert '$HOME/.wpr-openclaw/openclaw.env' in script
         assert "GLASSHIVE_ACTIVE_RUN_ID=run_capture" in script
+        assert "GLASSHIVE_RUN_ID=run_capture" in script
         assert "GLASSHIVE_ACTIVE_WORKER_ID=wrk_capture" in script
         (run_root / "stdout.log").write_text("FINAL REPORT:\nok")
         (run_root / "stderr.log").write_text("")
