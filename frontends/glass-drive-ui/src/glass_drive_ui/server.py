@@ -46,6 +46,7 @@ NOVNC_ASSET_CACHE_TTL_SECONDS = 10 * 60.0
 NOVNC_ASSET_CACHE_MAX_BYTES = 2 * 1024 * 1024
 RUNTIME_ENV_KEYS = {
     "GLASSHIVE_ENTERPRISE_MODE",
+    "GLASSHIVE_PUBLIC_LINKS_ONLY",
     "WPR_ENTERPRISE_MODE",
     "GLASSHIVE_AUTH_MODE",
     "GLASSHIVE_ENTERPRISE_TENANT_ID",
@@ -432,8 +433,18 @@ def _workspace_link_auto_resume_enabled() -> bool:
     return _env_flag("GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME", False)
 
 
+def _public_links_only_enabled() -> bool:
+    return _truthy_env("GLASSHIVE_PUBLIC_LINKS_ONLY")
+
+
 def _validate_enterprise_startup() -> None:
     enterprise = _truthy_env("GLASSHIVE_ENTERPRISE_MODE") or _truthy_env("WPR_ENTERPRISE_MODE")
+    if _public_links_only_enabled() and not str(
+        os.environ.get("GLASSHIVE_SIGNED_LINK_SECRET") or ""
+    ).strip():
+        raise RuntimeError(
+            "GlassHive public link mode requires GLASSHIVE_SIGNED_LINK_SECRET"
+        )
     if not enterprise:
         return
     api_token = str(os.environ.get("WPR_API_TOKEN") or "").strip()
@@ -819,12 +830,13 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     _validate_enterprise_startup()
     client = runtime_client or RuntimeClient()
     enterprise = _truthy_env("GLASSHIVE_ENTERPRISE_MODE") or _truthy_env("WPR_ENTERPRISE_MODE")
+    public_links_only = _public_links_only_enabled()
     app = FastAPI(
         title="GlassHive",
         version="0.1.0",
-        docs_url=None if enterprise else "/docs",
-        redoc_url=None if enterprise else "/redoc",
-        openapi_url=None if enterprise else "/openapi.json",
+        docs_url=None if enterprise or public_links_only else "/docs",
+        redoc_url=None if enterprise or public_links_only else "/redoc",
+        openapi_url=None if enterprise or public_links_only else "/openapi.json",
     )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -869,6 +881,12 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         path = str(request.url.path or "")
         if path.startswith("/v1/signed-links/"):
             token = unquote(path.removeprefix("/v1/signed-links/")).strip()
+            if token:
+                return token
+        if _public_links_only_enabled() and path.startswith("/v1/link-refs/"):
+            ref_id = unquote(path.removeprefix("/v1/link-refs/")).strip().split("/", 1)[0]
+            record = resolve_signed_link_ref(ref_id)
+            token = str((record or {}).get("token") or "").strip()
             if token:
                 return token
         cookie_worker_id = str(worker_id or request.path_params.get("worker_id") or "").strip()
@@ -921,7 +939,9 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
 
     def _allowed_signed_link_kinds(request: Request | WebSocket) -> set[str]:
         path = str(request.url.path or "")
-        if path.startswith("/v1/signed-links/"):
+        if path.startswith("/v1/signed-links/") or (
+            _public_links_only_enabled() and path.startswith("/v1/link-refs/")
+        ):
             return {"artifact_download", "artifact_open"}
         return {"worker_view"}
 
@@ -989,6 +1009,12 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         signed_identity = _signed_link_identity(request, worker_id)
         if signed_identity is not None:
             return signed_identity
+
+        if _public_links_only_enabled():
+            raise HTTPException(
+                status_code=401,
+                detail="This public GlassHive surface requires a signed workspace or artifact link",
+            )
 
         enterprise = _enterprise_mode_enabled()
         trust_inbound_identity = _truthy_env("GLASSHIVE_TRUST_INBOUND_IDENTITY")
@@ -1088,11 +1114,12 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         role_override: str | None = None,
     ) -> dict[str, str]:
         api_token = str(os.environ.get("WPR_API_TOKEN") or "").strip()
+        identity = _request_identity(request, worker_id) if _public_links_only_enabled() else None
         if not api_token:
             if _enterprise_mode_enabled():
                 raise HTTPException(status_code=503, detail="GlassHive enterprise UI is missing service authentication")
             return {}
-        identity = _request_identity(request, worker_id)
+        identity = identity or _request_identity(request, worker_id)
         headers = {"X-WPR-Token": api_token}
         if identity["tenant_id"]:
             headers["X-Viventium-Tenant-Id"] = identity["tenant_id"]
@@ -1283,6 +1310,8 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         return query_worker_id or None
 
     async def _runtime_proxy(prefix: str, path: str, request: Request) -> Response:
+        if _public_links_only_enabled() and prefix == "v1" and str(path).startswith("signed-links/"):
+            raise HTTPException(status_code=404, detail="GlassHive public links use opaque references")
         worker_id = _worker_id_from_runtime_proxy_path(path, request)
         auth_headers = _runtime_headers_for_request(request, worker_id)
         upstream_headers = {

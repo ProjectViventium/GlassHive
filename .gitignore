@@ -29,7 +29,6 @@
 .env
 .env.*
 !.env.example
-!.env.oauth21
 node_modules/
 .venv*/
 __pycache__/
@@ -39,3 +38,7 @@ backups/
 artifacts/
 videos/
 har/
+*.mp4
+*.mov
+*.webm
+*.har
