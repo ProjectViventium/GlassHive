@@ -5,6 +5,7 @@ import importlib.util
 import json
 import logging
 import os
+import sqlite3
 import time
 from hashlib import sha256
 from pathlib import Path
@@ -15,6 +16,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import glass_drive_ui.server as server_module
+import glass_drive_ui.signed_links as signed_links_module
 from glass_drive_ui.server import create_app
 from glass_drive_ui.signed_links import (
     SensitiveUrlLogFilter,
@@ -22,6 +24,7 @@ from glass_drive_ui.signed_links import (
     install_sensitive_url_log_filter,
     redact_sensitive_url_text,
     resolve_signed_link_ref,
+    revoke_signed_link_refs_for_worker,
 )
 
 
@@ -48,6 +51,7 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "GLASSHIVE_ALLOW_LOCAL_DEMO_OWNER",
         "GLASSHIVE_COOKIE_SECURE",
         "GLASSHIVE_SIGNED_LINK_SECRET",
+        "GLASSHIVE_SIGNED_LINK_TTL_S",
         "GLASSHIVE_LINK_REF_STATE_PATH",
         "GLASSHIVE_LINK_REF_TTL_SECONDS",
         "GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME",
@@ -1797,6 +1801,116 @@ def test_public_links_only_artifact_ref_is_bearer_but_raw_token_route_is_closed(
     assert response.status_code == 200
     assert captured["url"] == f"http://runtime.test/v1/link-refs/{ref_id}"
     assert client.get(f"/v1/signed-links/{token}").status_code == 404
+
+
+def test_public_links_only_nonexpiring_artifact_ref_outlives_embedded_token(monkeypatch):
+    secret = "public-link-secret"
+    now = {"value": 1_000}
+    monkeypatch.setattr(signed_links_module.time, "time", lambda: now["value"])
+    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_TTL_S", "60")
+    token = server_module.sign_link_token(
+        kind="artifact_open",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="workspace/report.txt",
+    )
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/v1/signed-links/{token}",
+    )
+    assert signed_links_module.verify_signed_link_token(token) is not None
+
+    class FakeUpstreamResponse:
+        status_code = 200
+        content = b"<html><body>artifact preview</body></html>"
+        headers = {"content-type": "text/html; charset=utf-8"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            return FakeUpstreamResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    now["value"] = 1_061
+    assert signed_links_module.verify_signed_link_token(token) is None
+
+    response = client.get(f"/v1/link-refs/{ref_id}")
+
+    assert response.status_code == 200
+    bypass = client.get(f"/v1/link-refs/ghr_unknown_123456?gh_token={token}")
+    assert bypass.status_code == 401
+
+
+def test_public_links_only_artifact_ref_still_enforces_ref_ttl_and_revocation(monkeypatch):
+    secret = "public-link-secret"
+    now = {"value": 1_000}
+    monkeypatch.setattr(signed_links_module.time, "time", lambda: now["value"])
+    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_TTL_SECONDS", "60")
+    token = signed_artifact_token(secret, kind="artifact_open")
+    expiring_ref = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/v1/signed-links/{token}",
+    )
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    now["value"] = 1_061
+
+    assert client.get(f"/v1/link-refs/{expiring_ref}").status_code == 401
+
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_TTL_SECONDS", "0")
+    now["value"] = 2_000
+    token = signed_artifact_token(secret, kind="artifact_open")
+    revoked_ref = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/v1/signed-links/{token}",
+    )
+    assert revoke_signed_link_refs_for_worker("wrk_1") == 1
+    assert client.get(f"/v1/link-refs/{revoked_ref}").status_code == 401
+
+
+def test_public_links_only_artifact_ref_ignores_unsigned_cache_and_rejects_hmac_tampering(monkeypatch):
+    secret = "public-link-secret"
+    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
+    token = signed_artifact_token(secret, kind="artifact_open")
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/v1/signed-links/{token}",
+    )
+    state_path = os.environ["GLASSHIVE_LINK_REF_STATE_PATH"]
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    with sqlite3.connect(state_path) as conn:
+        conn.execute(
+            "UPDATE signed_link_refs SET payload_json = ? WHERE ref_id = ?",
+            (json.dumps({"kind": "artifact_open", "worker_id": "wrk_other"}), ref_id),
+        )
+
+    resolved = resolve_signed_link_ref(ref_id)
+    assert resolved is not None
+    assert resolved["payload"]["worker_id"] == "wrk_1"
+
+    with sqlite3.connect(state_path) as conn:
+        conn.execute(
+            "UPDATE signed_link_refs SET token = ? WHERE ref_id = ?",
+            (f"{token}tampered", ref_id),
+        )
+
+    assert client.get(f"/v1/link-refs/{ref_id}").status_code == 401
 
 
 def test_enterprise_ui_requires_signed_link_secret_at_startup(monkeypatch):

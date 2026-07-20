@@ -399,27 +399,14 @@ def resolve_signed_link_ref(ref_id: str) -> dict[str, object] | None:
     verified_payload = _decode_signed_link_token(token, allow_expired=True)
     if not verified_payload:
         return None
-    payload = None
-    payload_json = str(row["payload_json"] or "")
-    if payload_json:
-        try:
-            parsed = json.loads(payload_json)
-        except (ValueError, json.JSONDecodeError):
-            parsed = None
-        if isinstance(parsed, dict):
-            payload = parsed
-    if not payload:
-        payload = verified_payload
-    if not payload:
-        return None
     return {
         "ref_id": clean_ref,
-        "kind": str(row["kind"] or payload.get("kind") or ""),
+        "kind": str(verified_payload.get("kind") or ""),
         "token": token,
         "target_url": str(row["target_url"] or ""),
         "expires_at": int(row["expires_at"]),
         "created_at": int(row["created_at"]),
-        "payload": payload,
+        "payload": verified_payload,
     }
 
 

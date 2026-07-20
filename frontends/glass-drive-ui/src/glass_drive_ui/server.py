@@ -35,6 +35,7 @@ from .signed_links import (
     resolve_signed_link_ref,
     signed_link_ref_url,
     sign_link_token,
+    verify_signed_link_ref_token,
     verify_signed_link_token,
 )
 
@@ -875,18 +876,16 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         return f"glasshive_gh_token_{digest}"
 
     def _signed_token_from_request(request: Request | WebSocket, worker_id: str | None = None) -> str:
-        token = str(request.query_params.get("gh_token") or "").strip()
-        if token:
-            return token
         path = str(request.url.path or "")
-        if path.startswith("/v1/signed-links/"):
-            token = unquote(path.removeprefix("/v1/signed-links/")).strip()
-            if token:
-                return token
         if _public_links_only_enabled() and path.startswith("/v1/link-refs/"):
             ref_id = unquote(path.removeprefix("/v1/link-refs/")).strip().split("/", 1)[0]
             record = resolve_signed_link_ref(ref_id)
-            token = str((record or {}).get("token") or "").strip()
+            return str((record or {}).get("token") or "").strip()
+        token = str(request.query_params.get("gh_token") or "").strip()
+        if token:
+            return token
+        if path.startswith("/v1/signed-links/"):
+            token = unquote(path.removeprefix("/v1/signed-links/")).strip()
             if token:
                 return token
         cookie_worker_id = str(worker_id or request.path_params.get("worker_id") or "").strip()
@@ -949,7 +948,16 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         token = _signed_token_from_request(request, worker_id)
         if not token:
             return None
-        payload = verify_signed_link_token(token)
+        path = str(request.url.path or "")
+        link_ref_request = (
+            _public_links_only_enabled()
+            and path.startswith("/v1/link-refs/")
+        )
+        payload = (
+            verify_signed_link_ref_token(token)
+            if link_ref_request
+            else verify_signed_link_token(token)
+        )
         if not payload:
             raise HTTPException(status_code=401, detail="Invalid or expired GlassHive workspace link")
         if str(payload.get("kind") or "") not in _allowed_signed_link_kinds(request):
