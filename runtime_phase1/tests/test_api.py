@@ -2125,6 +2125,22 @@ def test_runtime_sensitive_url_log_filter_redacts_signed_tokens():
     assert "GET /w/[redacted]" in record.args[0]
     assert "glasshive_gh_token_0123456789abcdef01234567=[redacted]" in record.args[0]
 
+    class UrlLike:
+        def __str__(self) -> str:
+            return "http://runtime.test/v1/link-refs/ghr_1234567890123456"
+
+    structured_record = logging.LogRecord(
+        name="httpx",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=0,
+        msg="HTTP Request: GET %s",
+        args=(UrlLike(),),
+        exc_info=None,
+    )
+    assert SensitiveUrlLogFilter().filter(structured_record) is True
+    assert structured_record.getMessage() == "HTTP Request: GET http://runtime.test/v1/link-refs/[redacted]"
+
 
 def test_runtime_sensitive_url_log_filter_installs_for_child_loggers(caplog):
     install_sensitive_url_log_filter()

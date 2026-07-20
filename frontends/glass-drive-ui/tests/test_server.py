@@ -1600,6 +1600,31 @@ def test_ui_sensitive_url_log_filter_redacts_signed_tokens():
     assert "gh_token=[redacted]" in record.args[0]
     assert f"{worker_cookie_name('wrk_1')}=[redacted]" in record.args[0]
 
+    class UrlLike:
+        def __str__(self) -> str:
+            return "http://runtime.test/v1/link-refs/ghr_1234567890123456"
+
+    structured_record = logging.LogRecord(
+        name="httpx",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=0,
+        msg="HTTP Request: GET %s",
+        args=(UrlLike(),),
+        exc_info=None,
+    )
+    assert SensitiveUrlLogFilter().filter(structured_record) is True
+    assert structured_record.getMessage() == "HTTP Request: GET http://runtime.test/v1/link-refs/[redacted]"
+
+
+def test_ui_static_pages_do_not_load_third_party_fonts():
+    static_root = Path(__file__).parents[1] / "src" / "glass_drive_ui" / "static"
+
+    for filename in ("index.html", "watch.html", "styles.css", "desktop.html"):
+        content = (static_root / filename).read_text(encoding="utf-8")
+        assert "fonts.googleapis.com" not in content
+        assert "fonts.gstatic.com" not in content
+
 
 def test_ui_sensitive_url_log_filter_installs_for_child_loggers(caplog):
     install_sensitive_url_log_filter()

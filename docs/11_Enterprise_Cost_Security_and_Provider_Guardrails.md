@@ -186,6 +186,11 @@ redirect to a tokenless watch/project/desktop URL, so the browser address bar an
 polling do not retain `gh_token`. Do not store valid signed links in reports, logs, or public
 artifacts.
 
+The shipped GlassHive browser surfaces use local assets and system font stacks; authenticated or
+opaque-reference pages must not fetch third-party font resources. Log redaction applies to both
+plain strings and structured URL objects supplied by HTTP clients, so an opaque ref cannot bypass
+the filter merely because a logging library preserved it as a URL instance.
+
 Artifact delivery should expose the scoped download short ref as the default chat-facing file link,
 labeled `Download file`, while preserving a preview/open short ref or View / Steer workspace link
 for inspection and all-deliveries access. A direct download default is a UX choice, not a weaker
