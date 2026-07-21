@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -14,6 +15,7 @@ from typing import Any, Optional
 import httpx
 
 from .models import utc_now
+from .openclaw_release import reviewed_openclaw_env, verify_reviewed_openclaw_binary
 from .store import Store
 
 DEFAULT_TOOL_TIMEOUT = int(os.environ.get("WPR_OPENCLAW_TOOL_TIMEOUT", "300"))
@@ -169,7 +171,7 @@ class OpenClawRuntimeManager:
         return f"{self._gateway_base_url(worker)}/v1/responses"
 
     def _openclaw_env(self, state_dir: Path, config_path: Path, token: str) -> dict[str, str]:
-        env = {**os.environ}
+        env = reviewed_openclaw_env(os.environ)
         env["OPENCLAW_STATE_DIR"] = str(state_dir)
         env["OPENCLAW_CONFIG_PATH"] = str(config_path)
         env["OPENCLAW_GATEWAY_TOKEN"] = token
@@ -274,6 +276,7 @@ class OpenClawRuntimeManager:
         lock = self._worker_lock(worker["worker_id"])
         async with lock:
             worker = self.store.update_worker(worker["worker_id"], state="starting", last_error=None) or worker
+            verify_reviewed_openclaw_binary(OPENCLAW_BIN)
             self._ensure_sandbox_image()
             worker_root = self._worker_root(worker["worker_id"])
             port = worker.get("gateway_port") or self._find_free_port()
@@ -284,7 +287,7 @@ class OpenClawRuntimeManager:
             log_stdout = open(self.log_root / f"{worker['worker_id']}.stdout.log", "a")
             log_stderr = open(self.log_root / f"{worker['worker_id']}.stderr.log", "a")
             env = self._openclaw_env(worker_root, config_path, token)
-            cmd = [*OPENCLAW_BIN.split(), "gateway", "--port", str(port), "--bind", "loopback", "--token", token, "--allow-unconfigured", "--force"]
+            cmd = [*shlex.split(OPENCLAW_BIN), "gateway", "--port", str(port), "--bind", "loopback", "--token", token, "--allow-unconfigured", "--force"]
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=log_stdout,

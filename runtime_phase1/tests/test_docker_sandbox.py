@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -841,7 +842,7 @@ def test_ensure_image_defaults_to_no_forced_ai_worker_browser_extensions(tmp_pat
     manager._ensure_image()
 
     dockerfile = (manager.build_root / "Dockerfile").read_text()
-    assert manager.image.endswith(":phase1-node22-docs7")
+    assert manager.image.endswith(":phase1-node22-docs8-openclaw2026.7.1-2")
     assert "@openai/codex@0.142.0" in dockerfile
     assert "@anthropic-ai/claude-code@2.1.186" in dockerfile
     assert "--cache /tmp/glasshive-npm-cache" in dockerfile
@@ -854,6 +855,58 @@ def test_ensure_image_defaults_to_no_forced_ai_worker_browser_extensions(tmp_pat
     assert "hehggadaopoacecdllhhajmbjkdcmajg;https://clients2.google.com/service/update2/crx" not in dockerfile
     assert "glasshive-browser-extension-check" in dockerfile
     assert "glasshive-browser-native-host-bootstrap" in dockerfile
+
+
+def test_ensure_image_consumes_reviewed_openclaw_lock_and_disables_bonjour(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+
+    def fake_docker(args: list[str], *, check: bool = True, capture_output: bool = False, timeout_sec=None):
+        if args[:2] == ["image", "inspect"]:
+            return subprocess.CompletedProcess(["docker", *args], returncode=1, stdout="", stderr="")
+        return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="", stderr="")
+
+    manager._docker = fake_docker  # type: ignore[method-assign]
+
+    manager._ensure_image()
+
+    dockerfile = (manager.build_root / "Dockerfile").read_text()
+    staged_lock = manager.build_root / "openclaw-runtime-lock" / "package-lock.json"
+    assert staged_lock.is_file()
+    assert hashlib.sha256(staged_lock.read_bytes()).hexdigest() == (
+        "e025a05ef3d268747dc293ef54876471d067f22644a8fa26a9139b7d1fe4fbc3"
+    )
+    assert "COPY openclaw-runtime-lock/ /opt/glasshive-openclaw-runtime/" in dockerfile
+    assert "npm ci --omit=dev" in dockerfile
+    assert "node_modules/openclaw/package.json" in dockerfile
+    assert "node_modules/fast-uri/package.json" in dockerfile
+    assert "2026.7.1-2" in dockerfile
+    assert "3.1.3" in dockerfile
+    assert "grep -Fq 'OpenClaw 2026.7.1-2 ('" in dockerfile
+    assert "/usr/local/bin/openclaw" in dockerfile
+    assert "ENV OPENCLAW_DISABLE_BONJOUR=1" in dockerfile
+    assert "openclaw@latest" not in dockerfile
+
+
+def test_ensure_image_fails_closed_when_reviewed_openclaw_lock_drifts(tmp_path, monkeypatch):
+    invalid_lock_root = tmp_path / "invalid-openclaw-lock"
+    invalid_lock_root.mkdir()
+    (invalid_lock_root / "package.json").write_text("{}\n")
+    (invalid_lock_root / "package-lock.json").write_text("{}\n")
+    monkeypatch.setattr(
+        "workers_projects_runtime.openclaw_release.OPENCLAW_RUNTIME_LOCK_DIR",
+        invalid_lock_root,
+    )
+    manager = DockerSandboxManager(base_dir=str(tmp_path / "data"))
+
+    def fake_docker(args: list[str], *, check: bool = True, capture_output: bool = False, timeout_sec=None):
+        if args[:2] == ["image", "inspect"]:
+            return subprocess.CompletedProcess(["docker", *args], returncode=1, stdout="", stderr="")
+        pytest.fail("Docker build must not start with an unreviewed OpenClaw lock")
+
+    manager._docker = fake_docker  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="OpenClaw runtime lock"):
+        manager._ensure_image()
 
 
 def test_ensure_image_can_opt_in_to_ai_worker_browser_extension_policy(monkeypatch, tmp_path):
