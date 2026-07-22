@@ -3371,6 +3371,40 @@ def test_claude_code_runtime_passes_headless_oauth_without_api_key_mode(tmp_path
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "claude-oauth-test"
 
 
+def test_claude_code_runtime_uses_bedrock_provider_model_without_oauth(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_claude_bedrock",
+        "name": "Claude Bedrock Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-4-8",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    provider_model = (
+        "arn:aws:bedrock:us-east-1:123456789012:"
+        "application-inference-profile/opus-48-test"
+    )
+    monkeypatch.setenv("WPR_CLAUDE_CODE_PROVIDER_MODEL", provider_model)
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEONLY0000")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "synthetic-secret-not-real")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-pass")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-pass")
+
+    command, env = runtime._build_command(
+        worker, "Create the artifact.", runtime._runtime_info(worker)
+    )
+
+    assert command[command.index("--model") + 1] == provider_model
+    assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+    assert env["AWS_ACCESS_KEY_ID"] == "AKIAEXAMPLEONLY0000"
+    assert env["AWS_SECRET_ACCESS_KEY"] == "synthetic-secret-not-real"
+    assert env["AWS_REGION"] == "us-east-1"
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+
+
 def test_host_env_strips_parent_secrets_and_keeps_minimal_runtime_context(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "callback-secret")
@@ -4232,12 +4266,16 @@ def test_openclaw_projects_ignore_unknown_compat_max_token_field(tmp_path, monke
 def test_redact_text_masks_parent_visible_secret_shapes():
     synthetic_openai_token = "sk-" + "abc123456789xyz"
     synthetic_bearer = "abcdef" + "ghijklmnopqrstuvwxyz"
+    synthetic_aws_access_key = "AKIA" + "EXAMPLEONLY00000"
     redacted = _redact_text(
-        f"Authorization: {'Bearer'} {synthetic_bearer} token=super-secret-value {synthetic_openai_token}"
+        f"Authorization: {'Bearer'} {synthetic_bearer} token=super-secret-value "
+        f"{synthetic_openai_token} {synthetic_aws_access_key}"
     )
     assert "abcdefghijklmnopqrstuvwxyz" not in redacted
     assert "super-secret-value" not in redacted
     assert synthetic_openai_token not in redacted
+    assert synthetic_aws_access_key not in redacted
+    assert "[REDACTED_AWS_ACCESS_KEY]" in redacted
     assert "[REDACTED]" in redacted
 
 

@@ -38,6 +38,24 @@ def test_safe_docker_exec_env_preserves_claude_headless_oauth_only():
     assert "UNRELATED_SECRET" not in env
 
 
+def test_safe_docker_exec_env_preserves_bedrock_run_credentials_only():
+    env = _safe_docker_exec_env(
+        {
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "AWS_ACCESS_KEY_ID": "AKIAEXAMPLEONLY0000",
+            "AWS_SECRET_ACCESS_KEY": "synthetic-secret-not-real",
+            "AWS_REGION": "us-east-1",
+            "UNRELATED_SECRET": "must-not-pass",
+        }
+    )
+
+    assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+    assert env["AWS_ACCESS_KEY_ID"] == "AKIAEXAMPLEONLY0000"
+    assert env["AWS_SECRET_ACCESS_KEY"] == "synthetic-secret-not-real"
+    assert env["AWS_REGION"] == "us-east-1"
+    assert "UNRELATED_SECRET" not in env
+
+
 def test_seed_bootstrap_writes_default_worker_contract_without_bundle(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     home_dir = tmp_path / "home"

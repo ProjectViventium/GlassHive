@@ -48,6 +48,21 @@ Current behavior:
   launches must not drop browser, computer/desktop, shell, file, or MCP capabilities just because
   GlassHive projected a broker MCP
 
+## Claude Code on Amazon Bedrock
+
+Claude workers can use Amazon Bedrock without changing the logical model recorded in GlassHive
+evidence. Set `WPR_MODEL_CLAUDE_CODE` to the audited Claude model name and
+`WPR_CLAUDE_CODE_PROVIDER_MODEL` to the Bedrock application inference profile ARN used by the CLI.
+Provide the standard Claude Code Bedrock environment (`CLAUDE_CODE_USE_BEDROCK=1`, an AWS region,
+and one supported AWS credential method). GlassHive projects those values only into the active run
+and removes Anthropic API/OAuth credentials whenever Bedrock mode is enabled, preventing an
+unintended provider fallback.
+
+The provider-specific model value is intentionally separate from the logical model: callers can
+continue to attest `claude-opus-4-8`, while Claude Code invokes the metered application inference
+profile selected by the administrator. Do not place AWS credentials in bootstrap instructions,
+worker metadata, source control, or logs.
+
 ## Run
 
 ```bash

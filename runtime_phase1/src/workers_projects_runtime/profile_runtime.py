@@ -2633,6 +2633,28 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
     def resolve_model(self, profile: str) -> str:
         return os.environ.get("WPR_MODEL_CLAUDE_CODE", "claude-sonnet-4-6")
 
+    def _provider_model_for_worker(self, worker: dict) -> str:
+        logical_model = worker.get("model") or self.resolve_model(
+            worker.get("profile", "claude-code")
+        )
+        return os.environ.get("WPR_CLAUDE_CODE_PROVIDER_MODEL", "").strip() or str(
+            logical_model
+        )
+
+    @staticmethod
+    def _bedrock_enabled() -> bool:
+        return os.environ.get("CLAUDE_CODE_USE_BEDROCK", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _remove_conflicting_anthropic_credentials(self, env: dict[str, str]) -> None:
+        if self._bedrock_enabled():
+            env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            env.pop("ANTHROPIC_API_KEY", None)
+
     def _default_session_key(self, worker: dict) -> str | None:
         existing = self._read_session_key(worker["worker_id"])
         if existing:
@@ -2709,7 +2731,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_key = self._read_session_key(worker["worker_id"])
-        model = worker.get("model") or self.resolve_model(worker.get("profile", "claude-code"))
+        model = self._provider_model_for_worker(worker)
         permission_mode = os.environ.get("WPR_CLAUDE_CODE_PERMISSION_MODE", "bypassPermissions")
         command = [
             self.binary,
@@ -2736,12 +2758,23 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         env = self._container_env(
             "ANTHROPIC_API_KEY",
             "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "ANTHROPIC_MODEL",
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_CUSTOM_HEADERS",
             "ANTHROPIC_DEFAULT_SONNET_MODEL",
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+            "ANTHROPIC_BEDROCK_BASE_URL",
+            "ANTHROPIC_BEDROCK_SERVICE_TIER",
             "HTTPS_PROXY",
             "HTTP_PROXY",
             "NO_PROXY",
@@ -2751,6 +2784,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         use_api_key = os.environ.get("WPR_CLAUDE_CODE_USE_API_KEY", "0").strip().lower() in {"1", "true", "yes", "on"}
         if not use_api_key:
             env.pop("ANTHROPIC_API_KEY", None)
+        self._remove_conflicting_anthropic_credentials(env)
         return command, env
 
     def _parse_output(self, worker: dict, stdout: str, stderr: str, info: RuntimeInfo) -> tuple[str | None, str]:
@@ -2769,6 +2803,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
 _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"/Users/[^/\s\"'`]+(?:/[^\s\"'`]+)+"), "[REDACTED_LOCAL_PATH]"),
     (re.compile(r"~/[^\s\"'`]+(?:/[^\s\"'`]+)+"), "[REDACTED_LOCAL_PATH]"),
+    (re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), "[REDACTED_AWS_ACCESS_KEY]"),
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)((?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s\"']{6,}"), r"\1[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
@@ -4690,7 +4725,7 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_key = self._read_session_key(worker["worker_id"])
-        model = worker.get("model") or self.resolve_model(worker.get("profile", "claude-code"))
+        model = self._provider_model_for_worker(worker)
         permission_mode = os.environ.get("WPR_CLAUDE_CODE_PERMISSION_MODE", "bypassPermissions")
         command = [
             self.binary,
@@ -4725,6 +4760,7 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
         use_api_key = os.environ.get("WPR_CLAUDE_CODE_USE_API_KEY", "0").strip().lower() in {"1", "true", "yes", "on"}
         if not use_api_key:
             env.pop("ANTHROPIC_API_KEY", None)
+        self._remove_conflicting_anthropic_credentials(env)
         return command, env
 
 
