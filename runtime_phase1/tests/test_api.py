@@ -1420,7 +1420,19 @@ def test_link_refs_are_redacted_deduplicated_and_secret_rotation_bound(monkeypat
     db_path = os.environ["GLASSHIVE_LINK_REF_STATE_PATH"]
     with sqlite3.connect(db_path) as conn:
         count = conn.execute("SELECT COUNT(*) FROM signed_link_refs").fetchone()[0]
+        conn.execute(
+            "UPDATE signed_link_refs SET kind = ?, payload_json = ? WHERE ref_id = ?",
+            (
+                "worker_view",
+                json.dumps({"kind": "worker_view", "worker_id": "wrk_tampered"}),
+                ref_id,
+            ),
+        )
     assert count == 1
+    resolved = resolve_signed_link_ref(ref_id)
+    assert resolved is not None
+    assert resolved["kind"] == "artifact_download"
+    assert resolved["payload"]["worker_id"] == "wrk_dedupe"
 
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "rotated-secret")
     assert resolve_signed_link_ref(ref_id) is None
@@ -2112,6 +2124,22 @@ def test_runtime_sensitive_url_log_filter_redacts_signed_tokens():
     assert "gh_token=[redacted]" in record.args[0]
     assert "GET /w/[redacted]" in record.args[0]
     assert "glasshive_gh_token_0123456789abcdef01234567=[redacted]" in record.args[0]
+
+    class UrlLike:
+        def __str__(self) -> str:
+            return "http://runtime.test/v1/link-refs/ghr_1234567890123456"
+
+    structured_record = logging.LogRecord(
+        name="httpx",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=0,
+        msg="HTTP Request: GET %s",
+        args=(UrlLike(),),
+        exc_info=None,
+    )
+    assert SensitiveUrlLogFilter().filter(structured_record) is True
+    assert structured_record.getMessage() == "HTTP Request: GET http://runtime.test/v1/link-refs/[redacted]"
 
 
 def test_runtime_sensitive_url_log_filter_installs_for_child_loggers(caplog):

@@ -51,6 +51,31 @@ Env:
   `gh_token`, bearer tokens, service-token headers, and artifact signed-link paths before logs leave
   the VM.
 
+## Public-link-only mode
+
+Set `GLASSHIVE_PUBLIC_LINKS_ONLY=true` when this UI endpoint should expose only health/static
+assets and signed workspace or artifact links, rather than the normal operator surface. This mode:
+
+- fails at startup unless `GLASSHIVE_SIGNED_LINK_SECRET` is set
+- disables `/docs`, `/redoc`, and `/openapi.json`
+- rejects normal operator UI/API/runtime-proxy requests that do not carry a valid signed link
+- accepts opaque `/r/{ref}` workspace references, then redirects to a tokenless watch URL and
+  stores a bounded, HTTP-only worker-session cookie
+- accepts opaque `/v1/link-refs/{ref}` artifact references and rejects direct
+  `/v1/signed-links/{token}` proxy access
+
+The link-ref database contains the signed token behind each opaque reference. Keep
+`GLASSHIVE_LINK_REF_STATE_PATH` private and, when the runtime creates the references, point both
+processes at the same state file or supported shared storage. Treat an opaque reference as a bearer
+link in this mode: anyone who receives it can exercise only the worker/artifact scope encoded in
+its valid signed token. Configure `GLASSHIVE_LINK_REF_TTL_SECONDS` and
+`GLASSHIVE_MAX_WATCH_SESSION_DURATION_S` when links and already-open watch sessions must expire.
+
+Public-link-only mode is a narrow link-serving boundary, not a substitute for enterprise identity
+and tenant isolation. Use enterprise mode and its trusted authenticated proxy contract when access
+must also be bound to a specific tenant/user. Terminate public deployments behind HTTPS so Secure
+session cookies can be used.
+
 ## Test
 
 ```bash

@@ -177,22 +177,24 @@ def redact_sensitive_url_text(value: object) -> str:
     return _WORKER_COOKIE_TOKEN_RE.sub(lambda match: f"{match.group(1)}[redacted]", text)
 
 
+def _redact_log_value(value: object) -> object:
+    """Redact sensitive URL material without coercing harmless structured args."""
+    rendered = str(value or "")
+    redacted = redact_sensitive_url_text(rendered)
+    return redacted if redacted != rendered else value
+
+
 class SensitiveUrlLogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str):
-            record.msg = redact_sensitive_url_text(record.msg)
+        record.msg = _redact_log_value(record.msg)
         if isinstance(record.args, tuple):
-            record.args = tuple(redact_sensitive_url_text(item) if isinstance(item, str) else item for item in record.args)
+            record.args = tuple(_redact_log_value(item) for item in record.args)
         elif isinstance(record.args, dict):
-            record.args = {
-                key: redact_sensitive_url_text(value) if isinstance(value, str) else value
-                for key, value in record.args.items()
-            }
+            record.args = {key: _redact_log_value(value) for key, value in record.args.items()}
         for key, value in list(record.__dict__.items()):
             if key in _STANDARD_LOG_RECORD_FIELDS:
                 continue
-            if isinstance(value, str):
-                record.__dict__[key] = redact_sensitive_url_text(value)
+            record.__dict__[key] = _redact_log_value(value)
         return True
 
 
@@ -399,27 +401,14 @@ def resolve_signed_link_ref(ref_id: str) -> dict[str, object] | None:
     verified_payload = _decode_signed_link_token(token, allow_expired=True)
     if not verified_payload:
         return None
-    payload = None
-    payload_json = str(row["payload_json"] or "")
-    if payload_json:
-        try:
-            parsed = json.loads(payload_json)
-        except (ValueError, json.JSONDecodeError):
-            parsed = None
-        if isinstance(parsed, dict):
-            payload = parsed
-    if not payload:
-        payload = verified_payload
-    if not payload:
-        return None
     return {
         "ref_id": clean_ref,
-        "kind": str(row["kind"] or payload.get("kind") or ""),
+        "kind": str(verified_payload.get("kind") or ""),
         "token": token,
         "target_url": str(row["target_url"] or ""),
         "expires_at": int(row["expires_at"]),
         "created_at": int(row["created_at"]),
-        "payload": payload,
+        "payload": verified_payload,
     }
 
 
