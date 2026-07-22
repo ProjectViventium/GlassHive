@@ -2242,6 +2242,7 @@ class WorkersProjectsService:
                 "running",
                 "failed",
                 error_text=error_text,
+                usage=usage,
                 **failure_fields,
             )
             if not finalized_run:

@@ -6067,7 +6067,7 @@ class HealRecoveryRuntime:
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         return self._info(worker)
 
-    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, str] | None:
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
         self.collect_run_ids.append(run_id)
         return {
             "state": "completed",
@@ -6341,6 +6341,12 @@ class RuntimeErrorWithPartialArtifactsRuntime(StubRuntime):
                 "from the current files and notes."
             ),
             "failure_diagnostic_summary": "response.failed event received",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 20,
+                "cache_creation_input_tokens": 3,
+            },
         }
 
 
@@ -6477,6 +6483,7 @@ def test_runtime_error_recovers_codex_failure_metadata_and_artifacts(tmp_path, m
     assert failed["state"] == "failed"
     assert failed["failure_class"] == "provider_response_failed"
     assert failed["failure_retryable"] == 1
+    assert failed["total_tokens"] == 38
     assert runtime.collect_run_ids == [run["run_id"]]
     refreshed_worker = client.get(f"/v1/workers/{worker['worker_id']}").json()
     assert refreshed_worker["runtime"] == "codex-cli"
