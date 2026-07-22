@@ -2081,6 +2081,16 @@ class WorkersProjectsService:
                 raise
             return self.runtime.collect_completed_run(worker)
 
+    def _run_usage(self, worker: dict, run_id: str) -> dict[str, int]:
+        reader = getattr(self.runtime, "run_usage", None)
+        if not callable(reader):
+            return {}
+        try:
+            value = reader(worker, run_id)
+        except (OSError, TypeError, ValueError):
+            return {}
+        return dict(value) if isinstance(value, dict) else {}
+
     def _fresh_user_artifact_deliverable(self, worker: dict, run: dict, deliverable: dict[str, object] | None) -> bool:
         if not deliverable:
             return False
@@ -2162,12 +2172,14 @@ class WorkersProjectsService:
             )
             if key in recovered
         }
+        usage = recovered.get("usage") if isinstance(recovered.get("usage"), dict) else {}
         if state == "completed":
             finalized_run = self.store.finalize_run_if_state(
                 run["run_id"],
                 "running",
                 "completed",
                 output_text=output_text,
+                usage=usage,
             )
             if not finalized_run:
                 return self.store.get_worker(worker_id)
@@ -2199,6 +2211,7 @@ class WorkersProjectsService:
                     "running",
                     "completed",
                     output_text=completed_output,
+                    usage=usage,
                 )
                 if not finalized_run:
                     return self.store.get_worker(worker_id)
@@ -2229,6 +2242,7 @@ class WorkersProjectsService:
                 "running",
                 "failed",
                 error_text=error_text,
+                usage=usage,
                 **failure_fields,
             )
             if not finalized_run:
@@ -2519,6 +2533,7 @@ class WorkersProjectsService:
                         run["run_id"],
                         state=final_state,
                         error_text=str(exc),
+                        usage=self._run_usage(refreshed_worker, run["run_id"]),
                         **failure_fields,
                     )
                     self.store.finalize_schedule_for_run(
@@ -2553,7 +2568,13 @@ class WorkersProjectsService:
                         exc,
                         runtime_name=str(worker.get("profile") or worker.get("runtime") or "worker"),
                     ).as_store_fields()
-                    self.store.finalize_run(run["run_id"], state="failed", error_text=str(exc), **failure_fields)
+                    self.store.finalize_run(
+                        run["run_id"],
+                        state="failed",
+                        error_text=str(exc),
+                        usage=self._run_usage(worker, run["run_id"]),
+                        **failure_fields,
+                    )
                     self.store.finalize_schedule_for_run(run["run_id"], state="failed", last_error=str(exc))
                     self.store.update_worker_state(worker_id, "ready", last_error=str(exc))
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.failed", str(exc))
@@ -2564,13 +2585,18 @@ class WorkersProjectsService:
 
                 if not self._processor_is_current(worker_id, generation):
                     return
-                self.store.finalize_run(run["run_id"], state="completed", output_text=output)
+                finalized_run = self.store.finalize_run(
+                    run["run_id"],
+                    state="completed",
+                    output_text=output,
+                    usage=self._run_usage(worker, run["run_id"]),
+                )
                 self.store.finalize_schedule_for_run(run["run_id"], state="completed")
                 self.store.update_worker(worker_id, state="ready", last_error="", last_run_id=run["run_id"])
                 message = terminal_callback_message(output)
                 full_message = terminal_callback_full_message(output)
                 self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.completed", message[:TERMINAL_CALLBACK_MESSAGE_LIMIT] or "Run completed")
-                completed_run = {**run, "state": "completed", "output_text": output}
+                completed_run = {**run, **(finalized_run or {}), "state": "completed", "output_text": output}
                 refreshed_worker = self._refresh_runtime_info(worker_id, state="ready", last_error="") or self.store.get_worker(worker_id) or worker
                 deliverable = self._completion_deliverable(refreshed_worker, completed_run, output)
                 self._promote_completed_deliverable(refreshed_worker, completed_run, deliverable)

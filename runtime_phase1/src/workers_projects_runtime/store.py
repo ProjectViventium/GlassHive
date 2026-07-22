@@ -18,6 +18,13 @@ _FAILURE_FIELD_NAMES = {
     "failure_diagnostic_summary",
 }
 
+_TOKEN_USAGE_FIELD_NAMES = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
 
 def _normalized_failure_fields(fields: dict[str, Any]) -> dict[str, Any]:
     normalized: dict[str, Any] = {}
@@ -29,6 +36,20 @@ def _normalized_failure_fields(fields: dict[str, Any]) -> dict[str, Any]:
             normalized[key] = 1 if bool(value) else 0
         else:
             normalized[key] = str(value or "")
+    return normalized
+
+
+def _normalized_token_usage(usage: dict[str, Any] | None) -> dict[str, int]:
+    normalized: dict[str, int] = {}
+    for key in _TOKEN_USAGE_FIELD_NAMES:
+        value = (usage or {}).get(key, 0)
+        if isinstance(value, bool):
+            value = 0
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            parsed = 0
+        normalized[key] = max(0, parsed)
     return normalized
 
 
@@ -117,6 +138,10 @@ class Store:
                     retry_after TEXT,
                     retry_attempts INTEGER NOT NULL DEFAULT 0,
                     last_retry_class TEXT NOT NULL DEFAULT '',
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY(worker_id) REFERENCES workers(worker_id),
                     FOREIGN KEY(project_id) REFERENCES projects(project_id)
                 );
@@ -228,6 +253,9 @@ class Store:
                 conn.execute("ALTER TABLE runs ADD COLUMN retry_attempts INTEGER NOT NULL DEFAULT 0")
             if "last_retry_class" not in run_columns:
                 conn.execute("ALTER TABLE runs ADD COLUMN last_retry_class TEXT NOT NULL DEFAULT ''")
+            for token_field in _TOKEN_USAGE_FIELD_NAMES:
+                if token_field not in run_columns:
+                    conn.execute(f"ALTER TABLE runs ADD COLUMN {token_field} INTEGER NOT NULL DEFAULT 0")
             event_columns = {row["name"] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
             if "tenant_id" not in event_columns:
                 conn.execute("ALTER TABLE events ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
@@ -860,6 +888,7 @@ class Store:
         state: str,
         output_text: str = "",
         error_text: str = "",
+        usage: dict[str, Any] | None = None,
         **failure_fields: Any,
     ) -> dict[str, Any] | None:
         fields = {
@@ -869,6 +898,7 @@ class Store:
             "error_text": error_text,
             "retry_after": None,
         }
+        fields.update(_normalized_token_usage(usage))
         fields.update(_normalized_failure_fields(failure_fields))
         return self.update_run(run_id, **fields)
 
@@ -879,6 +909,7 @@ class Store:
         state: str,
         output_text: str = "",
         error_text: str = "",
+        usage: dict[str, Any] | None = None,
         **failure_fields: Any,
     ) -> dict[str, Any] | None:
         normalized_failure_fields = _normalized_failure_fields(failure_fields)
@@ -891,12 +922,16 @@ class Store:
             "run_id": run_id,
             "expected_state": expected_state,
         }
+        normalized_usage = _normalized_token_usage(usage)
+        update_fields.update(normalized_usage)
         failure_assignments = "".join(f", {key} = :{key}" for key in normalized_failure_fields.keys())
+        usage_assignments = "".join(f", {key} = :{key}" for key in normalized_usage.keys())
         with self._connect() as conn:
             cur = conn.execute(
                 f"""
                 UPDATE runs
-                SET state = :state, ended_at = :ended_at, output_text = :output_text, error_text = :error_text{failure_assignments}
+                SET state = :state, ended_at = :ended_at, output_text = :output_text,
+                    error_text = :error_text{failure_assignments}{usage_assignments}
                 WHERE run_id = :run_id AND state = :expected_state
                 """,
                 update_fields,

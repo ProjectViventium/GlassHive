@@ -693,6 +693,11 @@ class ProfiledWorkerRuntime:
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
         return self._runtime_for_worker(worker).run_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
 
+    def run_usage(self, worker: dict, run_id: str) -> dict[str, int]:
+        runtime = self._runtime_for_worker(worker)
+        reader = getattr(runtime, "run_usage", None)
+        return dict(reader(worker, run_id)) if callable(reader) else {}
+
     def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
         runtime = self._runtime_for_worker(worker)
         checker = getattr(runtime, "worker_capacity_error", None)
@@ -841,6 +846,29 @@ class BaseCliWorkerRuntime:
     def _ensure_dirs(self, worker_id: str) -> None:
         self._workspace_dir(worker_id).mkdir(parents=True, exist_ok=True)
         self._home_dir(worker_id).mkdir(parents=True, exist_ok=True)
+
+    def _usage_from_output(self, stdout: str) -> dict[str, int]:
+        _ = stdout
+        return {}
+
+    def _record_run_usage(self, worker_id: str, run_id: str, stdout: str) -> dict[str, int]:
+        usage = self._usage_from_output(stdout)
+        if usage:
+            path = self._run_root(worker_id, run_id) / "usage.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(usage, sort_keys=True))
+            path.chmod(0o600)
+        return usage
+
+    def run_usage(self, worker: dict, run_id: str) -> dict[str, int]:
+        path = self._run_root(str(worker["worker_id"]), str(run_id)) / "usage.json"
+        if not path.is_file():
+            return {}
+        try:
+            value = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return {str(key): int(token_count) for key, token_count in value.items()} if isinstance(value, dict) else {}
 
     def _read_session_key(self, worker_id: str) -> str | None:
         path = self._session_meta_path(worker_id)
@@ -1342,6 +1370,7 @@ class BaseCliWorkerRuntime:
         info = self.reconcile_worker(worker)
         try:
             session_key, output = self._parse_output(worker, stdout, stderr, info)
+            usage = self._record_run_usage(worker["worker_id"], str(run_id or active_session.get("run_id") or ""), stdout)
         except RuntimeErrorBase as exc:
             return {
                 "state": "failed",
@@ -1384,6 +1413,7 @@ class BaseCliWorkerRuntime:
             "state": "completed",
             "output_text": output_text,
             "error_text": "",
+            "usage": usage,
         }
 
     def _finalize_stop_reason(self, worker_id: str, run_id: str | None = None) -> None:
@@ -1715,6 +1745,7 @@ class BaseCliWorkerRuntime:
             raise RuntimeErrorBase(f"{self.runtime_name} exited with code {exit_code}: {detail}")
 
         session_key, output = self._parse_output(worker_for_run, stdout, stderr, info)
+        self._record_run_usage(worker_for_run["worker_id"], effective_run_id, stdout)
         if session_key:
             self._write_session_key(worker_for_run["worker_id"], session_key)
         evidence_path = _write_evidence_for_run(
@@ -2799,6 +2830,31 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         session_key = str(payload.get("session_id") or info.session_key or "").strip() or None
         result = str(payload.get("result") or raw).strip()
         return session_key, _select_user_facing_agent_output([result]) or result
+
+    def _usage_from_output(self, stdout: str) -> dict[str, int]:
+        raw = stdout.strip()
+        try:
+            payload = json.loads(raw.splitlines()[-1]) if raw else {}
+        except json.JSONDecodeError:
+            payload = {}
+        source = payload.get("usage") if isinstance(payload, dict) else {}
+        usage = source if isinstance(source, dict) else {}
+        normalized: dict[str, int] = {}
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ):
+            value = usage.get(key, 0)
+            if isinstance(value, bool):
+                value = 0
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                parsed = 0
+            normalized[key] = max(0, parsed)
+        return normalized
 
 
 _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -4420,6 +4476,7 @@ class HostNativeCliMixin:
             raise RuntimeErrorBase(f"{self.runtime_name} exited with code {exit_code}: {detail}")
 
         session_key, output = self._parse_output(worker, stdout, stderr, info)
+        self._record_run_usage(worker["worker_id"], effective_run_id, stdout)
         if session_key:
             self._write_session_key(worker["worker_id"], session_key)
         if _FINAL_REPORT_PATTERN.search(stdout) and not _FINAL_REPORT_PATTERN.search(output):

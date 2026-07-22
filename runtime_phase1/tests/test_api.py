@@ -107,6 +107,49 @@ def wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> None:
     raise AssertionError("Condition did not become true before timeout")
 
 
+def test_completed_run_exposes_runtime_token_usage(tmp_path):
+    class UsageRuntime(StubRuntime):
+        def run_usage(self, worker: dict, run_id: str) -> dict[str, int]:
+            return {
+                "input_tokens": 100,
+                "output_tokens": 25,
+                "cache_read_input_tokens": 800,
+                "cache_creation_input_tokens": 75,
+            }
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime=UsageRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "owner",
+            "title": "Usage",
+            "goal": "Track tokens",
+            "default_worker_profile": "claude-code",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "owner",
+            "name": "Usage worker",
+            "role": "invoice processing",
+            "profile": "claude-code",
+        },
+    ).json()
+    assigned = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "process invoice"},
+    ).json()
+
+    completed = wait_for_run(client, assigned["run_id"])
+
+    assert completed["input_tokens"] == 100
+    assert completed["output_tokens"] == 25
+    assert completed["cache_read_input_tokens"] == 800
+    assert completed["cache_creation_input_tokens"] == 75
+    assert completed["total_tokens"] == 1000
+
+
 def test_fresh_user_artifact_deliverable_accepts_standard_deliverable_roots(tmp_path):
     store = Store(str(tmp_path / "runtime.db"))
     service = WorkersProjectsService(store, StubRuntime())
@@ -6024,7 +6067,7 @@ class HealRecoveryRuntime:
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         return self._info(worker)
 
-    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, str] | None:
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
         self.collect_run_ids.append(run_id)
         return {
             "state": "completed",
@@ -6298,6 +6341,12 @@ class RuntimeErrorWithPartialArtifactsRuntime(StubRuntime):
                 "from the current files and notes."
             ),
             "failure_diagnostic_summary": "response.failed event received",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 20,
+                "cache_creation_input_tokens": 3,
+            },
         }
 
 
@@ -6434,6 +6483,7 @@ def test_runtime_error_recovers_codex_failure_metadata_and_artifacts(tmp_path, m
     assert failed["state"] == "failed"
     assert failed["failure_class"] == "provider_response_failed"
     assert failed["failure_retryable"] == 1
+    assert failed["total_tokens"] == 38
     assert runtime.collect_run_ids == [run["run_id"]]
     refreshed_worker = client.get(f"/v1/workers/{worker['worker_id']}").json()
     assert refreshed_worker["runtime"] == "codex-cli"
