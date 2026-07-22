@@ -2765,6 +2765,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             "AWS_BEARER_TOKEN_BEDROCK",
             "AWS_REGION",
             "AWS_DEFAULT_REGION",
+            "AWS_EC2_METADATA_DISABLED",
             "ANTHROPIC_MODEL",
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_AUTH_TOKEN",

@@ -3389,6 +3389,7 @@ def test_claude_code_runtime_uses_bedrock_provider_model_without_oauth(tmp_path,
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEONLY0000")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "synthetic-secret-not-real")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-pass")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-pass")
 
@@ -3401,6 +3402,7 @@ def test_claude_code_runtime_uses_bedrock_provider_model_without_oauth(tmp_path,
     assert env["AWS_ACCESS_KEY_ID"] == "AKIAEXAMPLEONLY0000"
     assert env["AWS_SECRET_ACCESS_KEY"] == "synthetic-secret-not-real"
     assert env["AWS_REGION"] == "us-east-1"
+    assert env["AWS_EC2_METADATA_DISABLED"] == "true"
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
     assert "ANTHROPIC_API_KEY" not in env
 

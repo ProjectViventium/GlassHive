@@ -45,6 +45,7 @@ def test_safe_docker_exec_env_preserves_bedrock_run_credentials_only():
             "AWS_ACCESS_KEY_ID": "AKIAEXAMPLEONLY0000",
             "AWS_SECRET_ACCESS_KEY": "synthetic-secret-not-real",
             "AWS_REGION": "us-east-1",
+            "AWS_EC2_METADATA_DISABLED": "true",
             "UNRELATED_SECRET": "must-not-pass",
         }
     )
@@ -53,6 +54,7 @@ def test_safe_docker_exec_env_preserves_bedrock_run_credentials_only():
     assert env["AWS_ACCESS_KEY_ID"] == "AKIAEXAMPLEONLY0000"
     assert env["AWS_SECRET_ACCESS_KEY"] == "synthetic-secret-not-real"
     assert env["AWS_REGION"] == "us-east-1"
+    assert env["AWS_EC2_METADATA_DISABLED"] == "true"
     assert "UNRELATED_SECRET" not in env
 
 
