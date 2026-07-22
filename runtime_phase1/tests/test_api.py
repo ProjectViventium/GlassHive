@@ -5385,6 +5385,57 @@ def test_artifact_surfaces_reject_browser_runtime_scratch_paths(tmp_path, monkey
     assert persistent_download.json()["detail"] == "Artifact path is not downloadable"
 
 
+def test_worker_artifact_listing_pages_complete_large_workspace(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Large artifact package",
+            "goal": "Return every completed artifact without truncation.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Large artifact worker",
+            "role": "processor",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+            "execution_mode": "host",
+        },
+    ).json()
+    workspace = Path(worker["workspace_dir"])
+    for index in range(620):
+        path = workspace / "output" / "deliveries" / f"invoice-{index:04d}" / "canonical.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+
+    paths = []
+    cursor = 0
+    while True:
+        response = client.get(
+            f"/v1/workers/{worker['worker_id']}/artifacts",
+            params={"cursor": cursor, "limit": 200},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["total"] == 620
+        paths.extend(item["path"] for item in payload["items"])
+        if payload["next_cursor"] is None:
+            break
+        assert payload["next_cursor"] > cursor
+        cursor = payload["next_cursor"]
+
+    assert len(paths) == 620
+    assert len(set(paths)) == 620
+    assert paths[0] == "output/deliveries/invoice-0000/canonical.json"
+    assert paths[-1] == "output/deliveries/invoice-0619/canonical.json"
+
+
 def test_deliverable_detection_ignores_provider_api_endpoints(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

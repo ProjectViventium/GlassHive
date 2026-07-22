@@ -1906,19 +1906,34 @@ def create_app(
         )
 
     @app.get("/v1/workers/{worker_id}/artifacts")
-    def list_worker_artifacts(worker_id: str, request: Request) -> dict[str, object]:
+    def list_worker_artifacts(
+        worker_id: str,
+        request: Request,
+        cursor: int = 0,
+        limit: int = 500,
+    ) -> dict[str, object]:
         worker = require_worker(worker_id, request)
+        if cursor < 0 or not 1 <= limit <= 2_000:
+            raise HTTPException(status_code=400, detail="Artifact pagination is out of range")
+        scan_limit = int(os.environ.get("GLASSHIVE_ARTIFACT_LIST_SCAN_MAX_ENTRIES", "50000"))
+        if scan_limit < 1:
+            raise HTTPException(status_code=500, detail="Artifact scan limit is invalid")
+        workspace_items = _workspace_items(worker, max_entries=scan_limit + 1, max_depth=8)
+        if len(workspace_items) > scan_limit:
+            raise HTTPException(status_code=413, detail="Worker workspace exceeds the artifact scan limit")
+        files = [item for item in workspace_items if not item.get("is_dir")]
+        page = files[cursor : cursor + limit]
         items = [
             {
                 **item,
                 "open_url": _artifact_query_url(worker_id, "open", str(item["path"])),
                 "download_url": _artifact_query_url(worker_id, "download", str(item["path"])),
             }
-            for item in _workspace_items(worker, max_entries=500, max_depth=8)
-            if not item.get("is_dir")
+            for item in page
         ]
         store.add_event(worker["project_id"], worker_id, None, "worker.artifacts_listed", "Workspace artifacts listed")
-        return {"items": items}
+        next_cursor = cursor + len(page) if cursor + len(page) < len(files) else None
+        return {"items": items, "next_cursor": next_cursor, "total": len(files)}
 
     @app.get("/v1/workers/{worker_id}/artifacts/open")
     def open_worker_artifact(worker_id: str, path: str, request: Request) -> HTMLResponse:
