@@ -194,10 +194,28 @@ class RunResponse(BaseModel):
     failure_user_message: str = ""
     failure_recommended_recovery: str = ""
     failure_diagnostic_summary: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    total_tokens: int = 0
     effort: str = Field(
         default="",
         description="Normalized per-assignment effort accepted by the runtime.",
     )
+
+    @model_validator(mode="after")
+    def calculate_total_tokens(self):
+        self.total_tokens = sum(
+            max(0, int(value))
+            for value in (
+                self.input_tokens,
+                self.output_tokens,
+                self.cache_read_input_tokens,
+                self.cache_creation_input_tokens,
+            )
+        )
+        return self
 
 
 class ScheduleResponse(BaseModel):

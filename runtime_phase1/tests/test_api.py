@@ -107,6 +107,49 @@ def wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> None:
     raise AssertionError("Condition did not become true before timeout")
 
 
+def test_completed_run_exposes_runtime_token_usage(tmp_path):
+    class UsageRuntime(StubRuntime):
+        def run_usage(self, worker: dict, run_id: str) -> dict[str, int]:
+            return {
+                "input_tokens": 100,
+                "output_tokens": 25,
+                "cache_read_input_tokens": 800,
+                "cache_creation_input_tokens": 75,
+            }
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime=UsageRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "owner",
+            "title": "Usage",
+            "goal": "Track tokens",
+            "default_worker_profile": "claude-code",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "owner",
+            "name": "Usage worker",
+            "role": "invoice processing",
+            "profile": "claude-code",
+        },
+    ).json()
+    assigned = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "process invoice"},
+    ).json()
+
+    completed = wait_for_run(client, assigned["run_id"])
+
+    assert completed["input_tokens"] == 100
+    assert completed["output_tokens"] == 25
+    assert completed["cache_read_input_tokens"] == 800
+    assert completed["cache_creation_input_tokens"] == 75
+    assert completed["total_tokens"] == 1000
+
+
 def test_fresh_user_artifact_deliverable_accepts_standard_deliverable_roots(tmp_path):
     store = Store(str(tmp_path / "runtime.db"))
     service = WorkersProjectsService(store, StubRuntime())

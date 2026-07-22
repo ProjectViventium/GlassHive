@@ -2570,6 +2570,52 @@ def test_workspace_claude_command_ignores_host_binary_override(tmp_path, monkeyp
     assert "/opt/homebrew/bin/claude" not in " ".join(command)
 
 
+def test_claude_usage_parser_preserves_input_output_and_cache_tokens(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    stdout = json.dumps(
+        {
+            "type": "result",
+            "session_id": "session-usage",
+            "result": "done",
+            "usage": {
+                "input_tokens": 58,
+                "output_tokens": 108055,
+                "cache_read_input_tokens": 5236386,
+                "cache_creation_input_tokens": 241709,
+            },
+        }
+    )
+
+    assert runtime._usage_from_output(stdout) == {
+        "input_tokens": 58,
+        "output_tokens": 108055,
+        "cache_read_input_tokens": 5236386,
+        "cache_creation_input_tokens": 241709,
+    }
+
+
+def test_claude_usage_parser_rejects_negative_boolean_and_malformed_values(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    stdout = json.dumps(
+        {
+            "type": "result",
+            "usage": {
+                "input_tokens": -1,
+                "output_tokens": True,
+                "cache_read_input_tokens": "120",
+                "cache_creation_input_tokens": None,
+            },
+        }
+    )
+
+    assert runtime._usage_from_output(stdout) == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 120,
+        "cache_creation_input_tokens": 0,
+    }
+
+
 def test_workspace_claude_command_honors_per_run_max_effort(tmp_path, monkeypatch):
     runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
     worker = {
