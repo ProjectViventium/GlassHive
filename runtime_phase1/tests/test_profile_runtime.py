@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import workers_projects_runtime.profile_runtime as profile_runtime_module
 from workers_projects_runtime.bootstrap import GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS, GLASSHIVE_SAFETY_CHECKPOINT_RULE
 from workers_projects_runtime.failure_classification import classify_cli_failure, classify_runtime_error
 from workers_projects_runtime.openclaw_runtime import RuntimeDependencyMissingError, RuntimeErrorBase, WorkerTerminatedError
@@ -2750,6 +2751,7 @@ def test_claude_stream_telemetry_is_compact_and_content_free(tmp_path):
         "tool_call_counts": {"Read": 1},
         "event_count": 5,
         "malformed_line_count": 1,
+        "oversized_line_count": 0,
         "total_cost_usd": 3.25,
     }
     encoded = json.dumps(telemetry)
@@ -2878,6 +2880,123 @@ def test_claude_live_telemetry_does_not_substitute_console_tail_for_missing_run(
         "run_id": "run_missing",
         "telemetry_scope": "active_run_unavailable",
     }
+
+
+def test_claude_live_telemetry_bounds_an_unterminated_oversized_record(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_oversized_telemetry",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_oversized"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    stdout_path = run_root / "stdout.log"
+    stdout_path.write_bytes(b"x" * (5 * 1024 * 1024))
+
+    first = runtime.live_telemetry(worker, "", run_id=run_id)
+    cached = runtime._live_telemetry_cache[(worker["worker_id"], run_id)]
+
+    assert first["malformed_line_count"] == 1
+    assert first["oversized_line_count"] == 1
+    assert first["partial_line_present"] is True
+    assert len(cached["partial"]) == 0
+    assert cached["discarding_oversized_line"] is True
+
+    with stdout_path.open("ab") as handle:
+        handle.write(
+            b"\n"
+            + json.dumps(
+                {"type": "system", "subtype": "init", "model": "claude-opus-test"}
+            ).encode()
+            + b"\n"
+        )
+    second = runtime.live_telemetry(worker, "", run_id=run_id)
+
+    assert second["event_count"] == 1
+    assert second["malformed_line_count"] == 1
+    assert second["oversized_line_count"] == 1
+    assert second["partial_line_present"] is False
+
+
+def test_active_run_terminal_status_is_atomic_and_cannot_be_downgraded_by_heartbeat(tmp_path):
+    status_path = tmp_path / "active-run.json"
+    worker = {
+        "worker_id": "wrk_status_race",
+        "profile": "claude-code",
+        "execution_mode": "docker",
+    }
+    arguments = {
+        "path": status_path,
+        "worker": worker,
+        "run_id": "run_status_race",
+        "runtime_name": "claude-code",
+        "model": "claude-opus-test",
+        "transcript_paths": {},
+        "started_at": "2026-07-24T12:00:00Z",
+        "process_pid": 123,
+        "timeout_seconds": 30.0,
+    }
+    profile_runtime_module._write_active_run_status(state="running", **arguments)
+
+    start = threading.Event()
+
+    def heartbeat_writer():
+        start.wait()
+        for _ in range(200):
+            profile_runtime_module._write_active_run_status(state="running", **arguments)
+
+    heartbeat = threading.Thread(target=heartbeat_writer)
+    heartbeat.start()
+    start.set()
+    profile_runtime_module._write_active_run_status(
+        state="timeout",
+        stop_reason="timeout",
+        **arguments,
+    )
+    heartbeat.join()
+    profile_runtime_module._write_active_run_status(state="running", **arguments)
+
+    status = json.loads(status_path.read_text())
+    assert status["run_id"] == "run_status_race"
+    assert status["state"] == "timeout"
+    assert status["stop_reason"] == "timeout"
+
+
+def test_persisted_run_telemetry_is_atomic_and_content_allowlisted(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {"worker_id": "wrk_safe_telemetry", "profile": "claude-code"}
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_safe"
+    path = runtime._run_root(worker["worker_id"], run_id) / "telemetry.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "event_count": 7,
+                "model": "SECRET-INVOICE-CONTENT",
+                "stop_reason": "customer-name",
+                "prompt": "private invoice line",
+            }
+        )
+    )
+
+    assert runtime.run_telemetry(worker, run_id) == {
+        "schema": "glasshive.claude-run-telemetry.v1",
+        "run_id": run_id,
+        "event_count": 7,
+    }
+
+    monkeypatch.setattr(os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("disk")))
+    telemetry = runtime._record_run_telemetry(
+        worker["worker_id"],
+        "run_atomic_failure",
+        json.dumps({"type": "system", "subtype": "init", "model": "claude-opus-test"}),
+    )
+    assert telemetry["run_id"] == "run_atomic_failure"
 
 
 def test_claude_failed_stream_never_promotes_transcript_content_to_public_error_fields(tmp_path):

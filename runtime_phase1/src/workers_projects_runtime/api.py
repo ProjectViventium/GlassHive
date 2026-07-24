@@ -1202,14 +1202,13 @@ def create_app(
                         if "run_id" not in str(exc):
                             telemetry = {}
                         else:
-                            try:
-                                telemetry = dict(live_telemetry_reader(worker, stdout_text))
-                            except Exception:
-                                telemetry = {}
+                            telemetry = {}
                     except Exception:
                         telemetry = {}
             if telemetry:
-                telemetry["run_id"] = run_id
+                nested_run_id = str(telemetry.get("run_id") or "")
+                if nested_run_id != run_id:
+                    telemetry = {}
         else:
             live_telemetry_reader = getattr(runtime_impl, "live_telemetry", None)
             if callable(live_telemetry_reader):

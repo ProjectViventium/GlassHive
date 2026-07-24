@@ -155,6 +155,7 @@ def test_worker_live_exposes_content_free_runtime_telemetry(tmp_path):
         def run_telemetry(self, worker: dict, run_id: str) -> dict[str, object]:
             return {
                 "schema": "glasshive.claude-run-telemetry.v1",
+                "run_id": run_id,
                 "duration_ms": 125000,
                 "duration_api_ms": 121000,
                 "api_retry_count": 2,
@@ -196,10 +197,16 @@ def test_worker_live_exposes_content_free_runtime_telemetry(tmp_path):
 
 def test_worker_live_reads_active_run_logs_from_runtime_metadata(tmp_path):
     class LiveTelemetryRuntime(StubRuntime):
-        def live_telemetry(self, worker: dict, stdout: str) -> dict[str, object]:
+        def live_telemetry(
+            self,
+            worker: dict,
+            stdout: str,
+            run_id: str | None = None,
+        ) -> dict[str, object]:
             return {
                 "schema": "glasshive.claude-run-telemetry.v1",
-                "telemetry_scope": "console_tail",
+                "run_id": run_id,
+                "telemetry_scope": "full_active_run",
                 "event_count": len([line for line in stdout.splitlines() if line.strip()]),
             }
 
@@ -244,8 +251,48 @@ def test_worker_live_reads_active_run_logs_from_runtime_metadata(tmp_path):
 
     assert '"subtype":"init"' in live["console"]["stdout"]
     assert "runtime warning" in live["console"]["stderr"]
-    assert live["telemetry"]["telemetry_scope"] == "console_tail"
+    assert live["telemetry"]["telemetry_scope"] == "full_active_run"
     assert live["telemetry"]["event_count"] == 1
+
+
+def test_worker_live_does_not_fallback_to_console_tail_for_legacy_requested_run(tmp_path):
+    class LegacyTelemetryRuntime(StubRuntime):
+        def live_telemetry(self, worker: dict, stdout: str) -> dict[str, object]:
+            return {
+                "schema": "glasshive.claude-run-telemetry.v1",
+                "telemetry_scope": "console_tail",
+                "event_count": 99,
+            }
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime=LegacyTelemetryRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "owner",
+            "title": "Legacy telemetry",
+            "goal": "Do not misbind telemetry",
+            "default_worker_profile": "claude-code",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "owner",
+            "name": "Legacy worker",
+            "role": "invoice processing",
+            "profile": "claude-code",
+        },
+    ).json()
+    assigned = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "process invoice"},
+    ).json()
+    wait_for_run(client, assigned["run_id"])
+
+    payload = client.get(f"/v1/workers/{worker['worker_id']}/telemetry").json()
+
+    assert payload["telemetry_run_id"] == assigned["run_id"]
+    assert payload["telemetry"] == {}
 
 
 def test_worker_telemetry_is_bound_to_active_run_when_newer_run_is_queued(tmp_path):

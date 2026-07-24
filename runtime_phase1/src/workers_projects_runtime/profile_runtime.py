@@ -61,6 +61,157 @@ logger = logging.getLogger(__name__)
 _CODEX_MCP_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 _HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off", "none", "disabled"}
+_MAX_TELEMETRY_LINE_BYTES = 1024 * 1024
+_ACTIVE_RUN_STATUS_LOCK = Lock()
+_ACTIVE_RUN_TERMINAL_STATES = frozenset(
+    {"completed", "failed", "timeout", "paused", "interrupted", "terminated"}
+)
+_TELEMETRY_INTEGER_FIELDS = frozenset(
+    {
+        "duration_ms",
+        "duration_api_ms",
+        "ttft_ms",
+        "ttft_stream_ms",
+        "time_to_request_ms",
+        "num_turns",
+        "api_retry_count",
+        "api_retry_delay_ms",
+        "tool_call_count",
+        "event_count",
+        "assistant_event_count",
+        "malformed_line_count",
+        "oversized_line_count",
+        "sample_sequence",
+        "parsed_bytes",
+        "log_bytes",
+    }
+)
+_TELEMETRY_TOKEN_FIELDS = frozenset(
+    {
+        "claude_code_version",
+        "model",
+        "service_tier",
+        "speed",
+        "result_state",
+        "stop_reason",
+        "telemetry_scope",
+        "run_id",
+    }
+)
+_TELEMETRY_TIMESTAMP_FIELDS = frozenset(
+    {
+        "first_timestamp",
+        "last_timestamp",
+        "sampled_at",
+        "first_observed_at",
+        "last_progress_at",
+    }
+)
+_SAFE_TELEMETRY_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.:/+-]{0,63}$")
+_TELEMETRY_TOKEN_PATTERNS = {
+    "claude_code_version": re.compile(r"^\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]+)?$"),
+    "model": re.compile(r"^(?:claude|anthropic)[A-Za-z0-9_.:/+-]{0,120}$"),
+    "service_tier": re.compile(r"^(?:standard|priority|batch|flex|default)$"),
+    "speed": re.compile(r"^(?:standard|fast|normal|default)$"),
+    "result_state": re.compile(r"^(?:success|error|failed|cancelled|interrupted|timeout)$"),
+    "stop_reason": re.compile(
+        r"^(?:end_turn|max_tokens|tool_use|stop_sequence|refusal|error|timeout|"
+        r"cancelled|interrupted|terminated|paused|completed)$"
+    ),
+    "telemetry_scope": re.compile(
+        r"^(?:full_active_run_incremental|full_active_run|console_tail|"
+        r"active_run_unavailable)$"
+    ),
+    "run_id": re.compile(r"^(?:run[_-]?|r)[A-Za-z0-9_-]{0,120}$"),
+}
+
+
+def _safe_run_telemetry(value: object, *, run_id: str | None = None) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    safe: dict[str, object] = {}
+    for key in _TELEMETRY_INTEGER_FIELDS:
+        if key not in value or isinstance(value[key], bool):
+            continue
+        try:
+            safe[key] = max(0, int(value[key]))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    for key in _TELEMETRY_TOKEN_FIELDS:
+        text = str(value.get(key) or "").strip()
+        if text and _TELEMETRY_TOKEN_PATTERNS[key].fullmatch(text):
+            safe[key] = text
+    for key in _TELEMETRY_TIMESTAMP_FIELDS:
+        text = str(value.get(key) or "").strip()
+        if not text:
+            continue
+        try:
+            datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        safe[key] = text[:128]
+    if isinstance(value.get("is_error"), bool):
+        safe["is_error"] = value["is_error"]
+    if isinstance(value.get("partial_line_present"), bool):
+        safe["partial_line_present"] = value["partial_line_present"]
+    for key in ("seconds_since_progress", "total_cost_usd"):
+        if key not in value or isinstance(value[key], bool):
+            continue
+        try:
+            number = float(value[key])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if number == number and abs(number) != float("inf") and number >= 0:
+            safe[key] = number
+    statuses = value.get("api_retry_statuses")
+    if isinstance(statuses, (list, tuple)):
+        safe_statuses = sorted(
+            {
+                str(item).strip()
+                for item in statuses[:20]
+                if re.fullmatch(r"^[A-Za-z0-9_.:/+-]{1,32}$", str(item).strip())
+            }
+        )
+        safe["api_retry_statuses"] = safe_statuses
+    counts = value.get("tool_call_counts")
+    if isinstance(counts, dict):
+        safe_counts: dict[str, int] = {}
+        for raw_name, raw_count in list(counts.items())[:100]:
+            name = str(raw_name or "").strip()
+            if not _SAFE_TELEMETRY_NAME.fullmatch(name) or isinstance(raw_count, bool):
+                continue
+            try:
+                safe_counts[name] = max(0, int(raw_count))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        if safe_counts:
+            safe["tool_call_counts"] = dict(sorted(safe_counts.items()))
+    expected_run_id = str(run_id or "").strip()
+    nested_run_id = str(safe.get("run_id") or "").strip()
+    if expected_run_id:
+        if nested_run_id and nested_run_id != expected_run_id:
+            return {}
+        safe["run_id"] = expected_run_id
+    if safe:
+        safe["schema"] = "glasshive.claude-run-telemetry.v1"
+    return safe
+
+
+def _write_private_json(path: Path, value: object) -> bool:
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(value, sort_keys=True))
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        path.chmod(0o600)
+        return True
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
 
 def _claude_effort_help_supports(help_text: str, effort: str) -> bool:
@@ -718,6 +869,12 @@ class ProfiledWorkerRuntime:
         except TypeError as exc:
             if "run_id" not in str(exc):
                 raise
+            if run_id:
+                return {
+                    "schema": "glasshive.claude-run-telemetry.v1",
+                    "run_id": str(run_id),
+                    "telemetry_scope": "active_run_unavailable",
+                }
             return dict(reader(worker, stdout))
 
     def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
@@ -883,18 +1040,18 @@ class BaseCliWorkerRuntime:
         usage = self._usage_from_output(stdout)
         if usage:
             path = self._run_root(worker_id, run_id) / "usage.json"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(usage, sort_keys=True))
-            path.chmod(0o600)
+            _write_private_json(path, usage)
         return usage
 
     def _record_run_telemetry(self, worker_id: str, run_id: str, stdout: str) -> dict[str, object]:
-        telemetry = self._telemetry_from_output(stdout)
+        telemetry = _safe_run_telemetry(self._telemetry_from_output(stdout), run_id=run_id)
         if telemetry:
             path = self._run_root(worker_id, run_id) / "telemetry.json"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(telemetry, sort_keys=True))
-            path.chmod(0o600)
+            if not _write_private_json(path, telemetry):
+                logger.warning(
+                    "Failed to persist GlassHive run telemetry",
+                    extra={"worker_id": worker_id, "run_id": run_id},
+                )
         return telemetry
 
     def _record_run_metrics(
@@ -926,7 +1083,7 @@ class BaseCliWorkerRuntime:
             value = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             return {}
-        return value if isinstance(value, dict) else {}
+        return _safe_run_telemetry(value, run_id=str(run_id))
 
     def live_telemetry(
         self,
@@ -942,10 +1099,16 @@ class BaseCliWorkerRuntime:
                 telemetry_source = run_stdout.read_text(errors="replace")
                 scope = "full_active_run"
             except OSError:
-                pass
+                return {
+                    "schema": "glasshive.claude-run-telemetry.v1",
+                    "run_id": str(run_id),
+                    "telemetry_scope": "active_run_unavailable",
+                }
         telemetry = self._telemetry_from_output(telemetry_source)
         if telemetry:
             telemetry["telemetry_scope"] = scope
+            if run_id:
+                telemetry["run_id"] = str(run_id)
         return telemetry
 
     def _read_session_key(self, worker_id: str) -> str | None:
@@ -1713,6 +1876,7 @@ class BaseCliWorkerRuntime:
                 transcript_paths=transcript_paths,
                 started_at=started_at,
             )
+            _stop_active_run_heartbeat(heartbeat_stop, heartbeat_thread)
             _write_active_run_status(
                 path=heartbeat_path,
                 worker=worker_for_run,
@@ -1729,9 +1893,7 @@ class BaseCliWorkerRuntime:
             )
             raise
         finally:
-            heartbeat_stop.set()
-            if heartbeat_thread:
-                heartbeat_thread.join(timeout=1)
+            _stop_active_run_heartbeat(heartbeat_stop, heartbeat_thread)
         self.sandbox.ensure_container_writable_paths(
             worker_for_run["worker_id"],
             self.runtime_name,
@@ -2993,6 +3155,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             "event_count": 0,
             "assistant_event_count": 0,
             "malformed_line_count": 0,
+            "oversized_line_count": 0,
             "api_retry_count": 0,
             "api_retry_delay_ms": 0,
             "api_retry_statuses": set(),
@@ -3064,7 +3227,11 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         return True
 
     def _telemetry_from_state(self, state: dict[str, object]) -> dict[str, object]:
-        if int(state["event_count"]) <= 0:
+        if (
+            int(state["event_count"]) <= 0
+            and int(state["malformed_line_count"]) <= 0
+            and int(state["oversized_line_count"]) <= 0
+        ):
             return {}
         init = state["init"] if isinstance(state["init"], dict) else {}
         result = state["result"] if isinstance(state["result"], dict) else {}
@@ -3098,6 +3265,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             "tool_call_counts": dict(sorted(tool_call_counts.items())),
             "event_count": int(state["event_count"]),
             "malformed_line_count": int(state["malformed_line_count"]),
+            "oversized_line_count": int(state["oversized_line_count"]),
         }
         total_cost_usd = self._finite_telemetry_float(result.get("total_cost_usd"))
         if total_cost_usd is not None:
@@ -3125,18 +3293,17 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         worker_id = str(worker["worker_id"])
         run_id = str(run_id)
         run_stdout = self._run_root(worker_id, run_id) / "stdout.log"
-        try:
-            stat = run_stdout.stat()
-        except OSError:
-            return {
-                "schema": "glasshive.claude-run-telemetry.v1",
-                "run_id": run_id,
-                "telemetry_scope": "active_run_unavailable",
-            }
-
         key = (worker_id, run_id)
         sampled_at = datetime.now(timezone.utc)
         with self._live_telemetry_lock:
+            try:
+                stat = run_stdout.stat()
+            except OSError:
+                return {
+                    "schema": "glasshive.claude-run-telemetry.v1",
+                    "run_id": run_id,
+                    "telemetry_scope": "active_run_unavailable",
+                }
             cached = self._live_telemetry_cache.get(key)
             inode = int(getattr(stat, "st_ino", 0))
             if (
@@ -3148,6 +3315,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                     "inode": inode,
                     "offset": 0,
                     "partial": b"",
+                    "discarding_oversized_line": False,
                     "state": self._new_telemetry_state(),
                     "sample_sequence": 0,
                     "first_observed_at": sampled_at,
@@ -3158,6 +3326,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             offset = int(cached["offset"])
             state = cached["state"]
             pending = bytes(cached["partial"])
+            discarding_oversized_line = bool(cached.get("discarding_oversized_line"))
             consumed_progress = False
             with run_stdout.open("rb") as handle:
                 handle.seek(offset)
@@ -3166,10 +3335,27 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                     if not appended:
                         break
                     offset += len(appended)
+                    if discarding_oversized_line:
+                        newline = appended.find(b"\n")
+                        if newline < 0:
+                            continue
+                        appended = appended[newline + 1 :]
+                        discarding_oversized_line = False
+                        if not appended:
+                            continue
                     pieces = (pending + appended).split(b"\n")
                     pending = pieces.pop()
                     if isinstance(state, dict):
                         for raw_line in pieces:
+                            if len(raw_line) > _MAX_TELEMETRY_LINE_BYTES:
+                                state["malformed_line_count"] = (
+                                    int(state["malformed_line_count"]) + 1
+                                )
+                                state["oversized_line_count"] = (
+                                    int(state.get("oversized_line_count") or 0) + 1
+                                )
+                                consumed_progress = True
+                                continue
                             consumed_progress = (
                                 self._consume_telemetry_line(
                                     state,
@@ -3177,13 +3363,27 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                                 )
                                 or consumed_progress
                             )
+                    if len(pending) > _MAX_TELEMETRY_LINE_BYTES:
+                        if isinstance(state, dict):
+                            state["malformed_line_count"] = int(state["malformed_line_count"]) + 1
+                            state["oversized_line_count"] = (
+                                int(state.get("oversized_line_count") or 0) + 1
+                            )
+                        pending = b""
+                        discarding_oversized_line = True
+                        consumed_progress = True
             cached["offset"] = offset
             cached["partial"] = pending
+            cached["discarding_oversized_line"] = discarding_oversized_line
             if consumed_progress:
                 cached["last_progress_at"] = sampled_at
             cached["sample_sequence"] = int(cached["sample_sequence"]) + 1
 
             telemetry = self._telemetry_from_state(state) if isinstance(state, dict) else {}
+            try:
+                current_log_bytes = max(offset, int(run_stdout.stat().st_size))
+            except OSError:
+                current_log_bytes = offset
             telemetry.update(
                 {
                     "schema": "glasshive.claude-run-telemetry.v1",
@@ -3191,9 +3391,14 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                     "telemetry_scope": "full_active_run_incremental",
                     "sampled_at": sampled_at.isoformat().replace("+00:00", "Z"),
                     "sample_sequence": int(cached["sample_sequence"]),
-                    "parsed_bytes": int(cached["offset"]) - len(bytes(cached["partial"])),
-                    "log_bytes": int(stat.st_size),
-                    "partial_line_present": bool(cached["partial"]),
+                    "parsed_bytes": (
+                        int(cached["offset"])
+                        if cached["discarding_oversized_line"]
+                        else int(cached["offset"]) - len(bytes(cached["partial"]))
+                    ),
+                    "log_bytes": current_log_bytes,
+                    "partial_line_present": bool(cached["partial"])
+                    or bool(cached["discarding_oversized_line"]),
                     "first_observed_at": cached["first_observed_at"].isoformat().replace("+00:00", "Z"),
                 }
             )
@@ -3674,32 +3879,43 @@ def _write_active_run_status(
     evidence_path: str = "",
 ) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "schema": "glasshive.active_run.v1",
-            "run_id": run_id,
-            "state": state,
-            "started_at": started_at,
-            "last_heartbeat_at": _utc_iso(),
-            "heartbeat_sequence": _active_run_heartbeat_sequence(path),
-            "worker": {
-                "worker_id": str(worker.get("worker_id") or ""),
-                "profile": str(worker.get("profile") or ""),
-                "execution_mode": str(worker.get("execution_mode") or ""),
-                "runtime": str(worker.get("runtime") or ""),
-            },
-            "runtime": runtime_name,
-            "model": model,
-            "process_pid": process_pid,
-            "timeout_seconds": timeout_seconds,
-            "exit_code": exit_code,
-            "stop_reason": stop_reason,
-            "transcript_paths": transcript_paths,
-            "transcript_progress": _active_run_transcript_progress(path, transcript_paths),
-            "evidence_path": evidence_path,
-        }
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        path.chmod(0o600)
+        with _ACTIVE_RUN_STATUS_LOCK:
+            if state == "running":
+                try:
+                    previous = json.loads(path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    previous = {}
+                if (
+                    isinstance(previous, dict)
+                    and str(previous.get("run_id") or "") == run_id
+                    and str(previous.get("state") or "") in _ACTIVE_RUN_TERMINAL_STATES
+                ):
+                    return
+            payload = {
+                "schema": "glasshive.active_run.v1",
+                "run_id": run_id,
+                "state": state,
+                "started_at": started_at,
+                "last_heartbeat_at": _utc_iso(),
+                "heartbeat_sequence": _active_run_heartbeat_sequence(path),
+                "worker": {
+                    "worker_id": str(worker.get("worker_id") or ""),
+                    "profile": str(worker.get("profile") or ""),
+                    "execution_mode": str(worker.get("execution_mode") or ""),
+                    "runtime": str(worker.get("runtime") or ""),
+                },
+                "runtime": runtime_name,
+                "model": model,
+                "process_pid": process_pid,
+                "timeout_seconds": timeout_seconds,
+                "exit_code": exit_code,
+                "stop_reason": stop_reason,
+                "transcript_paths": transcript_paths,
+                "transcript_progress": _active_run_transcript_progress(path, transcript_paths),
+                "evidence_path": evidence_path,
+            }
+            if not _write_private_json(path, payload):
+                raise OSError("active run status write failed")
     except Exception as exc:  # pragma: no cover - heartbeat must not mask the real worker result
         logger.warning(
             "Failed to write GlassHive active run status",
@@ -3739,6 +3955,12 @@ def _start_active_run_heartbeat(
     thread = Thread(target=beat, name=f"glasshive-run-heartbeat-{run_id[:12]}", daemon=True)
     thread.start()
     return thread
+
+
+def _stop_active_run_heartbeat(stop_event: Event, thread: Thread | None) -> None:
+    stop_event.set()
+    if thread:
+        thread.join()
 
 
 def _safe_slug(value: str) -> str:
@@ -4695,6 +4917,7 @@ class HostNativeCliMixin:
                     transcript_paths=transcript_paths,
                     started_at=started_at,
                 )
+                _stop_active_run_heartbeat(heartbeat_stop, heartbeat_thread)
                 _write_active_run_status(
                     path=heartbeat_path,
                     worker=worker,
@@ -4715,9 +4938,7 @@ class HostNativeCliMixin:
                 )
                 raise RuntimeErrorBase(f"{self.runtime_name} timed out after {run_timeout_sec:g}s")
             finally:
-                heartbeat_stop.set()
-                if heartbeat_thread:
-                    heartbeat_thread.join(timeout=1)
+                _stop_active_run_heartbeat(heartbeat_stop, heartbeat_thread)
                 self._clear_process(worker["worker_id"])
                 self._release_host_slot(worker["worker_id"])
 

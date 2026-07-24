@@ -251,14 +251,19 @@ operator metrics. Claude stream telemetry stores counters and timings only, neve
 tool inputs, invoice content, or credentials.
 
 Active JSONL streams are consumed incrementally in bounded chunks. Only complete appended lines are
-counted, an unfinished line remains buffered, and each sample reports its run identity, scope,
-sequence, parsed bytes, log bytes, and last observed progress. A missing requested run is reported
-as unavailable instead of silently substituting a console tail.
+counted. An ordinary unfinished line remains buffered, while an unterminated record larger than
+1 MiB is counted as malformed and discarded until its newline so monitoring memory cannot grow
+with untrusted stream content. Each sample reports its run identity, scope, sequence, parsed bytes,
+log bytes, oversized/malformed counts, and last observed progress. A missing requested run is
+reported as unavailable instead of silently substituting a console tail.
 
 `GET /v1/workers/{worker_id}/telemetry` is the lightweight monitoring endpoint. The full `/live`
 endpoint supports `compact=1` during active polling to skip recursive workspace, image, and
 deliverable discovery. Runtime snapshots are written before success, process failure, timeout,
 pause, interruption, or termination so terminal evidence survives an operator cancellation.
+Persisted and public telemetry are strict, bounded allowlists of counters, timestamps, and runtime
+identifiers. Snapshot writes are atomic and best-effort: an observability I/O failure cannot turn a
+completed workload into a failed one.
 
 ## QA Requirements
 
@@ -273,7 +278,8 @@ The Standard GlassHive QA cases must include:
 - active-run termination race checks proving a background processor cannot resurrect a terminated
   worker or leak a pause, interrupt, or termination reason into a later run
 - active telemetry checks proving run identity cannot drift to a newer queued run, counters remain
-  monotonic across partial JSONL writes, and large unchanged logs are not reparsed
+  monotonic across partial JSONL writes, oversized unterminated records remain memory-bounded, and
+  large unchanged logs are not reparsed
 - resource quota checks for per-user, per-tenant, and profile allowlist limits
 - provider secret exposure checks that interactive shell startup files do not contain raw keys
 - Azure metadata blocking checks for Docker workers in cloud deployments
