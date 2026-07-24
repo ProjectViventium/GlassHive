@@ -150,6 +150,104 @@ def test_completed_run_exposes_runtime_token_usage(tmp_path):
     assert completed["total_tokens"] == 1000
 
 
+def test_worker_live_exposes_content_free_runtime_telemetry(tmp_path):
+    class TelemetryRuntime(StubRuntime):
+        def run_telemetry(self, worker: dict, run_id: str) -> dict[str, object]:
+            return {
+                "schema": "glasshive.claude-run-telemetry.v1",
+                "duration_ms": 125000,
+                "duration_api_ms": 121000,
+                "api_retry_count": 2,
+                "num_turns": 8,
+                "tool_call_counts": {"Read": 2},
+            }
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime=TelemetryRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "owner",
+            "title": "Telemetry",
+            "goal": "Track run health",
+            "default_worker_profile": "claude-code",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "owner",
+            "name": "Telemetry worker",
+            "role": "invoice processing",
+            "profile": "claude-code",
+        },
+    ).json()
+    assigned = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "process invoice"},
+    ).json()
+    wait_for_run(client, assigned["run_id"])
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live").json()
+
+    assert live["telemetry"]["api_retry_count"] == 2
+    assert live["telemetry"]["duration_api_ms"] == 121000
+    assert live["telemetry"]["tool_call_counts"] == {"Read": 2}
+
+
+def test_worker_live_reads_active_run_logs_from_runtime_metadata(tmp_path):
+    class LiveTelemetryRuntime(StubRuntime):
+        def live_telemetry(self, worker: dict, stdout: str) -> dict[str, object]:
+            return {
+                "schema": "glasshive.claude-run-telemetry.v1",
+                "telemetry_scope": "console_tail",
+                "event_count": len([line for line in stdout.splitlines() if line.strip()]),
+            }
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime=LiveTelemetryRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "owner",
+            "title": "Live logs",
+            "goal": "Show the active run",
+            "default_worker_profile": "claude-code",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "owner",
+            "name": "Live log worker",
+            "role": "invoice processing",
+            "profile": "claude-code",
+        },
+    ).json()
+    state_dir = Path(worker["state_dir"])
+    run_root = state_dir / "home" / ".glasshive-runs" / "run_live"
+    run_root.mkdir(parents=True)
+    stdout_path = run_root / "stdout.log"
+    stderr_path = run_root / "stderr.log"
+    stdout_path.write_text('{"type":"system","subtype":"init"}\n')
+    stderr_path.write_text("runtime warning\n")
+    (state_dir / "active_terminal_session.json").write_text(
+        json.dumps(
+            {
+                "session_name": "job-run_live",
+                "run_id": "run_live",
+                "stdout_path": str(stdout_path),
+                "stderr_path": str(stderr_path),
+            }
+        )
+    )
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live").json()
+
+    assert '"subtype":"init"' in live["console"]["stdout"]
+    assert "runtime warning" in live["console"]["stderr"]
+    assert live["telemetry"]["telemetry_scope"] == "console_tail"
+    assert live["telemetry"]["event_count"] == 1
+
+
 def test_fresh_user_artifact_deliverable_accepts_standard_deliverable_roots(tmp_path):
     store = Store(str(tmp_path / "runtime.db"))
     service = WorkersProjectsService(store, StubRuntime())

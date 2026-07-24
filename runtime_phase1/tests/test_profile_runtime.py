@@ -2568,6 +2568,24 @@ def test_workspace_claude_command_ignores_host_binary_override(tmp_path, monkeyp
     assert runtime.binary == "claude"
     assert command[0] == "claude"
     assert "/opt/homebrew/bin/claude" not in " ".join(command)
+    assert command[command.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in command
+
+
+def test_workspace_claude_command_passes_configured_api_timeout(tmp_path, monkeypatch):
+    monkeypatch.setenv("API_TIMEOUT_MS", "900000")
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_workspace_claude_timeout",
+        "name": "Workspace Claude Worker",
+        "profile": "claude-code",
+        "execution_mode": "docker",
+        "model": "claude-opus-test",
+    }
+
+    _command, env = runtime._build_command(worker, "do the work", runtime._runtime_info(worker))
+
+    assert env["API_TIMEOUT_MS"] == "900000"
 
 
 def test_claude_usage_parser_preserves_input_output_and_cache_tokens(tmp_path):
@@ -2614,6 +2632,181 @@ def test_claude_usage_parser_rejects_negative_boolean_and_malformed_values(tmp_p
         "cache_read_input_tokens": 120,
         "cache_creation_input_tokens": 0,
     }
+
+
+def test_claude_stream_telemetry_is_compact_and_content_free(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "claude_code_version": "2.1.207",
+                    "model": "claude-opus-test",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "thinking", "thinking": "private reasoning"},
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {"file_path": "/private/invoice.pdf"},
+                            },
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "user",
+                    "timestamp": "2026-07-24T10:11:12.000Z",
+                    "tool_use_result": "sensitive invoice content",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "api_retry",
+                    "retry_delay_ms": 1500,
+                    "error_status": 529,
+                }
+            ),
+            "{not valid json",
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "session_id": "session-telemetry",
+                    "duration_ms": 125000,
+                    "duration_api_ms": 121000,
+                    "num_turns": 8,
+                    "is_error": False,
+                    "stop_reason": "end_turn",
+                    "ttft_ms": 2424,
+                    "ttft_stream_ms": 1411,
+                    "time_to_request_ms": 24,
+                    "total_cost_usd": 3.25,
+                    "usage": {
+                        "input_tokens": 58,
+                        "output_tokens": 100,
+                        "cache_read_input_tokens": 800,
+                        "cache_creation_input_tokens": 75,
+                        "service_tier": "standard",
+                        "speed": "standard",
+                    },
+                }
+            ),
+        ]
+    )
+
+    telemetry = runtime._telemetry_from_output(stdout)
+
+    assert telemetry == {
+        "schema": "glasshive.claude-run-telemetry.v1",
+        "claude_code_version": "2.1.207",
+        "model": "claude-opus-test",
+        "service_tier": "standard",
+        "speed": "standard",
+        "result_state": "success",
+        "is_error": False,
+        "stop_reason": "end_turn",
+        "duration_ms": 125000,
+        "duration_api_ms": 121000,
+        "ttft_ms": 2424,
+        "ttft_stream_ms": 1411,
+        "time_to_request_ms": 24,
+        "num_turns": 8,
+        "api_retry_count": 1,
+        "api_retry_delay_ms": 1500,
+        "api_retry_statuses": ["529"],
+        "tool_call_count": 1,
+        "tool_call_counts": {"Read": 1},
+        "event_count": 5,
+        "malformed_line_count": 1,
+        "total_cost_usd": 3.25,
+    }
+    encoded = json.dumps(telemetry)
+    assert "private reasoning" not in encoded
+    assert "invoice.pdf" not in encoded
+    assert "sensitive invoice content" not in encoded
+
+
+def test_claude_failed_stream_never_promotes_transcript_content_to_public_error_fields(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_failed_claude_stream",
+        "name": "Invoice Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_failed_claude_stream"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    sensitive = "INVOICE 999999 PRIVATE-LINE-CONTENT"
+    (run_root / "stdout.log").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {"content": [{"type": "text", "text": sensitive}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error",
+                        "is_error": True,
+                        "error_status": 529,
+                        "result": "API Error: 529 Overloaded",
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    (run_root / "stderr.log").write_text("")
+    (run_root / "exit_code").write_text("1")
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+
+    assert recovered is not None
+    assert recovered["state"] == "failed"
+    assert recovered["failure_class"] == "provider_response_failed"
+    assert sensitive not in recovered["error_text"]
+    assert sensitive not in recovered["failure_diagnostic_summary"]
+    assert "Overloaded" not in recovered["failure_diagnostic_summary"]
+    assert recovered["telemetry"]["api_retry_statuses"] == []
+
+
+def test_claude_run_telemetry_is_recorded_and_read_back(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker_id = "wrk_telemetry"
+    run_id = "run_telemetry"
+    stdout = json.dumps(
+        {
+            "type": "result",
+            "subtype": "error",
+            "duration_ms": 4000,
+            "duration_api_ms": 3900,
+            "num_turns": 2,
+            "is_error": True,
+            "stop_reason": "max_tokens",
+        }
+    )
+
+    recorded = runtime._record_run_telemetry(worker_id, run_id, stdout)
+
+    assert recorded["result_state"] == "error"
+    assert recorded["is_error"] is True
+    assert runtime.run_telemetry({"worker_id": worker_id}, run_id) == recorded
+    telemetry_path = runtime._run_root(worker_id, run_id) / "telemetry.json"
+    assert telemetry_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_workspace_claude_command_honors_per_run_max_effort(tmp_path, monkeypatch):

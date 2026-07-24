@@ -704,6 +704,32 @@ def create_app(
         )
 
     def _log_paths(worker: dict) -> tuple[Path, Path]:
+        raw_state_dir = str(worker.get("state_dir") or "").strip()
+        if raw_state_dir:
+            state_dir = Path(raw_state_dir)
+            metadata_path = state_dir / "active_terminal_session.json"
+            try:
+                metadata = json.loads(metadata_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                metadata = {}
+            if isinstance(metadata, dict):
+                candidate_paths: list[Path] = []
+                safe = True
+                resolved_state_dir = state_dir.resolve(strict=False)
+                for key in ("stdout_path", "stderr_path"):
+                    raw_path = str(metadata.get(key) or "").strip()
+                    if not raw_path:
+                        safe = False
+                        break
+                    candidate = Path(raw_path)
+                    resolved_candidate = candidate.resolve(strict=False)
+                    if not resolved_candidate.is_relative_to(resolved_state_dir):
+                        safe = False
+                        break
+                    candidate_paths.append(candidate)
+                if safe and len(candidate_paths) == 2:
+                    return candidate_paths[0], candidate_paths[1]
+
         runtime_name = _profile_runtime_label(worker)
         if str(worker.get("execution_mode") or "docker") == "host":
             root_map = {
@@ -1154,9 +1180,26 @@ def create_app(
         project_runs = store.list_runs_for_project(worker["project_id"], limit=12, tenant_id=_tenant_filter(ctx))
         events = store.list_events(worker_id, _tenant_filter(ctx))[-25:]
         latest_run = runs[0] if runs else None
+        telemetry: dict[str, object] = {}
+        if latest_run:
+            telemetry_reader = getattr(runtime_impl, "run_telemetry", None)
+            if callable(telemetry_reader):
+                try:
+                    telemetry = dict(
+                        telemetry_reader(worker, str(latest_run.get("run_id") or ""))
+                    )
+                except Exception:
+                    telemetry = {}
         stdout_path, stderr_path = _log_paths(worker)
         stdout_text = _read_tail(stdout_path)
         stderr_text = _read_tail(stderr_path)
+        if not telemetry:
+            live_telemetry_reader = getattr(runtime_impl, "live_telemetry", None)
+            if callable(live_telemetry_reader):
+                try:
+                    telemetry = dict(live_telemetry_reader(worker, stdout_text))
+                except Exception:
+                    telemetry = {}
         runtime_details = _runtime_details(worker)
         host_visibility = _host_visibility(worker, runtime_details) if str(worker.get("execution_mode") or "docker") == "host" else {}
         latest_output = ""
@@ -1195,6 +1238,7 @@ def create_app(
             "project_runs": project_runs if show_internal else [_redact_run_for_member(run) for run in project_runs],
             "events": events if show_internal else [_redact_event_for_member(event) for event in events],
             "runtime_details": runtime_details_payload,
+            "telemetry": telemetry if show_internal else {},
             "console": {
                 "stdout": stdout_text if show_internal else "",
                 "stderr": stderr_text if show_internal else "",

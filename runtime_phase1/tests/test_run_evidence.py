@@ -786,6 +786,40 @@ def test_run_evidence_classifies_structured_provider_rate_limit(tmp_path):
     )
 
 
+def test_run_evidence_classifies_real_claude_error_status_field(tmp_path):
+    stdout_text = json.dumps(
+        {
+            "type": "system",
+            "subtype": "api_retry",
+            "error_status": 529,
+            "retry_attempt": 1,
+        }
+    )
+
+    evidence = build_run_evidence(
+        worker={"worker_id": "wrk_real_529", "profile": "claude-code", "execution_mode": "host"},
+        run_id="run_real_529",
+        runtime_name="claude-code",
+        model="claude-test",
+        command=["claude", "-p", "--output-format", "stream-json"],
+        env={},
+        workspace_dir=tmp_path,
+        stdout_text=stdout_text + "\n",
+        stderr_text="",
+        output_text="",
+        error_text="claude-code exited with code 1",
+        exit_code=1,
+        timeout_seconds=None,
+        stop_reason="process_exit",
+        constraint_ledger=None,
+    )
+
+    classification = evidence["failure_classification"]
+    assert classification["failure_class"] == "provider_response_failed"
+    assert classification["retryable"] is True
+    assert "error_status: 529" in classification["diagnostic_summary"]
+
+
 def test_run_evidence_classifies_structured_provider_overload(tmp_path):
     stdout_text = json.dumps(
         {
