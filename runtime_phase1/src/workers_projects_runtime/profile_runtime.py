@@ -824,6 +824,8 @@ class BaseCliWorkerRuntime:
         self._process_lock = Lock()
         self._active_processes: dict[str, subprocess.Popen[str]] = {}
         self._stop_reasons: dict[tuple[str, str | None], str] = {}
+        self._live_telemetry_lock = Lock()
+        self._live_telemetry_cache: dict[tuple[str, str], dict[str, object]] = {}
         self.sandbox = DockerSandboxManager(base_dir=str(self.base_dir))
 
     def resolve_model(self, profile: str) -> str:
@@ -1690,6 +1692,7 @@ class BaseCliWorkerRuntime:
         except Exception as exc:
             stdout = host_stdout.read_text() if host_stdout.exists() else ""
             stderr = host_stderr.read_text() if host_stderr.exists() else ""
+            self._record_run_metrics(worker_for_run["worker_id"], effective_run_id, stdout)
             stop_reason = "timeout" if "timed out" in str(exc).lower() else "error"
             evidence_path = _write_evidence_for_run(
                 worker=worker_for_run,
@@ -1754,6 +1757,7 @@ class BaseCliWorkerRuntime:
             if transcript_path.exists():
                 transcript_path.chmod(0o600)
 
+        self._record_run_metrics(worker_for_run["worker_id"], effective_run_id, stdout)
         try:
             self._finalize_stop_reason(worker_for_run["worker_id"], run_id=effective_run_id)
         except RuntimeErrorBase as exc:
@@ -1801,7 +1805,6 @@ class BaseCliWorkerRuntime:
             )
             raise
 
-        self._record_run_metrics(worker_for_run["worker_id"], effective_run_id, stdout)
         if exit_code != 0:
             if self.runtime_name == "claude-code":
                 classification = classify_cli_failure(
@@ -2963,119 +2966,256 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             normalized[key] = max(0, parsed)
         return normalized
 
-    def _telemetry_from_output(self, stdout: str) -> dict[str, object]:
-        events: list[dict[str, object]] = []
-        malformed_line_count = 0
-        for line in stdout.splitlines():
-            if not line.strip():
-                continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                malformed_line_count += 1
-                continue
-            if isinstance(value, dict):
-                events.append(value)
-        if not events:
-            return {}
+    @staticmethod
+    def _nonnegative_telemetry_int(value: object) -> int:
+        if isinstance(value, bool):
+            return 0
+        try:
+            return max(int(value or 0), 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
-        def nonnegative_int(value: object) -> int:
-            if isinstance(value, bool):
-                return 0
-            try:
-                return max(int(value or 0), 0)
-            except (TypeError, ValueError, OverflowError):
-                return 0
+    @staticmethod
+    def _finite_telemetry_float(value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if parsed == parsed and abs(parsed) != float("inf") else None
 
-        def finite_float(value: object) -> float | None:
-            if isinstance(value, bool):
-                return None
-            try:
-                parsed = float(value)
-            except (TypeError, ValueError, OverflowError):
-                return None
-            return parsed if parsed == parsed and abs(parsed) != float("inf") else None
+    @staticmethod
+    def _new_telemetry_state() -> dict[str, object]:
+        return {
+            "init": {},
+            "result": {},
+            "event_count": 0,
+            "assistant_event_count": 0,
+            "malformed_line_count": 0,
+            "api_retry_count": 0,
+            "api_retry_delay_ms": 0,
+            "api_retry_statuses": set(),
+            "tool_call_counts": {},
+        }
 
-        init = next(
-            (
-                event
-                for event in events
-                if event.get("type") == "system" and event.get("subtype") == "init"
-            ),
-            {},
-        )
-        result = next(
-            (event for event in reversed(events) if event.get("type") == "result"),
-            {},
-        )
-        result_usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
-        retry_events = [
-            event
-            for event in events
-            if event.get("type") == "api_retry" or event.get("subtype") == "api_retry"
-        ]
-        retry_statuses = sorted(
-            {
-                str(
-                    event.get("error_status")
-                    or event.get("api_error_status")
-                    or event.get("status")
-                    or ""
-                ).strip()
-                for event in retry_events
-                if str(
-                    event.get("error_status")
-                    or event.get("api_error_status")
-                    or event.get("status")
-                    or ""
-                ).strip()
+    def _consume_telemetry_line(self, state: dict[str, object], line: str) -> bool:
+        if not line.strip():
+            return False
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            state["malformed_line_count"] = int(state["malformed_line_count"]) + 1
+            return True
+        if not isinstance(value, dict):
+            return True
+
+        state["event_count"] = int(state["event_count"]) + 1
+        event_type = value.get("type")
+        subtype = value.get("subtype")
+        if event_type == "system" and subtype == "init" and not state["init"]:
+            state["init"] = {
+                "claude_code_version": str(value.get("claude_code_version") or "").strip(),
+                "model": str(value.get("model") or "").strip(),
             }
-        )
-
-        tool_call_counts: dict[str, int] = {}
-        for event in events:
-            if event.get("type") != "assistant":
-                continue
-            message = event.get("message")
+        if event_type == "result":
+            usage = value.get("usage") if isinstance(value.get("usage"), dict) else {}
+            state["result"] = {
+                "subtype": str(value.get("subtype") or "").strip(),
+                "is_error": bool(value.get("is_error")) if isinstance(value.get("is_error"), bool) else False,
+                "stop_reason": str(value.get("stop_reason") or "").strip(),
+                "duration_ms": value.get("duration_ms"),
+                "duration_api_ms": value.get("duration_api_ms"),
+                "ttft_ms": value.get("ttft_ms"),
+                "ttft_stream_ms": value.get("ttft_stream_ms"),
+                "time_to_request_ms": value.get("time_to_request_ms"),
+                "num_turns": value.get("num_turns"),
+                "total_cost_usd": value.get("total_cost_usd"),
+                "service_tier": str(usage.get("service_tier") or "").strip(),
+                "speed": str(usage.get("speed") or "").strip(),
+            }
+        if event_type == "api_retry" or subtype == "api_retry":
+            state["api_retry_count"] = int(state["api_retry_count"]) + 1
+            state["api_retry_delay_ms"] = int(state["api_retry_delay_ms"]) + self._nonnegative_telemetry_int(
+                value.get("retry_delay_ms") or value.get("delay_ms")
+            )
+            status = str(
+                value.get("error_status")
+                or value.get("api_error_status")
+                or value.get("status")
+                or ""
+            ).strip()
+            if status:
+                statuses = state["api_retry_statuses"]
+                if isinstance(statuses, set):
+                    statuses.add(status)
+        if event_type == "assistant":
+            state["assistant_event_count"] = int(state["assistant_event_count"]) + 1
+            message = value.get("message")
             content = message.get("content") if isinstance(message, dict) else None
-            if not isinstance(content, list):
-                continue
-            for item in content:
-                if not isinstance(item, dict) or item.get("type") != "tool_use":
-                    continue
-                name = str(item.get("name") or "unknown").strip() or "unknown"
-                tool_call_counts[name] = tool_call_counts.get(name, 0) + 1
+            if isinstance(content, list):
+                counts = state["tool_call_counts"]
+                if isinstance(counts, dict):
+                    for item in content:
+                        if not isinstance(item, dict) or item.get("type") != "tool_use":
+                            continue
+                        name = str(item.get("name") or "unknown").strip() or "unknown"
+                        counts[name] = int(counts.get(name, 0)) + 1
+        return True
 
+    def _telemetry_from_state(self, state: dict[str, object]) -> dict[str, object]:
+        if int(state["event_count"]) <= 0:
+            return {}
+        init = state["init"] if isinstance(state["init"], dict) else {}
+        result = state["result"] if isinstance(state["result"], dict) else {}
+        tool_call_counts = (
+            state["tool_call_counts"] if isinstance(state["tool_call_counts"], dict) else {}
+        )
+        retry_statuses = (
+            sorted(str(item) for item in state["api_retry_statuses"])
+            if isinstance(state["api_retry_statuses"], set)
+            else []
+        )
         telemetry: dict[str, object] = {
             "schema": "glasshive.claude-run-telemetry.v1",
             "claude_code_version": str(init.get("claude_code_version") or "").strip(),
             "model": str(init.get("model") or "").strip(),
-            "service_tier": str(result_usage.get("service_tier") or "").strip(),
-            "speed": str(result_usage.get("speed") or "").strip(),
+            "service_tier": str(result.get("service_tier") or "").strip(),
+            "speed": str(result.get("speed") or "").strip(),
             "result_state": str(result.get("subtype") or "").strip(),
             "is_error": bool(result.get("is_error")) if isinstance(result.get("is_error"), bool) else False,
             "stop_reason": str(result.get("stop_reason") or "").strip(),
-            "duration_ms": nonnegative_int(result.get("duration_ms")),
-            "duration_api_ms": nonnegative_int(result.get("duration_api_ms")),
-            "ttft_ms": nonnegative_int(result.get("ttft_ms")),
-            "ttft_stream_ms": nonnegative_int(result.get("ttft_stream_ms")),
-            "time_to_request_ms": nonnegative_int(result.get("time_to_request_ms")),
-            "num_turns": nonnegative_int(result.get("num_turns")),
-            "api_retry_count": len(retry_events),
-            "api_retry_delay_ms": sum(
-                nonnegative_int(event.get("retry_delay_ms") or event.get("delay_ms"))
-                for event in retry_events
-            ),
+            "duration_ms": self._nonnegative_telemetry_int(result.get("duration_ms")),
+            "duration_api_ms": self._nonnegative_telemetry_int(result.get("duration_api_ms")),
+            "ttft_ms": self._nonnegative_telemetry_int(result.get("ttft_ms")),
+            "ttft_stream_ms": self._nonnegative_telemetry_int(result.get("ttft_stream_ms")),
+            "time_to_request_ms": self._nonnegative_telemetry_int(result.get("time_to_request_ms")),
+            "num_turns": self._nonnegative_telemetry_int(result.get("num_turns")),
+            "api_retry_count": int(state["api_retry_count"]),
+            "api_retry_delay_ms": int(state["api_retry_delay_ms"]),
             "api_retry_statuses": retry_statuses,
             "tool_call_count": sum(tool_call_counts.values()),
             "tool_call_counts": dict(sorted(tool_call_counts.items())),
-            "event_count": len(events),
-            "malformed_line_count": malformed_line_count,
+            "event_count": int(state["event_count"]),
+            "malformed_line_count": int(state["malformed_line_count"]),
         }
-        total_cost_usd = finite_float(result.get("total_cost_usd"))
+        total_cost_usd = self._finite_telemetry_float(result.get("total_cost_usd"))
         if total_cost_usd is not None:
             telemetry["total_cost_usd"] = total_cost_usd
         return telemetry
+
+    def _telemetry_from_output(self, stdout: str) -> dict[str, object]:
+        state = self._new_telemetry_state()
+        for line in stdout.splitlines():
+            self._consume_telemetry_line(state, line)
+        return self._telemetry_from_state(state)
+
+    def live_telemetry(
+        self,
+        worker: dict,
+        stdout: str,
+        run_id: str | None = None,
+    ) -> dict[str, object]:
+        if not run_id:
+            telemetry = self._telemetry_from_output(stdout)
+            if telemetry:
+                telemetry["telemetry_scope"] = "console_tail"
+            return telemetry
+
+        worker_id = str(worker["worker_id"])
+        run_id = str(run_id)
+        run_stdout = self._run_root(worker_id, run_id) / "stdout.log"
+        try:
+            stat = run_stdout.stat()
+        except OSError:
+            return {
+                "schema": "glasshive.claude-run-telemetry.v1",
+                "run_id": run_id,
+                "telemetry_scope": "active_run_unavailable",
+            }
+
+        key = (worker_id, run_id)
+        sampled_at = datetime.now(timezone.utc)
+        with self._live_telemetry_lock:
+            cached = self._live_telemetry_cache.get(key)
+            inode = int(getattr(stat, "st_ino", 0))
+            if (
+                cached is None
+                or int(cached.get("inode") or -1) != inode
+                or int(cached.get("offset") or 0) > stat.st_size
+            ):
+                cached = {
+                    "inode": inode,
+                    "offset": 0,
+                    "partial": b"",
+                    "state": self._new_telemetry_state(),
+                    "sample_sequence": 0,
+                    "first_observed_at": sampled_at,
+                    "last_progress_at": None,
+                }
+                self._live_telemetry_cache[key] = cached
+
+            offset = int(cached["offset"])
+            state = cached["state"]
+            pending = bytes(cached["partial"])
+            consumed_progress = False
+            with run_stdout.open("rb") as handle:
+                handle.seek(offset)
+                while True:
+                    appended = handle.read(1024 * 1024)
+                    if not appended:
+                        break
+                    offset += len(appended)
+                    pieces = (pending + appended).split(b"\n")
+                    pending = pieces.pop()
+                    if isinstance(state, dict):
+                        for raw_line in pieces:
+                            consumed_progress = (
+                                self._consume_telemetry_line(
+                                    state,
+                                    raw_line.decode("utf-8", errors="replace"),
+                                )
+                                or consumed_progress
+                            )
+            cached["offset"] = offset
+            cached["partial"] = pending
+            if consumed_progress:
+                cached["last_progress_at"] = sampled_at
+            cached["sample_sequence"] = int(cached["sample_sequence"]) + 1
+
+            telemetry = self._telemetry_from_state(state) if isinstance(state, dict) else {}
+            telemetry.update(
+                {
+                    "schema": "glasshive.claude-run-telemetry.v1",
+                    "run_id": run_id,
+                    "telemetry_scope": "full_active_run_incremental",
+                    "sampled_at": sampled_at.isoformat().replace("+00:00", "Z"),
+                    "sample_sequence": int(cached["sample_sequence"]),
+                    "parsed_bytes": int(cached["offset"]) - len(bytes(cached["partial"])),
+                    "log_bytes": int(stat.st_size),
+                    "partial_line_present": bool(cached["partial"]),
+                    "first_observed_at": cached["first_observed_at"].isoformat().replace("+00:00", "Z"),
+                }
+            )
+            last_progress_at = cached["last_progress_at"]
+            if isinstance(last_progress_at, datetime):
+                telemetry["last_progress_at"] = last_progress_at.isoformat().replace("+00:00", "Z")
+                telemetry["seconds_since_progress"] = max(
+                    0.0,
+                    round((sampled_at - last_progress_at).total_seconds(), 3),
+                )
+
+            if len(self._live_telemetry_cache) > 128:
+                oldest_key = min(
+                    self._live_telemetry_cache,
+                    key=lambda item: (
+                        self._live_telemetry_cache[item].get("first_observed_at")
+                        or sampled_at
+                    ),
+                )
+                if oldest_key != key:
+                    self._live_telemetry_cache.pop(oldest_key, None)
+            return telemetry
 
 
 _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -4200,6 +4340,7 @@ class HostNativeCliMixin:
         exit_path = Path(raw_exit_path) if raw_exit_path else None
         stdout = stdout_path.read_text() if stdout_path and stdout_path.is_file() else ""
         stderr = stderr_path.read_text() if stderr_path and stderr_path.is_file() else ""
+        self._record_run_metrics(worker["worker_id"], run_id, stdout)
         exit_code: int | None = None
         if exit_path and exit_path.is_file():
             try:
@@ -4534,6 +4675,7 @@ class HostNativeCliMixin:
                     pass
                 timeout_stdout = raw_stdout.read_text() if raw_stdout.exists() else ""
                 timeout_stderr = raw_stderr.read_text() if raw_stderr.exists() else ""
+                self._record_run_metrics(worker["worker_id"], effective_run_id, timeout_stdout)
                 evidence_path = _write_evidence_for_run(
                     worker=worker,
                     run_id=effective_run_id,
@@ -4610,6 +4752,7 @@ class HostNativeCliMixin:
             },
         )
 
+        self._record_run_metrics(worker["worker_id"], effective_run_id, stdout)
         try:
             self._finalize_stop_reason(worker["worker_id"], run_id=effective_run_id)
         except RuntimeErrorBase as exc:
@@ -4706,7 +4849,6 @@ class HostNativeCliMixin:
             raise RuntimeErrorBase(f"{self.runtime_name} exited with code {exit_code}: {detail}")
 
         session_key, output = self._parse_output(worker, stdout, stderr, info)
-        self._record_run_metrics(worker["worker_id"], effective_run_id, stdout)
         if session_key:
             self._write_session_key(worker["worker_id"], session_key)
         if _FINAL_REPORT_PATTERN.search(stdout) and not _FINAL_REPORT_PATTERN.search(output):

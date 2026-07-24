@@ -248,6 +248,75 @@ def test_worker_live_reads_active_run_logs_from_runtime_metadata(tmp_path):
     assert live["telemetry"]["event_count"] == 1
 
 
+def test_worker_telemetry_is_bound_to_active_run_when_newer_run_is_queued(tmp_path):
+    class RunBoundTelemetryRuntime(StubRuntime):
+        def __init__(self):
+            super().__init__()
+            self.requested_run_ids: list[str] = []
+
+        def run_telemetry(self, worker: dict, run_id: str) -> dict[str, object]:
+            self.requested_run_ids.append(run_id)
+            return {
+                "schema": "glasshive.claude-run-telemetry.v1",
+                "run_id": run_id,
+                "event_count": 4,
+            }
+
+    runtime = RunBoundTelemetryRuntime()
+    app = create_app(str(tmp_path / "runtime.db"), runtime=runtime)
+    with TestClient(app) as client:
+        project = client.post(
+            "/v1/projects",
+            json={
+                "owner_id": "owner",
+                "title": "Run-bound telemetry",
+                "goal": "Keep telemetry attached to the running invoice",
+                "default_worker_profile": "claude-code",
+            },
+        ).json()
+        worker = client.post(
+            f"/v1/projects/{project['project_id']}/workers",
+            json={
+                "owner_id": "owner",
+                "name": "Telemetry worker",
+                "role": "invoice processing",
+                "profile": "claude-code",
+            },
+        ).json()
+        active = app.state.store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "active invoice",
+            state="running",
+        )
+        time.sleep(0.002)
+        queued = app.state.store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "next invoice",
+            state="queued",
+        )
+
+        payload = client.get(f"/v1/workers/{worker['worker_id']}/telemetry").json()
+        compact = client.get(
+            f"/v1/workers/{worker['worker_id']}/live",
+            params={"compact": "1"},
+        ).json()
+
+    assert payload["active_run"]["run_id"] == active["run_id"]
+    assert payload["latest_run"]["run_id"] == queued["run_id"]
+    assert payload["telemetry_run_id"] == active["run_id"]
+    assert payload["telemetry"]["run_id"] == active["run_id"]
+    assert runtime.requested_run_ids == [active["run_id"], active["run_id"]]
+    assert "console" not in payload
+    assert "artifacts" not in payload
+    assert compact["compact"] is True
+    assert compact["active_run"]["run_id"] == active["run_id"]
+    assert compact["project_runs"] == []
+    assert compact["workspace"]["items"] == []
+    assert compact["artifacts"]["items"] == []
+
+
 def test_fresh_user_artifact_deliverable_accepts_standard_deliverable_roots(tmp_path):
     store = Store(str(tmp_path / "runtime.db"))
     service = WorkersProjectsService(store, StubRuntime())

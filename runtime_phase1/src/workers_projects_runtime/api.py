@@ -1173,59 +1173,113 @@ def create_app(
         if ctx.enterprise and ctx.role.strip().lower() not in {"admin", "owner", "operator"}:
             raise HTTPException(status_code=403, detail="Admin role required")
 
-    def _live_payload(worker_id: str, request: Request | None = None) -> dict[str, object]:
-        ctx = _auth_context(request)
-        worker = require_worker(worker_id, request)
-        runs = store.list_runs_for_worker(worker_id, limit=10, tenant_id=_tenant_filter(ctx))
-        project_runs = store.list_runs_for_project(worker["project_id"], limit=12, tenant_id=_tenant_filter(ctx))
-        events = store.list_events(worker_id, _tenant_filter(ctx))[-25:]
-        latest_run = runs[0] if runs else None
+    def _telemetry_for_run(
+        worker: dict[str, object],
+        telemetry_run: dict[str, object] | None,
+        stdout_text: str,
+    ) -> dict[str, object]:
         telemetry: dict[str, object] = {}
-        if latest_run:
+        if telemetry_run:
+            run_id = str(telemetry_run.get("run_id") or "")
             telemetry_reader = getattr(runtime_impl, "run_telemetry", None)
             if callable(telemetry_reader):
                 try:
-                    telemetry = dict(
-                        telemetry_reader(worker, str(latest_run.get("run_id") or ""))
-                    )
+                    telemetry = dict(telemetry_reader(worker, run_id))
                 except Exception:
                     telemetry = {}
-        stdout_path, stderr_path = _log_paths(worker)
-        stdout_text = _read_tail(stdout_path)
-        stderr_text = _read_tail(stderr_path)
-        if not telemetry:
+            if not telemetry:
+                live_telemetry_reader = getattr(runtime_impl, "live_telemetry", None)
+                if callable(live_telemetry_reader):
+                    try:
+                        telemetry = dict(
+                            live_telemetry_reader(
+                                worker,
+                                stdout_text,
+                                run_id=run_id or None,
+                            )
+                        )
+                    except TypeError as exc:
+                        if "run_id" not in str(exc):
+                            telemetry = {}
+                        else:
+                            try:
+                                telemetry = dict(live_telemetry_reader(worker, stdout_text))
+                            except Exception:
+                                telemetry = {}
+                    except Exception:
+                        telemetry = {}
+            if telemetry:
+                telemetry["run_id"] = run_id
+        else:
             live_telemetry_reader = getattr(runtime_impl, "live_telemetry", None)
             if callable(live_telemetry_reader):
                 try:
-                    telemetry = dict(
-                        live_telemetry_reader(
-                            worker,
-                            stdout_text,
-                            run_id=str((latest_run or {}).get("run_id") or "") or None,
-                        )
-                    )
-                except TypeError as exc:
-                    if "run_id" not in str(exc):
-                        telemetry = {}
-                    else:
-                        try:
-                            telemetry = dict(live_telemetry_reader(worker, stdout_text))
-                        except Exception:
-                            telemetry = {}
+                    telemetry = dict(live_telemetry_reader(worker, stdout_text))
                 except Exception:
                     telemetry = {}
+        return telemetry
+
+    def _telemetry_payload(worker_id: str, request: Request | None = None) -> dict[str, object]:
+        ctx = _auth_context(request)
+        worker = require_worker(worker_id, request)
+        runs = store.list_runs_for_worker(worker_id, limit=10, tenant_id=_tenant_filter(ctx))
+        latest_run = runs[0] if runs else None
+        active_run = store.get_active_run(worker_id)
+        telemetry_run = active_run or latest_run
+        stdout_path, _stderr_path = _log_paths(worker)
+        stdout_text = _read_tail(stdout_path)
+        telemetry = _telemetry_for_run(worker, telemetry_run, stdout_text)
+        show_internal = _can_show_internal_details(ctx)
+        return {
+            "worker_id": worker_id,
+            "active_run": active_run if show_internal or active_run is None else _redact_run_for_member(active_run),
+            "latest_run": latest_run if show_internal or latest_run is None else _redact_run_for_member(latest_run),
+            "telemetry_run_id": str((telemetry_run or {}).get("run_id") or "") or None,
+            "telemetry": telemetry if show_internal else {},
+        }
+
+    def _live_payload(worker_id: str, request: Request | None = None) -> dict[str, object]:
+        ctx = _auth_context(request)
+        worker = require_worker(worker_id, request)
+        compact = (
+            request is not None
+            and str(request.query_params.get("compact") or "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        runs = store.list_runs_for_worker(worker_id, limit=10, tenant_id=_tenant_filter(ctx))
+        project_runs = (
+            []
+            if compact
+            else store.list_runs_for_project(
+                worker["project_id"],
+                limit=12,
+                tenant_id=_tenant_filter(ctx),
+            )
+        )
+        events = store.list_events(worker_id, _tenant_filter(ctx))[-25:]
+        latest_run = runs[0] if runs else None
+        active_run = store.get_active_run(worker_id)
+        telemetry_run = active_run or latest_run
+        stdout_path, stderr_path = _log_paths(worker)
+        stdout_text = _read_tail(stdout_path)
+        stderr_text = _read_tail(stderr_path)
+        telemetry = _telemetry_for_run(worker, telemetry_run, stdout_text)
         runtime_details = _runtime_details(worker)
         host_visibility = _host_visibility(worker, runtime_details) if str(worker.get("execution_mode") or "docker") == "host" else {}
         latest_output = ""
         if latest_run:
             latest_output = str(latest_run.get("output_text") or latest_run.get("error_text") or "")
-        latest_image = _latest_image_path(worker)
-        deliverable = _deliverable_with_action_urls(
-            worker,
-            deliverable_payload(worker, latest_run, latest_output, stdout_text, stderr_text),
+        latest_image = None if compact else _latest_image_path(worker)
+        deliverable = (
+            {}
+            if compact
+            else _deliverable_with_action_urls(
+                worker,
+                deliverable_payload(worker, latest_run, latest_output, stdout_text, stderr_text),
+            )
         )
         show_internal = _can_show_internal_details(ctx)
-        workspace_items = _workspace_items(worker, max_entries=120, max_depth=8)
+        workspace_items = [] if compact else _workspace_items(worker, max_entries=120, max_depth=8)
         workspace_summary_items = [
             item
             for item in workspace_items
@@ -1246,6 +1300,8 @@ def create_app(
         )
         return {
             "worker": _sanitize_worker(worker) if show_internal else _redact_worker_for_member(worker),
+            "compact": compact,
+            "active_run": active_run if show_internal or active_run is None else _redact_run_for_member(active_run),
             "latest_run": latest_run if show_internal or latest_run is None else _redact_run_for_member(latest_run),
             "latest_output": latest_output,
             "runs": runs if show_internal else [_redact_run_for_member(run) for run in runs],
@@ -1440,6 +1496,11 @@ def create_app(
     def worker_live(worker_id: str, request: Request) -> dict[str, object]:
         require_worker(worker_id, request)
         return _live_payload(worker_id, request)
+
+    @app.get("/v1/workers/{worker_id}/telemetry")
+    def worker_telemetry(worker_id: str, request: Request) -> dict[str, object]:
+        require_worker(worker_id, request)
+        return _telemetry_payload(worker_id, request)
 
     @app.get("/v1/workers/{worker_id}/runs")
     def list_worker_runs(worker_id: str, request: Request) -> dict[str, list[RunResponse]]:

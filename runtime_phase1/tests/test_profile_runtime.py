@@ -1656,6 +1656,13 @@ def test_host_cli_run_fails_when_evidence_contract_fails(tmp_path, monkeypatch):
 def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
+    recorded_metrics: list[tuple[str, str, str]] = []
+
+    def record_metrics(worker_id, run_id, stdout):
+        recorded_metrics.append((worker_id, run_id, stdout))
+        return {}, {}
+
+    runtime._record_run_metrics = record_metrics  # type: ignore[method-assign]
     _patch_host_codex_requirement_probe(monkeypatch)
     workspace = tmp_path / "workspace"
 
@@ -1724,6 +1731,9 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
     assert active_status["transcript_progress"]["files"]["stdout"]["bytes"] > 0
     assert active_status["transcript_progress"]["last_output_at"]
     assert active_status["transcript_progress"]["quiet_seconds"] is not None
+    assert recorded_metrics == [
+        ("wrk_timeout_evidence", "run_timeout_evidence", "working before timeout\n")
+    ]
 
 
 def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monkeypatch):
@@ -1876,6 +1886,13 @@ def test_host_codex_run_sends_instruction_via_stdin_not_argv(tmp_path, monkeypat
 def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
+    recorded_metrics: list[tuple[str, str, str]] = []
+
+    def record_metrics(worker_id, run_id, stdout):
+        recorded_metrics.append((worker_id, run_id, stdout))
+        return {}, {}
+
+    runtime._record_run_metrics = record_metrics  # type: ignore[method-assign]
     _patch_host_codex_requirement_probe(monkeypatch)
     workspace = tmp_path / "workspace"
     processes: list[object] = []
@@ -1974,6 +1991,12 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
     assert display.endswith(" -")
     assert active_status["state"] == "interrupted"
     assert active_status["stop_reason"] in {"interrupted", "WorkerInterruptedError"}
+    assert recorded_metrics
+    assert all(
+        item[:2] == ("wrk_interrupt_evidence", "run_interrupt_evidence")
+        for item in recorded_metrics
+    )
+    assert "working before interrupt" in recorded_metrics[-1][2]
 
 
 def test_host_codex_runtime_default_prompts_require_final_report(tmp_path, monkeypatch):
@@ -2779,7 +2802,7 @@ def test_claude_live_telemetry_reads_the_complete_active_run(tmp_path):
             ),
         ]
     )
-    (run_root / "stdout.log").write_text(full_stream, encoding="utf-8")
+    (run_root / "stdout.log").write_text(full_stream + "\n", encoding="utf-8")
 
     telemetry = runtime.live_telemetry(
         worker,
@@ -2787,10 +2810,74 @@ def test_claude_live_telemetry_reads_the_complete_active_run(tmp_path):
         run_id=run_id,
     )
 
-    assert telemetry["telemetry_scope"] == "full_active_run"
+    assert telemetry["telemetry_scope"] == "full_active_run_incremental"
+    assert telemetry["run_id"] == run_id
     assert telemetry["event_count"] == 3
     assert telemetry["tool_call_count"] == 2
     assert telemetry["tool_call_counts"] == {"Bash": 1, "Read": 1}
+
+
+def test_claude_live_telemetry_consumes_only_complete_appended_lines(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_incremental_telemetry",
+        "name": "Invoice Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_incremental_telemetry"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    stdout_path = run_root / "stdout.log"
+    init_line = json.dumps({"type": "system", "subtype": "init", "model": "claude-opus-test"})
+    assistant_line = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "Read", "input": {}}]},
+        }
+    )
+    split_at = len(assistant_line) // 2
+    stdout_path.write_text(init_line + "\n" + assistant_line[:split_at], encoding="utf-8")
+
+    first = runtime.live_telemetry(worker, "", run_id=run_id)
+
+    assert first["event_count"] == 1
+    assert first["malformed_line_count"] == 0
+    assert first["partial_line_present"] is True
+    assert first["sample_sequence"] == 1
+
+    with stdout_path.open("a", encoding="utf-8") as handle:
+        handle.write(assistant_line[split_at:] + "\n{not-json}\n")
+    second = runtime.live_telemetry(worker, "", run_id=run_id)
+    third = runtime.live_telemetry(worker, "", run_id=run_id)
+
+    assert second["event_count"] == 2
+    assert second["tool_call_counts"] == {"Read": 1}
+    assert second["malformed_line_count"] == 1
+    assert second["partial_line_present"] is False
+    assert second["parsed_bytes"] == second["log_bytes"]
+    assert third["event_count"] == second["event_count"]
+    assert third["malformed_line_count"] == second["malformed_line_count"]
+    assert third["sample_sequence"] == 3
+
+
+def test_claude_live_telemetry_does_not_substitute_console_tail_for_missing_run(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {"worker_id": "wrk_missing_run", "profile": "claude-code"}
+    runtime._ensure_dirs(worker["worker_id"])
+
+    telemetry = runtime.live_telemetry(
+        worker,
+        json.dumps({"type": "assistant", "message": {"content": []}}),
+        run_id="run_missing",
+    )
+
+    assert telemetry == {
+        "schema": "glasshive.claude-run-telemetry.v1",
+        "run_id": "run_missing",
+        "telemetry_scope": "active_run_unavailable",
+    }
 
 
 def test_claude_failed_stream_never_promotes_transcript_content_to_public_error_fields(tmp_path):
@@ -3328,6 +3415,13 @@ def test_docker_cli_run_writes_timeout_active_run_status(tmp_path, monkeypatch):
             return None, stdout.strip()
 
     runtime = CaptureRuntime(base_dir=str(tmp_path / "data"))
+    recorded_metrics: list[tuple[str, str, str]] = []
+
+    def record_metrics(worker_id, recorded_run_id, stdout):
+        recorded_metrics.append((worker_id, recorded_run_id, stdout))
+        return {}, {}
+
+    runtime._record_run_metrics = record_metrics  # type: ignore[method-assign]
     worker = {"worker_id": "wrk_docker_timeout", "name": "Timeout Worker", "profile": "openclaw-general"}
     run_id = "run_docker_timeout"
 
@@ -3365,6 +3459,9 @@ def test_docker_cli_run_writes_timeout_active_run_status(tmp_path, monkeypatch):
     assert active_status["process_pid"] == 9876
     assert active_status["transcript_progress"]["files"]["stdout"]["exists"] is True
     assert active_status["evidence_path"] == "glasshive-run/evidence.json"
+    assert recorded_metrics == [
+        ("wrk_docker_timeout", run_id, "Started but still working.\n")
+    ]
 
 
 def test_docker_cli_runtime_redirects_private_instruction_from_stdin_file(tmp_path):

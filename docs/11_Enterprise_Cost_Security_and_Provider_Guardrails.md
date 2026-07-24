@@ -244,6 +244,22 @@ probe must first prove Docker/curl can run, then fail if the endpoint returns ei
 HTTP error, because any HTTP response means the endpoint is reachable. If metadata reachability ever
 succeeds, firewall drift has occurred and operators should be alerted.
 
+## Content-safe run telemetry
+
+Telemetry is bound to the active `run_id`; a newer queued run cannot replace the executing run in
+operator metrics. Claude stream telemetry stores counters and timings only, never prompts, reasoning,
+tool inputs, invoice content, or credentials.
+
+Active JSONL streams are consumed incrementally in bounded chunks. Only complete appended lines are
+counted, an unfinished line remains buffered, and each sample reports its run identity, scope,
+sequence, parsed bytes, log bytes, and last observed progress. A missing requested run is reported
+as unavailable instead of silently substituting a console tail.
+
+`GET /v1/workers/{worker_id}/telemetry` is the lightweight monitoring endpoint. The full `/live`
+endpoint supports `compact=1` during active polling to skip recursive workspace, image, and
+deliverable discovery. Runtime snapshots are written before success, process failure, timeout,
+pause, interruption, or termination so terminal evidence survives an operator cancellation.
+
 ## QA Requirements
 
 The Standard GlassHive QA cases must include:
@@ -256,6 +272,8 @@ The Standard GlassHive QA cases must include:
   including failed records and non-running containers with timeout thresholds otherwise disabled
 - active-run termination race checks proving a background processor cannot resurrect a terminated
   worker or leak a pause, interrupt, or termination reason into a later run
+- active telemetry checks proving run identity cannot drift to a newer queued run, counters remain
+  monotonic across partial JSONL writes, and large unchanged logs are not reparsed
 - resource quota checks for per-user, per-tenant, and profile allowlist limits
 - provider secret exposure checks that interactive shell startup files do not contain raw keys
 - Azure metadata blocking checks for Docker workers in cloud deployments
