@@ -2735,6 +2735,64 @@ def test_claude_stream_telemetry_is_compact_and_content_free(tmp_path):
     assert "sensitive invoice content" not in encoded
 
 
+def test_claude_live_telemetry_reads_the_complete_active_run(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_live_telemetry",
+        "name": "Invoice Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_live_telemetry"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    full_stream = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "model": "claude-opus-test",
+                    "claude_code_version": "2.1.207",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "name": "Read", "input": {"file_path": "a"}}
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "name": "Bash", "input": {"command": "true"}}
+                        ]
+                    },
+                }
+            ),
+        ]
+    )
+    (run_root / "stdout.log").write_text(full_stream, encoding="utf-8")
+
+    telemetry = runtime.live_telemetry(
+        worker,
+        full_stream.splitlines()[-1],
+        run_id=run_id,
+    )
+
+    assert telemetry["telemetry_scope"] == "full_active_run"
+    assert telemetry["event_count"] == 3
+    assert telemetry["tool_call_count"] == 2
+    assert telemetry["tool_call_counts"] == {"Bash": 1, "Read": 1}
+
+
 def test_claude_failed_stream_never_promotes_transcript_content_to_public_error_fields(tmp_path):
     runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
     worker = {

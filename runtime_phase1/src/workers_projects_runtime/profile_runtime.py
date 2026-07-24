@@ -703,10 +703,22 @@ class ProfiledWorkerRuntime:
         reader = getattr(runtime, "run_telemetry", None)
         return dict(reader(worker, run_id)) if callable(reader) else {}
 
-    def live_telemetry(self, worker: dict, stdout: str) -> dict[str, object]:
+    def live_telemetry(
+        self,
+        worker: dict,
+        stdout: str,
+        run_id: str | None = None,
+    ) -> dict[str, object]:
         runtime = self._runtime_for_worker(worker)
         reader = getattr(runtime, "live_telemetry", None)
-        return dict(reader(worker, stdout)) if callable(reader) else {}
+        if not callable(reader):
+            return {}
+        try:
+            return dict(reader(worker, stdout, run_id=run_id))
+        except TypeError as exc:
+            if "run_id" not in str(exc):
+                raise
+            return dict(reader(worker, stdout))
 
     def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
         runtime = self._runtime_for_worker(worker)
@@ -914,10 +926,24 @@ class BaseCliWorkerRuntime:
             return {}
         return value if isinstance(value, dict) else {}
 
-    def live_telemetry(self, worker: dict, stdout: str) -> dict[str, object]:
-        telemetry = self._telemetry_from_output(stdout)
+    def live_telemetry(
+        self,
+        worker: dict,
+        stdout: str,
+        run_id: str | None = None,
+    ) -> dict[str, object]:
+        telemetry_source = stdout
+        scope = "console_tail"
+        if run_id:
+            run_stdout = self._run_root(str(worker["worker_id"]), str(run_id)) / "stdout.log"
+            try:
+                telemetry_source = run_stdout.read_text(errors="replace")
+                scope = "full_active_run"
+            except OSError:
+                pass
+        telemetry = self._telemetry_from_output(telemetry_source)
         if telemetry:
-            telemetry["telemetry_scope"] = "console_tail"
+            telemetry["telemetry_scope"] = scope
         return telemetry
 
     def _read_session_key(self, worker_id: str) -> str | None:

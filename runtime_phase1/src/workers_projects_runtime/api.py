@@ -1197,7 +1197,21 @@ def create_app(
             live_telemetry_reader = getattr(runtime_impl, "live_telemetry", None)
             if callable(live_telemetry_reader):
                 try:
-                    telemetry = dict(live_telemetry_reader(worker, stdout_text))
+                    telemetry = dict(
+                        live_telemetry_reader(
+                            worker,
+                            stdout_text,
+                            run_id=str((latest_run or {}).get("run_id") or "") or None,
+                        )
+                    )
+                except TypeError as exc:
+                    if "run_id" not in str(exc):
+                        telemetry = {}
+                    else:
+                        try:
+                            telemetry = dict(live_telemetry_reader(worker, stdout_text))
+                        except Exception:
+                            telemetry = {}
                 except Exception:
                     telemetry = {}
         runtime_details = _runtime_details(worker)
