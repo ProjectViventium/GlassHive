@@ -46,6 +46,15 @@ Every enterprise deployment must configure and QA these controls before users ar
 - `WPR_SANDBOX_CPUS`, `WPR_SANDBOX_MEMORY`, `WPR_SANDBOX_MEMORY_SWAP`,
   `WPR_SANDBOX_PIDS_LIMIT`, and `WPR_SANDBOX_SHM_SIZE`: Docker worker resource caps.
 
+Termination is verified, not assumed. Docker removal must be followed by a fresh inspect proving the
+container is gone, the service rejects a termination result that still reports active compute, and
+the always-on orphan reconciler removes any container left behind a terminated or failed worker
+record, including paused or exited containers. Set `GLASSHIVE_ORPHAN_REAPER_ENABLED=false` only when
+an external reconciler provides the same guarantee. Stop reasons are scoped to the active run so an
+idle pause, interrupt, cleanup, or prior termination cannot poison a later resumed task. If a stop
+marker races with successful process completion, GlassHive recovers the completed run evidence
+before applying the stale marker.
+
 The v1 SQLite deployment should run one runtime service process per GlassHive VM. The runtime uses
 an in-process create lock for quota check plus worker insert; multi-process or multi-replica service
 scale-out requires a DB-level transaction/constraint design before it is supported.
@@ -103,10 +112,11 @@ Codex supports global default reasoning through `WPR_CODEX_CLI_REASONING_EFFORT`
 `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`, subject to the active provider route's tested
 allowlist. Enterprise deep-work deployments should prove and use `high` by default for Codex; `xhigh`
 is reserved for explicitly hard work once direct route probes and real worker runs prove it.
-Claude Code effort is selected by model/provider configuration plus the native `--effort max` flag
-when a run asks for `max`. GlassHive must project that through `WPR_CLAUDE_CODE_EFFORT=max` in the
-worker bootstrap env for MCP, UI, and direct API assignments, the generated worker command must show
-`--effort max`, and host-native preflight/command generation must fail closed if the configured
+Claude Code effort is selected by model/provider configuration plus the native `--effort` flag when
+a run asks for `max` or `xhigh`. GlassHive must project the exact requested value through
+`WPR_CLAUDE_CODE_EFFORT` in the worker bootstrap env for MCP, UI, and direct API assignments, the
+generated worker command must preserve that value, and host-native preflight/command generation must
+fail closed if the configured
 Claude CLI does not expose `--effort`. Claude Code workers should also preserve native
 Chrome/browser substrate with `--chrome` by default when the CLI supports it.
 Codex feature lockdown is opt-in only: `WPR_CODEX_CLI_DISABLE_FEATURES` must be unset by default so
@@ -116,8 +126,8 @@ GlassHive also stores per-user defaults for default worker profile and per-profi
 through authenticated preferences, so a user can make Codex, OpenClaw, or any other profile present
 in `GLASSHIVE_ALLOWED_WORKER_PROFILES` the default without affecting other users. Per-run effort
 overrides must stay allowlisted by runtime profile:
-Codex accepts `none`/`minimal`/`low`/`medium`/`high`/`xhigh`; Claude Code currently accepts `default` or
-`max`; OpenClaw currently accepts `default`, `high`, or `max`.
+Codex accepts `none`/`minimal`/`low`/`medium`/`high`/`xhigh`; Claude Code accepts `default`, `max`, or
+`xhigh` on the pinned current CLI; OpenClaw currently accepts `default`, `high`, or `max`.
 
 Portkey can be used in more than one shape, and each shape must be validated separately:
 
@@ -239,6 +249,32 @@ probe must first prove Docker/curl can run, then fail if the endpoint returns ei
 HTTP error, because any HTTP response means the endpoint is reachable. If metadata reachability ever
 succeeds, firewall drift has occurred and operators should be alerted.
 
+## Content-safe run telemetry
+
+Telemetry is bound to the active `run_id`; a newer queued run cannot replace the executing run in
+operator metrics. Claude stream telemetry stores counters and timings only, never prompts, reasoning,
+tool inputs, invoice content, or credentials.
+
+Active JSONL streams are consumed incrementally in bounded chunks. Only complete appended lines are
+counted. An ordinary unfinished line remains buffered, while an unterminated record larger than
+1 MiB is counted as malformed and discarded until its newline so monitoring memory cannot grow
+with untrusted stream content. Each sample reports its run identity, scope, sequence, parsed bytes,
+log bytes, oversized/malformed counts, and last observed progress. A missing requested run is
+reported as unavailable instead of silently substituting a console tail.
+
+`GET /v1/workers/{worker_id}/telemetry` is the lightweight monitoring endpoint. The full `/live`
+endpoint supports `compact=1` during active polling to skip recursive workspace, image, and
+deliverable discovery. Runtime snapshots are written before success, process failure, timeout,
+pause, interruption, or termination so terminal evidence survives an operator cancellation.
+Persisted and public telemetry are strict, bounded allowlists of counters, timestamps, and runtime
+identifiers. Snapshot writes are atomic and best-effort: an observability I/O failure cannot turn a
+completed workload into a failed one.
+
+The telemetry endpoint's active/latest run references are also limited to run identity, state, and
+timestamps. Prompts, instructions, model output, and error text remain available only through the
+explicitly operator-private detailed surfaces and are never part of the lightweight telemetry
+contract.
+
 ## QA Requirements
 
 The Standard GlassHive QA cases must include:
@@ -247,7 +283,13 @@ The Standard GlassHive QA cases must include:
 - unauthenticated/wrong-token/wrong-tenant probes
 - artifact traversal probes
 - signed-link tamper and expiry probes
-- lifecycle reaper checks for idle, paused, and max-duration runs
+- lifecycle reaper checks for idle, paused, max-duration, and terminal-worker orphan compute,
+  including failed records and non-running containers with timeout thresholds otherwise disabled
+- active-run termination race checks proving a background processor cannot resurrect a terminated
+  worker or leak a pause, interrupt, or termination reason into a later run
+- active telemetry checks proving run identity cannot drift to a newer queued run, counters remain
+  monotonic across partial JSONL writes, oversized unterminated records remain memory-bounded, and
+  large unchanged logs are not reparsed
 - resource quota checks for per-user, per-tenant, and profile allowlist limits
 - provider secret exposure checks that interactive shell startup files do not contain raw keys
 - Azure metadata blocking checks for Docker workers in cloud deployments

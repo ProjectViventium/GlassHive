@@ -7,10 +7,12 @@ import stat
 import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
+import workers_projects_runtime.profile_runtime as profile_runtime_module
 from workers_projects_runtime.bootstrap import GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS, GLASSHIVE_SAFETY_CHECKPOINT_RULE
 from workers_projects_runtime.failure_classification import classify_cli_failure, classify_runtime_error
 from workers_projects_runtime.openclaw_runtime import RuntimeDependencyMissingError, RuntimeErrorBase, WorkerTerminatedError
@@ -80,6 +82,23 @@ def test_terminal_target_uses_inferred_job_session_when_metadata_missing(tmp_pat
     assert target.command == ["attach", session_name]
     assert target.title == "Main Worker live session"
     assert target.subtitle == "codex-cli active run"
+
+
+def test_host_terminal_target_preserves_shell_fallback_expression(tmp_path):
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_host_terminal",
+        "name": "Host Claude",
+        "profile": "claude-code",
+        "execution_mode": "host",
+    }
+    runtime.ensure_worker_ready = lambda worker: runtime._runtime_info(worker, pid=1234)  # type: ignore[method-assign]
+    runtime._infer_active_session = lambda worker: None  # type: ignore[method-assign]
+
+    target = runtime.terminal_target(worker)
+
+    assert target.command[-1].endswith("exec ${SHELL:-/bin/bash}")
+    assert target.title == "Host Claude host terminal"
 
 
 def test_collect_completed_run_recovers_from_latest_run_artifacts(tmp_path):
@@ -483,6 +502,30 @@ def test_codex_parser_accepts_inline_final_report_section(tmp_path):
     assert output == "Only this inline result should be posted."
 
 
+def test_codex_parser_accepts_backtick_wrapped_final_report_section(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_backtick_final_report",
+        "name": "Main Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    stdout = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "Done.\n\n`FINAL REPORT:`\n\nOnly this final result should be posted.",
+            },
+        }
+    )
+
+    _, output = runtime._parse_output(worker, stdout, "", runtime._runtime_info(worker))
+
+    assert output == "Only this final result should be posted."
+
+
 def test_codex_parser_strips_plain_resume_final_report(tmp_path):
     runtime = CodexCliRuntime(base_dir=str(tmp_path))
     worker = {
@@ -861,6 +904,57 @@ def test_global_stop_reason_still_applies_to_current_run(tmp_path):
 
     with pytest.raises(WorkerTerminatedError):
         runtime._finalize_stop_reason("wrk_test", run_id="run_any")
+
+
+def test_idle_worker_termination_does_not_poison_later_run(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    runtime.sandbox.terminate = lambda worker_id: None  # type: ignore[method-assign]
+    worker = {
+        "worker_id": "wrk_test",
+        "name": "Idle Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+        "state": "ready",
+    }
+
+    runtime.terminate_worker(worker)
+
+    runtime._finalize_stop_reason(worker["worker_id"], run_id="run_later")
+
+
+def test_idle_worker_interrupt_does_not_poison_later_run(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    runtime.sandbox.inspect = lambda worker_id: None  # type: ignore[method-assign]
+    worker = {
+        "worker_id": "wrk_test",
+        "name": "Idle Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+        "state": "ready",
+    }
+
+    runtime.interrupt_worker(worker)
+
+    runtime._finalize_stop_reason(worker["worker_id"], run_id="run_later")
+
+
+def test_worker_termination_reason_is_scoped_to_active_run(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    runtime.sandbox.terminate = lambda worker_id: None  # type: ignore[method-assign]
+    worker = {
+        "worker_id": "wrk_test",
+        "name": "Active Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+        "state": "running",
+        "_active_run_id": "run_active",
+    }
+
+    runtime.terminate_worker(worker)
+
+    runtime._finalize_stop_reason(worker["worker_id"], run_id="run_later")
+    with pytest.raises(WorkerTerminatedError):
+        runtime._finalize_stop_reason(worker["worker_id"], run_id="run_active")
 
 
 def test_host_codex_runtime_materializes_required_workspace_files(tmp_path, monkeypatch):
@@ -1564,6 +1658,13 @@ def test_host_cli_run_fails_when_evidence_contract_fails(tmp_path, monkeypatch):
 def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
+    recorded_metrics: list[tuple[str, str, str]] = []
+
+    def record_metrics(worker_id, run_id, stdout):
+        recorded_metrics.append((worker_id, run_id, stdout))
+        return {}, {}
+
+    runtime._record_run_metrics = record_metrics  # type: ignore[method-assign]
     _patch_host_codex_requirement_probe(monkeypatch)
     workspace = tmp_path / "workspace"
 
@@ -1632,6 +1733,9 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
     assert active_status["transcript_progress"]["files"]["stdout"]["bytes"] > 0
     assert active_status["transcript_progress"]["last_output_at"]
     assert active_status["transcript_progress"]["quiet_seconds"] is not None
+    assert recorded_metrics == [
+        ("wrk_timeout_evidence", "run_timeout_evidence", "working before timeout\n")
+    ]
 
 
 def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monkeypatch):
@@ -1784,6 +1888,13 @@ def test_host_codex_run_sends_instruction_via_stdin_not_argv(tmp_path, monkeypat
 def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
+    recorded_metrics: list[tuple[str, str, str]] = []
+
+    def record_metrics(worker_id, run_id, stdout):
+        recorded_metrics.append((worker_id, run_id, stdout))
+        return {}, {}
+
+    runtime._record_run_metrics = record_metrics  # type: ignore[method-assign]
     _patch_host_codex_requirement_probe(monkeypatch)
     workspace = tmp_path / "workspace"
     processes: list[object] = []
@@ -1882,6 +1993,12 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
     assert display.endswith(" -")
     assert active_status["state"] == "interrupted"
     assert active_status["stop_reason"] in {"interrupted", "WorkerInterruptedError"}
+    assert recorded_metrics
+    assert all(
+        item[:2] == ("wrk_interrupt_evidence", "run_interrupt_evidence")
+        for item in recorded_metrics
+    )
+    assert "working before interrupt" in recorded_metrics[-1][2]
 
 
 def test_host_codex_runtime_default_prompts_require_final_report(tmp_path, monkeypatch):
@@ -2476,6 +2593,568 @@ def test_workspace_claude_command_ignores_host_binary_override(tmp_path, monkeyp
     assert runtime.binary == "claude"
     assert command[0] == "claude"
     assert "/opt/homebrew/bin/claude" not in " ".join(command)
+    assert command[command.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in command
+
+
+def test_workspace_claude_command_passes_configured_api_timeout(tmp_path, monkeypatch):
+    monkeypatch.setenv("API_TIMEOUT_MS", "900000")
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_workspace_claude_timeout",
+        "name": "Workspace Claude Worker",
+        "profile": "claude-code",
+        "execution_mode": "docker",
+        "model": "claude-opus-test",
+    }
+
+    _command, env = runtime._build_command(worker, "do the work", runtime._runtime_info(worker))
+
+    assert env["API_TIMEOUT_MS"] == "900000"
+
+
+def test_claude_usage_parser_preserves_input_output_and_cache_tokens(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    stdout = json.dumps(
+        {
+            "type": "result",
+            "session_id": "session-usage",
+            "result": "done",
+            "usage": {
+                "input_tokens": 58,
+                "output_tokens": 108055,
+                "cache_read_input_tokens": 5236386,
+                "cache_creation_input_tokens": 241709,
+            },
+        }
+    )
+
+    assert runtime._usage_from_output(stdout) == {
+        "input_tokens": 58,
+        "output_tokens": 108055,
+        "cache_read_input_tokens": 5236386,
+        "cache_creation_input_tokens": 241709,
+    }
+
+
+def test_claude_usage_parser_rejects_negative_boolean_and_malformed_values(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    stdout = json.dumps(
+        {
+            "type": "result",
+            "usage": {
+                "input_tokens": -1,
+                "output_tokens": True,
+                "cache_read_input_tokens": "120",
+                "cache_creation_input_tokens": None,
+            },
+        }
+    )
+
+    assert runtime._usage_from_output(stdout) == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 120,
+        "cache_creation_input_tokens": 0,
+    }
+
+
+def test_claude_stream_telemetry_is_compact_and_content_free(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "claude_code_version": "2.1.207",
+                    "model": "claude-opus-test",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg-telemetry-1",
+                        "usage": {
+                            "input_tokens": 12,
+                            "output_tokens": 7,
+                            "cache_read_input_tokens": 40,
+                            "cache_creation_input_tokens": 3,
+                        },
+                        "content": [
+                            {"type": "thinking", "thinking": "private reasoning"},
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {"file_path": "/private/invoice.pdf"},
+                            },
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "user",
+                    "timestamp": "2026-07-24T10:11:12.000Z",
+                    "tool_use_result": "sensitive invoice content",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "api_retry",
+                    "retry_delay_ms": 1500,
+                    "error_status": 529,
+                }
+            ),
+            "{not valid json",
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "session_id": "session-telemetry",
+                    "duration_ms": 125000,
+                    "duration_api_ms": 121000,
+                    "num_turns": 8,
+                    "is_error": False,
+                    "stop_reason": "end_turn",
+                    "ttft_ms": 2424,
+                    "ttft_stream_ms": 1411,
+                    "time_to_request_ms": 24,
+                    "total_cost_usd": 3.25,
+                    "usage": {
+                        "input_tokens": 58,
+                        "output_tokens": 100,
+                        "cache_read_input_tokens": 800,
+                        "cache_creation_input_tokens": 75,
+                        "service_tier": "standard",
+                        "speed": "standard",
+                    },
+                }
+            ),
+        ]
+    )
+
+    telemetry = runtime._telemetry_from_output(stdout)
+    first_timestamp = telemetry.pop("first_timestamp")
+    last_timestamp = telemetry.pop("last_timestamp")
+
+    assert telemetry == {
+        "schema": "glasshive.claude-run-telemetry.v1",
+        "claude_code_version": "2.1.207",
+        "model": "claude-opus-test",
+        "service_tier": "standard",
+        "speed": "standard",
+        "result_state": "success",
+        "is_error": False,
+        "stop_reason": "end_turn",
+        "duration_ms": 125000,
+        "duration_api_ms": 121000,
+        "duration_non_api_ms": 4000,
+        "ttft_ms": 2424,
+        "ttft_stream_ms": 1411,
+        "time_to_request_ms": 24,
+        "num_turns": 8,
+        "api_retry_count": 1,
+        "api_retry_delay_ms": 1500,
+        "api_retry_statuses": ["529"],
+        "tool_call_count": 1,
+        "tool_call_counts": {"Read": 1},
+        "event_count": 5,
+        "malformed_line_count": 1,
+        "oversized_line_count": 0,
+        "stream_input_tokens": 12,
+        "stream_output_tokens": 7,
+        "stream_cache_read_input_tokens": 40,
+        "stream_cache_creation_input_tokens": 3,
+        "total_cost_usd": 3.25,
+    }
+    assert datetime.fromisoformat(first_timestamp)
+    assert datetime.fromisoformat(last_timestamp)
+    encoded = json.dumps(telemetry)
+    assert "private reasoning" not in encoded
+    assert "invoice.pdf" not in encoded
+    assert "sensitive invoice content" not in encoded
+
+
+def test_claude_stream_usage_is_counted_once_per_message_id_and_error_subtype_is_preserved(
+    tmp_path,
+):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    assistant = {
+        "type": "assistant",
+        "message": {
+            "id": "msg-duplicate",
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 8,
+                "cache_read_input_tokens": 100,
+                "cache_creation_input_tokens": 4,
+            },
+            "content": [],
+        },
+    }
+    stdout = "\n".join(
+        [
+            json.dumps(assistant),
+            json.dumps(assistant),
+            json.dumps({"type": "result", "subtype": "error_max_turns"}),
+        ]
+    )
+
+    telemetry = runtime._telemetry_from_output(stdout)
+
+    assert telemetry["stream_input_tokens"] == 20
+    assert telemetry["stream_output_tokens"] == 8
+    assert telemetry["stream_cache_read_input_tokens"] == 100
+    assert telemetry["stream_cache_creation_input_tokens"] == 4
+    assert telemetry["result_state"] == "error_max_turns"
+    assert telemetry["is_error"] is True
+
+
+def test_claude_live_telemetry_reads_the_complete_active_run(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_live_telemetry",
+        "name": "Invoice Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_live_telemetry"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    full_stream = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "model": "claude-opus-test",
+                    "claude_code_version": "2.1.207",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "name": "Read", "input": {"file_path": "a"}}
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "name": "Bash", "input": {"command": "true"}}
+                        ]
+                    },
+                }
+            ),
+        ]
+    )
+    (run_root / "stdout.log").write_text(full_stream + "\n", encoding="utf-8")
+
+    telemetry = runtime.live_telemetry(
+        worker,
+        full_stream.splitlines()[-1],
+        run_id=run_id,
+    )
+
+    assert telemetry["telemetry_scope"] == "full_active_run_incremental"
+    assert telemetry["run_id"] == run_id
+    assert telemetry["event_count"] == 3
+    assert telemetry["tool_call_count"] == 2
+    assert telemetry["tool_call_counts"] == {"Bash": 1, "Read": 1}
+    assert telemetry["last_stream_activity_at"] == telemetry["last_progress_at"]
+    assert telemetry["seconds_since_stream_activity"] == telemetry["seconds_since_progress"]
+
+
+def test_claude_live_telemetry_consumes_only_complete_appended_lines(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_incremental_telemetry",
+        "name": "Invoice Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_incremental_telemetry"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    stdout_path = run_root / "stdout.log"
+    init_line = json.dumps({"type": "system", "subtype": "init", "model": "claude-opus-test"})
+    assistant_line = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "Read", "input": {}}]},
+        }
+    )
+    split_at = len(assistant_line) // 2
+    stdout_path.write_text(init_line + "\n" + assistant_line[:split_at], encoding="utf-8")
+
+    first = runtime.live_telemetry(worker, "", run_id=run_id)
+
+    assert first["event_count"] == 1
+    assert first["malformed_line_count"] == 0
+    assert first["partial_line_present"] is True
+    assert first["sample_sequence"] == 1
+
+    with stdout_path.open("a", encoding="utf-8") as handle:
+        handle.write(assistant_line[split_at:] + "\n{not-json}\n")
+    second = runtime.live_telemetry(worker, "", run_id=run_id)
+    third = runtime.live_telemetry(worker, "", run_id=run_id)
+
+    assert second["event_count"] == 2
+    assert second["tool_call_counts"] == {"Read": 1}
+    assert second["malformed_line_count"] == 1
+    assert second["partial_line_present"] is False
+    assert second["parsed_bytes"] == second["log_bytes"]
+    assert third["event_count"] == second["event_count"]
+    assert third["malformed_line_count"] == second["malformed_line_count"]
+    assert third["sample_sequence"] == 3
+
+
+def test_claude_live_telemetry_deduplicates_tool_calls_by_id(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_deduplicated_tools",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_deduplicated_tools"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    repeated = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": "toolu_123", "name": "Read", "input": {}}
+                ]
+            },
+        }
+    )
+    (run_root / "stdout.log").write_text(repeated + "\n" + repeated + "\n")
+
+    telemetry = runtime.live_telemetry(worker, "", run_id=run_id)
+
+    assert telemetry["event_count"] == 2
+    assert telemetry["tool_call_count"] == 1
+    assert telemetry["tool_call_counts"] == {"Read": 1}
+
+
+def test_claude_live_telemetry_does_not_substitute_console_tail_for_missing_run(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {"worker_id": "wrk_missing_run", "profile": "claude-code"}
+    runtime._ensure_dirs(worker["worker_id"])
+
+    telemetry = runtime.live_telemetry(
+        worker,
+        json.dumps({"type": "assistant", "message": {"content": []}}),
+        run_id="run_missing",
+    )
+
+    assert telemetry == {
+        "schema": "glasshive.claude-run-telemetry.v1",
+        "run_id": "run_missing",
+        "telemetry_scope": "active_run_unavailable",
+    }
+
+
+def test_claude_live_telemetry_bounds_an_unterminated_oversized_record(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_oversized_telemetry",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_oversized"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    stdout_path = run_root / "stdout.log"
+    stdout_path.write_bytes(b"x" * (5 * 1024 * 1024))
+
+    first = runtime.live_telemetry(worker, "", run_id=run_id)
+    cached = runtime._live_telemetry_cache[(worker["worker_id"], run_id)]
+
+    assert first["malformed_line_count"] == 1
+    assert first["oversized_line_count"] == 1
+    assert first["partial_line_present"] is True
+    assert len(cached["partial"]) == 0
+    assert cached["discarding_oversized_line"] is True
+
+    with stdout_path.open("ab") as handle:
+        handle.write(
+            b"\n"
+            + json.dumps(
+                {"type": "system", "subtype": "init", "model": "claude-opus-test"}
+            ).encode()
+            + b"\n"
+        )
+    second = runtime.live_telemetry(worker, "", run_id=run_id)
+
+    assert second["event_count"] == 1
+    assert second["malformed_line_count"] == 1
+    assert second["oversized_line_count"] == 1
+    assert second["partial_line_present"] is False
+
+
+def test_active_run_terminal_status_is_atomic_and_cannot_be_downgraded_by_heartbeat(tmp_path):
+    status_path = tmp_path / "active-run.json"
+    worker = {
+        "worker_id": "wrk_status_race",
+        "profile": "claude-code",
+        "execution_mode": "docker",
+    }
+    arguments = {
+        "path": status_path,
+        "worker": worker,
+        "run_id": "run_status_race",
+        "runtime_name": "claude-code",
+        "model": "claude-opus-test",
+        "transcript_paths": {},
+        "started_at": "2026-07-24T12:00:00Z",
+        "process_pid": 123,
+        "timeout_seconds": 30.0,
+    }
+    profile_runtime_module._write_active_run_status(state="running", **arguments)
+
+    start = threading.Event()
+
+    def heartbeat_writer():
+        start.wait()
+        for _ in range(200):
+            profile_runtime_module._write_active_run_status(state="running", **arguments)
+
+    heartbeat = threading.Thread(target=heartbeat_writer)
+    heartbeat.start()
+    start.set()
+    profile_runtime_module._write_active_run_status(
+        state="timeout",
+        stop_reason="timeout",
+        **arguments,
+    )
+    heartbeat.join()
+    profile_runtime_module._write_active_run_status(state="running", **arguments)
+
+    status = json.loads(status_path.read_text())
+    assert status["run_id"] == "run_status_race"
+    assert status["state"] == "timeout"
+    assert status["stop_reason"] == "timeout"
+
+
+def test_persisted_run_telemetry_is_atomic_and_content_allowlisted(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {"worker_id": "wrk_safe_telemetry", "profile": "claude-code"}
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_safe"
+    path = runtime._run_root(worker["worker_id"], run_id) / "telemetry.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "event_count": 7,
+                "model": "SECRET-INVOICE-CONTENT",
+                "stop_reason": "customer-name",
+                "prompt": "private invoice line",
+            }
+        )
+    )
+
+    assert runtime.run_telemetry(worker, run_id) == {
+        "schema": "glasshive.claude-run-telemetry.v1",
+        "run_id": run_id,
+        "event_count": 7,
+    }
+
+    monkeypatch.setattr(os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("disk")))
+    telemetry = runtime._record_run_telemetry(
+        worker["worker_id"],
+        "run_atomic_failure",
+        json.dumps({"type": "system", "subtype": "init", "model": "claude-opus-test"}),
+    )
+    assert telemetry["run_id"] == "run_atomic_failure"
+
+
+def test_claude_failed_stream_never_promotes_transcript_content_to_public_error_fields(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_failed_claude_stream",
+        "name": "Invoice Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_failed_claude_stream"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    sensitive = "INVOICE 999999 PRIVATE-LINE-CONTENT"
+    (run_root / "stdout.log").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {"content": [{"type": "text", "text": sensitive}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error",
+                        "is_error": True,
+                        "error_status": 529,
+                        "result": "API Error: 529 Overloaded",
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    (run_root / "stderr.log").write_text("")
+    (run_root / "exit_code").write_text("1")
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+
+    assert recovered is not None
+    assert recovered["state"] == "failed"
+    assert recovered["failure_class"] == "provider_response_failed"
+    assert sensitive not in recovered["error_text"]
+    assert sensitive not in recovered["failure_diagnostic_summary"]
+    assert "Overloaded" not in recovered["failure_diagnostic_summary"]
+    assert recovered["telemetry"]["api_retry_statuses"] == []
+
+
+def test_claude_run_telemetry_is_recorded_and_read_back(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker_id = "wrk_telemetry"
+    run_id = "run_telemetry"
+    stdout = json.dumps(
+        {
+            "type": "result",
+            "subtype": "error",
+            "duration_ms": 4000,
+            "duration_api_ms": 3900,
+            "num_turns": 2,
+            "is_error": True,
+            "stop_reason": "max_tokens",
+        }
+    )
+
+    recorded = runtime._record_run_telemetry(worker_id, run_id, stdout)
+
+    assert recorded["result_state"] == "error"
+    assert recorded["is_error"] is True
+    assert runtime.run_telemetry({"worker_id": worker_id}, run_id) == recorded
+    telemetry_path = runtime._run_root(worker_id, run_id) / "telemetry.json"
+    assert telemetry_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_workspace_claude_command_honors_per_run_max_effort(tmp_path, monkeypatch):
@@ -2493,6 +3172,22 @@ def test_workspace_claude_command_honors_per_run_max_effort(tmp_path, monkeypatc
     command, _ = runtime._build_command(worker, "do the work", info)
 
     assert command[command.index("--effort") + 1] == "max"
+
+
+def test_workspace_claude_command_honors_per_run_xhigh_effort(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_workspace_claude_xhigh",
+        "name": "Workspace Claude Worker",
+        "profile": "claude-code",
+        "execution_mode": "docker",
+        "model": "claude-opus-4-8",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CLAUDE_CODE_EFFORT": "xhigh"}}),
+    }
+
+    command, _ = runtime._build_command(worker, "do the work", runtime._runtime_info(worker))
+
+    assert command[command.index("--effort") + 1] == "xhigh"
 
 
 def test_workspace_claude_max_effort_preflight_requires_effort_support(tmp_path, monkeypatch):
@@ -2523,7 +3218,12 @@ def test_workspace_claude_max_effort_preflight_accepts_effort_support(tmp_path, 
     monkeypatch.setattr(
         runtime.sandbox,
         "_docker",
-        lambda *args, **kwargs: subprocess.CompletedProcess(args, returncode=0, stdout="Usage: claude [options] --effort\n", stderr=""),
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="Usage: claude [options] --effort <level> (low, medium, high, xhigh, max)\n",
+            stderr="",
+        ),
     )
     worker = {
         "worker_id": "wrk_workspace_claude_effort",
@@ -2536,6 +3236,31 @@ def test_workspace_claude_max_effort_preflight_accepts_effort_support(tmp_path, 
     runtime._preflight_workspace_effort_support(worker)
 
     assert calls == ["image"]
+
+
+def test_workspace_claude_xhigh_effort_preflight_rejects_older_effort_contract(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    ClaudeCodeRuntime._workspace_effort_support_cache.clear()
+    monkeypatch.setattr(runtime.sandbox, "_ensure_image", lambda: None)
+    monkeypatch.setattr(
+        runtime.sandbox,
+        "_docker",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="Usage: claude [options] --effort <level> (low, medium, high, max)\n",
+            stderr="",
+        ),
+    )
+    worker = {
+        "worker_id": "wrk_workspace_claude_xhigh_unsupported",
+        "profile": "claude-code",
+        "execution_mode": "docker",
+        "bootstrap_bundle_json": json.dumps({"env": {"WPR_CLAUDE_CODE_EFFORT": "xhigh"}}),
+    }
+
+    with pytest.raises(RuntimeDependencyMissingError, match="xhigh"):
+        runtime._preflight_workspace_effort_support(worker)
 
 
 def test_host_claude_command_enables_chrome_by_default(tmp_path, monkeypatch):
@@ -2568,6 +3293,57 @@ def test_host_claude_command_enables_chrome_by_default(tmp_path, monkeypatch):
     stdin_text = runtime._command_stdin_text(worker, "do the work", info)
     assert stdin_text and stdin_text.startswith("do the work")
     assert "FINAL REPORT:" in stdin_text
+
+
+def test_host_claude_command_honors_xhigh_effort(tmp_path, monkeypatch):
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"--help\" ]]; then echo 'Usage: claude [options] --effort <level> (low, medium, high, xhigh, max)'; exit 0; fi\n"
+        "echo '2.1.207 (Claude Code)'\n"
+    )
+    fake_claude.chmod(0o755)
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(fake_claude)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "xhigh")
+    worker = {
+        "worker_id": "wrk_host_claude_xhigh",
+        "name": "Host Claude Worker",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "model": "claude-opus-4-8",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+
+    command, _ = runtime._build_command(worker, "do the work", runtime._host_runtime_info(worker))
+
+    assert command[command.index("--effort") + 1] == "xhigh"
+
+
+def test_host_claude_xhigh_effort_rejects_older_effort_contract(tmp_path, monkeypatch):
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"--help\" ]]; then echo 'Usage: claude [options] --effort <level> (low, medium, high, max)'; exit 0; fi\n"
+        "echo '2.1.178 (Claude Code)'\n"
+    )
+    fake_claude.chmod(0o755)
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(fake_claude)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "xhigh")
+    worker = {
+        "worker_id": "wrk_host_claude_xhigh_unsupported",
+        "name": "Host Claude Worker",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "model": "claude-opus-4-8",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+
+    with pytest.raises(RuntimeDependencyMissingError, match="xhigh"):
+        runtime._build_command(worker, "do the work", runtime._host_runtime_info(worker))
 
 
 def test_host_claude_chrome_can_be_explicitly_disabled(tmp_path, monkeypatch):
@@ -2795,6 +3571,7 @@ def test_docker_cli_runtime_sources_runtime_and_openclaw_env_files(tmp_path):
         assert '$HOME/.glasshive/runtime.env' in script
         assert '$HOME/.wpr-openclaw/openclaw.env' in script
         assert "GLASSHIVE_ACTIVE_RUN_ID=run_capture" in script
+        assert "GLASSHIVE_RUN_ID=run_capture" in script
         assert "GLASSHIVE_ACTIVE_WORKER_ID=wrk_capture" in script
         (run_root / "stdout.log").write_text("FINAL REPORT:\nok")
         (run_root / "stderr.log").write_text("")
@@ -2841,6 +3618,13 @@ def test_docker_cli_run_writes_timeout_active_run_status(tmp_path, monkeypatch):
             return None, stdout.strip()
 
     runtime = CaptureRuntime(base_dir=str(tmp_path / "data"))
+    recorded_metrics: list[tuple[str, str, str]] = []
+
+    def record_metrics(worker_id, recorded_run_id, stdout):
+        recorded_metrics.append((worker_id, recorded_run_id, stdout))
+        return {}, {}
+
+    runtime._record_run_metrics = record_metrics  # type: ignore[method-assign]
     worker = {"worker_id": "wrk_docker_timeout", "name": "Timeout Worker", "profile": "openclaw-general"}
     run_id = "run_docker_timeout"
 
@@ -2878,6 +3662,9 @@ def test_docker_cli_run_writes_timeout_active_run_status(tmp_path, monkeypatch):
     assert active_status["process_pid"] == 9876
     assert active_status["transcript_progress"]["files"]["stdout"]["exists"] is True
     assert active_status["evidence_path"] == "glasshive-run/evidence.json"
+    assert recorded_metrics == [
+        ("wrk_docker_timeout", run_id, "Started but still working.\n")
+    ]
 
 
 def test_docker_cli_runtime_redirects_private_instruction_from_stdin_file(tmp_path):
@@ -2915,6 +3702,8 @@ def test_docker_cli_runtime_redirects_private_instruction_from_stdin_file(tmp_pa
         run_root = runtime._run_root(worker_id, run_id)
         script = (run_root / "run.sh").read_text()
         stdin_path = run_root / "instruction.stdin"
+        assert (run_root / "stdout.log").is_file()
+        assert (run_root / "stderr.log").is_file()
         assert stdin_path.exists()
         assert stdin_path.read_text().startswith("Sensitive docker instruction.")
         assert oct(stdin_path.stat().st_mode & 0o777) == "0o600"
@@ -3179,6 +3968,42 @@ def test_claude_code_runtime_passes_headless_oauth_without_api_key_mode(tmp_path
 
     assert "ANTHROPIC_API_KEY" not in env
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "claude-oauth-test"
+
+
+def test_claude_code_runtime_uses_bedrock_provider_model_without_oauth(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_claude_bedrock",
+        "name": "Claude Bedrock Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-4-8",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    provider_model = (
+        "arn:aws:bedrock:us-east-1:123456789012:"
+        "application-inference-profile/opus-48-test"
+    )
+    monkeypatch.setenv("WPR_CLAUDE_CODE_PROVIDER_MODEL", provider_model)
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLEONLY0000")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "synthetic-secret-not-real")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-pass")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-pass")
+
+    command, env = runtime._build_command(
+        worker, "Create the artifact.", runtime._runtime_info(worker)
+    )
+
+    assert command[command.index("--model") + 1] == provider_model
+    assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+    assert env["AWS_ACCESS_KEY_ID"] == "AKIAEXAMPLEONLY0000"
+    assert env["AWS_SECRET_ACCESS_KEY"] == "synthetic-secret-not-real"
+    assert env["AWS_REGION"] == "us-east-1"
+    assert env["AWS_EC2_METADATA_DISABLED"] == "true"
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "ANTHROPIC_API_KEY" not in env
 
 
 def test_host_env_strips_parent_secrets_and_keeps_minimal_runtime_context(tmp_path, monkeypatch):
@@ -4042,12 +4867,16 @@ def test_openclaw_projects_ignore_unknown_compat_max_token_field(tmp_path, monke
 def test_redact_text_masks_parent_visible_secret_shapes():
     synthetic_openai_token = "sk-" + "abc123456789xyz"
     synthetic_bearer = "abcdef" + "ghijklmnopqrstuvwxyz"
+    synthetic_aws_access_key = "AKIA" + "EXAMPLEONLY00000"
     redacted = _redact_text(
-        f"Authorization: {'Bearer'} {synthetic_bearer} token=super-secret-value {synthetic_openai_token}"
+        f"Authorization: {'Bearer'} {synthetic_bearer} token=super-secret-value "
+        f"{synthetic_openai_token} {synthetic_aws_access_key}"
     )
     assert "abcdefghijklmnopqrstuvwxyz" not in redacted
     assert "super-secret-value" not in redacted
     assert synthetic_openai_token not in redacted
+    assert synthetic_aws_access_key not in redacted
+    assert "[REDACTED_AWS_ACCESS_KEY]" in redacted
     assert "[REDACTED]" in redacted
 
 

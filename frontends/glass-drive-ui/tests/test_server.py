@@ -409,6 +409,22 @@ def test_launch_applies_claude_max_effort_to_runtime_env():
     assert "Worker effort preference" not in bundle.get("system_instructions", "")
 
 
+def test_launch_applies_claude_xhigh_effort_to_runtime_env():
+    fake = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=fake))
+
+    launch = client.post('/api/launch', json={
+        'description': 'Create a report',
+        'success_criteria': 'Report exists',
+        'workspace_option': 'new:claude-code',
+        'effort': 'xhigh',
+    })
+
+    assert launch.status_code == 200
+    bundle = fake.create_worker_requests[-1]['bootstrap_bundle']
+    assert bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == "xhigh"
+
+
 def test_launch_watch_url_uses_short_ref_when_signed_links_enabled(monkeypatch):
     monkeypatch.setenv("WPR_API_TOKEN", "ui-service-token")
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "ui-signed-link-secret")

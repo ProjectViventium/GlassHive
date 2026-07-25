@@ -409,7 +409,7 @@ def _is_agent_substep_status(value: dict[str, Any], *, event_type: str, path: st
 def _dict_has_failure_signal(value: dict[str, Any]) -> bool:
     if value.get("is_error") is True:
         return True
-    for key in ("api_error_status", "status_code", "error_code"):
+    for key in ("error_status", "api_error_status", "status_code", "error_code"):
         if _failure_scalar_has_value(value.get(key)):
             return True
     return any(key in value and _failure_scalar_has_value(value.get(key)) for key in ("error", "failure"))
@@ -425,6 +425,7 @@ def _failure_scalar_has_value(value: Any) -> bool:
 
 def _failure_key_creates_context(key: str) -> bool:
     return key.lower() in {
+        "error_status",
         "api_error_status",
         "detail",
         "error",
@@ -438,6 +439,7 @@ def _failure_key_creates_context(key: str) -> bool:
 def _looks_failure_field(key: str) -> bool:
     lowered = key.lower()
     return lowered in {
+        "error_status",
         "api_error_status",
         "detail",
         "error",
@@ -452,7 +454,8 @@ def _looks_failure_field(key: str) -> bool:
 
 def _looks_like_provider_service_failure(lowered: str, *, structured: bool = False) -> bool:
     if (
-        "api_error_status" in lowered and "529" in lowered
+        ("error_status" in lowered or "api_error_status" in lowered)
+        and "529" in lowered
     ) or (
         "529" in lowered and "overloaded" in lowered
     ) or (
@@ -472,7 +475,7 @@ def _looks_like_provider_service_failure(lowered: str, *, structured: bool = Fal
 def _has_contextual_status_code(lowered: str, codes: tuple[str, ...]) -> bool:
     for code in codes:
         status_after_label = re.search(
-            rf"\b(?:api_error_status|status_code|status\s+code|http\s+status|response\s+status|http|status|code)"
+            rf"\b(?:error_status|api_error_status|status_code|status\s+code|http\s+status|response\s+status|http|status|code)"
             rf"\D{{0,24}}{re.escape(code)}\b",
             lowered,
         )
@@ -554,6 +557,7 @@ def _looks_failure_related(value: str) -> bool:
         "response.failed",
         "turn.failed",
         "api error",
+        "error_status",
         "api_error_status",
         "overloaded",
         "server-side issue",

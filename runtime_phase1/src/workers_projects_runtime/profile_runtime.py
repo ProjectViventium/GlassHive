@@ -61,6 +61,172 @@ logger = logging.getLogger(__name__)
 _CODEX_MCP_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 _HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off", "none", "disabled"}
+_MAX_TELEMETRY_LINE_BYTES = 1024 * 1024
+_ACTIVE_RUN_STATUS_LOCK = Lock()
+_ACTIVE_RUN_TERMINAL_STATES = frozenset(
+    {"completed", "failed", "timeout", "paused", "interrupted", "terminated"}
+)
+_TELEMETRY_INTEGER_FIELDS = frozenset(
+    {
+        "duration_ms",
+        "duration_api_ms",
+        "ttft_ms",
+        "ttft_stream_ms",
+        "time_to_request_ms",
+        "num_turns",
+        "api_retry_count",
+        "api_retry_delay_ms",
+        "tool_call_count",
+        "event_count",
+        "assistant_event_count",
+        "malformed_line_count",
+        "oversized_line_count",
+        "sample_sequence",
+        "parsed_bytes",
+        "log_bytes",
+        "stream_input_tokens",
+        "stream_output_tokens",
+        "stream_cache_read_input_tokens",
+        "stream_cache_creation_input_tokens",
+    }
+)
+_TELEMETRY_TOKEN_FIELDS = frozenset(
+    {
+        "claude_code_version",
+        "model",
+        "service_tier",
+        "speed",
+        "result_state",
+        "stop_reason",
+        "telemetry_scope",
+        "run_id",
+    }
+)
+_TELEMETRY_TIMESTAMP_FIELDS = frozenset(
+    {
+        "first_timestamp",
+        "last_timestamp",
+        "sampled_at",
+        "first_observed_at",
+        "last_progress_at",
+    }
+)
+_SAFE_TELEMETRY_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.:/+-]{0,63}$")
+_TELEMETRY_TOKEN_PATTERNS = {
+    "claude_code_version": re.compile(r"^\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]+)?$"),
+    "model": re.compile(r"^(?:claude|anthropic)[A-Za-z0-9_.:/+-]{0,120}$"),
+    "service_tier": re.compile(r"^(?:standard|priority|batch|flex|default)$"),
+    "speed": re.compile(r"^(?:standard|fast|normal|default)$"),
+    "result_state": re.compile(
+        r"^(?:success|error|failed|cancelled|interrupted|timeout|error_[a-z0-9_]{1,48})$"
+    ),
+    "stop_reason": re.compile(
+        r"^(?:end_turn|max_tokens|tool_use|stop_sequence|refusal|error|timeout|"
+        r"cancelled|interrupted|terminated|paused|completed)$"
+    ),
+    "telemetry_scope": re.compile(
+        r"^(?:full_active_run_incremental|full_active_run|console_tail|"
+        r"active_run_unavailable)$"
+    ),
+    "run_id": re.compile(r"^(?:run[_-]?|r)[A-Za-z0-9_-]{0,120}$"),
+}
+
+
+def _safe_run_telemetry(value: object, *, run_id: str | None = None) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    safe: dict[str, object] = {}
+    for key in _TELEMETRY_INTEGER_FIELDS:
+        if key not in value or isinstance(value[key], bool):
+            continue
+        try:
+            safe[key] = max(0, int(value[key]))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    for key in _TELEMETRY_TOKEN_FIELDS:
+        text = str(value.get(key) or "").strip()
+        if text and _TELEMETRY_TOKEN_PATTERNS[key].fullmatch(text):
+            safe[key] = text
+    for key in _TELEMETRY_TIMESTAMP_FIELDS:
+        text = str(value.get(key) or "").strip()
+        if not text:
+            continue
+        try:
+            datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        safe[key] = text[:128]
+    if isinstance(value.get("is_error"), bool):
+        safe["is_error"] = value["is_error"]
+    if isinstance(value.get("partial_line_present"), bool):
+        safe["partial_line_present"] = value["partial_line_present"]
+    for key in ("seconds_since_progress", "total_cost_usd"):
+        if key not in value or isinstance(value[key], bool):
+            continue
+        try:
+            number = float(value[key])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if number == number and abs(number) != float("inf") and number >= 0:
+            safe[key] = number
+    statuses = value.get("api_retry_statuses")
+    if isinstance(statuses, (list, tuple)):
+        safe_statuses = sorted(
+            {
+                str(item).strip()
+                for item in statuses[:20]
+                if re.fullmatch(r"^[A-Za-z0-9_.:/+-]{1,32}$", str(item).strip())
+            }
+        )
+        safe["api_retry_statuses"] = safe_statuses
+    counts = value.get("tool_call_counts")
+    if isinstance(counts, dict):
+        safe_counts: dict[str, int] = {}
+        for raw_name, raw_count in list(counts.items())[:100]:
+            name = str(raw_name or "").strip()
+            if not _SAFE_TELEMETRY_NAME.fullmatch(name) or isinstance(raw_count, bool):
+                continue
+            try:
+                safe_counts[name] = max(0, int(raw_count))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        if safe_counts:
+            safe["tool_call_counts"] = dict(sorted(safe_counts.items()))
+    expected_run_id = str(run_id or "").strip()
+    nested_run_id = str(safe.get("run_id") or "").strip()
+    if expected_run_id:
+        if nested_run_id and nested_run_id != expected_run_id:
+            return {}
+        safe["run_id"] = expected_run_id
+    if safe:
+        safe["schema"] = "glasshive.claude-run-telemetry.v1"
+    return safe
+
+
+def _write_private_json(path: Path, value: object) -> bool:
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(value, sort_keys=True))
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        path.chmod(0o600)
+        return True
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def _claude_effort_help_supports(help_text: str, effort: str) -> bool:
+    marker = help_text.find("--effort")
+    if marker < 0:
+        return False
+    if effort != "xhigh":
+        return True
+    return re.search(r"\bxhigh\b", help_text[marker : marker + 320], flags=re.IGNORECASE) is not None
 
 
 def _codex_mcp_section_server_name(section_name: str) -> str | None:
@@ -684,6 +850,39 @@ class ProfiledWorkerRuntime:
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
         return self._runtime_for_worker(worker).run_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
 
+    def run_usage(self, worker: dict, run_id: str) -> dict[str, int]:
+        runtime = self._runtime_for_worker(worker)
+        reader = getattr(runtime, "run_usage", None)
+        return dict(reader(worker, run_id)) if callable(reader) else {}
+
+    def run_telemetry(self, worker: dict, run_id: str) -> dict[str, object]:
+        runtime = self._runtime_for_worker(worker)
+        reader = getattr(runtime, "run_telemetry", None)
+        return dict(reader(worker, run_id)) if callable(reader) else {}
+
+    def live_telemetry(
+        self,
+        worker: dict,
+        stdout: str,
+        run_id: str | None = None,
+    ) -> dict[str, object]:
+        runtime = self._runtime_for_worker(worker)
+        reader = getattr(runtime, "live_telemetry", None)
+        if not callable(reader):
+            return {}
+        try:
+            return dict(reader(worker, stdout, run_id=run_id))
+        except TypeError as exc:
+            if "run_id" not in str(exc):
+                raise
+            if run_id:
+                return {
+                    "schema": "glasshive.claude-run-telemetry.v1",
+                    "run_id": str(run_id),
+                    "telemetry_scope": "active_run_unavailable",
+                }
+            return dict(reader(worker, stdout))
+
     def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
         runtime = self._runtime_for_worker(worker)
         checker = getattr(runtime, "worker_capacity_error", None)
@@ -693,6 +892,13 @@ class ProfiledWorkerRuntime:
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).reconcile_worker(worker)
+
+    def worker_compute_present(self, worker: dict) -> bool:
+        runtime = self._runtime_for_worker(worker)
+        checker = getattr(runtime, "worker_compute_present", None)
+        if callable(checker):
+            return bool(checker(worker))
+        return bool(runtime.reconcile_worker(worker).pid)
 
     def terminal_target(self, worker: dict) -> TerminalTarget:
         runtime = self._runtime_for_worker(worker)
@@ -781,6 +987,8 @@ class BaseCliWorkerRuntime:
         self._process_lock = Lock()
         self._active_processes: dict[str, subprocess.Popen[str]] = {}
         self._stop_reasons: dict[tuple[str, str | None], str] = {}
+        self._live_telemetry_lock = Lock()
+        self._live_telemetry_cache: dict[tuple[str, str], dict[str, object]] = {}
         self.sandbox = DockerSandboxManager(base_dir=str(self.base_dir))
 
     def resolve_model(self, profile: str) -> str:
@@ -825,6 +1033,89 @@ class BaseCliWorkerRuntime:
     def _ensure_dirs(self, worker_id: str) -> None:
         self._workspace_dir(worker_id).mkdir(parents=True, exist_ok=True)
         self._home_dir(worker_id).mkdir(parents=True, exist_ok=True)
+
+    def _usage_from_output(self, stdout: str) -> dict[str, int]:
+        _ = stdout
+        return {}
+
+    def _telemetry_from_output(self, stdout: str) -> dict[str, object]:
+        _ = stdout
+        return {}
+
+    def _record_run_usage(self, worker_id: str, run_id: str, stdout: str) -> dict[str, int]:
+        usage = self._usage_from_output(stdout)
+        if usage:
+            path = self._run_root(worker_id, run_id) / "usage.json"
+            _write_private_json(path, usage)
+        return usage
+
+    def _record_run_telemetry(self, worker_id: str, run_id: str, stdout: str) -> dict[str, object]:
+        telemetry = _safe_run_telemetry(self._telemetry_from_output(stdout), run_id=run_id)
+        if telemetry:
+            path = self._run_root(worker_id, run_id) / "telemetry.json"
+            if not _write_private_json(path, telemetry):
+                logger.warning(
+                    "Failed to persist GlassHive run telemetry",
+                    extra={"worker_id": worker_id, "run_id": run_id},
+                )
+        return telemetry
+
+    def _record_run_metrics(
+        self,
+        worker_id: str,
+        run_id: str,
+        stdout: str,
+    ) -> tuple[dict[str, int], dict[str, object]]:
+        return (
+            self._record_run_usage(worker_id, run_id, stdout),
+            self._record_run_telemetry(worker_id, run_id, stdout),
+        )
+
+    def run_usage(self, worker: dict, run_id: str) -> dict[str, int]:
+        path = self._run_root(str(worker["worker_id"]), str(run_id)) / "usage.json"
+        if not path.is_file():
+            return {}
+        try:
+            value = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return {str(key): int(token_count) for key, token_count in value.items()} if isinstance(value, dict) else {}
+
+    def run_telemetry(self, worker: dict, run_id: str) -> dict[str, object]:
+        path = self._run_root(str(worker["worker_id"]), str(run_id)) / "telemetry.json"
+        if not path.is_file():
+            return {}
+        try:
+            value = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return _safe_run_telemetry(value, run_id=str(run_id))
+
+    def live_telemetry(
+        self,
+        worker: dict,
+        stdout: str,
+        run_id: str | None = None,
+    ) -> dict[str, object]:
+        telemetry_source = stdout
+        scope = "console_tail"
+        if run_id:
+            run_stdout = self._run_root(str(worker["worker_id"]), str(run_id)) / "stdout.log"
+            try:
+                telemetry_source = run_stdout.read_text(errors="replace")
+                scope = "full_active_run"
+            except OSError:
+                return {
+                    "schema": "glasshive.claude-run-telemetry.v1",
+                    "run_id": str(run_id),
+                    "telemetry_scope": "active_run_unavailable",
+                }
+        telemetry = self._telemetry_from_output(telemetry_source)
+        if telemetry:
+            telemetry["telemetry_scope"] = scope
+            if run_id:
+                telemetry["run_id"] = str(run_id)
+        return telemetry
 
     def _read_session_key(self, worker_id: str) -> str | None:
         path = self._session_meta_path(worker_id)
@@ -1050,16 +1341,22 @@ class BaseCliWorkerRuntime:
         return self._runtime_info(worker, pid=None)
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
-        self._note_stop_reason(worker["worker_id"], "interrupted", run_id=run_id)
-        self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
+        worker_id = worker["worker_id"]
+        active_run_id = str(run_id or worker.get("_active_run_id") or "").strip() or None
+        if active_run_id or self._active_pid(worker_id):
+            self._note_stop_reason(worker_id, "interrupted", run_id=active_run_id)
+            self._stop_active_process(worker_id, worker=worker, run_id=active_run_id)
         sandbox = self.sandbox.inspect(worker["worker_id"])
         pid = sandbox.pid if sandbox and sandbox.state == "running" else None
         return self._runtime_info(worker, pid=pid)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
-        self._note_stop_reason(worker["worker_id"], "terminated")
-        self._stop_active_process(worker["worker_id"])
-        self.sandbox.terminate(worker["worker_id"])
+        worker_id = worker["worker_id"]
+        active_run_id = str(worker.get("_active_run_id") or "").strip() or None
+        if active_run_id or self._active_pid(worker_id):
+            self._note_stop_reason(worker_id, "terminated", run_id=active_run_id)
+        self._stop_active_process(worker_id, worker=worker, run_id=active_run_id)
+        self.sandbox.terminate(worker_id)
         return self._runtime_info(worker, pid=None)
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
@@ -1067,6 +1364,9 @@ class BaseCliWorkerRuntime:
         active_pid = self._active_pid(worker["worker_id"])
         pid = active_pid or (sandbox.pid if sandbox and sandbox.state == "running" else None)
         return self._runtime_info(worker, pid=pid)
+
+    def worker_compute_present(self, worker: dict) -> bool:
+        return self.sandbox.inspect(worker["worker_id"]) is not None
 
     def _log_paths(self, worker_id: str) -> tuple[Path, Path]:
         return (
@@ -1296,6 +1596,8 @@ class BaseCliWorkerRuntime:
             self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
         stdout = stdout_path.read_text() if stdout_path.exists() else ""
         stderr = stderr_path.read_text() if stderr_path.exists() else ""
+        effective_run_id = str(run_id or active_session.get("run_id") or "").strip()
+        usage, telemetry = self._record_run_metrics(worker["worker_id"], effective_run_id, stdout)
         try:
             exit_code = int(exit_path.read_text().strip() or "0")
         except ValueError:
@@ -1307,12 +1609,23 @@ class BaseCliWorkerRuntime:
                 runtime_name=self.runtime_name,
                 exit_code=exit_code,
             )
-            detail = _redact_text((stderr or stdout or "").strip(), max_chars=2000)
+            failure_fields = classification.as_store_fields()
+            if self.runtime_name == "claude-code":
+                # stream-json stdout is the full model/tool transcript. It remains in the
+                # operator-private run files, but must never become a durable/public job error.
+                detail = classification.user_message
+                failure_fields["failure_diagnostic_summary"] = (
+                    f"class={classification.failure_class}; exit_code={exit_code}"
+                )
+            else:
+                detail = _redact_text((stderr or stdout or "").strip(), max_chars=2000)
             return {
                 "state": "failed",
                 "output_text": "",
                 "error_text": _redact_text(f"{self.runtime_name} exited with code {exit_code}: {detail}"),
-                **classification.as_store_fields(),
+                "usage": usage,
+                "telemetry": telemetry,
+                **failure_fields,
             }
         info = self.reconcile_worker(worker)
         try:
@@ -1322,11 +1635,12 @@ class BaseCliWorkerRuntime:
                 "state": "failed",
                 "output_text": "",
                 "error_text": str(exc),
+                "usage": usage,
+                "telemetry": telemetry,
             }
         if session_key:
             self._write_session_key(worker["worker_id"], session_key)
         workspace = Path(str(info.workspace_dir or self._workspace_dir(worker["worker_id"])))
-        effective_run_id = str(run_id or active_session.get("run_id") or "").strip()
         try:
             _status, warning_message = _ensure_recovered_success_evidence(
                 worker=worker,
@@ -1359,6 +1673,8 @@ class BaseCliWorkerRuntime:
             "state": "completed",
             "output_text": output_text,
             "error_text": "",
+            "usage": usage,
+            "telemetry": telemetry,
         }
 
     def _finalize_stop_reason(self, worker_id: str, run_id: str | None = None) -> None:
@@ -1399,12 +1715,18 @@ class BaseCliWorkerRuntime:
 
         run_root = self._run_root(worker_for_run["worker_id"], effective_run_id)
         run_root.mkdir(parents=True, exist_ok=True)
+        run_root.chmod(0o700)
 
         host_stdout = run_root / "stdout.log"
         host_stderr = run_root / "stderr.log"
         host_exit = run_root / "exit_code"
         host_script = run_root / "run.sh"
         host_stdin = run_root / "instruction.stdin"
+        # Preserve host ownership across the bind mount so the service can read
+        # the completed transcript after the container process exits.
+        for transcript_path in (host_stdout, host_stderr):
+            transcript_path.touch(exist_ok=True)
+            transcript_path.chmod(0o600)
 
         container_run_root = self._container_run_root(effective_run_id)
         container_stdout = f"{container_run_root}/stdout.log"
@@ -1435,13 +1757,14 @@ class BaseCliWorkerRuntime:
                 "abort_run() { write_exit \"${1:-130}\"; exit \"${1:-130}\"; }",
                 "trap 'abort_run 130' HUP INT TERM",
                 f"cd {shlex.quote(self.sandbox.workspace_mount)} || exit 1",
-                f"export GLASSHIVE_ACTIVE_RUN_ID={shlex.quote(effective_run_id)}",
-                f"export GLASSHIVE_ACTIVE_WORKER_ID={shlex.quote(worker_for_run['worker_id'])}",
                 'if [ -f "$HOME/.glasshive/runtime.env" ]; then set -a; source "$HOME/.glasshive/runtime.env"; set +a; fi',
                 'GLASSHIVE_SECRET_ENV_KEYS_FILE="$HOME/.glasshive/secret-runtime.keys"',
                 'GLASSHIVE_SECRET_ENV_FILE="$HOME/.glasshive/secret-runtime.env"',
                 'if [ -f "$GLASSHIVE_SECRET_ENV_FILE" ]; then set -a; source "$GLASSHIVE_SECRET_ENV_FILE"; set +a; rm -f "$GLASSHIVE_SECRET_ENV_FILE"; fi',
                 'if [ -f "$HOME/.wpr-openclaw/openclaw.env" ]; then set -a; source "$HOME/.wpr-openclaw/openclaw.env"; set +a; fi',
+                f"export GLASSHIVE_ACTIVE_RUN_ID={shlex.quote(effective_run_id)}",
+                f"export GLASSHIVE_RUN_ID={shlex.quote(effective_run_id)}",
+                f"export GLASSHIVE_ACTIVE_WORKER_ID={shlex.quote(worker_for_run['worker_id'])}",
                 f"{command_invocation} > >(tee -a {shlex.quote(container_stdout)}) 2> >(tee -a {shlex.quote(container_stderr)} >&2)",
                 "status=$?",
                 'if [ -f "$GLASSHIVE_SECRET_ENV_KEYS_FILE" ]; then while IFS= read -r key; do [ -n "$key" ] && unset "$key"; done < "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; rm -f "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; fi',
@@ -1543,6 +1866,7 @@ class BaseCliWorkerRuntime:
         except Exception as exc:
             stdout = host_stdout.read_text() if host_stdout.exists() else ""
             stderr = host_stderr.read_text() if host_stderr.exists() else ""
+            self._record_run_metrics(worker_for_run["worker_id"], effective_run_id, stdout)
             stop_reason = "timeout" if "timed out" in str(exc).lower() else "error"
             evidence_path = _write_evidence_for_run(
                 worker=worker_for_run,
@@ -1563,6 +1887,7 @@ class BaseCliWorkerRuntime:
                 transcript_paths=transcript_paths,
                 started_at=started_at,
             )
+            _stop_active_run_heartbeat(heartbeat_stop, heartbeat_thread)
             _write_active_run_status(
                 path=heartbeat_path,
                 worker=worker_for_run,
@@ -1579,9 +1904,7 @@ class BaseCliWorkerRuntime:
             )
             raise
         finally:
-            heartbeat_stop.set()
-            if heartbeat_thread:
-                heartbeat_thread.join(timeout=1)
+            _stop_active_run_heartbeat(heartbeat_stop, heartbeat_thread)
         self.sandbox.ensure_container_writable_paths(
             worker_for_run["worker_id"],
             self.runtime_name,
@@ -1596,12 +1919,18 @@ class BaseCliWorkerRuntime:
                 handle.write(stdout)
                 if not stdout.endswith("\n"):
                     handle.write("\n")
+            stdout_path.chmod(0o600)
         with stderr_path.open("a") as handle:
             if stderr:
                 handle.write(stderr)
                 if not stderr.endswith("\n"):
                     handle.write("\n")
+            stderr_path.chmod(0o600)
+        for transcript_path in (host_stdout, host_stderr):
+            if transcript_path.exists():
+                transcript_path.chmod(0o600)
 
+        self._record_run_metrics(worker_for_run["worker_id"], effective_run_id, stdout)
         try:
             self._finalize_stop_reason(worker_for_run["worker_id"], run_id=effective_run_id)
         except RuntimeErrorBase as exc:
@@ -1650,7 +1979,16 @@ class BaseCliWorkerRuntime:
             raise
 
         if exit_code != 0:
-            detail = (stderr or stdout or "").strip()[-2000:]
+            if self.runtime_name == "claude-code":
+                classification = classify_cli_failure(
+                    stdout=stdout,
+                    stderr=stderr,
+                    runtime_name=self.runtime_name,
+                    exit_code=exit_code,
+                )
+                detail = classification.user_message
+            else:
+                detail = (stderr or stdout or "").strip()[-2000:]
             error_text = f"{self.runtime_name} exited with code {exit_code}: {detail}"
             evidence_path = _write_evidence_for_run(
                 worker=worker_for_run,
@@ -2122,17 +2460,22 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
         return self._runtime_info(worker, pid=None)
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
-        if str(worker.get("state") or "") == "running":
-            self._note_stop_reason(worker["worker_id"], "interrupted", run_id=run_id)
-        self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
+        worker_id = worker["worker_id"]
+        active_run_id = str(run_id or worker.get("_active_run_id") or "").strip() or None
+        if active_run_id or self._active_pid(worker_id):
+            self._note_stop_reason(worker_id, "interrupted", run_id=active_run_id)
+            self._stop_active_process(worker_id, worker=worker, run_id=active_run_id)
         sandbox = self.sandbox.inspect(worker["worker_id"])
         pid = sandbox.pid if sandbox and sandbox.state == "running" else None
         return self._runtime_info(worker, pid=pid)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
-        self._note_stop_reason(worker["worker_id"], "terminated")
-        self._stop_active_process(worker["worker_id"])
-        self.sandbox.terminate(worker["worker_id"])
+        worker_id = worker["worker_id"]
+        active_run_id = str(worker.get("_active_run_id") or "").strip() or None
+        if active_run_id or self._active_pid(worker_id):
+            self._note_stop_reason(worker_id, "terminated", run_id=active_run_id)
+        self._stop_active_process(worker_id, worker=worker, run_id=active_run_id)
+        self.sandbox.terminate(worker_id)
         return self._runtime_info(worker, pid=None)
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
@@ -2597,10 +2940,32 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
     runtime_name = "claude-code"
     worker_root_name = "claude_code_runtime"
     binary_name = "claude"
-    _workspace_effort_support_cache: dict[tuple[str, str], bool] = {}
+    _workspace_effort_support_cache: dict[tuple[str, str, str], bool] = {}
 
     def resolve_model(self, profile: str) -> str:
         return os.environ.get("WPR_MODEL_CLAUDE_CODE", "claude-sonnet-4-6")
+
+    def _provider_model_for_worker(self, worker: dict) -> str:
+        logical_model = worker.get("model") or self.resolve_model(
+            worker.get("profile", "claude-code")
+        )
+        return os.environ.get("WPR_CLAUDE_CODE_PROVIDER_MODEL", "").strip() or str(
+            logical_model
+        )
+
+    @staticmethod
+    def _bedrock_enabled() -> bool:
+        return os.environ.get("CLAUDE_CODE_USE_BEDROCK", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _remove_conflicting_anthropic_credentials(self, env: dict[str, str]) -> None:
+        if self._bedrock_enabled():
+            env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            env.pop("ANTHROPIC_API_KEY", None)
 
     def _default_session_key(self, worker: dict) -> str | None:
         existing = self._read_session_key(worker["worker_id"])
@@ -2626,9 +2991,10 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
     def _preflight_workspace_effort_support(self, worker: dict) -> None:
         if str(worker.get("execution_mode") or "docker") != "docker":
             return
-        if self._effort_for_worker(worker) != "max":
+        effort = self._effort_for_worker(worker)
+        if effort not in {"max", "xhigh"}:
             return
-        cache_key = (str(self.sandbox.image), self.binary)
+        cache_key = (str(self.sandbox.image), self.binary, effort)
         if self._workspace_effort_support_cache.get(cache_key):
             return
         try:
@@ -2641,7 +3007,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             )
         except Exception as exc:
             raise RuntimeDependencyMissingError(
-                "Claude Code max effort could not be preflighted in the GlassHive workspace image",
+                f"Claude Code {effort} effort could not be preflighted in the GlassHive workspace image",
                 binary=self.binary,
                 runtime_name=self.runtime_name,
                 profile=str(worker.get("profile") or "claude-code"),
@@ -2649,14 +3015,14 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                 dependency_label="Claude Code --effort support",
                 recovery_hint=(
                     "Use a GlassHive workspace image with a Claude Code CLI that supports `--effort`, "
-                    "or run this worker without `max` effort until the image is upgraded."
+                    "or use default effort until the image is upgraded."
                 ),
             ) from exc
         help_text = f"{result.stdout or ''}\n{result.stderr or ''}"
-        if result.returncode != 0 or "--effort" not in help_text:
+        if result.returncode != 0 or not _claude_effort_help_supports(help_text, effort):
             actual = (help_text.strip() or f"exit {result.returncode}")[-400:]
             raise RuntimeDependencyMissingError(
-                "Claude Code max effort requires workspace image support for `claude --effort`",
+                f"Claude Code {effort} effort requires workspace image support for `claude --effort`",
                 binary=self.binary,
                 runtime_name=self.runtime_name,
                 profile=str(worker.get("profile") or "claude-code"),
@@ -2666,7 +3032,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                 dependency_label="Claude Code --effort support",
                 recovery_hint=(
                     "Upgrade the GlassHive workspace image or use default Claude effort for this run. "
-                    "Do not silently project `max` when the active image cannot prove support."
+                    "Do not silently project a native effort when the active image cannot prove support."
                 ),
             )
         self._workspace_effort_support_cache[cache_key] = True
@@ -2677,7 +3043,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_key = self._read_session_key(worker["worker_id"])
-        model = worker.get("model") or self.resolve_model(worker.get("profile", "claude-code"))
+        model = self._provider_model_for_worker(worker)
         permission_mode = os.environ.get("WPR_CLAUDE_CODE_PERMISSION_MODE", "bypassPermissions")
         command = [
             self.binary,
@@ -2685,14 +3051,15 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             "--permission-mode",
             permission_mode,
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
             "--model",
             model,
         ]
         if self._chrome_enabled():
             command.insert(2, "--chrome")
         effort = self._effort_for_worker(worker)
-        if effort == "max":
+        if effort in {"max", "xhigh"}:
             command.extend(["--effort", effort])
         elif effort and effort != "default":
             logger.warning(
@@ -2704,12 +3071,25 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         env = self._container_env(
             "ANTHROPIC_API_KEY",
             "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_EC2_METADATA_DISABLED",
+            "ANTHROPIC_MODEL",
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_CUSTOM_HEADERS",
             "ANTHROPIC_DEFAULT_SONNET_MODEL",
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+            "ANTHROPIC_BEDROCK_BASE_URL",
+            "ANTHROPIC_BEDROCK_SERVICE_TIER",
+            "API_TIMEOUT_MS",
             "HTTPS_PROXY",
             "HTTP_PROXY",
             "NO_PROXY",
@@ -2719,6 +3099,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         use_api_key = os.environ.get("WPR_CLAUDE_CODE_USE_API_KEY", "0").strip().lower() in {"1", "true", "yes", "on"}
         if not use_api_key:
             env.pop("ANTHROPIC_API_KEY", None)
+        self._remove_conflicting_anthropic_credentials(env)
         return command, env
 
     def _parse_output(self, worker: dict, stdout: str, stderr: str, info: RuntimeInfo) -> tuple[str | None, str]:
@@ -2733,10 +3114,391 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         result = str(payload.get("result") or raw).strip()
         return session_key, _select_user_facing_agent_output([result]) or result
 
+    def _usage_from_output(self, stdout: str) -> dict[str, int]:
+        raw = stdout.strip()
+        try:
+            payload = json.loads(raw.splitlines()[-1]) if raw else {}
+        except json.JSONDecodeError:
+            payload = {}
+        source = payload.get("usage") if isinstance(payload, dict) else {}
+        usage = source if isinstance(source, dict) else {}
+        normalized: dict[str, int] = {}
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ):
+            value = usage.get(key, 0)
+            if isinstance(value, bool):
+                value = 0
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                parsed = 0
+            normalized[key] = max(0, parsed)
+        return normalized
+
+    @staticmethod
+    def _nonnegative_telemetry_int(value: object) -> int:
+        if isinstance(value, bool):
+            return 0
+        try:
+            return max(int(value or 0), 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    @staticmethod
+    def _finite_telemetry_float(value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if parsed == parsed and abs(parsed) != float("inf") else None
+
+    @staticmethod
+    def _new_telemetry_state() -> dict[str, object]:
+        return {
+            "init": {},
+            "result": {},
+            "event_count": 0,
+            "assistant_event_count": 0,
+            "malformed_line_count": 0,
+            "oversized_line_count": 0,
+            "api_retry_count": 0,
+            "api_retry_delay_ms": 0,
+            "api_retry_statuses": set(),
+            "tool_call_counts": {},
+            "seen_tool_call_ids": set(),
+            "seen_usage_message_ids": set(),
+            "stream_input_tokens": 0,
+            "stream_output_tokens": 0,
+            "stream_cache_read_input_tokens": 0,
+            "stream_cache_creation_input_tokens": 0,
+            "first_timestamp": "",
+            "last_timestamp": "",
+        }
+
+    def _consume_telemetry_line(self, state: dict[str, object], line: str) -> bool:
+        if not line.strip():
+            return False
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            state["malformed_line_count"] = int(state["malformed_line_count"]) + 1
+            return True
+        if not isinstance(value, dict):
+            return True
+
+        observed_at = datetime.now(timezone.utc).isoformat()
+        if not state["first_timestamp"]:
+            state["first_timestamp"] = observed_at
+        state["last_timestamp"] = observed_at
+        state["event_count"] = int(state["event_count"]) + 1
+        event_type = value.get("type")
+        subtype = value.get("subtype")
+        if event_type == "system" and subtype == "init" and not state["init"]:
+            state["init"] = {
+                "claude_code_version": str(value.get("claude_code_version") or "").strip(),
+                "model": str(value.get("model") or "").strip(),
+            }
+        if event_type == "result":
+            usage = value.get("usage") if isinstance(value.get("usage"), dict) else {}
+            result_state = str(value.get("subtype") or "").strip()
+            explicit_error = value.get("is_error")
+            state["result"] = {
+                "subtype": result_state,
+                "is_error": (
+                    explicit_error
+                    if isinstance(explicit_error, bool)
+                    else result_state.startswith("error_")
+                    or result_state in {"error", "failed", "timeout"}
+                ),
+                "stop_reason": str(value.get("stop_reason") or "").strip(),
+                "duration_ms": value.get("duration_ms"),
+                "duration_api_ms": value.get("duration_api_ms"),
+                "ttft_ms": value.get("ttft_ms"),
+                "ttft_stream_ms": value.get("ttft_stream_ms"),
+                "time_to_request_ms": value.get("time_to_request_ms"),
+                "num_turns": value.get("num_turns"),
+                "total_cost_usd": value.get("total_cost_usd"),
+                "service_tier": str(usage.get("service_tier") or "").strip(),
+                "speed": str(usage.get("speed") or "").strip(),
+            }
+        if event_type == "api_retry" or subtype == "api_retry":
+            state["api_retry_count"] = int(state["api_retry_count"]) + 1
+            state["api_retry_delay_ms"] = int(state["api_retry_delay_ms"]) + self._nonnegative_telemetry_int(
+                value.get("retry_delay_ms") or value.get("delay_ms")
+            )
+            status = str(
+                value.get("error_status")
+                or value.get("api_error_status")
+                or value.get("status")
+                or ""
+            ).strip()
+            if status:
+                statuses = state["api_retry_statuses"]
+                if isinstance(statuses, set):
+                    statuses.add(status)
+        if event_type == "assistant":
+            state["assistant_event_count"] = int(state["assistant_event_count"]) + 1
+            message = value.get("message")
+            if isinstance(message, dict):
+                message_id = str(message.get("id") or "").strip()
+                seen_ids = state["seen_usage_message_ids"]
+                if message_id and isinstance(seen_ids, set) and message_id not in seen_ids:
+                    seen_ids.add(message_id)
+                    usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+                    for source_key, state_key in (
+                        ("input_tokens", "stream_input_tokens"),
+                        ("output_tokens", "stream_output_tokens"),
+                        ("cache_read_input_tokens", "stream_cache_read_input_tokens"),
+                        ("cache_creation_input_tokens", "stream_cache_creation_input_tokens"),
+                    ):
+                        state[state_key] = int(state[state_key]) + self._nonnegative_telemetry_int(
+                            usage.get(source_key)
+                        )
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                counts = state["tool_call_counts"]
+                if isinstance(counts, dict):
+                    for item in content:
+                        if not isinstance(item, dict) or item.get("type") != "tool_use":
+                            continue
+                        tool_call_id = str(item.get("id") or "").strip()
+                        seen_tool_call_ids = state["seen_tool_call_ids"]
+                        if (
+                            tool_call_id
+                            and isinstance(seen_tool_call_ids, set)
+                            and tool_call_id in seen_tool_call_ids
+                        ):
+                            continue
+                        if tool_call_id and isinstance(seen_tool_call_ids, set):
+                            seen_tool_call_ids.add(tool_call_id)
+                        name = str(item.get("name") or "unknown").strip() or "unknown"
+                        counts[name] = int(counts.get(name, 0)) + 1
+        return True
+
+    def _telemetry_from_state(self, state: dict[str, object]) -> dict[str, object]:
+        if (
+            int(state["event_count"]) <= 0
+            and int(state["malformed_line_count"]) <= 0
+            and int(state["oversized_line_count"]) <= 0
+        ):
+            return {}
+        init = state["init"] if isinstance(state["init"], dict) else {}
+        result = state["result"] if isinstance(state["result"], dict) else {}
+        tool_call_counts = (
+            state["tool_call_counts"] if isinstance(state["tool_call_counts"], dict) else {}
+        )
+        retry_statuses = (
+            sorted(str(item) for item in state["api_retry_statuses"])
+            if isinstance(state["api_retry_statuses"], set)
+            else []
+        )
+        telemetry: dict[str, object] = {
+            "schema": "glasshive.claude-run-telemetry.v1",
+            "claude_code_version": str(init.get("claude_code_version") or "").strip(),
+            "model": str(init.get("model") or "").strip(),
+            "service_tier": str(result.get("service_tier") or "").strip(),
+            "speed": str(result.get("speed") or "").strip(),
+            "result_state": str(result.get("subtype") or "").strip(),
+            "is_error": bool(result.get("is_error")) if isinstance(result.get("is_error"), bool) else False,
+            "stop_reason": str(result.get("stop_reason") or "").strip(),
+            "duration_ms": self._nonnegative_telemetry_int(result.get("duration_ms")),
+            "duration_api_ms": self._nonnegative_telemetry_int(result.get("duration_api_ms")),
+            "ttft_ms": self._nonnegative_telemetry_int(result.get("ttft_ms")),
+            "ttft_stream_ms": self._nonnegative_telemetry_int(result.get("ttft_stream_ms")),
+            "time_to_request_ms": self._nonnegative_telemetry_int(result.get("time_to_request_ms")),
+            "num_turns": self._nonnegative_telemetry_int(result.get("num_turns")),
+            "api_retry_count": int(state["api_retry_count"]),
+            "api_retry_delay_ms": int(state["api_retry_delay_ms"]),
+            "api_retry_statuses": retry_statuses,
+            "tool_call_count": sum(tool_call_counts.values()),
+            "tool_call_counts": dict(sorted(tool_call_counts.items())),
+            "event_count": int(state["event_count"]),
+            "malformed_line_count": int(state["malformed_line_count"]),
+            "oversized_line_count": int(state["oversized_line_count"]),
+            "stream_input_tokens": int(state["stream_input_tokens"]),
+            "stream_output_tokens": int(state["stream_output_tokens"]),
+            "stream_cache_read_input_tokens": int(state["stream_cache_read_input_tokens"]),
+            "stream_cache_creation_input_tokens": int(
+                state["stream_cache_creation_input_tokens"]
+            ),
+            "first_timestamp": str(state["first_timestamp"]),
+            "last_timestamp": str(state["last_timestamp"]),
+        }
+        total_cost_usd = self._finite_telemetry_float(result.get("total_cost_usd"))
+        if total_cost_usd is not None:
+            telemetry["total_cost_usd"] = total_cost_usd
+        if telemetry["duration_ms"]:
+            telemetry["duration_non_api_ms"] = max(
+                int(telemetry["duration_ms"]) - int(telemetry["duration_api_ms"]),
+                0,
+            )
+        return telemetry
+
+    def _telemetry_from_output(self, stdout: str) -> dict[str, object]:
+        state = self._new_telemetry_state()
+        for line in stdout.splitlines():
+            self._consume_telemetry_line(state, line)
+        return self._telemetry_from_state(state)
+
+    def live_telemetry(
+        self,
+        worker: dict,
+        stdout: str,
+        run_id: str | None = None,
+    ) -> dict[str, object]:
+        if not run_id:
+            telemetry = self._telemetry_from_output(stdout)
+            if telemetry:
+                telemetry["telemetry_scope"] = "console_tail"
+            return telemetry
+
+        worker_id = str(worker["worker_id"])
+        run_id = str(run_id)
+        run_stdout = self._run_root(worker_id, run_id) / "stdout.log"
+        key = (worker_id, run_id)
+        sampled_at = datetime.now(timezone.utc)
+        with self._live_telemetry_lock:
+            try:
+                stat = run_stdout.stat()
+            except OSError:
+                return {
+                    "schema": "glasshive.claude-run-telemetry.v1",
+                    "run_id": run_id,
+                    "telemetry_scope": "active_run_unavailable",
+                }
+            cached = self._live_telemetry_cache.get(key)
+            inode = int(getattr(stat, "st_ino", 0))
+            if (
+                cached is None
+                or int(cached.get("inode") or -1) != inode
+                or int(cached.get("offset") or 0) > stat.st_size
+            ):
+                cached = {
+                    "inode": inode,
+                    "offset": 0,
+                    "partial": b"",
+                    "discarding_oversized_line": False,
+                    "state": self._new_telemetry_state(),
+                    "sample_sequence": 0,
+                    "first_observed_at": sampled_at,
+                    "last_progress_at": None,
+                }
+                self._live_telemetry_cache[key] = cached
+
+            offset = int(cached["offset"])
+            state = cached["state"]
+            pending = bytes(cached["partial"])
+            discarding_oversized_line = bool(cached.get("discarding_oversized_line"))
+            consumed_progress = False
+            with run_stdout.open("rb") as handle:
+                handle.seek(offset)
+                while True:
+                    appended = handle.read(1024 * 1024)
+                    if not appended:
+                        break
+                    offset += len(appended)
+                    if discarding_oversized_line:
+                        newline = appended.find(b"\n")
+                        if newline < 0:
+                            continue
+                        appended = appended[newline + 1 :]
+                        discarding_oversized_line = False
+                        if not appended:
+                            continue
+                    pieces = (pending + appended).split(b"\n")
+                    pending = pieces.pop()
+                    if isinstance(state, dict):
+                        for raw_line in pieces:
+                            if len(raw_line) > _MAX_TELEMETRY_LINE_BYTES:
+                                state["malformed_line_count"] = (
+                                    int(state["malformed_line_count"]) + 1
+                                )
+                                state["oversized_line_count"] = (
+                                    int(state.get("oversized_line_count") or 0) + 1
+                                )
+                                consumed_progress = True
+                                continue
+                            consumed_progress = (
+                                self._consume_telemetry_line(
+                                    state,
+                                    raw_line.decode("utf-8", errors="replace"),
+                                )
+                                or consumed_progress
+                            )
+                    if len(pending) > _MAX_TELEMETRY_LINE_BYTES:
+                        if isinstance(state, dict):
+                            state["malformed_line_count"] = int(state["malformed_line_count"]) + 1
+                            state["oversized_line_count"] = (
+                                int(state.get("oversized_line_count") or 0) + 1
+                            )
+                        pending = b""
+                        discarding_oversized_line = True
+                        consumed_progress = True
+            cached["offset"] = offset
+            cached["partial"] = pending
+            cached["discarding_oversized_line"] = discarding_oversized_line
+            if consumed_progress:
+                cached["last_progress_at"] = sampled_at
+            cached["sample_sequence"] = int(cached["sample_sequence"]) + 1
+
+            telemetry = self._telemetry_from_state(state) if isinstance(state, dict) else {}
+            try:
+                current_log_bytes = max(offset, int(run_stdout.stat().st_size))
+            except OSError:
+                current_log_bytes = offset
+            telemetry.update(
+                {
+                    "schema": "glasshive.claude-run-telemetry.v1",
+                    "run_id": run_id,
+                    "telemetry_scope": "full_active_run_incremental",
+                    "sampled_at": sampled_at.isoformat().replace("+00:00", "Z"),
+                    "sample_sequence": int(cached["sample_sequence"]),
+                    "parsed_bytes": (
+                        int(cached["offset"])
+                        if cached["discarding_oversized_line"]
+                        else int(cached["offset"]) - len(bytes(cached["partial"]))
+                    ),
+                    "log_bytes": current_log_bytes,
+                    "partial_line_present": bool(cached["partial"])
+                    or bool(cached["discarding_oversized_line"]),
+                    "first_observed_at": cached["first_observed_at"].isoformat().replace("+00:00", "Z"),
+                }
+            )
+            last_progress_at = cached["last_progress_at"]
+            if isinstance(last_progress_at, datetime):
+                telemetry["last_progress_at"] = last_progress_at.isoformat().replace("+00:00", "Z")
+                telemetry["seconds_since_progress"] = max(
+                    0.0,
+                    round((sampled_at - last_progress_at).total_seconds(), 3),
+                )
+                telemetry["last_stream_activity_at"] = telemetry["last_progress_at"]
+                telemetry["seconds_since_stream_activity"] = telemetry[
+                    "seconds_since_progress"
+                ]
+
+            if len(self._live_telemetry_cache) > 128:
+                oldest_key = min(
+                    self._live_telemetry_cache,
+                    key=lambda item: (
+                        self._live_telemetry_cache[item].get("first_observed_at")
+                        or sampled_at
+                    ),
+                )
+                if oldest_key != key:
+                    self._live_telemetry_cache.pop(oldest_key, None)
+            return telemetry
+
 
 _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"/Users/[^/\s\"'`]+(?:/[^\s\"'`]+)+"), "[REDACTED_LOCAL_PATH]"),
     (re.compile(r"~/[^\s\"'`]+(?:/[^\s\"'`]+)+"), "[REDACTED_LOCAL_PATH]"),
+    (re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), "[REDACTED_AWS_ACCESS_KEY]"),
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)((?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s\"']{6,}"), r"\1[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
@@ -2744,7 +3506,11 @@ _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{256,}"), "[REDACTED_IMAGE_BASE64]"),
     (re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{512,}={0,2}(?![A-Za-z0-9+/=])"), "[REDACTED_LONG_BASE64]"),
 )
-_FINAL_REPORT_PATTERN = re.compile(r"(?m)^[ \t]*FINAL REPORT:\s*")
+_FINAL_REPORT_PATTERN = re.compile(
+    r"(?mi)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*)?"
+    r"(?:(?:[*_]{1,3}|`{1,3})[ \t]*)?FINAL REPORT\s*:\s*"
+    r"(?:(?:[*_]{1,3}|`{1,3})[ \t]*)?"
+)
 _HOST_RUN_OUTPUT_MAX_CHARS = 64000
 
 
@@ -3185,32 +3951,43 @@ def _write_active_run_status(
     evidence_path: str = "",
 ) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "schema": "glasshive.active_run.v1",
-            "run_id": run_id,
-            "state": state,
-            "started_at": started_at,
-            "last_heartbeat_at": _utc_iso(),
-            "heartbeat_sequence": _active_run_heartbeat_sequence(path),
-            "worker": {
-                "worker_id": str(worker.get("worker_id") or ""),
-                "profile": str(worker.get("profile") or ""),
-                "execution_mode": str(worker.get("execution_mode") or ""),
-                "runtime": str(worker.get("runtime") or ""),
-            },
-            "runtime": runtime_name,
-            "model": model,
-            "process_pid": process_pid,
-            "timeout_seconds": timeout_seconds,
-            "exit_code": exit_code,
-            "stop_reason": stop_reason,
-            "transcript_paths": transcript_paths,
-            "transcript_progress": _active_run_transcript_progress(path, transcript_paths),
-            "evidence_path": evidence_path,
-        }
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        path.chmod(0o600)
+        with _ACTIVE_RUN_STATUS_LOCK:
+            if state == "running":
+                try:
+                    previous = json.loads(path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    previous = {}
+                if (
+                    isinstance(previous, dict)
+                    and str(previous.get("run_id") or "") == run_id
+                    and str(previous.get("state") or "") in _ACTIVE_RUN_TERMINAL_STATES
+                ):
+                    return
+            payload = {
+                "schema": "glasshive.active_run.v1",
+                "run_id": run_id,
+                "state": state,
+                "started_at": started_at,
+                "last_heartbeat_at": _utc_iso(),
+                "heartbeat_sequence": _active_run_heartbeat_sequence(path),
+                "worker": {
+                    "worker_id": str(worker.get("worker_id") or ""),
+                    "profile": str(worker.get("profile") or ""),
+                    "execution_mode": str(worker.get("execution_mode") or ""),
+                    "runtime": str(worker.get("runtime") or ""),
+                },
+                "runtime": runtime_name,
+                "model": model,
+                "process_pid": process_pid,
+                "timeout_seconds": timeout_seconds,
+                "exit_code": exit_code,
+                "stop_reason": stop_reason,
+                "transcript_paths": transcript_paths,
+                "transcript_progress": _active_run_transcript_progress(path, transcript_paths),
+                "evidence_path": evidence_path,
+            }
+            if not _write_private_json(path, payload):
+                raise OSError("active run status write failed")
     except Exception as exc:  # pragma: no cover - heartbeat must not mask the real worker result
         logger.warning(
             "Failed to write GlassHive active run status",
@@ -3250,6 +4027,12 @@ def _start_active_run_heartbeat(
     thread = Thread(target=beat, name=f"glasshive-run-heartbeat-{run_id[:12]}", daemon=True)
     thread.start()
     return thread
+
+
+def _stop_active_run_heartbeat(stop_event: Event, thread: Thread | None) -> None:
+    stop_event.set()
+    if thread:
+        thread.join()
 
 
 def _safe_slug(value: str) -> str:
@@ -3851,6 +4634,7 @@ class HostNativeCliMixin:
         exit_path = Path(raw_exit_path) if raw_exit_path else None
         stdout = stdout_path.read_text() if stdout_path and stdout_path.is_file() else ""
         stderr = stderr_path.read_text() if stderr_path and stderr_path.is_file() else ""
+        self._record_run_metrics(worker["worker_id"], run_id, stdout)
         exit_code: int | None = None
         if exit_path and exit_path.is_file():
             try:
@@ -3910,8 +4694,12 @@ class HostNativeCliMixin:
 
     def pause_worker(self, worker: dict) -> RuntimeInfo:
         active_session = self._read_active_session(worker["worker_id"])
-        self._note_stop_reason(worker["worker_id"], "paused")
-        self._stop_active_process(worker["worker_id"], worker=worker)
+        active_run_id = str(worker.get("_active_run_id") or "").strip() or None
+        if not active_run_id and active_session and self._active_pid(worker["worker_id"]):
+            active_run_id = str(active_session.get("run_id") or "").strip() or None
+        if active_run_id:
+            self._note_stop_reason(worker["worker_id"], "paused", run_id=active_run_id)
+        self._stop_active_process(worker["worker_id"], worker=worker, run_id=active_run_id)
         self._write_stopped_active_run_evidence(
             worker,
             active_session=active_session,
@@ -3925,8 +4713,12 @@ class HostNativeCliMixin:
         active_session = self._read_active_session(worker["worker_id"])
         if active_session and run_id and active_session.get("run_id") != run_id:
             active_session = None
-        self._note_stop_reason(worker["worker_id"], "interrupted", run_id=run_id)
-        self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
+        active_run_id = str(run_id or worker.get("_active_run_id") or "").strip() or None
+        if not active_run_id and active_session and self._active_pid(worker["worker_id"]):
+            active_run_id = str(active_session.get("run_id") or "").strip() or None
+        if active_run_id or self._active_pid(worker["worker_id"]):
+            self._note_stop_reason(worker["worker_id"], "interrupted", run_id=active_run_id)
+            self._stop_active_process(worker["worker_id"], worker=worker, run_id=active_run_id)
         self._write_stopped_active_run_evidence(
             worker,
             active_session=active_session,
@@ -3938,8 +4730,12 @@ class HostNativeCliMixin:
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
         active_session = self._read_active_session(worker["worker_id"])
-        self._note_stop_reason(worker["worker_id"], "terminated")
-        self._stop_active_process(worker["worker_id"], worker=worker)
+        active_run_id = str(worker.get("_active_run_id") or "").strip() or None
+        if not active_run_id and active_session and self._active_pid(worker["worker_id"]):
+            active_run_id = str(active_session.get("run_id") or "").strip() or None
+        if active_run_id:
+            self._note_stop_reason(worker["worker_id"], "terminated", run_id=active_run_id)
+        self._stop_active_process(worker["worker_id"], worker=worker, run_id=active_run_id)
         self._write_stopped_active_run_evidence(
             worker,
             active_session=active_session,
@@ -3951,6 +4747,9 @@ class HostNativeCliMixin:
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         return self._host_runtime_info(worker, pid=self._active_pid(worker["worker_id"]))
+
+    def worker_compute_present(self, worker: dict) -> bool:
+        return self._active_pid(worker["worker_id"]) is not None
 
     def _stop_active_process(self, worker_id: str, *, worker: dict | None = None, run_id: str | None = None) -> None:
         with self._process_lock:
@@ -4170,6 +4969,7 @@ class HostNativeCliMixin:
                     pass
                 timeout_stdout = raw_stdout.read_text() if raw_stdout.exists() else ""
                 timeout_stderr = raw_stderr.read_text() if raw_stderr.exists() else ""
+                self._record_run_metrics(worker["worker_id"], effective_run_id, timeout_stdout)
                 evidence_path = _write_evidence_for_run(
                     worker=worker,
                     run_id=effective_run_id,
@@ -4189,6 +4989,7 @@ class HostNativeCliMixin:
                     transcript_paths=transcript_paths,
                     started_at=started_at,
                 )
+                _stop_active_run_heartbeat(heartbeat_stop, heartbeat_thread)
                 _write_active_run_status(
                     path=heartbeat_path,
                     worker=worker,
@@ -4209,9 +5010,7 @@ class HostNativeCliMixin:
                 )
                 raise RuntimeErrorBase(f"{self.runtime_name} timed out after {run_timeout_sec:g}s")
             finally:
-                heartbeat_stop.set()
-                if heartbeat_thread:
-                    heartbeat_thread.join(timeout=1)
+                _stop_active_run_heartbeat(heartbeat_stop, heartbeat_thread)
                 self._clear_process(worker["worker_id"])
                 self._release_host_slot(worker["worker_id"])
 
@@ -4246,6 +5045,7 @@ class HostNativeCliMixin:
             },
         )
 
+        self._record_run_metrics(worker["worker_id"], effective_run_id, stdout)
         try:
             self._finalize_stop_reason(worker["worker_id"], run_id=effective_run_id)
         except RuntimeErrorBase as exc:
@@ -4293,7 +5093,16 @@ class HostNativeCliMixin:
             )
             raise
         if exit_code != 0:
-            detail = (redacted_stderr or redacted_stdout or "").strip()[-2000:]
+            if self.runtime_name == "claude-code":
+                classification = classify_cli_failure(
+                    stdout=stdout,
+                    stderr=stderr,
+                    runtime_name=self.runtime_name,
+                    exit_code=exit_code,
+                )
+                detail = classification.user_message
+            else:
+                detail = (redacted_stderr or redacted_stdout or "").strip()[-2000:]
             self._append_work_log(worker, f"Run {effective_run_id} failed with exit code {exit_code}.")
             error_text = f"{self.runtime_name} exited with code {exit_code}: {detail}"
             evidence_path = _write_evidence_for_run(
@@ -4431,7 +5240,7 @@ class HostNativeCliMixin:
         info = self.ensure_worker_ready(worker)
         active = self._infer_active_session(worker)
         stdout = str((active or {}).get("stdout_path") or "")
-        command = ["bash", "-lc", f"cd {shlex.quote(str(info.workspace_dir or ''))} && tail -n 80 -f {shlex.quote(stdout)}"] if stdout else ["bash", "-lc", f"cd {shlex.quote(str(info.workspace_dir or ''))} && exec ${SHELL:-/bin/bash}"]
+        command = ["bash", "-lc", f"cd {shlex.quote(str(info.workspace_dir or ''))} && tail -n 80 -f {shlex.quote(stdout)}"] if stdout else ["bash", "-lc", f"cd {shlex.quote(str(info.workspace_dir or ''))} && exec ${{SHELL:-/bin/bash}}"]
         return TerminalTarget(
             command=command,
             cwd=str(info.workspace_dir or ""),
@@ -4570,13 +5379,14 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
     def _chrome_supported(self) -> bool:
         return self._help_supports("--chrome")
 
-    def _effort_supported(self) -> bool:
-        return self._help_supports("--effort")
+    def _effort_supported(self, effort: str = "") -> bool:
+        help_text = self._help_text()
+        return bool(help_text) and _claude_effort_help_supports(help_text, effort)
 
-    def _help_supports(self, flag: str) -> bool:
+    def _help_text(self) -> str:
         resolved = shutil.which(self.binary)
         if not resolved:
-            return False
+            return ""
         try:
             completed = subprocess.run(
                 [resolved, "--help"],
@@ -4587,8 +5397,11 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
                 timeout=5,
             )
         except Exception:
-            return False
-        return flag in f"{completed.stdout}\n{completed.stderr}"
+            return ""
+        return f"{completed.stdout}\n{completed.stderr}"
+
+    def _help_supports(self, flag: str) -> bool:
+        return flag in self._help_text()
 
     def _requires_max_effort(self, worker: dict | None = None) -> bool:
         worker = worker or {}
@@ -4598,10 +5411,10 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
         ).strip().lower()
         return effort == "max"
 
-    def _raise_missing_effort_support(self, profile: str, execution_mode: str) -> None:
+    def _raise_missing_effort_support(self, profile: str, execution_mode: str, effort: str) -> None:
         raise RuntimeDependencyMissingError(
-            "Claude Code workers requested `max` effort, but the configured Claude Code CLI "
-            "does not expose the native --effort flag.",
+            f"Claude Code workers requested `{effort}` effort, but the configured Claude Code CLI "
+            "does not advertise that native --effort capability.",
             binary=self.binary,
             runtime_name=self.runtime_name,
             profile=profile,
@@ -4615,8 +5428,9 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
 
     def preflight_worker_profile(self, profile: str, execution_mode: str = "host") -> None:
         super().preflight_worker_profile(profile, execution_mode)
-        if os.environ.get("WPR_CLAUDE_CODE_EFFORT", "").strip().lower() == "max" and not self._effort_supported():
-            self._raise_missing_effort_support(profile, execution_mode)
+        effort = os.environ.get("WPR_CLAUDE_CODE_EFFORT", "").strip().lower()
+        if effort in {"max", "xhigh"} and not self._effort_supported(effort):
+            self._raise_missing_effort_support(profile, execution_mode, effort)
         if self._chrome_enabled() and not self._chrome_supported():
             raise RuntimeDependencyMissingError(
                 "Claude Code host workers require a Claude Code CLI that supports --chrome, "
@@ -4634,7 +5448,7 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_key = self._read_session_key(worker["worker_id"])
-        model = worker.get("model") or self.resolve_model(worker.get("profile", "claude-code"))
+        model = self._provider_model_for_worker(worker)
         permission_mode = os.environ.get("WPR_CLAUDE_CODE_PERMISSION_MODE", "bypassPermissions")
         command = [
             self.binary,
@@ -4642,7 +5456,8 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
             "--permission-mode",
             permission_mode,
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
             "--model",
             model,
         ]
@@ -4652,9 +5467,11 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
             self._bootstrap_env_value(worker, "WPR_CLAUDE_CODE_EFFORT")
             or os.environ.get("WPR_CLAUDE_CODE_EFFORT", "")
         ).strip().lower()
-        if effort == "max":
-            if not self._effort_supported():
-                self._raise_missing_effort_support(str(worker.get("profile") or "claude-code"), "host")
+        if effort in {"max", "xhigh"}:
+            if not self._effort_supported(effort):
+                self._raise_missing_effort_support(
+                    str(worker.get("profile") or "claude-code"), "host", effort
+                )
             command.extend(["--effort", effort])
         elif effort and effort != "default":
             logger.warning(
@@ -4667,6 +5484,7 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
         use_api_key = os.environ.get("WPR_CLAUDE_CODE_USE_API_KEY", "0").strip().lower() in {"1", "true", "yes", "on"}
         if not use_api_key:
             env.pop("ANTHROPIC_API_KEY", None)
+        self._remove_conflicting_anthropic_credentials(env)
         return command, env
 
 

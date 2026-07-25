@@ -107,6 +107,271 @@ def wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> None:
     raise AssertionError("Condition did not become true before timeout")
 
 
+def test_completed_run_exposes_runtime_token_usage(tmp_path):
+    class UsageRuntime(StubRuntime):
+        def run_usage(self, worker: dict, run_id: str) -> dict[str, int]:
+            return {
+                "input_tokens": 100,
+                "output_tokens": 25,
+                "cache_read_input_tokens": 800,
+                "cache_creation_input_tokens": 75,
+            }
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime=UsageRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "owner",
+            "title": "Usage",
+            "goal": "Track tokens",
+            "default_worker_profile": "claude-code",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "owner",
+            "name": "Usage worker",
+            "role": "invoice processing",
+            "profile": "claude-code",
+        },
+    ).json()
+    assigned = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "process invoice"},
+    ).json()
+
+    completed = wait_for_run(client, assigned["run_id"])
+
+    assert completed["input_tokens"] == 100
+    assert completed["output_tokens"] == 25
+    assert completed["cache_read_input_tokens"] == 800
+    assert completed["cache_creation_input_tokens"] == 75
+    assert completed["total_tokens"] == 1000
+
+
+def test_worker_live_exposes_content_free_runtime_telemetry(tmp_path):
+    class TelemetryRuntime(StubRuntime):
+        def run_telemetry(self, worker: dict, run_id: str) -> dict[str, object]:
+            return {
+                "schema": "glasshive.claude-run-telemetry.v1",
+                "run_id": run_id,
+                "duration_ms": 125000,
+                "duration_api_ms": 121000,
+                "api_retry_count": 2,
+                "num_turns": 8,
+                "tool_call_counts": {"Read": 2},
+            }
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime=TelemetryRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "owner",
+            "title": "Telemetry",
+            "goal": "Track run health",
+            "default_worker_profile": "claude-code",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "owner",
+            "name": "Telemetry worker",
+            "role": "invoice processing",
+            "profile": "claude-code",
+        },
+    ).json()
+    assigned = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "process invoice"},
+    ).json()
+    wait_for_run(client, assigned["run_id"])
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live").json()
+
+    assert live["telemetry_run_id"] == assigned["run_id"]
+    assert live["telemetry"]["run_id"] == assigned["run_id"]
+    assert live["telemetry"]["api_retry_count"] == 2
+    assert live["telemetry"]["duration_api_ms"] == 121000
+    assert live["telemetry"]["tool_call_counts"] == {"Read": 2}
+
+
+def test_worker_live_reads_active_run_logs_from_runtime_metadata(tmp_path):
+    class LiveTelemetryRuntime(StubRuntime):
+        def live_telemetry(
+            self,
+            worker: dict,
+            stdout: str,
+            run_id: str | None = None,
+        ) -> dict[str, object]:
+            return {
+                "schema": "glasshive.claude-run-telemetry.v1",
+                "run_id": run_id,
+                "telemetry_scope": "full_active_run",
+                "event_count": len([line for line in stdout.splitlines() if line.strip()]),
+            }
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime=LiveTelemetryRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "owner",
+            "title": "Live logs",
+            "goal": "Show the active run",
+            "default_worker_profile": "claude-code",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "owner",
+            "name": "Live log worker",
+            "role": "invoice processing",
+            "profile": "claude-code",
+        },
+    ).json()
+    state_dir = Path(worker["state_dir"])
+    run_root = state_dir / "home" / ".glasshive-runs" / "run_live"
+    run_root.mkdir(parents=True)
+    stdout_path = run_root / "stdout.log"
+    stderr_path = run_root / "stderr.log"
+    stdout_path.write_text('{"type":"system","subtype":"init"}\n')
+    stderr_path.write_text("runtime warning\n")
+    (state_dir / "active_terminal_session.json").write_text(
+        json.dumps(
+            {
+                "session_name": "job-run_live",
+                "run_id": "run_live",
+                "stdout_path": str(stdout_path),
+                "stderr_path": str(stderr_path),
+            }
+        )
+    )
+
+    live = client.get(f"/v1/workers/{worker['worker_id']}/live").json()
+
+    assert '"subtype":"init"' in live["console"]["stdout"]
+    assert "runtime warning" in live["console"]["stderr"]
+    assert live["telemetry"]["telemetry_scope"] == "full_active_run"
+    assert live["telemetry"]["event_count"] == 1
+
+
+def test_worker_live_does_not_fallback_to_console_tail_for_legacy_requested_run(tmp_path):
+    class LegacyTelemetryRuntime(StubRuntime):
+        def live_telemetry(self, worker: dict, stdout: str) -> dict[str, object]:
+            return {
+                "schema": "glasshive.claude-run-telemetry.v1",
+                "telemetry_scope": "console_tail",
+                "event_count": 99,
+            }
+
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime=LegacyTelemetryRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "owner",
+            "title": "Legacy telemetry",
+            "goal": "Do not misbind telemetry",
+            "default_worker_profile": "claude-code",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "owner",
+            "name": "Legacy worker",
+            "role": "invoice processing",
+            "profile": "claude-code",
+        },
+    ).json()
+    assigned = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "process invoice"},
+    ).json()
+    wait_for_run(client, assigned["run_id"])
+
+    payload = client.get(f"/v1/workers/{worker['worker_id']}/telemetry").json()
+
+    assert payload["telemetry_run_id"] == assigned["run_id"]
+    assert payload["telemetry"] == {}
+
+
+def test_worker_telemetry_is_bound_to_active_run_when_newer_run_is_queued(tmp_path):
+    class RunBoundTelemetryRuntime(StubRuntime):
+        def __init__(self):
+            super().__init__()
+            self.requested_run_ids: list[str] = []
+
+        def run_telemetry(self, worker: dict, run_id: str) -> dict[str, object]:
+            self.requested_run_ids.append(run_id)
+            return {
+                "schema": "glasshive.claude-run-telemetry.v1",
+                "run_id": run_id,
+                "event_count": 4,
+            }
+
+    runtime = RunBoundTelemetryRuntime()
+    app = create_app(str(tmp_path / "runtime.db"), runtime=runtime)
+    with TestClient(app) as client:
+        project = client.post(
+            "/v1/projects",
+            json={
+                "owner_id": "owner",
+                "title": "Run-bound telemetry",
+                "goal": "Keep telemetry attached to the running invoice",
+                "default_worker_profile": "claude-code",
+            },
+        ).json()
+        worker = client.post(
+            f"/v1/projects/{project['project_id']}/workers",
+            json={
+                "owner_id": "owner",
+                "name": "Telemetry worker",
+                "role": "invoice processing",
+                "profile": "claude-code",
+            },
+        ).json()
+        active = app.state.store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "active invoice",
+            state="running",
+        )
+        time.sleep(0.002)
+        queued = app.state.store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "next invoice",
+            state="queued",
+        )
+
+        payload = client.get(f"/v1/workers/{worker['worker_id']}/telemetry").json()
+        compact = client.get(
+            f"/v1/workers/{worker['worker_id']}/live",
+            params={"compact": "1"},
+        ).json()
+
+    assert payload["active_run"]["run_id"] == active["run_id"]
+    assert payload["latest_run"]["run_id"] == queued["run_id"]
+    assert "instruction" not in payload["active_run"]
+    assert "instruction" not in payload["latest_run"]
+    assert "output_text" not in payload["active_run"]
+    assert "error_text" not in payload["latest_run"]
+    assert payload["telemetry_run_id"] == active["run_id"]
+    assert payload["telemetry"]["run_id"] == active["run_id"]
+    assert runtime.requested_run_ids == [active["run_id"], active["run_id"]]
+    assert "console" not in payload
+    assert "artifacts" not in payload
+    assert compact["compact"] is True
+    assert compact["active_run"]["run_id"] == active["run_id"]
+    assert compact["telemetry_run_id"] == active["run_id"]
+    assert compact["telemetry"]["run_id"] == active["run_id"]
+    assert compact["project_runs"] == []
+    assert compact["workspace"]["items"] == []
+    assert compact["artifacts"]["items"] == []
+
+
 def test_fresh_user_artifact_deliverable_accepts_standard_deliverable_roots(tmp_path):
     store = Store(str(tmp_path / "runtime.db"))
     service = WorkersProjectsService(store, StubRuntime())
@@ -296,6 +561,13 @@ def test_terminal_callback_message_accepts_inline_final_report_marker():
     output = "Progress that should not surface.\nFINAL REPORT: Captured 42 rows."
 
     assert terminal_callback_message(output) == "Captured 42 rows."
+
+
+def test_terminal_callback_message_accepts_backtick_wrapped_final_report_marker():
+    output = "Progress that should not surface.\n\n`FINAL REPORT:`\n\nCaptured 42 rows."
+
+    assert terminal_callback_message(output) == "Captured 42 rows."
+    assert terminal_callback_full_message(output) == "Captured 42 rows."
 
 
 def test_terminal_callback_message_uses_tail_without_mid_word_fragment():
@@ -2691,6 +2963,135 @@ def test_idle_reaper_preserves_completed_worker_state(tmp_path, monkeypatch):
         service.shutdown()
 
 
+def test_lifecycle_reaper_removes_compute_orphaned_after_worker_termination(tmp_path, monkeypatch):
+    class OrphanRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.container_running = True
+            self.terminated: list[str] = []
+
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            return RuntimeInfo(
+                runtime=str(worker.get("runtime") or "openclaw-stub"),
+                model=str(worker.get("model") or "stub-model"),
+                gateway_url="",
+                gateway_port=None,
+                gateway_token=None,
+                session_key=str(worker.get("session_key") or ""),
+                state_dir=str(worker.get("state_dir") or ""),
+                workspace_dir=str(worker.get("workspace_dir") or ""),
+                pid=4242 if self.container_running else None,
+            )
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated.append(worker["worker_id"])
+            self.container_running = False
+            return self.reconcile_worker(worker)
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = OrphanRuntime()
+    service = WorkersProjectsService(store, runtime)
+    try:
+        project = service.create_project("owner", "Terminated", "Reconcile compute", "openclaw-general")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Terminated Worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+        )
+        store.update_worker(
+            worker["worker_id"],
+            state="terminated",
+            compute_released_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+        reaped = service.reap_terminated_workers_once()
+
+        assert reaped == [{"worker_id": worker["worker_id"], "project_id": project["project_id"]}]
+        assert runtime.terminated == [worker["worker_id"]]
+        assert store.get_worker(worker["worker_id"])["state"] == "terminated"
+        assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.terminated_compute_reconciled"
+    finally:
+        service.shutdown()
+
+
+def test_lifecycle_reaper_is_enabled_for_orphan_reconciliation_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("GLASSHIVE_ORPHAN_REAPER_ENABLED", raising=False)
+    monkeypatch.delenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", raising=False)
+    monkeypatch.delenv("GLASSHIVE_PAUSED_TERMINATE_AFTER_S", raising=False)
+    monkeypatch.delenv("GLASSHIVE_MAX_RUN_DURATION_S", raising=False)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        assert service._lifecycle_reaper_enabled() is True
+    finally:
+        service.shutdown()
+
+
+def test_lifecycle_reaper_removes_nonrunning_compute_from_failed_worker(tmp_path, monkeypatch):
+    class FailedOrphanRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.compute_present = True
+            self.terminated: list[str] = []
+
+        def worker_compute_present(self, worker: dict) -> bool:
+            return self.compute_present
+
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            return RuntimeInfo(
+                runtime=str(worker.get("runtime") or "openclaw-stub"),
+                model=str(worker.get("model") or "stub-model"),
+                gateway_url="",
+                gateway_port=None,
+                gateway_token=None,
+                session_key=str(worker.get("session_key") or ""),
+                state_dir=str(worker.get("state_dir") or ""),
+                workspace_dir=str(worker.get("workspace_dir") or ""),
+                pid=None,
+            )
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated.append(worker["worker_id"])
+            self.compute_present = False
+            return self.reconcile_worker(worker)
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = FailedOrphanRuntime()
+    service = WorkersProjectsService(store, runtime)
+    try:
+        project = service.create_project("owner", "Failed", "Reconcile nonrunning compute", "openclaw-general")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Failed Worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+        )
+        store.update_worker(
+            worker["worker_id"],
+            state="failed",
+            last_error="termination did not release compute",
+        )
+
+        reaped = service.reap_terminated_workers_once()
+
+        assert reaped == [{"worker_id": worker["worker_id"], "project_id": project["project_id"]}]
+        assert runtime.terminated == [worker["worker_id"]]
+        refreshed = store.get_worker(worker["worker_id"])
+        assert refreshed["state"] == "failed"
+        assert refreshed["last_error"] == "termination did not release compute"
+        assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.failed_compute_reconciled"
+    finally:
+        service.shutdown()
+
+
 def test_paused_reaper_stops_paused_compute_without_deleting_workspace(tmp_path, monkeypatch):
     class ReaperRuntime(StubRuntime):
         def __init__(self) -> None:
@@ -4414,6 +4815,7 @@ def test_assign_run_effort_updates_codex_worker_bootstrap_bundle(tmp_path):
     )
     assert run.status_code == 202
     assert run.json()["state"] == "queued"
+    assert run.json()["effort"] == "medium"
 
     stored_worker = Store(str(db_path)).get_worker(worker["worker_id"])
     bundle = json.loads(stored_worker["bootstrap_bundle_json"])
@@ -4457,6 +4859,7 @@ def test_assign_run_effort_updates_claude_worker_bootstrap_bundle(tmp_path):
     )
     assert run.status_code == 202
     assert run.json()["state"] == "queued"
+    assert run.json()["effort"] == "max"
 
     stored_worker = Store(str(db_path)).get_worker(worker["worker_id"])
     bundle = json.loads(stored_worker["bootstrap_bundle_json"])
@@ -4469,6 +4872,42 @@ def test_assign_run_effort_updates_claude_worker_bootstrap_bundle(tmp_path):
     )
     assert rejected.status_code == 400
     assert "Claude effort" in rejected.json()["detail"]
+
+
+def test_assign_run_effort_accepts_claude_xhigh(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub"))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Claude xhigh effort",
+            "goal": "Verify the current Claude CLI effort handoff.",
+            "default_worker_profile": "claude-code",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Claude Worker",
+            "role": "research",
+            "profile": "claude-code",
+            "backend": "openclaw",
+            "start_synchronously": False,
+        },
+    ).json()
+
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Continue with an xhigh effort pass.", "effort": "xhigh"},
+    )
+
+    assert run.status_code == 202
+    assert run.json()["effort"] == "xhigh"
+    stored_worker = Store(str(db_path)).get_worker(worker["worker_id"])
+    bundle = json.loads(stored_worker["bootstrap_bundle_json"])
+    assert bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == "xhigh"
 
 
 def test_signed_worker_view_cannot_inject_bootstrap_bundle_on_assign(tmp_path, monkeypatch):
@@ -5239,6 +5678,57 @@ def test_artifact_surfaces_reject_browser_runtime_scratch_paths(tmp_path, monkey
     assert persistent_download.json()["detail"] == "Artifact path is not downloadable"
 
 
+def test_worker_artifact_listing_pages_complete_large_workspace(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Large artifact package",
+            "goal": "Return every completed artifact without truncation.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Large artifact worker",
+            "role": "processor",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+            "execution_mode": "host",
+        },
+    ).json()
+    workspace = Path(worker["workspace_dir"])
+    for index in range(620):
+        path = workspace / "output" / "deliveries" / f"invoice-{index:04d}" / "canonical.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+
+    paths = []
+    cursor = 0
+    while True:
+        response = client.get(
+            f"/v1/workers/{worker['worker_id']}/artifacts",
+            params={"cursor": cursor, "limit": 200},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["total"] == 620
+        paths.extend(item["path"] for item in payload["items"])
+        if payload["next_cursor"] is None:
+            break
+        assert payload["next_cursor"] > cursor
+        cursor = payload["next_cursor"]
+
+    assert len(paths) == 620
+    assert len(set(paths)) == 620
+    assert paths[0] == "output/deliveries/invoice-0000/canonical.json"
+    assert paths[-1] == "output/deliveries/invoice-0619/canonical.json"
+
+
 def test_deliverable_detection_ignores_provider_api_endpoints(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -5409,6 +5899,23 @@ class SteerableControllableRuntime(ControllableRuntime):
         if instruction.startswith("Operator steer instruction"):
             return "STEER_REDIRECT_OK"
         return super().run_task(worker, instruction, timeout_sec=timeout_sec)
+
+
+class TerminationRaceRuntime(ControllableRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.task_exited = Event()
+
+    def terminate_worker(self, worker: dict) -> RuntimeInfo:
+        self.interrupted.set()
+        assert self.task_exited.wait(timeout=2), "active task did not observe termination"
+        return self._info(worker, pid=None)
+
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None) -> str:
+        try:
+            return super().run_task(worker, instruction, timeout_sec=timeout_sec)
+        finally:
+            self.task_exited.set()
 
 
 class RefreshingModelRuntime(ControllableRuntime):
@@ -5638,6 +6145,100 @@ def test_interrupt_stops_active_run_and_keeps_worker_ready(tmp_path):
     assert worker_after["state"] == "ready"
 
 
+def test_terminate_active_run_cannot_resurrect_worker(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime = TerminationRaceRuntime()
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
+
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Terminate", "goal": "Stop active compute permanently."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Terminate Worker", "role": "coder"},
+    ).json()
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Long task to be terminated."},
+    ).json()
+    assert runtime.running.wait(timeout=2), "worker run never started"
+
+    terminated = client.post(f"/v1/workers/{worker['worker_id']}/terminate")
+
+    assert terminated.status_code == 202
+    assert terminated.json()["state"] == "terminated"
+    assert wait_for_run(client, run["run_id"], timeout=3.0)["state"] == "cancelled"
+    time.sleep(0.1)
+    assert client.get(f"/v1/workers/{worker['worker_id']}").json()["state"] == "terminated"
+
+
+def test_terminate_failure_is_not_reported_as_success(tmp_path):
+    class FailingTerminateRuntime(StubRuntime):
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            raise RuntimeError("compute remained active")
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, FailingTerminateRuntime())
+    try:
+        project = service.create_project("owner", "Failure", "Surface termination failure", "openclaw-general")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Failure Worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+        )
+
+        with pytest.raises(RuntimeError, match="compute remained active"):
+            service.terminate_worker(worker["worker_id"])
+
+        refreshed = store.get_worker(worker["worker_id"])
+        assert refreshed is not None
+        assert refreshed["state"] == "failed"
+        assert refreshed["last_error"] == "compute remained active"
+        assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.termination_failed"
+    finally:
+        service.shutdown()
+
+
+def test_terminate_rejects_runtime_that_still_reports_compute(tmp_path):
+    class LingeringTerminateRuntime(StubRuntime):
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            return RuntimeInfo(
+                runtime="openclaw-stub",
+                model="stub-model",
+                gateway_url="",
+                gateway_port=None,
+                gateway_token=None,
+                session_key=str(worker.get("session_key") or ""),
+                state_dir=str(worker.get("state_dir") or ""),
+                workspace_dir=str(worker.get("workspace_dir") or ""),
+                pid=4242,
+            )
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, LingeringTerminateRuntime())
+    try:
+        project = service.create_project("owner", "Lingering", "Reject false termination", "openclaw-general")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Lingering Worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+        )
+
+        with pytest.raises(RuntimeError, match="still active after termination"):
+            service.terminate_worker(worker["worker_id"])
+
+        assert store.get_worker(worker["worker_id"])["state"] == "failed"
+    finally:
+        service.shutdown()
+
+
 def test_steer_interrupts_active_run_and_redirects_to_new_instruction(tmp_path):
     db_path = tmp_path / "runtime.db"
     runtime = SteerableControllableRuntime()
@@ -5716,7 +6317,7 @@ class HealRecoveryRuntime:
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         return self._info(worker)
 
-    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, str] | None:
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
         self.collect_run_ids.append(run_id)
         return {
             "state": "completed",
@@ -5930,6 +6531,11 @@ class TerminatedButCompletedRuntime(StubRuntime):
         }
 
 
+class InterruptedButCompletedRuntime(TerminatedButCompletedRuntime):
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        raise WorkerInterruptedError("stale interruption marker")
+
+
 class RuntimeErrorWithPartialArtifactsRuntime(StubRuntime):
     def __init__(self, root: Path) -> None:
         super().__init__()
@@ -5985,6 +6591,12 @@ class RuntimeErrorWithPartialArtifactsRuntime(StubRuntime):
                 "from the current files and notes."
             ),
             "failure_diagnostic_summary": "response.failed event received",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 20,
+                "cache_creation_input_tokens": 3,
+            },
         }
 
 
@@ -6121,6 +6733,7 @@ def test_runtime_error_recovers_codex_failure_metadata_and_artifacts(tmp_path, m
     assert failed["state"] == "failed"
     assert failed["failure_class"] == "provider_response_failed"
     assert failed["failure_retryable"] == 1
+    assert failed["total_tokens"] == 38
     assert runtime.collect_run_ids == [run["run_id"]]
     refreshed_worker = client.get(f"/v1/workers/{worker['worker_id']}").json()
     assert refreshed_worker["runtime"] == "codex-cli"
@@ -6315,6 +6928,39 @@ def test_worker_terminated_error_recovers_completed_artifacts(tmp_path):
     db_path = tmp_path / "runtime.db"
     store = Store(str(db_path))
     runtime = TerminatedButCompletedRuntime()
+    service = WorkersProjectsService(store, runtime)
+    try:
+        project = service.create_project("demo-owner", "Recovered Run", "Recover stdout.", "codex-cli")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="demo-owner",
+            name="Recovered Worker",
+            role="coder",
+            profile="codex-cli",
+            backend="openclaw",
+        )
+        run = service.assign_run(worker["worker_id"], "finish despite stale marker")
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            refreshed = store.get_run(run["run_id"])
+            if refreshed and refreshed["state"] == "completed":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("Run did not recover completed artifacts")
+
+        assert store.get_run(run["run_id"])["output_text"] == "Recovered final answer"
+        assert store.get_worker(worker["worker_id"])["state"] == "ready"
+        assert runtime.collect_run_ids == [run["run_id"]]
+    finally:
+        service.shutdown()
+
+
+def test_worker_interrupted_error_recovers_completed_artifacts(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    runtime = InterruptedButCompletedRuntime()
     service = WorkersProjectsService(store, runtime)
     try:
         project = service.create_project("demo-owner", "Recovered Run", "Recover stdout.", "codex-cli")

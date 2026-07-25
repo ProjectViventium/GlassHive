@@ -34,6 +34,11 @@ Each worker can now carry:
     - `agents_md`
     - `system_instructions`
 
+Bootstrap `files` are evidence seeds by default. A reference, tool, or Skill
+file that supports the worker but is not expected to appear in the final
+deliverable can set `"evidence_seed": false`; the file is still copied into the
+workspace but is excluded from output seed-coverage warnings.
+
 Current behavior:
 
 - existing host-projection defaults remain backward-compatible
@@ -42,6 +47,21 @@ Current behavior:
 - broker/client config is additive over native worker capability: Codex/Claude host and workstation
   launches must not drop browser, computer/desktop, shell, file, or MCP capabilities just because
   GlassHive projected a broker MCP
+
+## Claude Code on Amazon Bedrock
+
+Claude workers can use Amazon Bedrock without changing the logical model recorded in GlassHive
+evidence. Set `WPR_MODEL_CLAUDE_CODE` to the audited Claude model name and
+`WPR_CLAUDE_CODE_PROVIDER_MODEL` to the Bedrock application inference profile ARN used by the CLI.
+Provide the standard Claude Code Bedrock environment (`CLAUDE_CODE_USE_BEDROCK=1`, an AWS region,
+and one supported AWS credential method). GlassHive projects those values only into the active run
+and removes Anthropic API/OAuth credentials whenever Bedrock mode is enabled, preventing an
+unintended provider fallback.
+
+The provider-specific model value is intentionally separate from the logical model: callers can
+continue to attest `claude-opus-4-8`, while Claude Code invokes the metered application inference
+profile selected by the administrator. Do not place AWS credentials in bootstrap instructions,
+worker metadata, source control, or logs.
 
 ## Run
 

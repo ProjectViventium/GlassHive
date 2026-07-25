@@ -65,7 +65,6 @@ from .signed_links import (
     create_signed_link_ref,
     install_sensitive_url_log_filter,
     resolve_signed_link_ref,
-    sign_link_params,
     signed_link_ref_url,
     sign_link_token,
     verify_signed_link,
@@ -462,8 +461,8 @@ def create_app(
             normalized["codex_reasoning_effort"] = effort
         if payload.claude_effort is not None:
             effort = payload.claude_effort.strip().lower()
-            if effort and effort not in {"default", "max"}:
-                raise HTTPException(status_code=400, detail="claude_effort must be default or max")
+            if effort and effort not in {"default", "max", "xhigh"}:
+                raise HTTPException(status_code=400, detail="claude_effort must be default, max, or xhigh")
             normalized["claude_effort"] = "" if effort == "default" else effort
         if payload.openclaw_effort is not None:
             effort = payload.openclaw_effort.strip().lower()
@@ -482,8 +481,8 @@ def create_app(
                 raise HTTPException(status_code=400, detail="Codex effort must be none, minimal, low, medium, high, or xhigh")
             return {"env": {"WPR_CODEX_CLI_REASONING_EFFORT": effort}}
         if profile == "claude-code":
-            if effort not in {"default", "max"}:
-                raise HTTPException(status_code=400, detail="Claude effort must be default or max")
+            if effort not in {"default", "max", "xhigh"}:
+                raise HTTPException(status_code=400, detail="Claude effort must be default, max, or xhigh")
             if effort == "default":
                 return None
             return {"env": {"WPR_CLAUDE_CODE_EFFORT": effort}}
@@ -705,6 +704,32 @@ def create_app(
         )
 
     def _log_paths(worker: dict) -> tuple[Path, Path]:
+        raw_state_dir = str(worker.get("state_dir") or "").strip()
+        if raw_state_dir:
+            state_dir = Path(raw_state_dir)
+            metadata_path = state_dir / "active_terminal_session.json"
+            try:
+                metadata = json.loads(metadata_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                metadata = {}
+            if isinstance(metadata, dict):
+                candidate_paths: list[Path] = []
+                safe = True
+                resolved_state_dir = state_dir.resolve(strict=False)
+                for key in ("stdout_path", "stderr_path"):
+                    raw_path = str(metadata.get(key) or "").strip()
+                    if not raw_path:
+                        safe = False
+                        break
+                    candidate = Path(raw_path)
+                    resolved_candidate = candidate.resolve(strict=False)
+                    if not resolved_candidate.is_relative_to(resolved_state_dir):
+                        safe = False
+                        break
+                    candidate_paths.append(candidate)
+                if safe and len(candidate_paths) == 2:
+                    return candidate_paths[0], candidate_paths[1]
+
         runtime_name = _profile_runtime_label(worker)
         if str(worker.get("execution_mode") or "docker") == "host":
             root_map = {
@@ -954,7 +979,6 @@ def create_app(
         return visible.decode("utf-8", errors="replace"), truncated
 
     def _artifact_open_page(worker: dict, target: Path, relative_path: str, request: Request) -> HTMLResponse:
-        worker_id = str(worker.get("worker_id") or "")
         download_url = _signed_artifact_action_url(
             worker,
             relative_path,
@@ -1138,6 +1162,20 @@ def create_app(
             if key in {"event_type", "message", "created_at"}
         }
 
+    def _telemetry_run_reference(run: dict[str, object] | None) -> dict[str, object] | None:
+        if run is None:
+            return None
+        return {
+            key: run.get(key)
+            for key in (
+                "run_id",
+                "state",
+                "queued_at",
+                "started_at",
+                "ended_at",
+            )
+        }
+
     def _admin_api_enabled() -> bool:
         if not auth_settings.enterprise:
             return True
@@ -1149,28 +1187,112 @@ def create_app(
         if ctx.enterprise and ctx.role.strip().lower() not in {"admin", "owner", "operator"}:
             raise HTTPException(status_code=403, detail="Admin role required")
 
-    def _live_payload(worker_id: str, request: Request | None = None) -> dict[str, object]:
+    def _telemetry_for_run(
+        worker: dict[str, object],
+        telemetry_run: dict[str, object] | None,
+        stdout_text: str,
+    ) -> dict[str, object]:
+        telemetry: dict[str, object] = {}
+        if telemetry_run:
+            run_id = str(telemetry_run.get("run_id") or "")
+            telemetry_reader = getattr(runtime_impl, "run_telemetry", None)
+            if callable(telemetry_reader):
+                try:
+                    telemetry = dict(telemetry_reader(worker, run_id))
+                except Exception:
+                    telemetry = {}
+            if not telemetry:
+                live_telemetry_reader = getattr(runtime_impl, "live_telemetry", None)
+                if callable(live_telemetry_reader):
+                    try:
+                        telemetry = dict(
+                            live_telemetry_reader(
+                                worker,
+                                stdout_text,
+                                run_id=run_id or None,
+                            )
+                        )
+                    except TypeError as exc:
+                        if "run_id" not in str(exc):
+                            telemetry = {}
+                        else:
+                            telemetry = {}
+                    except Exception:
+                        telemetry = {}
+            if telemetry:
+                nested_run_id = str(telemetry.get("run_id") or "")
+                if nested_run_id != run_id:
+                    telemetry = {}
+        else:
+            live_telemetry_reader = getattr(runtime_impl, "live_telemetry", None)
+            if callable(live_telemetry_reader):
+                try:
+                    telemetry = dict(live_telemetry_reader(worker, stdout_text))
+                except Exception:
+                    telemetry = {}
+        return telemetry
+
+    def _telemetry_payload(worker_id: str, request: Request | None = None) -> dict[str, object]:
         ctx = _auth_context(request)
         worker = require_worker(worker_id, request)
         runs = store.list_runs_for_worker(worker_id, limit=10, tenant_id=_tenant_filter(ctx))
-        project_runs = store.list_runs_for_project(worker["project_id"], limit=12, tenant_id=_tenant_filter(ctx))
+        latest_run = runs[0] if runs else None
+        active_run = store.get_active_run(worker_id)
+        telemetry_run = active_run or latest_run
+        stdout_path, _stderr_path = _log_paths(worker)
+        stdout_text = _read_tail(stdout_path)
+        telemetry = _telemetry_for_run(worker, telemetry_run, stdout_text)
+        show_internal = _can_show_internal_details(ctx)
+        return {
+            "worker_id": worker_id,
+            "active_run": _telemetry_run_reference(active_run),
+            "latest_run": _telemetry_run_reference(latest_run),
+            "telemetry_run_id": str((telemetry_run or {}).get("run_id") or "") or None,
+            "telemetry": telemetry if show_internal else {},
+        }
+
+    def _live_payload(worker_id: str, request: Request | None = None) -> dict[str, object]:
+        ctx = _auth_context(request)
+        worker = require_worker(worker_id, request)
+        compact = (
+            request is not None
+            and str(request.query_params.get("compact") or "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        runs = store.list_runs_for_worker(worker_id, limit=10, tenant_id=_tenant_filter(ctx))
+        project_runs = (
+            []
+            if compact
+            else store.list_runs_for_project(
+                worker["project_id"],
+                limit=12,
+                tenant_id=_tenant_filter(ctx),
+            )
+        )
         events = store.list_events(worker_id, _tenant_filter(ctx))[-25:]
         latest_run = runs[0] if runs else None
+        active_run = store.get_active_run(worker_id)
+        telemetry_run = active_run or latest_run
         stdout_path, stderr_path = _log_paths(worker)
         stdout_text = _read_tail(stdout_path)
         stderr_text = _read_tail(stderr_path)
+        telemetry = _telemetry_for_run(worker, telemetry_run, stdout_text)
         runtime_details = _runtime_details(worker)
         host_visibility = _host_visibility(worker, runtime_details) if str(worker.get("execution_mode") or "docker") == "host" else {}
         latest_output = ""
         if latest_run:
             latest_output = str(latest_run.get("output_text") or latest_run.get("error_text") or "")
-        latest_image = _latest_image_path(worker)
-        deliverable = _deliverable_with_action_urls(
-            worker,
-            deliverable_payload(worker, latest_run, latest_output, stdout_text, stderr_text),
+        latest_image = None if compact else _latest_image_path(worker)
+        deliverable = (
+            {}
+            if compact
+            else _deliverable_with_action_urls(
+                worker,
+                deliverable_payload(worker, latest_run, latest_output, stdout_text, stderr_text),
+            )
         )
         show_internal = _can_show_internal_details(ctx)
-        workspace_items = _workspace_items(worker, max_entries=120, max_depth=8)
+        workspace_items = [] if compact else _workspace_items(worker, max_entries=120, max_depth=8)
         workspace_summary_items = [
             item
             for item in workspace_items
@@ -1191,12 +1313,16 @@ def create_app(
         )
         return {
             "worker": _sanitize_worker(worker) if show_internal else _redact_worker_for_member(worker),
+            "compact": compact,
+            "active_run": active_run if show_internal or active_run is None else _redact_run_for_member(active_run),
             "latest_run": latest_run if show_internal or latest_run is None else _redact_run_for_member(latest_run),
             "latest_output": latest_output,
             "runs": runs if show_internal else [_redact_run_for_member(run) for run in runs],
             "project_runs": project_runs if show_internal else [_redact_run_for_member(run) for run in project_runs],
             "events": events if show_internal else [_redact_event_for_member(event) for event in events],
             "runtime_details": runtime_details_payload,
+            "telemetry_run_id": str((telemetry_run or {}).get("run_id") or "") or None,
+            "telemetry": telemetry if show_internal else {},
             "console": {
                 "stdout": stdout_text if show_internal else "",
                 "stderr": stderr_text if show_internal else "",
@@ -1385,6 +1511,11 @@ def create_app(
         require_worker(worker_id, request)
         return _live_payload(worker_id, request)
 
+    @app.get("/v1/workers/{worker_id}/telemetry")
+    def worker_telemetry(worker_id: str, request: Request) -> dict[str, object]:
+        require_worker(worker_id, request)
+        return _telemetry_payload(worker_id, request)
+
     @app.get("/v1/workers/{worker_id}/runs")
     def list_worker_runs(worker_id: str, request: Request) -> dict[str, list[RunResponse]]:
         ctx = _auth_context(request)
@@ -1432,6 +1563,7 @@ def create_app(
         if ctx.auth_mode == "signed_link" and payload.bootstrap_bundle:
             raise HTTPException(status_code=403, detail="Signed workspace links cannot modify worker bootstrap context")
         worker = require_worker(worker_id, request)
+        normalized_effort = str(payload.effort or "").strip().lower()
         run = service.assign_run(
             worker_id,
             payload.instruction,
@@ -1440,7 +1572,7 @@ def create_app(
                 payload.bootstrap_bundle,
             ),
         )
-        return RunResponse(**run)
+        return RunResponse(**run, effort=normalized_effort)
 
     @app.post("/v1/workers/{worker_id}/message", response_model=RunResponse, status_code=202)
     def send_message(worker_id: str, payload: SendMessageRequest, request: Request) -> RunResponse:
@@ -1506,7 +1638,7 @@ def create_app(
 
     @app.post("/v1/workers/{worker_id}/desktop-action", response_model=DesktopActionResponse, status_code=202)
     def desktop_action(worker_id: str, payload: DesktopActionRequest, request: Request) -> DesktopActionResponse:
-        worker = require_worker(worker_id, request)
+        require_worker(worker_id, request)
         try:
             launched = service.desktop_action(worker_id, payload.action, url=payload.url, run_id=payload.run_id)
         except RuntimeError as exc:
@@ -1907,19 +2039,34 @@ def create_app(
         )
 
     @app.get("/v1/workers/{worker_id}/artifacts")
-    def list_worker_artifacts(worker_id: str, request: Request) -> dict[str, object]:
+    def list_worker_artifacts(
+        worker_id: str,
+        request: Request,
+        cursor: int = 0,
+        limit: int = 500,
+    ) -> dict[str, object]:
         worker = require_worker(worker_id, request)
+        if cursor < 0 or not 1 <= limit <= 2_000:
+            raise HTTPException(status_code=400, detail="Artifact pagination is out of range")
+        scan_limit = int(os.environ.get("GLASSHIVE_ARTIFACT_LIST_SCAN_MAX_ENTRIES", "50000"))
+        if scan_limit < 1:
+            raise HTTPException(status_code=500, detail="Artifact scan limit is invalid")
+        workspace_items = _workspace_items(worker, max_entries=scan_limit + 1, max_depth=8)
+        if len(workspace_items) > scan_limit:
+            raise HTTPException(status_code=413, detail="Worker workspace exceeds the artifact scan limit")
+        files = [item for item in workspace_items if not item.get("is_dir")]
+        page = files[cursor : cursor + limit]
         items = [
             {
                 **item,
                 "open_url": _artifact_query_url(worker_id, "open", str(item["path"])),
                 "download_url": _artifact_query_url(worker_id, "download", str(item["path"])),
             }
-            for item in _workspace_items(worker, max_entries=500, max_depth=8)
-            if not item.get("is_dir")
+            for item in page
         ]
         store.add_event(worker["project_id"], worker_id, None, "worker.artifacts_listed", "Workspace artifacts listed")
-        return {"items": items}
+        next_cursor = cursor + len(page) if cursor + len(page) < len(files) else None
+        return {"items": items, "next_cursor": next_cursor, "total": len(files)}
 
     @app.get("/v1/workers/{worker_id}/artifacts/open")
     def open_worker_artifact(worker_id: str, path: str, request: Request) -> HTMLResponse:

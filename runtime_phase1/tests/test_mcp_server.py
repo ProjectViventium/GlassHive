@@ -1522,6 +1522,35 @@ def test_workspace_launch_projects_saved_claude_max_effort(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_workspace_launch_projects_saved_claude_xhigh_effort(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "claude-code")
+    api = PreferenceApiClient()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            saved = await client.call_tool(
+                "workspace_preferences_set",
+                {"default_worker_profile": "claude-code", "claude_effort": "xhigh"},
+            )
+            assert _tool_json(saved)["claude_effort"] == "xhigh"
+
+            launched = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Create a synthetic Claude QA marker",
+                    "success_criteria": "Marker exists",
+                    "expose_diagnostics": True,
+                },
+            )
+            payload = _tool_json(launched)
+            assert payload["effort"] == "xhigh"
+            bundle = api.find_or_resume_payloads[-1]["bootstrap_bundle"]
+            assert bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == "xhigh"
+
+    asyncio.run(scenario())
+
+
 def test_workspace_artifact_download_rejects_traversal_before_signing(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ARTIFACT_BASE_URL", "https://glasshive.example.test")
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
@@ -4689,7 +4718,7 @@ def test_tool_descriptions_advertise_mcp_owned_usage_contract(monkeypatch):
             assert "deep research" in workspace_description
             assert "critical analysis" in workspace_description
             assert "high/xhigh" in workspace_description
-            assert "Claude max" in workspace_description
+            assert "Claude max/xhigh" in workspace_description
             assert "omit effort" in workspace_description
             assert "deployment defaults own the baseline" in workspace_description
             assert "Use medium only for ordinary bounded tasks" not in workspace_description

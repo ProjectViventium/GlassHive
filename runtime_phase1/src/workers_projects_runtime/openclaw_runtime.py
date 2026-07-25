@@ -141,7 +141,7 @@ class StubRuntime:
     def preflight_worker_profile(self, profile: str, execution_mode: str = "docker") -> None:
         return None
 
-    def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+    def _runtime_info(self, worker: dict, *, pid: int | None) -> RuntimeInfo:
         worker_id = worker["worker_id"]
         return RuntimeInfo(
             runtime="openclaw-stub",
@@ -152,22 +152,27 @@ class StubRuntime:
             session_key=worker.get("session_key") or f"agent:main:wpr:worker:{worker_id}",
             state_dir=f"/tmp/{worker_id}/state",
             workspace_dir=f"/tmp/{worker_id}/workspace",
-            pid=99999,
+            pid=pid,
         )
 
+    def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+        return self._runtime_info(worker, pid=99999)
+
     def pause_worker(self, worker: dict) -> RuntimeInfo:
-        return self.ensure_worker_ready(worker)
+        return self._runtime_info(worker, pid=None)
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
         return self.ensure_worker_ready(worker)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
-        return self.ensure_worker_ready(worker)
+        return self._runtime_info(worker, pid=None)
 
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
         return f"STUB_OK: {instruction}"
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+        if worker.get("state") in {"paused", "terminated"}:
+            return self._runtime_info(worker, pid=None)
         return self.ensure_worker_ready(worker)
 
 
