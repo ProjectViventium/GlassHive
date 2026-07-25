@@ -265,6 +265,11 @@ Persisted and public telemetry are strict, bounded allowlists of counters, times
 identifiers. Snapshot writes are atomic and best-effort: an observability I/O failure cannot turn a
 completed workload into a failed one.
 
+The telemetry endpoint's active/latest run references are also limited to run identity, state, and
+timestamps. Prompts, instructions, model output, and error text remain available only through the
+explicitly operator-private detailed surfaces and are never part of the lightweight telemetry
+contract.
+
 ## QA Requirements
 
 The Standard GlassHive QA cases must include:

@@ -1162,6 +1162,20 @@ def create_app(
             if key in {"event_type", "message", "created_at"}
         }
 
+    def _telemetry_run_reference(run: dict[str, object] | None) -> dict[str, object] | None:
+        if run is None:
+            return None
+        return {
+            key: run.get(key)
+            for key in (
+                "run_id",
+                "state",
+                "queued_at",
+                "started_at",
+                "ended_at",
+            )
+        }
+
     def _admin_api_enabled() -> bool:
         if not auth_settings.enterprise:
             return True
@@ -1231,8 +1245,8 @@ def create_app(
         show_internal = _can_show_internal_details(ctx)
         return {
             "worker_id": worker_id,
-            "active_run": active_run if show_internal or active_run is None else _redact_run_for_member(active_run),
-            "latest_run": latest_run if show_internal or latest_run is None else _redact_run_for_member(latest_run),
+            "active_run": _telemetry_run_reference(active_run),
+            "latest_run": _telemetry_run_reference(latest_run),
             "telemetry_run_id": str((telemetry_run or {}).get("run_id") or "") or None,
             "telemetry": telemetry if show_internal else {},
         }

@@ -354,6 +354,10 @@ def test_worker_telemetry_is_bound_to_active_run_when_newer_run_is_queued(tmp_pa
 
     assert payload["active_run"]["run_id"] == active["run_id"]
     assert payload["latest_run"]["run_id"] == queued["run_id"]
+    assert "instruction" not in payload["active_run"]
+    assert "instruction" not in payload["latest_run"]
+    assert "output_text" not in payload["active_run"]
+    assert "error_text" not in payload["latest_run"]
     assert payload["telemetry_run_id"] == active["run_id"]
     assert payload["telemetry"]["run_id"] == active["run_id"]
     assert runtime.requested_run_ids == [active["run_id"], active["run_id"]]
