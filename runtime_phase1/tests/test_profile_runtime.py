@@ -2750,6 +2750,7 @@ def test_claude_stream_telemetry_is_compact_and_content_free(tmp_path):
         "stop_reason": "end_turn",
         "duration_ms": 125000,
         "duration_api_ms": 121000,
+        "duration_non_api_ms": 4000,
         "ttft_ms": 2424,
         "ttft_stream_ms": 1411,
         "time_to_request_ms": 24,
@@ -2868,6 +2869,8 @@ def test_claude_live_telemetry_reads_the_complete_active_run(tmp_path):
     assert telemetry["event_count"] == 3
     assert telemetry["tool_call_count"] == 2
     assert telemetry["tool_call_counts"] == {"Bash": 1, "Read": 1}
+    assert telemetry["last_stream_activity_at"] == telemetry["last_progress_at"]
+    assert telemetry["seconds_since_stream_activity"] == telemetry["seconds_since_progress"]
 
 
 def test_claude_live_telemetry_consumes_only_complete_appended_lines(tmp_path):
@@ -2913,6 +2916,36 @@ def test_claude_live_telemetry_consumes_only_complete_appended_lines(tmp_path):
     assert third["event_count"] == second["event_count"]
     assert third["malformed_line_count"] == second["malformed_line_count"]
     assert third["sample_sequence"] == 3
+
+
+def test_claude_live_telemetry_deduplicates_tool_calls_by_id(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_deduplicated_tools",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_deduplicated_tools"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    repeated = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": "toolu_123", "name": "Read", "input": {}}
+                ]
+            },
+        }
+    )
+    (run_root / "stdout.log").write_text(repeated + "\n" + repeated + "\n")
+
+    telemetry = runtime.live_telemetry(worker, "", run_id=run_id)
+
+    assert telemetry["event_count"] == 2
+    assert telemetry["tool_call_count"] == 1
+    assert telemetry["tool_call_counts"] == {"Read": 1}
 
 
 def test_claude_live_telemetry_does_not_substitute_console_tail_for_missing_run(tmp_path):
@@ -3669,6 +3702,8 @@ def test_docker_cli_runtime_redirects_private_instruction_from_stdin_file(tmp_pa
         run_root = runtime._run_root(worker_id, run_id)
         script = (run_root / "run.sh").read_text()
         stdin_path = run_root / "instruction.stdin"
+        assert (run_root / "stdout.log").is_file()
+        assert (run_root / "stderr.log").is_file()
         assert stdin_path.exists()
         assert stdin_path.read_text().startswith("Sensitive docker instruction.")
         assert oct(stdin_path.stat().st_mode & 0o777) == "0o600"

@@ -1722,6 +1722,11 @@ class BaseCliWorkerRuntime:
         host_exit = run_root / "exit_code"
         host_script = run_root / "run.sh"
         host_stdin = run_root / "instruction.stdin"
+        # Preserve host ownership across the bind mount so the service can read
+        # the completed transcript after the container process exits.
+        for transcript_path in (host_stdout, host_stderr):
+            transcript_path.touch(exist_ok=True)
+            transcript_path.chmod(0o600)
 
         container_run_root = self._container_run_root(effective_run_id)
         container_stdout = f"{container_run_root}/stdout.log"
@@ -3166,6 +3171,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             "api_retry_delay_ms": 0,
             "api_retry_statuses": set(),
             "tool_call_counts": {},
+            "seen_tool_call_ids": set(),
             "seen_usage_message_ids": set(),
             "stream_input_tokens": 0,
             "stream_output_tokens": 0,
@@ -3261,6 +3267,16 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                     for item in content:
                         if not isinstance(item, dict) or item.get("type") != "tool_use":
                             continue
+                        tool_call_id = str(item.get("id") or "").strip()
+                        seen_tool_call_ids = state["seen_tool_call_ids"]
+                        if (
+                            tool_call_id
+                            and isinstance(seen_tool_call_ids, set)
+                            and tool_call_id in seen_tool_call_ids
+                        ):
+                            continue
+                        if tool_call_id and isinstance(seen_tool_call_ids, set):
+                            seen_tool_call_ids.add(tool_call_id)
                         name = str(item.get("name") or "unknown").strip() or "unknown"
                         counts[name] = int(counts.get(name, 0)) + 1
         return True
@@ -3317,6 +3333,11 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         total_cost_usd = self._finite_telemetry_float(result.get("total_cost_usd"))
         if total_cost_usd is not None:
             telemetry["total_cost_usd"] = total_cost_usd
+        if telemetry["duration_ms"]:
+            telemetry["duration_non_api_ms"] = max(
+                int(telemetry["duration_ms"]) - int(telemetry["duration_api_ms"]),
+                0,
+            )
         return telemetry
 
     def _telemetry_from_output(self, stdout: str) -> dict[str, object]:
@@ -3456,6 +3477,10 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                     0.0,
                     round((sampled_at - last_progress_at).total_seconds(), 3),
                 )
+                telemetry["last_stream_activity_at"] = telemetry["last_progress_at"]
+                telemetry["seconds_since_stream_activity"] = telemetry[
+                    "seconds_since_progress"
+                ]
 
             if len(self._live_telemetry_cache) > 128:
                 oldest_key = min(
