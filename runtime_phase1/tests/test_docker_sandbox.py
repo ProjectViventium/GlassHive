@@ -46,6 +46,7 @@ def test_safe_docker_exec_env_preserves_bedrock_run_credentials_only():
             "AWS_SECRET_ACCESS_KEY": "synthetic-secret-not-real",
             "AWS_REGION": "us-east-1",
             "AWS_EC2_METADATA_DISABLED": "true",
+            "API_TIMEOUT_MS": "240000",
             "UNRELATED_SECRET": "must-not-pass",
         }
     )
@@ -55,6 +56,7 @@ def test_safe_docker_exec_env_preserves_bedrock_run_credentials_only():
     assert env["AWS_SECRET_ACCESS_KEY"] == "synthetic-secret-not-real"
     assert env["AWS_REGION"] == "us-east-1"
     assert env["AWS_EC2_METADATA_DISABLED"] == "true"
+    assert env["API_TIMEOUT_MS"] == "240000"
     assert "UNRELATED_SECRET" not in env
 
 
@@ -1171,7 +1173,11 @@ def test_start_screen_session_prepares_runtime_dir_and_detaches(tmp_path):
         "codex-cli",
         "job-run_123456",
         ["echo", "ok"],
-        env={"OPENAI_API_KEY": "secret", "PATH": "/usr/bin:/bin"},
+        env={
+            "OPENAI_API_KEY": "secret",
+            "API_TIMEOUT_MS": "240000",
+            "PATH": "/usr/bin:/bin",
+        },
     )
 
     assert calls[0][0] == "root"
@@ -1180,6 +1186,7 @@ def test_start_screen_session_prepares_runtime_dir_and_detaches(tmp_path):
     assert calls[1][2] is True
     assert calls[1][3]["PATH"] == "/usr/bin:/bin"
     assert calls[1][3]["OPENAI_API_KEY"] == "secret"
+    assert calls[1][3]["API_TIMEOUT_MS"] == "240000"
 
 
 def test_screen_session_pid_reads_matching_screen_socket(tmp_path):
