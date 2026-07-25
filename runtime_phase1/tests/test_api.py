@@ -190,6 +190,8 @@ def test_worker_live_exposes_content_free_runtime_telemetry(tmp_path):
 
     live = client.get(f"/v1/workers/{worker['worker_id']}/live").json()
 
+    assert live["telemetry_run_id"] == assigned["run_id"]
+    assert live["telemetry"]["run_id"] == assigned["run_id"]
     assert live["telemetry"]["api_retry_count"] == 2
     assert live["telemetry"]["duration_api_ms"] == 121000
     assert live["telemetry"]["tool_call_counts"] == {"Read": 2}
@@ -359,6 +361,8 @@ def test_worker_telemetry_is_bound_to_active_run_when_newer_run_is_queued(tmp_pa
     assert "artifacts" not in payload
     assert compact["compact"] is True
     assert compact["active_run"]["run_id"] == active["run_id"]
+    assert compact["telemetry_run_id"] == active["run_id"]
+    assert compact["telemetry"]["run_id"] == active["run_id"]
     assert compact["project_runs"] == []
     assert compact["workspace"]["items"] == []
     assert compact["artifacts"]["items"] == []

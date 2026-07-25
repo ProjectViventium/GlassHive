@@ -1307,6 +1307,7 @@ def create_app(
             "project_runs": project_runs if show_internal else [_redact_run_for_member(run) for run in project_runs],
             "events": events if show_internal else [_redact_event_for_member(event) for event in events],
             "runtime_details": runtime_details_payload,
+            "telemetry_run_id": str((telemetry_run or {}).get("run_id") or "") or None,
             "telemetry": telemetry if show_internal else {},
             "console": {
                 "stdout": stdout_text if show_internal else "",
