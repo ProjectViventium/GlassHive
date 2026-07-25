@@ -84,6 +84,10 @@ _TELEMETRY_INTEGER_FIELDS = frozenset(
         "sample_sequence",
         "parsed_bytes",
         "log_bytes",
+        "stream_input_tokens",
+        "stream_output_tokens",
+        "stream_cache_read_input_tokens",
+        "stream_cache_creation_input_tokens",
     }
 )
 _TELEMETRY_TOKEN_FIELDS = frozenset(
@@ -113,7 +117,9 @@ _TELEMETRY_TOKEN_PATTERNS = {
     "model": re.compile(r"^(?:claude|anthropic)[A-Za-z0-9_.:/+-]{0,120}$"),
     "service_tier": re.compile(r"^(?:standard|priority|batch|flex|default)$"),
     "speed": re.compile(r"^(?:standard|fast|normal|default)$"),
-    "result_state": re.compile(r"^(?:success|error|failed|cancelled|interrupted|timeout)$"),
+    "result_state": re.compile(
+        r"^(?:success|error|failed|cancelled|interrupted|timeout|error_[a-z0-9_]{1,48})$"
+    ),
     "stop_reason": re.compile(
         r"^(?:end_turn|max_tokens|tool_use|stop_sequence|refusal|error|timeout|"
         r"cancelled|interrupted|terminated|paused|completed)$"
@@ -3160,6 +3166,13 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             "api_retry_delay_ms": 0,
             "api_retry_statuses": set(),
             "tool_call_counts": {},
+            "seen_usage_message_ids": set(),
+            "stream_input_tokens": 0,
+            "stream_output_tokens": 0,
+            "stream_cache_read_input_tokens": 0,
+            "stream_cache_creation_input_tokens": 0,
+            "first_timestamp": "",
+            "last_timestamp": "",
         }
 
     def _consume_telemetry_line(self, state: dict[str, object], line: str) -> bool:
@@ -3173,6 +3186,10 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         if not isinstance(value, dict):
             return True
 
+        observed_at = datetime.now(timezone.utc).isoformat()
+        if not state["first_timestamp"]:
+            state["first_timestamp"] = observed_at
+        state["last_timestamp"] = observed_at
         state["event_count"] = int(state["event_count"]) + 1
         event_type = value.get("type")
         subtype = value.get("subtype")
@@ -3183,9 +3200,16 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             }
         if event_type == "result":
             usage = value.get("usage") if isinstance(value.get("usage"), dict) else {}
+            result_state = str(value.get("subtype") or "").strip()
+            explicit_error = value.get("is_error")
             state["result"] = {
-                "subtype": str(value.get("subtype") or "").strip(),
-                "is_error": bool(value.get("is_error")) if isinstance(value.get("is_error"), bool) else False,
+                "subtype": result_state,
+                "is_error": (
+                    explicit_error
+                    if isinstance(explicit_error, bool)
+                    else result_state.startswith("error_")
+                    or result_state in {"error", "failed", "timeout"}
+                ),
                 "stop_reason": str(value.get("stop_reason") or "").strip(),
                 "duration_ms": value.get("duration_ms"),
                 "duration_api_ms": value.get("duration_api_ms"),
@@ -3215,6 +3239,21 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         if event_type == "assistant":
             state["assistant_event_count"] = int(state["assistant_event_count"]) + 1
             message = value.get("message")
+            if isinstance(message, dict):
+                message_id = str(message.get("id") or "").strip()
+                seen_ids = state["seen_usage_message_ids"]
+                if message_id and isinstance(seen_ids, set) and message_id not in seen_ids:
+                    seen_ids.add(message_id)
+                    usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+                    for source_key, state_key in (
+                        ("input_tokens", "stream_input_tokens"),
+                        ("output_tokens", "stream_output_tokens"),
+                        ("cache_read_input_tokens", "stream_cache_read_input_tokens"),
+                        ("cache_creation_input_tokens", "stream_cache_creation_input_tokens"),
+                    ):
+                        state[state_key] = int(state[state_key]) + self._nonnegative_telemetry_int(
+                            usage.get(source_key)
+                        )
             content = message.get("content") if isinstance(message, dict) else None
             if isinstance(content, list):
                 counts = state["tool_call_counts"]
@@ -3266,6 +3305,14 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             "event_count": int(state["event_count"]),
             "malformed_line_count": int(state["malformed_line_count"]),
             "oversized_line_count": int(state["oversized_line_count"]),
+            "stream_input_tokens": int(state["stream_input_tokens"]),
+            "stream_output_tokens": int(state["stream_output_tokens"]),
+            "stream_cache_read_input_tokens": int(state["stream_cache_read_input_tokens"]),
+            "stream_cache_creation_input_tokens": int(
+                state["stream_cache_creation_input_tokens"]
+            ),
+            "first_timestamp": str(state["first_timestamp"]),
+            "last_timestamp": str(state["last_timestamp"]),
         }
         total_cost_usd = self._finite_telemetry_float(result.get("total_cost_usd"))
         if total_cost_usd is not None:

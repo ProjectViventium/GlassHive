@@ -7,6 +7,7 @@ import stat
 import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -2674,6 +2675,13 @@ def test_claude_stream_telemetry_is_compact_and_content_free(tmp_path):
                 {
                     "type": "assistant",
                     "message": {
+                        "id": "msg-telemetry-1",
+                        "usage": {
+                            "input_tokens": 12,
+                            "output_tokens": 7,
+                            "cache_read_input_tokens": 40,
+                            "cache_creation_input_tokens": 3,
+                        },
                         "content": [
                             {"type": "thinking", "thinking": "private reasoning"},
                             {
@@ -2728,6 +2736,8 @@ def test_claude_stream_telemetry_is_compact_and_content_free(tmp_path):
     )
 
     telemetry = runtime._telemetry_from_output(stdout)
+    first_timestamp = telemetry.pop("first_timestamp")
+    last_timestamp = telemetry.pop("last_timestamp")
 
     assert telemetry == {
         "schema": "glasshive.claude-run-telemetry.v1",
@@ -2752,12 +2762,53 @@ def test_claude_stream_telemetry_is_compact_and_content_free(tmp_path):
         "event_count": 5,
         "malformed_line_count": 1,
         "oversized_line_count": 0,
+        "stream_input_tokens": 12,
+        "stream_output_tokens": 7,
+        "stream_cache_read_input_tokens": 40,
+        "stream_cache_creation_input_tokens": 3,
         "total_cost_usd": 3.25,
     }
+    assert datetime.fromisoformat(first_timestamp)
+    assert datetime.fromisoformat(last_timestamp)
     encoded = json.dumps(telemetry)
     assert "private reasoning" not in encoded
     assert "invoice.pdf" not in encoded
     assert "sensitive invoice content" not in encoded
+
+
+def test_claude_stream_usage_is_counted_once_per_message_id_and_error_subtype_is_preserved(
+    tmp_path,
+):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    assistant = {
+        "type": "assistant",
+        "message": {
+            "id": "msg-duplicate",
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 8,
+                "cache_read_input_tokens": 100,
+                "cache_creation_input_tokens": 4,
+            },
+            "content": [],
+        },
+    }
+    stdout = "\n".join(
+        [
+            json.dumps(assistant),
+            json.dumps(assistant),
+            json.dumps({"type": "result", "subtype": "error_max_turns"}),
+        ]
+    )
+
+    telemetry = runtime._telemetry_from_output(stdout)
+
+    assert telemetry["stream_input_tokens"] == 20
+    assert telemetry["stream_output_tokens"] == 8
+    assert telemetry["stream_cache_read_input_tokens"] == 100
+    assert telemetry["stream_cache_creation_input_tokens"] == 4
+    assert telemetry["result_state"] == "error_max_turns"
+    assert telemetry["is_error"] is True
 
 
 def test_claude_live_telemetry_reads_the_complete_active_run(tmp_path):
