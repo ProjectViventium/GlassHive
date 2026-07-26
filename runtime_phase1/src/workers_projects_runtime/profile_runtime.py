@@ -75,6 +75,7 @@ _TELEMETRY_INTEGER_FIELDS = frozenset(
         "time_to_request_ms",
         "num_turns",
         "api_retry_count",
+        "last_api_retry_event_sequence",
         "api_retry_delay_ms",
         "tool_call_count",
         "event_count",
@@ -3168,6 +3169,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             "malformed_line_count": 0,
             "oversized_line_count": 0,
             "api_retry_count": 0,
+            "last_api_retry_event_sequence": 0,
             "api_retry_delay_ms": 0,
             "api_retry_statuses": set(),
             "tool_call_counts": {},
@@ -3229,6 +3231,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             }
         if event_type == "api_retry" or subtype == "api_retry":
             state["api_retry_count"] = int(state["api_retry_count"]) + 1
+            state["last_api_retry_event_sequence"] = int(state["event_count"])
             state["api_retry_delay_ms"] = int(state["api_retry_delay_ms"]) + self._nonnegative_telemetry_int(
                 value.get("retry_delay_ms") or value.get("delay_ms")
             )
@@ -3314,6 +3317,9 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             "time_to_request_ms": self._nonnegative_telemetry_int(result.get("time_to_request_ms")),
             "num_turns": self._nonnegative_telemetry_int(result.get("num_turns")),
             "api_retry_count": int(state["api_retry_count"]),
+            "last_api_retry_event_sequence": int(
+                state["last_api_retry_event_sequence"]
+            ),
             "api_retry_delay_ms": int(state["api_retry_delay_ms"]),
             "api_retry_statuses": retry_statuses,
             "tool_call_count": sum(tool_call_counts.values()),

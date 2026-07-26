@@ -2756,6 +2756,7 @@ def test_claude_stream_telemetry_is_compact_and_content_free(tmp_path):
         "time_to_request_ms": 24,
         "num_turns": 8,
         "api_retry_count": 1,
+        "last_api_retry_event_sequence": 4,
         "api_retry_delay_ms": 1500,
         "api_retry_statuses": ["529"],
         "tool_call_count": 1,
@@ -2871,6 +2872,37 @@ def test_claude_live_telemetry_reads_the_complete_active_run(tmp_path):
     assert telemetry["tool_call_counts"] == {"Bash": 1, "Read": 1}
     assert telemetry["last_stream_activity_at"] == telemetry["last_progress_at"]
     assert telemetry["seconds_since_stream_activity"] == telemetry["seconds_since_progress"]
+
+
+def test_claude_live_telemetry_locates_the_last_retry_in_the_event_stream(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_retry_sequence",
+        "name": "Invoice Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_retry_sequence"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "system", "subtype": "init"}),
+                json.dumps({"type": "api_retry", "error_status": 500}),
+                json.dumps({"type": "assistant", "message": {"content": []}}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    telemetry = runtime.live_telemetry(worker, "", run_id=run_id)
+
+    assert telemetry["api_retry_count"] == 1
+    assert telemetry["last_api_retry_event_sequence"] == 2
+    assert telemetry["event_count"] == 3
 
 
 def test_claude_live_telemetry_consumes_only_complete_appended_lines(tmp_path):
