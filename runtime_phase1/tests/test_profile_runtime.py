@@ -1932,6 +1932,10 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
             self.terminated = True
 
     def fake_killpg(_pgid, _signal):
+        if _signal == 0:
+            if any(not process.terminated for process in processes):
+                return
+            raise ProcessLookupError
         for process in processes:
             process.terminate()
 
@@ -1999,6 +2003,49 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
         for item in recorded_metrics
     )
     assert "working before interrupt" in recorded_metrics[-1][2]
+
+
+def test_host_cli_interrupt_rejects_surviving_process_group(tmp_path, monkeypatch):
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker_id = "wrk_host_stop_failure"
+
+    class UnkillableProcess:
+        pid = 54321
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(["fake-claude"], timeout)
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            return None
+
+    process = UnkillableProcess()
+    runtime._active_processes[worker_id] = process  # type: ignore[assignment]
+    runtime._host_active_worker_id = worker_id
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.killpg", lambda pgid, sig: None)
+    monkeypatch.setattr(runtime, "_process_group_alive", lambda pgid: True)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.time.sleep", lambda seconds: None)
+
+    with pytest.raises(RuntimeError, match="remained alive after TERM/KILL"):
+        runtime.interrupt_worker(
+            {
+                "worker_id": worker_id,
+                "name": "Host Stop Failure",
+                "profile": "claude-code",
+                "execution_mode": "host",
+            },
+            run_id="run_host_stop_failure",
+        )
+
+    assert runtime._active_processes[worker_id] is process
+    assert runtime._host_active_worker_id == worker_id
+    assert runtime._pop_stop_reason(worker_id, run_id="run_host_stop_failure") is None
 
 
 def test_host_codex_runtime_default_prompts_require_final_report(tmp_path, monkeypatch):
@@ -3527,6 +3574,37 @@ def test_docker_cli_runtime_clears_active_session_after_stop(tmp_path):
 
     assert calls == [("screen", "job-run_stop_meta"), ("terminate", "run_stop_meta")]
     assert not runtime._active_session_meta_path(worker_id).exists()
+
+
+def test_docker_cli_runtime_propagates_stop_failure_and_keeps_active_session(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker_id = "wrk_stop_failure"
+    runtime._ensure_dirs(worker_id)
+    runtime._write_active_session(
+        worker_id,
+        {
+            "session_name": "job-run_stop_failure",
+            "run_id": "run_stop_failure",
+            "stdout_path": str(tmp_path / "stdout.log"),
+            "stderr_path": str(tmp_path / "stderr.log"),
+            "exit_path": str(tmp_path / "exit_code"),
+        },
+    )
+    terminate_calls: list[str] = []
+
+    def fail_screen(*args, **kwargs):
+        raise RuntimeError("screen session remained alive")
+
+    runtime.sandbox.stop_screen_session = fail_screen  # type: ignore[method-assign]
+    runtime.sandbox.terminate_run_processes = (  # type: ignore[method-assign]
+        lambda worker_id, runtime_name, run_id, **kwargs: terminate_calls.append(run_id)
+    )
+
+    with pytest.raises(RuntimeError, match="screen session remained alive"):
+        runtime._stop_active_process(worker_id, worker={"worker_id": worker_id})
+
+    assert terminate_calls == ["run_stop_failure"]
+    assert runtime._active_session_meta_path(worker_id).exists()
 
 
 def test_docker_cli_runtime_uses_configured_run_timeout(tmp_path, monkeypatch):

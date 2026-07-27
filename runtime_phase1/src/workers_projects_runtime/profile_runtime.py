@@ -1277,6 +1277,7 @@ class BaseCliWorkerRuntime:
             active_session = self._infer_active_session(worker or {"worker_id": worker_id}, run_id=run_id)
         if not active_session and run_id:
             active_session = self._run_payload(worker_id, run_id)
+        stop_errors: list[Exception] = []
         if active_session:
             try:
                 self.sandbox.stop_screen_session(
@@ -1286,8 +1287,8 @@ class BaseCliWorkerRuntime:
                     worker=worker,
                     missing_ok=True,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                stop_errors.append(exc)
             try:
                 self.sandbox.terminate_run_processes(
                     worker_id,
@@ -1295,24 +1296,32 @@ class BaseCliWorkerRuntime:
                     active_session["run_id"],
                     worker=worker,
                 )
-            except Exception:
-                pass
-            self._clear_active_session(worker_id)
+            except Exception as exc:
+                stop_errors.append(exc)
+            if not stop_errors:
+                self._clear_active_session(worker_id)
         with self._process_lock:
             process = self._active_processes.get(worker_id)
-        if not process or process.poll() is not None:
-            return
-        try:
-            process.terminate()
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
+        if process and process.poll() is None:
             try:
-                process.wait(timeout=2)
+                process.terminate()
+                process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                pass
-        except OSError:
-            return
+                process.kill()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired as exc:
+                    stop_errors.append(exc)
+            except OSError as exc:
+                if process.poll() is None:
+                    stop_errors.append(exc)
+            if process.poll() is None:
+                stop_errors.append(RuntimeError(f"Host process {process.pid} remained alive after TERM/KILL"))
+            else:
+                self._clear_process(worker_id)
+        if stop_errors:
+            detail = "; ".join(str(exc) or type(exc).__name__ for exc in stop_errors)
+            raise RuntimeError(f"Failed to stop active {self.runtime_name} run: {detail}")
 
     def _runtime_info(self, worker: dict, *, pid: int | None = None) -> RuntimeInfo:
         worker_id = worker["worker_id"]
@@ -1346,7 +1355,11 @@ class BaseCliWorkerRuntime:
         active_run_id = str(run_id or worker.get("_active_run_id") or "").strip() or None
         if active_run_id or self._active_pid(worker_id):
             self._note_stop_reason(worker_id, "interrupted", run_id=active_run_id)
-            self._stop_active_process(worker_id, worker=worker, run_id=active_run_id)
+            try:
+                self._stop_active_process(worker_id, worker=worker, run_id=active_run_id)
+            except Exception:
+                self._pop_stop_reason(worker_id, run_id=active_run_id)
+                raise
         sandbox = self.sandbox.inspect(worker["worker_id"])
         pid = sandbox.pid if sandbox and sandbox.state == "running" else None
         return self._runtime_info(worker, pid=pid)
@@ -1356,7 +1369,11 @@ class BaseCliWorkerRuntime:
         active_run_id = str(worker.get("_active_run_id") or "").strip() or None
         if active_run_id or self._active_pid(worker_id):
             self._note_stop_reason(worker_id, "terminated", run_id=active_run_id)
-        self._stop_active_process(worker_id, worker=worker, run_id=active_run_id)
+        try:
+            self._stop_active_process(worker_id, worker=worker, run_id=active_run_id)
+        except Exception:
+            self._pop_stop_reason(worker_id, run_id=active_run_id)
+            raise
         self.sandbox.terminate(worker_id)
         return self._runtime_info(worker, pid=None)
 
@@ -4724,7 +4741,11 @@ class HostNativeCliMixin:
             active_run_id = str(active_session.get("run_id") or "").strip() or None
         if active_run_id or self._active_pid(worker["worker_id"]):
             self._note_stop_reason(worker["worker_id"], "interrupted", run_id=active_run_id)
-            self._stop_active_process(worker["worker_id"], worker=worker, run_id=active_run_id)
+            try:
+                self._stop_active_process(worker["worker_id"], worker=worker, run_id=active_run_id)
+            except Exception:
+                self._pop_stop_reason(worker["worker_id"], run_id=active_run_id)
+                raise
         self._write_stopped_active_run_evidence(
             worker,
             active_session=active_session,
@@ -4741,7 +4762,11 @@ class HostNativeCliMixin:
             active_run_id = str(active_session.get("run_id") or "").strip() or None
         if active_run_id:
             self._note_stop_reason(worker["worker_id"], "terminated", run_id=active_run_id)
-        self._stop_active_process(worker["worker_id"], worker=worker, run_id=active_run_id)
+        try:
+            self._stop_active_process(worker["worker_id"], worker=worker, run_id=active_run_id)
+        except Exception:
+            self._pop_stop_reason(worker["worker_id"], run_id=active_run_id)
+            raise
         self._write_stopped_active_run_evidence(
             worker,
             active_session=active_session,
@@ -4762,28 +4787,56 @@ class HostNativeCliMixin:
             process = self._active_processes.get(worker_id)
         if not process or process.poll() is not None:
             return
+        pgid: int | None = None
         try:
             pgid = os.getpgid(process.pid)
             os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
+            pass
+
+        group_alive = bool(pgid and self._process_group_alive(pgid))
+        if process.poll() is None or group_alive:
             try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    process.kill()
             except OSError:
                 pass
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 pass
-        except OSError:
-            try:
-                process.terminate()
-            except OSError:
-                pass
-        finally:
-            self._clear_process(worker_id)
-            if self._host_active_worker_id == worker_id:
-                self._host_active_worker_id = None
+            if pgid is not None:
+                for _attempt in range(20):
+                    if not self._process_group_alive(pgid):
+                        break
+                    time.sleep(0.1)
+
+        group_alive = bool(pgid and self._process_group_alive(pgid))
+        if process.poll() is None or group_alive:
+            detail = f"process group {pgid}" if pgid is not None else f"process {process.pid}"
+            raise RuntimeError(f"Host {self.runtime_name} {detail} remained alive after TERM/KILL")
+        self._clear_process(worker_id)
+        if self._host_active_worker_id == worker_id:
+            self._host_active_worker_id = None
+
+    @staticmethod
+    def _process_group_alive(pgid: int) -> bool:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
 
     def _acquire_host_slot(self, worker: dict) -> None:
         if os.environ.get("WPR_HOST_ALLOW_CONCURRENT_SAME_CLI", "").strip().lower() in {"1", "true", "yes", "on"}:

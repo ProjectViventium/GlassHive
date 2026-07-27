@@ -55,6 +55,11 @@ idle pause, interrupt, cleanup, or prior termination cannot poison a later resum
 marker races with successful process completion, GlassHive recovers the completed run evidence
 before applying the stale marker.
 
+Active-run interruption is fail-closed too. GlassHive verifies that the exact screen session and all
+processes carrying the run identity are absent after TERM/KILL before it marks the run interrupted or
+the worker ready. A surviving process or failed verification leaves the run nonterminal, preserves
+its active-session evidence, and emits an interruption-failed event for operators.
+
 The v1 SQLite deployment should run one runtime service process per GlassHive VM. The runtime uses
 an in-process create lock for quota check plus worker insert; multi-process or multi-replica service
 scale-out requires a DB-level transaction/constraint design before it is supported.
@@ -282,6 +287,7 @@ The Standard GlassHive QA cases must include:
   including failed records and non-running containers with timeout thresholds otherwise disabled
 - active-run termination race checks proving a background processor cannot resurrect a terminated
   worker or leak a pause, interrupt, or termination reason into a later run
+- verified interruption checks proving a survivor cannot be reported as interrupted or ready
 - active telemetry checks proving run identity cannot drift to a newer queued run, counters remain
   monotonic across partial JSONL writes, oversized unterminated records remain memory-bounded, and
   large unchanged logs are not reparsed

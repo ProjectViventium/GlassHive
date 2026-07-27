@@ -1899,11 +1899,23 @@ class WorkersProjectsService:
         worker = self.require_worker(worker_id)
         active_run = self.store.get_active_run(worker_id)
         try:
-            info = self.runtime.interrupt_worker(worker, run_id=active_run["run_id"] if active_run else None)
-        except TypeError as exc:
-            if "run_id" not in str(exc):
-                raise
-            info = self.runtime.interrupt_worker(worker)
+            try:
+                info = self.runtime.interrupt_worker(worker, run_id=active_run["run_id"] if active_run else None)
+            except TypeError as exc:
+                if "run_id" not in str(exc):
+                    raise
+                info = self.runtime.interrupt_worker(worker)
+        except Exception as exc:
+            message = public_callback_message_text(str(exc)) or "Worker interruption failed"
+            self.store.update_worker(worker_id, state=str(worker.get("state") or "failed"), last_error=message)
+            self.store.add_event(
+                worker["project_id"],
+                worker_id,
+                active_run["run_id"] if active_run else None,
+                "worker.interruption_failed",
+                message,
+            )
+            raise
         updated = self._apply_runtime_info(worker_id, info, state="ready", last_error="")
         if active_run:
             self.store.finalize_run(
@@ -1936,15 +1948,25 @@ class WorkersProjectsService:
             **worker,
             "_active_run_id": str((active_run or {}).get("run_id") or ""),
         }
+        with self._processors_lock:
+            previous_generation = self._processor_generations.get(worker_id, 0)
+            processor_was_active = worker_id in self._active_processors
         self._invalidate_worker_processor(worker_id)
-        self.store.cancel_pending_runs(worker_id, error_text="Worker terminated by operator", state="cancelled")
         try:
             info = self.runtime.terminate_worker(runtime_worker)
-            if info.pid:
-                raise RuntimeError(f"Worker compute is still active after termination (pid={info.pid})")
+            compute_checker = getattr(self.runtime, "worker_compute_present", None)
+            compute_present = bool(compute_checker(runtime_worker)) if callable(compute_checker) else False
+            if info.pid or compute_present:
+                detail = f" (pid={info.pid})" if info.pid else ""
+                raise RuntimeError(f"Worker compute is still active after termination{detail}")
         except Exception as exc:
+            with self._processors_lock:
+                if self._processor_generations.get(worker_id) == previous_generation + 1:
+                    self._processor_generations[worker_id] = previous_generation
+                    if processor_was_active:
+                        self._active_processors.add(worker_id)
             message = public_callback_message_text(str(exc)) or "Worker compute termination failed"
-            self.store.update_worker(worker_id, state="failed", last_error=message)
+            self.store.update_worker(worker_id, state=str(worker.get("state") or "failed"), last_error=message)
             self.store.add_event(
                 worker["project_id"],
                 worker_id,
@@ -1953,6 +1975,7 @@ class WorkersProjectsService:
                 message,
             )
             raise
+        self.store.cancel_pending_runs(worker_id, error_text="Worker terminated by operator", state="cancelled")
         updated = self._apply_runtime_info(
             worker_id,
             info,

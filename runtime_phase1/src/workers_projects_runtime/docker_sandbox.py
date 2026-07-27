@@ -789,20 +789,28 @@ screen -ls | awk -v target="$target" '
         script = "\n".join(
             [
                 "target=$1",
-                "sockets=$(screen -ls | awk -v target=\"$target\" '",
-                "  /^[[:space:]]*[0-9]+[.]/ {",
-                "    socket=$1;",
-                "    name=socket;",
-                "    sub(/^[0-9]+[.]/, \"\", name);",
-                "    if (name == target) print socket;",
-                "  }",
-                "')",
+                "matching_sockets() {",
+                "  screen -ls | awk -v target=\"$target\" '",
+                "    /^[[:space:]]*[0-9]+[.]/ {",
+                "      socket=$1;",
+                "      name=socket;",
+                "      sub(/^[0-9]+[.]/, \"\", name);",
+                "      if (name == target) print socket;",
+                "    }",
+                "  '",
+                "}",
+                "sockets=$(matching_sockets)",
                 "if [ -z \"$sockets\" ]; then exit 42; fi",
-                "status=0",
                 "for socket in $sockets; do",
-                "  screen -S \"$socket\" -X quit >/dev/null 2>&1 || status=$?",
+                "  screen -S \"$socket\" -X quit >/dev/null 2>&1 || true",
                 "done",
-                "exit \"$status\"",
+                "for _attempt in $(seq 1 20); do",
+                "  sockets=$(matching_sockets)",
+                "  if [ -z \"$sockets\" ]; then exit 0; fi",
+                "  sleep 0.1",
+                "done",
+                "printf 'Screen session remains after quit: %s\\n' \"$sockets\" >&2",
+                "exit 43",
             ]
         )
         result = self._docker_exec(
@@ -833,15 +841,22 @@ screen -ls | awk -v target="$target" '
         run_root = f"{self.home_mount}/.glasshive-runs/{run_id}"
         script = "\n".join(
             [
-                f"needle={shlex.quote(run_root)}",
-                f"run_id={shlex.quote(run_id)}",
-                "arg_pids=$(ps -eo pid=,ppid=,args= | awk -v needle=\"$needle\" 'index($0, needle) > 0 { print $1 }')",
-                "env_pids=$(for env in /proc/[0-9]*/environ; do "
-                "pid=${env#/proc/}; pid=${pid%%/*}; "
-                "tr '\\0' '\\n' < \"$env\" 2>/dev/null | grep -Fxq \"GLASSHIVE_ACTIVE_RUN_ID=$run_id\" && printf '%s\\n' \"$pid\"; "
-                "done)",
-                "pids=$(printf '%s\\n%s\\n' \"$arg_pids\" \"$env_pids\" | awk 'NF' | sort -u)",
-                "if [ -z \"$pids\" ]; then exit 0; fi",
+                "needle=$GLASSHIVE_STOP_RUN_ROOT",
+                "run_id=$GLASSHIVE_STOP_RUN_ID",
+                "self_pid=$$",
+                "matching_pids() {",
+                "  arg_pids=$(ps -eo pid=,stat=,args= | while read -r pid stat args; do",
+                "    [ \"$pid\" = \"$self_pid\" ] && continue",
+                "    case \"$stat\" in Z*) continue ;; esac",
+                "    case \"$args\" in *\"$needle\"*) printf '%s\\n' \"$pid\" ;; esac",
+                "  done)",
+                "  env_pids=$(for process_env in /proc/[0-9]*/environ; do",
+                "    pid=${process_env#/proc/}; pid=${pid%%/*}",
+                "    [ \"$pid\" = \"$self_pid\" ] && continue",
+                "    tr '\\0' '\\n' < \"$process_env\" 2>/dev/null | grep -Fxq \"GLASSHIVE_ACTIVE_RUN_ID=$run_id\" && printf '%s\\n' \"$pid\"",
+                "  done)",
+                "  printf '%s\\n%s\\n' \"$arg_pids\" \"$env_pids\" | awk -v self_pid=\"$self_pid\" 'NF && $1 != self_pid' | sort -u",
+                "}",
                 "descendants() { "
                 "for parent in \"$@\"; do "
                 "children=$(ps -eo pid=,ppid= | awk -v p=\"$parent\" '$2 == p { print $1 }'); "
@@ -849,18 +864,41 @@ screen -ls | awk -v target="$target" '
                 "printf '%s\\n' \"$parent\"; "
                 "done; "
                 "}",
-                "targets=$(descendants $pids | awk 'NF' | sort -u)",
+                "pids=$(matching_pids)",
+                "if [ -z \"$pids\" ]; then exit 0; fi",
+                "targets=$(descendants $pids | awk -v self_pid=\"$self_pid\" 'NF && $1 != self_pid' | sort -u)",
                 "for pid in $targets; do kill -TERM \"$pid\" >/dev/null 2>&1 || true; done",
-                "sleep 1",
+                "for _attempt in $(seq 1 20); do",
+                "  survivors=$(matching_pids)",
+                "  if [ -z \"$survivors\" ]; then exit 0; fi",
+                "  sleep 0.1",
+                "done",
+                "targets=$(descendants $survivors | awk -v self_pid=\"$self_pid\" 'NF && $1 != self_pid' | sort -u)",
                 "for pid in $targets; do kill -KILL \"$pid\" >/dev/null 2>&1 || true; done",
+                "for _attempt in $(seq 1 20); do",
+                "  survivors=$(matching_pids)",
+                "  if [ -z \"$survivors\" ]; then exit 0; fi",
+                "  sleep 0.1",
+                "done",
+                "printf 'Run processes remain after TERM/KILL: %s\\n' \"$(printf '%s' \"$survivors\" | tr '\\n' ' ')\" >&2",
+                "exit 43",
             ]
         )
-        self._docker_exec(
+        result = self._docker_exec(
             container_name,
             ["bash", "-c", script],
-            env=self._desktop_env(),
+            env={
+                **self._desktop_env(),
+                "GLASSHIVE_STOP_RUN_ROOT": run_root,
+                "GLASSHIVE_STOP_RUN_ID": run_id,
+            },
             cwd=self.workspace_mount,
         )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[-1200:]
+            if not detail:
+                detail = f"docker exec exited with status {result.returncode}"
+            raise RuntimeError(f"Failed to terminate processes for run {run_id}: {detail}")
 
     def desktop_action(
         self,

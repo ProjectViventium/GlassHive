@@ -6117,6 +6117,44 @@ def test_interrupt_stops_active_run_and_keeps_worker_ready(tmp_path):
     assert worker_after["state"] == "ready"
 
 
+def test_interrupt_failure_keeps_active_run_nonterminal(tmp_path):
+    class FailingInterruptRuntime(StubRuntime):
+        def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
+            raise RuntimeError("run process remained alive")
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, FailingInterruptRuntime())
+    service._ensure_worker_processor = lambda worker_id: None  # type: ignore[method-assign]
+    try:
+        project = service.create_project("owner", "Interrupt Failure", "Keep active state truthful", "claude-code")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Interrupt Failure Worker",
+            role="coder",
+            profile="claude-code",
+            backend="openclaw",
+        )
+        run = service.assign_run(worker["worker_id"], "Keep running until interruption is verified.")
+        store.update_run(run["run_id"], state="running", started_at=datetime.now(timezone.utc).isoformat())
+        store.update_worker_state(worker["worker_id"], "running", last_error="")
+
+        with pytest.raises(RuntimeError, match="run process remained alive"):
+            service.interrupt_worker(worker["worker_id"])
+
+        refreshed_run = store.get_run(run["run_id"])
+        refreshed_worker = store.get_worker(worker["worker_id"])
+        assert refreshed_run is not None
+        assert refreshed_run["state"] == "running"
+        assert refreshed_run["ended_at"] is None
+        assert refreshed_worker is not None
+        assert refreshed_worker["state"] == "running"
+        assert refreshed_worker["last_error"] == "run process remained alive"
+        assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.interruption_failed"
+    finally:
+        service.shutdown()
+
+
 def test_terminate_active_run_cannot_resurrect_worker(tmp_path):
     db_path = tmp_path / "runtime.db"
     runtime = TerminationRaceRuntime()
@@ -6152,6 +6190,7 @@ def test_terminate_failure_is_not_reported_as_success(tmp_path):
 
     store = Store(str(tmp_path / "runtime.db"))
     service = WorkersProjectsService(store, FailingTerminateRuntime())
+    service._ensure_worker_processor = lambda worker_id: None  # type: ignore[method-assign]
     try:
         project = service.create_project("owner", "Failure", "Surface termination failure", "openclaw-general")
         worker = service.create_worker(
@@ -6162,14 +6201,19 @@ def test_terminate_failure_is_not_reported_as_success(tmp_path):
             profile="openclaw-general",
             backend="openclaw",
         )
+        run = service.assign_run(worker["worker_id"], "Keep running until termination is verified.")
+        store.update_run(run["run_id"], state="running", started_at=datetime.now(timezone.utc).isoformat())
+        store.update_worker_state(worker["worker_id"], "running", last_error="")
 
         with pytest.raises(RuntimeError, match="compute remained active"):
             service.terminate_worker(worker["worker_id"])
 
         refreshed = store.get_worker(worker["worker_id"])
         assert refreshed is not None
-        assert refreshed["state"] == "failed"
+        assert refreshed["state"] == "running"
         assert refreshed["last_error"] == "compute remained active"
+        assert store.get_run(run["run_id"])["state"] == "running"
+        assert store.get_run(run["run_id"])["ended_at"] is None
         assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.termination_failed"
     finally:
         service.shutdown()
@@ -6206,7 +6250,7 @@ def test_terminate_rejects_runtime_that_still_reports_compute(tmp_path):
         with pytest.raises(RuntimeError, match="still active after termination"):
             service.terminate_worker(worker["worker_id"])
 
-        assert store.get_worker(worker["worker_id"])["state"] == "failed"
+        assert store.get_worker(worker["worker_id"])["state"] == "ready"
     finally:
         service.shutdown()
 
