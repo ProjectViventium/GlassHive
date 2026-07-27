@@ -1316,6 +1316,8 @@ def test_terminate_run_processes_targets_run_env_and_descendants(tmp_path):
     assert "alive_pids()" in script
     assert "expected_start=${spec#*:}" in script
     assert "specs=$(merge_specs" in script
+    assert script.count("discovered=$(matching_pids)") == 2
+    assert script.count('kill -KILL "$pid"') == 2
     assert "survivors=" in script
     assert "exit 43" in script
 

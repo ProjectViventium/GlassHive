@@ -2068,9 +2068,8 @@ def test_host_cli_interrupt_stops_verified_persisted_process_after_restart(tmp_p
     alive = {54321}
     signals: list[int] = []
     monkeypatch.setattr(runtime, "_host_pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(runtime, "_process_group_alive", lambda pgid: pgid in alive)
     monkeypatch.setattr(runtime, "_host_pid_matches_run", lambda pid, candidate: pid == 54321 and candidate == run_id)
-    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.getpgid", lambda pid: pid)
-
     def fake_killpg(pgid, sig):
         signals.append(sig)
         if sig == signal.SIGTERM:
@@ -2094,6 +2093,54 @@ def test_host_cli_interrupt_stops_verified_persisted_process_after_restart(tmp_p
     assert runtime.worker_compute_present({"worker_id": worker_id}) is False
 
 
+def test_host_cli_persisted_stop_kills_surviving_process_group_after_leader_exits(tmp_path, monkeypatch):
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker_id = "wrk_host_persisted_group"
+    run_id = "run_host_persisted_group"
+    runtime._ensure_dirs(worker_id)
+    runtime._write_active_session(
+        worker_id,
+        {
+            "session_name": f"host-{run_id[:12]}",
+            "run_id": run_id,
+            "stdout_path": str(tmp_path / "stdout.log"),
+            "stderr_path": str(tmp_path / "stderr.log"),
+            "exit_path": str(tmp_path / "exit_code"),
+            "process_pid": 54321,
+            "process_pgid": 54321,
+        },
+    )
+    leader_alive = {54321}
+    group_alive = {54321}
+    signals: list[int] = []
+    monkeypatch.setattr(runtime, "_host_pid_alive", lambda pid: pid in leader_alive)
+    monkeypatch.setattr(runtime, "_process_group_alive", lambda pgid: pgid in group_alive)
+    monkeypatch.setattr(runtime, "_host_pid_matches_run", lambda pid, candidate: candidate == run_id)
+
+    def fake_killpg(pgid, sig):
+        signals.append(sig)
+        if sig == signal.SIGTERM:
+            leader_alive.discard(pgid)
+        elif sig == signal.SIGKILL:
+            group_alive.discard(pgid)
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.killpg", fake_killpg)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.time.sleep", lambda seconds: None)
+
+    runtime.interrupt_worker(
+        {
+            "worker_id": worker_id,
+            "name": "Persisted Host Group Worker",
+            "profile": "claude-code",
+            "execution_mode": "host",
+        },
+        run_id=run_id,
+    )
+
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert not runtime._active_session_meta_path(worker_id).exists()
+
+
 def test_host_cli_interrupt_rejects_unverified_persisted_pid(tmp_path, monkeypatch):
     runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
     worker_id = "wrk_host_pid_reuse"
@@ -2113,7 +2160,7 @@ def test_host_cli_interrupt_rejects_unverified_persisted_pid(tmp_path, monkeypat
     monkeypatch.setattr(runtime, "_host_pid_alive", lambda pid: True)
     monkeypatch.setattr(runtime, "_host_pid_matches_run", lambda pid, candidate: False)
 
-    with pytest.raises(RuntimeError, match="Refusing to stop unverified persisted host process"):
+    with pytest.raises(RuntimeError, match="Refusing to stop unverified persisted host process group"):
         runtime.interrupt_worker(
             {
                 "worker_id": worker_id,

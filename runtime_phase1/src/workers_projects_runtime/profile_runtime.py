@@ -1156,6 +1156,7 @@ class BaseCliWorkerRuntime:
             "argv_for_evidence_json": str(data.get("argv_for_evidence_json") or "").strip(),
             "started_at": str(data.get("started_at") or "").strip(),
             "process_pid": data.get("process_pid"),
+            "process_pgid": data.get("process_pgid"),
             "heartbeat_path": str(data.get("heartbeat_path") or "").strip(),
             "timeout_seconds": data.get("timeout_seconds"),
             "instruction_redacted": bool(data.get("instruction_redacted")),
@@ -4781,12 +4782,13 @@ class HostNativeCliMixin:
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         worker_id = worker["worker_id"]
-        pid = self._active_pid(worker_id) or self._persisted_host_pid(worker_id)
+        persisted = self._persisted_host_process(worker_id)
+        pid = self._active_pid(worker_id) or (persisted[0] if persisted else None)
         return self._host_runtime_info(worker, pid=pid)
 
     def worker_compute_present(self, worker: dict) -> bool:
         worker_id = worker["worker_id"]
-        return self._active_pid(worker_id) is not None or self._persisted_host_pid(worker_id) is not None
+        return self._active_pid(worker_id) is not None or self._persisted_host_process(worker_id) is not None
 
     @staticmethod
     def _host_pid_alive(pid: int) -> bool:
@@ -4807,15 +4809,18 @@ class HostNativeCliMixin:
             return True
         return True
 
-    def _persisted_host_pid(self, worker_id: str) -> int | None:
+    def _persisted_host_process(self, worker_id: str) -> tuple[int, int] | None:
         active_session = self._read_active_session(worker_id)
         if not active_session:
             return None
         try:
             pid = int(active_session.get("process_pid") or 0)
+            pgid = int(active_session.get("process_pgid") or pid)
         except (TypeError, ValueError):
             return None
-        return pid if pid > 0 and self._host_pid_alive(pid) else None
+        if pid <= 0 or pgid <= 0:
+            return None
+        return (pid, pgid) if self._host_pid_alive(pid) or self._process_group_alive(pgid) else None
 
     @staticmethod
     def _host_pid_matches_run(pid: int, run_id: str) -> bool:
@@ -4838,23 +4843,45 @@ class HostNativeCliMixin:
             return False
         return result.returncode == 0 and marker in result.stdout
 
-    def _stop_persisted_host_process(self, worker_id: str, pid: int, run_id: str) -> None:
-        if not self._host_pid_matches_run(pid, run_id):
-            raise RuntimeError(
-                f"Refusing to stop unverified persisted host process {pid} for run {run_id}"
-            )
+    @staticmethod
+    def _host_process_group_members(pgid: int) -> list[int]:
         try:
-            pgid = os.getpgid(pid)
-        except OSError as exc:
-            if self._host_pid_alive(pid):
-                raise RuntimeError(f"Could not inspect persisted host process {pid}") from exc
-            return
+            result = subprocess.run(
+                ["ps", "-eo", "pid=,pgid="],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        members: list[int] = []
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            try:
+                candidate_pid, candidate_pgid = map(int, parts)
+            except ValueError:
+                continue
+            if candidate_pgid == pgid:
+                members.append(candidate_pid)
+        return members
+
+    def _host_group_matches_run(self, pgid: int, run_id: str) -> bool:
+        return any(self._host_pid_matches_run(pid, run_id) for pid in self._host_process_group_members(pgid))
+
+    def _stop_persisted_host_process(self, worker_id: str, pid: int, pgid: int, run_id: str) -> None:
+        if not self._host_pid_matches_run(pid, run_id) and not self._host_group_matches_run(pgid, run_id):
+            raise RuntimeError(
+                f"Refusing to stop unverified persisted host process group {pgid} for run {run_id}"
+            )
         try:
             os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:
             return
         for _attempt in range(20):
-            if not self._host_pid_alive(pid):
+            if not self._process_group_alive(pgid):
                 self._clear_active_session(worker_id)
                 return
             time.sleep(0.1)
@@ -4864,26 +4891,32 @@ class HostNativeCliMixin:
             self._clear_active_session(worker_id)
             return
         for _attempt in range(20):
-            if not self._host_pid_alive(pid):
+            if not self._process_group_alive(pgid):
                 self._clear_active_session(worker_id)
                 return
             time.sleep(0.1)
-        raise RuntimeError(f"Persisted host process {pid} remained alive after TERM/KILL")
+        raise RuntimeError(f"Persisted host process group {pgid} remained alive after TERM/KILL")
 
     def _stop_active_process(self, worker_id: str, *, worker: dict | None = None, run_id: str | None = None) -> None:
         with self._process_lock:
             process = self._active_processes.get(worker_id)
         if not process or process.poll() is not None:
-            persisted_pid = self._persisted_host_pid(worker_id)
-            if persisted_pid is None:
+            persisted_process = self._persisted_host_process(worker_id)
+            if persisted_process is None:
                 return
+            persisted_pid, persisted_pgid = persisted_process
             active_session = self._read_active_session(worker_id) or {}
             persisted_run_id = str(active_session.get("run_id") or "").strip()
             if not persisted_run_id or (run_id and persisted_run_id != run_id):
                 raise RuntimeError(
                     f"Persisted host process {persisted_pid} does not match active run {run_id or '<unknown>'}"
                 )
-            self._stop_persisted_host_process(worker_id, persisted_pid, persisted_run_id)
+            self._stop_persisted_host_process(
+                worker_id,
+                persisted_pid,
+                persisted_pgid,
+                persisted_run_id,
+            )
             return
         pgid: int | None = None
         try:
@@ -5068,6 +5101,8 @@ class HostNativeCliMixin:
             )
             self._register_process(worker["worker_id"], process)
             process_pid = process.pid
+            # Popen uses start_new_session=True, so the child is the process-group leader.
+            process_pgid = process.pid
             self._write_active_session(
                 worker["worker_id"],
                 {
@@ -5081,6 +5116,7 @@ class HostNativeCliMixin:
                     "argv_for_evidence_json": json.dumps([_redact_command_arg(part) for part in command]),
                     "started_at": started_at_iso,
                     "process_pid": process.pid,
+                    "process_pgid": process_pgid,
                     "heartbeat_path": str(heartbeat_path),
                     "timeout_seconds": run_timeout_sec,
                     "instruction": instruction,
