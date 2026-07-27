@@ -1281,21 +1281,21 @@ class BaseCliWorkerRuntime:
         stop_errors: list[Exception] = []
         if active_session:
             try:
+                self.sandbox.terminate_run_processes(
+                    worker_id,
+                    self.runtime_name,
+                    active_session["run_id"],
+                    worker=worker,
+                )
+            except Exception as exc:
+                stop_errors.append(exc)
+            try:
                 self.sandbox.stop_screen_session(
                     worker_id,
                     self.runtime_name,
                     active_session["session_name"],
                     worker=worker,
                     missing_ok=True,
-                )
-            except Exception as exc:
-                stop_errors.append(exc)
-            try:
-                self.sandbox.terminate_run_processes(
-                    worker_id,
-                    self.runtime_name,
-                    active_session["run_id"],
-                    worker=worker,
                 )
             except Exception as exc:
                 stop_errors.append(exc)

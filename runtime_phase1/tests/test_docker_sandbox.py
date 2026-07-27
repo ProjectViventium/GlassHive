@@ -1313,11 +1313,17 @@ def test_terminate_run_processes_targets_run_env_and_descendants(tmp_path):
     assert '$1 != self_pid' in script
     assert "process_spec()" in script
     assert "capture_specs()" in script
+    assert "capture_pgids()" in script
     assert "alive_pids()" in script
+    assert "alive_pgids()" in script
+    assert "signal_groups()" in script
+    assert "self_pgid=" in script
     assert "expected_start=${spec#*:}" in script
     assert "specs=$(merge_specs" in script
+    assert "pgids=$(merge_specs" in script
     assert script.count("discovered=$(matching_pids)") == 2
     assert script.count('kill -KILL "$pid"') == 2
+    assert "signal_groups KILL $surviving_groups" in script
     assert "survivors=" in script
     assert "exit 43" in script
 

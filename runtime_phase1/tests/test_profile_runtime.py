@@ -3699,7 +3699,7 @@ def test_docker_cli_runtime_clears_active_session_after_stop(tmp_path):
 
     runtime._stop_active_process(worker_id, worker={"worker_id": worker_id})
 
-    assert calls == [("screen", "job-run_stop_meta"), ("terminate", "run_stop_meta")]
+    assert calls == [("terminate", "run_stop_meta"), ("screen", "job-run_stop_meta")]
     assert not runtime._active_session_meta_path(worker_id).exists()
 
 
