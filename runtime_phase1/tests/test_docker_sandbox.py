@@ -1311,6 +1311,11 @@ def test_terminate_run_processes_targets_run_env_and_descendants(tmp_path):
     assert env["GLASSHIVE_STOP_RUN_ID"] == "run_123"
     assert "self_pid=$$" in script
     assert '$1 != self_pid' in script
+    assert "process_spec()" in script
+    assert "capture_specs()" in script
+    assert "alive_pids()" in script
+    assert "expected_start=${spec#*:}" in script
+    assert "specs=$(merge_specs" in script
     assert "survivors=" in script
     assert "exit 43" in script
 

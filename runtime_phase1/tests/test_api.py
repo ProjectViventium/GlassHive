@@ -6155,6 +6155,44 @@ def test_interrupt_failure_keeps_active_run_nonterminal(tmp_path):
         service.shutdown()
 
 
+def test_interrupt_preserves_run_that_completes_before_conditional_finalization(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+
+    class CompletingInterruptRuntime(StubRuntime):
+        def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
+            assert run_id
+            store.finalize_run(run_id, state="completed", output_text="finished before interrupt")
+            store.update_worker_state(worker["worker_id"], "ready", last_error="")
+            return self._runtime_info(worker, pid=99999)
+
+    service = WorkersProjectsService(store, CompletingInterruptRuntime())
+    service._ensure_worker_processor = lambda worker_id: None  # type: ignore[method-assign]
+    try:
+        project = service.create_project("owner", "Interrupt Race", "Preserve terminal state", "claude-code")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Interrupt Race Worker",
+            role="coder",
+            profile="claude-code",
+            backend="openclaw",
+        )
+        run = service.assign_run(worker["worker_id"], "Finish while interruption races.")
+        store.update_run(run["run_id"], state="running", started_at=datetime.now(timezone.utc).isoformat())
+        store.update_worker_state(worker["worker_id"], "running", last_error="")
+
+        service.interrupt_worker(worker["worker_id"])
+
+        refreshed_run = store.get_run(run["run_id"])
+        assert refreshed_run is not None
+        assert refreshed_run["state"] == "completed"
+        assert refreshed_run["output_text"] == "finished before interrupt"
+        assert store.get_worker(worker["worker_id"])["state"] == "ready"
+        assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.interruption_not_applied"
+    finally:
+        service.shutdown()
+
+
 def test_terminate_active_run_cannot_resurrect_worker(tmp_path):
     db_path = tmp_path / "runtime.db"
     runtime = TerminationRaceRuntime()
@@ -6210,10 +6248,11 @@ def test_terminate_failure_is_not_reported_as_success(tmp_path):
 
         refreshed = store.get_worker(worker["worker_id"])
         assert refreshed is not None
-        assert refreshed["state"] == "running"
+        assert refreshed["state"] == "failed"
         assert refreshed["last_error"] == "compute remained active"
         assert store.get_run(run["run_id"])["state"] == "running"
         assert store.get_run(run["run_id"])["ended_at"] is None
+        assert worker["worker_id"] not in service._active_processors
         assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.termination_failed"
     finally:
         service.shutdown()
@@ -6250,7 +6289,7 @@ def test_terminate_rejects_runtime_that_still_reports_compute(tmp_path):
         with pytest.raises(RuntimeError, match="still active after termination"):
             service.terminate_worker(worker["worker_id"])
 
-        assert store.get_worker(worker["worker_id"])["state"] == "ready"
+        assert store.get_worker(worker["worker_id"])["state"] == "failed"
     finally:
         service.shutdown()
 

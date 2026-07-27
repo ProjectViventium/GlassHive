@@ -4718,7 +4718,7 @@ class HostNativeCliMixin:
     def pause_worker(self, worker: dict) -> RuntimeInfo:
         active_session = self._read_active_session(worker["worker_id"])
         active_run_id = str(worker.get("_active_run_id") or "").strip() or None
-        if not active_run_id and active_session and self._active_pid(worker["worker_id"]):
+        if not active_run_id and active_session and self.worker_compute_present(worker):
             active_run_id = str(active_session.get("run_id") or "").strip() or None
         if active_run_id:
             self._note_stop_reason(worker["worker_id"], "paused", run_id=active_run_id)
@@ -4729,6 +4729,7 @@ class HostNativeCliMixin:
             stop_reason="paused",
             error_text="Worker was paused by the operator",
         )
+        self._clear_active_session(worker["worker_id"])
         self._append_work_log(worker, "Worker paused by operator.")
         return self._host_runtime_info(worker, pid=None)
 
@@ -4737,7 +4738,7 @@ class HostNativeCliMixin:
         if active_session and run_id and active_session.get("run_id") != run_id:
             active_session = None
         active_run_id = str(run_id or worker.get("_active_run_id") or "").strip() or None
-        if not active_run_id and active_session and self._active_pid(worker["worker_id"]):
+        if not active_run_id and active_session and self.worker_compute_present(worker):
             active_run_id = str(active_session.get("run_id") or "").strip() or None
         if active_run_id or self._active_pid(worker["worker_id"]):
             self._note_stop_reason(worker["worker_id"], "interrupted", run_id=active_run_id)
@@ -4752,13 +4753,14 @@ class HostNativeCliMixin:
             stop_reason="interrupted",
             error_text="Worker run was interrupted by the operator",
         )
+        self._clear_active_session(worker["worker_id"])
         self._append_work_log(worker, "Active run interrupted by operator.")
         return self._host_runtime_info(worker, pid=None)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
         active_session = self._read_active_session(worker["worker_id"])
         active_run_id = str(worker.get("_active_run_id") or "").strip() or None
-        if not active_run_id and active_session and self._active_pid(worker["worker_id"]):
+        if not active_run_id and active_session and self.worker_compute_present(worker):
             active_run_id = str(active_session.get("run_id") or "").strip() or None
         if active_run_id:
             self._note_stop_reason(worker["worker_id"], "terminated", run_id=active_run_id)
@@ -4773,19 +4775,115 @@ class HostNativeCliMixin:
             stop_reason="terminated",
             error_text="Worker was terminated by the operator",
         )
+        self._clear_active_session(worker["worker_id"])
         self._append_work_log(worker, "Worker terminated by operator.")
         return self._host_runtime_info(worker, pid=None)
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
-        return self._host_runtime_info(worker, pid=self._active_pid(worker["worker_id"]))
+        worker_id = worker["worker_id"]
+        pid = self._active_pid(worker_id) or self._persisted_host_pid(worker_id)
+        return self._host_runtime_info(worker, pid=pid)
 
     def worker_compute_present(self, worker: dict) -> bool:
-        return self._active_pid(worker["worker_id"]) is not None
+        worker_id = worker["worker_id"]
+        return self._active_pid(worker_id) is not None or self._persisted_host_pid(worker_id) is not None
+
+    @staticmethod
+    def _host_pid_alive(pid: int) -> bool:
+        stat_path = Path(f"/proc/{pid}/stat")
+        if stat_path.exists():
+            try:
+                stat_value = stat_path.read_text()
+                state = stat_value[stat_value.rfind(")") + 2 :].split(maxsplit=1)[0]
+                if state.startswith("Z"):
+                    return False
+            except (OSError, IndexError):
+                pass
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _persisted_host_pid(self, worker_id: str) -> int | None:
+        active_session = self._read_active_session(worker_id)
+        if not active_session:
+            return None
+        try:
+            pid = int(active_session.get("process_pid") or 0)
+        except (TypeError, ValueError):
+            return None
+        return pid if pid > 0 and self._host_pid_alive(pid) else None
+
+    @staticmethod
+    def _host_pid_matches_run(pid: int, run_id: str) -> bool:
+        marker = f"GLASSHIVE_RUN_ID={run_id}"
+        environ_path = Path(f"/proc/{pid}/environ")
+        if environ_path.exists():
+            try:
+                return marker.encode() in environ_path.read_bytes().split(b"\0")
+            except OSError:
+                return False
+        try:
+            result = subprocess.run(
+                ["ps", "eww", "-p", str(pid), "-o", "command="],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0 and marker in result.stdout
+
+    def _stop_persisted_host_process(self, worker_id: str, pid: int, run_id: str) -> None:
+        if not self._host_pid_matches_run(pid, run_id):
+            raise RuntimeError(
+                f"Refusing to stop unverified persisted host process {pid} for run {run_id}"
+            )
+        try:
+            pgid = os.getpgid(pid)
+        except OSError as exc:
+            if self._host_pid_alive(pid):
+                raise RuntimeError(f"Could not inspect persisted host process {pid}") from exc
+            return
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        for _attempt in range(20):
+            if not self._host_pid_alive(pid):
+                self._clear_active_session(worker_id)
+                return
+            time.sleep(0.1)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            self._clear_active_session(worker_id)
+            return
+        for _attempt in range(20):
+            if not self._host_pid_alive(pid):
+                self._clear_active_session(worker_id)
+                return
+            time.sleep(0.1)
+        raise RuntimeError(f"Persisted host process {pid} remained alive after TERM/KILL")
 
     def _stop_active_process(self, worker_id: str, *, worker: dict | None = None, run_id: str | None = None) -> None:
         with self._process_lock:
             process = self._active_processes.get(worker_id)
         if not process or process.poll() is not None:
+            persisted_pid = self._persisted_host_pid(worker_id)
+            if persisted_pid is None:
+                return
+            active_session = self._read_active_session(worker_id) or {}
+            persisted_run_id = str(active_session.get("run_id") or "").strip()
+            if not persisted_run_id or (run_id and persisted_run_id != run_id):
+                raise RuntimeError(
+                    f"Persisted host process {persisted_pid} does not match active run {run_id or '<unknown>'}"
+                )
+            self._stop_persisted_host_process(worker_id, persisted_pid, persisted_run_id)
             return
         pgid: int | None = None
         try:

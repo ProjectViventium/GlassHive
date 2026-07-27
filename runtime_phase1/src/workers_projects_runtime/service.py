@@ -1916,14 +1916,27 @@ class WorkersProjectsService:
                 message,
             )
             raise
-        updated = self._apply_runtime_info(worker_id, info, state="ready", last_error="")
         if active_run:
-            self.store.finalize_run(
+            finalized = self.store.finalize_run_if_state(
                 active_run["run_id"],
+                expected_state="running",
                 state="interrupted",
                 output_text=active_run.get("output_text", ""),
                 error_text="Interrupted by operator",
             )
+            if finalized is None:
+                current_run = self.store.get_run(active_run["run_id"])
+                current_worker = self.store.get_worker(worker_id) or worker
+                current_state = str((current_run or {}).get("state") or "unknown")
+                self.store.add_event(
+                    worker["project_id"],
+                    worker_id,
+                    active_run["run_id"],
+                    "worker.interruption_not_applied",
+                    f"Run reached {current_state} before interruption finalization; terminal result preserved.",
+                )
+                return current_worker
+        updated = self._apply_runtime_info(worker_id, info, state="ready", last_error="")
         self.store.add_event(worker["project_id"], worker_id, active_run["run_id"] if active_run else None, "worker.interrupted", "Worker interrupted")
         self._emit_callback(worker, "worker.interrupted", run=active_run, message="Worker interrupted")
         return updated or worker
@@ -1948,9 +1961,6 @@ class WorkersProjectsService:
             **worker,
             "_active_run_id": str((active_run or {}).get("run_id") or ""),
         }
-        with self._processors_lock:
-            previous_generation = self._processor_generations.get(worker_id, 0)
-            processor_was_active = worker_id in self._active_processors
         self._invalidate_worker_processor(worker_id)
         try:
             info = self.runtime.terminate_worker(runtime_worker)
@@ -1960,13 +1970,8 @@ class WorkersProjectsService:
                 detail = f" (pid={info.pid})" if info.pid else ""
                 raise RuntimeError(f"Worker compute is still active after termination{detail}")
         except Exception as exc:
-            with self._processors_lock:
-                if self._processor_generations.get(worker_id) == previous_generation + 1:
-                    self._processor_generations[worker_id] = previous_generation
-                    if processor_was_active:
-                        self._active_processors.add(worker_id)
             message = public_callback_message_text(str(exc)) or "Worker compute termination failed"
-            self.store.update_worker(worker_id, state=str(worker.get("state") or "failed"), last_error=message)
+            self.store.update_worker(worker_id, state="failed", last_error=message)
             self.store.add_event(
                 worker["project_id"],
                 worker_id,
