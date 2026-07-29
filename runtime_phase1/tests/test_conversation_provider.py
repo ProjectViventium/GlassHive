@@ -459,6 +459,7 @@ def test_streaming_completion_and_activity_recovery(tmp_path, monkeypatch):
     ]
     assert reasoning[0] == "The harness started working.\n"
     assert all("queued" not in item.lower() and "waiting" not in item.lower() for item in reasoning)
+    assert all("content" not in chunk["choices"][0]["delta"] for chunk in chunks if "reasoning_content" in chunk["choices"][0]["delta"])
     request_id = chunks[0]["id"]
     assert any("Hello from LIFE." in chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
     assert lines[-1] == "data: [DONE]"
@@ -473,6 +474,33 @@ def test_streaming_completion_and_activity_recovery(tmp_path, monkeypatch):
         headers={**AUTH, "Last-Event-ID": str(events[0]["id"])},
     )
     assert all(event["id"] > events[0]["id"] for event in after_first.json()["data"])
+
+
+def test_streaming_can_mirror_activity_as_langchain_content_parts(tmp_path, monkeypatch):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    payload = _payload(workspace, stream=True)
+    headers = {**AUTH, "X-GlassHive-Activity-Format": "langchain-content-parts-v1"}
+
+    with client.stream("POST", "/v1/chat/completions", headers=headers, json=payload) as response:
+        assert response.status_code == 200, response.text
+        lines = [line for line in response.iter_lines() if line]
+
+    chunks = [json.loads(line.removeprefix("data: ")) for line in lines if line != "data: [DONE]"]
+    activity_chunks = [
+        chunk["choices"][0]["delta"]
+        for chunk in chunks
+        if "reasoning_content" in chunk["choices"][0]["delta"]
+    ]
+    assert activity_chunks
+    assert activity_chunks[0]["reasoning_content"] == "The harness started working.\n"
+    assert activity_chunks[0]["content"] == [
+        {
+            "type": "reasoning_content",
+            "reasoning": "The harness started working.\n",
+        }
+    ]
 
 
 def test_non_streaming_completion_uses_native_usage_when_the_harness_reports_it(tmp_path, monkeypatch):
