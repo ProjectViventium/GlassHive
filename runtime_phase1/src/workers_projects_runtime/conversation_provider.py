@@ -1219,10 +1219,6 @@ class ConversationProvider:
         native_snapshot = ""
         emitted_content = ""
         execution_started_seen = False
-        activity_content_parts = (
-            _header(request, "x-glasshive-activity-format")
-            == "langchain-content-parts-v1"
-        )
         last_heartbeat = time.monotonic()
         while True:
             if await request.is_disconnected():
@@ -1280,19 +1276,6 @@ class ConversationProvider:
                 activity_delta: dict[str, Any] = {
                     "reasoning_content": summary,
                 }
-                if activity_content_parts:
-                    # LibreChat's currently pinned LangChain OpenAI client drops the
-                    # reasoning_content extension before its graph sees the chunk. Its graph does,
-                    # however, preserve structured reasoning content parts. Keep the ordinary
-                    # OpenAI-compatible field for independent clients and add this non-text mirror
-                    # only when an authenticated caller explicitly opts into the compatibility
-                    # format. The mirror is never user-authored answer text.
-                    activity_delta["content"] = [
-                        {
-                            "type": "reasoning_content",
-                            "reasoning": summary,
-                        }
-                    ]
                 summary_chunk = {
                     "id": request_id,
                     "object": "chat.completion.chunk",
