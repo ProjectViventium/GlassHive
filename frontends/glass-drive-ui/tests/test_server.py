@@ -36,6 +36,7 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "WPR_API_TOKEN",
         "GLASSHIVE_DEFAULT_OWNER_ID",
         "GLASSHIVE_ENTERPRISE_MODE",
+        "GLASSHIVE_PUBLIC_LINKS_ONLY",
         "WPR_ENTERPRISE_MODE",
         "GLASSHIVE_AUTH_MODE",
         "GLASSHIVE_ENTERPRISE_TENANT_ID",
@@ -62,6 +63,9 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV",
     ):
         monkeypatch.delenv(name, raising=False)
+    # Keep unit tests isolated from the currently installed Viventium runtime.
+    # Individual runtime-env loading tests opt into their own synthetic env file.
+    monkeypatch.setenv("VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV", "1")
     monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(tmp_path / "link_refs.sqlite3"))
     server_module._NOVNC_VIEW_URL_CACHE.clear()
     server_module._NOVNC_ASSET_CACHE.clear()
@@ -1716,6 +1720,83 @@ def test_enterprise_ui_requires_service_token_at_startup(monkeypatch):
 
     with pytest.raises(RuntimeError, match="requires WPR_API_TOKEN"):
         create_app(runtime_client=FakeRuntimeClient())
+
+
+def test_public_links_only_ui_requires_signed_link_secret_at_startup(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
+
+    with pytest.raises(RuntimeError, match="public link mode requires GLASSHIVE_SIGNED_LINK_SECRET"):
+        create_app(runtime_client=FakeRuntimeClient())
+
+
+def test_public_links_only_ui_rejects_operator_surfaces_without_signed_session(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-link-secret")
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    assert client.get("/docs").status_code == 404
+    assert client.get("/").status_code == 401
+    assert client.get("/api/bootstrap").status_code == 401
+    assert client.get("/watch/wrk_1").status_code == 401
+    assert client.get("/v1/workers/wrk_1").status_code == 401
+
+
+def test_public_links_only_worker_ref_opens_scoped_watch_session(monkeypatch):
+    secret = "public-link-secret"
+    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
+    token = signed_worker_token(secret)
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url="/watch/wrk_1?project_id=prj_1&surface=desktop",
+    )
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get(f"/r/{ref_id}", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"].startswith("/watch/wrk_1?")
+    assert client.get(response.headers["location"]).status_code == 200
+
+
+def test_public_links_only_artifact_ref_is_bearer_but_raw_token_route_is_closed(monkeypatch):
+    secret = "public-link-secret"
+    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
+    token = signed_artifact_token(secret, kind="artifact_open")
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/v1/signed-links/{token}",
+    )
+    captured = {}
+
+    class FakeUpstreamResponse:
+        status_code = 200
+        content = b"<html><body>artifact preview</body></html>"
+        headers = {"content-type": "text/html; charset=utf-8"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            captured.update({"method": method, "url": url, "headers": headers or {}})
+            return FakeUpstreamResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get(f"/v1/link-refs/{ref_id}")
+
+    assert response.status_code == 200
+    assert captured["url"] == f"http://runtime.test/v1/link-refs/{ref_id}"
+    assert client.get(f"/v1/signed-links/{token}").status_code == 404
 
 
 def test_enterprise_ui_requires_signed_link_secret_at_startup(monkeypatch):

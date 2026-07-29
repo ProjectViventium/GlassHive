@@ -25,6 +25,7 @@ from .auth import (
     owner_matches_auth_context,
     scoped_alias,
 )
+from .conversation_provider import install_conversation_provider_routes
 from .deliverables import deliverable_payload, is_user_deliverable_relative_path
 from .failure_classification import classify_runtime_error
 from .models import (
@@ -161,6 +162,8 @@ def create_app(
         version="0.3.0",
         lifespan=lifespan,
     )
+    app.state.store = store
+    app.state.service = service
 
     @app.exception_handler(HostWorkersDisabledError)
     async def host_workers_disabled_handler(request: Request, exc: HostWorkersDisabledError) -> JSONResponse:
@@ -1213,6 +1216,16 @@ def create_app(
             },
             "deliverable": deliverable,
         }
+
+    app.state.conversation_provider = install_conversation_provider_routes(
+        app,
+        store=store,
+        service=service,
+        tenant_for_request=lambda request: (
+            _auth_context(request).tenant_id if _auth_context(request).enterprise else "local"
+        ),
+        provider_token=api_token,
+    )
 
     @app.get("/health")
     def health() -> dict[str, object]:

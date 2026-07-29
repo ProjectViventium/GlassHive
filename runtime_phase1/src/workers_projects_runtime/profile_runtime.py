@@ -11,6 +11,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import time
 try:
     import tomllib
@@ -633,6 +634,8 @@ class ProfiledWorkerRuntime:
         self.host_openclaw = HostOpenClawRuntime(base_dir=base_dir)
         self.host_codex = HostCodexCliRuntime(base_dir=base_dir)
         self.host_claude = HostClaudeCodeRuntime(base_dir=base_dir)
+        self._provider_log_cache: dict[tuple[str, str], dict[str, object]] = {}
+        self._provider_log_cache_lock = Lock()
 
     def _runtime_for_profile(self, profile: str, execution_mode: str = "docker") -> WorkerRuntime:
         if execution_mode == "host":
@@ -725,6 +728,88 @@ class ProfiledWorkerRuntime:
             return {}
         projection = resolver(worker)
         return dict(projection) if isinstance(projection, dict) else {}
+
+    def provider_activity_log(self, worker: dict, run_id: str) -> tuple[str, str]:
+        """Return the private native JSONL log used for provider activity normalization."""
+
+        clean_run_id = str(run_id or "").strip()
+        if not clean_run_id or "/" in clean_run_id or "\\" in clean_run_id or clean_run_id in {".", ".."}:
+            raise ValueError("invalid run id")
+        runtime = self._runtime_for_worker(worker)
+        run_root = runtime._run_root(str(worker["worker_id"]), clean_run_id)
+        stdout_path = run_root / "stdout.log"
+        if not stdout_path.is_file():
+            return str(worker.get("profile") or ""), ""
+        try:
+            max_bytes = max(
+                1024,
+                int(
+                    os.environ.get(
+                        "GLASSHIVE_PROVIDER_LOG_WINDOW_BYTES",
+                        str(8 * 1024 * 1024),
+                    )
+                    or str(8 * 1024 * 1024)
+                ),
+            )
+        except ValueError:
+            max_bytes = 8 * 1024 * 1024
+        cache_key = (str(worker["worker_id"]), clean_run_id)
+        stat = stdout_path.stat()
+        with self._provider_log_cache_lock:
+            cached = self._provider_log_cache.get(cache_key)
+            if (
+                cached
+                and int(cached.get("size") or -1) == stat.st_size
+                and int(cached.get("mtime_ns") or -1) == stat.st_mtime_ns
+            ):
+                return str(worker.get("profile") or ""), str(cached.get("rendered") or "")
+
+            data = b""
+            previous_size = int(cached.get("size") or 0) if cached else 0
+            previous_data = cached.get("data") if cached else b""
+            if (
+                cached
+                and isinstance(previous_data, bytes)
+                and previous_size < stat.st_size
+                and stat.st_size - previous_size <= max_bytes
+            ):
+                with stdout_path.open("rb") as handle:
+                    handle.seek(previous_size)
+                    data = previous_data + handle.read()
+            else:
+                with stdout_path.open("rb") as handle:
+                    handle.seek(max(0, stat.st_size - max_bytes))
+                    data = handle.read(max_bytes)
+
+            if len(data) > max_bytes:
+                data = data[-max_bytes:]
+            excluded_bytes = max(0, stat.st_size - len(data))
+            if excluded_bytes:
+                newline = data.find(b"\n")
+                if newline >= 0:
+                    data = data[newline + 1 :]
+                else:
+                    data = b""
+                excluded_bytes = stat.st_size - len(data)
+            text = data.decode("utf-8", errors="ignore")
+            if excluded_bytes:
+                marker = json.dumps(
+                    {
+                        "type": "glasshive.log_compacted",
+                        "excluded_prefix_bytes": excluded_bytes,
+                    },
+                    separators=(",", ":"),
+                )
+                text = f"{marker}\n{text}"
+            self._provider_log_cache[cache_key] = {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "data": data,
+                "rendered": text,
+            }
+            while len(self._provider_log_cache) > 16:
+                self._provider_log_cache.pop(next(iter(self._provider_log_cache)))
+        return str(worker.get("profile") or ""), text
 
     def collect_completed_run(
         self,
@@ -2348,8 +2433,11 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
 
     def _compatible_provider_allowed_reasoning_efforts(self) -> set[str]:
         raw = os.environ.get("WPR_CODEX_CLI_ALLOWED_REASONING_EFFORTS", "").strip()
-        valid = {"none", "minimal", "low", "medium", "high", "xhigh"}
+        valid = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
         if not raw:
+            # Keep the generic OpenAI-compatible route conservative. The GlassHive core
+            # provider uses the native host CLI path and advertises its own richer effort set;
+            # compatible gateways must explicitly declare anything beyond this proven set.
             allowed = {"none", "low", "medium", "high"}
             if self._codex_xhigh_route_proven():
                 allowed.add("xhigh")
@@ -2418,7 +2506,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
 
     def _append_codex_reasoning_effort_config(self, command: list[str], worker: dict) -> None:
         reasoning_effort = self._codex_reasoning_effort_for_worker(worker)
-        if reasoning_effort in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+        if reasoning_effort in {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
             command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
         if reasoning_effort == "minimal":
             command.extend(["-c", 'web_search="disabled"'])
@@ -2588,6 +2676,8 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
                     output_parts.append(text)
         if output_parts:
             return session_key, _select_user_facing_agent_output(output_parts)
+        if getattr(self, "_conversation_mode_from_worker", lambda _worker: False)(worker):
+            return session_key, "The harness completed without a user-facing response."
         fallback = self._extract_plain_output(stdout, stderr)
         selected = _select_user_facing_agent_output([fallback])
         return session_key, (selected or fallback)[-4000:]
@@ -2724,7 +2814,40 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
     def _parse_output(self, worker: dict, stdout: str, stderr: str, info: RuntimeInfo) -> tuple[str | None, str]:
         raw = stdout.strip()
         if not raw:
+            if getattr(self, "_conversation_mode_from_worker", lambda _worker: False)(worker):
+                return info.session_key, "The harness completed without a user-facing response."
             return info.session_key, (stderr.strip() or "")[-4000:]
+        if getattr(self, "_conversation_mode_from_worker", lambda _worker: False)(worker):
+            session_key = info.session_key
+            assistant_parts: list[str] = []
+            result_parts: list[str] = []
+            for line in raw.splitlines():
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                maybe_session = str(event.get("session_id") or "").strip()
+                if maybe_session:
+                    session_key = maybe_session
+                if str(event.get("type") or "") == "result":
+                    result = str(event.get("result") or "").strip()
+                    if result:
+                        result_parts.append(result)
+                if str(event.get("type") or "") != "assistant":
+                    continue
+                message = event.get("message") if isinstance(event.get("message"), dict) else {}
+                content = message.get("content") if isinstance(message.get("content"), list) else []
+                text = "".join(
+                    str(block.get("text") or "")
+                    for block in content
+                    if isinstance(block, dict) and str(block.get("type") or "") == "text"
+                ).strip()
+                if text:
+                    assistant_parts.append(text)
+            selected = _select_user_facing_agent_output(result_parts or assistant_parts)
+            return session_key, selected or "The harness completed without a user-facing response."
         try:
             payload = json.loads(raw.splitlines()[-1])
         except json.JSONDecodeError:
@@ -2735,8 +2858,8 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
 
 
 _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"/Users/[^/\s\"'`]+(?:/[^\s\"'`]+)+"), "[REDACTED_LOCAL_PATH]"),
-    (re.compile(r"~/[^\s\"'`]+(?:/[^\s\"'`]+)+"), "[REDACTED_LOCAL_PATH]"),
+    (re.compile(r"/Users/[^/\s\"'`]+(?:/[^\s\"'`]*)*"), "[REDACTED_LOCAL_PATH]"),
+    (re.compile(r"~/[^\s\"'`]+(?:/[^\s\"'`]*)*"), "[REDACTED_LOCAL_PATH]"),
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)((?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s\"']{6,}"), r"\1[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
@@ -3260,10 +3383,47 @@ def _safe_slug(value: str) -> str:
 class HostNativeCliMixin:
     execution_mode = "host"
     worker_root_name = "host_cli_runtime"
-    _host_active_worker_id: str | None = None
+
+    def _host_active_slots(self) -> dict[str, str]:
+        slots = self.__dict__.get("_viventium_host_active_slots")
+        if not isinstance(slots, dict):
+            slots = {}
+            self.__dict__["_viventium_host_active_slots"] = slots
+        return slots
+
+    def _host_worker_lanes(self) -> dict[str, str]:
+        lanes = self.__dict__.get("_viventium_host_worker_lanes")
+        if not isinstance(lanes, dict):
+            lanes = {}
+            self.__dict__["_viventium_host_worker_lanes"] = lanes
+        return lanes
+
+    def _host_capacity_lane(self, worker: dict | None) -> str:
+        return "conversation" if self._conversation_mode_from_worker(worker) else "mission"
 
     def _instruction_with_completion_contract(self, instruction: str) -> str:
         return _instruction_with_completion_contract(instruction)
+
+    def _command_stdin_text(self, worker: dict, instruction: str, info: RuntimeInfo) -> str | None:
+        _ = info
+        if self._conversation_mode_from_worker(worker):
+            return str(instruction or "").strip()
+        return self._instruction_with_completion_contract(instruction)
+
+    def _run_mode_from_worker(self, worker: dict | None) -> str:
+        if not isinstance(worker, dict):
+            return "mission"
+        bundle = self._bootstrap_bundle_for_worker(worker)
+        return str(bundle.get("run_mode") or "mission").strip().lower()
+
+    def _conversation_mode_from_worker(self, worker: dict | None) -> bool:
+        return self._run_mode_from_worker(worker) == "conversation"
+
+    def _conversation_evidence_workspace(self, worker: dict, run_id: str) -> Path:
+        path = self._run_root(str(worker["worker_id"]), run_id) / "private-evidence"
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o700)
+        return path
 
     def _agent_type(self) -> str:
         if self.runtime_name == "codex-cli":
@@ -3300,6 +3460,8 @@ class HostNativeCliMixin:
         if existing:
             return Path(existing).expanduser()
         root = self._host_workspace_root(worker)
+        if self._conversation_mode_from_worker(worker):
+            return root
         date_prefix = datetime.now().strftime("%Y-%m-%d")
         alias = str(worker.get("alias") or worker.get("name") or worker.get("worker_id") or "project")
         slug = _safe_slug(alias)
@@ -3549,12 +3711,55 @@ class HostNativeCliMixin:
             codex_target.chmod(0o600)
             self._copy_host_codex_auth(codex_home)
 
+    def _write_conversation_runtime_files(self, worker: dict, bundle: dict[str, object]) -> None:
+        """Write harness configuration under private worker state, never inside LIFE."""
+
+        profile = str(worker.get("profile") or "").strip()
+        if profile == "codex-cli":
+            codex_home = self._host_codex_home(worker)
+            codex_home.mkdir(parents=True, exist_ok=True)
+            codex_home.chmod(0o700)
+            codex_config = self._host_codex_worker_config(
+                str(bundle.get("codex_config_append") or "")
+            )
+            config_path = codex_home / "config.toml"
+            config_path.write_text((codex_config.rstrip() + "\n") if codex_config else "")
+            config_path.chmod(0o600)
+            self._copy_host_codex_auth(codex_home)
+            return
+
+        if profile != "claude-code":
+            return
+        claude_home = self._home_dir(str(worker["worker_id"])) / ".claude"
+        claude_home.mkdir(parents=True, exist_ok=True)
+        claude_home.chmod(0o700)
+        project_mcp = bundle.get("claude_project_mcp")
+        state_dir = self._state_dir(str(worker["worker_id"]))
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_dir.chmod(0o700)
+        mcp_path = state_dir / "conversation-mcp.json"
+        if isinstance(project_mcp, dict):
+            payload = claude_project_mcp_payload_for_bundle(bundle, project_mcp)
+            mcp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            mcp_path.chmod(0o600)
+        else:
+            try:
+                mcp_path.unlink()
+            except FileNotFoundError:
+                pass
+
     def _materialize_workspace(self, worker: dict, workspace: Path) -> None:
         root = self._host_workspace_root(worker)
         root.mkdir(parents=True, exist_ok=True)
         if not os.access(root, os.W_OK):
             raise RuntimeErrorBase(f"Host workspace root is not writable: {root}")
         workspace.mkdir(parents=True, exist_ok=True)
+        if self._conversation_mode_from_worker(worker):
+            self._write_conversation_runtime_files(
+                worker,
+                self._bootstrap_bundle_for_worker(worker),
+            )
+            return
         bundle = self._bootstrap_bundle_for_worker(worker)
         self._write_workspace_file(workspace, "project-definition.md", self._host_project_definition(worker), overwrite=False)
         if not (workspace / "work-log.md").exists():
@@ -3687,6 +3892,8 @@ class HostNativeCliMixin:
                 raise RuntimeErrorBase(f"Bootstrap file {path} is missing content or source_path")
 
     def _append_work_log(self, worker: dict, message: str) -> None:
+        if self._conversation_mode_from_worker(worker):
+            return
         path = self._host_workspace_dir(worker) / "work-log.md"
         try:
             with path.open("a") as handle:
@@ -3837,7 +4044,7 @@ class HostNativeCliMixin:
         stop_reason: str,
         error_text: str,
     ) -> None:
-        if not active_session:
+        if self._conversation_mode_from_worker(worker) or not active_session:
             return
         run_id = str(active_session.get("run_id") or "").strip()
         if not run_id:
@@ -3977,26 +4184,31 @@ class HostNativeCliMixin:
                 pass
         finally:
             self._clear_process(worker_id)
-            if self._host_active_worker_id == worker_id:
-                self._host_active_worker_id = None
+            self._release_host_slot(worker_id)
 
     def _acquire_host_slot(self, worker: dict) -> None:
         if os.environ.get("WPR_HOST_ALLOW_CONCURRENT_SAME_CLI", "").strip().lower() in {"1", "true", "yes", "on"}:
             return
         worker_id = worker["worker_id"]
+        lane = self._host_capacity_lane(worker)
         with self._process_lock:
-            error = self._host_capacity_error_locked(worker_id)
+            error = self._host_capacity_error_locked(worker_id, lane)
             if error is not None:
                 raise error
-            self._host_active_worker_id = worker_id
+            self._host_active_slots()[lane] = worker_id
+            self._host_worker_lanes()[worker_id] = lane
 
-    def _host_capacity_error_locked(self, worker_id: str) -> RuntimeErrorBase | None:
-        active = self._host_active_worker_id
+    def _host_capacity_error_locked(
+        self,
+        worker_id: str,
+        lane: str = "mission",
+    ) -> RuntimeErrorBase | None:
+        active = self._host_active_slots().get(lane)
         active_process = self._active_processes.get(active or "")
         if active and active != worker_id and (active_process is None or active_process.poll() is None):
             return RuntimeErrorBase(
-                f"Host-native {self.runtime_name} already has an active worker ({active}); "
-                "v1 allows one active host worker per CLI family."
+                f"Host-native {self.runtime_name} already has an active {lane} worker ({active}); "
+                f"v1 allows one active host worker per CLI family and {lane} lane."
             )
         return None
 
@@ -4004,12 +4216,16 @@ class HostNativeCliMixin:
         if os.environ.get("WPR_HOST_ALLOW_CONCURRENT_SAME_CLI", "").strip().lower() in {"1", "true", "yes", "on"}:
             return None
         with self._process_lock:
-            return self._host_capacity_error_locked(str(worker["worker_id"]))
+            return self._host_capacity_error_locked(
+                str(worker["worker_id"]),
+                self._host_capacity_lane(worker),
+            )
 
     def _release_host_slot(self, worker_id: str) -> None:
         with self._process_lock:
-            if self._host_active_worker_id == worker_id:
-                self._host_active_worker_id = None
+            lane = self._host_worker_lanes().pop(worker_id, None)
+            if lane and self._host_active_slots().get(lane) == worker_id:
+                self._host_active_slots().pop(lane, None)
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         raise NotImplementedError
@@ -4032,7 +4248,133 @@ class HostNativeCliMixin:
             return None
         return parsed if parsed > 0 else None
 
+    def _run_conversation_task(
+        self,
+        worker: dict,
+        instruction: str,
+        *,
+        timeout_sec: float | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        """Run a natural harness turn without mission scaffolding or LIFE-side runtime files."""
+        effective_run_id = (run_id or secrets.token_hex(8)).strip()
+        worker = {**worker, "_active_run_id": effective_run_id, "_glasshive_conversation_run": True}
+        info = self.ensure_worker_ready(worker)
+        command, env = self._build_command(worker, instruction, info)
+        stdin_text = self._command_stdin_text(worker, instruction, info)
+        env["GLASSHIVE_RUN_ID"] = effective_run_id
+        env["GLASSHIVE_RUN_MODE"] = "conversation"
+        workspace = Path(str(info.workspace_dir or self._host_workspace_dir(worker)))
+        self._acquire_host_slot(worker)
+
+        run_root = self._run_root(str(worker["worker_id"]), effective_run_id)
+        run_root.mkdir(parents=True, exist_ok=True)
+        run_root.chmod(0o700)
+        raw_stdout = run_root / "stdout.log"
+        raw_stderr = run_root / "stderr.log"
+        host_stdin = run_root / "instruction.stdin"
+        exit_path = run_root / "exit_code"
+        if stdin_text is not None:
+            host_stdin.write_text(stdin_text)
+            host_stdin.chmod(0o600)
+
+        self._write_action_audit(
+            worker,
+            {
+                "kind": "conversation.started",
+                "run_id": effective_run_id,
+                "cwd": str(workspace),
+                "argv_redacted": [_redact_command_arg(part) for part in command],
+                "env_keys": sorted(env.keys()),
+                "effort_projection": _effort_projection_for_audit(worker),
+            },
+        )
+        run_timeout_sec = self._host_run_timeout_sec(timeout_sec)
+        process: subprocess.Popen[str] | None = None
+        try:
+            with raw_stdout.open("w") as stdout_handle, raw_stderr.open("w") as stderr_handle:
+                raw_stdout.chmod(0o600)
+                raw_stderr.chmod(0o600)
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(workspace),
+                    env=env,
+                    text=True,
+                    stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    start_new_session=True,
+                )
+                self._register_process(str(worker["worker_id"]), process)
+                self._write_active_session(
+                    str(worker["worker_id"]),
+                    {
+                        "session_name": f"conversation-{effective_run_id[:12]}",
+                        "run_id": effective_run_id,
+                        "stdout_path": str(raw_stdout),
+                        "stderr_path": str(raw_stderr),
+                        "exit_path": str(exit_path),
+                        "model": str(info.model or ""),
+                        "argv_for_evidence_json": json.dumps([_redact_command_arg(part) for part in command]),
+                        "started_at": _utc_iso(),
+                        "process_pid": process.pid,
+                        "timeout_seconds": run_timeout_sec,
+                        "instruction": instruction,
+                        "run_mode": "conversation",
+                    },
+                )
+                try:
+                    if stdin_text is not None:
+                        process.communicate(stdin_text, timeout=run_timeout_sec)
+                        exit_code = process.returncode
+                    else:
+                        exit_code = process.wait(timeout=run_timeout_sec)
+                except subprocess.TimeoutExpired as exc:
+                    self._note_stop_reason(str(worker["worker_id"]), "terminated", run_id=effective_run_id)
+                    self._stop_active_process(str(worker["worker_id"]), worker=worker, run_id=effective_run_id)
+                    raise RuntimeErrorBase(f"{self.runtime_name} timed out after {run_timeout_sec:g}s") from exc
+        finally:
+            self._clear_process(str(worker["worker_id"]))
+            self._release_host_slot(str(worker["worker_id"]))
+
+        exit_path.write_text(str(exit_code))
+        exit_path.chmod(0o600)
+        stdout = raw_stdout.read_text() if raw_stdout.exists() else ""
+        stderr = raw_stderr.read_text() if raw_stderr.exists() else ""
+        self._finalize_stop_reason(str(worker["worker_id"]), run_id=effective_run_id)
+        if exit_code != 0:
+            detail = (_redact_text(stderr, max_chars=2000) or _redact_text(stdout, max_chars=2000)).strip()
+            self._write_action_audit(
+                worker,
+                {
+                    "kind": "conversation.failed",
+                    "run_id": effective_run_id,
+                    "exit_code": exit_code,
+                    "detail": detail,
+                },
+            )
+            raise RuntimeErrorBase(f"{self.runtime_name} exited with code {exit_code}: {detail}")
+
+        session_key, output = self._parse_output(worker, stdout, stderr, info)
+        if session_key:
+            self._write_session_key(str(worker["worker_id"]), session_key)
+        redacted_output = _redact_text(str(output or "").strip())
+        if len(redacted_output) > _HOST_RUN_OUTPUT_MAX_CHARS:
+            redacted_output = f"{redacted_output[: _HOST_RUN_OUTPUT_MAX_CHARS - 3].rstrip()}..."
+        self._write_action_audit(
+            worker,
+            {
+                "kind": "conversation.completed",
+                "run_id": effective_run_id,
+                "exit_code": exit_code,
+                "output_chars": len(redacted_output),
+            },
+        )
+        return redacted_output
+
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        if self._conversation_mode_from_worker(worker):
+            return self._run_conversation_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
         effective_run_id = (run_id or secrets.token_hex(8)).strip()
         worker = {
             **worker,
@@ -4526,17 +4868,50 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         info = HostNativeCliMixin.ensure_worker_ready(self, worker)
         workspace = Path(str(info.workspace_dir or ""))
-        if workspace.exists() and not (workspace / ".git").exists():
+        if (
+            not self._conversation_mode_from_worker(worker)
+            and workspace.exists()
+            and not (workspace / ".git").exists()
+        ):
             self._ensure_git_workspace(str(workspace))
         return info
+
+    def _codex_reasoning_effort_for_worker(self, worker: dict) -> str:
+        if not self._conversation_mode_from_worker(worker):
+            return super()._codex_reasoning_effort_for_worker(worker)
+        requested = (
+            self._bootstrap_env_value(worker, "WPR_CODEX_CLI_REASONING_EFFORT")
+            or os.environ.get("WPR_CODEX_CLI_REASONING_EFFORT", "")
+            or os.environ.get("WPR_CODEX_CLI_DEFAULT_REASONING_EFFORT", "")
+        ).strip().lower()
+        allowed = {"low", "medium", "high", "xhigh", "max", "ultra"}
+        if requested and requested not in allowed:
+            raise RuntimeErrorBase(
+                f"Unsupported native Codex conversation effort: {requested}"
+            )
+        if requested:
+            worker["_effort_projection"] = {
+                "requested": requested,
+                "effective": requested,
+                "allowed": sorted(allowed),
+                "route_proven": True,
+                "fallback_reason": "",
+            }
+        return requested
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         existing_session = self._read_session_key(worker["worker_id"])
         model = self._codex_model_for_worker(worker, "WPR_MODEL_HOST_CODEX_CLI")
         is_resume = bool(existing_session and not existing_session.startswith("codex-worker:"))
         dangerous_mode = os.environ.get("WPR_CODEX_DANGEROUS", "1").strip().lower() in {"1", "true", "yes", "on"}
+        if self._conversation_mode_from_worker(worker):
+            bundle = self._bootstrap_bundle_for_worker(worker)
+            dangerous_mode = str(bundle.get("access_mode") or "full").strip().lower() == "full"
+        conversation_mode = self._conversation_mode_from_worker(worker)
         if is_resume:
             command = [self.binary, "exec", "resume"]
+            if conversation_mode:
+                command.extend(["--json", "--skip-git-repo-check"])
         else:
             command = [self.binary, "exec", "--json", "--skip-git-repo-check", "-C", str(info.workspace_dir or ".")]
         if model:
@@ -4551,14 +4926,23 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
                 command.append("--dangerously-bypass-approvals-and-sandbox")
             else:
                 command.extend(["-s", "danger-full-access", "--dangerously-bypass-approvals-and-sandbox"])
-        elif not is_resume:
+        elif is_resume:
+            command.extend(
+                [
+                    "-c",
+                    'sandbox_mode="workspace-write"',
+                    "-c",
+                    'approval_policy="never"',
+                ]
+            )
+        else:
             command.append("--full-auto")
         if is_resume:
             command.append(existing_session)
         command.append("-")
         env = self._host_env(worker)
         codex_home = self._host_codex_home(worker)
-        if (codex_home / "config.toml").exists():
+        if conversation_mode or (codex_home / "config.toml").exists():
             env["CODEX_HOME"] = str(codex_home)
         return command, env
 
@@ -4600,7 +4984,7 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
 
     def _raise_missing_effort_support(self, profile: str, execution_mode: str) -> None:
         raise RuntimeDependencyMissingError(
-            "Claude Code workers requested `max` effort, but the configured Claude Code CLI "
+            "Claude Code workers requested an explicit effort level, but the configured Claude Code CLI "
             "does not expose the native --effort flag.",
             binary=self.binary,
             runtime_name=self.runtime_name,
@@ -4632,38 +5016,106 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
                 ),
             )
 
+    def _inject_private_subscription_auth(self, env: dict[str, str]) -> None:
+        """Give an isolated Claude config the host subscription without copying user config."""
+        access_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+        refresh_token = os.environ.get("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "").strip()
+        if not access_token and sys.platform == "darwin" and shutil.which("security"):
+            try:
+                completed = subprocess.run(
+                    [
+                        "security",
+                        "find-generic-password",
+                        "-s",
+                        "Claude Code-credentials",
+                        "-w",
+                    ],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=5,
+                )
+                credential = json.loads(completed.stdout) if completed.returncode == 0 else {}
+                oauth = credential.get("claudeAiOauth") if isinstance(credential, dict) else {}
+                if isinstance(oauth, dict):
+                    access_token = str(oauth.get("accessToken") or "").strip()
+                    refresh_token = str(oauth.get("refreshToken") or "").strip()
+            except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+                return
+        if access_token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = access_token
+        if refresh_token:
+            env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] = refresh_token
+
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_key = self._read_session_key(worker["worker_id"])
         model = worker.get("model") or self.resolve_model(worker.get("profile", "claude-code"))
         permission_mode = os.environ.get("WPR_CLAUDE_CODE_PERMISSION_MODE", "bypassPermissions")
+        if self._conversation_mode_from_worker(worker):
+            bundle = self._bootstrap_bundle_for_worker(worker)
+            permission_mode = (
+                "bypassPermissions"
+                if str(bundle.get("access_mode") or "full").strip().lower() == "full"
+                else "acceptEdits"
+            )
+        output_format = "stream-json" if self._conversation_mode_from_worker(worker) else "json"
         command = [
             self.binary,
             "-p",
             "--permission-mode",
             permission_mode,
             "--output-format",
-            "json",
+            output_format,
             "--model",
             model,
         ]
+        if self._conversation_mode_from_worker(worker):
+            command.append("--verbose")
+            mcp_path = self._state_dir(str(worker["worker_id"])) / "conversation-mcp.json"
+            if mcp_path.is_file():
+                command.extend(["--mcp-config", str(mcp_path), "--strict-mcp-config"])
+            bundle = self._bootstrap_bundle_for_worker(worker)
+            if str(bundle.get("access_mode") or "full").strip().lower() == "workspace":
+                workspace = str(Path(str(info.workspace_dir or ".")).resolve())
+                command.extend(
+                    [
+                        "--settings",
+                        json.dumps(
+                            {
+                                "permissions": {"defaultMode": "acceptEdits"},
+                                "sandbox": {
+                                    "enabled": True,
+                                    "failIfUnavailable": True,
+                                    "allowUnsandboxedCommands": False,
+                                    "filesystem": {
+                                        "denyRead": [str(Path.home().resolve())],
+                                        "allowRead": [workspace],
+                                    },
+                                },
+                            },
+                            separators=(",", ":"),
+                        ),
+                    ]
+                )
         if self._chrome_enabled():
             command.insert(2, "--chrome")
         effort = (
             self._bootstrap_env_value(worker, "WPR_CLAUDE_CODE_EFFORT")
             or os.environ.get("WPR_CLAUDE_CODE_EFFORT", "")
         ).strip().lower()
-        if effort == "max":
+        if effort and effort != "default":
             if not self._effort_supported():
                 self._raise_missing_effort_support(str(worker.get("profile") or "claude-code"), "host")
             command.extend(["--effort", effort])
-        elif effort and effort != "default":
-            logger.warning(
-                "Ignoring unsupported Claude Code effort",
-                extra={"worker_id": str(worker.get("worker_id") or ""), "effort": effort},
-            )
         if session_key and not session_key.startswith("claude-worker:"):
             command.extend(["--resume", session_key])
         env = self._host_env(worker)
+        if self._conversation_mode_from_worker(worker):
+            env["CLAUDE_CONFIG_DIR"] = str(
+                self._home_dir(str(worker["worker_id"])) / ".claude"
+            )
+            self._inject_private_subscription_auth(env)
         use_api_key = os.environ.get("WPR_CLAUDE_CODE_USE_API_KEY", "0").strip().lower() in {"1", "true", "yes", "on"}
         if not use_api_key:
             env.pop("ANTHROPIC_API_KEY", None)

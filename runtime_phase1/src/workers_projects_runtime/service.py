@@ -303,6 +303,20 @@ class WorkersProjectsService:
         self.store = store
         self.runtime = runtime
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="wpr-runner")
+        # Interactive provider turns have a separate dispatch lane so autonomous mission workers
+        # cannot occupy every service thread before a conversation reaches the host CLI's own
+        # profile-isolated capacity lane.
+        conversation_workers = max(
+            1,
+            min(
+                max_workers,
+                int(os.environ.get("GLASSHIVE_CONVERSATION_EXECUTOR_WORKERS", "2") or "2"),
+            ),
+        )
+        self.conversation_executor = ThreadPoolExecutor(
+            max_workers=conversation_workers,
+            thread_name_prefix="wpr-conversation",
+        )
         self._shutdown_event = Event()
         self._processors_lock = Lock()
         self._active_processors: set[str] = set()
@@ -342,6 +356,7 @@ class WorkersProjectsService:
             if thread and thread.is_alive():
                 thread.join(timeout=2)
         self.executor.shutdown(wait=True, cancel_futures=False)
+        self.conversation_executor.shutdown(wait=True, cancel_futures=False)
 
     def _callback_config_for(self, worker: dict) -> dict:
         bundle = self._bootstrap_bundle_for(worker) or {}
@@ -624,10 +639,11 @@ class WorkersProjectsService:
         worker_id = str(worker.get("worker_id") or "").strip()
         if not profile or not worker_id:
             return worker
+        bootstrap_bundle = self._bootstrap_bundle_for(worker) or {}
+        provider_model = str(bootstrap_bundle.get("provider_model") or "").strip()
         try:
-            resolved_model = self._resolve_worker_model(
-                profile,
-                str(worker.get("execution_mode") or "docker"),
+            resolved_model = provider_model or self._resolve_worker_model(
+                profile, str(worker.get("execution_mode") or "docker")
             ).strip()
         except Exception as exc:
             logger.warning("Could not resolve model for worker %s profile %s: %s", worker_id, profile, exc)
@@ -1821,11 +1837,16 @@ class WorkersProjectsService:
         self._emit_callback(worker, "worker.paused", run=active_run, message="Worker paused")
         return updated or worker
 
-    def interrupt_worker(self, worker_id: str) -> dict:
+    def interrupt_worker(self, worker_id: str, run_id: str | None = None) -> dict:
         worker = self.require_worker(worker_id)
         active_run = self.store.get_active_run(worker_id)
+        if run_id and (not active_run or str(active_run.get("run_id") or "") != str(run_id)):
+            return worker
         try:
-            info = self.runtime.interrupt_worker(worker, run_id=active_run["run_id"] if active_run else None)
+            info = self.runtime.interrupt_worker(
+                worker,
+                run_id=str(active_run["run_id"]) if active_run else None,
+            )
         except TypeError as exc:
             if "run_id" not in str(exc):
                 raise
@@ -2283,7 +2304,14 @@ class WorkersProjectsService:
             generation = self._processor_generations.get(worker_id, 0) + 1
             self._processor_generations[worker_id] = generation
             self._active_processors.add(worker_id)
-        self.executor.submit(self._process_worker_queue, worker_id, generation)
+        worker = self.store.get_worker(worker_id) or {}
+        bundle = self._bootstrap_bundle_for(worker) or {}
+        executor = (
+            self.conversation_executor
+            if str(bundle.get("run_mode") or "mission").strip().lower() == "conversation"
+            else self.executor
+        )
+        executor.submit(self._process_worker_queue, worker_id, generation)
 
     def _processor_is_current(self, worker_id: str, generation: int) -> bool:
         with self._processors_lock:

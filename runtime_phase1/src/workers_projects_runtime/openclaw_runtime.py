@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import secrets
 import shlex
 import signal
@@ -143,6 +144,15 @@ class StubRuntime:
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         worker_id = worker["worker_id"]
+        workspace_dir = f"/tmp/{worker_id}/workspace"
+        raw_bundle = worker.get("bootstrap_bundle_json")
+        if isinstance(raw_bundle, str) and raw_bundle.strip():
+            try:
+                bundle = json.loads(raw_bundle)
+            except json.JSONDecodeError:
+                bundle = {}
+            if isinstance(bundle, dict) and bundle.get("run_mode") == "conversation":
+                workspace_dir = str(Path(str(worker.get("workspace_root") or workspace_dir)).expanduser().resolve())
         return RuntimeInfo(
             runtime="openclaw-stub",
             model=worker.get("model") or self.resolve_model(worker.get("profile", "openclaw-general")),
@@ -151,7 +161,7 @@ class StubRuntime:
             gateway_token=None,
             session_key=worker.get("session_key") or f"agent:main:wpr:worker:{worker_id}",
             state_dir=f"/tmp/{worker_id}/state",
-            workspace_dir=f"/tmp/{worker_id}/workspace",
+            workspace_dir=workspace_dir,
             pid=99999,
         )
 
