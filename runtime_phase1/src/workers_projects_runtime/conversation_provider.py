@@ -1993,8 +1993,7 @@ def _redact_json_value(value: Any) -> Any:
 def _is_provider_path(path: str) -> bool:
     return (
         path in {"/v1/models", "/v1/chat/completions", "/v1/responses"}
-        or path.startswith("/v1/responses/")
-        or path.startswith("/v1/requests/")
+        or path.startswith(("/v1/responses/", "/v1/requests/"))
     )
 
 

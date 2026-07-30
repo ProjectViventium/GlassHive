@@ -370,8 +370,7 @@ def create_app(
         bearer = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
         provider_path = (
             request.url.path in {"/v1/models", "/v1/chat/completions", "/v1/responses"}
-            or request.url.path.startswith("/v1/responses/")
-            or request.url.path.startswith("/v1/requests/")
+            or request.url.path.startswith(("/v1/responses/", "/v1/requests/"))
         )
         if provider_path and _token_matches(bearer, provider_token):
             return await call_next(request)
