@@ -1,25 +1,29 @@
 from __future__ import annotations
 
+import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import json
 import os
+import re
 import shutil
 import subprocess
-import time
-import base64
-import binascii
-import asyncio
-import re
 import threading
+import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, Literal
 
 from fastapi import HTTPException, Request
-from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -27,7 +31,6 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .profile_runtime import _redact_text
 from .service import WorkersProjectsService
 from .store import Store
-
 
 TERMINAL_RUN_STATES = {"completed", "failed", "cancelled", "interrupted"}
 TERMINAL_REQUEST_STATES = {"completed", "failed", "cancelled"}
@@ -43,6 +46,8 @@ ACTIVITY_SUMMARIES = {
     "failed": "The harness could not complete the turn.",
     "cancelled": "The harness turn was cancelled.",
 }
+MODEL_CREATED_AT = int(time.time())
+DEFAULT_BOOTSTRAP_SIGNATURE_MAX_AGE_SECONDS = 5 * 60
 
 
 @dataclass(frozen=True)
@@ -59,6 +64,7 @@ class HarnessModel:
         return {
             "id": self.id,
             "object": "model",
+            "created": MODEL_CREATED_AT,
             "owned_by": "glasshive",
             "display_name": self.display_name,
             "harness_profile": self.harness_profile,
@@ -78,6 +84,9 @@ class HarnessModel:
                 "conversation_session": True,
                 "native_tools": True,
                 "activity_stream": True,
+                # Claude's stream-json transport currently exposes text deltas. Codex exec
+                # --json exposes safe activity while working and the assistant text at completion.
+                "incremental_text": self.harness_profile == "claude-code",
             },
         }
 
@@ -231,6 +240,19 @@ class ChatCompletionRequest(BaseModel):
     user: str | None = None
     metadata: CompletionMetadata | None = None
     reasoning_effort: str | None = None
+    # Standard Chat Completions tuning fields that harness-native models cannot honor are accepted
+    # and intentionally ignored for wire portability. Shape-changing orchestration fields such as
+    # tools/tool_choice/response_format remain forbidden and fail visibly.
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    top_p: float | None = Field(default=None, ge=0, le=1)
+    max_tokens: int | None = Field(default=None, gt=0)
+    max_completion_tokens: int | None = Field(default=None, gt=0)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
+    seed: int | None = None
+    stop: str | list[str] | None = None
+    store: bool | None = None
+    service_tier: str | None = None
 
     @model_validator(mode="after")
     def validate_stream_options(self):
@@ -242,7 +264,7 @@ class ChatCompletionRequest(BaseModel):
 class StreamingRedactor:
     """Redact bounded stream segments while retaining sensitive split-token prefixes."""
 
-    def __init__(self, overlap: int = 1024, max_buffer: int = 64 * 1024) -> None:
+    def __init__(self, overlap: int = 64, max_buffer: int = 64 * 1024) -> None:
         self.overlap = max(1, int(overlap))
         self.max_buffer = max(self.overlap, int(max_buffer))
         self._buffer = ""
@@ -374,6 +396,40 @@ def _decode_bootstrap_bundle(request: Request) -> dict[str, Any]:
     encoded = _header(request, "x-glasshive-bootstrap-bundle-b64")
     if not encoded:
         return {}
+    signature_secret = str(
+        os.environ.get("VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET") or ""
+    ).strip()
+    if not signature_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="GlassHive bootstrap signature verification is not configured",
+        )
+    issued_at = _header(request, "x-glasshive-bootstrap-timestamp")
+    signature = _header(request, "x-glasshive-bootstrap-signature")
+    try:
+        issued_at_seconds = int(issued_at)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=403, detail="Invalid GlassHive bootstrap signature") from exc
+    try:
+        max_age_seconds = int(
+            str(
+                os.environ.get("GLASSHIVE_PROVIDER_BOOTSTRAP_SIGNATURE_MAX_AGE_SECONDS")
+                or DEFAULT_BOOTSTRAP_SIGNATURE_MAX_AGE_SECONDS
+            ).strip()
+        )
+    except ValueError:
+        max_age_seconds = DEFAULT_BOOTSTRAP_SIGNATURE_MAX_AGE_SECONDS
+    max_age_seconds = max(30, min(max_age_seconds, 3600))
+    if abs(int(time.time()) - issued_at_seconds) > max_age_seconds:
+        raise HTTPException(status_code=403, detail="Expired GlassHive bootstrap signature")
+    expected = hmac.new(
+        signature_secret.encode("utf-8"),
+        f"v1\n{issued_at}\n{encoded}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    supplied = signature.removeprefix("sha256=")
+    if not supplied or not hmac.compare_digest(expected, supplied):
+        raise HTTPException(status_code=403, detail="Invalid GlassHive bootstrap signature")
     try:
         decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
         payload = json.loads(decoded)
@@ -626,7 +682,7 @@ def _normalized_harness_activity(profile: str, stdout: str) -> list[dict[str, An
             absolute_offset = _native_log_excluded_prefix_bytes(raw_line)
             continue
         source_line_id = hashlib.sha256(
-            f"{absolute_offset}:".encode("utf-8") + raw_line.encode("utf-8")
+            f"{absolute_offset}:".encode() + raw_line.encode("utf-8")
         ).hexdigest()[:20]
         absolute_offset += len(raw_segment.encode("utf-8"))
 
@@ -736,6 +792,7 @@ class ConversationProvider:
         # idempotency uniqueness check runs.
         self._start_lock = threading.RLock()
         self._prestart_cancellations: dict[tuple[str, str, str], float] = {}
+        self._last_retention_monotonic = 0.0
         self._apply_retention_policy()
 
     def _prune_prestart_cancellations(self) -> None:
@@ -761,7 +818,7 @@ class ConversationProvider:
         except ValueError:
             request_days, session_days = 30, 90
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         request_cutoff = (now - timedelta(days=request_days)).isoformat()
         session_cutoff = (now - timedelta(days=session_days)).isoformat()
         try:
@@ -777,7 +834,20 @@ class ConversationProvider:
             self.store.delete_provider_sessions(removable)
         except (OSError, RuntimeError, ValueError):
             # Retention is housekeeping and must not make the authenticated provider unavailable.
-            return
+            pass
+        finally:
+            self._last_retention_monotonic = time.monotonic()
+
+    def _maybe_apply_retention_policy(self) -> None:
+        try:
+            interval = max(
+                60,
+                int(os.environ.get("GLASSHIVE_PROVIDER_RETENTION_INTERVAL_SECONDS", "3600") or "3600"),
+            )
+        except ValueError:
+            interval = 3600
+        if time.monotonic() - self._last_retention_monotonic >= interval:
+            self._apply_retention_policy()
 
     def models_payload(self) -> dict[str, Any]:
         return {"object": "list", "data": [model.api_payload() for model in GLASSHIVE_MODELS.values()]}
@@ -963,6 +1033,7 @@ class ConversationProvider:
 
     def start(self, payload: ChatCompletionRequest, *, tenant_id: str = "local") -> dict[str, Any]:
         with self._start_lock:
+            self._maybe_apply_retention_policy()
             model = self._model(payload.model)
             effort = self._effort(payload, model)
             idempotency_key = _idempotency_key(payload)

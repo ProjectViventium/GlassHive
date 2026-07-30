@@ -43,6 +43,30 @@ Current behavior:
   launches must not drop browser, computer/desktop, shell, file, or MCP capabilities just because
   GlassHive projected a broker MCP
 
+## Universal AI Endpoint
+
+GlassHive exposes an authenticated OpenAI-compatible conversation surface that is independently
+callable by LibreChat or any ordinary Chat Completions client:
+
+- `GET /v1/models` publishes exact model IDs, readiness, effort/context metadata, native
+  capabilities, and whether the harness exposes incremental assistant text
+- `POST /v1/chat/completions` accepts standard bearer authentication plus `model`, `messages`, and
+  optional streaming; common tuning fields are tolerated for portability while unsupported
+  client-orchestrated tools and response shapes fail visibly
+- `/v1/requests/{request_id}/activity` and `/cancel` add resumable activity and explicit lifecycle
+  control without making those extensions prerequisites for a standard client
+- provider, MCP, capability-broker, and runtime administrator credentials are separate
+
+Viventium may attach owner/session/workspace metadata and a brokered capability bundle. Any bundle
+that can project environment or harness configuration must carry a fresh HMAC signature generated
+with `VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET`; a provider bearer alone cannot authorize it.
+The default generic endpoint identity is workspace-only. A trusted local deployment can explicitly
+grant full access, which disables harness sandbox and approval gates.
+
+Conversation streams never expose hidden chain-of-thought. Claude stream-json currently provides
+assistant-text deltas. Codex exec JSON currently provides safe activity while running and the
+assistant message on completion; this is declared as `incremental_text: false` in model metadata.
+
 ## Run
 
 ```bash
@@ -83,6 +107,6 @@ uv run pytest -q
 
 ## Current Boundary
 
-This phase proves the product/runtime shape well.
-
-It does not yet prove a production connected-account broker from LibreChat into Glass Hive. The right design for that is a brokered provider projector, not direct dependence on LibreChat storage internals.
+This runtime owns the universal harness/provider boundary. It does not depend on LibreChat storage
+internals. Connected capabilities are projected by an authenticated broker bundle; GlassHive
+remains the native execution owner and LibreChat remains one optional conversation/UI consumer.

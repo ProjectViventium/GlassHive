@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import subprocess
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from workers_projects_runtime.api import create_app
 from workers_projects_runtime.conversation_provider import (
-    ConversationProvider,
     GLASSHIVE_MODELS,
+    ConversationProvider,
     StreamingRedactor,
     _harness_auth_configured,
     _native_usage,
@@ -23,11 +25,27 @@ from workers_projects_runtime.openclaw_runtime import StubRuntime
 from workers_projects_runtime.service import WorkersProjectsService
 from workers_projects_runtime.store import Store
 
-
 AUTH = {
     "Authorization": "Bearer provider-test-token",
     "X-Viventium-User-Id": "owner-a",
 }
+
+BOOTSTRAP_SIGNATURE_SECRET = "synthetic-bootstrap-signature-secret"
+
+
+def _signed_bundle_headers(bundle: dict, *, timestamp: int | None = None) -> dict[str, str]:
+    encoded = base64.b64encode(json.dumps(bundle, separators=(",", ":")).encode()).decode()
+    issued_at = str(timestamp if timestamp is not None else int(time.time()))
+    signature = hmac.new(
+        BOOTSTRAP_SIGNATURE_SECRET.encode(),
+        f"v1\n{issued_at}\n{encoded}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return {
+        "X-GlassHive-Bootstrap-Bundle-B64": encoded,
+        "X-GlassHive-Bootstrap-Timestamp": issued_at,
+        "X-GlassHive-Bootstrap-Signature": f"sha256={signature}",
+    }
 
 
 def _payload(workspace: Path, *, model: str = "codex-cli:gpt-5.6-sol", stream: bool = False) -> dict:
@@ -64,6 +82,10 @@ def _client(tmp_path: Path, monkeypatch, runtime=None) -> TestClient:
     monkeypatch.setenv("GLASSHIVE_PROVIDER_ALLOW_FULL_ACCESS", "1")
     monkeypatch.setenv("GLASSHIVE_PROVIDER_DEFAULT_ACCESS", "full")
     monkeypatch.setenv("GLASSHIVE_PROVIDER_DEFAULT_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv(
+        "VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET",
+        BOOTSTRAP_SIGNATURE_SECRET,
+    )
     monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "1")
     monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,claude-code")
     monkeypatch.setenv("GLASSHIVE_PROVIDER_ALLOWED_WORKSPACE_ROOTS", str(tmp_path))
@@ -98,6 +120,10 @@ def _scoped_client(
     )
     monkeypatch.setenv("GLASSHIVE_PROVIDER_DEFAULT_WORKSPACE", str(tmp_path))
     monkeypatch.setenv("GLASSHIVE_PROVIDER_ALLOWED_WORKSPACE_ROOTS", str(tmp_path))
+    monkeypatch.setenv(
+        "VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET",
+        BOOTSTRAP_SIGNATURE_SECRET,
+    )
     monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "1")
     monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,claude-code")
     return TestClient(
@@ -246,7 +272,10 @@ def test_models_expose_exact_harness_registry(tmp_path, monkeypatch):
     ]
     assert all(model["capabilities"]["activity_stream"] for model in models.values())
     assert all(model["capabilities"]["conversation_session"] for model in models.values())
+    assert models["codex-cli:gpt-5.6-sol"]["capabilities"]["incremental_text"] is False
+    assert models["claude-code:opus"]["capabilities"]["incremental_text"] is True
     assert all(model["readiness"]["status"] for model in models.values())
+    assert all(isinstance(model["created"], int) and model["created"] > 0 for model in models.values())
 
 
 def test_provider_credential_is_scoped_and_standard_request_needs_no_viventium_headers(
@@ -375,18 +404,33 @@ def test_trusted_service_credential_can_delegate_owner_and_full_access(tmp_path,
     assert sessions[0]["access_mode"] == "full"
 
 
-def test_unsupported_parameters_and_validation_errors_use_openai_error_envelope(
+def test_standard_ignored_parameters_and_unsupported_shapes_use_openai_error_envelope(
     tmp_path, monkeypatch
 ):
     client = _scoped_client(tmp_path, monkeypatch)
 
-    unsupported = client.post(
+    tolerated = client.post(
         "/v1/chat/completions",
         headers={"Authorization": "Bearer provider-test-token"},
         json={
             "model": "codex-cli:gpt-5.6-sol",
             "messages": [{"role": "user", "content": "Hello."}],
             "temperature": 0.2,
+            "top_p": 0.9,
+            "max_tokens": 100,
+            "presence_penalty": 0,
+            "frequency_penalty": 0,
+            "seed": 7,
+            "store": False,
+        },
+    )
+    unsupported = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer provider-test-token"},
+        json={
+            "model": "codex-cli:gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "Hello."}],
+            "tools": [{"type": "function", "function": {"name": "unsafe_shape"}}],
         },
     )
     invalid = client.post(
@@ -395,6 +439,7 @@ def test_unsupported_parameters_and_validation_errors_use_openai_error_envelope(
         json={"model": "codex-cli:gpt-5.6-sol", "messages": []},
     )
 
+    assert tolerated.status_code == 200, tolerated.text
     assert unsupported.status_code == 400
     assert unsupported.json()["error"]["type"] == "invalid_request_error"
     assert unsupported.json()["error"]["code"] == "unsupported_parameter"
@@ -632,9 +677,7 @@ def test_authenticated_broker_bundle_is_forwarded_and_conversation_policy_is_for
     }
     headers = {
         **AUTH,
-        "X-GlassHive-Bootstrap-Bundle-B64": base64.b64encode(
-            json.dumps(broker_bundle).encode()
-        ).decode(),
+        **_signed_bundle_headers(broker_bundle),
     }
 
     response = client.post("/v1/chat/completions", headers=headers, json=payload)
@@ -650,6 +693,59 @@ def test_authenticated_broker_bundle_is_forwarded_and_conversation_policy_is_for
         "self_delegation": False,
         "native_tools": True,
     }
+
+
+def test_bootstrap_bundle_requires_a_fresh_valid_service_signature(tmp_path, monkeypatch):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    payload = _payload(workspace)
+    bundle = {"env": {"SYNTHETIC_BROKER_TOKEN": "test-only"}}
+    encoded = base64.b64encode(json.dumps(bundle).encode()).decode()
+
+    unsigned = client.post(
+        "/v1/chat/completions",
+        headers={**AUTH, "X-GlassHive-Bootstrap-Bundle-B64": encoded},
+        json=payload,
+    )
+    invalid = client.post(
+        "/v1/chat/completions",
+        headers={
+            **AUTH,
+            **_signed_bundle_headers(bundle),
+            "X-GlassHive-Bootstrap-Signature": "sha256=invalid",
+        },
+        json=payload,
+    )
+    stale = client.post(
+        "/v1/chat/completions",
+        headers={**AUTH, **_signed_bundle_headers(bundle, timestamp=int(time.time()) - 601)},
+        json=payload,
+    )
+
+    assert unsigned.status_code == 403
+    assert invalid.status_code == 403
+    assert stale.status_code == 403
+    assert unsigned.json()["error"]["code"] == "permission_denied"
+
+
+def test_bootstrap_bundle_fails_closed_when_signature_verification_is_unconfigured(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    headers = {**AUTH, **_signed_bundle_headers({"env": {"SYNTHETIC": "value"}})}
+    monkeypatch.delenv("VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET")
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=headers,
+        json=_payload(workspace),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "service_unavailable"
 
 
 def test_streaming_completion_and_activity_recovery(tmp_path, monkeypatch):
@@ -985,6 +1081,17 @@ def test_streaming_redactor_emits_safe_text_before_newline_or_terminal_flush():
     assert first + final == "A safe response can arrive word by word without waiting for a newline"
 
 
+def test_streaming_redactor_default_emits_an_ordinary_short_answer_incrementally():
+    redactor = StreamingRedactor()
+
+    first = redactor.feed(
+        "This is an ordinary safe conversational answer that should appear before completion. "
+        "It is intentionally far shorter than one kilobyte."
+    )
+
+    assert first
+
+
 def test_streaming_redactor_redacts_newline_split_home_path_and_bounds_long_lines():
     redactor = StreamingRedactor(overlap=16, max_buffer=64)
 
@@ -1131,7 +1238,7 @@ def test_provider_startup_prunes_only_old_terminal_requests_and_idle_sessions(tm
         )
         store.update_provider_request(request["request_id"], state="completed")
         store.add_provider_activity(request["request_id"], "completed", "Completed")
-        old = (datetime.now(timezone.utc) - timedelta(days=120)).isoformat()
+        old = (datetime.now(UTC) - timedelta(days=120)).isoformat()
         with store._connect() as conn:
             conn.execute(
                 "UPDATE provider_requests SET created_at = ?, updated_at = ? WHERE request_id = ?",
@@ -1147,6 +1254,30 @@ def test_provider_startup_prunes_only_old_terminal_requests_and_idle_sessions(tm
         assert store.get_provider_request(request["request_id"]) is None
         assert store.list_provider_sessions(owner_id="owner-a") == []
         assert store.get_worker(worker["worker_id"])["state"] == "terminated"
+    finally:
+        service.shutdown()
+
+
+def test_provider_reapplies_retention_during_a_long_lived_process(tmp_path, monkeypatch):
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = InterruptCountingRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        provider = ConversationProvider(store, service)
+        calls = 0
+        original = provider._apply_retention_policy
+
+        def counted_retention():
+            nonlocal calls
+            calls += 1
+            original()
+
+        provider._apply_retention_policy = counted_retention
+        provider._last_retention_monotonic = time.monotonic() - 7200
+        provider._maybe_apply_retention_policy()
+
+        assert calls == 1
+        assert time.monotonic() - provider._last_retention_monotonic < 2
     finally:
         service.shutdown()
 
