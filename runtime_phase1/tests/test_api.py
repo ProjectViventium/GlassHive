@@ -723,6 +723,128 @@ def test_retryable_host_busy_waits_and_retries_without_terminal_failure(tmp_path
         service.shutdown()
 
 
+def test_future_capacity_retry_does_not_hot_resubmit_processor(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), max_workers=2)
+    try:
+        project = store.create_project("owner", "Future Retry", "Wait without spinning.", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Future Retry Worker",
+            role="worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+        )
+        run = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "wait for the retry timestamp",
+            state="queued",
+        )
+        retry_after = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        store.update_run(run["run_id"], retry_after=retry_after)
+
+        generation = 1
+        service._active_processors.add(worker["worker_id"])
+        service._processor_generations[worker["worker_id"]] = generation
+        scheduled: list[tuple[str, str | None]] = []
+        immediate_restarts: list[str] = []
+        service._schedule_worker_retry_after = (  # type: ignore[method-assign]
+            lambda worker_id, value: scheduled.append((worker_id, value))
+        )
+        service._ensure_worker_processor = (  # type: ignore[method-assign]
+            lambda worker_id: immediate_restarts.append(worker_id)
+        )
+
+        service._process_worker_queue(worker["worker_id"], generation)
+
+        assert scheduled == [(worker["worker_id"], retry_after)]
+        assert immediate_restarts == []
+        assert store.get_run(run["run_id"])["state"] == "queued"
+    finally:
+        service.shutdown()
+
+
+def test_service_startup_resumes_eligible_queued_run(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project("owner", "Startup Queue", "Resume queued work.", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Startup Queue Worker",
+        role="worker",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="stub/codex-cli",
+    )
+    run = store.create_run(
+        worker["worker_id"],
+        project["project_id"],
+        "resume after service restart",
+        state="queued",
+    )
+
+    service = WorkersProjectsService(store, StubRuntime(), max_workers=2)
+    try:
+        wait_until(
+            lambda: (store.get_run(run["run_id"]) or {}).get("state") == "completed",
+            timeout=1.0,
+        )
+    finally:
+        service.shutdown()
+
+
+def test_service_startup_resumes_queued_host_worker_without_persistent_process(tmp_path):
+    class ProcessPerRunHostRuntime(StubRuntime):
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            return RuntimeInfo(
+                runtime="codex-cli",
+                model="stub/codex-cli",
+                gateway_url="",
+                gateway_port=None,
+                gateway_token=None,
+                session_key=worker.get("session_key"),
+                state_dir=str(tmp_path / "state"),
+                workspace_dir=str(tmp_path / "workspace"),
+                pid=None,
+            )
+
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project("owner", "Host Startup Queue", "Resume host work.", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Host Startup Queue Worker",
+        role="worker",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="stub/codex-cli",
+        execution_mode="host",
+    )
+    store.update_worker_state(worker["worker_id"], "ready")
+    run = store.create_run(
+        worker["worker_id"],
+        project["project_id"],
+        "resume process-per-run host work",
+        state="queued",
+    )
+
+    service = WorkersProjectsService(store, ProcessPerRunHostRuntime(), max_workers=2)
+    try:
+        wait_until(
+            lambda: (store.get_run(run["run_id"]) or {}).get("state") == "completed",
+            timeout=1.0,
+        )
+        assert (store.get_worker(worker["worker_id"]) or {})["state"] == "ready"
+    finally:
+        service.shutdown()
+
+
 def test_retryable_capacity_wait_has_max_attempts(tmp_path, monkeypatch):
     class AlwaysBusyRuntime(StubRuntime):
         def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:

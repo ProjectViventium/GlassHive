@@ -1943,7 +1943,8 @@ class WorkersProjectsService:
         info = self.runtime.reconcile_worker(worker)
         state = worker["state"]
         if state in {"running", "ready", "starting"}:
-            state = "ready" if info.pid else "paused"
+            process_per_run_host = str(worker.get("execution_mode") or "") == "host"
+            state = "ready" if info.pid or process_per_run_host else "paused"
         if not info.pid:
             if active_run:
                 orphaned_run = self.store.finalize_run_if_state(
@@ -1967,6 +1968,8 @@ class WorkersProjectsService:
                         message="Worker process was not running during reconcile",
                     )
         self._apply_runtime_info(worker["worker_id"], info, state=state, last_error=worker.get("last_error") or "")
+        if state not in {"paused", "terminated", "failed"} and self.store.has_queued_runs(worker["worker_id"]):
+            self._ensure_worker_processor(worker["worker_id"])
 
     def require_project(self, project_id: str) -> dict:
         project = self.store.get_project(project_id)
@@ -2515,6 +2518,5 @@ class WorkersProjectsService:
             if self._release_processor(worker_id, generation):
                 pending = self.store.get_worker(worker_id)
                 if pending and pending["state"] not in {"paused", "terminated"}:
-                    queued = next((item for item in self.store.list_runs_for_worker(worker_id, limit=10) if item["state"] == "queued"), None)
-                    if queued:
+                    if self.store.peek_next_queued_run(worker_id):
                         self._ensure_worker_processor(worker_id)
