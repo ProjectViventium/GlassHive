@@ -252,6 +252,7 @@ def test_models_expose_exact_harness_registry(tmp_path, monkeypatch):
 def test_provider_credential_is_scoped_and_standard_request_needs_no_viventium_headers(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setenv("GLASSHIVE_MCP_API_KEY", "mcp-test-token")
     client = _scoped_client(tmp_path, monkeypatch)
 
     models = client.get(
@@ -261,6 +262,10 @@ def test_provider_credential_is_scoped_and_standard_request_needs_no_viventium_h
     admin_on_provider = client.get(
         "/v1/models",
         headers={"Authorization": "Bearer runtime-admin-token"},
+    )
+    mcp_on_provider = client.get(
+        "/v1/models",
+        headers={"Authorization": "Bearer mcp-test-token"},
     )
     provider_on_runtime = client.get(
         "/v1/projects",
@@ -277,6 +282,8 @@ def test_provider_credential_is_scoped_and_standard_request_needs_no_viventium_h
 
     assert models.status_code == 200
     assert admin_on_provider.status_code == 401
+    assert mcp_on_provider.status_code == 401
+    assert mcp_on_provider.json()["error"]["code"] == "invalid_api_key"
     assert provider_on_runtime.status_code == 401
     assert completion.status_code == 200, completion.text
     sessions = client.app.state.store.list_provider_sessions(owner_id="owner-a")

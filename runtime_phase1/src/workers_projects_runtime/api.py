@@ -378,6 +378,18 @@ def create_app(
             return await call_next(request)
         token = _service_token_from_headers(request.headers)
         if not (_token_matches(token, api_token) or _token_matches(bearer, api_token)):
+            if provider_path:
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": {
+                            "message": "Unauthorized GlassHive provider request",
+                            "type": "authentication_error",
+                            "param": None,
+                            "code": "invalid_api_key",
+                        }
+                    },
+                )
             return Response(status_code=401, content="Unauthorized")
         try:
             request.state.auth_context = auth_settings.context_from_headers(
