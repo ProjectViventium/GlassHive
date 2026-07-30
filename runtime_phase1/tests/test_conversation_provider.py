@@ -293,6 +293,34 @@ def test_provider_credential_is_scoped_and_standard_request_needs_no_viventium_h
     assert sessions[0]["access_mode"] == "workspace"
 
 
+def test_standard_stream_options_and_user_are_openai_compatible(tmp_path, monkeypatch):
+    client = _scoped_client(tmp_path, monkeypatch)
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer provider-test-token"},
+        json={
+            "model": "codex-cli:gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "Portable stream."}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "user": "portable-client-user",
+        },
+    ) as response:
+        assert response.status_code == 200
+        lines = [line for line in response.iter_lines() if line]
+
+    chunks = [
+        json.loads(line.removeprefix("data: "))
+        for line in lines
+        if line != "data: [DONE]"
+    ]
+    assert chunks[-1]["usage"]["total_tokens"] > 0
+    assert chunks[-1]["choices"] == []
+    assert lines[-1] == "data: [DONE]"
+
+
 def test_identity_delegation_and_full_access_require_server_side_grants(tmp_path, monkeypatch):
     client = _scoped_client(tmp_path, monkeypatch)
     payload = _payload(tmp_path)

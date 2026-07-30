@@ -213,14 +213,30 @@ class ChatMessage(BaseModel):
     content: Any = ""
 
 
+class ChatStreamOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    include_usage: bool = False
+
+
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model: str
     messages: list[ChatMessage] = Field(min_length=1)
     stream: bool = False
+    stream_options: ChatStreamOptions | None = None
+    # OpenAI's optional end-user identifier is accepted for wire compatibility,
+    # but never treated as an authenticated GlassHive principal.
+    user: str | None = None
     metadata: CompletionMetadata | None = None
     reasoning_effort: str | None = None
+
+    @model_validator(mode="after")
+    def validate_stream_options(self):
+        if self.stream_options is not None and not self.stream:
+            raise ValueError("stream_options is only supported when stream is true")
+        return self
 
 
 class StreamingRedactor:
@@ -1389,10 +1405,19 @@ class ConversationProvider:
                     "created": created,
                     "model": payload.model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-                    "usage": usage,
-                    "glasshive": {"usage_source": usage_source},
                 }
                 yield f"data: {json.dumps(final_chunk, separators=(',', ':'))}\n\n"
+                if payload.stream_options and payload.stream_options.include_usage:
+                    usage_chunk = {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": payload.model,
+                        "choices": [],
+                        "usage": usage,
+                        "glasshive": {"usage_source": usage_source},
+                    }
+                    yield f"data: {json.dumps(usage_chunk, separators=(',', ':'))}\n\n"
                 yield "data: [DONE]\n\n"
                 return
             if time.monotonic() - last_heartbeat >= 15:
