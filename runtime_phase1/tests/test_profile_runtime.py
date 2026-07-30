@@ -264,6 +264,35 @@ def test_collect_completed_run_classifies_and_redacts_provider_rate_limit(tmp_pa
     assert "PUBLIC_FAKE_TOKEN_VALUE" not in recovered["error_text"]
 
 
+def test_cli_failure_classifies_codex_usage_quota_as_provider_rate_limit():
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": (
+                        "You've hit your usage limit. To get more access now, "
+                        "review your provider plan."
+                    ),
+                }
+            ),
+            json.dumps({"type": "turn.failed"}),
+        ]
+    )
+
+    failure = classify_cli_failure(
+        stdout=stdout,
+        stderr="",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_rate_limited"
+    assert failure.retryable is True
+    assert "quota or rate limit" in failure.user_message
+    assert "provider-reported reset" in failure.recommended_recovery
+
+
 def test_classify_cli_failure_maps_structured_provider_overload():
     failure = classify_cli_failure(
         stdout=json.dumps(

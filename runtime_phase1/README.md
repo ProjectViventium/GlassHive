@@ -53,6 +53,11 @@ callable by LibreChat or any ordinary Chat Completions client:
 - `POST /v1/chat/completions` accepts standard bearer authentication plus `model`, `messages`, and
   optional streaming; common tuning fields are tolerated for portability while unsupported
   client-orchestrated tools and response shapes fail visibly
+- `POST /v1/responses` exposes the same authenticated model/session core using the standard
+  Responses request, response, streaming-event, and `previous_response_id` shapes
+- provider usage-quota and rate-limit failures remain explicit across both APIs: non-streaming
+  requests return OpenAI-compatible HTTP `429` errors and streams emit `rate_limit_exceeded`
+  failure events; GlassHive never substitutes another model or silently retries an authoring turn
 - `/v1/requests/{request_id}/activity` and `/cancel` add resumable activity and explicit lifecycle
   control without making those extensions prerequisites for a standard client
 - provider, MCP, capability-broker, and runtime administrator credentials are separate

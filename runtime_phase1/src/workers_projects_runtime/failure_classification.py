@@ -61,11 +61,12 @@ def classify_cli_failure(
             failure_class="provider_rate_limited",
             retryable=True,
             user_message=(
-                "The worker made progress, but the model or research provider rate-limited the run before it finished."
+                "The selected model provider rejected the worker turn because its usage quota or "
+                "rate limit was reached."
             ),
             recommended_recovery=(
-                "Use workspace_continue to resume the same workspace after a short wait, preserving the "
-                "original task and any files already produced."
+                "Retry after the provider-reported reset, restore provider quota, or authenticate an "
+                "account with available quota; then use workspace_continue to resume the same workspace."
             ),
             diagnostic_summary=diagnostic_summary,
         )
@@ -492,6 +493,11 @@ def _looks_like_rate_limit_failure(lowered: str) -> bool:
         "too many requests" in lowered
         or "rate limit" in lowered
         or "rate_limit" in lowered
+        or "usage limit" in lowered
+        or "usage_limit" in lowered
+        or "quota exceeded" in lowered
+        or "quota_exceeded" in lowered
+        or "insufficient_quota" in lowered
         or _has_contextual_status_code(lowered, ("429",))
     )
 
@@ -548,6 +554,11 @@ def _looks_failure_related(value: str) -> bool:
         "too many requests",
         "rate limit",
         "rate_limit",
+        "usage limit",
+        "usage_limit",
+        "quota exceeded",
+        "quota_exceeded",
+        "insufficient_quota",
         "unauthorized",
         "forbidden",
         "invalid api key",

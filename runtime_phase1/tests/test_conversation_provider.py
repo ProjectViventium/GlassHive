@@ -25,7 +25,7 @@ from workers_projects_runtime.conversation_provider import (
     _normalized_harness_activity,
     _system_snapshot,
 )
-from workers_projects_runtime.openclaw_runtime import StubRuntime
+from workers_projects_runtime.openclaw_runtime import RuntimeErrorBase, StubRuntime
 from workers_projects_runtime.service import WorkersProjectsService
 from workers_projects_runtime.store import Store
 
@@ -321,6 +321,41 @@ class CompactedActivityRuntime(StubRuntime):
         )
 
 
+class ProviderRateLimitedRuntime(StubRuntime):
+    def run_task(
+        self,
+        worker: dict,
+        instruction: str,
+        timeout_sec: float | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        _ = worker, instruction, timeout_sec, run_id
+        raise RuntimeErrorBase("codex-cli exited after the model provider reached its usage limit")
+
+    def collect_completed_run(
+        self,
+        worker: dict,
+        run_id: str | None = None,
+        instruction: str | None = None,
+    ) -> dict[str, object]:
+        _ = worker, run_id, instruction
+        return {
+            "state": "failed",
+            "output_text": "",
+            "error_text": "The model provider reached its usage limit.",
+            "failure_class": "provider_rate_limited",
+            "failure_retryable": 1,
+            "failure_user_message": (
+                "The selected model provider rejected the worker turn because its "
+                "usage quota or rate limit was reached."
+            ),
+            "failure_recommended_recovery": (
+                "Retry after the provider-reported reset or restore provider quota."
+            ),
+            "failure_diagnostic_summary": "Provider usage limit reached.",
+        }
+
+
 def test_models_expose_exact_harness_registry(tmp_path, monkeypatch):
     client = _client(tmp_path, monkeypatch)
 
@@ -348,6 +383,82 @@ def test_models_expose_exact_harness_registry(tmp_path, monkeypatch):
     assert models["claude-code:opus"]["capabilities"]["incremental_text"] is False
     assert all(model["readiness"]["status"] for model in models.values())
     assert all(isinstance(model["created"], int) and model["created"] > 0 for model in models.values())
+
+
+def test_provider_rate_limit_uses_standard_openai_429_error(tmp_path, monkeypatch):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch, runtime=ProviderRateLimitedRuntime())
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=AUTH,
+        json=_payload(workspace),
+    )
+
+    assert response.status_code == 429
+    assert response.json() == {
+        "error": {
+            "message": (
+                "The selected model provider rejected the worker turn because its "
+                "usage quota or rate limit was reached."
+            ),
+            "type": "rate_limit_error",
+            "param": None,
+            "code": "rate_limit_exceeded",
+        }
+    }
+
+
+def test_provider_rate_limit_stream_uses_standard_error_type_and_code(tmp_path, monkeypatch):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch, runtime=ProviderRateLimitedRuntime())
+    payload = _payload(workspace, stream=True)
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers=AUTH,
+        json=payload,
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert '"type":"rate_limit_error"' in body
+    assert '"code":"rate_limit_exceeded"' in body
+    assert body.count('"error"') == 1
+
+
+def test_responses_api_preserves_rate_limit_status_and_stream_code(tmp_path, monkeypatch):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_DEFAULT_WORKSPACE", str(workspace))
+    client = _client(tmp_path, monkeypatch, runtime=ProviderRateLimitedRuntime())
+    request = {
+        "model": "codex-cli:gpt-5.6-sol",
+        "input": "Hello from the Responses API.",
+    }
+
+    response = client.post("/v1/responses", headers=AUTH, json=request)
+
+    assert response.status_code == 429
+    assert response.json()["error"]["type"] == "rate_limit_error"
+    assert response.json()["error"]["code"] == "rate_limit_exceeded"
+
+    stream_request = {**request, "stream": True}
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        headers={**AUTH, "X-GlassHive-Idempotency-Key": "responses-rate-stream"},
+        json=stream_request,
+    ) as stream:
+        body = "".join(stream.iter_text())
+
+    assert stream.status_code == 200
+    assert '"type":"error"' in body
+    assert '"code":"rate_limit_exceeded"' in body
+    assert '"type":"response.failed"' in body
 
 
 def test_provider_credential_is_scoped_and_standard_request_needs_no_viventium_headers(

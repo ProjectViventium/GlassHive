@@ -50,6 +50,20 @@ MODEL_CREATED_AT = int(time.time())
 DEFAULT_BOOTSTRAP_SIGNATURE_MAX_AGE_SECONDS = 5 * 60
 
 
+def _provider_failure_http_status(run: dict[str, Any]) -> int:
+    failure_class = str(run.get("failure_class") or "").strip()
+    if failure_class == "provider_rate_limited":
+        return 429
+    return 502
+
+
+def _provider_failure_error(run: dict[str, Any]) -> tuple[str, str]:
+    failure_class = str(run.get("failure_class") or "").strip()
+    if failure_class == "provider_rate_limited":
+        return "rate_limit_error", "rate_limit_exceeded"
+    return "glasshive_runtime_error", "server_error"
+
+
 @dataclass(frozen=True)
 class HarnessModel:
     id: str
@@ -1487,7 +1501,10 @@ class ConversationProvider:
                 pass
         if request_record["state"] != "completed":
             detail = str(run.get("failure_user_message") or run.get("error_text") or "GlassHive harness run failed")
-            raise HTTPException(status_code=502, detail=_redact_text(detail))
+            raise HTTPException(
+                status_code=_provider_failure_http_status(run),
+                detail=_redact_text(detail),
+            )
         output = self._conversation_output(request_record, run)
         usage, usage_source = self._completion_usage(request_record, run, payload, output)
         response = {
@@ -1639,12 +1656,17 @@ class ConversationProvider:
                     finish_reason = "stop"
                 else:
                     error = _redact_text(str(run.get("failure_user_message") or run.get("error_text") or "GlassHive run failed"))
+                    error_type, error_code = _provider_failure_error(run)
                     error_chunk = {
                         "id": request_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": payload.model,
-                        "error": {"message": error, "type": "glasshive_runtime_error"},
+                        "error": {
+                            "message": error,
+                            "type": error_type,
+                            "code": error_code,
+                        },
                         "choices": [],
                     }
                     yield f"data: {json.dumps(error_chunk, separators=(',', ':'))}\n\n"
@@ -1953,7 +1975,7 @@ async def _responses_stream(
             sequence += 1
     if runtime_error:
         error = {
-            "code": "glasshive_runtime_error",
+            "code": str(runtime_error.get("code") or "server_error"),
             "message": _redact_text(str(runtime_error.get("message") or "GlassHive run failed")),
         }
         yield _responses_sse("error", sequence, code=error["code"], message=error["message"], param=None)
@@ -2035,6 +2057,8 @@ def _openai_error(status_code: int, message: str, code: str, *, param: str | Non
         error_type = "authentication_error"
     elif status_code == 403:
         error_type = "permission_error"
+    elif status_code == 429:
+        error_type = "rate_limit_error"
     return JSONResponse(
         status_code=status_code,
         content={
