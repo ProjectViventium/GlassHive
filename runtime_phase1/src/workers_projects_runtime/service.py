@@ -1863,6 +1863,82 @@ class WorkersProjectsService:
         self._emit_callback(worker, "worker.interrupted", run=active_run, message="Worker interrupted")
         return updated or worker
 
+    def cancel_run(self, worker_id: str, run_id: str) -> dict:
+        """Cancel one queued or running run without affecting a newer turn."""
+
+        worker = self.require_worker(worker_id)
+        run = self.store.get_run(run_id)
+        if not run or str(run.get("worker_id") or "") != str(worker_id):
+            return worker
+        state = str(run.get("state") or "")
+        if state in {"completed", "failed", "cancelled", "interrupted"}:
+            return worker
+
+        cancelled = None
+        if state == "queued":
+            cancelled = self.store.finalize_run_if_state(
+                run_id,
+                expected_state="queued",
+                state="cancelled",
+                error_text="Cancelled by provider client",
+            )
+            if not cancelled:
+                run = self.store.get_run(run_id) or run
+                state = str(run.get("state") or "")
+
+        if state == "running":
+            active_run = self.store.get_active_run(worker_id)
+            if not active_run or str(active_run.get("run_id") or "") != str(run_id):
+                return worker
+            # Stop the processor generation before interrupting the host process. A late
+            # runtime return can then never overwrite the durable cancellation with completion.
+            self._invalidate_worker_processor(worker_id)
+            try:
+                try:
+                    info = self.runtime.interrupt_worker(worker, run_id=run_id)
+                except TypeError as exc:
+                    if "run_id" not in str(exc):
+                        raise
+                    info = self.runtime.interrupt_worker(worker)
+                worker = self._apply_runtime_info(
+                    worker_id,
+                    info,
+                    state="ready",
+                    last_error="",
+                ) or worker
+            finally:
+                cancelled = self.store.finalize_run_if_state(
+                    run_id,
+                    expected_state="running",
+                    state="cancelled",
+                    output_text="",
+                    error_text="Cancelled by provider client",
+                )
+
+        if cancelled:
+            self.store.finalize_schedule_for_run(
+                run_id,
+                state="cancelled",
+                last_error="Cancelled by provider client",
+            )
+            cancelled_run = {**run, **cancelled, "state": "cancelled"}
+            self.store.add_event(
+                worker["project_id"],
+                worker_id,
+                run_id,
+                "run.cancelled",
+                "Run cancelled by provider client",
+            )
+            self._emit_callback(
+                worker,
+                "run.cancelled",
+                run=cancelled_run,
+                message="Run cancelled by provider client",
+            )
+        if self.store.has_queued_runs(worker_id):
+            self._ensure_worker_processor(worker_id)
+        return self.store.get_worker(worker_id) or worker
+
     def resume_worker(self, worker_id: str) -> dict:
         worker = self.require_worker(worker_id)
         self._ensure_execution_allowed(worker)

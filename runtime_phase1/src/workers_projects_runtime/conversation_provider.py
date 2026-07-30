@@ -322,7 +322,7 @@ class StreamingRedactor:
 
         stable_limit = max(0, len(self._buffer) - self.overlap)
         sensitive_tail = re.search(
-            r"(?i)(?:/Users/|~/|bearer\s+|(?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]?\s*|sk-|data:image/)[^\n]*$",
+            r"(?i)(?:/Users/|/(?:home|root|Volumes|private/var)/|~/|bearer\s+|(?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]?\s*|sk-|ghp_|xoxb-|eyJ|-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|data:image/)[^\n]*$",
             self._buffer,
         )
         if sensitive_tail is not None:
@@ -1269,6 +1269,10 @@ class ConversationProvider:
 
     def _sync(self, request_record: dict[str, Any]) -> dict[str, Any]:
         request_id = str(request_record["request_id"])
+        # Cancellation is an irreversible authoring boundary. In particular, a host process
+        # that exits after an interrupt must never resurrect the client-visible request.
+        if str(request_record.get("state") or "") == "cancelled":
+            return request_record
         run_id = str(request_record.get("run_id") or "")
         if not run_id:
             return request_record
@@ -1278,6 +1282,22 @@ class ConversationProvider:
         activities = self.store.list_provider_activity(request_id)
         activity_types = {str(item["event_type"]) for item in activities}
         run_state = str(run.get("state") or "queued")
+        if run_state == "completed" and callable(
+            getattr(self.service.runtime, "provider_activity_log", None)
+        ):
+            native_output = self._native_output_snapshot(request_record, run)
+            if not native_output:
+                failure_text = "Harness exited without a terminal authored response event"
+                self.store.update_run(
+                    run_id,
+                    state="failed",
+                    error_text=failure_text,
+                    failure_class="missing_terminal_response",
+                    failure_user_message=failure_text,
+                    failure_retryable=0,
+                )
+                run = self.store.get_run(run_id) or run
+                run_state = "failed"
         execution_started = bool(run.get("started_at") or run_state != "queued")
         if execution_started and "started" not in activity_types:
             self.store.add_provider_activity(request_id, "started", ACTIVITY_SUMMARIES["started"])
@@ -1421,7 +1441,9 @@ class ConversationProvider:
         run: dict[str, Any],
     ) -> str:
         native = self._native_output_snapshot(request_record, run)
-        return _redact_text(native or str(run.get("output_text") or ""))
+        if callable(getattr(self.service.runtime, "provider_activity_log", None)):
+            return _redact_text(native)
+        return _redact_text(str(run.get("output_text") or ""))
 
     def _completion_usage(
         self,
@@ -1685,24 +1707,34 @@ class ConversationProvider:
         return {"object": "list", "request_id": request_id, "data": data}
 
     def cancel(self, request_id: str) -> dict[str, Any]:
-        record = self.store.get_provider_request(request_id)
-        if not record:
-            raise HTTPException(status_code=404, detail="GlassHive request not found")
-        record = self._sync(record)
-        if record["state"] in TERMINAL_REQUEST_STATES:
-            return record
-        session = self.store.get_provider_session_by_id(str(record["session_id"]))
-        run_id = str(record.get("run_id") or "").strip()
-        if session and run_id:
-            self.service.interrupt_worker(
-                str(session["worker_id"]),
-                run_id=run_id,
-            )
-        updated = self.store.update_provider_request(request_id, state="cancelled") or record
-        existing_types = {item["event_type"] for item in self.store.list_provider_activity(request_id)}
-        if "cancelled" not in existing_types:
-            self.store.add_provider_activity(request_id, "cancelled", ACTIVITY_SUMMARIES["cancelled"])
-        return updated
+        with self._start_lock:
+            record = self.store.get_provider_request(request_id)
+            if not record:
+                raise HTTPException(status_code=404, detail="GlassHive request not found")
+            record = self._sync(record)
+            if record["state"] in TERMINAL_REQUEST_STATES:
+                return record
+            # Persist client intent before touching the runtime so concurrent poll/reconnect
+            # paths observe an irreversible cancellation boundary.
+            updated = self.store.update_provider_request(request_id, state="cancelled") or record
+            existing_types = {
+                item["event_type"]
+                for item in self.store.list_provider_activity(request_id)
+            }
+            if "cancelled" not in existing_types:
+                self.store.add_provider_activity(
+                    request_id,
+                    "cancelled",
+                    ACTIVITY_SUMMARIES["cancelled"],
+                )
+            session = self.store.get_provider_session_by_id(str(record["session_id"]))
+            run_id = str(record.get("run_id") or "").strip()
+            if session and run_id:
+                self.service.cancel_run(
+                    str(session["worker_id"]),
+                    run_id,
+                )
+            return updated
 
     def cancel_by_idempotency(
         self,

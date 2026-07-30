@@ -210,6 +210,13 @@ class ActivityStubRuntime(StubRuntime):
                             "item": {"type": "file_change", "status": "completed", "changes": [{}]},
                         }
                     ),
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {"type": "agent_message", "text": "Activity answer."},
+                        }
+                    ),
+                    json.dumps({"type": "turn.completed"}),
                 ]
             ),
         )
@@ -252,6 +259,12 @@ class SplitSecretStreamingRuntime(StubRuntime):
         time.sleep(0.15)
         self.stdout += "\n" + json.dumps(second)
         time.sleep(0.15)
+        self.stdout += "\n" + json.dumps(
+            {
+                "type": "result",
+                "result": "Before api_key=PUBLIC_FAKE_SECRET_VALUE after\n",
+            }
+        )
         return "Before api_key=PUBLIC_FAKE_SECRET_VALUE after\n"
 
     def provider_activity_log(self, worker: dict, run_id: str) -> tuple[str, str]:
@@ -302,6 +315,7 @@ class CompactedActivityRuntime(StubRuntime):
                             "item": {"type": "agent_message", "text": "Tail answer."},
                         }
                     ),
+                    json.dumps({"type": "turn.completed"}),
                 ]
             ),
         )
@@ -1273,6 +1287,127 @@ def test_run_scoped_interrupt_cannot_cancel_a_newer_active_turn(tmp_path):
         service.shutdown()
 
 
+def test_provider_cancel_marks_a_queued_run_cancelled_before_native_execution(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = InterruptCountingRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = store.create_project(
+            "owner-a",
+            "Synthetic conversation",
+            "Queued cancellation regression",
+            "codex-cli",
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner-a",
+            name="Synthetic worker",
+            role="conversation-agent",
+            profile="codex-cli",
+            backend="",
+            runtime="codex-cli",
+            model="gpt-5.6-sol",
+        )
+        session = store.upsert_provider_session(
+            tenant_id="local",
+            owner_id="owner-a",
+            conversation_id="conv-cancel",
+            agent_id="agent-cancel",
+            model_id="codex-cli:gpt-5.6-sol",
+            project_id=project["project_id"],
+            worker_id=worker["worker_id"],
+            workspace_dir=str(tmp_path),
+            access_mode="workspace",
+        )
+        run = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "never execute this",
+            state="queued",
+        )
+        request, _ = store.create_provider_request(
+            tenant_id="local",
+            owner_id="owner-a",
+            session_id=session["session_id"],
+            idempotency_key="queued-cancel",
+            message_id="message-cancel",
+            stream_id="stream-cancel",
+            requested_history_count=0,
+        )
+        store.update_provider_request(request["request_id"], run_id=run["run_id"])
+        provider = ConversationProvider(store, service)
+
+        cancelled = provider.cancel(request["request_id"])
+
+        assert cancelled["state"] == "cancelled"
+        assert store.get_run(run["run_id"])["state"] == "cancelled"
+        assert runtime.interrupt_calls == []
+        assert provider._sync(store.get_provider_request(request["request_id"]))["state"] == "cancelled"
+    finally:
+        service.shutdown()
+
+
+def test_sync_never_resurrects_a_cancelled_provider_request(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(
+        store,
+        InterruptCountingRuntime(),
+        reconcile_on_startup=False,
+    )
+    try:
+        project = store.create_project(
+            "owner-a", "Synthetic conversation", "Cancellation race", "codex-cli"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner-a",
+            name="Synthetic worker",
+            role="conversation-agent",
+            profile="codex-cli",
+            backend="",
+            runtime="codex-cli",
+            model="gpt-5.6-sol",
+        )
+        session = store.upsert_provider_session(
+            tenant_id="local",
+            owner_id="owner-a",
+            conversation_id="conv-race",
+            agent_id="agent-race",
+            model_id="codex-cli:gpt-5.6-sol",
+            project_id=project["project_id"],
+            worker_id=worker["worker_id"],
+            workspace_dir=str(tmp_path),
+            access_mode="workspace",
+        )
+        run = store.create_run(
+            worker["worker_id"], project["project_id"], "late completion", state="running"
+        )
+        request, _ = store.create_provider_request(
+            tenant_id="local",
+            owner_id="owner-a",
+            session_id=session["session_id"],
+            idempotency_key="cancel-race",
+            message_id="message-race",
+            stream_id="stream-race",
+            requested_history_count=0,
+        )
+        store.update_provider_request(
+            request["request_id"], run_id=run["run_id"], state="cancelled"
+        )
+        store.finalize_run(run["run_id"], state="completed", output_text="late answer")
+        provider = ConversationProvider(store, service)
+
+        synced = provider._sync(store.get_provider_request(request["request_id"]))
+
+        assert synced["state"] == "cancelled"
+        assert all(
+            event["event_type"] != "completed"
+            for event in store.list_provider_activity(request["request_id"])
+        )
+    finally:
+        service.shutdown()
+
+
 def test_activity_payload_recursively_redacts_private_strings(tmp_path, monkeypatch):
     workspace = tmp_path / "Life"
     workspace.mkdir()
@@ -1341,6 +1476,19 @@ def test_streaming_redactor_redacts_newline_split_home_path_and_bounds_long_line
     assert "/Users/synthetic" not in visible
     assert "[REDACTED_LOCAL_PATH]" in visible
     assert "[REDACTED_OVERSIZED_STREAM_SEGMENT]" in visible
+
+
+def test_streaming_redactor_holds_and_redacts_split_common_credentials():
+    redactor = StreamingRedactor(overlap=16, max_buffer=512)
+
+    visible = redactor.feed("token ghp_synthetic")
+    visible += redactor.feed("githubcredential then xoxb-synthetic-")
+    visible += redactor.feed("slack-credential done\n")
+    visible += redactor.flush()
+
+    assert "syntheticgithubcredential" not in visible
+    assert "synthetic-slack-credential" not in visible
+    assert "[REDACTED]" in visible
 
 
 def test_production_sse_redacts_a_secret_split_across_native_stream_snapshots(
@@ -1444,6 +1592,60 @@ def test_native_visible_text_waits_for_codex_turn_and_returns_only_latest_agent_
         "codex-cli",
         "\n".join([*lines, json.dumps({"type": "turn.completed"})]),
     ) == "Exact final answer."
+
+
+@pytest.mark.parametrize("profile", ["codex-cli", "claude-code"])
+def test_completed_native_harness_without_terminal_answer_fails_loudly(
+    tmp_path, monkeypatch, profile
+):
+    class MissingTerminalRuntime(StubRuntime):
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            _ = worker, instruction, timeout_sec, run_id
+            return "I am still working on it."
+
+        def provider_activity_log(self, worker: dict, run_id: str) -> tuple[str, str]:
+            _ = worker, run_id
+            if profile == "codex-cli":
+                return profile, json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": "I am still working on it.",
+                        },
+                    }
+                )
+            return profile, json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "I am still working on it."}
+                        ]
+                    },
+                }
+            )
+
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch, runtime=MissingTerminalRuntime())
+    model = "codex-cli:gpt-5.6-sol" if profile == "codex-cli" else "claude-code:opus"
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=AUTH,
+        json=_payload(workspace, model=model),
+    )
+
+    assert response.status_code == 502
+    assert "terminal authored response" in response.text
+    assert "I am still working on it" not in response.text
 
 
 def test_native_usage_ignores_non_usage_events_and_normalizes_counts():

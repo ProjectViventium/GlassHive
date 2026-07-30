@@ -4086,6 +4086,40 @@ def test_redact_text_masks_parent_visible_secret_shapes():
     assert "[REDACTED]" in redacted
 
 
+def test_redact_text_masks_common_host_paths_and_credential_families():
+    private_key = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "c3ludGhldGljLXByaXZhdGUta2V5LW1hdGVyaWFs\n"
+        "-----END PRIVATE KEY-----"
+    )
+    raw = " ".join(
+        [
+            "/home/synthetic/private.txt",
+            "/root/private.txt",
+            "/Volumes/Private/private.txt",
+            "/private/var/synthetic/private.txt",
+            "ghp_syntheticgithubcredential",
+            "xoxb-synthetic-slack-credential",
+            "eyJhbGciOiJIUzI1NiJ9.c3ludGhldGlj.c2lnbmF0dXJl",
+            private_key,
+        ]
+    )
+
+    redacted = _redact_text(raw)
+
+    for forbidden in (
+        "/home/synthetic",
+        "/root/private.txt",
+        "/Volumes/Private",
+        "/private/var/synthetic",
+        "syntheticgithubcredential",
+        "synthetic-slack-credential",
+        "c3ludGhldGlj",
+        "c3ludGhldGljLXByaXZhdGUta2V5LW1hdGVyaWFs",
+    ):
+        assert forbidden not in redacted
+
+
 def test_redact_text_masks_parent_visible_image_payloads():
     base64_png = "iVBORw0KGgo" + ("A" * 900) + "=="
     redacted = _redact_text(
