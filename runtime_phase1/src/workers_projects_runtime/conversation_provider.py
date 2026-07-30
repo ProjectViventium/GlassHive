@@ -324,13 +324,18 @@ def _message_text(content: Any) -> str:
 
 
 def _system_snapshot(messages: Iterable[ChatMessage]) -> str:
-    systems = [
-        _message_text(message.content).strip()
-        for message in messages
-        if str(message.role or "").strip().lower() == "system"
-        and _message_text(message.content).strip()
-    ]
-    return systems[-1] if systems else ""
+    instruction_parts: list[str] = []
+    seen: set[str] = set()
+    for message in messages:
+        role = str(message.role or "").strip().lower()
+        if role not in {"system", "developer"}:
+            continue
+        text = _message_text(message.content).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        instruction_parts.append(text)
+    return "\n\n".join(instruction_parts)
 
 
 def _history_instruction(messages: Iterable[ChatMessage], *, start_at: int = 0) -> str:
@@ -339,7 +344,8 @@ def _history_instruction(messages: Iterable[ChatMessage], *, start_at: int = 0) 
     selected = [
         message
         for index, message in enumerate(all_messages)
-        if index >= max(0, start_at) and str(message.role or "").strip().lower() != "system"
+        if index >= max(0, start_at)
+        and str(message.role or "").strip().lower() not in {"system", "developer"}
     ]
     if not selected and not current_system:
         return "Continue the current conversation naturally."

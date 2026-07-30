@@ -15,12 +15,15 @@ from fastapi.testclient import TestClient
 from workers_projects_runtime.api import create_app
 from workers_projects_runtime.conversation_provider import (
     GLASSHIVE_MODELS,
+    ChatMessage,
     ConversationProvider,
     StreamingRedactor,
     _harness_auth_configured,
+    _history_instruction,
     _native_usage,
     _native_visible_text,
     _normalized_harness_activity,
+    _system_snapshot,
 )
 from workers_projects_runtime.openclaw_runtime import StubRuntime
 from workers_projects_runtime.service import WorkersProjectsService
@@ -32,6 +35,58 @@ AUTH = {
 }
 
 BOOTSTRAP_SIGNATURE_SECRET = "synthetic-bootstrap-signature-secret"
+
+
+def test_system_snapshot_preserves_all_current_request_instruction_messages():
+    messages = [
+        ChatMessage(role="system", content="Current agent instructions."),
+        ChatMessage(role="user", content="Hello."),
+        ChatMessage(role="system", content="Current conversation policy."),
+    ]
+
+    snapshot = _system_snapshot(messages)
+
+    assert snapshot.count("Current agent instructions.") == 1
+    assert snapshot.count("Current conversation policy.") == 1
+    assert snapshot.index("Current agent instructions.") < snapshot.index(
+        "Current conversation policy."
+    )
+
+
+def test_system_snapshot_deduplicates_identical_instruction_messages():
+    messages = [
+        ChatMessage(role="system", content="Shared instruction."),
+        ChatMessage(role="system", content="Shared instruction."),
+    ]
+
+    assert _system_snapshot(messages) == "Shared instruction."
+
+
+def test_system_snapshot_preserves_openai_developer_instructions():
+    messages = [
+        ChatMessage(role="developer", content="Application-owned instruction."),
+        ChatMessage(role="user", content="Hello."),
+    ]
+
+    assert _system_snapshot(messages) == "Application-owned instruction."
+
+
+def test_history_instruction_excludes_system_messages_from_visible_transcript():
+    messages = [
+        ChatMessage(role="system", content="Current agent instructions."),
+        ChatMessage(role="user", content="Hello."),
+        ChatMessage(role="developer", content="Application-owned instruction."),
+        ChatMessage(role="system", content="Current conversation policy."),
+    ]
+
+    instruction = _history_instruction(messages)
+
+    assert instruction.count("Current agent instructions.") == 1
+    assert instruction.count("Current conversation policy.") == 1
+    assert instruction.count("Application-owned instruction.") == 1
+    assert instruction.count("[system]") == 1
+    assert "[developer]" not in instruction
+    assert "[user]\nHello." in instruction
 
 
 def _signed_bundle_headers(bundle: dict, *, timestamp: int | None = None) -> dict[str, str]:
