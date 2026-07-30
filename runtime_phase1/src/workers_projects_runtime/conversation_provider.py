@@ -86,9 +86,9 @@ class HarnessModel:
                 "activity_stream": True,
                 "chat_completions": True,
                 "responses_api": True,
-                # Claude's stream-json transport currently exposes text deltas. Codex exec
-                # --json exposes safe activity while working and the assistant text at completion.
-                "incremental_text": self.harness_profile == "claude-code",
+                # Native assistant messages can include working preambles. Both harnesses expose
+                # safe activity while working and publish only the terminal authored answer.
+                "incremental_text": False,
             },
         }
 
@@ -728,8 +728,8 @@ def _native_visible_text(profile: str, stdout: str) -> str:
     """Extract only user-visible assistant text from complete native JSONL events."""
 
     assistant_parts: list[str] = []
-    partial_parts: list[str] = []
     result_parts: list[str] = []
+    codex_turn_completed = False
     for raw_line in str(stdout or "").splitlines():
         try:
             event = json.loads(raw_line)
@@ -743,16 +743,12 @@ def _native_visible_text(profile: str, stdout: str) -> str:
                 text = str(item.get("text") or "").strip()
                 if text:
                     assistant_parts.append(text)
+            elif event.get("type") == "turn.completed":
+                codex_turn_completed = True
             continue
         if profile != "claude-code":
             continue
         if event.get("type") == "stream_event":
-            stream_event = event.get("event") if isinstance(event.get("event"), dict) else {}
-            delta = stream_event.get("delta") if isinstance(stream_event.get("delta"), dict) else {}
-            if stream_event.get("type") == "content_block_delta" and delta.get("type") == "text_delta":
-                text = str(delta.get("text") or "")
-                if text:
-                    partial_parts.append(text)
             continue
         if event.get("type") == "result":
             text = str(event.get("result") or "").strip()
@@ -771,8 +767,10 @@ def _native_visible_text(profile: str, stdout: str) -> str:
         if text:
             assistant_parts.append(text)
     if profile == "claude-code":
-        return "".join(partial_parts) or "".join(assistant_parts) or (result_parts[-1] if result_parts else "")
-    return "".join(assistant_parts)
+        return result_parts[-1] if result_parts else ""
+    if profile == "codex-cli" and codex_turn_completed:
+        return assistant_parts[-1] if assistant_parts else ""
+    return ""
 
 
 def _native_usage(profile: str, stdout: str) -> dict[str, int] | None:

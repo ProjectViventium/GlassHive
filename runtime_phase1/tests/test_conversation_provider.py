@@ -331,7 +331,7 @@ def test_models_expose_exact_harness_registry(tmp_path, monkeypatch):
     assert all(model["capabilities"]["chat_completions"] for model in models.values())
     assert all(model["capabilities"]["responses_api"] for model in models.values())
     assert models["codex-cli:gpt-5.6-sol"]["capabilities"]["incremental_text"] is False
-    assert models["claude-code:opus"]["capabilities"]["incremental_text"] is True
+    assert models["claude-code:opus"]["capabilities"]["incremental_text"] is False
     assert all(model["readiness"]["status"] for model in models.values())
     assert all(isinstance(model["created"], int) and model["created"] > 0 for model in models.values())
 
@@ -1377,6 +1377,7 @@ def test_native_visible_text_never_falls_back_to_raw_ndjson_or_thinking():
                     },
                 }
             ),
+            json.dumps({"type": "result", "result": "Safe visible answer."}),
         ]
     )
 
@@ -1384,7 +1385,7 @@ def test_native_visible_text_never_falls_back_to_raw_ndjson_or_thinking():
     assert _native_visible_text("unknown-profile", raw) == ""
 
 
-def test_native_visible_text_streams_claude_partial_text_without_hidden_thinking():
+def test_native_visible_text_waits_for_claude_result_and_excludes_working_preamble():
     raw = "\n".join(
         [
             json.dumps(
@@ -1401,7 +1402,7 @@ def test_native_visible_text_streams_claude_partial_text_without_hidden_thinking
                     "type": "stream_event",
                     "event": {
                         "type": "content_block_delta",
-                        "delta": {"type": "text_delta", "text": "Visible "},
+                        "delta": {"type": "text_delta", "text": "I will inspect the file."},
                     },
                 }
             ),
@@ -1410,14 +1411,39 @@ def test_native_visible_text_streams_claude_partial_text_without_hidden_thinking
                     "type": "stream_event",
                     "event": {
                         "type": "content_block_delta",
-                        "delta": {"type": "text_delta", "text": "answer."},
+                        "delta": {"type": "text_delta", "text": "Exact final answer."},
                     },
                 }
             ),
+            json.dumps({"type": "result", "result": "Exact final answer."}),
         ]
     )
 
-    assert _native_visible_text("claude-code", raw) == "Visible answer."
+    assert _native_visible_text("claude-code", raw) == "Exact final answer."
+    assert _native_visible_text("claude-code", "\n".join(raw.splitlines()[:-1])) == ""
+
+
+def test_native_visible_text_waits_for_codex_turn_and_returns_only_latest_agent_message():
+    lines = [
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "I will inspect the file."},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "Exact final answer."},
+            }
+        ),
+    ]
+
+    assert _native_visible_text("codex-cli", "\n".join(lines)) == ""
+    assert _native_visible_text(
+        "codex-cli",
+        "\n".join([*lines, json.dumps({"type": "turn.completed"})]),
+    ) == "Exact final answer."
 
 
 def test_native_usage_ignores_non_usage_events_and_normalizes_counts():
