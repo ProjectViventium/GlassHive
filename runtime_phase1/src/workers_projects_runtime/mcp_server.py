@@ -60,7 +60,10 @@ DEFAULT_HOST = os.environ.get("WPR_MCP_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("WPR_MCP_PORT", "8767"))
 DEFAULT_TIMEOUT_SEC = float(os.environ.get("WPR_MCP_TIMEOUT_SEC", "120"))
 DEFAULT_OWNER_ID = os.environ.get("WPR_DEFAULT_OWNER_ID", "").strip()
-DEFAULT_API_TOKEN = os.environ.get("WPR_API_TOKEN", "").strip()
+DEFAULT_API_TOKEN = (
+    os.environ.get("GLASSHIVE_MCP_API_KEY", "").strip()
+    or os.environ.get("WPR_API_TOKEN", "").strip()
+)
 
 HOST_SIDE_ORCHESTRATION_GUIDANCE = (
     "Preserve host-side GlassHive orchestration requirements as context, but do not turn them into "

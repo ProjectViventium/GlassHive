@@ -102,6 +102,11 @@ TEXT_ARTIFACT_PREVIEW_EXTENSIONS = {
     ".yaml",
     ".yml",
 }
+
+
+def _env_enabled(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name) or ("true" if default else "false")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 ARTIFACT_OPEN_SECURITY_HEADERS = {
     "Cache-Control": "no-store, no-cache, private, max-age=0",
     "Content-Security-Policy": "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'self'",
@@ -267,6 +272,9 @@ def create_app(
         )
 
     api_token = os.environ.get("WPR_API_TOKEN", "").strip()
+    provider_token = os.environ.get("GLASSHIVE_PROVIDER_API_KEY", "").strip()
+    if api_token and provider_token and hmac.compare_digest(api_token, provider_token):
+        raise RuntimeError("GLASSHIVE_PROVIDER_API_KEY must be distinct from WPR_API_TOKEN")
     auth_settings = EnterpriseAuthSettings()
     auth_settings.validate_startup(api_token=api_token)
     unauthenticated_prefixes = (
@@ -353,6 +361,13 @@ def create_app(
     @app.middleware("http")
     async def optional_bearer_auth(request: Request, call_next):
         request.state.auth_context = AuthContext()
+        auth_header = request.headers.get("authorization", "")
+        bearer = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
+        provider_path = request.url.path in {"/v1/models", "/v1/chat/completions"} or request.url.path.startswith(
+            "/v1/requests/"
+        )
+        if provider_path and _token_matches(bearer, provider_token):
+            return await call_next(request)
         if not api_token:
             return await call_next(request)
         if request.url.path.startswith(unauthenticated_prefixes):
@@ -361,9 +376,7 @@ def create_app(
         if signed_context is not None:
             request.state.auth_context = signed_context
             return await call_next(request)
-        auth_header = request.headers.get("authorization", "")
         token = _service_token_from_headers(request.headers)
-        bearer = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
         if not (_token_matches(token, api_token) or _token_matches(bearer, api_token)):
             return Response(status_code=401, content="Unauthorized")
         try:
@@ -1221,10 +1234,16 @@ def create_app(
         app,
         store=store,
         service=service,
-        tenant_for_request=lambda request: (
-            _auth_context(request).tenant_id if _auth_context(request).enterprise else "local"
+        provider_token=provider_token,
+        provider_principal_id=os.environ.get("GLASSHIVE_PROVIDER_PRINCIPAL_ID", "glasshive-local"),
+        provider_tenant_id=os.environ.get("GLASSHIVE_PROVIDER_TENANT_ID", "local"),
+        trust_identity_headers=_env_enabled("GLASSHIVE_PROVIDER_TRUST_IDENTITY_HEADERS"),
+        allow_full_access=_env_enabled("GLASSHIVE_PROVIDER_ALLOW_FULL_ACCESS"),
+        default_access=(
+            "full"
+            if os.environ.get("GLASSHIVE_PROVIDER_DEFAULT_ACCESS", "workspace").strip().lower() == "full"
+            else "workspace"
         ),
-        provider_token=api_token,
     )
 
     @app.get("/health")

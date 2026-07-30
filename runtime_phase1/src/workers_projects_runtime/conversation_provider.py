@@ -10,13 +10,17 @@ import time
 import base64
 import binascii
 import asyncio
+import re
 import threading
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Literal
 
 from fastapi import HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -76,6 +80,15 @@ class HarnessModel:
                 "activity_stream": True,
             },
         }
+
+
+@dataclass(frozen=True)
+class ProviderAuthContext:
+    tenant_id: str
+    principal_id: str
+    trust_identity_headers: bool = False
+    allow_full_access: bool = False
+    default_access: Literal["full", "workspace"] = "workspace"
 
 
 GLASSHIVE_MODELS: dict[str, HarnessModel] = {
@@ -161,7 +174,7 @@ def _harness_readiness(profile: str) -> dict[str, Any]:
 class WorkspaceBinding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    mode: Literal["life", "custom"] = "life"
+    mode: Literal["default", "life", "custom"] = "default"
     path: str | None = None
 
     @model_validator(mode="after")
@@ -175,15 +188,15 @@ class GlassHiveOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     workspace: WorkspaceBinding = Field(default_factory=WorkspaceBinding)
-    access: Literal["full", "workspace"] = "full"
+    access: Literal["full", "workspace"] = "workspace"
 
 
 class CompletionMetadata(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    owner_id: str = Field(min_length=1)
-    conversation_id: str = Field(min_length=1)
-    agent_id: str = Field(min_length=1)
+    owner_id: str = ""
+    conversation_id: str = ""
+    agent_id: str = ""
     message_id: str = ""
     stream_id: str = ""
     surface: str = "web"
@@ -201,7 +214,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     model: str
     messages: list[ChatMessage] = Field(min_length=1)
@@ -211,7 +224,7 @@ class ChatCompletionRequest(BaseModel):
 
 
 class StreamingRedactor:
-    """Redact complete logical lines without retaining an unbounded provider stream."""
+    """Redact bounded stream segments while retaining sensitive split-token prefixes."""
 
     def __init__(self, overlap: int = 1024, max_buffer: int = 64 * 1024) -> None:
         self.overlap = max(1, int(overlap))
@@ -220,15 +233,33 @@ class StreamingRedactor:
 
     def feed(self, value: str) -> str:
         self._buffer += str(value or "")
-        newline = self._buffer.rfind("\n")
-        if newline < 0:
-            if len(self._buffer) > self.max_buffer:
-                self._buffer = ""
-                return "[REDACTED_OVERSIZED_STREAM_SEGMENT]"
+        if len(self._buffer) > self.max_buffer and not re.search(r"\s", self._buffer):
+            self._buffer = ""
+            return "[REDACTED_OVERSIZED_STREAM_SEGMENT]"
+
+        stable_limit = max(0, len(self._buffer) - self.overlap)
+        sensitive_tail = re.search(
+            r"(?i)(?:/Users/|~/|bearer\s+|(?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]?\s*|sk-|data:image/)[^\n]*$",
+            self._buffer,
+        )
+        if sensitive_tail is not None:
+            stable_limit = min(stable_limit, sensitive_tail.start())
+        if stable_limit <= 0:
             return ""
-        stable = self._buffer[: newline + 1]
-        self._buffer = self._buffer[newline + 1 :]
-        return _redact_text(stable)
+
+        boundary = max(
+            (match.end() for match in re.finditer(r"\s+", self._buffer[:stable_limit])),
+            default=0,
+        )
+        if boundary <= 0:
+            return ""
+        stable = self._buffer[:boundary]
+        self._buffer = self._buffer[boundary:]
+        visible = _redact_text(stable)
+        if len(self._buffer) > self.max_buffer and not re.search(r"\s", self._buffer):
+            self._buffer = ""
+            visible += "[REDACTED_OVERSIZED_STREAM_SEGMENT]"
+        return visible
 
     def flush(self) -> str:
         result = _redact_text(self._buffer)
@@ -275,14 +306,14 @@ def _history_instruction(messages: Iterable[ChatMessage], *, start_at: int = 0) 
     if not selected and not current_system:
         return "Continue the current conversation naturally."
     lines = [
-        "Continue this Viventium conversation naturally. Honor AGENTS.md in the working folder as canonical instructions.",
+        "Continue this conversation naturally. Honor AGENTS.md in the working folder as canonical instructions.",
         "Ask a concise clarifying question when the user's desired outcome genuinely cannot be inferred.",
         "Before any destructive, irreversible, externally consequential, or permission-expanding action, verify that it is explicitly within the user's request and pause for approval when it is not.",
     ]
     if current_system:
         lines.extend(
             [
-                "The following single system snapshot is authoritative for this turn and supersedes every earlier Viventium system or feeling snapshot retained by the native session:",
+                "The following single system snapshot is authoritative for this turn and supersedes every earlier system snapshot retained by the native session:",
                 f"[system]\n{current_system}",
             ]
         )
@@ -298,6 +329,15 @@ def _history_instruction(messages: Iterable[ChatMessage], *, start_at: int = 0) 
 def _canonical_life_dir() -> Path:
     configured = str(os.environ.get("VIVENTIUM_LIFE_DIR") or "").strip()
     return Path(configured or "~/Documents/Viventium/Life").expanduser().resolve()
+
+
+def _default_workspace_dir() -> Path:
+    configured = str(
+        os.environ.get("GLASSHIVE_PROVIDER_DEFAULT_WORKSPACE")
+        or os.environ.get("VIVENTIUM_LIFE_DIR")
+        or os.getcwd()
+    ).strip()
+    return Path(configured).expanduser().resolve()
 
 
 def _header(request: Request, name: str) -> str:
@@ -328,22 +368,32 @@ def _decode_bootstrap_bundle(request: Request) -> dict[str, Any]:
     return payload
 
 
-def _hydrate_metadata(payload: ChatCompletionRequest, request: Request) -> ChatCompletionRequest:
-    """Merge trusted per-request/provider headers into the OpenAI-compatible request shape."""
+def _hydrate_metadata(
+    payload: ChatCompletionRequest,
+    request: Request,
+    auth: ProviderAuthContext,
+) -> ChatCompletionRequest:
+    """Apply authenticated defaults and optional trusted service context."""
 
     incoming = payload.metadata.model_dump(mode="python") if payload.metadata is not None else {}
     asserted_owner = _header(request, "x-viventium-user-id")
     incoming_owner = str(incoming.get("owner_id") or "").strip()
     if asserted_owner and incoming_owner and asserted_owner != incoming_owner:
         raise HTTPException(status_code=403, detail="Authenticated owner does not match completion metadata")
+    requested_owner = asserted_owner or incoming_owner
+    if requested_owner and requested_owner != auth.principal_id and not auth.trust_identity_headers:
+        raise HTTPException(status_code=403, detail="Provider credential cannot delegate another owner")
+    owner_id = requested_owner if auth.trust_identity_headers and requested_owner else auth.principal_id
 
     metadata = {
         **incoming,
-        "owner_id": asserted_owner or incoming_owner,
+        "owner_id": owner_id,
         "conversation_id": _header(request, "x-viventium-conversation-id")
-        or str(incoming.get("conversation_id") or "").strip(),
+        or str(incoming.get("conversation_id") or "").strip()
+        or f"conversation-{uuid.uuid4().hex}",
         "agent_id": _header(request, "x-glasshive-agent-id")
-        or str(incoming.get("agent_id") or "").strip(),
+        or str(incoming.get("agent_id") or "").strip()
+        or "glasshive-direct",
         "message_id": _header(request, "x-viventium-message-id")
         or str(incoming.get("message_id") or "").strip(),
         "stream_id": _header(request, "x-viventium-stream-id")
@@ -368,8 +418,10 @@ def _hydrate_metadata(payload: ChatCompletionRequest, request: Request) -> ChatC
         workspace["path"] = workspace_path
     if workspace:
         options["workspace"] = workspace
-    if access:
-        options["access"] = access
+    requested_access = str(access or options.get("access") or auth.default_access).strip().lower()
+    if requested_access == "full" and not auth.allow_full_access:
+        raise HTTPException(status_code=403, detail="Provider credential is not granted full host access")
+    options["access"] = requested_access
     metadata["glasshive_options"] = options
 
     try:
@@ -380,7 +432,12 @@ def _hydrate_metadata(payload: ChatCompletionRequest, request: Request) -> ChatC
 
 
 def _resolve_workspace(options: GlassHiveOptions) -> Path:
-    path = _canonical_life_dir() if options.workspace.mode == "life" else Path(str(options.workspace.path)).expanduser()
+    if options.workspace.mode == "default":
+        path = _default_workspace_dir()
+    elif options.workspace.mode == "life":
+        path = _canonical_life_dir()
+    else:
+        path = Path(str(options.workspace.path)).expanduser()
     if options.workspace.mode == "custom" and not path.is_absolute():
         raise HTTPException(
             status_code=400,
@@ -389,7 +446,7 @@ def _resolve_workspace(options: GlassHiveOptions) -> Path:
     try:
         resolved = path.resolve(strict=True)
     except FileNotFoundError as exc:
-        label = "Viventium LIFE" if options.workspace.mode == "life" else "Custom GlassHive workspace"
+        label = "GlassHive default workspace" if options.workspace.mode != "custom" else "Custom GlassHive workspace"
         raise HTTPException(status_code=409, detail=f"{label} does not exist on the GlassHive host: {path}") from exc
     if not resolved.is_dir():
         raise HTTPException(status_code=400, detail="GlassHive working folder must be a directory")
@@ -405,7 +462,7 @@ def _resolve_workspace(options: GlassHiveOptions) -> Path:
         if not any(resolved == root or resolved.is_relative_to(root) for root in allowed_roots):
             raise HTTPException(
                 status_code=403,
-                detail="Custom GlassHive workspace is outside the configured Viventium workspace roots",
+                detail="Custom GlassHive workspace is outside the configured workspace roots",
             )
     return resolved
 
@@ -414,18 +471,7 @@ def _idempotency_key(payload: ChatCompletionRequest) -> str:
     explicit = str(payload.metadata.idempotency_key or payload.metadata.message_id or "").strip()
     if explicit:
         return explicit
-    canonical = json.dumps(
-        {
-            "owner": payload.metadata.owner_id,
-            "conversation": payload.metadata.conversation_id,
-            "agent": payload.metadata.agent_id,
-            "model": payload.model,
-            "messages": [message.model_dump(mode="json") for message in payload.messages],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"request-{uuid.uuid4().hex}"
 
 
 def _usage(messages: list[ChatMessage], output: str) -> dict[str, int]:
@@ -444,6 +490,7 @@ def _native_visible_text(profile: str, stdout: str) -> str:
     """Extract only user-visible assistant text from complete native JSONL events."""
 
     assistant_parts: list[str] = []
+    partial_parts: list[str] = []
     result_parts: list[str] = []
     for raw_line in str(stdout or "").splitlines():
         try:
@@ -460,6 +507,14 @@ def _native_visible_text(profile: str, stdout: str) -> str:
                     assistant_parts.append(text)
             continue
         if profile != "claude-code":
+            continue
+        if event.get("type") == "stream_event":
+            stream_event = event.get("event") if isinstance(event.get("event"), dict) else {}
+            delta = stream_event.get("delta") if isinstance(stream_event.get("delta"), dict) else {}
+            if stream_event.get("type") == "content_block_delta" and delta.get("type") == "text_delta":
+                text = str(delta.get("text") or "")
+                if text:
+                    partial_parts.append(text)
             continue
         if event.get("type") == "result":
             text = str(event.get("result") or "").strip()
@@ -478,7 +533,7 @@ def _native_visible_text(profile: str, stdout: str) -> str:
         if text:
             assistant_parts.append(text)
     if profile == "claude-code":
-        return "".join(assistant_parts) or (result_parts[-1] if result_parts else "")
+        return "".join(partial_parts) or "".join(assistant_parts) or (result_parts[-1] if result_parts else "")
     return "".join(assistant_parts)
 
 
@@ -729,13 +784,6 @@ class ConversationProvider:
             )
         return effort
 
-    def _assert_owner(self, payload: ChatCompletionRequest, request: Request) -> None:
-        asserted = str(request.headers.get("x-viventium-user-id") or "").strip()
-        if not asserted:
-            raise HTTPException(status_code=401, detail="X-Viventium-User-Id is required")
-        if asserted != payload.metadata.owner_id:
-            raise HTTPException(status_code=403, detail="Authenticated owner does not match completion metadata")
-
     def _native_bundle(
         self,
         payload: ChatCompletionRequest,
@@ -769,14 +817,11 @@ class ConversationProvider:
             return {}
         return value if isinstance(value, dict) else {}
 
-    def assert_request_owner(self, request_id: str, request: Request) -> dict[str, Any]:
-        asserted = _header(request, "x-viventium-user-id")
-        if not asserted:
-            raise HTTPException(status_code=401, detail="X-Viventium-User-Id is required")
+    def assert_request_owner(self, request_id: str, owner_id: str) -> dict[str, Any]:
         record = self.store.get_provider_request(request_id)
         if not record:
             raise HTTPException(status_code=404, detail="GlassHive request not found")
-        if str(record.get("owner_id") or "") != asserted:
+        if str(record.get("owner_id") or "") != str(owner_id or "").strip():
             raise HTTPException(status_code=403, detail="GlassHive request belongs to another owner")
         return record
 
@@ -792,8 +837,8 @@ class ConversationProvider:
         metadata = payload.metadata
         project = self.service.create_project(
             metadata.owner_id,
-            f"Viventium conversation {metadata.conversation_id}",
-            "Persistent Viventium conversation session",
+            f"GlassHive conversation {metadata.conversation_id}",
+            "Persistent GlassHive conversation session",
             model.harness_profile,
             tenant_id=tenant_id,
         )
@@ -801,14 +846,14 @@ class ConversationProvider:
         worker = self.service.create_worker(
             project_id=project["project_id"],
             owner_id=metadata.owner_id,
-            name=f"Viventium {metadata.agent_id}",
+            name=f"GlassHive {metadata.agent_id}",
             role="conversation-agent",
             profile=model.harness_profile,
             backend="",
             execution_mode="host",
             alias=f"conversation-{metadata.conversation_id}-{metadata.agent_id}",
             workspace_root=str(workspace),
-            bootstrap_profile="viventium-conversation-v1",
+            bootstrap_profile="glasshive-conversation-v1",
             bootstrap_bundle=bundle,
             tenant_id=tenant_id,
             start_synchronously=True,
@@ -900,9 +945,8 @@ class ConversationProvider:
                 self.service.terminate_worker(str(existing["worker_id"]))
         return self._create_native_session(payload, model, workspace, effort, tenant_id=tenant_id), True
 
-    def start(self, payload: ChatCompletionRequest, request: Request, *, tenant_id: str = "local") -> dict[str, Any]:
+    def start(self, payload: ChatCompletionRequest, *, tenant_id: str = "local") -> dict[str, Any]:
         with self._start_lock:
-            self._assert_owner(payload, request)
             model = self._model(payload.model)
             effort = self._effort(payload, model)
             idempotency_key = _idempotency_key(payload)
@@ -1403,13 +1447,11 @@ class ConversationProvider:
     def cancel_by_idempotency(
         self,
         idempotency_key: str,
-        request: Request,
+        owner_id: str,
         *,
         tenant_id: str = "local",
     ) -> dict[str, Any]:
-        owner_id = _header(request, "x-viventium-user-id")
-        if not owner_id:
-            raise HTTPException(status_code=401, detail="X-Viventium-User-Id is required")
+        owner_id = str(owner_id or "").strip()
         normalized_key = str(idempotency_key or "").strip()
         if not normalized_key:
             raise HTTPException(status_code=400, detail="GlassHive idempotency key is required")
@@ -1437,17 +1479,89 @@ def _redact_json_value(value: Any) -> Any:
     return value
 
 
+def _is_provider_path(path: str) -> bool:
+    return path in {"/v1/models", "/v1/chat/completions"} or path.startswith("/v1/requests/")
+
+
+def _openai_error(status_code: int, message: str, code: str, *, param: str | None = None) -> JSONResponse:
+    error_type = "invalid_request_error" if status_code < 500 else "server_error"
+    if status_code == 401:
+        error_type = "authentication_error"
+    elif status_code == 403:
+        error_type = "permission_error"
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": _redact_text(str(message or "Request failed")),
+                "type": error_type,
+                "param": param,
+                "code": code,
+            }
+        },
+    )
+
+
+def _http_error_code(status_code: int) -> str:
+    return {
+        400: "invalid_request",
+        401: "invalid_api_key",
+        403: "permission_denied",
+        404: "not_found",
+        409: "conflict",
+        429: "rate_limit_exceeded",
+        503: "service_unavailable",
+    }.get(status_code, "server_error" if status_code >= 500 else "invalid_request")
+
+
 def install_conversation_provider_routes(
     app,
     *,
     store: Store,
     service: WorkersProjectsService,
-    tenant_for_request,
     provider_token: str,
+    provider_principal_id: str = "glasshive-local",
+    provider_tenant_id: str = "local",
+    trust_identity_headers: bool = False,
+    allow_full_access: bool = False,
+    default_access: Literal["full", "workspace"] = "workspace",
 ) -> ConversationProvider:
     provider = ConversationProvider(store, service)
+    auth_context = ProviderAuthContext(
+        tenant_id=str(provider_tenant_id or "local").strip() or "local",
+        principal_id=str(provider_principal_id or "glasshive-local").strip() or "glasshive-local",
+        trust_identity_headers=bool(trust_identity_headers),
+        allow_full_access=bool(allow_full_access),
+        default_access="full" if default_access == "full" else "workspace",
+    )
 
-    def require_provider_auth(request: Request) -> None:
+    @app.exception_handler(HTTPException)
+    async def provider_http_exception_handler(request: Request, exc: HTTPException):
+        if not _is_provider_path(request.url.path):
+            return await http_exception_handler(request, exc)
+        return _openai_error(
+            exc.status_code,
+            str(exc.detail),
+            _http_error_code(exc.status_code),
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def provider_validation_exception_handler(request: Request, exc: RequestValidationError):
+        if not _is_provider_path(request.url.path):
+            return await request_validation_exception_handler(request, exc)
+        errors = exc.errors()
+        extra = next((error for error in errors if error.get("type") == "extra_forbidden"), None)
+        if extra is not None:
+            param = str(extra.get("loc", [""])[-1] or "")
+            return _openai_error(
+                400,
+                f"Unsupported parameter '{param}'",
+                "unsupported_parameter",
+                param=param,
+            )
+        return _openai_error(400, "Invalid chat completion request", "invalid_request")
+
+    def require_provider_auth(request: Request) -> ProviderAuthContext:
         expected = str(provider_token or "").strip()
         if not expected:
             raise HTTPException(
@@ -1458,6 +1572,13 @@ def install_conversation_provider_routes(
         supplied = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
         if not supplied or not hmac.compare_digest(supplied, expected):
             raise HTTPException(status_code=401, detail="Unauthorized GlassHive provider request")
+        return auth_context
+
+    def owner_for_request(request: Request, auth: ProviderAuthContext) -> str:
+        asserted = _header(request, "x-viventium-user-id")
+        if asserted and asserted != auth.principal_id and not auth.trust_identity_headers:
+            raise HTTPException(status_code=403, detail="Provider credential cannot delegate another owner")
+        return asserted if asserted and auth.trust_identity_headers else auth.principal_id
 
     @app.get("/v1/models")
     def glasshive_models(request: Request) -> dict[str, Any]:
@@ -1466,10 +1587,9 @@ def install_conversation_provider_routes(
 
     @app.post("/v1/chat/completions")
     async def glasshive_chat_completions(payload: ChatCompletionRequest, request: Request):
-        require_provider_auth(request)
-        payload = _hydrate_metadata(payload, request)
-        tenant_id = str(tenant_for_request(request) or "local")
-        record = await asyncio.to_thread(provider.start, payload, request, tenant_id=tenant_id)
+        auth = require_provider_auth(request)
+        payload = _hydrate_metadata(payload, request, auth)
+        record = await asyncio.to_thread(provider.start, payload, tenant_id=auth.tenant_id)
         if payload.stream:
             return StreamingResponse(
                 provider.stream(record, payload, request),
@@ -1486,8 +1606,8 @@ def install_conversation_provider_routes(
 
     @app.get("/v1/requests/{request_id}/activity")
     async def glasshive_activity(request_id: str, request: Request):
-        require_provider_auth(request)
-        provider.assert_request_owner(request_id, request)
+        auth = require_provider_auth(request)
+        provider.assert_request_owner(request_id, owner_for_request(request, auth))
         raw_after = str(request.headers.get("last-event-id") or "0").strip()
         try:
             after = max(0, int(raw_after))
@@ -1530,8 +1650,8 @@ def install_conversation_provider_routes(
 
     @app.post("/v1/requests/{request_id}/cancel")
     def glasshive_cancel(request_id: str, request: Request) -> dict[str, Any]:
-        require_provider_auth(request)
-        provider.assert_request_owner(request_id, request)
+        auth = require_provider_auth(request)
+        provider.assert_request_owner(request_id, owner_for_request(request, auth))
         record = provider.cancel(request_id)
         return {"id": request_id, "object": "glasshive.request", "state": record["state"]}
 
@@ -1540,12 +1660,11 @@ def install_conversation_provider_routes(
         idempotency_key: str,
         request: Request,
     ) -> dict[str, Any]:
-        require_provider_auth(request)
-        tenant_id = str(tenant_for_request(request) or "local")
+        auth = require_provider_auth(request)
         record = provider.cancel_by_idempotency(
             idempotency_key,
-            request,
-            tenant_id=tenant_id,
+            owner_for_request(request, auth),
+            tenant_id=auth.tenant_id,
         )
         return {
             "id": str(record["request_id"]),

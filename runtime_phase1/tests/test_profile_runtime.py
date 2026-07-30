@@ -4395,8 +4395,10 @@ def test_host_claude_conversation_mode_uses_native_stream_json_without_changing_
 
     assert conversation_command[conversation_command.index("--output-format") + 1] == "stream-json"
     assert "--verbose" in conversation_command
+    assert "--include-partial-messages" in conversation_command
     assert mission_command[mission_command.index("--output-format") + 1] == "json"
     assert "--verbose" not in mission_command
+    assert "--include-partial-messages" not in mission_command
 
 
 @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])

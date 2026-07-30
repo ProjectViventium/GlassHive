@@ -56,10 +56,50 @@ def _payload(workspace: Path, *, model: str = "codex-cli:gpt-5.6-sol", stream: b
 
 
 def _client(tmp_path: Path, monkeypatch, runtime=None) -> TestClient:
-    monkeypatch.setenv("WPR_API_TOKEN", "provider-test-token")
+    monkeypatch.setenv("WPR_API_TOKEN", "runtime-admin-token")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_API_KEY", "provider-test-token")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_PRINCIPAL_ID", "owner-a")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_TENANT_ID", "local")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_TRUST_IDENTITY_HEADERS", "1")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ALLOW_FULL_ACCESS", "1")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_DEFAULT_ACCESS", "full")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_DEFAULT_WORKSPACE", str(tmp_path))
     monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "1")
     monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,claude-code")
     monkeypatch.setenv("GLASSHIVE_PROVIDER_ALLOWED_WORKSPACE_ROOTS", str(tmp_path))
+    return TestClient(
+        create_app(
+            str(tmp_path / "runtime.db"),
+            runtime_backend="stub",
+            runtime=runtime or StubRuntime(),
+        )
+    )
+
+
+def _scoped_client(
+    tmp_path: Path,
+    monkeypatch,
+    runtime=None,
+    *,
+    trust_identity_headers: bool = False,
+    allow_full_access: bool = False,
+) -> TestClient:
+    monkeypatch.setenv("WPR_API_TOKEN", "runtime-admin-token")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_API_KEY", "provider-test-token")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_PRINCIPAL_ID", "owner-a")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_TENANT_ID", "local")
+    monkeypatch.setenv(
+        "GLASSHIVE_PROVIDER_TRUST_IDENTITY_HEADERS",
+        "1" if trust_identity_headers else "0",
+    )
+    monkeypatch.setenv(
+        "GLASSHIVE_PROVIDER_ALLOW_FULL_ACCESS",
+        "1" if allow_full_access else "0",
+    )
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_DEFAULT_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ALLOWED_WORKSPACE_ROOTS", str(tmp_path))
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "1")
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,claude-code")
     return TestClient(
         create_app(
             str(tmp_path / "runtime.db"),
@@ -207,6 +247,143 @@ def test_models_expose_exact_harness_registry(tmp_path, monkeypatch):
     assert all(model["capabilities"]["activity_stream"] for model in models.values())
     assert all(model["capabilities"]["conversation_session"] for model in models.values())
     assert all(model["readiness"]["status"] for model in models.values())
+
+
+def test_provider_credential_is_scoped_and_standard_request_needs_no_viventium_headers(
+    tmp_path, monkeypatch
+):
+    client = _scoped_client(tmp_path, monkeypatch)
+
+    models = client.get(
+        "/v1/models",
+        headers={"Authorization": "Bearer provider-test-token"},
+    )
+    admin_on_provider = client.get(
+        "/v1/models",
+        headers={"Authorization": "Bearer runtime-admin-token"},
+    )
+    provider_on_runtime = client.get(
+        "/v1/projects",
+        headers={"Authorization": "Bearer provider-test-token"},
+    )
+    completion = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer provider-test-token"},
+        json={
+            "model": "codex-cli:gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "Portable hello."}],
+        },
+    )
+
+    assert models.status_code == 200
+    assert admin_on_provider.status_code == 401
+    assert provider_on_runtime.status_code == 401
+    assert completion.status_code == 200, completion.text
+    sessions = client.app.state.store.list_provider_sessions(owner_id="owner-a")
+    assert len(sessions) == 1
+    assert sessions[0]["tenant_id"] == "local"
+    assert sessions[0]["workspace_dir"] == str(tmp_path.resolve())
+    assert sessions[0]["access_mode"] == "workspace"
+
+
+def test_identity_delegation_and_full_access_require_server_side_grants(tmp_path, monkeypatch):
+    client = _scoped_client(tmp_path, monkeypatch)
+    payload = _payload(tmp_path)
+    payload["metadata"]["owner_id"] = "owner-b"
+
+    impersonation = client.post(
+        "/v1/chat/completions",
+        headers={
+            "Authorization": "Bearer provider-test-token",
+            "X-Viventium-User-Id": "owner-b",
+        },
+        json=payload,
+    )
+
+    payload = _payload(tmp_path)
+    payload["metadata"]["glasshive_options"]["access"] = "full"
+    full_access = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer provider-test-token"},
+        json=payload,
+    )
+
+    assert impersonation.status_code == 403
+    assert full_access.status_code == 403
+    assert impersonation.json()["error"]["code"] == "permission_denied"
+    assert full_access.json()["error"]["code"] == "permission_denied"
+
+
+def test_trusted_service_credential_can_delegate_owner_and_full_access(tmp_path, monkeypatch):
+    client = _scoped_client(
+        tmp_path,
+        monkeypatch,
+        trust_identity_headers=True,
+        allow_full_access=True,
+    )
+    payload = _payload(tmp_path)
+    payload["metadata"]["owner_id"] = "owner-b"
+    payload["metadata"]["glasshive_options"]["access"] = "full"
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={
+            "Authorization": "Bearer provider-test-token",
+            "X-Viventium-User-Id": "owner-b",
+        },
+        json=payload,
+    )
+
+    assert response.status_code == 200, response.text
+    sessions = client.app.state.store.list_provider_sessions(owner_id="owner-b")
+    assert len(sessions) == 1
+    assert sessions[0]["access_mode"] == "full"
+
+
+def test_unsupported_parameters_and_validation_errors_use_openai_error_envelope(
+    tmp_path, monkeypatch
+):
+    client = _scoped_client(tmp_path, monkeypatch)
+
+    unsupported = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer provider-test-token"},
+        json={
+            "model": "codex-cli:gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "Hello."}],
+            "temperature": 0.2,
+        },
+    )
+    invalid = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer provider-test-token"},
+        json={"model": "codex-cli:gpt-5.6-sol", "messages": []},
+    )
+
+    assert unsupported.status_code == 400
+    assert unsupported.json()["error"]["type"] == "invalid_request_error"
+    assert unsupported.json()["error"]["code"] == "unsupported_parameter"
+    assert invalid.status_code == 400
+    assert invalid.json()["error"]["type"] == "invalid_request_error"
+    assert invalid.json()["error"]["code"] == "invalid_request"
+
+
+def test_identical_requests_without_explicit_idempotency_start_distinct_runs(
+    tmp_path, monkeypatch
+):
+    client = _scoped_client(tmp_path, monkeypatch)
+    request = {
+        "model": "codex-cli:gpt-5.6-sol",
+        "messages": [{"role": "user", "content": "Run this twice."}],
+    }
+    headers = {"Authorization": "Bearer provider-test-token"}
+
+    first = client.post("/v1/chat/completions", headers=headers, json=request)
+    second = client.post("/v1/chat/completions", headers=headers, json=request)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["id"] != second.json()["id"]
 
 
 def test_readiness_does_not_treat_placeholder_provider_tokens_as_authentication(
@@ -551,7 +728,9 @@ def test_completion_persists_native_activity_once_and_hides_internal_source_ids(
     assert "source_event_id" not in json.dumps(first)
 
 
-def test_invalid_model_and_missing_authenticated_metadata_fail_loudly(tmp_path, monkeypatch):
+def test_invalid_model_fails_loudly_and_missing_optional_agent_metadata_is_defaulted(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / "Life"
     workspace.mkdir()
     client = _client(tmp_path, monkeypatch)
@@ -565,8 +744,9 @@ def test_invalid_model_and_missing_authenticated_metadata_fail_loudly(tmp_path, 
     payload = _payload(workspace)
     del payload["metadata"]["agent_id"]
     missing = client.post("/v1/chat/completions", headers=AUTH, json=payload)
-    assert missing.status_code == 422
-    assert "agent_id" in missing.text
+    assert missing.status_code == 200, missing.text
+    sessions = client.app.state.store.list_provider_sessions(owner_id="owner-a")
+    assert any(session["agent_id"] == "glasshive-direct" for session in sessions)
 
 
 def test_relative_custom_workspace_fails_loudly_before_native_execution(tmp_path, monkeypatch):
@@ -585,6 +765,7 @@ def test_provider_routes_fail_closed_when_service_authentication_is_not_configur
     tmp_path, monkeypatch
 ):
     monkeypatch.delenv("WPR_API_TOKEN", raising=False)
+    monkeypatch.delenv("GLASSHIVE_PROVIDER_API_KEY", raising=False)
     monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "1")
     client = TestClient(
         create_app(
@@ -597,7 +778,8 @@ def test_provider_routes_fail_closed_when_service_authentication_is_not_configur
     response = client.get("/v1/models", headers=AUTH)
 
     assert response.status_code == 503
-    assert response.json()["detail"] == "GlassHive provider authentication is not configured"
+    assert response.json()["error"]["code"] == "service_unavailable"
+    assert response.json()["error"]["message"] == "GlassHive provider authentication is not configured"
 
 
 def test_openai_compatible_request_hydrates_structured_metadata_from_headers(tmp_path, monkeypatch):
@@ -758,6 +940,16 @@ def test_streaming_redactor_handles_secrets_split_across_chunks():
     assert GLASSHIVE_MODELS["codex-cli:gpt-5.6-sol"].recommended_effort == "medium"
 
 
+def test_streaming_redactor_emits_safe_text_before_newline_or_terminal_flush():
+    redactor = StreamingRedactor(overlap=16)
+
+    first = redactor.feed("A safe response can arrive word by word without waiting for a newline")
+    final = redactor.flush()
+
+    assert first
+    assert first + final == "A safe response can arrive word by word without waiting for a newline"
+
+
 def test_streaming_redactor_redacts_newline_split_home_path_and_bounds_long_lines():
     redactor = StreamingRedactor(overlap=16, max_buffer=64)
 
@@ -809,6 +1001,42 @@ def test_native_visible_text_never_falls_back_to_raw_ndjson_or_thinking():
 
     assert _native_visible_text("claude-code", raw) == "Safe visible answer."
     assert _native_visible_text("unknown-profile", raw) == ""
+
+
+def test_native_visible_text_streams_claude_partial_text_without_hidden_thinking():
+    raw = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "delta": {"type": "thinking_delta", "thinking": "hidden"},
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": "Visible "},
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": "answer."},
+                    },
+                }
+            ),
+        ]
+    )
+
+    assert _native_visible_text("claude-code", raw) == "Visible answer."
 
 
 def test_native_usage_ignores_non_usage_events_and_normalizes_counts():

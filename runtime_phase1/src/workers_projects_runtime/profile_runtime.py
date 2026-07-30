@@ -5071,7 +5071,7 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
             model,
         ]
         if self._conversation_mode_from_worker(worker):
-            command.append("--verbose")
+            command.extend(["--verbose", "--include-partial-messages"])
             mcp_path = self._state_dir(str(worker["worker_id"])) / "conversation-mcp.json"
             if mcp_path.is_file():
                 command.extend(["--mcp-config", str(mcp_path), "--strict-mcp-config"])
