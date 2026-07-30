@@ -84,6 +84,8 @@ class HarnessModel:
                 "conversation_session": True,
                 "native_tools": True,
                 "activity_stream": True,
+                "chat_completions": True,
+                "responses_api": True,
                 # Claude's stream-json transport currently exposes text deltas. Codex exec
                 # --json exposes safe activity while working and the assistant text at completion.
                 "incremental_text": self.harness_profile == "claude-code",
@@ -261,6 +263,49 @@ class ChatCompletionRequest(BaseModel):
         return self
 
 
+class ResponsesReasoning(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    effort: str | None = None
+
+
+class ResponsesConversation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=256)
+
+
+class ResponsesRequest(BaseModel):
+    """Portable text/message subset of the OpenAI Responses create contract."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    input: str | list[dict[str, Any]]
+    instructions: str | None = None
+    stream: bool = False
+    reasoning: ResponsesReasoning | None = None
+    previous_response_id: str | None = None
+    conversation: str | ResponsesConversation | None = None
+    metadata: dict[str, str] | None = None
+    max_output_tokens: int | None = Field(default=None, gt=0)
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    top_p: float | None = Field(default=None, ge=0, le=1)
+    store: bool = False
+    background: bool = False
+    service_tier: str | None = None
+
+    @model_validator(mode="after")
+    def validate_supported_shape(self):
+        if isinstance(self.input, list) and not self.input:
+            raise ValueError("Responses input must not be empty")
+        if self.previous_response_id and self.conversation is not None:
+            raise ValueError("previous_response_id and conversation cannot be used together")
+        if self.background:
+            raise ValueError("Background Responses are not supported by this endpoint")
+        return self
+
+
 class StreamingRedactor:
     """Redact bounded stream segments while retaining sensitive split-token prefixes."""
 
@@ -315,7 +360,7 @@ def _message_text(content: Any) -> str:
         if not isinstance(item, dict):
             continue
         item_type = str(item.get("type") or "")
-        if item_type in {"text", "input_text"}:
+        if item_type in {"text", "input_text", "output_text"}:
             parts.append(str(item.get("text") or item.get("input_text") or ""))
         elif item_type in {"image_url", "input_image", "file", "input_file"}:
             label = str(item.get("name") or item.get("filename") or item_type)
@@ -368,6 +413,58 @@ def _history_instruction(messages: Iterable[ChatMessage], *, start_at: int = 0) 
         if text:
             lines.append(f"[{role}]\n{text}")
     return "\n\n".join(lines).strip()
+
+
+def _responses_request_id(response_id: str) -> str:
+    normalized = str(response_id or "").strip()
+    if normalized.startswith("resp_gh-"):
+        return "chatcmpl-gh-" + normalized.removeprefix("resp_gh-")
+    return normalized
+
+
+def _responses_id(request_id: str) -> str:
+    normalized = str(request_id or "").strip()
+    if normalized.startswith("chatcmpl-gh-"):
+        return "resp_gh-" + normalized.removeprefix("chatcmpl-gh-")
+    return normalized
+
+
+def _responses_input_messages(payload: ResponsesRequest) -> list[ChatMessage]:
+    messages: list[ChatMessage] = []
+    if str(payload.instructions or "").strip():
+        messages.append(ChatMessage(role="developer", content=str(payload.instructions).strip()))
+    if isinstance(payload.input, str):
+        text = payload.input.strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="Responses input must not be empty")
+        messages.append(ChatMessage(role="user", content=text))
+        return messages
+
+    for item in payload.input:
+        item_type = str(item.get("type") or "message").strip()
+        if item_type != "message":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported Responses input item type '{item_type}'",
+            )
+        role = str(item.get("role") or "").strip().lower()
+        if role not in {"system", "developer", "user", "assistant"}:
+            raise HTTPException(status_code=400, detail="Responses message role is invalid")
+        content = item.get("content", "")
+        if isinstance(content, list):
+            for part in content:
+                part_type = str(part.get("type") or "") if isinstance(part, dict) else ""
+                if part_type not in {"text", "input_text", "output_text"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unsupported Responses content part type '{part_type or 'unknown'}'",
+                    )
+        text = _message_text(content).strip()
+        if text:
+            messages.append(ChatMessage(role=role, content=text))
+    if not messages or all(message.role in {"system", "developer"} for message in messages):
+        raise HTTPException(status_code=400, detail="Responses input must include visible message text")
+    return messages
 
 
 def _canonical_life_dir() -> Path:
@@ -453,7 +550,11 @@ def _hydrate_metadata(
 ) -> ChatCompletionRequest:
     """Apply authenticated defaults and optional trusted service context."""
 
-    incoming = payload.metadata.model_dump(mode="python") if payload.metadata is not None else {}
+    incoming = (
+        payload.metadata.model_dump(mode="python", exclude_unset=True)
+        if payload.metadata is not None
+        else {}
+    )
     asserted_owner = _header(request, "x-viventium-user-id")
     incoming_owner = str(incoming.get("owner_id") or "").strip()
     if asserted_owner and incoming_owner and asserted_owner != incoming_owner:
@@ -507,6 +608,65 @@ def _hydrate_metadata(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return payload.model_copy(update={"metadata": hydrated})
+
+
+def _chat_request_from_responses(
+    payload: ResponsesRequest,
+    request: Request,
+    auth: ProviderAuthContext,
+    store: Store,
+    *,
+    owner_id: str,
+) -> ChatCompletionRequest:
+    metadata = CompletionMetadata(owner_id=owner_id)
+    if payload.previous_response_id:
+        previous_id = _responses_request_id(payload.previous_response_id)
+        previous = store.get_provider_request(previous_id)
+        if not previous:
+            raise HTTPException(status_code=404, detail="Previous GlassHive response was not found")
+        if (
+            str(previous.get("tenant_id") or "local") != auth.tenant_id
+            or str(previous.get("owner_id") or "") != owner_id
+        ):
+            raise HTTPException(status_code=403, detail="Previous GlassHive response belongs to another owner")
+        session = store.get_provider_session_by_id(str(previous.get("session_id") or ""))
+        if not session:
+            raise HTTPException(status_code=409, detail="Previous GlassHive response session is unavailable")
+        if str(session.get("model_id") or "") != payload.model:
+            raise HTTPException(
+                status_code=409,
+                detail="Changing model with previous_response_id requires complete visible input history",
+            )
+        metadata = CompletionMetadata(
+            owner_id=owner_id,
+            conversation_id=str(session["conversation_id"]),
+            agent_id=str(session["agent_id"]),
+        )
+    elif payload.conversation is not None:
+        conversation_ref = (
+            payload.conversation
+            if isinstance(payload.conversation, str)
+            else payload.conversation.id
+        )
+        metadata = CompletionMetadata(
+            owner_id=owner_id,
+            conversation_id=f"responses:{conversation_ref}",
+            agent_id="glasshive-responses",
+        )
+    chat_payload = ChatCompletionRequest(
+        model=payload.model,
+        messages=_responses_input_messages(payload),
+        stream=payload.stream,
+        stream_options=ChatStreamOptions(include_usage=True) if payload.stream else None,
+        metadata=metadata,
+        reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
+        temperature=payload.temperature,
+        top_p=payload.top_p,
+        max_completion_tokens=payload.max_output_tokens,
+        store=payload.store,
+        service_tier=payload.service_tier,
+    )
+    return _hydrate_metadata(chat_payload, request, auth)
 
 
 def _resolve_workspace(options: GlassHiveOptions) -> Path:
@@ -1570,6 +1730,257 @@ class ConversationProvider:
             return {"request_id": "", "state": "cancelled"}
 
 
+def _responses_usage(chat_usage: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not chat_usage:
+        return None
+    input_tokens = int(chat_usage.get("prompt_tokens") or 0)
+    output_tokens = int(chat_usage.get("completion_tokens") or 0)
+    return {
+        "input_tokens": input_tokens,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": output_tokens,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": int(chat_usage.get("total_tokens") or input_tokens + output_tokens),
+    }
+
+
+def _responses_payload(
+    request_id: str,
+    payload: ResponsesRequest,
+    *,
+    text: str = "",
+    status: Literal["in_progress", "completed", "failed", "cancelled"] = "completed",
+    usage: dict[str, Any] | None = None,
+    created_at: int | None = None,
+    error: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    response_id = _responses_id(request_id)
+    item_id = f"msg_{response_id.removeprefix('resp_')}"
+    output = []
+    if status == "completed":
+        output = [
+            {
+                "id": item_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": [],
+                        "logprobs": [],
+                    }
+                ],
+                "phase": "final_answer",
+            }
+        ]
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(created_at or time.time()),
+        "status": status,
+        "background": False,
+        "completed_at": int(time.time()) if status == "completed" else None,
+        "error": error,
+        "incomplete_details": None,
+        "instructions": payload.instructions,
+        "max_output_tokens": payload.max_output_tokens,
+        "model": payload.model,
+        "output": output,
+        "output_text": text if status == "completed" else "",
+        "parallel_tool_calls": True,
+        "previous_response_id": payload.previous_response_id,
+        "reasoning": {
+            "effort": payload.reasoning.effort if payload.reasoning else None,
+            "summary": None,
+        },
+        "service_tier": payload.service_tier or "default",
+        "store": payload.store,
+        "temperature": payload.temperature,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": payload.top_p,
+        "truncation": "disabled",
+        "usage": _responses_usage(usage),
+        "metadata": payload.metadata or {},
+        "glasshive": {
+            "request_id": request_id,
+            "activity_url": f"/v1/requests/{request_id}/activity",
+        },
+    }
+
+
+def _responses_from_chat(
+    chat_response: dict[str, Any],
+    payload: ResponsesRequest,
+) -> dict[str, Any]:
+    message = ((chat_response.get("choices") or [{}])[0].get("message") or {})
+    response = _responses_payload(
+        str(chat_response["id"]),
+        payload,
+        text=str(message.get("content") or ""),
+        status="completed",
+        usage=chat_response.get("usage"),
+        created_at=int(chat_response.get("created") or time.time()),
+    )
+    response["glasshive"]["usage_source"] = (
+        (chat_response.get("glasshive") or {}).get("usage_source") or "estimated"
+    )
+    return response
+
+
+def _responses_sse(event_type: str, sequence_number: int, **fields: Any) -> str:
+    event = {"type": event_type, "sequence_number": sequence_number, **fields}
+    return (
+        f"event: {event_type}\n"
+        f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
+    )
+
+
+async def _responses_stream(
+    provider: ConversationProvider,
+    request_record: dict[str, Any],
+    responses_payload: ResponsesRequest,
+    chat_payload: ChatCompletionRequest,
+    request: Request,
+):
+    request_id = str(request_record["request_id"])
+    created_at = int(time.time())
+    sequence = 0
+    initial_response = _responses_payload(
+        request_id,
+        responses_payload,
+        status="in_progress",
+        created_at=created_at,
+    )
+    yield _responses_sse("response.created", sequence, response=initial_response)
+    sequence += 1
+    yield _responses_sse("response.in_progress", sequence, response=initial_response)
+    sequence += 1
+    response_id = _responses_id(request_id)
+    item_id = f"msg_{response_id.removeprefix('resp_')}"
+    in_progress_item = {
+        "id": item_id,
+        "type": "message",
+        "status": "in_progress",
+        "role": "assistant",
+        "content": [],
+        "phase": "final_answer",
+    }
+    yield _responses_sse(
+        "response.output_item.added",
+        sequence,
+        output_index=0,
+        item=in_progress_item,
+    )
+    sequence += 1
+    empty_part = {"type": "output_text", "text": "", "annotations": [], "logprobs": []}
+    yield _responses_sse(
+        "response.content_part.added",
+        sequence,
+        item_id=item_id,
+        output_index=0,
+        content_index=0,
+        part=empty_part,
+    )
+    sequence += 1
+    output_text = ""
+    usage: dict[str, Any] | None = None
+    runtime_error: dict[str, Any] | None = None
+    async for chunk in provider.stream(request_record, chat_payload, request):
+        if chunk.startswith(":"):
+            yield chunk
+            continue
+        if not chunk.startswith("data: "):
+            continue
+        raw = chunk.removeprefix("data: ").strip()
+        if raw == "[DONE]":
+            break
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event.get("usage"), dict):
+            usage = event["usage"]
+        if isinstance(event.get("error"), dict):
+            runtime_error = event["error"]
+        choices = event.get("choices") or []
+        delta = choices[0].get("delta") if choices else {}
+        text_delta = str((delta or {}).get("content") or "")
+        if text_delta:
+            output_text += text_delta
+            yield _responses_sse(
+                "response.output_text.delta",
+                sequence,
+                item_id=item_id,
+                output_index=0,
+                content_index=0,
+                delta=text_delta,
+                logprobs=[],
+            )
+            sequence += 1
+    if runtime_error:
+        error = {
+            "code": "glasshive_runtime_error",
+            "message": _redact_text(str(runtime_error.get("message") or "GlassHive run failed")),
+        }
+        yield _responses_sse("error", sequence, code=error["code"], message=error["message"], param=None)
+        sequence += 1
+        failed_response = _responses_payload(
+            request_id,
+            responses_payload,
+            status="failed",
+            created_at=created_at,
+            error=error,
+        )
+        yield _responses_sse("response.failed", sequence, response=failed_response)
+        return
+    done_part = {
+        "type": "output_text",
+        "text": output_text,
+        "annotations": [],
+        "logprobs": [],
+    }
+    yield _responses_sse(
+        "response.output_text.done",
+        sequence,
+        item_id=item_id,
+        output_index=0,
+        content_index=0,
+        text=output_text,
+        logprobs=[],
+    )
+    sequence += 1
+    yield _responses_sse(
+        "response.content_part.done",
+        sequence,
+        item_id=item_id,
+        output_index=0,
+        content_index=0,
+        part=done_part,
+    )
+    sequence += 1
+    completed_item = {**in_progress_item, "status": "completed", "content": [done_part]}
+    yield _responses_sse(
+        "response.output_item.done",
+        sequence,
+        output_index=0,
+        item=completed_item,
+    )
+    sequence += 1
+    completed_response = _responses_payload(
+        request_id,
+        responses_payload,
+        text=output_text,
+        status="completed",
+        usage=usage,
+        created_at=created_at,
+    )
+    yield _responses_sse("response.completed", sequence, response=completed_response)
+
+
 def _redact_json_value(value: Any) -> Any:
     """Redact every string in an activity payload before it crosses the provider boundary."""
     if isinstance(value, str):
@@ -1582,7 +1993,11 @@ def _redact_json_value(value: Any) -> Any:
 
 
 def _is_provider_path(path: str) -> bool:
-    return path in {"/v1/models", "/v1/chat/completions"} or path.startswith("/v1/requests/")
+    return (
+        path in {"/v1/models", "/v1/chat/completions", "/v1/responses"}
+        or path.startswith("/v1/responses/")
+        or path.startswith("/v1/requests/")
+    )
 
 
 def _openai_error(status_code: int, message: str, code: str, *, param: str | None = None) -> JSONResponse:
@@ -1661,7 +2076,7 @@ def install_conversation_provider_routes(
                 "unsupported_parameter",
                 param=param,
             )
-        return _openai_error(400, "Invalid chat completion request", "invalid_request")
+        return _openai_error(400, "Invalid GlassHive provider request", "invalid_request")
 
     def require_provider_auth(request: Request) -> ProviderAuthContext:
         expected = str(provider_token or "").strip()
@@ -1705,6 +2120,33 @@ def install_conversation_provider_routes(
             )
         record, run = await asyncio.to_thread(provider.wait, str(record["request_id"]))
         return JSONResponse(provider.response_payload(record, run, payload))
+
+    @app.post("/v1/responses")
+    async def glasshive_responses(payload: ResponsesRequest, request: Request):
+        auth = require_provider_auth(request)
+        owner_id = owner_for_request(request, auth)
+        chat_payload = _chat_request_from_responses(
+            payload,
+            request,
+            auth,
+            store,
+            owner_id=owner_id,
+        )
+        record = await asyncio.to_thread(provider.start, chat_payload, tenant_id=auth.tenant_id)
+        if payload.stream:
+            return StreamingResponse(
+                _responses_stream(provider, record, payload, chat_payload, request),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache, no-transform",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "X-GlassHive-Request-Id": str(record["request_id"]),
+                },
+            )
+        record, run = await asyncio.to_thread(provider.wait, str(record["request_id"]))
+        chat_response = provider.response_payload(record, run, chat_payload)
+        return JSONResponse(_responses_from_chat(chat_response, payload))
 
     @app.get("/v1/requests/{request_id}/activity")
     async def glasshive_activity(request_id: str, request: Request):

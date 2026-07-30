@@ -717,6 +717,13 @@ def test_retryable_host_busy_waits_and_retries_without_terminal_failure(tmp_path
         completed = store.get_run(run["run_id"])
         assert completed["state"] == "completed"
         assert "Completed after capacity wait" in completed["output_text"]
+        assert completed["failure_class"] == ""
+        assert completed["failure_retryable"] == 0
+        assert completed["failure_user_message"] == ""
+        assert completed["failure_recommended_recovery"] == ""
+        assert completed["failure_diagnostic_summary"] == ""
+        assert completed["error_text"] == ""
+        assert completed["last_retry_class"] == "host_worker_busy"
         assert runtime.run_calls == 1
         assert not any(payload.get("event") == "run.failed" for payload in payloads)
     finally:

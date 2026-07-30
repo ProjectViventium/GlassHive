@@ -1153,7 +1153,19 @@ class Store:
                 return None
             started_at = utc_now()
             conn.execute(
-                "UPDATE runs SET state = 'running', started_at = ?, retry_after = NULL WHERE run_id = ?",
+                """
+                UPDATE runs
+                SET state = 'running',
+                    started_at = ?,
+                    retry_after = NULL,
+                    error_text = '',
+                    failure_class = '',
+                    failure_retryable = 0,
+                    failure_user_message = '',
+                    failure_recommended_recovery = '',
+                    failure_diagnostic_summary = ''
+                WHERE run_id = ?
+                """,
                 (started_at, row["run_id"]),
             )
             claimed = conn.execute("SELECT * FROM runs WHERE run_id = ?", (row["run_id"],)).fetchone()

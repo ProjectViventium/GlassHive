@@ -328,6 +328,8 @@ def test_models_expose_exact_harness_registry(tmp_path, monkeypatch):
     ]
     assert all(model["capabilities"]["activity_stream"] for model in models.values())
     assert all(model["capabilities"]["conversation_session"] for model in models.values())
+    assert all(model["capabilities"]["chat_completions"] for model in models.values())
+    assert all(model["capabilities"]["responses_api"] for model in models.values())
     assert models["codex-cli:gpt-5.6-sol"]["capabilities"]["incremental_text"] is False
     assert models["claude-code:opus"]["capabilities"]["incremental_text"] is True
     assert all(model["readiness"]["status"] for model in models.values())
@@ -376,6 +378,155 @@ def test_provider_credential_is_scoped_and_standard_request_needs_no_viventium_h
     assert sessions[0]["tenant_id"] == "local"
     assert sessions[0]["workspace_dir"] == str(tmp_path.resolve())
     assert sessions[0]["access_mode"] == "workspace"
+
+
+def test_standard_responses_request_uses_the_same_provider_core(tmp_path, monkeypatch):
+    client = _scoped_client(tmp_path, monkeypatch)
+
+    response = client.post(
+        "/v1/responses",
+        headers={"Authorization": "Bearer provider-test-token"},
+        json={
+            "model": "codex-cli:gpt-5.6-sol",
+            "instructions": "Be concise.",
+            "input": "Portable Responses hello.",
+            "reasoning": {"effort": "medium"},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["id"].startswith("resp_")
+    assert body["object"] == "response"
+    assert body["status"] == "completed"
+    assert body["model"] == "codex-cli:gpt-5.6-sol"
+    assert body["output"][0]["type"] == "message"
+    assert body["output"][0]["role"] == "assistant"
+    assert body["output"][0]["content"][0]["type"] == "output_text"
+    assert "Portable Responses hello." in body["output_text"]
+    assert body["usage"]["total_tokens"] > 0
+    assert body["glasshive"]["activity_url"].endswith("/activity")
+    sessions = client.app.state.store.list_provider_sessions(owner_id="owner-a")
+    assert len(sessions) == 1
+    request = client.app.state.store.get_provider_request(body["glasshive"]["request_id"])
+    assert request["session_id"] == sessions[0]["session_id"]
+
+
+def test_responses_previous_response_id_reuses_only_the_authenticated_session(
+    tmp_path, monkeypatch
+):
+    client = _client(tmp_path, monkeypatch)
+    first = client.post(
+        "/v1/responses",
+        headers=AUTH,
+        json={
+            "model": "codex-cli:gpt-5.6-sol",
+            "input": [
+                {"role": "developer", "content": "Answer naturally."},
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "First turn."}],
+                },
+            ],
+        },
+    )
+    assert first.status_code == 200, first.text
+
+    follow_up = client.post(
+        "/v1/responses",
+        headers=AUTH,
+        json={
+            "model": "codex-cli:gpt-5.6-sol",
+            "input": "Second turn.",
+            "previous_response_id": first.json()["id"],
+        },
+    )
+    cross_owner = client.post(
+        "/v1/responses",
+        headers={
+            "Authorization": "Bearer provider-test-token",
+            "X-Viventium-User-Id": "owner-b",
+        },
+        json={
+            "model": "codex-cli:gpt-5.6-sol",
+            "input": "Attempt cross-owner resume.",
+            "previous_response_id": first.json()["id"],
+        },
+    )
+
+    assert follow_up.status_code == 200, follow_up.text
+    first_request = client.app.state.store.get_provider_request(
+        first.json()["glasshive"]["request_id"]
+    )
+    second_request = client.app.state.store.get_provider_request(
+        follow_up.json()["glasshive"]["request_id"]
+    )
+    assert first_request["session_id"] == second_request["session_id"]
+    assert follow_up.json()["previous_response_id"] == first.json()["id"]
+    assert cross_owner.status_code == 403
+    assert cross_owner.json()["error"]["code"] == "permission_denied"
+
+
+def test_responses_stream_emits_typed_monotonic_events(tmp_path, monkeypatch):
+    client = _scoped_client(tmp_path, monkeypatch)
+
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        headers={"Authorization": "Bearer provider-test-token"},
+        json={
+            "model": "codex-cli:gpt-5.6-sol",
+            "input": "Portable Responses stream.",
+            "stream": True,
+        },
+    ) as response:
+        assert response.status_code == 200, response.text
+        lines = [line for line in response.iter_lines() if line]
+
+    events = []
+    current_event = ""
+    for line in lines:
+        if line.startswith("event: "):
+            current_event = line.removeprefix("event: ")
+        elif line.startswith("data: "):
+            payload = json.loads(line.removeprefix("data: "))
+            assert payload["type"] == current_event
+            events.append(payload)
+    event_types = [event["type"] for event in events]
+    assert event_types[0] == "response.created"
+    assert "response.output_text.delta" in event_types
+    assert event_types[-1] == "response.completed"
+    assert [event["sequence_number"] for event in events] == list(range(len(events)))
+    assert events[-1]["response"]["status"] == "completed"
+    assert "Portable Responses stream." in events[-1]["response"]["output_text"]
+
+
+def test_responses_unsupported_or_non_text_shapes_fail_visibly(tmp_path, monkeypatch):
+    client = _scoped_client(tmp_path, monkeypatch)
+
+    unsupported_tools = client.post(
+        "/v1/responses",
+        headers={"Authorization": "Bearer provider-test-token"},
+        json={
+            "model": "codex-cli:gpt-5.6-sol",
+            "input": "Hello.",
+            "tools": [{"type": "function", "name": "wrapper_tool"}],
+        },
+    )
+    unsupported_item = client.post(
+        "/v1/responses",
+        headers={"Authorization": "Bearer provider-test-token"},
+        json={
+            "model": "codex-cli:gpt-5.6-sol",
+            "input": [{"type": "computer_call_output", "call_id": "call-1", "output": "x"}],
+        },
+    )
+
+    assert unsupported_tools.status_code == 400
+    assert unsupported_tools.json()["error"]["code"] == "unsupported_parameter"
+    assert unsupported_tools.json()["error"]["param"] == "tools"
+    assert unsupported_item.status_code == 400
+    assert unsupported_item.json()["error"]["code"] == "invalid_request"
 
 
 def test_standard_stream_options_and_user_are_openai_compatible(tmp_path, monkeypatch):
