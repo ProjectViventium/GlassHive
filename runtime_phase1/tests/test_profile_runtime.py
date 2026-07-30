@@ -18,6 +18,12 @@ from workers_projects_runtime.profile_runtime import BaseCliWorkerRuntime, Claud
 from workers_projects_runtime.run_evidence import build_constraint_ledger, write_constraint_ledger
 
 
+@pytest.fixture(autouse=True)
+def isolate_host_claude_auth_from_unit_tests(monkeypatch):
+    """Never let command-construction tests read or rotate a developer's real Claude login."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-test-oauth-token")
+
+
 def _patch_host_codex_requirement_probe(monkeypatch):
     monkeypatch.setattr(
         "workers_projects_runtime.runtime_requirements.subprocess.run",
@@ -4492,6 +4498,8 @@ def test_host_claude_private_config_receives_subscription_auth_without_copying_u
                     "claudeAiOauth": {
                         "accessToken": "synthetic-access-token",
                         "refreshToken": "synthetic-refresh-token",
+                        "scopes": ["user:profile", "user:inference"],
+                        "expiresAt": int(time.time() * 1000) + 3_600_000,
                     }
                 }
             ),
@@ -4523,6 +4531,7 @@ def test_host_claude_private_config_receives_subscription_auth_without_copying_u
 
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-access-token"
     assert env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] == "synthetic-refresh-token"
+    assert env["CLAUDE_CODE_OAUTH_SCOPES"] == "user:profile user:inference"
     assert env["CLAUDE_CONFIG_DIR"].startswith(str(tmp_path / "private-state"))
     assert not (life / ".claude").exists()
 
@@ -4555,6 +4564,78 @@ def test_host_claude_private_auth_prefers_explicit_environment_tokens(tmp_path, 
 
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-env-access"
     assert env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] == "synthetic-env-refresh"
+
+
+def test_host_claude_private_auth_refreshes_expired_keychain_token_into_isolated_config(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_SCOPES", raising=False)
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.sys.platform", "darwin"
+    )
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.shutil.which", lambda binary: f"/usr/bin/{binary}"
+    )
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[0] == "security":
+            refreshed = len([call for call, _ in calls if call[0] == "security"]) > 1
+            return subprocess.CompletedProcess(
+                command,
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "claudeAiOauth": {
+                            "accessToken": (
+                                "synthetic-refreshed-access"
+                                if refreshed
+                                else "synthetic-expired-access"
+                            ),
+                            "refreshToken": "synthetic-refresh-token",
+                            "scopes": ["user:profile", "user:inference"],
+                            "expiresAt": int(time.time() * 1000) + (3_600_000 if refreshed else -1),
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        assert command[-2:] == ["auth", "login"]
+        login_env = kwargs["env"]
+        assert "CLAUDE_CONFIG_DIR" not in login_env
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in login_env
+        assert login_env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] == "synthetic-refresh-token"
+        assert login_env["CLAUDE_CODE_OAUTH_SCOPES"] == "user:profile user:inference"
+        return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.subprocess.run", fake_run
+    )
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    worker = {
+        "worker_id": "wrk_claude_expired_auth",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "Life"),
+        "model": "opus",
+        "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
+    }
+
+    _, env = runtime._build_command(
+        worker,
+        "Talk naturally.",
+        runtime._host_runtime_info(worker),
+    )
+
+    assert len(calls) == 3
+    assert calls[1][0][-2:] == ["auth", "login"]
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-refreshed-access"
+    assert env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] == "synthetic-refresh-token"
+    assert env["CLAUDE_CODE_OAUTH_SCOPES"] == "user:profile user:inference"
 
 
 def test_host_mission_mode_retains_workspace_and_completion_contract(tmp_path):

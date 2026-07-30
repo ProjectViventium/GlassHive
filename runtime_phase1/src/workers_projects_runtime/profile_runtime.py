@@ -62,6 +62,7 @@ logger = logging.getLogger(__name__)
 _CODEX_MCP_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 _HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off", "none", "disabled"}
+_CLAUDE_AUTH_REFRESH_LOCK = Lock()
 
 
 def _codex_mcp_section_server_name(section_name: str) -> str | None:
@@ -5018,35 +5019,109 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
 
     def _inject_private_subscription_auth(self, env: dict[str, str]) -> None:
         """Give an isolated Claude config the host subscription without copying user config."""
+        def read_macos_keychain_oauth() -> dict[str, object]:
+            if sys.platform != "darwin" or not shutil.which("security"):
+                return {}
+            completed = subprocess.run(
+                [
+                    "security",
+                    "find-generic-password",
+                    "-s",
+                    "Claude Code-credentials",
+                    "-w",
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+            )
+            credential = json.loads(completed.stdout) if completed.returncode == 0 else {}
+            oauth = credential.get("claudeAiOauth") if isinstance(credential, dict) else {}
+            return oauth if isinstance(oauth, dict) else {}
+
+        def unpack_oauth(oauth: dict[str, object]) -> tuple[str, str, str, int]:
+            raw_scopes = oauth.get("scopes")
+            if isinstance(raw_scopes, list):
+                scope_text = " ".join(
+                    str(scope).strip() for scope in raw_scopes if str(scope).strip()
+                )
+            else:
+                scope_text = str(raw_scopes or "").strip()
+            try:
+                expiry = int(oauth.get("expiresAt") or 0)
+            except (TypeError, ValueError):
+                expiry = 0
+            return (
+                str(oauth.get("accessToken") or "").strip(),
+                str(oauth.get("refreshToken") or "").strip(),
+                scope_text,
+                expiry,
+            )
+
         access_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
         refresh_token = os.environ.get("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "").strip()
+        scopes = os.environ.get("CLAUDE_CODE_OAUTH_SCOPES", "").strip()
+        expires_at_ms = 0
+        explicit_auth = bool(access_token or refresh_token)
         if not access_token and sys.platform == "darwin" and shutil.which("security"):
             try:
-                completed = subprocess.run(
-                    [
-                        "security",
-                        "find-generic-password",
-                        "-s",
-                        "Claude Code-credentials",
-                        "-w",
-                    ],
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    timeout=5,
+                access_token, refresh_token, scopes, expires_at_ms = unpack_oauth(
+                    read_macos_keychain_oauth()
                 )
-                credential = json.loads(completed.stdout) if completed.returncode == 0 else {}
-                oauth = credential.get("claudeAiOauth") if isinstance(credential, dict) else {}
-                if isinstance(oauth, dict):
-                    access_token = str(oauth.get("accessToken") or "").strip()
-                    refresh_token = str(oauth.get("refreshToken") or "").strip()
             except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
                 return
+        token_expires_soon = bool(
+            access_token
+            and expires_at_ms
+            and expires_at_ms <= int(time.time() * 1000) + 300_000
+        )
+        if token_expires_soon and refresh_token and scopes and not explicit_auth:
+            login_env = dict(env)
+            # Refresh the canonical host credential in place. Never rotate the host refresh token
+            # into a one-off worker-specific Keychain service.
+            login_env.pop("CLAUDE_CONFIG_DIR", None)
+            login_env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            login_env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] = refresh_token
+            login_env["CLAUDE_CODE_OAUTH_SCOPES"] = scopes
+            try:
+                with _CLAUDE_AUTH_REFRESH_LOCK:
+                    completed = subprocess.run(
+                        [self.binary, "auth", "login"],
+                        check=False,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        env=login_env,
+                        timeout=30,
+                    )
+            except (OSError, subprocess.TimeoutExpired):
+                completed = None
+            if completed is None or completed.returncode != 0:
+                raise RuntimeErrorBase(
+                    "Claude Code isolated worker authentication refresh failed; run `claude auth login` "
+                    "on the GlassHive host or configure a long-lived CLAUDE_CODE_OAUTH_TOKEN."
+                )
+            try:
+                access_token, refresh_token, scopes, expires_at_ms = unpack_oauth(
+                    read_macos_keychain_oauth()
+                )
+            except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+                raise RuntimeErrorBase(
+                    "Claude Code refreshed the host login but GlassHive could not read the refreshed credential."
+                ) from exc
+            if not access_token or (
+                expires_at_ms and expires_at_ms <= int(time.time() * 1000) + 60_000
+            ):
+                raise RuntimeErrorBase(
+                    "Claude Code host authentication refresh did not produce a usable access token."
+                )
         if access_token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = access_token
         if refresh_token:
             env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] = refresh_token
+        if scopes:
+            env["CLAUDE_CODE_OAUTH_SCOPES"] = scopes
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_key = self._read_session_key(worker["worker_id"])
