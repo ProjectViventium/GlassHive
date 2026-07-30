@@ -3426,6 +3426,17 @@ class HostNativeCliMixin:
         path.chmod(0o700)
         return path
 
+    def _conversation_workspace_side_effect_state(self, workspace: Path) -> dict[str, bool]:
+        _ = workspace
+        return {}
+
+    def _cleanup_conversation_workspace_side_effects(
+        self,
+        workspace: Path,
+        state: dict[str, bool],
+    ) -> None:
+        _ = (workspace, state)
+
     def _agent_type(self) -> str:
         if self.runtime_name == "codex-cli":
             return "codex"
@@ -4266,6 +4277,7 @@ class HostNativeCliMixin:
         env["GLASSHIVE_RUN_ID"] = effective_run_id
         env["GLASSHIVE_RUN_MODE"] = "conversation"
         workspace = Path(str(info.workspace_dir or self._host_workspace_dir(worker)))
+        workspace_side_effect_state = self._conversation_workspace_side_effect_state(workspace)
         self._acquire_host_slot(worker)
 
         run_root = self._run_root(str(worker["worker_id"]), effective_run_id)
@@ -4337,6 +4349,20 @@ class HostNativeCliMixin:
         finally:
             self._clear_process(str(worker["worker_id"]))
             self._release_host_slot(str(worker["worker_id"]))
+            try:
+                self._cleanup_conversation_workspace_side_effects(
+                    workspace,
+                    workspace_side_effect_state,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "Failed to clean harness conversation workspace side effect",
+                    extra={
+                        "worker_id": str(worker.get("worker_id") or ""),
+                        "workspace": str(workspace),
+                        "error": str(exc),
+                    },
+                )
 
         exit_path.write_text(str(exit_code))
         exit_path.chmod(0o600)
@@ -4951,6 +4977,33 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
 class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
     worker_root_name = "host_claude_code_runtime"
     binary_env_var = "WPR_CLAUDE_CODE_BIN"
+
+    def _conversation_workspace_side_effect_state(self, workspace: Path) -> dict[str, bool]:
+        claude_dir = workspace / ".claude"
+        marker = claude_dir / ".cc-writes"
+        return {
+            "claude_dir_existed": claude_dir.exists() or claude_dir.is_symlink(),
+            "cc_writes_existed": marker.exists() or marker.is_symlink(),
+        }
+
+    def _cleanup_conversation_workspace_side_effects(
+        self,
+        workspace: Path,
+        state: dict[str, bool],
+    ) -> None:
+        if state.get("cc_writes_existed"):
+            return
+        claude_dir = workspace / ".claude"
+        marker = claude_dir / ".cc-writes"
+        if marker.is_symlink() or marker.is_file():
+            marker.unlink()
+        elif marker.is_dir():
+            shutil.rmtree(marker)
+        if not state.get("claude_dir_existed"):
+            try:
+                claude_dir.rmdir()
+            except FileNotFoundError:
+                pass
 
     def _chrome_supported(self) -> bool:
         return self._help_supports("--chrome")

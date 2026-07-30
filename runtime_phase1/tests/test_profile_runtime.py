@@ -4407,6 +4407,122 @@ def test_host_claude_conversation_mode_uses_native_stream_json_without_changing_
     assert "--include-partial-messages" not in mission_command
 
 
+def test_host_claude_conversation_removes_cli_marker_created_in_life(tmp_path, monkeypatch):
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    life = tmp_path / "Life"
+    life.mkdir()
+    worker = {
+        "worker_id": "wrk_claude_conversation_marker",
+        "name": "Viventium Main",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "workspace_root": str(life),
+        "model": "opus",
+        "bootstrap_bundle_json": json.dumps(
+            {"run_mode": "conversation", "provider_model": "opus", "access_mode": "full"}
+        ),
+    }
+
+    class MarkerCreatingProcess:
+        pid = 12345
+        returncode = 0
+
+        def __init__(self, _command, **kwargs):
+            workspace = Path(kwargs["cwd"])
+            (workspace / ".claude" / ".cc-writes").mkdir(parents=True)
+            stdout = kwargs["stdout"]
+            stdout.write(
+                json.dumps(
+                    {
+                        "type": "result",
+                        "result": "Conversation complete.",
+                        "session_id": "session-marker-cleanup",
+                    }
+                )
+                + "\n"
+            )
+            stdout.flush()
+
+        def communicate(self, input=None, timeout=None):
+            return None, None
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    runtime.ensure_worker_ready = lambda _worker: runtime._host_runtime_info(worker)  # type: ignore[method-assign]
+    runtime._build_command = lambda _worker, _instruction, _info: (["claude"], {})  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.subprocess.Popen", MarkerCreatingProcess
+    )
+
+    result = runtime.run_task(
+        worker,
+        "Talk naturally.",
+        timeout_sec=5,
+        run_id="run_marker_cleanup",
+    )
+
+    assert result == "Conversation complete."
+    assert not (life / ".claude").exists()
+
+
+def test_host_claude_conversation_preserves_preexisting_workspace_content(tmp_path, monkeypatch):
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    life = tmp_path / "Life"
+    marker = life / ".claude" / ".cc-writes"
+    marker.mkdir(parents=True)
+    user_file = marker / "user-owned.txt"
+    user_file.write_text("preserve me\n")
+    worker = {
+        "worker_id": "wrk_claude_conversation_preexisting",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "workspace_root": str(life),
+        "model": "opus",
+        "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
+    }
+
+    class SuccessfulProcess:
+        pid = 12345
+        returncode = 0
+
+        def __init__(self, _command, **kwargs):
+            stdout = kwargs["stdout"]
+            stdout.write(
+                json.dumps(
+                    {
+                        "type": "result",
+                        "result": "Conversation complete.",
+                        "session_id": "session-preserve-workspace",
+                    }
+                )
+                + "\n"
+            )
+            stdout.flush()
+
+        def communicate(self, input=None, timeout=None):
+            return None, None
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    runtime.ensure_worker_ready = lambda _worker: runtime._host_runtime_info(worker)  # type: ignore[method-assign]
+    runtime._build_command = lambda _worker, _instruction, _info: (["claude"], {})  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.subprocess.Popen", SuccessfulProcess
+    )
+
+    runtime.run_task(worker, "Talk naturally.", run_id="run_preserve_workspace")
+
+    assert user_file.read_text() == "preserve me\n"
+
+
 @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
 def test_host_claude_conversation_mode_honors_each_declared_effort(
     tmp_path, monkeypatch, effort
