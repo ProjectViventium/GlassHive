@@ -56,6 +56,8 @@ callable by LibreChat or any ordinary Chat Completions client:
 - `/v1/requests/{request_id}/activity` and `/cancel` add resumable activity and explicit lifecycle
   control without making those extensions prerequisites for a standard client
 - provider, MCP, capability-broker, and runtime administrator credentials are separate
+- streamable-HTTP MCP requires its configured MCP service credential in local and enterprise
+  deployments; stdio remains process-local and does not add an HTTP authentication layer
 
 Viventium may attach owner/session/workspace metadata and a brokered capability bundle. Any bundle
 that can project environment or harness configuration must carry a fresh HMAC signature generated
@@ -84,6 +86,7 @@ Run MCP:
 
 ```bash
 cd <workspace-root>/viventium_v0_4/GlassHive/runtime_phase1
+export GLASSHIVE_MCP_API_KEY="<dedicated-mcp-service-token>"
 uv run python -m workers_projects_runtime.mcp_server --transport streamable-http --port 8767
 ```
 

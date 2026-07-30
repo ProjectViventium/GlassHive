@@ -273,8 +273,13 @@ def create_app(
 
     api_token = os.environ.get("WPR_API_TOKEN", "").strip()
     provider_token = os.environ.get("GLASSHIVE_PROVIDER_API_KEY", "").strip()
+    mcp_token = os.environ.get("GLASSHIVE_MCP_API_KEY", "").strip()
     if api_token and provider_token and hmac.compare_digest(api_token, provider_token):
         raise RuntimeError("GLASSHIVE_PROVIDER_API_KEY must be distinct from WPR_API_TOKEN")
+    if provider_token and mcp_token and hmac.compare_digest(provider_token, mcp_token):
+        raise RuntimeError("GLASSHIVE_MCP_API_KEY must be distinct from GLASSHIVE_PROVIDER_API_KEY")
+    if api_token and mcp_token and hmac.compare_digest(api_token, mcp_token):
+        raise RuntimeError("GLASSHIVE_MCP_API_KEY must be distinct from WPR_API_TOKEN")
     auth_settings = EnterpriseAuthSettings()
     auth_settings.validate_startup(api_token=api_token)
     unauthenticated_prefixes = (

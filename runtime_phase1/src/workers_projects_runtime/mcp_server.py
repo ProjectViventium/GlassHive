@@ -60,10 +60,8 @@ DEFAULT_HOST = os.environ.get("WPR_MCP_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("WPR_MCP_PORT", "8767"))
 DEFAULT_TIMEOUT_SEC = float(os.environ.get("WPR_MCP_TIMEOUT_SEC", "120"))
 DEFAULT_OWNER_ID = os.environ.get("WPR_DEFAULT_OWNER_ID", "").strip()
-DEFAULT_API_TOKEN = (
-    os.environ.get("GLASSHIVE_MCP_API_KEY", "").strip()
-    or os.environ.get("WPR_API_TOKEN", "").strip()
-)
+DEFAULT_API_TOKEN = os.environ.get("WPR_API_TOKEN", "").strip()
+DEFAULT_MCP_API_TOKEN = os.environ.get("GLASSHIVE_MCP_API_KEY", "").strip()
 
 HOST_SIDE_ORCHESTRATION_GUIDANCE = (
     "Preserve host-side GlassHive orchestration requirements as context, but do not turn them into "
@@ -851,7 +849,12 @@ def _token_matches(candidate: str | None, expected: str | None) -> bool:
 def _require_enterprise_mcp_service_auth(headers: dict[str, str]) -> None:
     if not _enterprise_mode_enabled():
         return
-    expected = str(DEFAULT_API_TOKEN or os.environ.get("WPR_API_TOKEN", "")).strip()
+
+    _require_mcp_service_auth(headers)
+
+
+def _require_mcp_service_auth(headers: dict[str, str]) -> None:
+    expected = str(DEFAULT_MCP_API_TOKEN or os.environ.get("GLASSHIVE_MCP_API_KEY", "")).strip()
     if not expected:
         raise PermissionError("GlassHive MCP service authentication is not configured")
     auth_header = str(headers.get("authorization") or "").strip()
@@ -881,16 +884,21 @@ def _require_enterprise_mcp_identity_assertion(headers: dict[str, str]) -> None:
         raise PermissionError("GlassHive MCP requires an authenticated user assertion")
 
 
-class EnterpriseMcpHttpAuthMiddleware(BaseHTTPMiddleware):
+class McpHttpAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if _enterprise_mode_enabled():
-            headers = {key.lower(): value for key, value in request.headers.items()}
-            try:
-                _require_enterprise_mcp_service_auth(headers)
+        headers = {key.lower(): value for key, value in request.headers.items()}
+        try:
+            _require_mcp_service_auth(headers)
+            if _enterprise_mode_enabled():
                 _require_enterprise_mcp_identity_assertion(headers)
-            except PermissionError as exc:
-                return JSONResponse(status_code=401, content={"detail": str(exc)})
+        except PermissionError as exc:
+            return JSONResponse(status_code=401, content={"detail": str(exc)})
         return await call_next(request)
+
+
+# Backward-compatible import name for deployments/tests that referenced the former enterprise-only
+# middleware. HTTP service authentication now applies in both local and enterprise deployments.
+EnterpriseMcpHttpAuthMiddleware = McpHttpAuthMiddleware
 
 
 def _require_enterprise_mcp_transport(transport: str) -> None:
@@ -4902,11 +4910,11 @@ def main() -> None:
 
     _require_enterprise_mcp_transport(args.transport)
     server = create_mcp_server(base_url=args.base_url.rstrip("/"), host=args.host, port=args.port)
-    if args.transport == "streamable-http" and _enterprise_mode_enabled():
+    if args.transport == "streamable-http":
         import uvicorn
 
         app = server.streamable_http_app()
-        app.add_middleware(EnterpriseMcpHttpAuthMiddleware)
+        app.add_middleware(McpHttpAuthMiddleware)
         uvicorn.run(app, host=args.host, port=args.port, access_log=False)
         return
     server.run(transport=args.transport)

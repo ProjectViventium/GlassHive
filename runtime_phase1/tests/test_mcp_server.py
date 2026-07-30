@@ -1154,6 +1154,7 @@ def test_enterprise_mcp_http_auth_middleware_gates_transport_requests(monkeypatc
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-token")
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
 
     async def ok(request):
         return JSONResponse({"ok": True})
@@ -1182,10 +1183,27 @@ def test_enterprise_mcp_http_auth_middleware_gates_transport_requests(monkeypatc
     assert client.post("/mcp", headers={**good_headers, "Authorization": "Bearer service-token"}).status_code == 200
 
 
+def test_local_mcp_http_auth_middleware_requires_distinct_service_credential(monkeypatch):
+    monkeypatch.delenv("GLASSHIVE_ENTERPRISE_MODE", raising=False)
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "mcp-service-token")
+
+    async def ok(request):
+        return JSONResponse({"ok": True})
+
+    app = Starlette(routes=[Route("/mcp", ok, methods=["POST"])])
+    app.add_middleware(mcp_server.McpHttpAuthMiddleware)
+    client = TestClient(app)
+
+    assert client.post("/mcp").status_code == 401
+    assert client.post("/mcp", headers={"Authorization": "Bearer provider-token"}).status_code == 401
+    assert client.post("/mcp", headers={"X-WPR-Token": "mcp-service-token"}).status_code == 200
+    assert client.post("/mcp", headers={"Authorization": "Bearer mcp-service-token"}).status_code == 200
+
+
 def test_enterprise_mcp_requires_service_authentication(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
-    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
 
     with pytest.raises(PermissionError):
         mcp_server._require_enterprise_mcp_service_auth(
@@ -1238,7 +1256,7 @@ def test_enterprise_mcp_requires_service_authentication(monkeypatch):
 def test_enterprise_owner_and_alias_accept_generic_glasshive_identity_headers(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
-    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
     monkeypatch.setattr(
         mcp_server,
         "get_http_headers",
@@ -1255,7 +1273,7 @@ def test_enterprise_owner_and_alias_accept_generic_glasshive_identity_headers(mo
 
 def test_enterprise_worker_delegate_once_rejects_before_preflight_without_service_auth(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
-    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
     server = create_mcp_server(api_client=FakeApiClient())
 
     async def scenario():
@@ -2634,7 +2652,7 @@ def test_enterprise_launch_without_conversation_id_is_not_remembered(monkeypatch
     monkeypatch.setenv("WPR_API_TOKEN", "service-token")
     monkeypatch.setenv("GLASSHIVE_MCP_DIAGNOSTIC_PAYLOADS_ENABLED", "true")
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
-    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
     monkeypatch.setattr(
         mcp_server,
         "get_http_headers",
@@ -2684,7 +2702,7 @@ def test_enterprise_diagnostic_payloads_are_suppressed_without_opt_in(monkeypatc
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-token")
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
-    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
     monkeypatch.setattr(
         mcp_server,
         "get_http_headers",
@@ -2741,7 +2759,7 @@ def test_enterprise_recent_launch_fallback_is_scoped_by_user_and_conversation(mo
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-token")
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
-    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
     current_headers = {
         "X-GlassHive-Service-Token": "service-token",
         "X-GlassHive-Tenant-Id": "tenant-alpha",
@@ -2958,7 +2976,7 @@ def test_workspace_continue_rejects_active_previous_run(monkeypatch):
 def test_enterprise_workspace_continue_rechecks_tenant_and_owner_scope(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
-    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
     monkeypatch.setattr(
         mcp_server,
         "get_http_headers",
@@ -2987,7 +3005,7 @@ def test_enterprise_workspace_continue_rechecks_tenant_and_owner_scope(monkeypat
 def test_enterprise_workspace_continue_rejects_cross_tenant_previous_run(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
-    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
     monkeypatch.setattr(
         mcp_server,
         "get_http_headers",
@@ -3016,7 +3034,7 @@ def test_enterprise_workspace_continue_rejects_cross_tenant_previous_run(monkeyp
 def test_enterprise_workspace_status_rechecks_tenant_and_owner_scope(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
-    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
     monkeypatch.setattr(
         mcp_server,
         "get_http_headers",
@@ -3045,7 +3063,7 @@ def test_enterprise_workspace_artifacts_rechecks_owner_scope(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
-    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
     monkeypatch.setattr(
         mcp_server,
         "get_http_headers",
@@ -3428,6 +3446,7 @@ def test_uploaded_file_text_prefers_owner_scoped_binary_when_available(monkeypat
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_MCP_API_KEY", "service-secret")
     monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
     monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", str(uploads_root))
     monkeypatch.setattr(
@@ -3482,6 +3501,7 @@ def test_uploaded_file_text_does_not_cross_owner_boundary(monkeypatch, tmp_path)
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_MCP_API_KEY", "service-secret")
     monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
     monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", str(uploads_root))
     monkeypatch.setattr(
@@ -3528,6 +3548,7 @@ def test_binary_upload_text_without_source_reports_blocker(monkeypatch, tmp_path
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_MCP_API_KEY", "service-secret")
     monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
     monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", str(uploads_root))
     monkeypatch.setattr(
@@ -4542,6 +4563,7 @@ def test_workspace_launch_reuses_enterprise_scoped_workspace_alias(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-token")
+    monkeypatch.setenv("GLASSHIVE_MCP_API_KEY", "service-token")
     monkeypatch.setattr(
         mcp_server,
         "get_http_headers",
@@ -5182,7 +5204,7 @@ def test_legacy_upload_fallback_materializes_recent_storage_owner_file(monkeypat
     monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", str(uploads_root))
     monkeypatch.setenv("GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_FALLBACK", "true")
     monkeypatch.setenv("GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_RECENT_SECONDS", "900")
-    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-secret")
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-secret")
     monkeypatch.setattr(
         mcp_server,
         "get_http_headers",

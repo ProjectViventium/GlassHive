@@ -9,6 +9,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from workers_projects_runtime.api import create_app
@@ -911,6 +912,38 @@ def test_provider_routes_fail_closed_when_service_authentication_is_not_configur
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "service_unavailable"
     assert response.json()["error"]["message"] == "GlassHive provider authentication is not configured"
+
+
+@pytest.mark.parametrize(
+    ("first_name", "second_name", "message"),
+    [
+        (
+            "GLASSHIVE_PROVIDER_API_KEY",
+            "GLASSHIVE_MCP_API_KEY",
+            "GLASSHIVE_MCP_API_KEY must be distinct from GLASSHIVE_PROVIDER_API_KEY",
+        ),
+        (
+            "WPR_API_TOKEN",
+            "GLASSHIVE_MCP_API_KEY",
+            "GLASSHIVE_MCP_API_KEY must be distinct from WPR_API_TOKEN",
+        ),
+    ],
+)
+def test_runtime_rejects_shared_provider_mcp_or_admin_credentials(
+    tmp_path, monkeypatch, first_name, second_name, message
+):
+    monkeypatch.setenv("WPR_API_TOKEN", "runtime-admin-token")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_API_KEY", "provider-test-token")
+    monkeypatch.setenv("GLASSHIVE_MCP_API_KEY", "mcp-test-token")
+    monkeypatch.setenv(first_name, "shared-token")
+    monkeypatch.setenv(second_name, "shared-token")
+
+    with pytest.raises(RuntimeError, match=message):
+        create_app(
+            str(tmp_path / "runtime.db"),
+            runtime_backend="stub",
+            runtime=StubRuntime(),
+        )
 
 
 def test_openai_compatible_request_hydrates_structured_metadata_from_headers(tmp_path, monkeypatch):
