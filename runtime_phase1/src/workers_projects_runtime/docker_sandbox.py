@@ -14,6 +14,13 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from .bootstrap import apply_bootstrap
+from .openclaw_release import (
+    OPENCLAW_RUNTIME_FAST_URI_VERSION,
+    OPENCLAW_RUNTIME_VERSION,
+    require_reviewed_openclaw_version,
+    reviewed_openclaw_env,
+    stage_reviewed_openclaw_lock,
+)
 
 
 def _utc_iso() -> str:
@@ -73,6 +80,7 @@ SAFE_DOCKER_EXEC_ENV_KEYS = {
     "WPR_OPENCLAW_MODEL_PROVIDER",
     "WPR_OPENCLAW_USE_CUSTOM_PROVIDER",
     "WPR_OPENCLAW_WIRE_API",
+    "OPENCLAW_DISABLE_BONJOUR",
     "TMPDIR",
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
@@ -96,7 +104,6 @@ AI_WORKER_CLAUDE_CODE_NPM_SPEC = (
     os.environ.get("WPR_SANDBOX_CLAUDE_CODE_NPM_SPEC", "@anthropic-ai/claude-code@2.1.186").strip()
     or "@anthropic-ai/claude-code@2.1.186"
 )
-AI_WORKER_OPENCLAW_NPM_SPEC = os.environ.get("WPR_SANDBOX_OPENCLAW_NPM_SPEC", "openclaw@latest").strip() or "openclaw@latest"
 
 
 def _enabled_ai_worker_browser_extension_names() -> tuple[str, ...]:
@@ -384,7 +391,7 @@ def _safe_docker_exec_env(env: dict[str, str] | None) -> dict[str, str]:
 
 class DockerSandboxManager:
     _build_lock = Lock()
-    _default_image = "workers-projects-runtime-workstation:phase1-node22-docs7"
+    _default_image = "workers-projects-runtime-workstation:phase1-node22-docs8-openclaw2026.7.1-2"
 
     def __init__(self, base_dir: str | None = None) -> None:
         self.base_dir = Path(base_dir) if base_dir else Path(__file__).resolve().parents[2] / "data"
@@ -424,6 +431,7 @@ class DockerSandboxManager:
         self.image_build_timeout_sec = float(os.environ.get("WPR_DOCKER_IMAGE_BUILD_TIMEOUT_SEC", "900") or "900")
         self.image_check_ttl_sec = float(os.environ.get("WPR_DOCKER_IMAGE_CHECK_TTL_SEC", "300") or "300")
         self._image_checked_at: float = 0.0
+        self._openclaw_image_checked_at: float = 0.0
         self.novnc_health_timeout_sec = float(os.environ.get("WPR_SANDBOX_NOVNC_HEALTH_TIMEOUT_SEC", "1.5") or "1.5")
         self.novnc_health_cache_ttl_sec = float(os.environ.get("WPR_SANDBOX_NOVNC_HEALTH_CACHE_TTL_SEC", "10") or "10")
         self.novnc_self_heal = self._env_flag("WPR_SANDBOX_NOVNC_SELF_HEAL", True)
@@ -1267,6 +1275,7 @@ screen -ls | awk -v target="$target" '
                 self._image_checked_at = now
                 return
             dockerfile = self.build_root / "Dockerfile"
+            stage_reviewed_openclaw_lock(self.build_root / "openclaw-runtime-lock")
             extension_policy = _ai_worker_browser_extension_policy_json()
             extension_policy_source = AI_WORKER_BROWSER_EXTENSION_POLICY_PATHS[0]
             extension_policy_dirs = " ".join(
@@ -1295,7 +1304,6 @@ screen -ls | awk -v target="$target" '
                 for spec in (
                     AI_WORKER_CODEX_NPM_SPEC,
                     AI_WORKER_CLAUDE_CODE_NPM_SPEC,
-                    AI_WORKER_OPENCLAW_NPM_SPEC,
                 )
             )
             dockerfile.write_text(
@@ -1308,6 +1316,20 @@ screen -ls | awk -v target="$target" '
                         "RUN mkdir -p /etc/apt/keyrings && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main' > /etc/apt/sources.list.d/nodesource.list",
                         "RUN apt-get update && apt-get install -y --no-install-recommends nodejs && node --version && npm --version && rm -rf /var/lib/apt/lists/*",
                         f"RUN npm install -g --cache /tmp/glasshive-npm-cache {npm_worker_specs} && npm cache clean --force --cache /tmp/glasshive-npm-cache && rm -rf /tmp/glasshive-npm-cache /root/.npm /home/seluser/.npm",
+                        "COPY openclaw-runtime-lock/ /opt/glasshive-openclaw-runtime/",
+                        (
+                            "RUN cd /opt/glasshive-openclaw-runtime "
+                            "&& npm ci --omit=dev --cache /tmp/glasshive-openclaw-npm-cache "
+                            "&& node -e \"const v=require('./node_modules/openclaw/package.json').version;"
+                            f"if(v!=='{OPENCLAW_RUNTIME_VERSION}')throw new Error('OpenClaw version drift: '+v)\" "
+                            "&& node -e \"const v=require('./node_modules/fast-uri/package.json').version;"
+                            f"if(v!=='{OPENCLAW_RUNTIME_FAST_URI_VERSION}')throw new Error('fast-uri override drift: '+v)\" "
+                            "&& ln -sf /opt/glasshive-openclaw-runtime/node_modules/.bin/openclaw /usr/local/bin/openclaw "
+                            "&& openclaw --version | "
+                            f"grep -Fq 'OpenClaw {OPENCLAW_RUNTIME_VERSION} (' "
+                            "&& npm cache clean --force --cache /tmp/glasshive-openclaw-npm-cache "
+                            "&& rm -rf /tmp/glasshive-openclaw-npm-cache /root/.npm /home/seluser/.npm"
+                        ),
                         "RUN pip3 install --no-cache-dir selenium beautifulsoup4 markdown matplotlib openpyxl pdf2image pillow PyMuPDF PyPDF2 python-docx python-pptx reportlab requests xlsxwriter",
                         f"RUN mkdir -p {extension_policy_dirs} && {extension_policy_writes}",
                         f"RUN printf '%s\\n' {extension_check_script_lines} > /usr/local/bin/glasshive-browser-extension-check && chmod +x /usr/local/bin/glasshive-browser-extension-check && glasshive-browser-extension-check",
@@ -1318,6 +1340,7 @@ screen -ls | awk -v target="$target" '
                         "ENV SHELL=/bin/bash",
                         "ENV DISPLAY=:99.0",
                         "ENV TERM=xterm-256color",
+                        "ENV OPENCLAW_DISABLE_BONJOUR=1",
                         "",
                     ]
                 )
@@ -1465,6 +1488,52 @@ screen -ls | awk -v target="$target" '
             self._spawn_detached_docker_exec(full_command)
             return subprocess.CompletedProcess(full_command, returncode=0, stdout="", stderr="")
         return self._docker(args, check=False, capture_output=True, timeout_sec=timeout_sec)
+
+    def require_reviewed_openclaw(self, container_name: str) -> str:
+        result = self._docker_exec(
+            container_name,
+            ["openclaw", "--version"],
+            env=reviewed_openclaw_env({}),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"GlassHive requires OpenClaw {OPENCLAW_RUNTIME_VERSION}; "
+                "the workstation runtime version could not be verified."
+            )
+        return require_reviewed_openclaw_version(result.stdout or result.stderr)
+
+    def require_reviewed_openclaw_image(self) -> str:
+        now = time.monotonic()
+        if (
+            self._openclaw_image_checked_at
+            and self._openclaw_image_checked_at + self.image_check_ttl_sec > now
+        ):
+            return OPENCLAW_RUNTIME_VERSION
+        self._ensure_image()
+        result = self._docker(
+            [
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "-e",
+                "OPENCLAW_DISABLE_BONJOUR=1",
+                "--entrypoint",
+                "openclaw",
+                self.image,
+                "--version",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"GlassHive requires OpenClaw {OPENCLAW_RUNTIME_VERSION}; "
+                "the workstation image runtime version could not be verified."
+            )
+        version = require_reviewed_openclaw_version(result.stdout or result.stderr)
+        self._openclaw_image_checked_at = time.monotonic()
+        return version
 
     @staticmethod
     def _spawn_detached_docker_exec(full_command: list[str]) -> None:

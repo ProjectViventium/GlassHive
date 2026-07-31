@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import secrets
 import shlex
 import signal
@@ -14,6 +15,7 @@ from typing import Protocol
 
 import httpx
 
+from .openclaw_release import reviewed_openclaw_env, verify_reviewed_openclaw_binary
 from .terminal_takeover import TerminalTarget
 
 _PROVIDER_ENV_KEYS = [
@@ -143,6 +145,15 @@ class StubRuntime:
 
     def _runtime_info(self, worker: dict, *, pid: int | None) -> RuntimeInfo:
         worker_id = worker["worker_id"]
+        workspace_dir = f"/tmp/{worker_id}/workspace"
+        raw_bundle = worker.get("bootstrap_bundle_json")
+        if isinstance(raw_bundle, str) and raw_bundle.strip():
+            try:
+                bundle = json.loads(raw_bundle)
+            except json.JSONDecodeError:
+                bundle = {}
+            if isinstance(bundle, dict) and bundle.get("run_mode") == "conversation":
+                workspace_dir = str(Path(str(worker.get("workspace_root") or workspace_dir)).expanduser().resolve())
         return RuntimeInfo(
             runtime="openclaw-stub",
             model=worker.get("model") or self.resolve_model(worker.get("profile", "openclaw-general")),
@@ -151,7 +162,7 @@ class StubRuntime:
             gateway_token=None,
             session_key=worker.get("session_key") or f"agent:main:wpr:worker:{worker_id}",
             state_dir=f"/tmp/{worker_id}/state",
-            workspace_dir=f"/tmp/{worker_id}/workspace",
+            workspace_dir=workspace_dir,
             pid=pid,
         )
 
@@ -215,6 +226,7 @@ class OpenClawRuntime:
         return defaults.get(profile, defaults["openclaw-general"])
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+        verify_reviewed_openclaw_binary(self.openclaw_bin)
         self._ensure_sandbox_image()
         meta = self._metadata_for_worker(worker)
         pid = self._safe_int(worker.get("pid"))
@@ -433,7 +445,7 @@ class OpenClawRuntime:
         stderr_path = self.logs_dir / f"{worker_id}.stderr.log"
         stdout_handle = stdout_path.open("a")
         stderr_handle = stderr_path.open("a")
-        env = {**os.environ}
+        env = reviewed_openclaw_env(os.environ)
         env["OPENCLAW_STATE_DIR"] = str(state_dir)
         env["OPENCLAW_CONFIG_PATH"] = str(state_dir / "openclaw.json")
         env["OPENCLAW_GATEWAY_TOKEN"] = token

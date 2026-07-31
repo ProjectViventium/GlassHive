@@ -888,6 +888,12 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             token = unquote(path.removeprefix("/v1/signed-links/")).strip()
             if token:
                 return token
+        if _public_links_only_enabled() and path.startswith("/v1/link-refs/"):
+            ref_id = unquote(path.removeprefix("/v1/link-refs/")).strip().split("/", 1)[0]
+            record = resolve_signed_link_ref(ref_id)
+            token = str((record or {}).get("token") or "").strip()
+            if token:
+                return token
         cookie_worker_id = str(worker_id or request.path_params.get("worker_id") or "").strip()
         if cookie_worker_id:
             token = str(request.cookies.get(_worker_cookie_name(cookie_worker_id)) or "").strip()
