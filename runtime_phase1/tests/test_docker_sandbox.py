@@ -23,6 +23,11 @@ from workers_projects_runtime.bootstrap import (
     GLASSHIVE_NATIVE_CAPABILITY_INVENTORY,
     GLASSHIVE_SAFETY_CHECKPOINT_RULE,
 )
+from workers_projects_runtime.openclaw_release import (
+    OPENCLAW_RUNTIME_FAST_URI_VERSION,
+    OPENCLAW_RUNTIME_LOCK_SHA256,
+    OPENCLAW_RUNTIME_VERSION,
+)
 
 
 def test_safe_docker_exec_env_preserves_claude_headless_oauth_only():
@@ -951,16 +956,14 @@ def test_ensure_image_consumes_reviewed_openclaw_lock_and_disables_bonjour(tmp_p
     dockerfile = (manager.build_root / "Dockerfile").read_text()
     staged_lock = manager.build_root / "openclaw-runtime-lock" / "package-lock.json"
     assert staged_lock.is_file()
-    assert hashlib.sha256(staged_lock.read_bytes()).hexdigest() == (
-        "e025a05ef3d268747dc293ef54876471d067f22644a8fa26a9139b7d1fe4fbc3"
-    )
+    assert hashlib.sha256(staged_lock.read_bytes()).hexdigest() == OPENCLAW_RUNTIME_LOCK_SHA256
     assert "COPY openclaw-runtime-lock/ /opt/glasshive-openclaw-runtime/" in dockerfile
     assert "npm ci --omit=dev" in dockerfile
     assert "node_modules/openclaw/package.json" in dockerfile
     assert "node_modules/fast-uri/package.json" in dockerfile
-    assert "2026.7.1-2" in dockerfile
-    assert "3.1.3" in dockerfile
-    assert "grep -Fq 'OpenClaw 2026.7.1-2 ('" in dockerfile
+    assert OPENCLAW_RUNTIME_VERSION in dockerfile
+    assert OPENCLAW_RUNTIME_FAST_URI_VERSION in dockerfile
+    assert f"grep -Fq 'OpenClaw {OPENCLAW_RUNTIME_VERSION} ('" in dockerfile
     assert "/usr/local/bin/openclaw" in dockerfile
     assert "ENV OPENCLAW_DISABLE_BONJOUR=1" in dockerfile
     assert "openclaw@latest" not in dockerfile

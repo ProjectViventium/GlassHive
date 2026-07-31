@@ -8,6 +8,7 @@ import pytest
 from workers_projects_runtime.docker_sandbox import DockerSandboxManager
 from workers_projects_runtime.openclaw_release import (
     OPENCLAW_RUNTIME_LOCK_SHA256,
+    OPENCLAW_RUNTIME_OVERRIDES,
     OPENCLAW_RUNTIME_VERSION,
     require_reviewed_openclaw_version,
     reviewed_openclaw_env,
@@ -21,7 +22,14 @@ from workers_projects_runtime.runtime_requirements import (
 
 def test_reviewed_openclaw_contract_is_exact_and_bonjour_is_forced_off():
     assert OPENCLAW_RUNTIME_VERSION == "2026.7.1-2"
-    assert OPENCLAW_RUNTIME_LOCK_SHA256 == "e025a05ef3d268747dc293ef54876471d067f22644a8fa26a9139b7d1fe4fbc3"
+    assert OPENCLAW_RUNTIME_LOCK_SHA256 == "b0cdcd1f4d842bebb20967dbdfb154d3725dabb510962240171a2cca67da4fde"
+    assert OPENCLAW_RUNTIME_OVERRIDES == {
+        "@hono/node-server": "2.0.12",
+        "@modelcontextprotocol/sdk": "1.30.0",
+        "brace-expansion": "5.0.9",
+        "fast-uri": "3.1.4",
+        "tar": "7.5.22",
+    }
     assert reviewed_openclaw_env({"OPENCLAW_DISABLE_BONJOUR": "0"})["OPENCLAW_DISABLE_BONJOUR"] == "1"
 
 
@@ -51,16 +59,17 @@ def test_committed_openclaw_lock_contains_reviewed_tarball_and_override():
     assert package["dependencies"]["openclaw"] == (
         "https://registry.npmjs.org/openclaw/-/openclaw-2026.7.1-2.tgz"
     )
-    assert package["overrides"]["fast-uri"] == "3.1.3"
+    assert package["overrides"] == OPENCLAW_RUNTIME_OVERRIDES
     assert lock["packages"]["node_modules/openclaw"]["integrity"] == (
         "sha512-ycF3yPcbjN6bUPeaUx6Mh6vze1hQWoD3CT/wWcmD7a8xaHHHRUaAlaq+lFxMHf1ssEgODVAwjlzYqp2twkYZ7g=="
     )
-    fast_uri_versions = {
-        package["version"]
-        for path, package in lock["packages"].items()
-        if path.endswith("node_modules/fast-uri")
-    }
-    assert fast_uri_versions == {"3.1.3"}
+    for name, version in OPENCLAW_RUNTIME_OVERRIDES.items():
+        installed_versions = {
+            package["version"]
+            for path, package in lock["packages"].items()
+            if path.endswith(f"node_modules/{name}")
+        }
+        assert installed_versions == {version}
 
 
 def test_runtime_sources_have_no_mutable_or_rejected_openclaw_install():
