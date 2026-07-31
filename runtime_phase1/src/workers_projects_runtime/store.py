@@ -207,11 +207,63 @@ class Store:
                     PRIMARY KEY (tenant_id, owner_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS provider_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
+                    owner_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    model_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    workspace_dir TEXT NOT NULL,
+                    access_mode TEXT NOT NULL,
+                    history_count INTEGER NOT NULL DEFAULT 0,
+                    context_manifest_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (tenant_id, owner_id, conversation_id, agent_id),
+                    FOREIGN KEY(project_id) REFERENCES projects(project_id),
+                    FOREIGN KEY(worker_id) REFERENCES workers(worker_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_requests (
+                    request_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
+                    owner_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    run_id TEXT,
+                    idempotency_key TEXT NOT NULL,
+                    message_id TEXT NOT NULL DEFAULT '',
+                    stream_id TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL,
+                    requested_history_count INTEGER NOT NULL DEFAULT 0,
+                    response_json TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (tenant_id, owner_id, idempotency_key),
+                    FOREIGN KEY(session_id) REFERENCES provider_sessions(session_id),
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_activity (
+                    sequence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(request_id) REFERENCES provider_requests(request_id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_workers_project_id ON workers(project_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_worker_state ON runs(worker_id, state, queued_at);
                 CREATE INDEX IF NOT EXISTS idx_events_worker_created ON events(worker_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_callback_outbox_status_updated ON callback_outbox(status, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_scheduled_runs_state_run_at ON scheduled_runs(state, run_at);
+                CREATE INDEX IF NOT EXISTS idx_provider_sessions_owner ON provider_sessions(tenant_id, owner_id, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_provider_requests_session ON provider_requests(session_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_provider_activity_request ON provider_activity(request_id, sequence_id);
                 """
             )
             project_columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()}
@@ -277,6 +329,338 @@ class Store:
                 conn.execute("ALTER TABLE user_preferences ADD COLUMN claude_effort TEXT NOT NULL DEFAULT ''")
             if "openclaw_effort" not in preferences_columns:
                 conn.execute("ALTER TABLE user_preferences ADD COLUMN openclaw_effort TEXT NOT NULL DEFAULT ''")
+
+    def get_provider_session(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        conversation_id: str,
+        agent_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM provider_sessions
+                WHERE tenant_id = ? AND owner_id = ? AND conversation_id = ? AND agent_id = ?
+                """,
+                (tenant_id or "local", owner_id, conversation_id, agent_id),
+            ).fetchone()
+        return self._row(row)
+
+    def get_provider_session_by_id(self, session_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM provider_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return self._row(row)
+
+    def list_provider_sessions(
+        self,
+        *,
+        tenant_id: str | None = None,
+        owner_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM provider_sessions"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if tenant_id:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        if owner_id:
+            clauses.append("owner_id = ?")
+            params.append(owner_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at DESC"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return self._rows(rows)
+
+    def upsert_provider_session(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        conversation_id: str,
+        agent_id: str,
+        model_id: str,
+        project_id: str,
+        worker_id: str,
+        workspace_dir: str,
+        access_mode: str,
+        history_count: int = 0,
+        context_manifest: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        existing = self.get_provider_session(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            agent_id=agent_id,
+        )
+        session_id = str(existing.get("session_id") or "") if existing else f"ghs_{uuid.uuid4().hex}"
+        data = {
+            "session_id": session_id,
+            "tenant_id": tenant_id or "local",
+            "owner_id": owner_id,
+            "conversation_id": conversation_id,
+            "agent_id": agent_id,
+            "model_id": model_id,
+            "project_id": project_id,
+            "worker_id": worker_id,
+            "workspace_dir": workspace_dir,
+            "access_mode": access_mode,
+            "history_count": max(0, int(history_count)),
+            "context_manifest_json": json.dumps(context_manifest or {}, sort_keys=True),
+            "created_at": str(existing.get("created_at") or now) if existing else now,
+            "updated_at": now,
+        }
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO provider_sessions (
+                    session_id, tenant_id, owner_id, conversation_id, agent_id, model_id,
+                    project_id, worker_id, workspace_dir, access_mode, history_count,
+                    context_manifest_json, created_at, updated_at
+                ) VALUES (
+                    :session_id, :tenant_id, :owner_id, :conversation_id, :agent_id, :model_id,
+                    :project_id, :worker_id, :workspace_dir, :access_mode, :history_count,
+                    :context_manifest_json, :created_at, :updated_at
+                )
+                ON CONFLICT(tenant_id, owner_id, conversation_id, agent_id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    model_id = excluded.model_id,
+                    project_id = excluded.project_id,
+                    worker_id = excluded.worker_id,
+                    workspace_dir = excluded.workspace_dir,
+                    access_mode = excluded.access_mode,
+                    history_count = excluded.history_count,
+                    context_manifest_json = excluded.context_manifest_json,
+                    updated_at = excluded.updated_at
+                """,
+                data,
+            )
+            row = conn.execute("SELECT * FROM provider_sessions WHERE session_id = ?", (session_id,)).fetchone()
+        return dict(row)
+
+    def update_provider_session_history(
+        self,
+        session_id: str,
+        *,
+        history_count: int,
+        context_manifest: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT history_count FROM provider_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            prior_count = int(existing["history_count"] or 0) if existing else 0
+            effective_count = max(prior_count, max(0, int(history_count)))
+            fields: dict[str, Any] = {
+                "history_count": effective_count,
+                "updated_at": utc_now(),
+            }
+            if context_manifest is not None:
+                manifest = dict(context_manifest)
+                manifest["messages"] = effective_count
+                fields["context_manifest_json"] = json.dumps(manifest, sort_keys=True)
+            assignments = ", ".join(f"{key} = :{key}" for key in fields)
+            fields["session_id"] = session_id
+            conn.execute(f"UPDATE provider_sessions SET {assignments} WHERE session_id = :session_id", fields)
+            row = conn.execute("SELECT * FROM provider_sessions WHERE session_id = ?", (session_id,)).fetchone()
+        return self._row(row)
+
+    def get_provider_request(
+        self,
+        request_id: str | None = None,
+        *,
+        tenant_id: str | None = None,
+        owner_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any] | None:
+        if request_id:
+            query = "SELECT * FROM provider_requests WHERE request_id = ?"
+            params: list[Any] = [request_id]
+        elif idempotency_key:
+            query = "SELECT * FROM provider_requests WHERE idempotency_key = ?"
+            params = [idempotency_key]
+        else:
+            return None
+        if tenant_id:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        if owner_id:
+            query += " AND owner_id = ?"
+            params.append(owner_id)
+        with self._connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return self._row(row)
+
+    def create_provider_request(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        session_id: str,
+        idempotency_key: str,
+        message_id: str,
+        stream_id: str,
+        requested_history_count: int,
+    ) -> tuple[dict[str, Any], bool]:
+        existing = self.get_provider_request(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            idempotency_key=idempotency_key,
+        )
+        if existing:
+            return existing, False
+        now = utc_now()
+        data = {
+            "request_id": f"chatcmpl-gh-{uuid.uuid4().hex}",
+            "tenant_id": tenant_id or "local",
+            "owner_id": owner_id,
+            "session_id": session_id,
+            "run_id": None,
+            "idempotency_key": idempotency_key,
+            "message_id": message_id,
+            "stream_id": stream_id,
+            "state": "queued",
+            "requested_history_count": max(0, int(requested_history_count)),
+            "response_json": "",
+            "created_at": now,
+            "updated_at": now,
+        }
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO provider_requests (
+                        request_id, tenant_id, owner_id, session_id, run_id, idempotency_key,
+                        message_id, stream_id, state, requested_history_count, response_json,
+                        created_at, updated_at
+                    ) VALUES (
+                        :request_id, :tenant_id, :owner_id, :session_id, :run_id, :idempotency_key,
+                        :message_id, :stream_id, :state, :requested_history_count, :response_json,
+                        :created_at, :updated_at
+                    )
+                    """,
+                    data,
+                )
+        except sqlite3.IntegrityError:
+            raced = self.get_provider_request(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                idempotency_key=idempotency_key,
+            )
+            if raced:
+                return raced, False
+            raise
+        return data, True
+
+    def update_provider_request(self, request_id: str, **fields: Any) -> dict[str, Any] | None:
+        if not fields:
+            return self.get_provider_request(request_id)
+        fields["updated_at"] = utc_now()
+        assignments = ", ".join(f"{key} = :{key}" for key in fields)
+        fields["request_id"] = request_id
+        with self._connect() as conn:
+            conn.execute(f"UPDATE provider_requests SET {assignments} WHERE request_id = :request_id", fields)
+            row = conn.execute("SELECT * FROM provider_requests WHERE request_id = ?", (request_id,)).fetchone()
+        return self._row(row)
+
+    def add_provider_activity(
+        self,
+        request_id: str,
+        event_type: str,
+        summary: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        data = {
+            "request_id": request_id,
+            "event_type": event_type,
+            "summary": summary,
+            "payload_json": json.dumps(payload or {}, sort_keys=True),
+            "created_at": utc_now(),
+        }
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO provider_activity (request_id, event_type, summary, payload_json, created_at)
+                VALUES (:request_id, :event_type, :summary, :payload_json, :created_at)
+                """,
+                data,
+            )
+            row = conn.execute(
+                "SELECT * FROM provider_activity WHERE sequence_id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+        return dict(row)
+
+    def list_provider_activity(self, request_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM provider_activity
+                WHERE request_id = ? AND sequence_id > ?
+                ORDER BY sequence_id ASC
+                """,
+                (request_id, max(0, int(after_sequence))),
+            ).fetchall()
+        return self._rows(rows)
+
+    def prune_terminal_provider_requests(self, *, updated_before: str) -> int:
+        with self._connect() as conn:
+            request_rows = conn.execute(
+                """
+                SELECT request_id FROM provider_requests
+                WHERE state IN ('completed', 'failed', 'cancelled') AND updated_at < ?
+                """,
+                (updated_before,),
+            ).fetchall()
+            request_ids = [str(row["request_id"]) for row in request_rows]
+            if not request_ids:
+                return 0
+            placeholders = ",".join("?" for _ in request_ids)
+            conn.execute(
+                f"DELETE FROM provider_activity WHERE request_id IN ({placeholders})",
+                request_ids,
+            )
+            conn.execute(
+                f"DELETE FROM provider_requests WHERE request_id IN ({placeholders})",
+                request_ids,
+            )
+        return len(request_ids)
+
+    def list_stale_provider_sessions(self, *, updated_before: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT session.* FROM provider_sessions AS session
+                WHERE session.updated_at < ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM provider_requests AS request
+                    WHERE request.session_id = session.session_id
+                  )
+                ORDER BY session.updated_at ASC
+                """,
+                (updated_before,),
+            ).fetchall()
+        return self._rows(rows)
+
+    def delete_provider_sessions(self, session_ids: list[str]) -> int:
+        clean_ids = [str(value).strip() for value in session_ids if str(value).strip()]
+        if not clean_ids:
+            return 0
+        placeholders = ",".join("?" for _ in clean_ids)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"DELETE FROM provider_sessions WHERE session_id IN ({placeholders})",
+                clean_ids,
+            )
+        return int(cursor.rowcount or 0)
 
     def _row(self, value: sqlite3.Row | None) -> dict[str, Any] | None:
         return dict(value) if value is not None else None
@@ -797,7 +1181,19 @@ class Store:
                 return None
             started_at = utc_now()
             conn.execute(
-                "UPDATE runs SET state = 'running', started_at = ?, retry_after = NULL WHERE run_id = ?",
+                """
+                UPDATE runs
+                SET state = 'running',
+                    started_at = ?,
+                    retry_after = NULL,
+                    error_text = '',
+                    failure_class = '',
+                    failure_retryable = 0,
+                    failure_user_message = '',
+                    failure_recommended_recovery = '',
+                    failure_diagnostic_summary = ''
+                WHERE run_id = ?
+                """,
                 (started_at, row["run_id"]),
             )
             claimed = conn.execute("SELECT * FROM runs WHERE run_id = ?", (row["run_id"],)).fetchone()

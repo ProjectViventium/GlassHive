@@ -307,6 +307,20 @@ class WorkersProjectsService:
         self.store = store
         self.runtime = runtime
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="wpr-runner")
+        # Interactive provider turns have a separate dispatch lane so autonomous mission workers
+        # cannot occupy every service thread before a conversation reaches the host CLI's own
+        # profile-isolated capacity lane.
+        conversation_workers = max(
+            1,
+            min(
+                max_workers,
+                int(os.environ.get("GLASSHIVE_CONVERSATION_EXECUTOR_WORKERS", "2") or "2"),
+            ),
+        )
+        self.conversation_executor = ThreadPoolExecutor(
+            max_workers=conversation_workers,
+            thread_name_prefix="wpr-conversation",
+        )
         self._shutdown_event = Event()
         self._processors_lock = Lock()
         self._active_processors: set[str] = set()
@@ -346,6 +360,7 @@ class WorkersProjectsService:
             if thread and thread.is_alive():
                 thread.join(timeout=2)
         self.executor.shutdown(wait=True, cancel_futures=False)
+        self.conversation_executor.shutdown(wait=True, cancel_futures=False)
 
     def _callback_config_for(self, worker: dict) -> dict:
         bundle = self._bootstrap_bundle_for(worker) or {}
@@ -628,10 +643,11 @@ class WorkersProjectsService:
         worker_id = str(worker.get("worker_id") or "").strip()
         if not profile or not worker_id:
             return worker
+        bootstrap_bundle = self._bootstrap_bundle_for(worker) or {}
+        provider_model = str(bootstrap_bundle.get("provider_model") or "").strip()
         try:
-            resolved_model = self._resolve_worker_model(
-                profile,
-                str(worker.get("execution_mode") or "docker"),
+            resolved_model = provider_model or self._resolve_worker_model(
+                profile, str(worker.get("execution_mode") or "docker")
             ).strip()
         except Exception as exc:
             logger.warning("Could not resolve model for worker %s profile %s: %s", worker_id, profile, exc)
@@ -1895,11 +1911,16 @@ class WorkersProjectsService:
         self._emit_callback(worker, "worker.paused", run=active_run, message="Worker paused")
         return updated or worker
 
-    def interrupt_worker(self, worker_id: str) -> dict:
+    def interrupt_worker(self, worker_id: str, run_id: str | None = None) -> dict:
         worker = self.require_worker(worker_id)
         active_run = self.store.get_active_run(worker_id)
+        if run_id and (not active_run or str(active_run.get("run_id") or "") != str(run_id)):
+            return worker
         try:
-            info = self.runtime.interrupt_worker(worker, run_id=active_run["run_id"] if active_run else None)
+            info = self.runtime.interrupt_worker(
+                worker,
+                run_id=str(active_run["run_id"]) if active_run else None,
+            )
         except TypeError as exc:
             if "run_id" not in str(exc):
                 raise
@@ -1915,6 +1936,82 @@ class WorkersProjectsService:
         self.store.add_event(worker["project_id"], worker_id, active_run["run_id"] if active_run else None, "worker.interrupted", "Worker interrupted")
         self._emit_callback(worker, "worker.interrupted", run=active_run, message="Worker interrupted")
         return updated or worker
+
+    def cancel_run(self, worker_id: str, run_id: str) -> dict:
+        """Cancel one queued or running run without affecting a newer turn."""
+
+        worker = self.require_worker(worker_id)
+        run = self.store.get_run(run_id)
+        if not run or str(run.get("worker_id") or "") != str(worker_id):
+            return worker
+        state = str(run.get("state") or "")
+        if state in {"completed", "failed", "cancelled", "interrupted"}:
+            return worker
+
+        cancelled = None
+        if state == "queued":
+            cancelled = self.store.finalize_run_if_state(
+                run_id,
+                expected_state="queued",
+                state="cancelled",
+                error_text="Cancelled by provider client",
+            )
+            if not cancelled:
+                run = self.store.get_run(run_id) or run
+                state = str(run.get("state") or "")
+
+        if state == "running":
+            active_run = self.store.get_active_run(worker_id)
+            if not active_run or str(active_run.get("run_id") or "") != str(run_id):
+                return worker
+            # Stop the processor generation before interrupting the host process. A late
+            # runtime return can then never overwrite the durable cancellation with completion.
+            self._invalidate_worker_processor(worker_id)
+            try:
+                try:
+                    info = self.runtime.interrupt_worker(worker, run_id=run_id)
+                except TypeError as exc:
+                    if "run_id" not in str(exc):
+                        raise
+                    info = self.runtime.interrupt_worker(worker)
+                worker = self._apply_runtime_info(
+                    worker_id,
+                    info,
+                    state="ready",
+                    last_error="",
+                ) or worker
+            finally:
+                cancelled = self.store.finalize_run_if_state(
+                    run_id,
+                    expected_state="running",
+                    state="cancelled",
+                    output_text="",
+                    error_text="Cancelled by provider client",
+                )
+
+        if cancelled:
+            self.store.finalize_schedule_for_run(
+                run_id,
+                state="cancelled",
+                last_error="Cancelled by provider client",
+            )
+            cancelled_run = {**run, **cancelled, "state": "cancelled"}
+            self.store.add_event(
+                worker["project_id"],
+                worker_id,
+                run_id,
+                "run.cancelled",
+                "Run cancelled by provider client",
+            )
+            self._emit_callback(
+                worker,
+                "run.cancelled",
+                run=cancelled_run,
+                message="Run cancelled by provider client",
+            )
+        if self.store.has_queued_runs(worker_id):
+            self._ensure_worker_processor(worker_id)
+        return self.store.get_worker(worker_id) or worker
 
     def resume_worker(self, worker_id: str) -> dict:
         worker = self.require_worker(worker_id)
@@ -2017,7 +2114,8 @@ class WorkersProjectsService:
         info = self.runtime.reconcile_worker(worker)
         state = worker["state"]
         if state in {"running", "ready", "starting"}:
-            state = "ready" if info.pid else "paused"
+            process_per_run_host = str(worker.get("execution_mode") or "") == "host"
+            state = "ready" if info.pid or process_per_run_host else "paused"
         if not info.pid:
             if active_run:
                 orphaned_run = self.store.finalize_run_if_state(
@@ -2041,6 +2139,8 @@ class WorkersProjectsService:
                         message="Worker process was not running during reconcile",
                     )
         self._apply_runtime_info(worker["worker_id"], info, state=state, last_error=worker.get("last_error") or "")
+        if state not in {"paused", "terminated", "failed"} and self.store.has_queued_runs(worker["worker_id"]):
+            self._ensure_worker_processor(worker["worker_id"])
 
     def require_project(self, project_id: str) -> dict:
         project = self.store.get_project(project_id)
@@ -2392,7 +2492,14 @@ class WorkersProjectsService:
             generation = self._processor_generations.get(worker_id, 0) + 1
             self._processor_generations[worker_id] = generation
             self._active_processors.add(worker_id)
-        self.executor.submit(self._process_worker_queue, worker_id, generation)
+        worker = self.store.get_worker(worker_id) or {}
+        bundle = self._bootstrap_bundle_for(worker) or {}
+        executor = (
+            self.conversation_executor
+            if str(bundle.get("run_mode") or "mission").strip().lower() == "conversation"
+            else self.executor
+        )
+        executor.submit(self._process_worker_queue, worker_id, generation)
 
     def _processor_is_current(self, worker_id: str, generation: int) -> bool:
         with self._processors_lock:
@@ -2612,6 +2719,5 @@ class WorkersProjectsService:
             if self._release_processor(worker_id, generation):
                 pending = self.store.get_worker(worker_id)
                 if pending and pending["state"] not in {"paused", "terminated"}:
-                    queued = next((item for item in self.store.list_runs_for_worker(worker_id, limit=10) if item["state"] == "queued"), None)
-                    if queued:
+                    if self.store.peek_next_queued_run(worker_id):
                         self._ensure_worker_processor(worker_id)
