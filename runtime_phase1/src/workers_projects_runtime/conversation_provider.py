@@ -327,20 +327,61 @@ class StreamingRedactor:
         self.overlap = max(1, int(overlap))
         self.max_buffer = max(self.overlap, int(max_buffer))
         self._buffer = ""
+        self._drop_remaining = False
 
     def feed(self, value: str) -> str:
+        if self._drop_remaining:
+            return ""
         self._buffer += str(value or "")
         if len(self._buffer) > self.max_buffer and not re.search(r"\s", self._buffer):
             self._buffer = ""
+            self._drop_remaining = True
             return "[REDACTED_OVERSIZED_STREAM_SEGMENT]"
 
+        # A PEM block is the one unbounded multi-line redaction form. Replace complete
+        # blocks before choosing a streaming boundary, and retain an unmatched opener
+        # regardless of the ordinary overlap window.
+        self._buffer = re.sub(
+            r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\s\S]*?"
+            r"-----END (?:[A-Z ]+ )?PRIVATE KEY-----",
+            "[REDACTED_PRIVATE_KEY]",
+            self._buffer,
+            flags=re.IGNORECASE,
+        )
+        last_newline = self._buffer.rfind("\n")
+        if last_newline >= 0:
+            complete_lines = self._buffer[: last_newline + 1]
+            if not re.search(
+                r"(?i)(?:-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|data:image/)",
+                complete_lines,
+            ):
+                self._buffer = _redact_text(complete_lines) + self._buffer[last_newline + 1 :]
         stable_limit = max(0, len(self._buffer) - self.overlap)
         sensitive_tail = re.search(
-            r"(?i)(?:/Users/|/(?:home|root|Volumes|private/var)/|~/|bearer\s+|(?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]?\s*|sk-|ghp_|xoxb-|eyJ|-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|data:image/)[^\n]*$",
+            r"(?i)(?:/Users/|/(?:home|root|Volumes|private/var)/|~/|bearer(?:\s+)?|(?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]?\s*|sk-|ghp_|xoxb-|eyJ|-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|data:image/)[^\n]*$",
             self._buffer,
         )
+        multiline_opener = re.search(
+            r"(?i)(?:-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|data:image/)",
+            self._buffer,
+        )
+        hold_start = min(
+            (
+                match.start()
+                for match in (sensitive_tail, multiline_opener)
+                if match is not None
+            ),
+            default=None,
+        )
+        if hold_start is not None and len(self._buffer) > self.max_buffer:
+            safe_prefix = _redact_text(self._buffer[:hold_start])
+            self._buffer = ""
+            self._drop_remaining = True
+            return safe_prefix + "[REDACTED_OVERSIZED_STREAM_SEGMENT]"
         if sensitive_tail is not None:
             stable_limit = min(stable_limit, sensitive_tail.start())
+        if multiline_opener is not None:
+            stable_limit = min(stable_limit, multiline_opener.start())
         if stable_limit <= 0:
             return ""
 
@@ -359,6 +400,10 @@ class StreamingRedactor:
         return visible
 
     def flush(self) -> str:
+        if self._drop_remaining:
+            self._drop_remaining = False
+            self._buffer = ""
+            return ""
         result = _redact_text(self._buffer)
         self._buffer = ""
         return result

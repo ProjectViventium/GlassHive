@@ -4978,6 +4978,21 @@ def test_redact_text_masks_common_host_paths_and_credential_families():
         assert forbidden not in redacted
 
 
+def test_redact_text_fails_closed_for_an_unterminated_private_key():
+    private_key_body = "A" * 120
+    redacted = _redact_text(
+        "Safe prefix.\n-----BEGIN PRIVATE KEY-----\n"
+        f"{private_key_body}\n"
+        "untrusted trailing text"
+    )
+
+    assert "Safe prefix." in redacted
+    assert "BEGIN PRIVATE KEY" not in redacted
+    assert private_key_body not in redacted
+    assert "untrusted trailing text" not in redacted
+    assert "[REDACTED_PRIVATE_KEY]" in redacted
+
+
 def test_redact_text_masks_parent_visible_image_payloads():
     base64_png = "iVBORw0KGgo" + ("A" * 900) + "=="
     redacted = _redact_text(

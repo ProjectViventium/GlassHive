@@ -1602,18 +1602,87 @@ def test_streaming_redactor_holds_and_redacts_split_common_credentials():
     assert "[REDACTED]" in visible
 
 
+def test_streaming_redactor_holds_a_multiline_private_key_until_it_can_be_redacted():
+    redactor = StreamingRedactor(overlap=32, max_buffer=512)
+    private_key_body = "A" * 120
+
+    visible = redactor.feed(
+        "Safe preamble. "
+        + ("word " * 24)
+        + "-----BEGIN PRIVATE KEY-----\n"
+    )
+    visible += redactor.feed(f"{private_key_body}\n")
+    visible += redactor.feed("-----END PRIVATE KEY-----\nSafe tail.")
+    visible += redactor.flush()
+
+    assert "BEGIN PRIVATE KEY" not in visible
+    assert private_key_body not in visible
+    assert "[REDACTED_PRIVATE_KEY]" in visible
+    assert "Safe preamble." in visible
+    assert "Safe tail." in visible
+
+
+def test_streaming_redactor_fails_closed_for_an_oversized_unterminated_private_key():
+    redactor = StreamingRedactor(overlap=16, max_buffer=96)
+
+    visible = redactor.feed("Safe prefix. -----BEGIN PRIVATE KEY-----\n")
+    visible += redactor.feed(("A" * 64) + "\n")
+    visible += redactor.feed(("B" * 64) + "\nunsafe trailing text")
+    visible += redactor.flush()
+
+    assert "BEGIN PRIVATE KEY" not in visible
+    assert "A" * 32 not in visible
+    assert "B" * 32 not in visible
+    assert "unsafe trailing text" not in visible
+    assert "[REDACTED_OVERSIZED_STREAM_SEGMENT]" in visible
+    assert "Safe prefix." in visible
+
+
+def test_streaming_redactor_holds_a_bearer_credential_split_at_whitespace():
+    redactor = StreamingRedactor(overlap=16, max_buffer=256)
+
+    visible = redactor.feed(("safe " * 20) + "Bearer")
+    visible += redactor.feed(" ")
+    visible += redactor.feed("synthetic-bearer-credential\nSafe tail.")
+    visible += redactor.flush()
+
+    assert "synthetic-bearer-credential" not in visible
+    assert "Bearer [REDACTED]" in visible
+    assert "Safe tail." in visible
+
+
 def test_production_sse_redacts_a_secret_split_across_native_stream_snapshots(
     tmp_path, monkeypatch
 ):
     workspace = tmp_path / "Life"
     workspace.mkdir()
     client = _client(tmp_path, monkeypatch, runtime=SplitSecretStreamingRuntime())
+    native_snapshots = [
+        "Before api_key=PUBLIC_FAKE_",
+        "Before api_key=PUBLIC_FAKE_SECRET_VALUE after\n",
+    ]
+    observed_snapshots: list[str] = []
+
+    def split_native_snapshot(_request_record, _run):
+        index = min(len(observed_snapshots), len(native_snapshots) - 1)
+        snapshot = native_snapshots[index]
+        observed_snapshots.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(
+        client.app.state.conversation_provider,
+        "_native_output_snapshot",
+        split_native_snapshot,
+    )
     payload = _payload(workspace, model="claude-code:opus", stream=True)
 
     with client.stream("POST", "/v1/chat/completions", headers=AUTH, json=payload) as response:
         assert response.status_code == 200, response.text
         serialized = "\n".join(line for line in response.iter_lines() if line)
 
+    assert len(observed_snapshots) >= 2
+    assert observed_snapshots[0] == "Before api_key=PUBLIC_FAKE_"
+    assert observed_snapshots[1] == "Before api_key=PUBLIC_FAKE_SECRET_VALUE after\n"
     assert "PUBLIC_FAKE_SECRET_VALUE" not in serialized
     assert "PUBLIC_FAKE_" not in serialized
     assert "[REDACTED]" in serialized
