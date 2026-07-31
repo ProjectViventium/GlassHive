@@ -115,6 +115,24 @@ export GLASSHIVE_MCP_API_KEY="<dedicated-mcp-service-token>"
 uv run python -m workers_projects_runtime.mcp_server --transport streamable-http --port 8767
 ```
 
+## OpenClaw Runtime Release Contract
+
+GlassHive's workstation image installs OpenClaw `2026.7.1-2` through the committed
+`runtime_locks/openclaw/package-lock.json`, not through a mutable global package spec. The reviewed
+lock pins the npm tarball integrity and applies the production `fast-uri@3.1.3` override. Image
+generation validates the lock checksum before Docker starts, uses `npm ci --omit=dev`, verifies the
+installed OpenClaw and `fast-uri` versions, and then exposes the locked CLI.
+
+GlassHive also verifies the OpenClaw version when a workstation container is selected. Host-native
+OpenClaw workers require exactly `2026.7.1-2`; older, newer, missing, and unverified installations
+fail closed with recovery guidance. Both workstation and host launch environments force
+`OPENCLAW_DISABLE_BONJOUR=1`, because loopback gateway binding alone does not suppress native mDNS
+advertising.
+
+The 2026-07-21 reviewed production graph reports 0 critical, 0 high, and 6 moderate npm audit
+findings. A custom workstation image is supported only when it contains the same reviewed OpenClaw
+runtime; GlassHive checks it before starting a worker.
+
 ## Link Lifetime Defaults
 
 - `GLASSHIVE_LINK_REF_TTL_SECONDS` default: `0`, so `/r/{ref}` and `/v1/link-refs/{ref}` short

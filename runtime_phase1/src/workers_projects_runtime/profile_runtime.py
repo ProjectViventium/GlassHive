@@ -47,6 +47,7 @@ from .openclaw_runtime import (
     WorkerTerminatedError,
     _PROVIDER_ENV_KEYS,
 )
+from .openclaw_release import reviewed_openclaw_env
 from .runtime_requirements import host_runtime_requirement_issue
 from .run_evidence import (
     build_constraint_ledger,
@@ -2415,6 +2416,7 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
             f"export OPENCLAW_CONFIG_PATH={shlex.quote(self._container_openclaw_config_path())}",
             f"export OPENCLAW_MODEL={shlex.quote(model)}",
             f"export OPENCLAW_SESSION_ID={shlex.quote(self._default_session_key(worker) or worker_id)}",
+            "export OPENCLAW_DISABLE_BONJOUR=1",
         ]
         self._openclaw_env_path(worker_id).write_text("\n".join(env_lines) + "\n")
 
@@ -2422,7 +2424,7 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
         return self._env_flag("WPR_OPENCLAW_START_GATEWAY", False)
 
     def _gateway_env(self, worker: dict) -> dict[str, str]:
-        env = self._sandbox_env()
+        env = reviewed_openclaw_env(self._sandbox_env())
         env["OPENCLAW_STATE_DIR"] = self._container_openclaw_state_dir()
         env["OPENCLAW_CONFIG_PATH"] = self._container_openclaw_config_path()
         env["OPENCLAW_MODEL"] = self._openclaw_model_for_worker(worker)
@@ -2477,7 +2479,7 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
             logger.warning("OpenClaw gateway did not become ready for %s: %s", worker.get("worker_id"), detail)
 
     def _sandbox_env(self) -> dict[str, str]:
-        env = self._container_env(*_PROVIDER_ENV_KEYS)
+        env = reviewed_openclaw_env(self._container_env(*_PROVIDER_ENV_KEYS))
         env["HOME"] = self.sandbox.home_mount
         env["TERM"] = self.sandbox.term_value
         env["DISPLAY"] = self.sandbox.display_value
@@ -2535,8 +2537,14 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
         bootstrap_path.write_text(task_mode_text)
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+        require_reviewed_image = getattr(self.sandbox, "require_reviewed_openclaw_image", None)
+        if callable(require_reviewed_image):
+            require_reviewed_image()
         fast_sandbox = getattr(self.sandbox, "fast_sandbox_from_worker", lambda _worker: None)(worker)
         sandbox = fast_sandbox or self.sandbox.ensure_ready(worker, self.runtime_name)
+        require_reviewed = getattr(self.sandbox, "require_reviewed_openclaw", None)
+        if callable(require_reviewed):
+            require_reviewed(sandbox.container_name)
         self._write_gateway_config(worker, self._gateway_token(worker))
         self._start_openclaw_gateway(worker, sandbox)
         return self._runtime_info(worker, pid=sandbox.pid)
@@ -6108,7 +6116,7 @@ class HostOpenClawRuntime(HostNativeCliMixin, OpenClawWorkstationRuntime):
             )
         )
         config_path.chmod(0o600)
-        env = self._host_env(worker)
+        env = reviewed_openclaw_env(self._host_env(worker))
         env["OPENCLAW_STATE_DIR"] = str(state_dir)
         env["OPENCLAW_CONFIG_PATH"] = str(config_path)
         env["OPENCLAW_MODEL"] = model

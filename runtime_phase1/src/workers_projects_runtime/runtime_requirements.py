@@ -35,8 +35,8 @@ DEFAULT_HOST_RUNTIME_REQUIREMENTS: dict[str, list[dict[str, Any]]] = {
             "binary": "openclaw",
             "use_configured_binary": True,
             "label": "OpenClaw",
-            "min_version": "2026.6.6",
-            "recovery_hint": "Upgrade OpenClaw to the current stable release, then restart GlassHive.",
+            "exact_version": "2026.7.1-2",
+            "recovery_hint": "Install GlassHive's reviewed OpenClaw 2026.7.1-2 runtime, then restart GlassHive.",
         }
     ],
     "openclaw": [
@@ -44,8 +44,8 @@ DEFAULT_HOST_RUNTIME_REQUIREMENTS: dict[str, list[dict[str, Any]]] = {
             "binary": "openclaw",
             "use_configured_binary": True,
             "label": "OpenClaw",
-            "min_version": "2026.6.6",
-            "recovery_hint": "Upgrade OpenClaw to the current stable release, then restart GlassHive.",
+            "exact_version": "2026.7.1-2",
+            "recovery_hint": "Install GlassHive's reviewed OpenClaw 2026.7.1-2 runtime, then restart GlassHive.",
         }
     ],
 }
@@ -66,6 +66,12 @@ class RuntimeRequirementIssue:
     @property
     def user_message(self) -> str:
         profile_hint = f" for `{self.profile}`" if self.profile else ""
+        if self.problem == "version_mismatch_exact":
+            actual = f" Current version: {self.actual_version}." if self.actual_version else ""
+            return (
+                f"GlassHive cannot start the selected host worker{profile_hint} because {self.label} "
+                f"must be exactly {self.required_version}.{actual}"
+            )
         if self.problem == "version_mismatch":
             actual = f" Current version: {self.actual_version}." if self.actual_version else ""
             return (
@@ -181,6 +187,9 @@ def _normalize_requirement(requirement: dict[str, Any]) -> dict[str, Any]:
     ).strip()
     if min_version:
         normalized["min_version"] = min_version
+    exact_version = str(normalized.get("exact_version") or normalized.get("required_version") or "").strip()
+    if exact_version:
+        normalized["exact_version"] = exact_version
     return normalized
 
 
@@ -207,8 +216,10 @@ def _evaluate_requirement(
             recovery_hint=recovery_hint,
         )
 
+    exact_version = str(requirement.get("exact_version") or "").strip()
     min_version = str(requirement.get("min_version") or "").strip()
-    if not min_version:
+    required_version = exact_version or min_version
+    if not required_version:
         return _evaluate_capability_requirements(
             requirement,
             resolved_binary=resolved,
@@ -236,7 +247,7 @@ def _evaluate_requirement(
             binary=binary,
             label=_label_for_binary(label),
             problem="version_unverified",
-            required_version=min_version,
+            required_version=required_version,
             diagnostic_summary=f"Could not verify {label} version: {type(exc).__name__}",
             recovery_hint=recovery_hint,
         )
@@ -250,12 +261,24 @@ def _evaluate_requirement(
             binary=binary,
             label=_label_for_binary(label),
             problem="version_unverified",
-            required_version=min_version,
+            required_version=required_version,
             actual_version=actual_version,
             diagnostic_summary=_truncate(output or f"{label} version command exited {completed.returncode}"),
             recovery_hint=recovery_hint,
         )
-    if _version_tuple(actual_version) < _version_tuple(min_version):
+    if exact_version and actual_version != exact_version:
+        return RuntimeRequirementIssue(
+            profile=profile,
+            runtime_name=runtime_name,
+            binary=binary,
+            label=_label_for_binary(label),
+            problem="version_mismatch_exact",
+            required_version=exact_version,
+            actual_version=actual_version,
+            diagnostic_summary=f"{label} version {actual_version} differs from reviewed {exact_version}",
+            recovery_hint=recovery_hint,
+        )
+    if min_version and _version_tuple(actual_version) < _version_tuple(min_version):
         return RuntimeRequirementIssue(
             profile=profile,
             runtime_name=runtime_name,
@@ -402,7 +425,7 @@ def _csv_or_list(value: Any) -> set[str]:
 
 
 def _extract_version(text: str) -> str:
-    match = re.search(r"\bv?(\d+(?:\.\d+){0,3})\b", str(text or ""))
+    match = re.search(r"\bv?(\d+(?:\.\d+){0,3}(?:-[0-9A-Za-z.-]+)?)\b", str(text or ""))
     return match.group(1) if match else ""
 
 

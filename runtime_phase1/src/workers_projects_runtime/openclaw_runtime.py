@@ -15,6 +15,7 @@ from typing import Protocol
 
 import httpx
 
+from .openclaw_release import reviewed_openclaw_env, verify_reviewed_openclaw_binary
 from .terminal_takeover import TerminalTarget
 
 _PROVIDER_ENV_KEYS = [
@@ -225,6 +226,7 @@ class OpenClawRuntime:
         return defaults.get(profile, defaults["openclaw-general"])
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+        verify_reviewed_openclaw_binary(self.openclaw_bin)
         self._ensure_sandbox_image()
         meta = self._metadata_for_worker(worker)
         pid = self._safe_int(worker.get("pid"))
@@ -443,7 +445,7 @@ class OpenClawRuntime:
         stderr_path = self.logs_dir / f"{worker_id}.stderr.log"
         stdout_handle = stdout_path.open("a")
         stderr_handle = stderr_path.open("a")
-        env = {**os.environ}
+        env = reviewed_openclaw_env(os.environ)
         env["OPENCLAW_STATE_DIR"] = str(state_dir)
         env["OPENCLAW_CONFIG_PATH"] = str(state_dir / "openclaw.json")
         env["OPENCLAW_GATEWAY_TOKEN"] = token
