@@ -1153,6 +1153,7 @@ class WorkersProjectsService:
                     last_error=error_text,
                     compute_released_at=utc_now(),
                 )
+                self._wake_host_capacity_waiters(updated or worker)
                 self.store.add_event(
                     str(worker.get("project_id") or run.get("project_id") or ""),
                     worker_id,
@@ -1212,9 +1213,9 @@ class WorkersProjectsService:
         if failure_class == "host_worker_busy":
             return _bounded_float_env(
                 "GLASSHIVE_HOST_BUSY_RETRY_MAX_DELAY_S",
-                _bounded_float_env("GLASSHIVE_RETRY_MAX_DELAY_S", 300.0, min_value=0.1, max_value=86400.0),
+                15.0,
                 min_value=0.1,
-                max_value=86400.0,
+                max_value=60.0,
             )
         return _bounded_float_env("GLASSHIVE_RETRY_MAX_DELAY_S", 300.0, min_value=0.1, max_value=86400.0)
 
@@ -1224,7 +1225,14 @@ class WorkersProjectsService:
         exponent = min(max(0, attempts - 1), 8)
         return min(max_delay, base * (2**exponent))
 
-    def _capacity_retry_max_attempts(self) -> int:
+    def _capacity_retry_max_attempts(self, failure_class: str = "") -> int:
+        if failure_class == "host_worker_busy":
+            return _bounded_int_env(
+                "GLASSHIVE_HOST_BUSY_MAX_RETRY_ATTEMPTS",
+                240,
+                min_value=0,
+                max_value=10000,
+            )
         return _bounded_int_env("GLASSHIVE_MAX_CAPACITY_RETRY_ATTEMPTS", 6, min_value=0, max_value=1000)
 
     def _wake_worker_processor_later(self, worker_id: str, delay_s: float) -> None:
@@ -1279,7 +1287,7 @@ class WorkersProjectsService:
             ).as_store_fields()
         failure_class = str(failure_fields.get("failure_class") or "runtime_retryable")
         attempts = int(run.get("retry_attempts") or 0) + 1
-        max_attempts = self._capacity_retry_max_attempts()
+        max_attempts = self._capacity_retry_max_attempts(failure_class)
         if attempts > max_attempts:
             message = (
                 f"GlassHive stopped retrying this run because worker capacity stayed unavailable "
@@ -1906,6 +1914,7 @@ class WorkersProjectsService:
         }
         info = self.runtime.pause_worker(runtime_worker)
         updated = self._apply_runtime_info(worker_id, info, state="paused", last_error=worker.get("last_error") or "")
+        self._wake_host_capacity_waiters(updated or worker)
         active_run = self.store.get_active_run(worker_id)
         self.store.add_event(worker["project_id"], worker_id, active_run["run_id"] if active_run else None, "worker.paused", "Worker paused")
         self._emit_callback(worker, "worker.paused", run=active_run, message="Worker paused")
@@ -1933,6 +1942,7 @@ class WorkersProjectsService:
                 output_text=active_run.get("output_text", ""),
                 error_text="Interrupted by operator",
             )
+        self._wake_host_capacity_waiters(updated or worker)
         self.store.add_event(worker["project_id"], worker_id, active_run["run_id"] if active_run else None, "worker.interrupted", "Worker interrupted")
         self._emit_callback(worker, "worker.interrupted", run=active_run, message="Worker interrupted")
         return updated or worker
@@ -1949,6 +1959,7 @@ class WorkersProjectsService:
             return worker
 
         cancelled = None
+        released_running_capacity = state == "running"
         if state == "queued":
             cancelled = self.store.finalize_run_if_state(
                 run_id,
@@ -2009,6 +2020,8 @@ class WorkersProjectsService:
                 run=cancelled_run,
                 message="Run cancelled by provider client",
             )
+            if released_running_capacity:
+                self._wake_host_capacity_waiters(self.store.get_worker(worker_id) or worker)
         if self.store.has_queued_runs(worker_id):
             self._ensure_worker_processor(worker_id)
         return self.store.get_worker(worker_id) or worker
@@ -2057,6 +2070,7 @@ class WorkersProjectsService:
             last_error="",
             compute_released_at=utc_now(),
         )
+        self._wake_host_capacity_waiters(updated or worker)
         self.store.add_event(worker["project_id"], worker_id, None, "worker.terminated", "Worker terminated")
         revoke_signed_link_refs_for_worker(worker_id)
         self._emit_callback(worker, "worker.terminated", message="Worker terminated")
@@ -2300,6 +2314,7 @@ class WorkersProjectsService:
                 full_message=full_message if full_message != message else "",
                 deliverable=deliverable,
             )
+            self._wake_host_capacity_waiters(refreshed_worker)
         else:
             recovered_run = {**run, "state": "failed", "error_text": error_text, **failure_fields}
             refreshed_worker = self._refresh_runtime_info(worker_id, state="ready", last_error=error_text) or self.store.get_worker(worker_id) or worker
@@ -2336,6 +2351,7 @@ class WorkersProjectsService:
                     full_message=full_message if full_message != message else "",
                     deliverable=deliverable,
                 )
+                self._wake_host_capacity_waiters(refreshed_worker)
                 return self.store.get_worker(worker_id)
             finalized_run = self.store.finalize_run_if_state(
                 run["run_id"],
@@ -2358,6 +2374,7 @@ class WorkersProjectsService:
                 message=failure_message,
                 deliverable=deliverable,
             )
+            self._wake_host_capacity_waiters(refreshed_worker)
         return self.store.get_worker(worker_id)
 
     def heal_worker(self, worker_id: str) -> dict | None:
@@ -2501,6 +2518,50 @@ class WorkersProjectsService:
         )
         executor.submit(self._process_worker_queue, worker_id, generation)
 
+    def _wake_host_capacity_waiters(self, released_worker: dict) -> None:
+        """Wake one free host CLI/auth lane without disturbing unrelated queues."""
+
+        if str(released_worker.get("execution_mode") or "docker").strip().lower() != "host":
+            return
+        # Capacity checks intentionally allow the currently registered worker to
+        # re-enter its own lane. Probe as a distinct waiter so a stale/held slot is
+        # not mistaken for released capacity.
+        capacity_probe = {
+            **released_worker,
+            "worker_id": f"{released_worker.get('worker_id') or 'host'}:capacity-probe",
+        }
+        try:
+            if self._runtime_capacity_error(capacity_probe) is not None:
+                return
+        except Exception as exc:
+            logger.warning(
+                "Failed to verify released host capacity for worker %s: %s",
+                released_worker.get("worker_id") or "",
+                exc,
+            )
+            return
+        bundle = self._bootstrap_bundle_for(released_worker) or {}
+        run_mode = (
+            "conversation"
+            if str(bundle.get("run_mode") or "").strip().lower() == "conversation"
+            else "mission"
+        )
+        try:
+            waiting_worker_ids = self.store.release_host_capacity_waiters(
+                profile=str(released_worker.get("profile") or "").strip(),
+                execution_mode="host",
+                run_mode=run_mode,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to release queued host-capacity waiters for worker %s: %s",
+                released_worker.get("worker_id") or "",
+                exc,
+            )
+            return
+        for waiting_worker_id in waiting_worker_ids:
+            self._ensure_worker_processor(waiting_worker_id)
+
     def _processor_is_current(self, worker_id: str, generation: int) -> bool:
         with self._processors_lock:
             return worker_id in self._active_processors and self._processor_generations.get(worker_id) == generation
@@ -2567,6 +2628,7 @@ class WorkersProjectsService:
                     self.store.update_worker_state(worker_id, "paused", last_error="")
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.paused", str(exc))
                     self._emit_callback(worker, "run.paused", run={**run, "state": "paused", "error_text": str(exc)}, message=str(exc))
+                    self._wake_host_capacity_waiters(self.store.get_worker(worker_id) or worker)
                     return
                 except WorkerInterruptedError as exc:
                     if not self._processor_is_current(worker_id, generation):
@@ -2580,6 +2642,7 @@ class WorkersProjectsService:
                     self.store.update_worker_state(worker_id, "ready", last_error="")
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.interrupted", str(exc))
                     self._emit_callback(worker, "run.interrupted", run={**run, "state": "interrupted", "error_text": str(exc)}, message=str(exc))
+                    self._wake_host_capacity_waiters(self.store.get_worker(worker_id) or worker)
                     continue
                 except WorkerTerminatedError as exc:
                     if not self._processor_is_current(worker_id, generation):
@@ -2593,6 +2656,7 @@ class WorkersProjectsService:
                     self.store.update_worker_state(worker_id, "terminated", last_error=str(exc))
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.cancelled", str(exc))
                     self._emit_callback(worker, "run.cancelled", run={**run, "state": "cancelled", "error_text": str(exc)}, message=str(exc))
+                    self._wake_host_capacity_waiters(self.store.get_worker(worker_id) or worker)
                     return
                 except RuntimeErrorBase as exc:
                     if not self._processor_is_current(worker_id, generation):
@@ -2665,6 +2729,7 @@ class WorkersProjectsService:
                         message=failure_message,
                         deliverable=deliverable,
                     )
+                    self._wake_host_capacity_waiters(callback_worker)
                     if worker_state in {"paused", "terminated"}:
                         return
                     continue
@@ -2688,6 +2753,7 @@ class WorkersProjectsService:
                     failed_run = {**run, "state": "failed", "error_text": str(exc), **failure_fields}
                     failure_message = runtime_failure_callback_message(failure_fields, str(exc))
                     self._emit_callback(worker, "run.failed", run=failed_run, message=failure_message)
+                    self._wake_host_capacity_waiters(self.store.get_worker(worker_id) or worker)
                     continue
 
                 if not self._processor_is_current(worker_id, generation):
@@ -2698,6 +2764,7 @@ class WorkersProjectsService:
                     output_text=output,
                     usage=self._run_usage(worker, run["run_id"]),
                 )
+                self._wake_host_capacity_waiters(worker)
                 self.store.finalize_schedule_for_run(run["run_id"], state="completed")
                 self.store.update_worker(worker_id, state="ready", last_error="", last_run_id=run["run_id"])
                 message = terminal_callback_message(output)

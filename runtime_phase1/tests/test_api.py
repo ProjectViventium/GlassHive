@@ -13,7 +13,7 @@ import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from urllib.parse import urlencode, urlsplit
 
 import httpx
@@ -1002,6 +1002,550 @@ def test_retryable_host_busy_waits_and_retries_without_terminal_failure(tmp_path
         service.shutdown()
 
 
+def test_completed_run_immediately_wakes_other_host_capacity_waiters(tmp_path, monkeypatch):
+    class SharedCapacityRuntime(StubRuntime):
+        def __init__(self) -> None:
+            self.active_worker_id = ""
+            self.active_started = Event()
+            self.release_active = Event()
+            self.waiting_run_calls = 0
+
+        def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
+            if self.active_worker_id and worker["worker_id"] != self.active_worker_id:
+                return RuntimeErrorBase(
+                    f"Host-native codex-cli already has an active worker ({self.active_worker_id}); "
+                    "v1 allows one active host worker per CLI family."
+                )
+            return None
+
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            _ = timeout_sec, run_id
+            if instruction == "hold the shared slot":
+                self.active_worker_id = worker["worker_id"]
+                self.active_started.set()
+                assert self.release_active.wait(timeout=2)
+                self.active_worker_id = ""
+                return "active run completed"
+            self.waiting_run_calls += 1
+            return "waiting run completed"
+
+    monkeypatch.setenv("GLASSHIVE_HOST_BUSY_RETRY_BASE_DELAY_S", "60")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = SharedCapacityRuntime()
+    service = WorkersProjectsService(
+        store,
+        runtime,
+        max_workers=2,
+        reconcile_on_startup=False,
+    )
+    try:
+        project = store.create_project("owner", "Capacity", "Share host capacity.", "codex-cli")
+
+        def worker(name: str) -> dict:
+            return store.create_worker(
+                project_id=project["project_id"],
+                owner_id="owner",
+                name=name,
+                role="worker",
+                profile="codex-cli",
+                backend="openclaw",
+                runtime="codex-cli",
+                model="stub/codex-cli",
+                execution_mode="host",
+                bootstrap_bundle={"run_mode": "conversation"},
+            )
+
+        active_worker = worker("Active worker")
+        waiting_worker = worker("Waiting worker")
+        active_run = service.assign_run(active_worker["worker_id"], "hold the shared slot")
+        assert runtime.active_started.wait(timeout=2)
+        waiting_run = service.assign_run(waiting_worker["worker_id"], "use the released slot")
+
+        wait_until(
+            lambda: (store.get_run(waiting_run["run_id"]) or {}).get("failure_class")
+            == "host_worker_busy"
+        )
+        blocked = store.get_run(waiting_run["run_id"])
+        assert blocked["state"] == "queued"
+        assert blocked["retry_after"]
+
+        runtime.release_active.set()
+        wait_until(
+            lambda: (store.get_run(active_run["run_id"]) or {}).get("state") == "completed"
+        )
+        wait_until(
+            lambda: (store.get_run(waiting_run["run_id"]) or {}).get("state") == "completed"
+        )
+
+        completed = store.get_run(waiting_run["run_id"])
+        assert completed["retry_attempts"] == 1
+        assert completed["last_retry_class"] == "host_worker_busy"
+        assert runtime.waiting_run_calls == 1
+    finally:
+        runtime.release_active.set()
+        service.shutdown()
+
+
+def test_release_host_capacity_waiters_filters_to_the_released_structural_lane(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+
+    def create_waiter(*, profile: str, execution_mode: str, run_mode: str) -> tuple[dict, dict]:
+        project = store.create_project(
+            "owner",
+            f"{profile}-{execution_mode}-{run_mode}",
+            "Wait on one structural host lane.",
+            profile,
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name=f"{profile}-{execution_mode}-{run_mode}",
+            role="worker",
+            profile=profile,
+            backend="openclaw",
+            runtime=profile,
+            model=f"stub/{profile}",
+            execution_mode=execution_mode,
+            bootstrap_bundle={"run_mode": run_mode},
+        )
+        run = store.create_run(worker["worker_id"], project["project_id"], "wait", state="queued")
+        store.update_run(
+            run["run_id"],
+            failure_class="host_worker_busy",
+            retry_after="2099-01-01T00:00:00+00:00",
+        )
+        return worker, run
+
+    matching_worker, matching_run = create_waiter(
+        profile="codex-cli", execution_mode="host", run_mode="conversation"
+    )
+    _, mission_run = create_waiter(
+        profile="codex-cli", execution_mode="host", run_mode="mission"
+    )
+    _, claude_run = create_waiter(
+        profile="claude-code", execution_mode="host", run_mode="conversation"
+    )
+    _, docker_run = create_waiter(
+        profile="codex-cli", execution_mode="docker", run_mode="conversation"
+    )
+
+    released = store.release_host_capacity_waiters(
+        profile="codex-cli",
+        execution_mode="host",
+        run_mode="conversation",
+    )
+
+    assert released == [matching_worker["worker_id"]]
+    assert store.get_run(matching_run["run_id"])["retry_after"] is None
+    assert store.get_run(mission_run["run_id"])["retry_after"] is not None
+    assert store.get_run(claude_run["run_id"])["retry_after"] is not None
+    assert store.get_run(docker_run["run_id"])["retry_after"] is not None
+
+
+def test_host_capacity_waiters_remain_delayed_while_the_lane_is_still_held(tmp_path):
+    class BusyRuntime(StubRuntime):
+        active_worker_id = ""
+
+        def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
+            if worker["worker_id"] != self.active_worker_id:
+                return RuntimeErrorBase(
+                    "Host-native codex-cli still has an active conversation worker."
+                )
+            return None
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(
+        store,
+        BusyRuntime(),
+        max_workers=2,
+        reconcile_on_startup=False,
+    )
+    try:
+        project = store.create_project("owner", "Held Lane", "Keep the retry delay.", "codex-cli")
+        released_worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Released worker",
+            role="worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+            execution_mode="host",
+            bootstrap_bundle={"run_mode": "conversation"},
+        )
+        waiting_worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Waiting worker",
+            role="worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+            execution_mode="host",
+            bootstrap_bundle={"run_mode": "conversation"},
+        )
+        service.runtime.active_worker_id = released_worker["worker_id"]
+        waiting_run = store.create_run(
+            waiting_worker["worker_id"],
+            project["project_id"],
+            "wait",
+            state="queued",
+        )
+        retry_after = "2099-01-01T00:00:00+00:00"
+        store.update_run(
+            waiting_run["run_id"],
+            failure_class="host_worker_busy",
+            retry_after=retry_after,
+        )
+        awakened: list[str] = []
+        service._ensure_worker_processor = awakened.append  # type: ignore[method-assign]
+
+        service._wake_host_capacity_waiters(released_worker)
+
+        assert store.get_run(waiting_run["run_id"])["retry_after"] == retry_after
+        assert awakened == []
+    finally:
+        service.shutdown()
+
+
+def test_failed_host_run_immediately_wakes_its_capacity_lane(tmp_path, monkeypatch):
+    class SharedCapacityRuntime(StubRuntime):
+        def __init__(self) -> None:
+            self.active_worker_id = ""
+            self.active_started = Event()
+            self.release_active = Event()
+
+        def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
+            if self.active_worker_id and worker["worker_id"] != self.active_worker_id:
+                return RuntimeErrorBase("Host-native codex-cli already has an active worker.")
+            return None
+
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            _ = timeout_sec, run_id
+            if instruction == "fail after releasing the shared slot":
+                self.active_worker_id = worker["worker_id"]
+                self.active_started.set()
+                assert self.release_active.wait(timeout=2)
+                self.active_worker_id = ""
+                raise RuntimeError("synthetic terminal failure")
+            return "waiting run completed"
+
+    monkeypatch.setenv("GLASSHIVE_HOST_BUSY_RETRY_BASE_DELAY_S", "60")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = SharedCapacityRuntime()
+    service = WorkersProjectsService(store, runtime, max_workers=2, reconcile_on_startup=False)
+    try:
+        project = store.create_project("owner", "Failure Handoff", "Release after failure.", "codex-cli")
+
+        def worker(name: str) -> dict:
+            return store.create_worker(
+                project_id=project["project_id"],
+                owner_id="owner",
+                name=name,
+                role="worker",
+                profile="codex-cli",
+                backend="openclaw",
+                runtime="codex-cli",
+                model="stub/codex-cli",
+                execution_mode="host",
+                bootstrap_bundle={"run_mode": "conversation"},
+            )
+
+        active_worker = worker("Failing worker")
+        waiting_worker = worker("Waiting worker")
+        active_run = service.assign_run(
+            active_worker["worker_id"], "fail after releasing the shared slot"
+        )
+        assert runtime.active_started.wait(timeout=2)
+        waiting_run = service.assign_run(waiting_worker["worker_id"], "use the released slot")
+        wait_until(
+            lambda: (store.get_run(waiting_run["run_id"]) or {}).get("failure_class")
+            == "host_worker_busy"
+        )
+
+        runtime.release_active.set()
+        wait_until(lambda: (store.get_run(active_run["run_id"]) or {}).get("state") == "failed")
+        wait_until(
+            lambda: (store.get_run(waiting_run["run_id"]) or {}).get("state") == "completed",
+            timeout=1.0,
+        )
+    finally:
+        runtime.release_active.set()
+        service.shutdown()
+
+
+@pytest.mark.parametrize("operation", ["pause", "interrupt", "cancel", "terminate"])
+def test_host_control_terminal_paths_wake_the_released_capacity_lane(
+    tmp_path,
+    operation,
+):
+    class ControlRuntime(StubRuntime):
+        def __init__(self) -> None:
+            self.active = True
+            self.active_worker_id = ""
+
+        def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
+            if self.active and worker["worker_id"] != self.active_worker_id:
+                return RuntimeErrorBase("Host-native codex-cli already has an active worker.")
+            return None
+
+        def _released_info(self, worker: dict) -> RuntimeInfo:
+            self.active = False
+            return RuntimeInfo(
+                runtime="codex-cli",
+                model=str(worker.get("model") or "stub/codex-cli"),
+                gateway_url="",
+                gateway_port=None,
+                gateway_token=None,
+                session_key=None,
+                state_dir="",
+                workspace_dir="",
+                pid=None,
+            )
+
+        def pause_worker(self, worker: dict) -> RuntimeInfo:
+            return self._released_info(worker)
+
+        def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
+            _ = run_id
+            return self._released_info(worker)
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            return self._released_info(worker)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = ControlRuntime()
+    service = WorkersProjectsService(store, runtime, max_workers=2, reconcile_on_startup=False)
+    try:
+        project = store.create_project("owner", "Control Handoff", "Release on control.", "codex-cli")
+
+        def worker(name: str) -> dict:
+            return store.create_worker(
+                project_id=project["project_id"],
+                owner_id="owner",
+                name=name,
+                role="worker",
+                profile="codex-cli",
+                backend="openclaw",
+                runtime="codex-cli",
+                model="stub/codex-cli",
+                execution_mode="host",
+                bootstrap_bundle={"run_mode": "conversation"},
+            )
+
+        active_worker = worker("Controlled worker")
+        waiting_worker = worker("Waiting worker")
+        runtime.active_worker_id = active_worker["worker_id"]
+        active_run = store.create_run(
+            active_worker["worker_id"],
+            project["project_id"],
+            "active",
+            state="running",
+        )
+        waiting_run = store.create_run(
+            waiting_worker["worker_id"],
+            project["project_id"],
+            "waiting",
+            state="queued",
+        )
+        store.update_run(
+            waiting_run["run_id"],
+            failure_class="host_worker_busy",
+            retry_after="2099-01-01T00:00:00+00:00",
+        )
+        awakened: list[str] = []
+        service._ensure_worker_processor = awakened.append  # type: ignore[method-assign]
+
+        if operation == "pause":
+            service.pause_worker(active_worker["worker_id"])
+        elif operation == "interrupt":
+            service.interrupt_worker(active_worker["worker_id"])
+        elif operation == "cancel":
+            service.cancel_run(active_worker["worker_id"], active_run["run_id"])
+        else:
+            service.terminate_worker(active_worker["worker_id"])
+
+        assert store.get_run(waiting_run["run_id"])["retry_after"] is None
+        assert awakened == [waiting_worker["worker_id"]]
+    finally:
+        service.shutdown()
+
+
+def test_recovered_terminal_run_wakes_the_released_host_capacity_lane(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), max_workers=2, reconcile_on_startup=False)
+    try:
+        project = store.create_project("owner", "Recovered Handoff", "Release after recovery.", "codex-cli")
+
+        def worker(name: str) -> dict:
+            return store.create_worker(
+                project_id=project["project_id"],
+                owner_id="owner",
+                name=name,
+                role="worker",
+                profile="codex-cli",
+                backend="openclaw",
+                runtime="codex-cli",
+                model="stub/codex-cli",
+                execution_mode="host",
+                bootstrap_bundle={"run_mode": "conversation"},
+            )
+
+        recovered_worker = worker("Recovered worker")
+        waiting_worker = worker("Waiting worker")
+        recovered_run = store.create_run(
+            recovered_worker["worker_id"],
+            project["project_id"],
+            "recover",
+            state="running",
+        )
+        waiting_run = store.create_run(
+            waiting_worker["worker_id"],
+            project["project_id"],
+            "wait",
+            state="queued",
+        )
+        store.update_run(
+            waiting_run["run_id"],
+            failure_class="host_worker_busy",
+            retry_after="2099-01-01T00:00:00+00:00",
+        )
+        awakened: list[str] = []
+        service._ensure_worker_processor = awakened.append  # type: ignore[method-assign]
+
+        service._apply_recovered_run(
+            recovered_worker,
+            recovered_run,
+            {"state": "completed", "output_text": "recovered output", "usage": {}},
+        )
+
+        assert store.get_run(waiting_run["run_id"])["retry_after"] is None
+        assert awakened == [waiting_worker["worker_id"]]
+    finally:
+        service.shutdown()
+
+
+def test_host_busy_retry_policy_has_short_cadence_and_an_independent_long_budget(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.delenv("GLASSHIVE_HOST_BUSY_RETRY_BASE_DELAY_S", raising=False)
+    monkeypatch.delenv("GLASSHIVE_HOST_BUSY_RETRY_MAX_DELAY_S", raising=False)
+    monkeypatch.delenv("GLASSHIVE_HOST_BUSY_MAX_RETRY_ATTEMPTS", raising=False)
+    monkeypatch.setenv("GLASSHIVE_RETRY_MAX_DELAY_S", "300")
+    monkeypatch.setenv("GLASSHIVE_MAX_CAPACITY_RETRY_ATTEMPTS", "6")
+
+    service = WorkersProjectsService(Store(str(tmp_path / "runtime.db")), StubRuntime(), max_workers=2)
+    try:
+        assert [service._retry_delay_s("host_worker_busy", attempt) for attempt in (1, 2, 3, 10)] == [
+            5.0,
+            10.0,
+            15.0,
+            15.0,
+        ]
+        assert service._capacity_retry_max_attempts("host_worker_busy") == 240
+
+        assert service._retry_delay_s("runtime_retryable", 10) == 300.0
+        assert service._capacity_retry_max_attempts("runtime_retryable") == 6
+    finally:
+        service.shutdown()
+
+
+def test_three_host_workers_handoff_one_cli_lane_without_using_generic_retry_budget(
+    tmp_path,
+    monkeypatch,
+):
+    class SingleLaneRuntime(StubRuntime):
+        def __init__(self) -> None:
+            self._lock = Lock()
+            self._active = False
+            self.active_count = 0
+            self.max_active_count = 0
+            self.completed_workers: list[str] = []
+
+        def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
+            _ = worker
+            with self._lock:
+                if not self._active:
+                    return None
+            return RuntimeErrorBase("Host-native codex-cli already has an active worker.")
+
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            _ = instruction, timeout_sec, run_id
+            with self._lock:
+                if self._active:
+                    raise RuntimeErrorBase("Host-native codex-cli already has an active worker.")
+                self._active = True
+                self.active_count += 1
+                self.max_active_count = max(self.max_active_count, self.active_count)
+            try:
+                time.sleep(0.22)
+                self.completed_workers.append(str(worker["worker_id"]))
+                return f"completed {worker['worker_id']}"
+            finally:
+                with self._lock:
+                    self.active_count -= 1
+                    self._active = False
+
+    monkeypatch.setenv("GLASSHIVE_HOST_BUSY_RETRY_BASE_DELAY_S", "0.1")
+    monkeypatch.setenv("GLASSHIVE_HOST_BUSY_RETRY_MAX_DELAY_S", "0.1")
+    monkeypatch.setenv("GLASSHIVE_HOST_BUSY_MAX_RETRY_ATTEMPTS", "20")
+    monkeypatch.setenv("GLASSHIVE_MAX_CAPACITY_RETRY_ATTEMPTS", "1")
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = SingleLaneRuntime()
+    service = WorkersProjectsService(store, runtime, max_workers=3)
+    try:
+        project = store.create_project("owner", "Lane Handoff", "Serialize one CLI lane.", "codex-cli")
+        runs: list[dict] = []
+        for index in range(3):
+            worker = store.create_worker(
+                project_id=project["project_id"],
+                owner_id="owner",
+                name=f"Queued Cortex {index + 1}",
+                role="worker",
+                profile="codex-cli",
+                backend="openclaw",
+                runtime="codex-cli",
+                model="stub/codex-cli",
+            )
+            runs.append(service.assign_run(worker["worker_id"], f"run cortex {index + 1}"))
+
+        run_ids = [str(run["run_id"]) for run in runs]
+        wait_until(
+            lambda: all((store.get_run(run_id) or {}).get("state") == "completed" for run_id in run_ids),
+            timeout=5.0,
+        )
+
+        settled = [store.get_run(run_id) for run_id in run_ids]
+        assert runtime.max_active_count == 1
+        assert len(runtime.completed_workers) == 3
+        assert all(run and run["state"] == "completed" for run in settled)
+        assert sum(int((run or {}).get("retry_attempts") or 0) for run in settled) >= 2
+    finally:
+        service.shutdown()
+
+
 def test_future_capacity_retry_does_not_hot_resubmit_processor(tmp_path):
     store = Store(str(tmp_path / "runtime.db"))
     service = WorkersProjectsService(store, StubRuntime(), max_workers=2)
@@ -1155,6 +1699,7 @@ def test_retryable_capacity_wait_has_max_attempts(tmp_path, monkeypatch):
 
     monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
     monkeypatch.setenv("GLASSHIVE_HOST_BUSY_RETRY_BASE_DELAY_S", "0.1")
+    monkeypatch.setenv("GLASSHIVE_HOST_BUSY_MAX_RETRY_ATTEMPTS", "1")
     monkeypatch.setenv("GLASSHIVE_MAX_CAPACITY_RETRY_ATTEMPTS", "1")
     monkeypatch.setattr("workers_projects_runtime.service.httpx.post", capture_post)
 

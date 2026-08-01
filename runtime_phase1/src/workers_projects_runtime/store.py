@@ -1242,6 +1242,78 @@ class Store:
             return None
         return str(row["retry_after"] or "") or None
 
+    def release_host_capacity_waiters(
+        self,
+        *,
+        profile: str,
+        execution_mode: str,
+        run_mode: str,
+    ) -> list[str]:
+        """Make only one released host CLI/auth lane immediately eligible."""
+
+        normalized_profile = str(profile or "").strip()
+        normalized_execution_mode = str(execution_mode or "").strip().lower()
+        normalized_run_mode = (
+            "conversation" if str(run_mode or "").strip().lower() == "conversation" else "mission"
+        )
+        if not normalized_profile or normalized_execution_mode != "host":
+            return []
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT
+                    runs.run_id,
+                    runs.worker_id,
+                    workers.bootstrap_bundle_json
+                FROM runs
+                INNER JOIN workers ON workers.worker_id = runs.worker_id
+                WHERE runs.state = 'queued'
+                  AND runs.failure_class = 'host_worker_busy'
+                  AND runs.retry_after IS NOT NULL
+                  AND runs.retry_after != ''
+                  AND workers.profile = ?
+                  AND workers.execution_mode = ?
+                ORDER BY runs.queued_at ASC, runs.run_id ASC
+                """,
+                (normalized_profile, normalized_execution_mode),
+            ).fetchall()
+            matching_rows = []
+            for row in rows:
+                bundle = {}
+                raw_bundle = str(row["bootstrap_bundle_json"] or "").strip()
+                if raw_bundle:
+                    try:
+                        parsed = json.loads(raw_bundle)
+                    except json.JSONDecodeError:
+                        parsed = {}
+                    bundle = parsed if isinstance(parsed, dict) else {}
+                waiter_run_mode = (
+                    "conversation"
+                    if str(bundle.get("run_mode") or "").strip().lower() == "conversation"
+                    else "mission"
+                )
+                if waiter_run_mode == normalized_run_mode:
+                    matching_rows.append(row)
+            run_ids = [str(row["run_id"]) for row in matching_rows]
+            if run_ids:
+                placeholders = ", ".join("?" for _ in run_ids)
+                conn.execute(
+                    f"""
+                    UPDATE runs
+                    SET retry_after = NULL
+                    WHERE run_id IN ({placeholders})
+                      AND state = 'queued'
+                      AND failure_class = 'host_worker_busy'
+                      AND retry_after IS NOT NULL
+                      AND retry_after != ''
+                    """,
+                    run_ids,
+                )
+            conn.execute("COMMIT")
+        return list(dict.fromkeys(str(row["worker_id"]) for row in matching_rows))
+
     def requeue_run_for_retry(
         self,
         run_id: str,
