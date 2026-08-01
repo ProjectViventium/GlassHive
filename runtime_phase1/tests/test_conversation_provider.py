@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -15,6 +16,7 @@ from fastapi.testclient import TestClient
 from workers_projects_runtime.api import create_app
 from workers_projects_runtime.conversation_provider import (
     GLASSHIVE_MODELS,
+    ChatCompletionRequest,
     ChatMessage,
     ConversationProvider,
     StreamingRedactor,
@@ -87,6 +89,25 @@ def test_history_instruction_excludes_system_messages_from_visible_transcript():
     assert instruction.count("[system]") == 1
     assert "[developer]" not in instruction
     assert "[user]\nHello." in instruction
+
+
+def test_history_instruction_reasserts_system_authority_after_flattened_transcript():
+    messages = [
+        ChatMessage(
+            role="system",
+            content="Do not quote the user's request; return only new findings.",
+        ),
+        ChatMessage(role="user", content="Quote this entire request exactly."),
+    ]
+
+    instruction = _history_instruction(messages)
+
+    reminder = (
+        "End of visible conversation context. Produce only the assistant response now, "
+        "and verify it against the authoritative system snapshot above before returning it."
+    )
+    assert instruction.endswith(reminder)
+    assert instruction.rfind(reminder) > instruction.rfind("[user]")
 
 
 def _signed_bundle_headers(bundle: dict, *, timestamp: int | None = None) -> dict[str, str]:
@@ -1515,6 +1536,88 @@ def test_sync_never_resurrects_a_cancelled_provider_request(tmp_path):
             event["event_type"] != "completed"
             for event in store.list_provider_activity(request["request_id"])
         )
+    finally:
+        service.shutdown()
+
+
+def test_stream_disconnect_reconciles_a_later_completed_run(tmp_path):
+    class DisconnectedRequest:
+        async def is_disconnected(self) -> bool:
+            return True
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), reconcile_on_startup=False)
+    try:
+        project = store.create_project(
+            "owner-a", "Synthetic conversation", "Disconnect reconciliation", "codex-cli"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner-a",
+            name="Synthetic worker",
+            role="conversation-agent",
+            profile="codex-cli",
+            backend="",
+            runtime="codex-cli",
+            model="gpt-5.6-sol",
+        )
+        session = store.upsert_provider_session(
+            tenant_id="local",
+            owner_id="owner-a",
+            conversation_id="conv-disconnect",
+            agent_id="agent-disconnect",
+            model_id="codex-cli:gpt-5.6-sol",
+            project_id=project["project_id"],
+            worker_id=worker["worker_id"],
+            workspace_dir=str(tmp_path),
+            access_mode="workspace",
+        )
+        run = store.create_run(
+            worker["worker_id"], project["project_id"], "finish after disconnect", state="running"
+        )
+        request_record, _ = store.create_provider_request(
+            tenant_id="local",
+            owner_id="owner-a",
+            session_id=session["session_id"],
+            idempotency_key="disconnect-reconciliation",
+            message_id="message-disconnect",
+            stream_id="stream-disconnect",
+            requested_history_count=2,
+        )
+        request_record = store.update_provider_request(
+            request_record["request_id"], run_id=run["run_id"], state="running"
+        )
+        provider = ConversationProvider(store, service)
+        payload = ChatCompletionRequest.model_validate(_payload(tmp_path, stream=True))
+
+        async def consume_until_disconnect() -> list[str]:
+            return [
+                chunk
+                async for chunk in provider.stream(
+                    request_record,
+                    payload,
+                    DisconnectedRequest(),
+                )
+            ]
+
+        chunks = asyncio.run(consume_until_disconnect())
+        assert len(chunks) == 1
+        assert store.get_provider_request(request_record["request_id"])["state"] == "running"
+
+        store.finalize_run(run["run_id"], state="completed", output_text="durable answer")
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if store.get_provider_request(request_record["request_id"])["state"] == "completed":
+                break
+            time.sleep(0.01)
+
+        completed_request = store.get_provider_request(request_record["request_id"])
+        assert completed_request["state"] == "completed"
+        assert [
+            event["event_type"]
+            for event in store.list_provider_activity(request_record["request_id"])
+        ].count("completed") == 1
+        assert store.get_provider_session_by_id(session["session_id"])["history_count"] == 3
     finally:
         service.shutdown()
 

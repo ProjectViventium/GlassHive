@@ -471,6 +471,14 @@ def _history_instruction(messages: Iterable[ChatMessage], *, start_at: int = 0) 
         text = _message_text(message.content).strip()
         if text:
             lines.append(f"[{role}]\n{text}")
+    if current_system:
+        # A native CLI accepts one flattened instruction rather than an ordered role array. End on
+        # the request's authority contract so the final user transcript cannot accidentally gain
+        # system-level precedence through simple recency.
+        lines.append(
+            "End of visible conversation context. Produce only the assistant response now, "
+            "and verify it against the authoritative system snapshot above before returning it."
+        )
     return "\n\n".join(lines).strip()
 
 
@@ -1014,6 +1022,9 @@ class ConversationProvider:
         # creation so concurrent transport retries cannot create orphan workers before SQLite's
         # idempotency uniqueness check runs.
         self._start_lock = threading.RLock()
+        self._sync_lock = threading.RLock()
+        self._detached_reconciliation_lock = threading.Lock()
+        self._detached_reconciliations: set[str] = set()
         self._prestart_cancellations: dict[tuple[str, str, str], float] = {}
         self._last_retention_monotonic = 0.0
         self._apply_retention_policy()
@@ -1327,6 +1338,13 @@ class ConversationProvider:
             ) or request_record
 
     def _sync(self, request_record: dict[str, Any]) -> dict[str, Any]:
+        # Streaming, activity polling, and detached reconciliation can observe the same
+        # request concurrently. Serialize the idempotent transition so terminal activity and
+        # session history are each committed exactly once.
+        with self._sync_lock:
+            return self._sync_locked(request_record)
+
+    def _sync_locked(self, request_record: dict[str, Any]) -> dict[str, Any]:
         request_id = str(request_record["request_id"])
         # Cancellation is an irreversible authoring boundary. In particular, a host process
         # that exits after an interrupt must never resurrect the client-visible request.
@@ -1404,6 +1422,34 @@ class ConversationProvider:
                 },
             )
         return updated
+
+    def _reconcile_detached_request(self, request_id: str) -> None:
+        try:
+            while True:
+                record = self.store.get_provider_request(request_id)
+                if not record or str(record.get("state") or "") in TERMINAL_REQUEST_STATES:
+                    return
+                self._sync(record)
+                record = self.store.get_provider_request(request_id)
+                if not record or str(record.get("state") or "") in TERMINAL_REQUEST_STATES:
+                    return
+                time.sleep(0.2)
+        finally:
+            with self._detached_reconciliation_lock:
+                self._detached_reconciliations.discard(request_id)
+
+    def _ensure_detached_reconciliation(self, request_id: str) -> None:
+        with self._detached_reconciliation_lock:
+            if request_id in self._detached_reconciliations:
+                return
+            self._detached_reconciliations.add(request_id)
+        thread = threading.Thread(
+            target=self._reconcile_detached_request,
+            args=(request_id,),
+            daemon=True,
+            name=f"glasshive-provider-reconcile-{request_id[-8:]}",
+        )
+        thread.start()
 
     def _sync_native_activity(self, request_record: dict[str, Any], run: dict[str, Any]) -> None:
         collector = getattr(self.service.runtime, "provider_activity_log", None)
@@ -1578,6 +1624,24 @@ class ConversationProvider:
         return response
 
     async def stream(
+        self,
+        request_record: dict[str, Any],
+        payload: ChatCompletionRequest,
+        request: Request,
+    ):
+        request_id = str(request_record["request_id"])
+        try:
+            async for chunk in self._stream_chunks(request_record, payload, request):
+                yield chunk
+        finally:
+            # Transport lifetime must not own durable request lifetime. A refresh, relay timeout,
+            # or network loss detaches the consumer while the harness continues; reconcile its
+            # terminal run in the provider process so reattachment and persisted state are correct.
+            record = self.store.get_provider_request(request_id)
+            if record and str(record.get("state") or "") not in TERMINAL_REQUEST_STATES:
+                self._ensure_detached_reconciliation(request_id)
+
+    async def _stream_chunks(
         self,
         request_record: dict[str, Any],
         payload: ChatCompletionRequest,
