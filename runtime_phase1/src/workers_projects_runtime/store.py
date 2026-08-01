@@ -1296,6 +1296,7 @@ class Store:
                 )
                 if waiter_run_mode == normalized_run_mode:
                     matching_rows.append(row)
+                    break
             run_ids = [str(row["run_id"]) for row in matching_rows]
             if run_ids:
                 placeholders = ", ".join("?" for _ in run_ids)

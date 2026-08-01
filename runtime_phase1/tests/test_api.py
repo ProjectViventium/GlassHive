@@ -1125,6 +1125,18 @@ def test_release_host_capacity_waiters_filters_to_the_released_structural_lane(t
     matching_worker, matching_run = create_waiter(
         profile="codex-cli", execution_mode="host", run_mode="conversation"
     )
+    second_matching_worker, second_matching_run = create_waiter(
+        profile="codex-cli", execution_mode="host", run_mode="conversation"
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE runs SET queued_at = ? WHERE run_id = ?",
+            ("2026-08-01T10:00:00+00:00", matching_run["run_id"]),
+        )
+        conn.execute(
+            "UPDATE runs SET queued_at = ? WHERE run_id = ?",
+            ("2026-08-01T10:01:00+00:00", second_matching_run["run_id"]),
+        )
     _, mission_run = create_waiter(
         profile="codex-cli", execution_mode="host", run_mode="mission"
     )
@@ -1143,6 +1155,8 @@ def test_release_host_capacity_waiters_filters_to_the_released_structural_lane(t
 
     assert released == [matching_worker["worker_id"]]
     assert store.get_run(matching_run["run_id"])["retry_after"] is None
+    assert store.get_run(second_matching_run["run_id"])["retry_after"] is not None
+    assert second_matching_worker["worker_id"] not in released
     assert store.get_run(mission_run["run_id"])["retry_after"] is not None
     assert store.get_run(claude_run["run_id"])["retry_after"] is not None
     assert store.get_run(docker_run["run_id"])["retry_after"] is not None
@@ -4507,13 +4521,13 @@ def test_callback_over_budget_dead_letters_without_http(tmp_path, monkeypatch):
     monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
     store = Store(str(tmp_path / "runtime.db"))
     service = WorkersProjectsService(store, StubRuntime())
-    try:
-        _project, worker, _run, record = _create_callback_outbox_record(store)
-        with store._connect() as conn:
-            conn.execute("UPDATE callback_outbox SET attempts = 3 WHERE callback_id = ?", (record["callback_id"],))
-        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
-    finally:
-        service.shutdown()
+    # This is a synchronous unit of the delivery method; stop the background retry poller so it
+    # cannot claim the synthetic record concurrently and inflate the attempt count.
+    service.shutdown()
+    _project, worker, _run, record = _create_callback_outbox_record(store)
+    with store._connect() as conn:
+        conn.execute("UPDATE callback_outbox SET attempts = 3 WHERE callback_id = ?", (record["callback_id"],))
+    service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
 
     row = _callback_row(store, record["callback_id"])
     assert row["status"] == "dead_lettered"
