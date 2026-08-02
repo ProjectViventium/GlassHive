@@ -400,6 +400,8 @@ def test_models_expose_exact_harness_registry(tmp_path, monkeypatch):
     assert all(model["capabilities"]["conversation_session"] for model in models.values())
     assert all(model["capabilities"]["chat_completions"] for model in models.values())
     assert all(model["capabilities"]["responses_api"] for model in models.values())
+    assert all(model["capabilities"]["voice_pipeline_llm"] for model in models.values())
+    assert all(not model["capabilities"]["native_realtime_voice"] for model in models.values())
     assert models["codex-cli:gpt-5.6-sol"]["capabilities"]["incremental_text"] is False
     assert models["claude-code:opus"]["capabilities"]["incremental_text"] is False
     assert all(model["readiness"]["status"] for model in models.values())
