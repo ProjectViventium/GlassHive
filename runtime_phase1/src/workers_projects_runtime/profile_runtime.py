@@ -504,6 +504,159 @@ def _render_toml_document(data: dict[str, object]) -> str:
     return "\n\n".join(block for block in blocks if block.strip()).strip()
 
 
+_PLUGIN_ID_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*"
+)
+
+
+def _host_plugin_denylist() -> tuple[str, ...]:
+    raw = (
+        os.environ.get("GLASSHIVE_HOST_PLUGIN_DENYLIST", "").strip()
+        or os.environ.get("WPR_HOST_PLUGIN_DENYLIST", "").strip()
+    )
+    values: list[str] = []
+    for item in raw.split(","):
+        plugin_id = item.strip()
+        if not plugin_id:
+            continue
+        if not _PLUGIN_ID_RE.fullmatch(plugin_id):
+            raise RuntimeErrorBase(
+                "Host plugin denylist entries must use the canonical name@marketplace plugin ID"
+            )
+        if plugin_id not in values:
+            values.append(plugin_id)
+    return tuple(values)
+
+
+def _host_codex_personality() -> str:
+    personality = os.environ.get("WPR_CODEX_CLI_PERSONALITY", "inherit").strip().lower()
+    if personality not in {"inherit", "none", "friendly", "pragmatic"}:
+        raise RuntimeErrorBase(
+            "Host Codex personality must be inherit, none, friendly, or pragmatic"
+        )
+    return personality
+
+
+def _host_codex_conversation_project_instructions() -> str:
+    mode = os.environ.get(
+        "WPR_CODEX_CLI_CONVERSATION_PROJECT_INSTRUCTIONS",
+        "inherit",
+    ).strip().lower()
+    if mode not in {"inherit", "exclude"}:
+        raise RuntimeErrorBase(
+            "Host Codex conversation project instructions must be inherit or exclude"
+        )
+    return mode
+
+
+def _host_codex_personality_policy_state() -> str:
+    configured = _host_codex_personality()
+    if configured != "inherit":
+        return configured
+    source_config = Path(
+        os.environ.get("CODEX_HOME") or (Path.home() / ".codex")
+    ).expanduser() / "config.toml"
+    try:
+        parsed = tomllib.loads(source_config.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return "inherit"
+    inherited = str(parsed.get("personality") or "").strip().lower()
+    if inherited in {"none", "friendly", "pragmatic"}:
+        return f"inherit:{inherited}"
+    return "inherit"
+
+
+def _apply_codex_plugin_denylist(config_text: str, plugin_ids: tuple[str, ...]) -> str:
+    if not plugin_ids:
+        return config_text.strip()
+    try:
+        parsed = tomllib.loads(config_text) if config_text.strip() else {}
+    except Exception as exc:
+        raise RuntimeErrorBase(
+            "Cannot apply the host plugin denylist because the Codex worker config is invalid"
+        ) from exc
+    if not isinstance(parsed, dict):
+        parsed = {}
+    plugins = parsed.get("plugins")
+    if not isinstance(plugins, dict):
+        plugins = {}
+        parsed["plugins"] = plugins
+    for plugin_id in plugin_ids:
+        existing = plugins.get(plugin_id)
+        entry = dict(existing) if isinstance(existing, dict) else {}
+        entry["enabled"] = False
+        plugins[plugin_id] = entry
+    return _render_toml_document(parsed)
+
+
+def _apply_codex_personality(config_text: str, personality: str) -> str:
+    if personality == "inherit":
+        return config_text.strip()
+    try:
+        parsed = tomllib.loads(config_text) if config_text.strip() else {}
+    except Exception as exc:
+        raise RuntimeErrorBase(
+            "Cannot apply the host Codex personality because the worker config is invalid"
+        ) from exc
+    if not isinstance(parsed, dict):
+        parsed = {}
+    parsed["personality"] = personality
+    return _render_toml_document(parsed)
+
+
+def _apply_codex_developer_instructions(
+    config_text: str,
+    developer_instructions: str | None,
+) -> str:
+    if developer_instructions is None:
+        return config_text.strip()
+    try:
+        parsed = tomllib.loads(config_text) if config_text.strip() else {}
+    except Exception as exc:
+        raise RuntimeErrorBase(
+            "Cannot apply host Codex developer instructions because the worker config is invalid"
+        ) from exc
+    if not isinstance(parsed, dict):
+        parsed = {}
+    if developer_instructions:
+        parsed["developer_instructions"] = developer_instructions
+    else:
+        parsed.pop("developer_instructions", None)
+    return _render_toml_document(parsed)
+
+
+def _assert_codex_worker_policy(
+    config_text: str,
+    *,
+    plugin_ids: tuple[str, ...],
+    personality: str,
+    developer_instructions: str | None = None,
+) -> None:
+    try:
+        parsed = tomllib.loads(config_text) if config_text.strip() else {}
+    except Exception as exc:
+        raise RuntimeErrorBase("Host Codex worker policy config is invalid") from exc
+    plugins = parsed.get("plugins") if isinstance(parsed, dict) else None
+    for plugin_id in plugin_ids:
+        entry = plugins.get(plugin_id) if isinstance(plugins, dict) else None
+        if not isinstance(entry, dict) or entry.get("enabled") is not False:
+            raise RuntimeErrorBase(
+                "Host Codex plugin denylist policy was not materialized; refusing to launch"
+            )
+    if personality != "inherit" and (
+        not isinstance(parsed, dict) or parsed.get("personality") != personality
+    ):
+        raise RuntimeErrorBase(
+            "Host Codex personality policy was not materialized; refusing to launch"
+        )
+    if developer_instructions is not None and str(
+        parsed.get("developer_instructions") or ""
+    ) != developer_instructions:
+        raise RuntimeErrorBase(
+            "Host Codex developer instruction authority was not materialized; refusing to launch"
+        )
+
+
 def _render_toml_table(path: list[str], table: dict[str, object]) -> list[str]:
     scalar_lines: list[str] = []
     nested_blocks: list[str] = []
@@ -1242,19 +1395,62 @@ class BaseCliWorkerRuntime:
             "argv_for_evidence_json": str(data.get("argv_for_evidence_json") or "").strip(),
             "started_at": str(data.get("started_at") or "").strip(),
             "process_pid": data.get("process_pid"),
+            "process_identity_sha256": str(data.get("process_identity_sha256") or "").strip(),
             "heartbeat_path": str(data.get("heartbeat_path") or "").strip(),
             "timeout_seconds": data.get("timeout_seconds"),
             "instruction_redacted": bool(data.get("instruction_redacted")),
+            "run_mode": str(data.get("run_mode") or "").strip(),
         }
 
     def _write_active_session(self, worker_id: str, payload: dict[str, object]) -> None:
         path = self._active_session_meta_path(worker_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         safe_payload = dict(payload)
+        if safe_payload.get("process_pid") and not safe_payload.get("process_identity_sha256"):
+            try:
+                process_pid = int(safe_payload["process_pid"])
+            except (TypeError, ValueError):
+                process_pid = 0
+            process_identity = self._process_identity_sha256(process_pid)
+            if process_identity:
+                safe_payload["process_identity_sha256"] = process_identity
         if "instruction" in safe_payload:
             safe_payload.pop("instruction", None)
             safe_payload["instruction_redacted"] = True
-        path.write_text(json.dumps(safe_payload, indent=2))
+        temp_path = path.with_name(
+            f"{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}"
+        )
+        try:
+            temp_path.write_text(json.dumps(safe_payload, indent=2))
+            temp_path.chmod(0o600)
+            os.replace(temp_path, path)
+            path.chmod(0o600)
+        finally:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+    def _process_identity_sha256(self, pid: int) -> str | None:
+        """Return a non-secret birth/command fingerprint for safe post-restart PID recovery."""
+        if pid <= 1:
+            return None
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "lstart=", "-o", "command="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+                env={**os.environ, "LC_ALL": "C"},
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        identity = result.stdout.strip() if result.returncode == 0 else ""
+        if not identity:
+            return None
+        # Persist only the digest: a harness command line may contain private arguments.
+        return hashlib.sha256(f"{pid}\n{identity}".encode("utf-8", errors="replace")).hexdigest()
 
     def _clear_active_session(self, worker_id: str) -> None:
         path = self._active_session_meta_path(worker_id)
@@ -1728,29 +1924,35 @@ class BaseCliWorkerRuntime:
         if session_key:
             self._write_session_key(worker["worker_id"], session_key)
         workspace = Path(str(info.workspace_dir or self._workspace_dir(worker["worker_id"])))
-        try:
-            _status, warning_message = _ensure_recovered_success_evidence(
-                worker=worker,
-                run_id=effective_run_id,
-                runtime_name=self.runtime_name,
-                model=str(active_session.get("model") or worker.get("model") or self.resolve_model(str(worker.get("profile") or ""))),
-                command=self._active_session_argv_for_evidence(active_session),
-                workspace=workspace,
-                stdout_text=stdout,
-                stderr_text=stderr,
-                output_text=output,
-                exit_code=exit_code,
-                active_session=active_session,
-                instruction=str(instruction or "").strip(),
-            )
-        except RuntimeErrorBase as exc:
-            classification = classify_runtime_error(exc, runtime_name=self.runtime_name)
-            return {
-                "state": "failed",
-                "output_text": "",
-                "error_text": str(exc),
-                **classification.as_store_fields(),
-            }
+        warning_message = ""
+        run_mode = str(active_session.get("run_mode") or "").strip().lower()
+        conversation_recovery = run_mode == "conversation" or bool(
+            getattr(self, "_conversation_mode_from_worker", lambda _worker: False)(worker)
+        )
+        if not conversation_recovery:
+            try:
+                _status, warning_message = _ensure_recovered_success_evidence(
+                    worker=worker,
+                    run_id=effective_run_id,
+                    runtime_name=self.runtime_name,
+                    model=str(active_session.get("model") or worker.get("model") or self.resolve_model(str(worker.get("profile") or ""))),
+                    command=self._active_session_argv_for_evidence(active_session),
+                    workspace=workspace,
+                    stdout_text=stdout,
+                    stderr_text=stderr,
+                    output_text=output,
+                    exit_code=exit_code,
+                    active_session=active_session,
+                    instruction=str(instruction or "").strip(),
+                )
+            except RuntimeErrorBase as exc:
+                classification = classify_runtime_error(exc, runtime_name=self.runtime_name)
+                return {
+                    "state": "failed",
+                    "output_text": "",
+                    "error_text": str(exc),
+                    **classification.as_store_fields(),
+                }
         output_text = output.strip()
         if warning_message:
             suffix = f"\n\n{warning_message}"
@@ -4189,6 +4391,241 @@ class HostNativeCliMixin:
             self.__dict__["_viventium_host_active_slots"] = slots
         return slots
 
+    def _durable_host_process_command(
+        self,
+        command: list[str],
+        *,
+        run_root: Path,
+        exit_path: Path,
+        timeout_sec: float | None = None,
+        stdin_path: Path | None = None,
+    ) -> list[str]:
+        """Wrap a native CLI so the surviving process owns its terminal marker."""
+        wrapper_path = run_root / "native-process-supervisor.py"
+        wrapper_path.write_text(
+            """#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+status_path = Path(sys.argv[1])
+start_path = Path(sys.argv[2])
+ready_path = Path(sys.argv[3])
+timeout_sec = float(sys.argv[4]) if sys.argv[4] else None
+stdin_path = Path(sys.argv[5]) if sys.argv[5] else None
+command = sys.argv[6:]
+child: subprocess.Popen[bytes] | None = None
+requested_signal = 0
+
+
+class SupervisorSignal(Exception):
+    pass
+
+
+def write_exit(exit_code: int) -> None:
+    temp_path = status_path.with_name(f"{status_path.name}.tmp.{os.getpid()}")
+    try:
+        temp_path.write_text(f"{exit_code}\\n")
+        temp_path.chmod(0o600)
+        os.replace(temp_path, status_path)
+        status_path.chmod(0o600)
+    finally:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+
+
+def stop_child(signum: int) -> None:
+    if child is None or child.poll() is not None:
+        return
+    try:
+        os.killpg(child.pid, signum)
+    except ProcessLookupError:
+        return
+
+
+def await_child_stop() -> None:
+    if child is None or child.poll() is not None:
+        return
+    try:
+        child.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        child.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def handle_signal(signum: int, _frame: object) -> None:
+    global requested_signal
+    requested_signal = signum
+    raise SupervisorSignal
+
+
+for handled_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(handled_signal, handle_signal)
+
+exit_code = 70
+try:
+    ready_temp_path = ready_path.with_name(f"{ready_path.name}.tmp.{os.getpid()}")
+    ready_temp_path.write_text(f"{os.getpid()}\\n")
+    ready_temp_path.chmod(0o600)
+    os.replace(ready_temp_path, ready_path)
+    ready_path.chmod(0o600)
+    handshake_deadline = time.monotonic() + 30
+    while not start_path.exists():
+        if time.monotonic() >= handshake_deadline:
+            sys.stderr.write("GlassHive host-native launch handshake timed out before authoring began.\\n")
+            exit_code = 75
+            break
+        time.sleep(0.05)
+    else:
+        stdin_handle = stdin_path.open("rb") if stdin_path is not None else open(os.devnull, "rb")
+        try:
+            child = subprocess.Popen(command, stdin=stdin_handle, process_group=0)
+            try:
+                exit_code = child.wait(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                sys.stderr.write(
+                    f"GlassHive host-native process timed out after {timeout_sec:g}s.\\n"
+                )
+                sys.stderr.flush()
+                stop_child(signal.SIGTERM)
+                await_child_stop()
+                exit_code = 124
+        finally:
+            stdin_handle.close()
+except SupervisorSignal:
+    for handled in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(handled, signal.SIG_IGN)
+    stop_child(requested_signal)
+    await_child_stop()
+    exit_code = {
+        signal.SIGHUP: 129,
+        signal.SIGINT: 130,
+        signal.SIGTERM: 143,
+    }.get(requested_signal, 128 + requested_signal)
+finally:
+    write_exit(exit_code)
+
+raise SystemExit(exit_code)
+"""
+        )
+        wrapper_path.chmod(0o700)
+        return [
+            sys.executable,
+            str(wrapper_path),
+            str(exit_path),
+            str(run_root / "start-permit"),
+            str(run_root / "supervisor-ready"),
+            f"{timeout_sec:g}" if timeout_sec is not None else "",
+            str(stdin_path) if stdin_path is not None else "",
+            *command,
+        ]
+
+    def _wait_for_durable_host_supervisor(
+        self,
+        process: subprocess.Popen[str],
+        *,
+        run_root: Path,
+    ) -> None:
+        def abort_unready(message: str) -> None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            raise RuntimeErrorBase(message)
+
+        ready_path = run_root / "supervisor-ready"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                ready_pid = int(ready_path.read_text().strip())
+            except (OSError, ValueError):
+                ready_pid = 0
+            if ready_pid == process.pid:
+                return
+            return_code = process.poll()
+            if return_code is not None:
+                raise RuntimeErrorBase(
+                    f"Host-native process supervisor exited before launch handshake (code {return_code})"
+                )
+            time.sleep(0.01)
+        abort_unready("Host-native process supervisor did not become ready")
+
+    def _release_durable_host_process(self, active_session: dict[str, object]) -> None:
+        raw_exit_path = str(active_session.get("exit_path") or "").strip()
+        if not raw_exit_path:
+            raise RuntimeErrorBase("Host-native process metadata is missing its terminal path")
+        exit_path = Path(raw_exit_path)
+        if exit_path.exists():
+            return
+        start_path = exit_path.with_name("start-permit")
+        if start_path.exists():
+            return
+        temp_path = start_path.with_name(
+            f"{start_path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}"
+        )
+        try:
+            temp_path.write_text("start\n")
+            temp_path.chmod(0o600)
+            os.replace(temp_path, start_path)
+            start_path.chmod(0o600)
+        finally:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+    def _read_durable_host_exit_code(self, exit_path: Path) -> int | None:
+        try:
+            return int(exit_path.read_text().strip())
+        except (OSError, ValueError):
+            return None
+
+    def _write_durable_host_exit_code(self, exit_path: Path, exit_code: int) -> None:
+        """Atomically backfill a marker when the API process outlives the wrapper write."""
+        temp_path = exit_path.with_name(
+            f"{exit_path.name}.tmp.api-{os.getpid()}-{secrets.token_hex(4)}"
+        )
+        try:
+            temp_path.write_text(f"{exit_code}\n")
+            temp_path.chmod(0o600)
+            os.replace(temp_path, exit_path)
+            exit_path.chmod(0o600)
+        finally:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _final_host_exit_code(self, exit_path: Path, process_exit_code: int) -> int:
+        durable_exit_code = self._read_durable_host_exit_code(exit_path)
+        if durable_exit_code is not None:
+            return durable_exit_code
+        self._write_durable_host_exit_code(exit_path, process_exit_code)
+        return process_exit_code
+
     def _host_worker_lanes(self) -> dict[str, str]:
         lanes = self.__dict__.get("_viventium_host_worker_lanes")
         if not isinstance(lanes, dict):
@@ -4368,6 +4805,12 @@ class HostNativeCliMixin:
     def _host_codex_home(self, worker: dict) -> Path:
         return self._home_dir(worker["worker_id"]) / ".codex"
 
+    def _host_plugin_denylist(self) -> tuple[str, ...]:
+        return _host_plugin_denylist()
+
+    def _host_codex_personality(self) -> str:
+        return _host_codex_personality()
+
     def _source_host_codex_home(self) -> Path:
         return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
 
@@ -4379,6 +4822,118 @@ class HostNativeCliMixin:
         target_auth = target_codex_home / "auth.json"
         shutil.copy2(source_auth, target_auth)
         target_auth.chmod(0o600)
+
+    def _project_private_capability_directory(self, source: Path, target: Path) -> None:
+        """Expose an installed, read-mostly capability catalog without copying it into LIFE.
+
+        Existing worker-local state wins. A stale derived symlink is repaired, while a real file or
+        directory is never replaced. The containing worker home is owner-only.
+        """
+        if not source.exists() or not source.is_dir():
+            return
+        resolved_source = source.resolve()
+        if target.is_symlink():
+            try:
+                if target.resolve() == resolved_source:
+                    return
+            except OSError:
+                pass
+            target.unlink()
+        elif target.exists():
+            if not target.is_dir():
+                return
+            # Older worker homes may already contain harness-created catalog entries
+            # (for example Codex's `.system` skills). Preserve those entries and project
+            # only missing host capabilities so an upgrade enriches the worker instead of
+            # replacing or silently skipping its local catalog.
+            try:
+                source_entries = sorted(source.iterdir(), key=lambda item: item.name)
+            except OSError:
+                return
+            for source_entry in source_entries:
+                target_entry = target / source_entry.name
+                resolved_entry = source_entry.resolve()
+                if target_entry.is_symlink():
+                    try:
+                        if target_entry.resolve() == resolved_entry:
+                            continue
+                    except OSError:
+                        pass
+                    target_entry.unlink()
+                elif target_entry.exists():
+                    continue
+                target_entry.symlink_to(
+                    resolved_entry,
+                    target_is_directory=source_entry.is_dir(),
+                )
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(resolved_source, target_is_directory=True)
+
+    def _project_host_codex_capability_roots(self, target_codex_home: Path) -> None:
+        source_home = self._source_host_codex_home()
+        self._project_private_capability_directory(
+            source_home / "skills", target_codex_home / "skills"
+        )
+        self._project_private_capability_directory(
+            source_home / "plugins" / "cache",
+            target_codex_home / "plugins" / "cache",
+        )
+
+    def _source_host_claude_home(self) -> Path:
+        raw = os.environ.get("GLASSHIVE_HOST_CLAUDE_CONFIG", "").strip()
+        return Path(raw).expanduser() if raw else Path.home() / ".claude"
+
+    def _merge_private_capability_registry(self, source: Path, target: Path) -> None:
+        """Add host registry entries without replacing worker-local selections."""
+        if not source.exists() or not source.is_file():
+            return
+        if target.is_symlink():
+            target.unlink()
+        if not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            target.chmod(0o600)
+            return
+        if not target.is_file():
+            return
+        try:
+            source_payload = json.loads(source.read_text())
+            target_payload = json.loads(target.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+
+        def merge_additive(current: object, incoming: object) -> object:
+            if isinstance(current, dict) and isinstance(incoming, dict):
+                merged = dict(current)
+                for key, value in incoming.items():
+                    merged[key] = merge_additive(merged[key], value) if key in merged else value
+                return merged
+            if isinstance(current, list) and isinstance(incoming, list):
+                merged = list(current)
+                for value in incoming:
+                    if value not in merged:
+                        merged.append(value)
+                return merged
+            return current
+
+        merged_payload = merge_additive(target_payload, source_payload)
+        if merged_payload == target_payload:
+            return
+        target.write_text(json.dumps(merged_payload, indent=2, sort_keys=True) + "\n")
+        target.chmod(0o600)
+
+    def _project_host_claude_capability_roots(self, target_claude_home: Path) -> None:
+        source_home = self._source_host_claude_home()
+        for relative in (Path("plugins/cache"), Path("plugins/marketplaces"), Path("skills")):
+            self._project_private_capability_directory(
+                source_home / relative,
+                target_claude_home / relative,
+            )
+        for filename in ("installed_plugins.json", "known_marketplaces.json"):
+            source = source_home / "plugins" / filename
+            target = target_claude_home / "plugins" / filename
+            self._merge_private_capability_registry(source, target)
 
     def _host_codex_native_mcp_allowlist(self) -> set[str]:
         raw = os.environ.get(
@@ -4453,7 +5008,12 @@ class HostNativeCliMixin:
                 )
         return "\n\n".join(blocks).strip()
 
-    def _host_codex_worker_config(self, codex_config_append: str) -> str:
+    def _host_codex_worker_config(
+        self,
+        codex_config_append: str,
+        *,
+        developer_instructions: str | None = None,
+    ) -> str:
         append = codex_config_append.strip()
         append_names = _codex_mcp_server_names(append)
         preserve_names = self._host_codex_native_mcp_allowlist() - append_names
@@ -4474,9 +5034,51 @@ class HostNativeCliMixin:
         native = "\n\n".join(
             part for part in (preserved, plugin_preserved, known_native) if part.strip()
         ).strip()
+        personality = self._host_codex_personality()
+        native = _apply_codex_personality(native, personality)
+        native = _apply_codex_developer_instructions(native, developer_instructions)
+        denied_plugins = self._host_plugin_denylist()
+        native = _apply_codex_plugin_denylist(native, denied_plugins)
         if append_names:
             native = _strip_codex_mcp_server_blocks(native, append_names)
-        return "\n\n".join(part for part in (native, append) if part.strip()).strip()
+        config = "\n\n".join(part for part in (native, append) if part.strip()).strip()
+        _assert_codex_worker_policy(
+            config,
+            plugin_ids=denied_plugins,
+            personality=personality,
+            developer_instructions=developer_instructions,
+        )
+        return config
+
+    def _assert_host_codex_worker_policy(self, worker: dict) -> None:
+        denied_plugins = self._host_plugin_denylist()
+        personality = self._host_codex_personality()
+        bundle = self._bootstrap_bundle_for_worker(worker)
+        developer_instructions = (
+            str(bundle.get("developer_instructions") or "")
+            if self._conversation_mode_from_worker(worker)
+            and "developer_instructions" in bundle
+            else None
+        )
+        if not denied_plugins and personality == "inherit" and developer_instructions is None:
+            return
+        config_path = self._host_codex_home(worker) / "config.toml"
+        if not config_path.is_file():
+            raise RuntimeErrorBase(
+                "Host Codex worker policy config is missing; refusing to launch"
+            )
+        try:
+            config_text = config_path.read_text()
+        except OSError as exc:
+            raise RuntimeErrorBase(
+                "Host Codex worker policy config is unreadable; refusing to launch"
+            ) from exc
+        _assert_codex_worker_policy(
+            config_text,
+            plugin_ids=denied_plugins,
+            personality=personality,
+            developer_instructions=developer_instructions,
+        )
 
     def _write_host_project_mcp_files(self, worker: dict, workspace: Path, bundle: dict[str, object]) -> None:
         """Project scoped MCP/client config for host-native workers.
@@ -4506,8 +5108,21 @@ class HostNativeCliMixin:
             target.chmod(0o600)
 
         codex_config_append = str(bundle.get("codex_config_append") or "").strip()
-        if codex_config_append:
-            codex_config = self._host_codex_worker_config(codex_config_append)
+        developer_instructions = (
+            str(bundle.get("developer_instructions") or "")
+            if "developer_instructions" in bundle
+            else None
+        )
+        if (
+            codex_config_append
+            or self._host_plugin_denylist()
+            or self._host_codex_personality() != "inherit"
+            or developer_instructions is not None
+        ):
+            codex_config = self._host_codex_worker_config(
+                codex_config_append,
+                developer_instructions=developer_instructions,
+            )
             target = workspace / ".codex" / "config.toml"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(codex_config + "\n")
@@ -4519,6 +5134,7 @@ class HostNativeCliMixin:
             codex_target.write_text(codex_config + "\n")
             codex_target.chmod(0o600)
             self._copy_host_codex_auth(codex_home)
+            self._project_host_codex_capability_roots(codex_home)
 
     def _write_conversation_runtime_files(self, worker: dict, bundle: dict[str, object]) -> None:
         """Write harness configuration under private worker state, never inside LIFE."""
@@ -4529,12 +5145,18 @@ class HostNativeCliMixin:
             codex_home.mkdir(parents=True, exist_ok=True)
             codex_home.chmod(0o700)
             codex_config = self._host_codex_worker_config(
-                str(bundle.get("codex_config_append") or "")
+                str(bundle.get("codex_config_append") or ""),
+                developer_instructions=(
+                    str(bundle.get("developer_instructions") or "")
+                    if "developer_instructions" in bundle
+                    else None
+                ),
             )
             config_path = codex_home / "config.toml"
             config_path.write_text((codex_config.rstrip() + "\n") if codex_config else "")
             config_path.chmod(0o600)
             self._copy_host_codex_auth(codex_home)
+            self._project_host_codex_capability_roots(codex_home)
             return
 
         if profile != "claude-code":
@@ -4542,10 +5164,21 @@ class HostNativeCliMixin:
         claude_home = self._home_dir(str(worker["worker_id"])) / ".claude"
         claude_home.mkdir(parents=True, exist_ok=True)
         claude_home.chmod(0o700)
+        self._project_host_claude_capability_roots(claude_home)
         project_mcp = bundle.get("claude_project_mcp")
         state_dir = self._state_dir(str(worker["worker_id"]))
         state_dir.mkdir(parents=True, exist_ok=True)
         state_dir.chmod(0o700)
+        authority_path = state_dir / "conversation-developer-instructions.md"
+        developer_instructions = str(bundle.get("developer_instructions") or "").strip()
+        if developer_instructions:
+            authority_path.write_text(developer_instructions + "\n")
+            authority_path.chmod(0o600)
+        else:
+            try:
+                authority_path.unlink()
+            except FileNotFoundError:
+                pass
         mcp_path = state_dir / "conversation-mcp.json"
         if isinstance(project_mcp, dict):
             payload = claude_project_mcp_payload_for_bundle(bundle, project_mcp)
@@ -4979,37 +5612,101 @@ class HostNativeCliMixin:
         return self._host_runtime_info(worker, pid=None)
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
-        return self._host_runtime_info(worker, pid=self._active_pid(worker["worker_id"]))
+        worker_id = str(worker["worker_id"])
+        pid = self._active_pid(worker_id)
+        if pid:
+            active_session = self._read_active_session(worker_id)
+            if active_session:
+                try:
+                    self._release_durable_host_process(active_session)
+                except (OSError, RuntimeErrorBase) as exc:
+                    logger.warning(
+                        "Failed to release a recovered host-native process handshake",
+                        extra={"worker_id": worker_id, "error": str(exc)},
+                    )
+        with self._process_lock:
+            if pid:
+                lane = self._host_capacity_lane(worker)
+                active = self._host_active_slots().get(lane)
+                if not active or active == worker_id:
+                    self._host_active_slots()[lane] = worker_id
+                    self._host_worker_lanes()[worker_id] = lane
+            else:
+                lane = self._host_worker_lanes().pop(worker_id, None)
+                if lane and self._host_active_slots().get(lane) == worker_id:
+                    self._host_active_slots().pop(lane, None)
+        return self._host_runtime_info(worker, pid=pid)
 
     def worker_compute_present(self, worker: dict) -> bool:
         return self._active_pid(worker["worker_id"]) is not None
 
+    def _persisted_active_pid(self, worker_id: str) -> int | None:
+        active_session = self._read_active_session(worker_id)
+        expected_identity = str((active_session or {}).get("process_identity_sha256") or "").strip()
+        if not expected_identity:
+            # Legacy metadata cannot prove that a recycled PID is still the harness process.
+            return None
+        try:
+            pid = int((active_session or {}).get("process_pid") or 0)
+        except (TypeError, ValueError):
+            return None
+        if pid <= 1:
+            return None
+        try:
+            # Host-native runs always launch with start_new_session=True. Requiring the
+            # persisted PID to remain its own process-group leader prevents a recycled PID
+            # from being mistaken for the prior harness process after an API restart.
+            if os.getpgid(pid) != pid:
+                return None
+            os.kill(pid, 0)
+        except (OSError, ProcessLookupError):
+            return None
+        if self._process_identity_sha256(pid) != expected_identity:
+            return None
+        return pid
+
+    def _active_pid(self, worker_id: str) -> int | None:
+        current = super()._active_pid(worker_id)
+        return current if current is not None else self._persisted_active_pid(worker_id)
+
     def _stop_active_process(self, worker_id: str, *, worker: dict | None = None, run_id: str | None = None) -> None:
+        active_session = self._read_active_session(worker_id)
+        if active_session and run_id and str(active_session.get("run_id") or "") != str(run_id):
+            active_session = None
         with self._process_lock:
             process = self._active_processes.get(worker_id)
-        if not process or process.poll() is not None:
-            return
-        try:
-            pgid = os.getpgid(process.pid)
-            os.killpg(pgid, signal.SIGTERM)
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
+        persisted_pid = self._persisted_active_pid(worker_id) if active_session else None
+        pid = process.pid if process and process.poll() is None else persisted_pid
+        if pid:
             try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                os.killpg(pid, signal.SIGTERM)
             except OSError:
                 pass
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-        except OSError:
-            try:
-                process.terminate()
-            except OSError:
-                pass
-        finally:
-            self._clear_process(worker_id)
-            self._release_host_slot(worker_id)
+            if process and process.pid == pid:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+            else:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and self._persisted_active_pid(worker_id) == pid:
+                    time.sleep(0.05)
+                if self._persisted_active_pid(worker_id) == pid:
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+        if active_session:
+            self._clear_active_session(worker_id)
+        self._clear_process(worker_id)
+        self._release_host_slot(worker_id)
 
     def _acquire_host_slot(self, worker: dict) -> None:
         if os.environ.get("WPR_HOST_ALLOW_CONCURRENT_SAME_CLI", "").strip().lower() in {"1", "true", "yes", "on"}:
@@ -5121,17 +5818,25 @@ class HostNativeCliMixin:
             with raw_stdout.open("w") as stdout_handle, raw_stderr.open("w") as stderr_handle:
                 raw_stdout.chmod(0o600)
                 raw_stderr.chmod(0o600)
-                process = subprocess.Popen(
+                process_command = self._durable_host_process_command(
                     command,
+                    run_root=run_root,
+                    exit_path=exit_path,
+                    timeout_sec=run_timeout_sec,
+                    stdin_path=host_stdin if stdin_text is not None else None,
+                )
+                process = subprocess.Popen(
+                    process_command,
                     cwd=str(workspace),
                     env=env,
                     text=True,
-                    stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
                     stdout=stdout_handle,
                     stderr=stderr_handle,
                     start_new_session=True,
                 )
                 self._register_process(str(worker["worker_id"]), process)
+                self._wait_for_durable_host_supervisor(process, run_root=run_root)
                 self._write_active_session(
                     str(worker["worker_id"]),
                     {
@@ -5149,12 +5854,19 @@ class HostNativeCliMixin:
                         "run_mode": "conversation",
                     },
                 )
+                active_session = self._read_active_session(str(worker["worker_id"]))
+                if not active_session:
+                    self._stop_active_process(
+                        str(worker["worker_id"]),
+                        worker=worker,
+                        run_id=effective_run_id,
+                    )
+                    raise RuntimeErrorBase(
+                        "Host-native process metadata was not durably recorded before launch"
+                    )
+                self._release_durable_host_process(active_session)
                 try:
-                    if stdin_text is not None:
-                        process.communicate(stdin_text, timeout=run_timeout_sec)
-                        exit_code = process.returncode
-                    else:
-                        exit_code = process.wait(timeout=run_timeout_sec)
+                    exit_code = process.wait()
                 except subprocess.TimeoutExpired as exc:
                     self._note_stop_reason(str(worker["worker_id"]), "terminated", run_id=effective_run_id)
                     self._stop_active_process(str(worker["worker_id"]), worker=worker, run_id=effective_run_id)
@@ -5177,8 +5889,7 @@ class HostNativeCliMixin:
                     },
                 )
 
-        exit_path.write_text(str(exit_code))
-        exit_path.chmod(0o600)
+        exit_code = self._final_host_exit_code(exit_path, exit_code)
         stdout = raw_stdout.read_text() if raw_stdout.exists() else ""
         stderr = raw_stderr.read_text() if raw_stderr.exists() else ""
         self._finalize_stop_reason(str(worker["worker_id"]), run_id=effective_run_id)
@@ -5282,18 +5993,26 @@ class HostNativeCliMixin:
         with raw_stdout.open("w") as stdout_handle, raw_stderr.open("w") as stderr_handle:
             raw_stdout.chmod(0o600)
             raw_stderr.chmod(0o600)
-            process = subprocess.Popen(
+            process_command = self._durable_host_process_command(
                 command,
+                run_root=run_root,
+                exit_path=exit_path,
+                timeout_sec=run_timeout_sec,
+                stdin_path=host_stdin if stdin_text is not None else None,
+            )
+            process = subprocess.Popen(
+                process_command,
                 cwd=str(workspace),
                 env=env,
                 text=True,
-                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 start_new_session=True,
             )
             self._register_process(worker["worker_id"], process)
             process_pid = process.pid
+            self._wait_for_durable_host_supervisor(process, run_root=run_root)
             self._write_active_session(
                 worker["worker_id"],
                 {
@@ -5312,6 +6031,17 @@ class HostNativeCliMixin:
                     "instruction": instruction,
                 },
             )
+            active_session = self._read_active_session(str(worker["worker_id"]))
+            if not active_session:
+                self._stop_active_process(
+                    str(worker["worker_id"]),
+                    worker=worker,
+                    run_id=effective_run_id,
+                )
+                raise RuntimeErrorBase(
+                    "Host-native process metadata was not durably recorded before launch"
+                )
+            self._release_durable_host_process(active_session)
             _write_active_run_status(
                 path=heartbeat_path,
                 worker=worker,
@@ -5337,11 +6067,7 @@ class HostNativeCliMixin:
                 stop_event=heartbeat_stop,
             )
             try:
-                if stdin_text is not None:
-                    process.communicate(stdin_text, timeout=run_timeout_sec)
-                    exit_code = process.returncode
-                else:
-                    exit_code = process.wait(timeout=run_timeout_sec)
+                exit_code = process.wait()
             except subprocess.TimeoutExpired:
                 self._note_stop_reason(worker["worker_id"], "terminated", run_id=effective_run_id)
                 self._stop_active_process(worker["worker_id"], worker=worker, run_id=effective_run_id)
@@ -5397,8 +6123,7 @@ class HostNativeCliMixin:
                 self._clear_process(worker["worker_id"])
                 self._release_host_slot(worker["worker_id"])
 
-        exit_path.write_text(str(exit_code))
-        exit_path.chmod(0o600)
+        exit_code = self._final_host_exit_code(exit_path, exit_code)
         stdout = raw_stdout.read_text() if raw_stdout.exists() else ""
         stderr = raw_stderr.read_text() if raw_stderr.exists() else ""
         redacted_stdout = _redact_text(stdout, max_chars=16000)
@@ -5749,7 +6474,23 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
             }
         return requested
 
+    def _conversation_primary_workspace(
+        self,
+        worker: dict,
+        workspace: str,
+    ) -> tuple[str, str]:
+        if (
+            not self._conversation_mode_from_worker(worker)
+            or _host_codex_conversation_project_instructions() == "inherit"
+        ):
+            return workspace, ""
+        primary = self._state_dir(str(worker["worker_id"])) / "conversation-workspace"
+        primary.mkdir(parents=True, exist_ok=True)
+        primary.chmod(0o700)
+        return str(primary), workspace
+
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
+        self._assert_host_codex_worker_policy(worker)
         existing_session = self._read_session_key(worker["worker_id"])
         model = self._codex_model_for_worker(worker, "WPR_MODEL_HOST_CODEX_CLI")
         is_resume = bool(existing_session and not existing_session.startswith("codex-worker:"))
@@ -5758,12 +6499,26 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
             bundle = self._bootstrap_bundle_for_worker(worker)
             dangerous_mode = str(bundle.get("access_mode") or "full").strip().lower() == "full"
         conversation_mode = self._conversation_mode_from_worker(worker)
+        workspace = str(info.workspace_dir or ".")
+        primary_workspace, additional_workspace = self._conversation_primary_workspace(
+            worker,
+            workspace,
+        )
         if is_resume:
             command = [self.binary, "exec", "resume"]
             if conversation_mode:
                 command.extend(["--json", "--skip-git-repo-check"])
         else:
-            command = [self.binary, "exec", "--json", "--skip-git-repo-check", "-C", str(info.workspace_dir or ".")]
+            command = [
+                self.binary,
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "-C",
+                primary_workspace,
+            ]
+            if additional_workspace:
+                command.extend(["--add-dir", additional_workspace])
         if model:
             if is_resume:
                 command.extend(["-c", f'model="{model}"'])
@@ -6026,34 +6781,61 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
             "--model",
             model,
         ]
+        settings: dict[str, object] = {}
+        denied_plugins = self._host_plugin_denylist()
+        if denied_plugins:
+            settings["enabledPlugins"] = {
+                plugin_id: False for plugin_id in denied_plugins
+            }
         if self._conversation_mode_from_worker(worker):
             command.extend(["--verbose", "--include-partial-messages"])
+            developer_instructions = str(
+                bundle.get("developer_instructions") or ""
+            ).strip()
+            if developer_instructions:
+                # Claude Code exposes request-time application authority through its native
+                # system-prompt channel. Keep it private and out of both process argv and the
+                # user-authored visible history.
+                authority_path = (
+                    self._state_dir(str(worker["worker_id"]))
+                    / "conversation-developer-instructions.md"
+                )
+                expected = developer_instructions + "\n"
+                try:
+                    actual = authority_path.read_text()
+                except OSError as exc:
+                    raise RuntimeErrorBase(
+                        "Claude Code conversation developer instruction authority is unavailable"
+                    ) from exc
+                if actual != expected:
+                    raise RuntimeErrorBase(
+                        "Claude Code conversation developer instruction authority is stale"
+                    )
+                command.extend(["--append-system-prompt-file", str(authority_path)])
             mcp_path = self._state_dir(str(worker["worker_id"])) / "conversation-mcp.json"
             if mcp_path.is_file():
                 command.extend(["--mcp-config", str(mcp_path), "--strict-mcp-config"])
             bundle = self._bootstrap_bundle_for_worker(worker)
             if str(bundle.get("access_mode") or "full").strip().lower() == "workspace":
                 workspace = str(Path(str(info.workspace_dir or ".")).resolve())
-                command.extend(
-                    [
-                        "--settings",
-                        json.dumps(
-                            {
-                                "permissions": {"defaultMode": "acceptEdits"},
-                                "sandbox": {
-                                    "enabled": True,
-                                    "failIfUnavailable": True,
-                                    "allowUnsandboxedCommands": False,
-                                    "filesystem": {
-                                        "denyRead": [str(Path.home().resolve())],
-                                        "allowRead": [workspace],
-                                    },
-                                },
+                settings.update(
+                    {
+                        "permissions": {"defaultMode": "acceptEdits"},
+                        "sandbox": {
+                            "enabled": True,
+                            "failIfUnavailable": True,
+                            "allowUnsandboxedCommands": False,
+                            "filesystem": {
+                                "denyRead": [str(Path.home().resolve())],
+                                "allowRead": [workspace],
                             },
-                            separators=(",", ":"),
-                        ),
-                    ]
+                        },
+                    }
                 )
+        if settings:
+            command.extend(
+                ["--settings", json.dumps(settings, separators=(",", ":"))]
+            )
         if self._chrome_enabled():
             command.insert(2, "--chrome")
         effort = (

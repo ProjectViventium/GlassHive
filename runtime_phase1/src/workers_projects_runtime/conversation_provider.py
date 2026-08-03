@@ -6,6 +6,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import shutil
@@ -28,9 +29,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .profile_runtime import _redact_text
+from .profile_runtime import (
+    _host_codex_conversation_project_instructions,
+    _host_codex_personality_policy_state,
+    _host_plugin_denylist,
+    _redact_text,
+)
 from .service import WorkersProjectsService
 from .store import Store
+
+logger = logging.getLogger(__name__)
 
 TERMINAL_RUN_STATES = {"completed", "failed", "cancelled", "interrupted"}
 TERMINAL_REQUEST_STATES = {"completed", "failed", "cancelled"}
@@ -231,6 +239,7 @@ class CompletionMetadata(BaseModel):
     idempotency_key: str = ""
     glasshive_options: GlassHiveOptions = Field(default_factory=GlassHiveOptions)
     bootstrap_bundle: dict[str, Any] = Field(default_factory=dict)
+    developer_instruction_tail: str = ""
 
 
 class ChatMessage(BaseModel):
@@ -444,44 +453,119 @@ def _system_snapshot(messages: Iterable[ChatMessage]) -> str:
     return "\n\n".join(instruction_parts)
 
 
+def _bootstrap_developer_instructions(
+    bundle: dict[str, Any], harness_profile: str
+) -> str:
+    """Select signed host instructions for the active native harness.
+
+    Conversation workers run in the user's exact workspace, so GlassHive deliberately does not
+    write transient ``AGENTS.md``/``CLAUDE.md``/``CODEX.md`` files there.  Signed bootstrap
+    instructions still need to reach the harness as developer authority; otherwise the MCP config
+    can be present while the model never learns the broker's discovery and recovery contract.
+    """
+
+    profile_key = "codex_md" if harness_profile == "codex-cli" else "claude_md"
+    profile_instructions = str(bundle.get(profile_key) or "").strip()
+    if profile_instructions:
+        return profile_instructions
+    return str(bundle.get("agents_md") or "").strip()
+
+
+def _merge_developer_instructions(*parts: str) -> str:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        text = str(part or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        merged.append(text)
+    return "\n\n".join(merged)
+
+
+def _pin_developer_instruction_tail(snapshot: str, tail: str) -> str:
+    exact_snapshot = str(snapshot or "").strip()
+    exact_tail = str(tail or "").strip()
+    if not exact_tail:
+        return exact_snapshot
+    if exact_tail not in exact_snapshot:
+        raise HTTPException(
+            status_code=400,
+            detail="Declared developer instruction tail is absent from authority messages",
+        )
+    without_tail = "\n\n".join(
+        part.strip() for part in exact_snapshot.split(exact_tail) if part.strip()
+    )
+    return _merge_developer_instructions(without_tail, exact_tail)
+
+
+def _developer_instruction_snapshot(
+    payload: ChatCompletionRequest, *following_structural_parts: str
+) -> str:
+    application_snapshot = _system_snapshot(payload.messages)
+    tail = str(payload.metadata.developer_instruction_tail or "").strip()
+    if not application_snapshot:
+        return _merge_developer_instructions(*following_structural_parts)
+    application_snapshot = _pin_developer_instruction_tail(application_snapshot, tail)
+    combined = _merge_developer_instructions(
+        application_snapshot, *following_structural_parts
+    )
+    return _pin_developer_instruction_tail(combined, tail)
+
+
 def _history_instruction(messages: Iterable[ChatMessage], *, start_at: int = 0) -> str:
     all_messages = list(messages)
-    current_system = _system_snapshot(all_messages)
     selected = [
         message
         for index, message in enumerate(all_messages)
         if index >= max(0, start_at)
         and str(message.role or "").strip().lower() not in {"system", "developer"}
     ]
-    if not selected and not current_system:
+    if not selected:
         return "Continue the current conversation naturally."
     lines = [
-        "Continue this conversation naturally. Honor AGENTS.md in the working folder as canonical instructions.",
+        "Continue this conversation naturally.",
         "Ask a concise clarifying question when the user's desired outcome genuinely cannot be inferred.",
         "Before any destructive, irreversible, externally consequential, or permission-expanding action, verify that it is explicitly within the user's request and pause for approval when it is not.",
     ]
-    if current_system:
-        lines.extend(
-            [
-                "The following single system snapshot is authoritative for this turn and supersedes every earlier system snapshot retained by the native session:",
-                f"[system]\n{current_system}",
-            ]
-        )
     lines.append("Visible conversation context:")
     for message in selected:
         role = str(message.role or "user").strip().lower()
         text = _message_text(message.content).strip()
         if text:
             lines.append(f"[{role}]\n{text}")
-    if current_system:
-        # A native CLI accepts one flattened instruction rather than an ordered role array. End on
-        # the request's authority contract so the final user transcript cannot accidentally gain
-        # system-level precedence through simple recency.
-        lines.append(
-            "End of visible conversation context. Produce only the assistant response now, "
-            "and verify it against the authoritative system snapshot above before returning it."
-        )
     return "\n\n".join(lines).strip()
+
+
+def _native_policy_state(model: HarnessModel) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "plugin_denylist": list(_host_plugin_denylist()),
+    }
+    if model.harness_profile == "codex-cli":
+        state["codex_personality"] = _host_codex_personality_policy_state()
+        state["codex_conversation_project_instructions"] = (
+            _host_codex_conversation_project_instructions()
+        )
+    return state
+
+
+def _native_policy_sha256(model: HarnessModel) -> str:
+    payload = json.dumps(
+        _native_policy_state(model),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _native_policy_is_default(model: HarnessModel) -> bool:
+    state = _native_policy_state(model)
+    return (
+        not state["plugin_denylist"]
+        and state.get("codex_personality", "inherit") == "inherit"
+        and state.get("codex_conversation_project_instructions", "inherit")
+        == "inherit"
+    )
 
 
 def _responses_request_id(response_id: str) -> str:
@@ -562,6 +646,24 @@ def _decode_workspace_path(request: Request) -> str:
         return base64.b64decode(encoded, validate=True).decode("utf-8")
     except (binascii.Error, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=400, detail="Invalid GlassHive workspace path header") from exc
+
+
+def _decode_developer_instruction_tail(request: Request) -> str:
+    encoded = _header(request, "x-glasshive-developer-instruction-tail-b64")
+    if not encoded:
+        return ""
+    if len(encoded) > 128 * 1024:
+        raise HTTPException(
+            status_code=400,
+            detail="GlassHive developer instruction tail is too large",
+        )
+    try:
+        return base64.b64decode(encoded, validate=True).decode("utf-8").strip()
+    except (binascii.Error, UnicodeDecodeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid GlassHive developer instruction tail header",
+        ) from exc
 
 
 def _decode_bootstrap_bundle(request: Request) -> dict[str, Any]:
@@ -653,6 +755,8 @@ def _hydrate_metadata(
         "idempotency_key": _header(request, "x-glasshive-idempotency-key")
         or str(incoming.get("idempotency_key") or "").strip(),
         "bootstrap_bundle": _decode_bootstrap_bundle(request),
+        "developer_instruction_tail": _decode_developer_instruction_tail(request)
+        or str(incoming.get("developer_instruction_tail") or "").strip(),
     }
 
     options = dict(incoming.get("glasshive_options") or {})
@@ -1027,9 +1131,23 @@ class ConversationProvider:
         self._sync_lock = threading.RLock()
         self._detached_reconciliation_lock = threading.Lock()
         self._detached_reconciliations: set[str] = set()
+        self._detached_reconciliation_thread: threading.Thread | None = None
         self._prestart_cancellations: dict[tuple[str, str, str], float] = {}
         self._last_retention_monotonic = 0.0
         self._apply_retention_policy()
+        self._resume_nonterminal_request_reconciliation()
+
+    def _resume_nonterminal_request_reconciliation(self) -> None:
+        """Reconnect durable provider requests to their native runs after an API restart."""
+
+        try:
+            records = self.store.list_provider_requests_by_state({"queued", "running"}, limit=500)
+        except (OSError, RuntimeError, ValueError):
+            return
+        for record in records:
+            request_id = str(record.get("request_id") or "").strip()
+            if request_id:
+                self._ensure_detached_reconciliation(request_id)
 
     def _prune_prestart_cancellations(self) -> None:
         cutoff = time.monotonic() - 600
@@ -1119,11 +1237,27 @@ class ConversationProvider:
             if model.harness_profile == "codex-cli"
             else {"WPR_CLAUDE_CODE_EFFORT": effort}
         )
+        bootstrap_instructions = _bootstrap_developer_instructions(
+            incoming, model.harness_profile
+        )
+        application_instructions = _developer_instruction_snapshot(payload)
+        declared_tail = (
+            str(payload.metadata.developer_instruction_tail or "").strip()
+            if application_instructions
+            else ""
+        )
         return {
             **incoming,
             "run_mode": "conversation",
             "provider_model": model.native_model,
             "access_mode": payload.metadata.glasshive_options.access,
+            # Mutable application authority stays in Codex's native developer role. It must never
+            # be flattened into the user-authored conversation instruction.
+            "application_developer_instructions": application_instructions,
+            "developer_instructions": _developer_instruction_snapshot(
+                payload, bootstrap_instructions
+            ),
+            "declared_developer_instruction_tail": declared_tail,
             "env": {**incoming_env, **effort_env},
             "provider_capabilities": {
                 "self_delegation": False,
@@ -1204,8 +1338,9 @@ class ConversationProvider:
                 "compactions": [],
                 "effort": effort,
                 "system_snapshot_sha256": hashlib.sha256(
-                    _system_snapshot(payload.messages).encode("utf-8")
+                    _developer_instruction_snapshot(payload).encode("utf-8")
                 ).hexdigest(),
+                "native_policy_sha256": _native_policy_sha256(model),
             },
         )
 
@@ -1230,6 +1365,34 @@ class ConversationProvider:
             self.store.get_worker(str(existing["worker_id"])) if existing else None
         )
         existing_manifest = self._session_manifest(existing)
+        current_policy_sha256 = _native_policy_sha256(model)
+        previous_policy_sha256 = str(
+            existing_manifest.get("native_policy_sha256") or ""
+        ).strip()
+        requested_system_snapshot = _developer_instruction_snapshot(payload)
+        authority_update_present = bool(requested_system_snapshot)
+        previous_system_sha256 = str(
+            existing_manifest.get("system_snapshot_sha256") or ""
+        ).strip()
+        current_system_sha256 = (
+            hashlib.sha256(requested_system_snapshot.encode("utf-8")).hexdigest()
+            if authority_update_present
+            else previous_system_sha256
+            or hashlib.sha256(b"").hexdigest()
+        )
+        policy_changed = bool(
+            existing
+            and (
+                previous_policy_sha256 != current_policy_sha256
+                if previous_policy_sha256
+                else not _native_policy_is_default(model)
+            )
+        )
+        system_state_changed = bool(
+            existing
+            and authority_update_present
+            and previous_system_sha256 != current_system_sha256
+        )
         binding_changed = bool(
             existing
             and (
@@ -1238,10 +1401,38 @@ class ConversationProvider:
                 or existing["access_mode"] != expected_access
                 or not existing_worker
                 or str(existing_worker.get("state") or "") in {"failed", "terminated"}
+                or policy_changed
+                or system_state_changed
             )
         )
         if existing and not binding_changed:
             bundle = self._native_bundle(payload, model, effort)
+            if not authority_update_present and existing_worker:
+                try:
+                    existing_bundle = json.loads(
+                        str(existing_worker.get("bootstrap_bundle_json") or "{}")
+                    )
+                except json.JSONDecodeError:
+                    existing_bundle = {}
+                application_instructions = str(
+                    existing_bundle.get("application_developer_instructions")
+                    or existing_bundle.get("developer_instructions")
+                    or ""
+                ).strip()
+                declared_tail = str(
+                    payload.metadata.developer_instruction_tail
+                    or existing_bundle.get("declared_developer_instruction_tail")
+                    or ""
+                ).strip()
+                bundle["application_developer_instructions"] = application_instructions
+                bundle["developer_instructions"] = _merge_developer_instructions(
+                    application_instructions,
+                    _bootstrap_developer_instructions(bundle, model.harness_profile),
+                )
+                bundle["developer_instructions"] = _pin_developer_instruction_tail(
+                    bundle["developer_instructions"], declared_tail
+                )
+                bundle["declared_developer_instruction_tail"] = declared_tail
             self.store.update_worker(
                 str(existing["worker_id"]),
                 bootstrap_bundle_json=json.dumps(bundle, sort_keys=True),
@@ -1251,9 +1442,8 @@ class ConversationProvider:
             current_manifest = {
                 **existing_manifest,
                 "effort": effort,
-                "system_snapshot_sha256": hashlib.sha256(
-                    _system_snapshot(payload.messages).encode("utf-8")
-                ).hexdigest(),
+                "system_snapshot_sha256": current_system_sha256,
+                "native_policy_sha256": current_policy_sha256,
             }
             updated_session = self.store.update_provider_session_history(
                 str(existing["session_id"]),
@@ -1425,33 +1615,94 @@ class ConversationProvider:
             )
         return updated
 
-    def _reconcile_detached_request(self, request_id: str) -> None:
-        try:
-            while True:
-                record = self.store.get_provider_request(request_id)
-                if not record or str(record.get("state") or "") in TERMINAL_REQUEST_STATES:
-                    return
-                self._sync(record)
-                record = self.store.get_provider_request(request_id)
-                if not record or str(record.get("state") or "") in TERMINAL_REQUEST_STATES:
-                    return
-                time.sleep(0.2)
-        finally:
+    def _reconcile_detached_request_once(self, request_id: str) -> bool:
+        record = self.store.get_provider_request(request_id)
+        if not record or str(record.get("state") or "") in TERMINAL_REQUEST_STATES:
+            return False
+        run_id = str(record.get("run_id") or "").strip()
+        if not run_id:
+            # A process can stop in the narrow interval after durable idempotency reservation but
+            # before assign_run attaches a native run. There is no persisted instruction to replay,
+            # so fail loudly instead of hanging forever or guessing a second authoring request.
+            activity_types = {
+                str(item.get("event_type") or "")
+                for item in self.store.list_provider_activity(request_id)
+            }
+            if "failed" not in activity_types:
+                self.store.add_provider_activity(
+                    request_id,
+                    "failed",
+                    ACTIVITY_SUMMARIES["failed"],
+                    {"failure_class": "prestart_interrupted"},
+                )
+            self.store.update_provider_request(request_id, state="failed")
+            return False
+        run = self.store.get_run(run_id) if run_id else None
+        if not run:
+            if "failed" not in {
+                str(item.get("event_type") or "")
+                for item in self.store.list_provider_activity(request_id)
+            }:
+                self.store.add_provider_activity(
+                    request_id,
+                    "failed",
+                    ACTIVITY_SUMMARIES["failed"],
+                    {"failure_class": "durable_run_missing"},
+                )
+            self.store.update_provider_request(request_id, state="failed")
+            return False
+        if run and str(run.get("state") or "") == "running":
+            session = self.store.get_provider_session_by_id(str(record.get("session_id") or ""))
+            worker_id = str((session or {}).get("worker_id") or "").strip()
+            if worker_id:
+                # The original queue processor is process-local. After an API restart,
+                # heal_worker recovers a completed native transcript and finalizes the
+                # durable run without starting a second authoring process.
+                self.service.heal_worker(worker_id)
+        self._sync(record)
+        record = self.store.get_provider_request(request_id)
+        return bool(record and str(record.get("state") or "") not in TERMINAL_REQUEST_STATES)
+
+    def _detached_reconciliation_loop(self) -> None:
+        while True:
             with self._detached_reconciliation_lock:
-                self._detached_reconciliations.discard(request_id)
+                request_ids = sorted(self._detached_reconciliations)
+                if not request_ids:
+                    self._detached_reconciliation_thread = None
+                    return
+            for request_id in request_ids:
+                try:
+                    keep = self._reconcile_detached_request_once(request_id)
+                except Exception as error:
+                    # One malformed durable record must not terminate reconciliation for every
+                    # other active request. Log only the request id and error class; request
+                    # content and private paths never belong in provider logs.
+                    logger.warning(
+                        "GlassHive detached request reconciliation failed",
+                        extra={
+                            "request_id": request_id,
+                            "error_type": type(error).__name__,
+                        },
+                    )
+                    keep = False
+                if not keep:
+                    with self._detached_reconciliation_lock:
+                        self._detached_reconciliations.discard(request_id)
+            time.sleep(0.2)
 
     def _ensure_detached_reconciliation(self, request_id: str) -> None:
+        thread_to_start: threading.Thread | None = None
         with self._detached_reconciliation_lock:
-            if request_id in self._detached_reconciliations:
-                return
             self._detached_reconciliations.add(request_id)
-        thread = threading.Thread(
-            target=self._reconcile_detached_request,
-            args=(request_id,),
-            daemon=True,
-            name=f"glasshive-provider-reconcile-{request_id[-8:]}",
-        )
-        thread.start()
+            if not self._detached_reconciliation_thread or not self._detached_reconciliation_thread.is_alive():
+                thread_to_start = threading.Thread(
+                    target=self._detached_reconciliation_loop,
+                    daemon=True,
+                    name="glasshive-provider-reconcile",
+                )
+                self._detached_reconciliation_thread = thread_to_start
+        if thread_to_start:
+            thread_to_start.start()
 
     def _sync_native_activity(self, request_record: dict[str, Any], run: dict[str, Any]) -> None:
         collector = getattr(self.service.runtime, "provider_activity_log", None)
