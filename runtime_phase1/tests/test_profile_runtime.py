@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import stat
 import subprocess
+import sys
 import threading
 import time
+import tomllib
 from datetime import datetime
 from pathlib import Path
 
@@ -36,6 +39,15 @@ def _patch_host_codex_requirement_probe(monkeypatch):
             stderr="",
         ),
     )
+
+
+def _mark_fake_host_supervisor_ready(command: list[str], pid: int) -> None:
+    """Make legacy Popen fakes honor the native supervisor readiness contract."""
+    if len(command) < 5 or Path(command[1]).name != "native-process-supervisor.py":
+        return
+    ready_path = Path(command[4])
+    ready_path.write_text(f"{pid}\n")
+    ready_path.chmod(0o600)
 
 
 def _write_pass_evidence(runtime, worker_id: str, run_id: str) -> None:
@@ -105,6 +117,527 @@ def test_host_terminal_target_preserves_shell_fallback_expression(tmp_path):
 
     assert target.command[-1].endswith("exec ${SHELL:-/bin/bash}")
     assert target.title == "Host Claude host terminal"
+
+
+def test_host_runtime_recovers_and_stops_a_persisted_process_after_api_restart(tmp_path):
+    runtime_before_restart = HostCodexCliRuntime(base_dir=str(tmp_path))
+    runtime_after_restart = HostCodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_host_restart",
+        "name": "Host Codex",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+    }
+    process = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+    try:
+        runtime_before_restart._write_active_session(
+            worker["worker_id"],
+            {
+                "session_name": "conversation-run_restart",
+                "run_id": "run_restart",
+                "stdout_path": str(tmp_path / "stdout.log"),
+                "stderr_path": str(tmp_path / "stderr.log"),
+                "exit_path": str(tmp_path / "exit_code"),
+                "model": "gpt-5.6-sol",
+                "process_pid": process.pid,
+                "started_at": datetime.now().astimezone().isoformat(),
+            },
+        )
+
+        assert runtime_after_restart.reconcile_worker(worker).pid == process.pid
+
+        runtime_after_restart._stop_active_process(
+            worker["worker_id"],
+            worker=worker,
+            run_id="run_restart",
+        )
+        process.wait(timeout=3)
+
+        assert process.returncode is not None
+        assert runtime_after_restart.reconcile_worker(worker).pid is None
+        assert not runtime_after_restart._active_session_meta_path(worker["worker_id"]).exists()
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=3)
+
+
+def test_host_runtime_rejects_recycled_pid_identity_without_stopping_the_process(tmp_path):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_host_recycled_pid",
+        "name": "Host Codex",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+    }
+    unrelated_process = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+    try:
+        runtime._write_active_session(
+            worker["worker_id"],
+            {
+                "session_name": "conversation-run_recycled",
+                "run_id": "run_recycled",
+                "stdout_path": str(tmp_path / "stdout.log"),
+                "stderr_path": str(tmp_path / "stderr.log"),
+                "exit_path": str(tmp_path / "exit_code"),
+                "model": "gpt-5.6-sol",
+                "process_pid": unrelated_process.pid,
+                "process_identity_sha256": "0" * 64,
+                "started_at": datetime.now().astimezone().isoformat(),
+            },
+        )
+
+        assert runtime.reconcile_worker(worker).pid is None
+        runtime._stop_active_process(
+            worker["worker_id"],
+            worker=worker,
+            run_id="run_recycled",
+        )
+
+        assert unrelated_process.poll() is None
+    finally:
+        if unrelated_process.poll() is None:
+            unrelated_process.terminate()
+            unrelated_process.wait(timeout=3)
+
+
+@pytest.mark.parametrize(
+    ("runtime_class", "profile", "model", "stdout_payload", "expected_output", "expected_session"),
+    [
+        (
+            HostCodexCliRuntime,
+            "codex-cli",
+            "gpt-5.6-sol",
+            "\n".join(
+                [
+                    json.dumps({"type": "thread.started", "thread_id": "thread-recovered"}),
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "type": "agent_message",
+                                "text": "Recovered Codex conversation.",
+                            },
+                        }
+                    ),
+                ]
+            ),
+            "Recovered Codex conversation.",
+            "thread-recovered",
+        ),
+        (
+            HostClaudeCodeRuntime,
+            "claude-code",
+            "opus",
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "Recovered Claude conversation.",
+                    "session_id": "session-recovered",
+                }
+            ),
+            "Recovered Claude conversation.",
+            "session-recovered",
+        ),
+    ],
+)
+def test_host_native_child_persists_completion_for_restart_recovery_without_duplicate_authoring(
+    tmp_path,
+    runtime_class,
+    profile,
+    model,
+    stdout_payload,
+    expected_output,
+    expected_session,
+):
+    private_state = tmp_path / "private-state"
+    runtime_before_restart = runtime_class(base_dir=str(private_state))
+    runtime_after_restart = runtime_class(base_dir=str(private_state))
+    life = tmp_path / "Life"
+    life.mkdir()
+    worker = {
+        "worker_id": f"wrk_recover_{profile}",
+        "name": "Synthetic conversation worker",
+        "profile": profile,
+        "execution_mode": "host",
+        "workspace_root": str(life),
+        "model": model,
+        "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
+    }
+    run_id = f"run_recover_{profile}"
+    run_root = runtime_before_restart._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    run_root.chmod(0o700)
+    stdout_path = run_root / "stdout.log"
+    stderr_path = run_root / "stderr.log"
+    exit_path = run_root / "exit_code"
+    launch_count_path = run_root / "launch-count.log"
+    stdin_hash_path = run_root / "stdin.sha256"
+    instruction_path = run_root / "instruction.stdin"
+    private_instruction = "Complete durable restart prompt.\n" + ("synthetic-context " * 2048)
+    instruction_path.write_text(private_instruction)
+    instruction_path.chmod(0o600)
+    expected_stdin_hash = hashlib.sha256(private_instruction.encode()).hexdigest()
+    child_code = (
+        "import hashlib,pathlib,sys,time; "
+        "pathlib.Path(sys.argv[1]).open('a').write('launch\\n'); "
+        "stdin_text=sys.stdin.read(); "
+        "stdin_hash=hashlib.sha256(stdin_text.encode()).hexdigest(); "
+        "pathlib.Path(sys.argv[2]).write_text(stdin_hash); "
+        "sys.exit(61) if stdin_hash != sys.argv[3] else None; "
+        "time.sleep(0.2); print(sys.argv[4], flush=True)"
+    )
+    command = [
+        sys.executable,
+        "-c",
+        child_code,
+        str(launch_count_path),
+        str(stdin_hash_path),
+        expected_stdin_hash,
+        stdout_payload,
+    ]
+    process_command = runtime_before_restart._durable_host_process_command(
+        command,
+        run_root=run_root,
+        exit_path=exit_path,
+        stdin_path=instruction_path,
+    )
+
+    process: subprocess.Popen[str] | None = None
+    try:
+        with stdout_path.open("w") as stdout_handle, stderr_path.open("w") as stderr_handle:
+            process = subprocess.Popen(
+                process_command,
+                cwd=str(life),
+                text=True,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                start_new_session=True,
+            )
+        runtime_before_restart._wait_for_durable_host_supervisor(
+            process,
+            run_root=run_root,
+        )
+        runtime_before_restart._write_active_session(
+            worker["worker_id"],
+            {
+                "session_name": f"conversation-{run_id[:12]}",
+                "run_id": run_id,
+                "stdout_path": str(stdout_path),
+                "stderr_path": str(stderr_path),
+                "exit_path": str(exit_path),
+                "model": model,
+                "argv_for_evidence_json": json.dumps(command),
+                "started_at": datetime.now().astimezone().isoformat(),
+                "process_pid": process.pid,
+                "run_mode": "conversation",
+            },
+        )
+        time.sleep(0.1)
+        assert not launch_count_path.exists()
+        assert not exit_path.exists()
+        persisted_session = runtime_after_restart._read_active_session(worker["worker_id"])
+        assert persisted_session is not None
+        assert persisted_session["process_pid"] == process.pid
+        assert persisted_session["process_identity_sha256"]
+        assert persisted_session["run_mode"] == "conversation"
+        assert stat.S_IMODE(
+            runtime_after_restart._active_session_meta_path(worker["worker_id"]).stat().st_mode
+        ) == 0o600
+        assert list(
+            runtime_after_restart._active_session_meta_path(worker["worker_id"]).parent.glob(
+                "active-session.json.tmp-*"
+            )
+        ) == []
+
+        # A fresh API instance observes the durable metadata and releases the
+        # pre-authoring handshake exactly once.
+        assert runtime_after_restart.reconcile_worker(worker).pid == process.pid
+
+        deadline = time.monotonic() + 5
+        while not exit_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert exit_path.read_text().strip() == "0"
+
+        recovered = runtime_after_restart.collect_completed_run(worker, run_id=run_id)
+        recovered_again = runtime_after_restart.collect_completed_run(worker, run_id=run_id)
+
+        assert recovered is not None
+        assert recovered["state"] == "completed"
+        assert recovered["output_text"] == expected_output
+        assert recovered_again is not None
+        assert recovered_again["state"] == "completed"
+        assert recovered_again["output_text"] == expected_output
+        assert json.loads(
+            runtime_after_restart._session_meta_path(worker["worker_id"]).read_text()
+        )["session_key"] == expected_session
+        assert launch_count_path.read_text().splitlines() == ["launch"]
+        assert stdin_hash_path.read_text() == expected_stdin_hash
+        assert stat.S_IMODE(exit_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE((run_root / "native-process-supervisor.py").stat().st_mode) == 0o700
+        assert list(run_root.glob("exit_code.tmp.*")) == []
+        assert not (life / "glasshive-run").exists()
+    finally:
+        if process is not None:
+            process.wait(timeout=5)
+
+
+def test_host_native_restart_cancellation_stops_process_group_and_persists_terminal_marker(
+    tmp_path,
+):
+    private_state = tmp_path / "private-state"
+    runtime_before_restart = HostCodexCliRuntime(base_dir=str(private_state))
+    runtime_after_restart = HostCodexCliRuntime(base_dir=str(private_state))
+    worker = {
+        "worker_id": "wrk_cancel_after_restart",
+        "name": "Synthetic cancellation worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+    }
+    run_id = "run_cancel_after_restart"
+    run_root = runtime_before_restart._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    exit_path = run_root / "exit_code"
+    child_pid_path = run_root / "child.pid"
+    process_command = runtime_before_restart._durable_host_process_command(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,pathlib,sys,time; "
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+                "time.sleep(30)"
+            ),
+            str(child_pid_path),
+        ],
+        run_root=run_root,
+        exit_path=exit_path,
+    )
+    process = subprocess.Popen(
+        process_command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        runtime_before_restart._wait_for_durable_host_supervisor(
+            process,
+            run_root=run_root,
+        )
+        runtime_before_restart._write_active_session(
+            worker["worker_id"],
+            {
+                "session_name": f"conversation-{run_id[:12]}",
+                "run_id": run_id,
+                "stdout_path": str(run_root / "stdout.log"),
+                "stderr_path": str(run_root / "stderr.log"),
+                "exit_path": str(exit_path),
+                "model": "gpt-5.6-sol",
+                "process_pid": process.pid,
+                "run_mode": "conversation",
+            },
+        )
+        assert runtime_after_restart.reconcile_worker(worker).pid == process.pid
+        deadline = time.monotonic() + 5
+        while not child_pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert child_pid_path.exists()
+        child_pid = int(child_pid_path.read_text())
+
+        runtime_after_restart._stop_active_process(
+            worker["worker_id"],
+            worker=worker,
+            run_id=run_id,
+        )
+        process.wait(timeout=5)
+
+        assert exit_path.read_text().strip() == "143"
+        assert stat.S_IMODE(exit_path.stat().st_mode) == 0o600
+        assert list(run_root.glob("exit_code.tmp.*")) == []
+        assert not runtime_after_restart._active_session_meta_path(worker["worker_id"]).exists()
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        with pytest.raises(ProcessLookupError):
+            os.killpg(process.pid, 0)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, 9)
+            process.wait(timeout=5)
+
+
+def test_host_native_nonzero_exit_is_durably_recovered_with_precise_failure(tmp_path):
+    private_state = tmp_path / "private-state"
+    runtime_before_restart = HostCodexCliRuntime(base_dir=str(private_state))
+    runtime_after_restart = HostCodexCliRuntime(base_dir=str(private_state))
+    life = tmp_path / "Life"
+    life.mkdir()
+    worker = {
+        "worker_id": "wrk_nonzero_after_restart",
+        "name": "Synthetic nonzero worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(life),
+        "model": "gpt-5.6-sol",
+        "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
+    }
+    run_id = "run_nonzero_after_restart"
+    run_root = runtime_before_restart._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    stdout_path = run_root / "stdout.log"
+    stderr_path = run_root / "stderr.log"
+    exit_path = run_root / "exit_code"
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; sys.stderr.write('synthetic durable child failure\\n'); sys.exit(23)",
+    ]
+    process_command = runtime_before_restart._durable_host_process_command(
+        command,
+        run_root=run_root,
+        exit_path=exit_path,
+    )
+    with stdout_path.open("w") as stdout_handle, stderr_path.open("w") as stderr_handle:
+        process = subprocess.Popen(
+            process_command,
+            cwd=str(life),
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            start_new_session=True,
+        )
+    try:
+        runtime_before_restart._wait_for_durable_host_supervisor(
+            process,
+            run_root=run_root,
+        )
+        runtime_before_restart._write_active_session(
+            worker["worker_id"],
+            {
+                "session_name": f"conversation-{run_id[:12]}",
+                "run_id": run_id,
+                "stdout_path": str(stdout_path),
+                "stderr_path": str(stderr_path),
+                "exit_path": str(exit_path),
+                "model": "gpt-5.6-sol",
+                "process_pid": process.pid,
+                "run_mode": "conversation",
+            },
+        )
+        assert runtime_after_restart.reconcile_worker(worker).pid == process.pid
+
+        deadline = time.monotonic() + 5
+        while not exit_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        process.wait(timeout=5)
+        recovered = runtime_after_restart.collect_completed_run(worker, run_id=run_id)
+
+        assert exit_path.read_text().strip() == "23"
+        assert process.returncode == 23
+        assert recovered is not None
+        assert recovered["state"] == "failed"
+        assert "exited with code 23" in recovered["error_text"]
+        assert "synthetic durable child failure" in recovered["error_text"]
+        assert not (life / "glasshive-run").exists()
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, 9)
+            process.wait(timeout=5)
+
+
+def test_host_native_configured_timeout_survives_api_restart_and_stops_child_group(tmp_path):
+    private_state = tmp_path / "private-state"
+    runtime_before_restart = HostCodexCliRuntime(base_dir=str(private_state))
+    runtime_after_restart = HostCodexCliRuntime(base_dir=str(private_state))
+    life = tmp_path / "Life"
+    life.mkdir()
+    worker = {
+        "worker_id": "wrk_timeout_after_restart",
+        "name": "Synthetic timeout worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(life),
+        "model": "gpt-5.6-sol",
+        "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
+    }
+    run_id = "run_timeout_after_restart"
+    run_root = runtime_before_restart._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    stdout_path = run_root / "stdout.log"
+    stderr_path = run_root / "stderr.log"
+    exit_path = run_root / "exit_code"
+    child_pid_path = run_root / "child.pid"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import os,pathlib,sys,time; "
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+            "print('child started', flush=True); time.sleep(30)"
+        ),
+        str(child_pid_path),
+    ]
+    process_command = runtime_before_restart._durable_host_process_command(
+        command,
+        run_root=run_root,
+        exit_path=exit_path,
+        timeout_sec=0.2,
+    )
+    with stdout_path.open("w") as stdout_handle, stderr_path.open("w") as stderr_handle:
+        process = subprocess.Popen(
+            process_command,
+            cwd=str(life),
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            start_new_session=True,
+        )
+    try:
+        runtime_before_restart._wait_for_durable_host_supervisor(
+            process,
+            run_root=run_root,
+        )
+        runtime_before_restart._write_active_session(
+            worker["worker_id"],
+            {
+                "session_name": f"conversation-{run_id[:12]}",
+                "run_id": run_id,
+                "stdout_path": str(stdout_path),
+                "stderr_path": str(stderr_path),
+                "exit_path": str(exit_path),
+                "model": "gpt-5.6-sol",
+                "process_pid": process.pid,
+                "timeout_seconds": 0.2,
+                "run_mode": "conversation",
+            },
+        )
+        started = time.monotonic()
+        assert runtime_after_restart.reconcile_worker(worker).pid == process.pid
+
+        deadline = time.monotonic() + 5
+        while not exit_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        process.wait(timeout=5)
+        elapsed = time.monotonic() - started
+        recovered = runtime_after_restart.collect_completed_run(worker, run_id=run_id)
+
+        assert exit_path.read_text().strip() == "124"
+        assert process.returncode == 124
+        assert elapsed < 3
+        assert child_pid_path.exists()
+        child_pid = int(child_pid_path.read_text())
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        assert recovered is not None
+        assert recovered["state"] == "failed"
+        assert "exited with code 124" in recovered["error_text"]
+        assert "timed out after 0.2s" in recovered["error_text"]
+        assert not (life / "glasshive-run").exists()
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, 9)
+            process.wait(timeout=5)
 
 
 def test_collect_completed_run_recovers_from_latest_run_artifacts(tmp_path):
@@ -712,24 +1245,27 @@ def test_host_openclaw_run_writes_private_instruction_file_for_pointer(tmp_path,
         returncode = 0
 
         def __init__(self, command, **kwargs):
+            _mark_fake_host_supervisor_ready(list(command), self.pid)
             captured["command"] = list(command)
-            captured["stdin_pipe"] = kwargs["stdin"] == subprocess.PIPE
+            captured["stdin_is_devnull"] = kwargs["stdin"] == subprocess.DEVNULL
             self.stdout_handle = kwargs["stdout"]
+            self.wrote_output = False
 
         def communicate(self, input=None, timeout=None):
-            captured["stdin"] = input
-            self.stdout_handle.write(
-                json.dumps(
-                    {
-                        "finalAssistantVisibleText": "FINAL REPORT:\nDone.",
-                        "completion": {"stopReason": "stop"},
-                    }
-                )
-            )
-            self.stdout_handle.flush()
-            return None, None
+            raise AssertionError("API process must not own supervisor stdin")
 
         def wait(self, timeout=None):
+            if not self.wrote_output:
+                self.stdout_handle.write(
+                    json.dumps(
+                        {
+                            "finalAssistantVisibleText": "FINAL REPORT:\nDone.",
+                            "completion": {"stopReason": "stop"},
+                        }
+                    )
+                )
+                self.stdout_handle.flush()
+                self.wrote_output = True
             return self.returncode
 
         def poll(self):
@@ -755,6 +1291,8 @@ def test_host_openclaw_run_writes_private_instruction_file_for_pointer(tmp_path,
     assert output == "Done."
     command = captured["command"]
     assert isinstance(command, list)
+    assert captured["stdin_is_devnull"] is True
+    assert Path(command[6]).read_text().startswith("Sensitive OpenClaw task.")
     pointer = command[command.index("-m") + 1]
     assert "Sensitive OpenClaw task" not in pointer
     assert "run_host_openclaw_pointer/instruction.stdin" in pointer
@@ -762,8 +1300,6 @@ def test_host_openclaw_run_writes_private_instruction_file_for_pointer(tmp_path,
     assert stdin_path.exists()
     assert stdin_path.read_text().startswith("Sensitive OpenClaw task.")
     assert oct(stdin_path.stat().st_mode & 0o777) == "0o600"
-    assert captured["stdin_pipe"] is True
-    assert str(captured["stdin"]).startswith("Sensitive OpenClaw task.")
 
 
 def test_openclaw_parser_prefers_final_visible_text(tmp_path):
@@ -1512,7 +2048,7 @@ def test_codex_cli_provider_config_ignores_invalid_allowed_reasoning_efforts(tmp
     assert 'model_reasoning_effort="low"' in joined
 
 
-def test_host_cli_run_uses_stdin_pipe_for_private_instruction(tmp_path, monkeypatch):
+def test_host_cli_run_gives_supervisor_private_instruction_file(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
     _patch_host_codex_requirement_probe(monkeypatch)
@@ -1523,7 +2059,9 @@ def test_host_cli_run_uses_stdin_pipe_for_private_instruction(tmp_path, monkeypa
         returncode = 0
 
         def __init__(self, command, **kwargs):
+            _mark_fake_host_supervisor_ready(list(command), self.pid)
             captured["stdin"] = kwargs.get("stdin")
+            captured["command"] = list(command)
             stdout = kwargs["stdout"]
             stdout.write(
                 '{"type":"item.completed","item":{"type":"agent_message","text":"FINAL REPORT:\\nDone"}}\n'
@@ -1534,8 +2072,7 @@ def test_host_cli_run_uses_stdin_pipe_for_private_instruction(tmp_path, monkeypa
             return 0
 
         def communicate(self, input=None, timeout=None):
-            captured["input"] = input
-            return None, None
+            raise AssertionError("API process must not own supervisor stdin")
 
         def poll(self):
             return 0
@@ -1559,8 +2096,10 @@ def test_host_cli_run_uses_stdin_pipe_for_private_instruction(tmp_path, monkeypa
     }
 
     assert runtime.run_task(worker, "create marker", run_id="run_no_stdin") == "Done"
-    assert captured["stdin"] is subprocess.PIPE
-    assert str(captured["input"]).startswith("create marker")
+    assert captured["stdin"] is subprocess.DEVNULL
+    supervisor_stdin = Path(captured["command"][6])  # type: ignore[index]
+    assert supervisor_stdin.stat().st_mode & 0o777 == 0o600
+    assert supervisor_stdin.read_text().startswith("create marker")
 
 
 def test_host_cli_run_writes_constraint_ledger_and_evidence(tmp_path, monkeypatch):
@@ -1573,7 +2112,8 @@ def test_host_cli_run_writes_constraint_ledger_and_evidence(tmp_path, monkeypatc
         pid = 12345
         returncode = 0
 
-        def __init__(self, _command, **kwargs):
+        def __init__(self, command, **kwargs):
+            _mark_fake_host_supervisor_ready(list(command), self.pid)
             cwd = Path(kwargs["cwd"])
             output_dir = cwd / "output"
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -1645,7 +2185,8 @@ def test_host_cli_run_fails_when_evidence_contract_fails(tmp_path, monkeypatch):
         pid = 12345
         returncode = 0
 
-        def __init__(self, _command, **kwargs):
+        def __init__(self, command, **kwargs):
+            _mark_fake_host_supervisor_ready(list(command), self.pid)
             stdout = kwargs["stdout"]
             stdout.write(
                 '{"type":"item.completed","item":{"type":"agent_message","text":"FINAL REPORT:\\nDone"}}\n'
@@ -1706,7 +2247,8 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
     class TimeoutProcess:
         pid = 12345
 
-        def __init__(self, _command, **kwargs):
+        def __init__(self, command, **kwargs):
+            _mark_fake_host_supervisor_ready(list(command), self.pid)
             self.terminated = False
             stdout = kwargs["stdout"]
             stdout.write("working before timeout\n")
@@ -1782,7 +2324,8 @@ def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monke
     class ForegroundServerProcess:
         pid = 12345
 
-        def __init__(self, _command, **kwargs):
+        def __init__(self, command, **kwargs):
+            _mark_fake_host_supervisor_ready(list(command), self.pid)
             self.terminated = False
             stdout = kwargs["stdout"]
             stderr = kwargs["stderr"]
@@ -1858,8 +2401,9 @@ def test_host_codex_run_sends_instruction_via_stdin_not_argv(tmp_path, monkeypat
         returncode = 0
 
         def __init__(self, command, **kwargs):
+            _mark_fake_host_supervisor_ready(list(command), self.pid)
             captured["command"] = list(command)
-            captured["stdin_pipe"] = kwargs["stdin"] == subprocess.PIPE
+            captured["stdin_is_devnull"] = kwargs["stdin"] == subprocess.DEVNULL
             stdout = kwargs["stdout"]
             stdout.write(
                 json.dumps(
@@ -1873,8 +2417,7 @@ def test_host_codex_run_sends_instruction_via_stdin_not_argv(tmp_path, monkeypat
             stdout.flush()
 
         def communicate(self, input=None, timeout=None):
-            captured["stdin"] = input
-            return None, None
+            raise AssertionError("API process must not own supervisor stdin")
 
         def wait(self, timeout=None):
             return self.returncode
@@ -1912,8 +2455,10 @@ def test_host_codex_run_sends_instruction_via_stdin_not_argv(tmp_path, monkeypat
     command_text = " ".join(captured["command"])  # type: ignore[arg-type]
     assert "Sensitive private instruction" not in command_text
     assert str(captured["command"][-1]) == "-"  # type: ignore[index]
-    assert captured["stdin_pipe"] is True
-    assert str(captured["stdin"]).startswith("Sensitive private instruction.")
+    assert captured["stdin_is_devnull"] is True
+    supervisor_stdin = Path(captured["command"][6])  # type: ignore[index]
+    assert supervisor_stdin.stat().st_mode & 0o777 == 0o600
+    assert supervisor_stdin.read_text().startswith("Sensitive private instruction.")
     evidence = json.loads((workspace / "glasshive-run" / "evidence.json").read_text())
     assert all("Sensitive private instruction" not in arg for arg in evidence["command"]["argv_redacted"])
     assert evidence["command"]["argv_redacted"][0] == "echo"
@@ -1937,7 +2482,8 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
     class BlockingProcess:
         pid = 12345
 
-        def __init__(self, _command, **kwargs):
+        def __init__(self, command, **kwargs):
+            _mark_fake_host_supervisor_ready(list(command), self.pid)
             self.terminated = False
             processes.append(self)
             stdout = kwargs["stdout"]
@@ -2080,6 +2626,10 @@ def test_host_runtime_materializes_project_mcp_bootstrap_with_owner_only_files(t
     _patch_host_codex_requirement_probe(monkeypatch)
     source_codex_home = tmp_path / "source-codex-home"
     source_codex_home.mkdir()
+    (source_codex_home / "skills" / "synthetic-skill").mkdir(parents=True)
+    (source_codex_home / "skills" / "synthetic-skill" / "SKILL.md").write_text(
+        "# Synthetic skill\n"
+    )
     (source_codex_home / "auth.json").write_text('{"OPENAI_API_KEY":"redacted-test-key"}')
     (source_codex_home / "config.toml").write_text(
         'model = "gpt-local-public-safe"\n'
@@ -2183,6 +2733,13 @@ def test_host_runtime_materializes_project_mcp_bootstrap_with_owner_only_files(t
     assert "private-mail" not in worker_codex_config
     assert "PRIVATE_TOKEN" not in worker_codex_config
     assert json.loads((worker_codex_home / "auth.json").read_text())["OPENAI_API_KEY"] == "redacted-test-key"
+    assert (worker_codex_home / "skills").is_symlink()
+    assert (worker_codex_home / "skills").resolve() == (source_codex_home / "skills").resolve()
+    assert (worker_codex_home / "plugins" / "cache").is_symlink()
+    assert (worker_codex_home / "plugins" / "cache").resolve() == (
+        source_codex_home / "plugins" / "cache"
+    ).resolve()
+    assert not (worker_codex_home / "plugins" / "data").exists()
     command, env = runtime._build_command(worker, "Use the broker", info)
     assert env["CODEX_HOME"] == str(worker_codex_home)
     assert env["GLASSHIVE_CAPABILITY_BROKER_TOKEN"] == "broker-grant"
@@ -2222,6 +2779,93 @@ def test_host_codex_preserves_known_computer_use_client_when_manifest_is_absent(
     assert "[mcp_servers.computer-use]" in config
     assert str(computer_use_client) in config
     assert "glasshive-user-capabilities" in config
+
+
+def test_host_codex_conversation_developer_instructions_are_exact_and_worker_local(
+    tmp_path, monkeypatch
+):
+    source_codex_home = tmp_path / "source-codex-home"
+    source_codex_home.mkdir()
+    (source_codex_home / "config.toml").write_text(
+        'developer_instructions = "Stale inherited instructions."\n'
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "codex-state"))
+    life = tmp_path / "Life"
+    life.mkdir()
+    worker = {
+        "worker_id": "wrk_codex_developer_authority",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(life),
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "run_mode": "conversation",
+                "developer_instructions": "Current Feeling capsule.",
+            }
+        ),
+    }
+
+    runtime._materialize_workspace(worker, life)
+    worker_config_path = runtime._host_codex_home(worker) / "config.toml"
+    worker_config = tomllib.loads(worker_config_path.read_text())
+    assert worker_config["developer_instructions"] == "Current Feeling capsule."
+    assert not (life / ".codex").exists()
+
+    worker_config_path.write_text(
+        'developer_instructions = "Stale inherited instructions."\n'
+    )
+    with pytest.raises(RuntimeErrorBase, match="developer instruction authority"):
+        runtime._build_command(
+            worker,
+            "Continue.",
+            runtime._host_runtime_info(worker),
+        )
+
+
+def test_host_codex_nonconversation_worker_keeps_inherited_developer_instructions(
+    tmp_path, monkeypatch
+):
+    source_codex_home = tmp_path / "source-codex-home"
+    source_codex_home.mkdir()
+    (source_codex_home / "config.toml").write_text(
+        'developer_instructions = "Standalone instructions."\n'
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "codex-state"))
+
+    config = tomllib.loads(runtime._host_codex_worker_config(""))
+
+    assert config["developer_instructions"] == "Standalone instructions."
+
+
+def test_host_codex_plugin_denylist_and_personality_are_worker_local(
+    tmp_path, monkeypatch
+):
+    denied_plugin = "viventium-feelings@project-viventium"
+    source_codex_home = tmp_path / "source-codex-home"
+    source_codex_home.mkdir()
+    source_config = source_codex_home / "config.toml"
+    source_config.write_text(
+        'personality = "pragmatic"\n'
+        f'[plugins."{denied_plugin}"]\n'
+        "enabled = true\n\n"
+        '[plugins."chrome@openai-bundled"]\n'
+        "enabled = true\n"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+    monkeypatch.setenv("GLASSHIVE_HOST_PLUGIN_DENYLIST", denied_plugin)
+    monkeypatch.setenv("WPR_CODEX_CLI_PERSONALITY", "none")
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "codex-state"))
+
+    worker_config = tomllib.loads(runtime._host_codex_worker_config(""))
+    source_after = tomllib.loads(source_config.read_text())
+
+    assert worker_config["personality"] == "none"
+    assert worker_config["plugins"][denied_plugin]["enabled"] is False
+    assert worker_config["plugins"]["chrome@openai-bundled"]["enabled"] is True
+    assert source_after["personality"] == "pragmatic"
+    assert source_after["plugins"][denied_plugin]["enabled"] is True
 
 
 def test_host_codex_strips_noncanonical_private_mcp_tables(tmp_path, monkeypatch):
@@ -4946,7 +5590,8 @@ def test_redact_text_masks_parent_visible_secret_shapes():
 
 def test_redact_text_masks_common_host_paths_and_credential_families():
     private_key = (
-        "-----BEGIN PRIVATE KEY-----\n"
+        "-----BEGIN "
+        "PRIVATE KEY-----\n"
         "c3ludGhldGljLXByaXZhdGUta2V5LW1hdGVyaWFs\n"
         "-----END PRIVATE KEY-----"
     )
@@ -5034,6 +5679,44 @@ def test_host_conversation_mode_uses_exact_workspace_without_scaffolding(tmp_pat
         assert not (life / forbidden).exists()
 
 
+def test_host_codex_conversation_can_exclude_workspace_project_instructions(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "WPR_CODEX_CLI_CONVERSATION_PROJECT_INSTRUCTIONS",
+        "exclude",
+    )
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "private-state"))
+    life = tmp_path / "Life"
+    life.mkdir()
+    (life / "AGENTS.md").write_text("Mission-only project instructions.\n")
+    worker = {
+        "worker_id": "wrk_conversation_without_project_instructions",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(life),
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "run_mode": "conversation",
+                "provider_model": "gpt-5.6-sol",
+                "access_mode": "full",
+            }
+        ),
+    }
+
+    command, _ = runtime._build_command(
+        worker,
+        "Talk naturally.",
+        runtime._host_runtime_info(worker),
+    )
+
+    primary = Path(command[command.index("-C") + 1])
+    assert primary != life
+    assert primary.is_dir()
+    assert not (primary / "AGENTS.md").exists()
+    assert command[command.index("--add-dir") + 1] == str(life)
+
+
 def test_host_capacity_reserves_an_independent_interactive_lane_per_cli_profile(tmp_path):
     class ActiveProcess:
         @staticmethod
@@ -5088,6 +5771,15 @@ def test_provider_activity_log_reads_incrementally_and_marks_a_bounded_tail(tmp_
 
 def test_host_conversation_broker_config_stays_in_private_worker_state(tmp_path, monkeypatch):
     monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    source_codex_home = tmp_path / "source-codex"
+    (source_codex_home / "skills").mkdir(parents=True)
+    (source_codex_home / "plugins" / "cache").mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+    source_claude_home = tmp_path / "source-claude"
+    (source_claude_home / "plugins" / "cache").mkdir(parents=True)
+    (source_claude_home / "plugins" / "marketplaces").mkdir(parents=True)
+    (source_claude_home / "plugins" / "installed_plugins.json").write_text("{}\n")
+    monkeypatch.setenv("GLASSHIVE_HOST_CLAUDE_CONFIG", str(source_claude_home))
     life = tmp_path / "Life"
     life.mkdir()
     codex_runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "codex-private-state"))
@@ -5118,6 +5810,10 @@ def test_host_conversation_broker_config_stays_in_private_worker_state(tmp_path,
     assert codex_config.is_file()
     assert "mcp_servers.synthetic" in codex_config.read_text()
     assert codex_env["CODEX_HOME"] == str(codex_config.parent)
+    assert (codex_config.parent / "skills").resolve() == (source_codex_home / "skills").resolve()
+    assert (codex_config.parent / "plugins" / "cache").resolve() == (
+        source_codex_home / "plugins" / "cache"
+    ).resolve()
     assert codex_command[:4] == ["codex", "exec", "--json", "--skip-git-repo-check"]
     assert not (life / ".codex").exists()
 
@@ -5134,6 +5830,7 @@ def test_host_conversation_broker_config_stays_in_private_worker_state(tmp_path,
                 "run_mode": "conversation",
                 "provider_model": "opus",
                 "access_mode": "full",
+                "developer_instructions": "Current Viventium authority.",
                 "claude_project_mcp": {
                     "synthetic": {"type": "http", "url": "http://127.0.0.1.invalid/mcp"}
                 },
@@ -5152,9 +5849,121 @@ def test_host_conversation_broker_config_stays_in_private_worker_state(tmp_path,
     assert mcp_path.is_file()
     assert claude_command[claude_command.index("--mcp-config") + 1] == str(mcp_path)
     assert "--strict-mcp-config" in claude_command
+    authority_path = (
+        claude_runtime._state_dir(claude_worker["worker_id"])
+        / "conversation-developer-instructions.md"
+    )
+    assert claude_command[claude_command.index("--append-system-prompt-file") + 1] == str(
+        authority_path
+    )
+    assert authority_path.read_text() == "Current Viventium authority.\n"
+    assert authority_path.stat().st_mode & 0o777 == 0o600
     assert claude_env["CLAUDE_CONFIG_DIR"].startswith(str(tmp_path / "claude-private-state"))
+    claude_home = Path(claude_env["CLAUDE_CONFIG_DIR"])
+    assert (claude_home / "plugins" / "cache").resolve() == (
+        source_claude_home / "plugins" / "cache"
+    ).resolve()
+    assert (claude_home / "plugins" / "marketplaces").resolve() == (
+        source_claude_home / "plugins" / "marketplaces"
+    ).resolve()
+    assert json.loads((claude_home / "plugins" / "installed_plugins.json").read_text()) == {}
+    assert not (claude_home / "plugins" / "data").exists()
     assert not (life / ".mcp.json").exists()
     assert not (life / ".claude").exists()
+
+
+def test_host_capability_projection_adds_missing_entries_to_existing_worker_catalogs(
+    tmp_path,
+    monkeypatch,
+):
+    source_codex_home = tmp_path / "source-codex"
+    source_skill = source_codex_home / "skills" / "synthetic-skill"
+    source_skill.mkdir(parents=True)
+    (source_skill / "SKILL.md").write_text("# Synthetic skill\n")
+    source_plugin = source_codex_home / "plugins" / "cache" / "synthetic-plugin-family"
+    source_plugin.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "private-state"))
+    worker = {
+        "worker_id": "wrk_existing_catalog",
+        "name": "Existing Main",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+    }
+    target_home = runtime._host_codex_home(worker)
+    existing_skill = target_home / "skills" / ".system"
+    existing_skill.mkdir(parents=True)
+    (existing_skill / "local-marker").write_text("preserve\n")
+    existing_plugin = target_home / "plugins" / "cache" / "worker-local-family"
+    existing_plugin.mkdir(parents=True)
+
+    runtime._project_host_codex_capability_roots(target_home)
+
+    assert (existing_skill / "local-marker").read_text() == "preserve\n"
+    assert existing_plugin.is_dir()
+    assert (target_home / "skills" / "synthetic-skill").is_symlink()
+    assert (target_home / "skills" / "synthetic-skill").resolve() == source_skill.resolve()
+    assert (target_home / "plugins" / "cache" / "synthetic-plugin-family").is_symlink()
+    assert (
+        target_home / "plugins" / "cache" / "synthetic-plugin-family"
+    ).resolve() == source_plugin.resolve()
+
+
+def test_claude_capability_projection_merges_registries_without_replacing_worker_choices(
+    tmp_path,
+    monkeypatch,
+):
+    source_home = tmp_path / "source-claude"
+    source_plugins = source_home / "plugins"
+    source_plugins.mkdir(parents=True)
+    (source_plugins / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {
+                    "host-only": {"enabled": True},
+                    "shared": {"source": "host"},
+                },
+            }
+        )
+    )
+    (source_plugins / "known_marketplaces.json").write_text(
+        json.dumps({"host-market": {"path": "/synthetic/host-market"}})
+    )
+    monkeypatch.setenv("GLASSHIVE_HOST_CLAUDE_CONFIG", str(source_home))
+
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    target_home = tmp_path / "worker-claude"
+    target_plugins = target_home / "plugins"
+    target_plugins.mkdir(parents=True)
+    (target_plugins / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "plugins": {
+                    "worker-only": {"enabled": True},
+                    "shared": {"source": "worker"},
+                },
+            }
+        )
+    )
+    (target_plugins / "known_marketplaces.json").write_text(
+        json.dumps({"worker-market": {"path": "/synthetic/worker-market"}})
+    )
+
+    runtime._project_host_claude_capability_roots(target_home)
+
+    installed = json.loads((target_plugins / "installed_plugins.json").read_text())
+    marketplaces = json.loads((target_plugins / "known_marketplaces.json").read_text())
+    assert installed["version"] == 1
+    assert installed["plugins"]["shared"] == {"source": "worker"}
+    assert installed["plugins"]["worker-only"] == {"enabled": True}
+    assert installed["plugins"]["host-only"] == {"enabled": True}
+    assert marketplaces == {
+        "host-market": {"path": "/synthetic/host-market"},
+        "worker-market": {"path": "/synthetic/worker-market"},
+    }
 
 
 def test_codex_resume_flags_change_only_for_conversation_mode(tmp_path):
@@ -5334,7 +6143,8 @@ def test_host_claude_conversation_removes_cli_marker_created_in_life(tmp_path, m
         pid = 12345
         returncode = 0
 
-        def __init__(self, _command, **kwargs):
+        def __init__(self, command, **kwargs):
+            _mark_fake_host_supervisor_ready(list(command), self.pid)
             workspace = Path(kwargs["cwd"])
             (workspace / ".claude" / ".cc-writes").mkdir(parents=True)
             stdout = kwargs["stdout"]
@@ -5361,6 +6171,7 @@ def test_host_claude_conversation_removes_cli_marker_created_in_life(tmp_path, m
 
     runtime.ensure_worker_ready = lambda _worker: runtime._host_runtime_info(worker)  # type: ignore[method-assign]
     runtime._build_command = lambda _worker, _instruction, _info: (["claude"], {})  # type: ignore[method-assign]
+    runtime._process_identity_sha256 = lambda _pid: "1" * 64  # type: ignore[method-assign]
     monkeypatch.setattr(
         "workers_projects_runtime.profile_runtime.subprocess.Popen", MarkerCreatingProcess
     )
@@ -5396,7 +6207,8 @@ def test_host_claude_conversation_preserves_preexisting_workspace_content(tmp_pa
         pid = 12345
         returncode = 0
 
-        def __init__(self, _command, **kwargs):
+        def __init__(self, command, **kwargs):
+            _mark_fake_host_supervisor_ready(list(command), self.pid)
             stdout = kwargs["stdout"]
             stdout.write(
                 json.dumps(
@@ -5421,6 +6233,7 @@ def test_host_claude_conversation_preserves_preexisting_workspace_content(tmp_pa
 
     runtime.ensure_worker_ready = lambda _worker: runtime._host_runtime_info(worker)  # type: ignore[method-assign]
     runtime._build_command = lambda _worker, _instruction, _info: (["claude"], {})  # type: ignore[method-assign]
+    runtime._process_identity_sha256 = lambda _pid: "1" * 64  # type: ignore[method-assign]
     monkeypatch.setattr(
         "workers_projects_runtime.profile_runtime.subprocess.Popen", SuccessfulProcess
     )

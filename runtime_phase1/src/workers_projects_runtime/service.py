@@ -2153,8 +2153,14 @@ class WorkersProjectsService:
                         message="Worker process was not running during reconcile",
                     )
         self._apply_runtime_info(worker["worker_id"], info, state=state, last_error=worker.get("last_error") or "")
-        if state not in {"paused", "terminated", "failed"} and self.store.has_queued_runs(worker["worker_id"]):
-            self._ensure_worker_processor(worker["worker_id"])
+        if state not in {"paused", "terminated", "failed"}:
+            if active_run and info.pid:
+                # Queue processors are process-local. Recreate a monitor after service restart
+                # so any surviving host-native process can be finalized exactly once from its
+                # durable transcript instead of occupying capacity forever.
+                self._ensure_worker_processor(worker["worker_id"])
+            elif self.store.has_queued_runs(worker["worker_id"]):
+                self._ensure_worker_processor(worker["worker_id"])
 
     def require_project(self, project_id: str) -> dict:
         project = self.store.get_project(project_id)
@@ -2578,11 +2584,48 @@ class WorkersProjectsService:
     def _process_worker_queue(self, worker_id: str, generation: int) -> None:
         try:
             while True:
+                if self._shutdown_event.is_set():
+                    return
                 if not self._processor_is_current(worker_id, generation):
                     return
                 worker = self.store.get_worker(worker_id)
                 if not worker or worker["state"] in {"paused", "terminated"}:
                     return
+
+                active_run = self.store.get_active_run(worker_id)
+                if active_run:
+                    recovered = self._collect_completed_run(worker, active_run)
+                    if recovered:
+                        self._apply_recovered_run(worker, active_run, recovered)
+                        continue
+                    info = self.runtime.reconcile_worker(worker)
+                    if info.pid:
+                        if self._shutdown_event.wait(0.2):
+                            return
+                        continue
+                    orphaned_run = self.store.finalize_run_if_state(
+                        active_run["run_id"],
+                        "running",
+                        "interrupted",
+                        error_text="Worker process ended before restart recovery produced a complete result",
+                    )
+                    if orphaned_run:
+                        self.store.update_worker_state(worker_id, "ready", last_error="")
+                        self.store.add_event(
+                            worker["project_id"],
+                            worker_id,
+                            active_run["run_id"],
+                            "run.orphaned",
+                            "Active run ended without a complete recoverable result",
+                        )
+                        self._emit_callback(
+                            worker,
+                            "run.interrupted",
+                            run=orphaned_run,
+                            message="Worker process ended before restart recovery produced a complete result",
+                        )
+                        self._wake_host_capacity_waiters(self.store.get_worker(worker_id) or worker)
+                    continue
 
                 queued_run = self.store.peek_next_queued_run(worker_id)
                 if queued_run:

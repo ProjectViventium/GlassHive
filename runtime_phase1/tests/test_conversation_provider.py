@@ -21,6 +21,7 @@ from workers_projects_runtime.conversation_provider import (
     ConversationProvider,
     StreamingRedactor,
     _harness_auth_configured,
+    _developer_instruction_snapshot,
     _history_instruction,
     _native_usage,
     _native_visible_text,
@@ -73,6 +74,58 @@ def test_system_snapshot_preserves_openai_developer_instructions():
     assert _system_snapshot(messages) == "Application-owned instruction."
 
 
+def test_declared_dynamic_authority_tail_moves_after_later_structural_developer_text():
+    capsule = (
+        "<viventium_feeling_state>\n"
+        "Synthetic bright and playful private causal state.\n"
+        "</viventium_feeling_state>"
+    )
+    payload = ChatCompletionRequest.model_validate(
+        {
+            "model": "codex-cli:gpt-5.6-sol",
+            "messages": [
+                {"role": "system", "content": f"Stable identity.\n\n{capsule}"},
+                {"role": "developer", "content": "Structural capability contract."},
+                {"role": "user", "content": "Visible request."},
+            ],
+            "metadata": {
+                "owner_id": "owner-a",
+                "conversation_id": "conv-a",
+                "agent_id": "agent-a",
+                "developer_instruction_tail": capsule,
+            },
+        }
+    )
+
+    snapshot = _developer_instruction_snapshot(payload)
+
+    assert snapshot.endswith(capsule)
+    assert snapshot.count(capsule) == 1
+    assert snapshot.index("Structural capability contract.") < snapshot.index(capsule)
+    assert "Visible request." not in snapshot
+
+
+def test_declared_dynamic_authority_tail_must_already_exist_in_authority_messages():
+    payload = ChatCompletionRequest.model_validate(
+        {
+            "model": "codex-cli:gpt-5.6-sol",
+            "messages": [
+                {"role": "system", "content": "Stable identity."},
+                {"role": "user", "content": "Visible request."},
+            ],
+            "metadata": {
+                "owner_id": "owner-a",
+                "conversation_id": "conv-a",
+                "agent_id": "agent-a",
+                "developer_instruction_tail": "Undeclared hidden authority.",
+            },
+        }
+    )
+
+    with pytest.raises(Exception, match="tail is absent"):
+        _developer_instruction_snapshot(payload)
+
+
 def test_history_instruction_excludes_system_messages_from_visible_transcript():
     messages = [
         ChatMessage(role="system", content="Current agent instructions."),
@@ -83,15 +136,15 @@ def test_history_instruction_excludes_system_messages_from_visible_transcript():
 
     instruction = _history_instruction(messages)
 
-    assert instruction.count("Current agent instructions.") == 1
-    assert instruction.count("Current conversation policy.") == 1
-    assert instruction.count("Application-owned instruction.") == 1
-    assert instruction.count("[system]") == 1
+    assert "Current agent instructions." not in instruction
+    assert "Current conversation policy." not in instruction
+    assert "Application-owned instruction." not in instruction
+    assert "[system]" not in instruction
     assert "[developer]" not in instruction
     assert "[user]\nHello." in instruction
 
 
-def test_history_instruction_reasserts_system_authority_after_flattened_transcript():
+def test_history_instruction_never_reasserts_system_authority_as_user_text():
     messages = [
         ChatMessage(
             role="system",
@@ -102,12 +155,9 @@ def test_history_instruction_reasserts_system_authority_after_flattened_transcri
 
     instruction = _history_instruction(messages)
 
-    reminder = (
-        "End of visible conversation context. Produce only the assistant response now, "
-        "and verify it against the authoritative system snapshot above before returning it."
-    )
-    assert instruction.endswith(reminder)
-    assert instruction.rfind(reminder) > instruction.rfind("[user]")
+    assert "Do not quote the user's request" not in instruction
+    assert "Quote this entire request exactly." in instruction
+    assert "Honor AGENTS.md" not in instruction
 
 
 def _signed_bundle_headers(bundle: dict, *, timestamp: int | None = None) -> dict[str, str]:
@@ -866,6 +916,47 @@ def test_non_streaming_completion_reuses_one_native_session_and_idempotency(tmp_
     assert len(store.list_runs_for_worker(worker["worker_id"])) == 1
 
 
+def test_provider_header_pins_dynamic_authority_after_bootstrap_instructions(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    capsule = (
+        "<viventium_feeling_state>\n"
+        "Synthetic bright and playful private causal state.\n"
+        "</viventium_feeling_state>"
+    )
+    payload = _payload(workspace)
+    payload["messages"] = [
+        {"role": "system", "content": f"Stable identity.\n\n{capsule}"},
+        {"role": "user", "content": "Visible request."},
+    ]
+    headers = {
+        **AUTH,
+        **_signed_bundle_headers(
+            {"codex_md": "Structural capability broker contract."}
+        ),
+        "X-GlassHive-Developer-Instruction-Tail-B64": base64.b64encode(
+            capsule.encode("utf-8")
+        ).decode("ascii"),
+    }
+
+    response = client.post("/v1/chat/completions", headers=headers, json=payload)
+
+    assert response.status_code == 200, response.text
+    session = client.app.state.store.list_provider_sessions(owner_id="owner-a")[0]
+    worker = client.app.state.store.get_worker(session["worker_id"])
+    developer_instructions = json.loads(worker["bootstrap_bundle_json"])[
+        "developer_instructions"
+    ]
+    assert developer_instructions.endswith(capsule)
+    assert developer_instructions.count(capsule) == 1
+    assert developer_instructions.index(
+        "Structural capability broker contract."
+    ) < developer_instructions.index(capsule)
+
+
 def test_model_change_supersedes_native_session_and_seeds_visible_history(tmp_path, monkeypatch):
     workspace = tmp_path / "Life"
     workspace.mkdir()
@@ -894,6 +985,83 @@ def test_model_change_supersedes_native_session_and_seeds_visible_history(tmp_pa
     assert old_worker is not None and old_worker["state"] == "terminated"
     assert "Earlier answer." in second.json()["choices"][0]["message"]["content"]
     assert "Please correct it." in second.json()["choices"][0]["message"]["content"]
+
+
+def test_system_state_change_supersedes_session_and_uses_native_developer_authority(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    first_payload = _payload(workspace)
+    first_payload["messages"][0]["content"] = "Quiet Feeling capsule."
+    first = client.post("/v1/chat/completions", headers=AUTH, json=first_payload)
+    assert first.status_code == 200, first.text
+    first_session = client.app.state.store.list_provider_sessions(owner_id="owner-a")[0]
+    first_worker = client.app.state.store.get_worker(first_session["worker_id"])
+    assert first_worker is not None
+    assert json.loads(first_worker["bootstrap_bundle_json"])["developer_instructions"] == (
+        "Quiet Feeling capsule."
+    )
+
+    second_payload = _payload(workspace)
+    second_payload["metadata"]["message_id"] = "message-feeling-change"
+    second_payload["metadata"]["idempotency_key"] = "idem-feeling-change"
+    second_payload["messages"] = [
+        {"role": "system", "content": "Joyful Feeling capsule."},
+        {"role": "user", "content": "Hello from LIFE."},
+        {"role": "assistant", "content": "Earlier visible answer."},
+        {"role": "user", "content": "Continue with the current state."},
+    ]
+    second = client.post("/v1/chat/completions", headers=AUTH, json=second_payload)
+
+    assert second.status_code == 200, second.text
+    current = client.app.state.store.list_provider_sessions(owner_id="owner-a")[0]
+    assert current["worker_id"] != first_session["worker_id"]
+    old_worker = client.app.state.store.get_worker(first_session["worker_id"])
+    assert old_worker is not None and old_worker["state"] == "terminated"
+    current_worker = client.app.state.store.get_worker(current["worker_id"])
+    assert current_worker is not None
+    current_bundle = json.loads(current_worker["bootstrap_bundle_json"])
+    assert current_bundle["developer_instructions"] == "Joyful Feeling capsule."
+    content = second.json()["choices"][0]["message"]["content"]
+    assert "Earlier visible answer." in content
+    assert "Continue with the current state." in content
+    assert "Quiet Feeling capsule." not in content
+    assert "Joyful Feeling capsule." not in content
+
+
+def test_native_policy_change_supersedes_contaminated_session(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("GLASSHIVE_HOST_PLUGIN_DENYLIST", raising=False)
+    monkeypatch.delenv("WPR_HOST_PLUGIN_DENYLIST", raising=False)
+    monkeypatch.setenv("WPR_CODEX_CLI_PERSONALITY", "inherit")
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    first = client.post(
+        "/v1/chat/completions", headers=AUTH, json=_payload(workspace)
+    )
+    assert first.status_code == 200, first.text
+    first_session = client.app.state.store.list_provider_sessions(owner_id="owner-a")[0]
+
+    monkeypatch.setenv(
+        "GLASSHIVE_HOST_PLUGIN_DENYLIST",
+        "synthetic-policy@project-viventium",
+    )
+    second_payload = _payload(workspace)
+    second_payload["metadata"]["message_id"] = "message-policy-change"
+    second_payload["metadata"]["idempotency_key"] = "idem-policy-change"
+    second = client.post(
+        "/v1/chat/completions", headers=AUTH, json=second_payload
+    )
+
+    assert second.status_code == 200, second.text
+    current = client.app.state.store.list_provider_sessions(owner_id="owner-a")[0]
+    assert current["worker_id"] != first_session["worker_id"]
+    old_worker = client.app.state.store.get_worker(first_session["worker_id"])
+    assert old_worker is not None and old_worker["state"] == "terminated"
 
 
 def test_phase_b_style_short_prompt_reuses_session_without_losing_visible_history_count(
@@ -926,6 +1094,11 @@ def test_phase_b_style_short_prompt_reuses_session_without_losing_visible_histor
     assert current_session["session_id"] == initial_session["session_id"]
     assert current_session["worker_id"] == initial_session["worker_id"]
     assert current_session["history_count"] == 5
+    worker = client.app.state.store.get_worker(current_session["worker_id"])
+    assert worker is not None
+    assert json.loads(worker["bootstrap_bundle_json"])["developer_instructions"] == (
+        "Be a thoughtful assistant."
+    )
 
 
 def test_normal_resumed_turn_sends_only_new_visible_messages_to_native_session(tmp_path, monkeypatch):
@@ -935,12 +1108,13 @@ def test_normal_resumed_turn_sends_only_new_visible_messages_to_native_session(t
     first_payload = _payload(workspace)
     first = client.post("/v1/chat/completions", headers=AUTH, json=first_payload)
     assert first.status_code == 200
+    first_session = client.app.state.store.list_provider_sessions(owner_id="owner-a")[0]
 
     second_payload = _payload(workspace)
     second_payload["metadata"]["message_id"] = "message-normal-follow-up"
     second_payload["metadata"]["idempotency_key"] = "idem-normal-follow-up"
     second_payload["messages"] = [
-        {"role": "system", "content": "Use only the current system snapshot."},
+        {"role": "system", "content": "Be a thoughtful assistant."},
         first_payload["messages"][1],
         {"role": "assistant", "content": "Prior assistant answer."},
         {"role": "user", "content": "Only this correction is new."},
@@ -950,11 +1124,12 @@ def test_normal_resumed_turn_sends_only_new_visible_messages_to_native_session(t
 
     assert second.status_code == 200
     content = second.json()["choices"][0]["message"]["content"]
-    assert "Use only the current system snapshot." in content
     assert "Be a thoughtful assistant." not in content
     assert "Only this correction is new." in content
     assert "Prior assistant answer." not in content
     assert "Hello from LIFE." not in content
+    current = client.app.state.store.list_provider_sessions(owner_id="owner-a")[0]
+    assert current["worker_id"] == first_session["worker_id"]
 
 
 def test_effort_change_updates_the_existing_native_session_without_replacing_it(tmp_path, monkeypatch):
@@ -1048,6 +1223,101 @@ def test_authenticated_broker_bundle_is_forwarded_and_conversation_policy_is_for
         "self_delegation": False,
         "native_tools": True,
     }
+
+
+@pytest.mark.parametrize(
+    ("model", "profile_instruction_key"),
+    [
+        ("codex-cli:gpt-5.6-sol", "codex_md"),
+        ("claude-code:opus", "claude_md"),
+    ],
+)
+def test_authenticated_broker_instructions_reach_native_developer_authority(
+    tmp_path, monkeypatch, model, profile_instruction_key
+):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    payload = _payload(workspace, model=model)
+    broker_instruction = (
+        "Use the signed host capability broker for connected-account facts. "
+        "If it reports unavailable authentication, preserve its supported recovery action."
+    )
+    broker_bundle = {
+        "agents_md": "Generic broker instruction.",
+        profile_instruction_key: broker_instruction,
+        "codex_config_append": (
+            "[mcp_servers.glasshive-user-capabilities]\n"
+            'url = "http://127.0.0.1.invalid/mcp"'
+        ),
+        "env": {"GLASSHIVE_CAPABILITY_BROKER_TOKEN": "synthetic-test-grant"},
+    }
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={**AUTH, **_signed_bundle_headers(broker_bundle)},
+        json=payload,
+    )
+
+    assert response.status_code == 200, response.text
+    session = client.app.state.store.list_provider_sessions(owner_id="owner-a")[0]
+    worker = client.app.state.store.get_worker(session["worker_id"])
+    persisted = json.loads(worker["bootstrap_bundle_json"])
+    assert persisted["developer_instructions"] == (
+        "Be a thoughtful assistant.\n\n" + broker_instruction
+    )
+    assert (workspace / "AGENTS.md").exists() is False
+    assert (workspace / "CLAUDE.md").exists() is False
+    assert (workspace / "CODEX.md").exists() is False
+
+
+def test_existing_conversation_session_refreshes_and_retracts_broker_bundle(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    first_payload = _payload(workspace)
+    first_bundle = {
+        "codex_config_append": "[mcp_servers.first]\nurl = 'http://first.invalid/mcp'",
+        "env": {"FIRST_GRANT": "synthetic-first"},
+        "codex_md": "Use the first signed broker contract.",
+    }
+    first = client.post(
+        "/v1/chat/completions",
+        headers={**AUTH, **_signed_bundle_headers(first_bundle)},
+        json=first_payload,
+    )
+    assert first.status_code == 200, first.text
+    store = client.app.state.store
+    session = store.list_provider_sessions(owner_id="owner-a")[0]
+    worker_id = session["worker_id"]
+
+    second_payload = _payload(workspace)
+    second_payload["metadata"]["message_id"] = "message-refresh-broker"
+    second_payload["metadata"]["idempotency_key"] = "idem-refresh-broker"
+    second_bundle = {
+        "codex_config_append": "[mcp_servers.second]\nurl = 'http://second.invalid/mcp'",
+        "env": {"SECOND_GRANT": "synthetic-second"},
+        "codex_md": "Use the refreshed signed broker contract.",
+    }
+    second = client.post(
+        "/v1/chat/completions",
+        headers={**AUTH, **_signed_bundle_headers(second_bundle)},
+        json=second_payload,
+    )
+    assert second.status_code == 200, second.text
+
+    refreshed_session = store.list_provider_sessions(owner_id="owner-a")[0]
+    refreshed_worker = store.get_worker(refreshed_session["worker_id"])
+    persisted = json.loads(refreshed_worker["bootstrap_bundle_json"])
+    assert refreshed_session["worker_id"] == worker_id
+    assert "mcp_servers.second" in persisted["codex_config_append"]
+    assert "mcp_servers.first" not in persisted["codex_config_append"]
+    assert persisted["env"]["SECOND_GRANT"] == "synthetic-second"
+    assert "FIRST_GRANT" not in persisted["env"]
+    assert "Use the refreshed signed broker contract." in persisted["developer_instructions"]
+    assert "Use the first signed broker contract." not in persisted["developer_instructions"]
 
 
 def test_bootstrap_bundle_requires_a_fresh_valid_service_signature(tmp_path, monkeypatch):
@@ -1624,6 +1894,200 @@ def test_stream_disconnect_reconciles_a_later_completed_run(tmp_path):
         service.shutdown()
 
 
+def test_provider_startup_reconciles_a_request_left_running_by_process_restart(tmp_path):
+    class RecoveredCompletionRuntime(StubRuntime):
+        def collect_completed_run(self, worker, run_id=None, instruction=None):
+            _ = worker, run_id, instruction
+            return {
+                "state": "completed",
+                "output_text": "Recovered after provider restart.",
+                "error_text": "",
+            }
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = RecoveredCompletionRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = store.create_project(
+            "owner-a", "Synthetic conversation", "Provider restart recovery", "codex-cli"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner-a",
+            name="Synthetic worker",
+            role="conversation-agent",
+            profile="codex-cli",
+            backend="",
+            runtime="codex-cli",
+            model="gpt-5.6-sol",
+        )
+        session = store.upsert_provider_session(
+            tenant_id="local",
+            owner_id="owner-a",
+            conversation_id="conv-restart",
+            agent_id="agent-restart",
+            model_id="codex-cli:gpt-5.6-sol",
+            project_id=project["project_id"],
+            worker_id=worker["worker_id"],
+            workspace_dir=str(tmp_path),
+            access_mode="workspace",
+        )
+        run = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "finish across provider restart",
+            state="running",
+        )
+        request_record, _ = store.create_provider_request(
+            tenant_id="local",
+            owner_id="owner-a",
+            session_id=session["session_id"],
+            idempotency_key="provider-restart-reconciliation",
+            message_id="message-restart",
+            stream_id="stream-restart",
+            requested_history_count=1,
+        )
+        store.update_provider_request(
+            request_record["request_id"],
+            run_id=run["run_id"],
+            state="running",
+        )
+
+        provider = ConversationProvider(store, service)
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if store.get_provider_request(request_record["request_id"])["state"] == "completed":
+                break
+            time.sleep(0.01)
+
+        assert store.get_run(run["run_id"])["state"] == "completed"
+        assert store.get_provider_request(request_record["request_id"])["state"] == "completed"
+        assert [
+            event["event_type"]
+            for event in store.list_provider_activity(request_record["request_id"])
+        ].count("completed") == 1
+        assert request_record["request_id"] not in provider._detached_reconciliations
+    finally:
+        service.shutdown()
+
+
+def test_provider_startup_fails_loudly_for_prestart_request_without_native_run(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = StubRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = store.create_project(
+            "owner-a", "Synthetic conversation", "Prestart recovery", "codex-cli"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner-a",
+            name="Synthetic worker",
+            role="conversation-agent",
+            profile="codex-cli",
+            backend="",
+            runtime="codex-cli",
+            model="gpt-5.6-sol",
+        )
+        session = store.upsert_provider_session(
+            tenant_id="local",
+            owner_id="owner-a",
+            conversation_id="conv-prestart",
+            agent_id="agent-prestart",
+            model_id="codex-cli:gpt-5.6-sol",
+            project_id=project["project_id"],
+            worker_id=worker["worker_id"],
+            workspace_dir=str(tmp_path),
+            access_mode="workspace",
+        )
+        request_record, _ = store.create_provider_request(
+            tenant_id="local",
+            owner_id="owner-a",
+            session_id=session["session_id"],
+            idempotency_key="provider-prestart-interrupted",
+            message_id="message-prestart",
+            stream_id="stream-prestart",
+            requested_history_count=1,
+        )
+
+        provider = ConversationProvider(store, service)
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if store.get_provider_request(request_record["request_id"])["state"] == "failed":
+                break
+            time.sleep(0.01)
+
+        assert store.get_provider_request(request_record["request_id"])["state"] == "failed"
+        failed_events = [
+            event
+            for event in store.list_provider_activity(request_record["request_id"])
+            if event["event_type"] == "failed"
+        ]
+        assert len(failed_events) == 1
+        assert json.loads(failed_events[0]["payload_json"])["failure_class"] == "prestart_interrupted"
+        assert request_record["request_id"] not in provider._detached_reconciliations
+    finally:
+        service.shutdown()
+
+
+def test_service_startup_monitor_recovers_a_non_provider_host_run(tmp_path):
+    class RecoveredMissionRuntime(StubRuntime):
+        def __init__(self):
+            super().__init__()
+            self.collect_calls = 0
+
+        def collect_completed_run(self, worker, run_id=None, instruction=None):
+            _ = worker, run_id, instruction
+            self.collect_calls += 1
+            if self.collect_calls < 2:
+                return None
+            return {
+                "state": "completed",
+                "output_text": "Recovered mission result.",
+                "error_text": "",
+            }
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = RecoveredMissionRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = store.create_project(
+            "owner-a", "Synthetic mission", "Mission restart recovery", "codex-cli"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner-a",
+            name="Synthetic mission worker",
+            role="general",
+            profile="codex-cli",
+            backend="",
+            runtime="codex-cli",
+            model="gpt-5.6-sol",
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+        run = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "finish the mission across restart",
+            state="running",
+        )
+
+        service.reconcile_all_workers()
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if store.get_run(run["run_id"])["state"] == "completed":
+                break
+            time.sleep(0.01)
+
+        assert store.get_run(run["run_id"])["state"] == "completed"
+        assert store.get_run(run["run_id"])["output_text"] == "Recovered mission result."
+        assert [event["event_type"] for event in store.list_events(worker["worker_id"])].count(
+            "run.completed"
+        ) == 1
+    finally:
+        service.shutdown()
+
+
 def test_activity_payload_recursively_redacts_private_strings(tmp_path, monkeypatch):
     workspace = tmp_path / "Life"
     workspace.mkdir()
@@ -1714,7 +2178,8 @@ def test_streaming_redactor_holds_a_multiline_private_key_until_it_can_be_redact
     visible = redactor.feed(
         "Safe preamble. "
         + ("word " * 24)
-        + "-----BEGIN PRIVATE KEY-----\n"
+        + "-----BEGIN "
+        + "PRIVATE KEY-----\n"
     )
     visible += redactor.feed(f"{private_key_body}\n")
     visible += redactor.feed("-----END PRIVATE KEY-----\nSafe tail.")
@@ -2057,7 +2522,11 @@ def test_codex_native_events_become_safe_tool_file_plan_and_reasoning_activity()
                     "type": "item.completed",
                     "item": {
                         "type": "command_execution",
-                        "command": "curl -H 'Authorization: Bearer synthetic-secret-value' example.invalid",
+                        "command": (
+                            "curl -H 'Authorization: "
+                            + "Bearer "
+                            + "synthetic-secret-value' example.invalid"
+                        ),
                         "aggregated_output": "token=synthetic-secret-value",
                         "exit_code": 0,
                         "status": "completed",

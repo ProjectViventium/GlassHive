@@ -499,6 +499,29 @@ class Store:
             row = conn.execute(query, params).fetchone()
         return self._row(row)
 
+    def list_provider_requests_by_state(
+        self,
+        states: set[str],
+        *,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        clean_states = sorted({str(state or "").strip() for state in states if str(state or "").strip()})
+        if not clean_states:
+            return []
+        placeholders = ",".join("?" for _ in clean_states)
+        bounded_limit = max(1, min(int(limit), 5000))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM provider_requests
+                WHERE state IN ({placeholders})
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                [*clean_states, bounded_limit],
+            ).fetchall()
+        return self._rows(rows)
+
     def create_provider_request(
         self,
         *,
