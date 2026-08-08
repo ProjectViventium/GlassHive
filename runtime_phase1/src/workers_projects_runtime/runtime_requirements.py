@@ -16,6 +16,8 @@ DEFAULT_HOST_RUNTIME_REQUIREMENTS: dict[str, list[dict[str, Any]]] = {
             "binary": "codex",
             "use_configured_binary": True,
             "label": "Codex CLI",
+            # Existing host-native Viventium conversations remain compatible with this reviewed
+            # baseline. Fresh isolated GlassHive workstations pin the current release separately.
             "min_version": "0.144.1",
             "recovery_hint": "Run `codex update` when supported, or update the Codex app/CLI, then restart GlassHive.",
         }
@@ -27,7 +29,7 @@ DEFAULT_HOST_RUNTIME_REQUIREMENTS: dict[str, list[dict[str, Any]]] = {
             "label": "Claude Code",
             "min_version": "2.1.178",
             "required_help_flags": ["--effort"],
-            "recovery_hint": "Run `claude install stable` or `claude update`, then restart GlassHive.",
+            "recovery_hint": "Run `claude install latest` or `claude update`, then restart GlassHive.",
         }
     ],
     "openclaw-general": [
@@ -49,6 +51,10 @@ DEFAULT_HOST_RUNTIME_REQUIREMENTS: dict[str, list[dict[str, Any]]] = {
         }
     ],
 }
+
+
+class RuntimeRequirementConfigurationError(RuntimeError):
+    """Raised when an explicit host-runtime requirements override is unusable."""
 
 
 @dataclass(frozen=True)
@@ -159,18 +165,33 @@ def _load_requirements_payload() -> Any:
         path = os.environ.get(env_name, "").strip()
         if not path:
             continue
+        source = Path(path).expanduser()
         try:
-            return json.loads(Path(path).expanduser().read_text())
-        except Exception:
-            return {}
+            payload = json.loads(source.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeRequirementConfigurationError(
+                f"{env_name} does not point to a readable valid JSON requirements file"
+            ) from exc
+        if not isinstance(payload, (dict, list)):
+            raise RuntimeRequirementConfigurationError(
+                f"{env_name} must contain a JSON object or array"
+            )
+        return payload
     for env_name in ("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", "WPR_HOST_RUNTIME_REQUIREMENTS_JSON"):
         raw = os.environ.get(env_name, "").strip()
         if not raw:
             continue
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeRequirementConfigurationError(
+                f"{env_name} must contain valid JSON"
+            ) from exc
+        if not isinstance(payload, (dict, list)):
+            raise RuntimeRequirementConfigurationError(
+                f"{env_name} must contain a JSON object or array"
+            )
+        return payload
     return DEFAULT_HOST_RUNTIME_REQUIREMENTS
 
 

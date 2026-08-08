@@ -21,20 +21,25 @@ from urllib.parse import quote, urlparse
 
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from pydantic import Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from .auth import AuthContext, scoped_alias
+from .auth import AuthContext, multi_user_security_enabled, scoped_alias
 from .bootstrap import (
     BOOTSTRAP_SOURCE_TOKEN_KEY,
     GLASSHIVE_CAPABILITY_BROKER_TOKEN_ENV,
     sign_bootstrap_source_path,
 )
 from .deliverables import is_user_deliverable_relative_path
-from .operator_urls import surface_aware_watch_url, surface_can_open_operator_url
+from .operator_urls import operator_base_url, surface_aware_watch_url, surface_can_open_operator_url
+from .mcp_oauth import McpOAuthConfigurationError, oauth_from_env
+from .mcp_internal_assertions import McpInternalAssertionError, signed_runtime_assertion
+from .release_provenance import release_provenance
 from .runtime_requirements import host_runtime_requirement_issue
 from .runtime_env import load_viventium_runtime_env
 from .runtime_identity import derive_legacy_backend_label
@@ -62,6 +67,13 @@ DEFAULT_TIMEOUT_SEC = float(os.environ.get("WPR_MCP_TIMEOUT_SEC", "120"))
 DEFAULT_OWNER_ID = os.environ.get("WPR_DEFAULT_OWNER_ID", "").strip()
 DEFAULT_API_TOKEN = os.environ.get("WPR_API_TOKEN", "").strip()
 DEFAULT_MCP_API_TOKEN = os.environ.get("GLASSHIVE_MCP_API_KEY", "").strip()
+
+READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
 HOST_SIDE_ORCHESTRATION_GUIDANCE = (
     "Preserve host-side GlassHive orchestration requirements as context, but do not turn them into "
@@ -475,8 +487,7 @@ def _host_workers_enabled() -> bool:
 
 
 def _enterprise_mode_enabled() -> bool:
-    value = os.environ.get("GLASSHIVE_ENTERPRISE_MODE", os.environ.get("WPR_ENTERPRISE_MODE", "")).strip().lower()
-    return value in {"1", "true", "yes", "on", "enabled"}
+    return multi_user_security_enabled()
 
 
 def _dedupe(values: list[str]) -> list[str]:
@@ -766,12 +777,33 @@ def _header_value(headers: dict[str, str], primary: str) -> str:
 
 
 def _request_headers() -> dict[str, str]:
-    if get_http_headers is None:
-        return {}
-    try:
-        return _normalize_headers(get_http_headers())
-    except Exception:
-        return {}
+    headers: dict[str, str] = {}
+    if get_http_headers is not None:
+        try:
+            headers = _normalize_headers(get_http_headers())
+        except Exception:
+            headers = {}
+    access_token = get_access_token()
+    if access_token is not None:
+        claims = access_token.claims or {}
+        # Raw request identity is untrusted once OAuth is present. Remove every
+        # primary and compatibility alias before projecting the verified principal.
+        for primary in (
+            HEADER_USER_ID,
+            HEADER_STORAGE_USER_ID,
+            HEADER_TENANT_ID,
+            HEADER_USER_EMAIL,
+            HEADER_USER_ROLE,
+        ):
+            headers.pop(primary, None)
+            for alias in HEADER_ALIASES.get(primary, ()):
+                headers.pop(alias, None)
+        headers[HEADER_USER_ID] = str(access_token.subject or "").strip()
+        headers[HEADER_STORAGE_USER_ID] = str(access_token.subject or "").strip()
+        headers[HEADER_TENANT_ID] = str(claims.get("tenant_id") or "").strip()
+        headers[HEADER_USER_EMAIL] = str(claims.get("email") or "").strip()
+        headers[HEADER_USER_ROLE] = str(claims.get("role") or "viewer").strip()
+    return {key: value for key, value in headers.items() if value}
 
 
 def _request_owner_id(owner_id: str | None) -> str | None:
@@ -854,6 +886,8 @@ def _require_enterprise_mcp_service_auth(headers: dict[str, str]) -> None:
 
 
 def _require_mcp_service_auth(headers: dict[str, str]) -> None:
+    if get_access_token() is not None:
+        return
     expected = str(DEFAULT_MCP_API_TOKEN or os.environ.get("GLASSHIVE_MCP_API_KEY", "")).strip()
     if not expected:
         raise PermissionError("GlassHive MCP service authentication is not configured")
@@ -2214,10 +2248,31 @@ class WorkersProjectsApiClient:
             headers["Authorization"] = f"Bearer {self.api_token}"
         request_headers = _request_headers()
         _require_enterprise_mcp_service_auth(request_headers)
-        for name in (HEADER_USER_ID, HEADER_TENANT_ID, HEADER_USER_EMAIL, HEADER_USER_ROLE):
-            value = _header_value(request_headers, name)
-            if value:
-                headers[name] = value
+        write_requested = method.upper() not in {"GET", "HEAD", "OPTIONS"}
+        signed_hop = (
+            str(os.environ.get("GLASSHIVE_SECURITY_MODE") or "").strip().lower() == "multi_user"
+            or str(os.environ.get("GLASSHIVE_AUTH_MODE") or "").strip().lower() == "signed_internal_assertion"
+        )
+        if signed_hop:
+            if get_access_token() is None:
+                raise PermissionError(
+                    "GlassHive multi-user MCP requires a verified OAuth principal"
+                )
+            try:
+                headers["X-GlassHive-User-Assertion"] = signed_runtime_assertion(
+                    subject=_header_value(request_headers, HEADER_USER_ID),
+                    tenant_id=_header_value(request_headers, HEADER_TENANT_ID),
+                    email=_header_value(request_headers, HEADER_USER_EMAIL),
+                    role=_header_value(request_headers, HEADER_USER_ROLE),
+                    write=write_requested,
+                )
+            except McpInternalAssertionError as exc:
+                raise PermissionError(str(exc)) from exc
+        else:
+            for name in (HEADER_USER_ID, HEADER_TENANT_ID, HEADER_USER_EMAIL, HEADER_USER_ROLE):
+                value = _header_value(request_headers, name)
+                if value:
+                    headers[name] = value
         with httpx.Client(timeout=self.timeout_sec) as client:
             response = client.request(method, url, json=json_body, headers=headers)
             if response.status_code >= 400:
@@ -2254,6 +2309,168 @@ class WorkersProjectsApiClient:
 
     def update_preferences(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("PATCH", "/v1/preferences", json_body=payload)
+
+    def current_user(self) -> dict[str, Any]:
+        return self._request("GET", "/v1/me")
+
+    def workspace_catalog(
+        self,
+        *,
+        search: str = "",
+        kind: str = "named",
+        tags: list[str] | None = None,
+        favorite: bool | None = None,
+        cursor: str | None = None,
+        limit: int = 25,
+    ) -> dict[str, Any]:
+        query: dict[str, str] = {
+            "kind": kind,
+            "search": search,
+            "tags": ",".join(tags or []),
+            "limit": str(max(1, min(int(limit), 100))),
+        }
+        if favorite is not None:
+            query["favorite"] = "true" if favorite else "false"
+        if cursor:
+            query["cursor"] = cursor
+        return self._request("GET", f"/v1/workspaces?{httpx.QueryParams(query)}")
+
+    def update_workspace(self, worker_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        return self._request("PATCH", f"/v1/workspaces/{worker_path_id}", json_body=payload)
+
+    def duplicate_workspace(
+        self,
+        worker_id: str,
+        *,
+        idempotency_key: str,
+        name: str = "",
+    ) -> dict[str, Any]:
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        payload: dict[str, Any] = {"idempotency_key": idempotency_key}
+        if name:
+            payload["name"] = name
+        return self._request(
+            "POST",
+            f"/v1/workspaces/{worker_path_id}/duplicate",
+            json_body=payload,
+        )
+
+    def workspace_templates(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/v1/workspace-templates").get("items", [])
+
+    def save_workspace_template(
+        self,
+        worker_id: str,
+        *,
+        name: str,
+        description: str = "",
+        lineage_id: str = "",
+    ) -> dict[str, Any]:
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        payload: dict[str, Any] = {"name": name, "description": description}
+        if lineage_id:
+            payload["lineage_id"] = lineage_id
+        return self._request(
+            "POST",
+            f"/v1/workspaces/{worker_path_id}/templates",
+            json_body=payload,
+        )
+
+    def instantiate_workspace_template(
+        self,
+        template_id: str,
+        *,
+        idempotency_key: str,
+        name: str = "",
+    ) -> dict[str, Any]:
+        template_path_id = self._path_id(template_id, "template_id")
+        payload: dict[str, Any] = {"idempotency_key": idempotency_key}
+        if name:
+            payload["name"] = name
+        return self._request(
+            "POST",
+            f"/v1/workspace-templates/{template_path_id}/instantiate",
+            json_body=payload,
+        )
+
+    def provider_accounts(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/v1/provider-accounts").get("items", [])
+
+    def create_provider_account(
+        self,
+        *,
+        provider: str,
+        label: str,
+        auth_method: str,
+        make_default: bool = False,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/v1/provider-accounts",
+            json_body={
+                "provider": provider,
+                "label": label,
+                "auth_method": auth_method,
+                "platform_support": "server_evaluated",
+                "secret_locator": (
+                    "native-home://auto"
+                    if auth_method == "subscription"
+                    else "broker://librechat-openai"
+                ),
+                "make_default": bool(make_default),
+            },
+        )
+
+    def start_provider_account_setup(self, account_id: str) -> dict[str, Any]:
+        account_path_id = self._path_id(account_id, "account_id")
+        return self._request("POST", f"/v1/provider-accounts/{account_path_id}/setup")
+
+    def verify_provider_account(self, account_id: str) -> dict[str, Any]:
+        account_path_id = self._path_id(account_id, "account_id")
+        return self._request("POST", f"/v1/provider-accounts/{account_path_id}/verify")
+
+    def disconnect_provider_account(self, account_id: str) -> dict[str, Any]:
+        account_path_id = self._path_id(account_id, "account_id")
+        return self._request("POST", f"/v1/provider-accounts/{account_path_id}/disconnect")
+
+    def forget_provider_account(self, account_id: str) -> dict[str, Any]:
+        account_path_id = self._path_id(account_id, "account_id")
+        return self._request("DELETE", f"/v1/provider-accounts/{account_path_id}")
+
+    def connections(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/v1/connections").get("items", [])
+
+    def library(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/v1/library").get("items", [])
+
+    def propose_library_manifest(self, manifest: dict[str, Any]) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/v1/library/proposals",
+            json_body={"manifest": manifest},
+        )
+
+    def create_pending_change(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", "/v1/pending-changes", json_body=payload)
+
+    def workspace_grants(self, worker_id: str) -> list[dict[str, Any]]:
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        return self._request(
+            "GET", f"/v1/workspaces/{worker_path_id}/capability-grants"
+        ).get("items", [])
+
+    def revoke_workspace_grant(self, worker_id: str, grant_id: str) -> dict[str, Any]:
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        grant_path_id = self._path_id(grant_id, "grant_id")
+        return self._request(
+            "DELETE",
+            f"/v1/workspaces/{worker_path_id}/capability-grants/{grant_path_id}",
+        )
+
+    def activity(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(int(limit), 200))
+        return self._request("GET", f"/v1/activity?limit={bounded_limit}").get("items", [])
 
     def list_projects(self, owner_id: str | None = None) -> list[dict[str, Any]]:
         projects = self._request("GET", "/v1/projects").get("items", [])
@@ -2327,6 +2544,7 @@ class WorkersProjectsApiClient:
         bootstrap_profile: str | None = None,
         bootstrap_bundle: dict[str, Any] | None = None,
         start_synchronously: bool = True,
+        workspace_kind: str | None = None,
     ) -> dict[str, Any]:
         payload = {
             "owner_id": self._owner_id(owner_id),
@@ -2342,6 +2560,8 @@ class WorkersProjectsApiClient:
         }
         if backend:
             payload["backend"] = backend
+        if workspace_kind:
+            payload["workspace_kind"] = workspace_kind
         project_path_id = self._path_id(project_id, "project_id")
         return self._request("POST", f"/v1/projects/{project_path_id}/workers", json_body=payload)
 
@@ -2360,6 +2580,7 @@ class WorkersProjectsApiClient:
         bootstrap_profile: str | None = None,
         bootstrap_bundle: dict[str, Any] | None = None,
         start_synchronously: bool = True,
+        workspace_kind: str | None = None,
     ) -> dict[str, Any]:
         payload = {
             "owner_id": self._owner_id(owner_id),
@@ -2375,6 +2596,8 @@ class WorkersProjectsApiClient:
         }
         if backend:
             payload["backend"] = backend
+        if workspace_kind:
+            payload["workspace_kind"] = workspace_kind
         project_path_id = self._path_id(project_id, "project_id")
         return self._request("POST", f"/v1/projects/{project_path_id}/workers/find-or-resume", json_body=payload)
 
@@ -2455,6 +2678,74 @@ class WorkersProjectsApiClient:
         schedule_path_id = self._path_id(schedule_id, "schedule_id")
         return self._request("GET", f"/v1/schedules/{schedule_path_id}")
 
+    def create_recurring_schedule(self, worker_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        worker_path_id = self._path_id(worker_id, "worker_id")
+        return self._request(
+            "POST",
+            f"/v1/workers/{worker_path_id}/recurring-schedules",
+            json_body=payload,
+        )
+
+    def recurring_schedules(
+        self,
+        worker_id: str | None = None,
+        include_inactive: bool = False,
+    ) -> list[dict[str, Any]]:
+        suffix = "?include_inactive=true" if include_inactive else ""
+        if worker_id:
+            worker_path_id = self._path_id(worker_id, "worker_id")
+            path = f"/v1/workers/{worker_path_id}/recurring-schedules{suffix}"
+        else:
+            path = f"/v1/recurring-schedules{suffix}"
+        return self._request("GET", path).get("items", [])
+
+    def recurring_schedule_occurrences(
+        self,
+        definition_id: str,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        definition_path_id = self._path_id(definition_id, "definition_id")
+        bounded_limit = max(1, min(int(limit), 100))
+        return self._request(
+            "GET",
+            f"/v1/recurring-schedules/{definition_path_id}/occurrences?limit={bounded_limit}",
+        ).get("items", [])
+
+    def update_recurring_schedule(
+        self,
+        definition_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        definition_path_id = self._path_id(definition_id, "definition_id")
+        return self._request(
+            "PATCH",
+            f"/v1/recurring-schedules/{definition_path_id}",
+            json_body=payload,
+        )
+
+    def deactivate_recurring_schedule(self, definition_id: str) -> dict[str, Any]:
+        definition_path_id = self._path_id(definition_id, "definition_id")
+        return self._request(
+            "POST",
+            f"/v1/recurring-schedules/{definition_path_id}/deactivate",
+        )
+
+    def retire_recurring_schedule(self, definition_id: str) -> dict[str, Any]:
+        definition_path_id = self._path_id(definition_id, "definition_id")
+        return self._request("DELETE", f"/v1/recurring-schedules/{definition_path_id}")
+
+    def run_recurring_schedule_now(
+        self,
+        definition_id: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        definition_path_id = self._path_id(definition_id, "definition_id")
+        return self._request(
+            "POST",
+            f"/v1/recurring-schedules/{definition_path_id}/run-now",
+            json_body={"idempotency_key": idempotency_key},
+        )
+
     def lifecycle(self, worker_id: str, action: str) -> dict[str, Any]:
         worker_path_id = self._path_id(worker_id, "worker_id")
         clean_action = str(action or "").strip()
@@ -2489,6 +2780,11 @@ def create_mcp_server(
     api_client: WorkersProjectsApiClient | None = None,
 ) -> FastMCP:
     client = api_client or WorkersProjectsApiClient(base_url=base_url)
+    oauth = oauth_from_env()
+    if multi_user_security_enabled() and oauth is None:
+        raise McpOAuthConfigurationError(
+            "GlassHive multi-user MCP requires configured OAuth issuer and public URL"
+        )
     recent_dispatches: dict[tuple[str, str, str, str, str], RecentDispatchContext] = {}
     recent_dispatches_lock = threading.RLock()
     server = FastMCP(
@@ -2498,7 +2794,13 @@ def create_mcp_server(
         port=port,
         streamable_http_path="/mcp",
         transport_security=_mcp_transport_security_settings(host, port),
+        token_verifier=oauth[0] if oauth else None,
+        auth=oauth[1] if oauth else None,
     )
+
+    @server.custom_route("/health", methods=["GET"], include_in_schema=False)
+    async def mcp_health(_request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok", "release": release_provenance()})
 
     def _recent_dispatch_ttl_seconds() -> float:
         try:
@@ -2598,6 +2900,75 @@ def create_mcp_server(
                     return context
         return None
 
+    def _provider_account_selection(
+        *,
+        profile: str,
+        policy: str | None,
+        account_id: str | None,
+    ) -> dict[str, str] | None:
+        requested_policy = str(policy or "").strip().lower()
+        requested_account_id = str(account_id or "").strip()
+        if not requested_policy and not requested_account_id:
+            return None
+        resolved_policy = requested_policy or "personal_required"
+        if resolved_policy not in {
+            "legacy",
+            "personal_preferred",
+            "personal_required",
+        }:
+            raise ValueError(
+                "provider_account_policy must be legacy, personal_preferred, or personal_required"
+            )
+        if resolved_policy == "legacy":
+            if requested_account_id:
+                raise ValueError(
+                    "Deployment account policy cannot include a personal account id"
+                )
+            return {"policy": "legacy"}
+        profile_providers = {
+            "codex-cli": {"codex", "openai"},
+            "claude-code": {"claude", "anthropic"},
+        }.get(profile)
+        if profile_providers is None:
+            raise ValueError(
+                "Personal worker accounts are available only for Codex and Claude Code profiles"
+            )
+        accounts = list(client.provider_accounts())
+        matching = [
+            account
+            for account in accounts
+            if str(account.get("provider") or "").strip().lower()
+            in profile_providers
+        ]
+        selected = next(
+            (
+                account
+                for account in matching
+                if str(account.get("account_id") or "") == requested_account_id
+            ),
+            None,
+        ) if requested_account_id else next(
+            (
+                account
+                for account in matching
+                if bool(account.get("is_default"))
+                and str(account.get("status") or "").lower() == "ready"
+            ),
+            None,
+        )
+        if requested_account_id and selected is None:
+            raise ValueError("Selected provider account is unavailable for this worker profile")
+        if selected is not None and str(selected.get("status") or "").lower() != "ready":
+            raise ValueError("Selected provider account is not ready")
+        if selected is None and resolved_policy == "personal_required":
+            raise ValueError(
+                "Personal-only policy requires a ready selected or default provider account"
+            )
+        selection = {"policy": resolved_policy}
+        if selected is not None:
+            selection["account_id"] = str(selected.get("account_id") or "")
+        return selection
+
     @server.tool(
         name="projects_list",
         title="List Projects",
@@ -2607,6 +2978,7 @@ def create_mcp_server(
             "Returns project records with project_id, owner, title, goal, and runtime metadata when available."
         ),
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def projects_list(owner_id: str | None = None) -> list[dict[str, Any]]:
         return client.list_projects(owner_id=owner_id)
@@ -2644,6 +3016,7 @@ def create_mcp_server(
             "GlassHive will use."
         ),
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def workspace_preferences_get() -> dict[str, Any]:
         return client.get_preferences()
@@ -2690,6 +3063,404 @@ def create_mcp_server(
         return client.update_preferences(payload)
 
     @server.tool(
+        name="workspace_list",
+        title="Find My Workspaces",
+        description=(
+            "List, search, and rediscover the authenticated user's persisted GlassHive workspaces by "
+            "human name, tag, favorite state, or workspace kind. Returns an opaque next_cursor for pagination."
+        ),
+        structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
+    )
+    def workspace_list(
+        search: str = "",
+        kind: str = "named",
+        tags: list[str] | None = None,
+        favorite: bool | None = None,
+        cursor: str | None = None,
+        limit: Annotated[int, Field(ge=1, le=100)] = 25,
+    ) -> dict[str, Any]:
+        return client.workspace_catalog(
+            search=search,
+            kind=kind,
+            tags=tags,
+            favorite=favorite,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    @server.tool(
+        name="workspace_rename",
+        title="Rename Workspace",
+        description="Rename one authenticated-user workspace using its worker_id and a clear human name.",
+        structured_output=True,
+    )
+    def workspace_rename(worker_id: str, name: str) -> dict[str, Any]:
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("name is required")
+        return client.update_workspace(worker_id, {"name": clean_name})
+
+    @server.tool(
+        name="workspace_duplicate",
+        title="Duplicate Workspace",
+        description=(
+            "Create a separate persisted workspace from an existing workspace. GlassHive copies only "
+            "approved project files; credentials, account homes, browser sessions, and VCS internals are never copied."
+        ),
+        structured_output=True,
+    )
+    def workspace_duplicate(
+        worker_id: str,
+        idempotency_key: Annotated[str, Field(min_length=8, max_length=128)],
+        name: str = "",
+    ) -> dict[str, Any]:
+        return client.duplicate_workspace(
+            worker_id,
+            idempotency_key=idempotency_key,
+            name=str(name or "").strip(),
+        )
+
+    @server.tool(
+        name="workspace_template_list",
+        title="List My Workspace Templates",
+        description=(
+            "List the authenticated user's immutable, versioned workspace templates and their exact "
+            "Library references. A same-owner opaque provider-account reference may be retained and is "
+            "revalidated before use; source files, credentials, provider homes, grants, schedules, and audit "
+            "history are never included."
+        ),
+        structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
+    )
+    def workspace_template_list() -> list[dict[str, Any]]:
+        return client.workspace_templates()
+
+    @server.tool(
+        name="workspace_template_save",
+        title="Save Workspace as Template",
+        description=(
+            "Save one owned workspace as a new immutable template version. Only reusable project intent, "
+            "safe worker settings, and exact Library version/hash/scope references are retained."
+        ),
+        structured_output=True,
+    )
+    def workspace_template_save(
+        worker_id: str,
+        name: str,
+        description: str = "",
+        lineage_id: str = "",
+    ) -> dict[str, Any]:
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("name is required")
+        return client.save_workspace_template(
+            worker_id,
+            name=clean_name,
+            description=str(description or "").strip(),
+            lineage_id=str(lineage_id or "").strip(),
+        )
+
+    @server.tool(
+        name="workspace_template_instantiate",
+        title="Start Workspace from Template",
+        description=(
+            "Create a fresh paused workspace from one exact immutable template without rereading its source. "
+            "Returns Library capabilities that require fresh human approval; retry with the same idempotency key."
+        ),
+        structured_output=True,
+    )
+    def workspace_template_instantiate(
+        template_id: str,
+        idempotency_key: Annotated[str, Field(min_length=8, max_length=128)],
+        name: str = "",
+    ) -> dict[str, Any]:
+        return client.instantiate_workspace_template(
+            template_id,
+            idempotency_key=idempotency_key,
+            name=str(name or "").strip(),
+        )
+
+    @server.tool(
+        name="worker_accounts_list",
+        title="List My Worker Accounts",
+        description=(
+            "List the authenticated user's Codex, Claude, or API/enterprise worker-account metadata and "
+            "connection status. Credential bytes and secret locators are never returned."
+        ),
+        structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
+    )
+    def worker_accounts_list() -> list[dict[str, Any]]:
+        return client.provider_accounts()
+
+    @server.tool(
+        name="worker_account_connect",
+        title="Connect My Worker Account",
+        description=(
+            "Create owner-scoped Codex or Claude worker-account metadata. Subscription accounts must "
+            "then use worker_account_setup_start; API/enterprise routes reuse the user's managed "
+            "connected-account secret without copying it into GlassHive."
+        ),
+        structured_output=True,
+    )
+    def worker_account_connect(
+        provider: Literal["codex", "claude"],
+        label: Annotated[str, Field(min_length=1, max_length=160)],
+        auth_method: Literal["subscription", "api_key", "enterprise_route"] = "subscription",
+        make_default: bool = False,
+    ) -> dict[str, Any]:
+        return client.create_provider_account(
+            provider=provider,
+            label=label,
+            auth_method=auth_method,
+            make_default=make_default,
+        )
+
+    @server.tool(
+        name="worker_account_setup_start",
+        title="Start My Worker Account Sign-in",
+        description=(
+            "Start the provider-native sign-in for one owner-scoped subscription account and return "
+            "its bounded device/browser instructions. Call worker_account_test to check completion."
+        ),
+        structured_output=True,
+    )
+    def worker_account_setup_start(account_id: str) -> dict[str, Any]:
+        return client.start_provider_account_setup(account_id)
+
+    @server.tool(
+        name="worker_account_test",
+        title="Test My Worker Account",
+        description=(
+            "Recheck native subscription status or the managed inference-broker binding for one "
+            "authenticated user's worker account without returning credentials."
+        ),
+        structured_output=True,
+    )
+    def worker_account_test(account_id: str) -> dict[str, Any]:
+        return client.verify_provider_account(account_id)
+
+    @server.tool(
+        name="worker_account_disconnect",
+        title="Disconnect My Worker Account",
+        description=(
+            "Disconnect one authenticated user's worker account, release its active leases, and remove "
+            "only that account's isolated provider credential home."
+        ),
+        structured_output=True,
+    )
+    def worker_account_disconnect(account_id: str) -> dict[str, Any]:
+        return client.disconnect_provider_account(account_id)
+
+    @server.tool(
+        name="worker_account_forget",
+        title="Forget My Disconnected Worker Account",
+        description=(
+            "Remove only the authenticated user's disconnected account metadata after its isolated "
+            "provider credentials have already been removed."
+        ),
+        structured_output=True,
+    )
+    def worker_account_forget(account_id: str) -> dict[str, Any]:
+        return client.forget_provider_account(account_id)
+
+    @server.tool(
+        name="connections_list",
+        title="List My Connections",
+        description=(
+            "List brokered connected services available to the authenticated user, including their "
+            "approved scopes and readiness. Use this before proposing a workspace capability change."
+        ),
+        structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
+    )
+    def connections_list() -> list[dict[str, Any]]:
+        return client.connections()
+
+    @server.tool(
+        name="library_list",
+        title="Browse GlassHive Library",
+        description=(
+            "List administrator-curated skills, tools, and connector manifests that may be enabled for "
+            "workspaces. This does not install arbitrary model-supplied code."
+        ),
+        structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
+    )
+    def library_list() -> list[dict[str, Any]]:
+        return client.library()
+
+    @server.tool(
+        name="library_manifest_propose",
+        title="Propose a GlassHive Library Manifest",
+        description=(
+            "Submit a complete non-secret, hash-pinned Library manifest for administrator review. "
+            "This never publishes, installs, confirms, or grants the proposal. Arbitrary shell "
+            "activation and credential-bearing manifests are rejected."
+        ),
+        structured_output=True,
+    )
+    def library_manifest_propose(manifest: dict[str, Any]) -> dict[str, Any]:
+        return client.propose_library_manifest(manifest)
+
+    @server.tool(
+        name="workspace_capability_prepare",
+        title="Prepare Workspace Capability",
+        description=(
+            "Prepare, but do not apply, one curated Library item for a workspace. Return a browser "
+            "confirmation URL that the authenticated human must explicitly review and approve. "
+            "Connected services use their brokered workspace bundle; personal worker accounts use the "
+            "workspace execution policy. Never claim success before confirmation completes."
+        ),
+        structured_output=True,
+    )
+    def workspace_capability_prepare(
+        worker_id: str,
+        library_id: str,
+        scopes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        normalized_library_id = str(library_id or "").strip()
+        if not normalized_library_id:
+            raise ValueError("Choose one library_id")
+        payload: dict[str, Any] = {"library_id": normalized_library_id}
+        payload["scopes"] = [str(scope).strip() for scope in (scopes or []) if str(scope).strip()]
+        pending = client.create_pending_change(
+            {
+                "change_type": "library_enable",
+                "target_id": worker_id,
+                "payload": payload,
+            }
+        )
+        confirmation_token = str(pending.pop("confirmation_token", "") or "")
+        if not confirmation_token:
+            raise RuntimeError("GlassHive did not return a human confirmation token")
+        change_id = str(pending.get("change_id") or "").strip()
+        confirmation_url = (
+            f"{operator_base_url()}/confirm-change"
+            f"#change_id={quote(change_id, safe='')}&token={quote(confirmation_token, safe='')}"
+        )
+        return {**pending, "confirmation_url": confirmation_url, "requires_human_confirmation": True}
+
+    @server.tool(
+        name="workspace_capability_upgrade_prepare",
+        title="Prepare Workspace Capability Upgrade",
+        description=(
+            "Propose a newer version of one already approved Library capability. This cannot widen "
+            "the current workspace scopes and never publishes or applies content itself. The "
+            "authenticated human must review and confirm the immutable upgrade in the browser."
+        ),
+        structured_output=True,
+    )
+    def workspace_capability_upgrade_prepare(
+        worker_id: str,
+        library_id: str,
+        replaces_grant_id: str,
+        scopes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        normalized_library_id = str(library_id or "").strip()
+        normalized_grant_id = str(replaces_grant_id or "").strip()
+        if not normalized_library_id or not normalized_grant_id:
+            raise ValueError("Choose the newer library_id and current replaces_grant_id")
+        pending = client.create_pending_change(
+            {
+                "change_type": "library_upgrade",
+                "target_id": worker_id,
+                "payload": {
+                    "library_id": normalized_library_id,
+                    "replaces_grant_id": normalized_grant_id,
+                    "scopes": [
+                        str(scope).strip() for scope in (scopes or []) if str(scope).strip()
+                    ],
+                },
+            }
+        )
+        confirmation_token = str(pending.pop("confirmation_token", "") or "")
+        if not confirmation_token:
+            raise RuntimeError("GlassHive did not return a human confirmation token")
+        change_id = str(pending.get("change_id") or "").strip()
+        confirmation_url = (
+            f"{operator_base_url()}/confirm-change"
+            f"#change_id={quote(change_id, safe='')}&token={quote(confirmation_token, safe='')}"
+        )
+        return {**pending, "confirmation_url": confirmation_url, "requires_human_confirmation": True}
+
+    @server.tool(
+        name="workspace_provider_account_prepare",
+        title="Prepare Workspace Account Switch",
+        description=(
+            "Prepare a user-scoped worker-account selection for future runs in one workspace. "
+            "This never changes queued or running work and returns a browser confirmation URL "
+            "that the authenticated human must explicitly approve. Use policy legacy with no "
+            "account_id for the deployment-managed account, or personal_required with a ready "
+            "account_id to opt out of global credentials."
+        ),
+        structured_output=True,
+    )
+    def workspace_provider_account_prepare(
+        worker_id: str,
+        policy: Literal["legacy", "personal_required", "personal_preferred"],
+        account_id: str = "",
+    ) -> dict[str, Any]:
+        normalized_policy = str(policy or "").strip().lower()
+        normalized_account_id = str(account_id or "").strip()
+        if normalized_policy == "legacy" and normalized_account_id:
+            raise ValueError("legacy policy cannot include account_id")
+        if normalized_policy != "legacy" and not normalized_account_id:
+            raise ValueError("a ready personal account_id is required")
+        pending = client.create_pending_change(
+            {
+                "change_type": "workspace_provider_account",
+                "target_id": worker_id,
+                "payload": {
+                    "policy": normalized_policy,
+                    **({"account_id": normalized_account_id} if normalized_account_id else {}),
+                },
+            }
+        )
+        confirmation_token = str(pending.pop("confirmation_token", "") or "")
+        if not confirmation_token:
+            raise RuntimeError("GlassHive did not return a human confirmation token")
+        change_id = str(pending.get("change_id") or "").strip()
+        confirmation_url = (
+            f"{operator_base_url()}/confirm-change"
+            f"#change_id={quote(change_id, safe='')}&token={quote(confirmation_token, safe='')}"
+        )
+        return {**pending, "confirmation_url": confirmation_url, "requires_human_confirmation": True}
+
+    @server.tool(
+        name="workspace_capabilities_list",
+        title="List Workspace Capabilities",
+        description="List the authenticated user's active capability grants for one workspace.",
+        structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
+    )
+    def workspace_capabilities_list(worker_id: str) -> list[dict[str, Any]]:
+        return client.workspace_grants(worker_id)
+
+    @server.tool(
+        name="workspace_capability_remove",
+        title="Remove Workspace Capability",
+        description=(
+            "Remove the newest active capability from a workspace. GlassHive refuses removal if a newer "
+            "capability or later workspace configuration change would make rollback unsafe."
+        ),
+        structured_output=True,
+    )
+    def workspace_capability_remove(worker_id: str, grant_id: str) -> dict[str, Any]:
+        return client.revoke_workspace_grant(worker_id, grant_id)
+
+    @server.tool(
+        name="workspace_activity",
+        title="Workspace Activity",
+        description="List recent user-scoped workspace events for discovery, audit, and resume decisions.",
+        structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
+    )
+    def workspace_activity(limit: Annotated[int, Field(ge=1, le=200)] = 50) -> list[dict[str, Any]]:
+        return client.activity(limit=limit)
+
+    @server.tool(
         name="project_get",
         title="Get Project",
         description=(
@@ -2697,6 +3468,7 @@ def create_mcp_server(
             "Do not use as the first step for ordinary fresh delegation; prefer worker_delegate_once. Returns the project record and high-signal ownership/title/goal fields."
         ),
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def project_get(project_id: str) -> dict[str, Any]:
         return client.get_project(project_id)
@@ -2774,6 +3546,10 @@ def create_mcp_server(
                 )
             ),
         ] = None,
+        provider_account_policy: Literal[
+            "legacy", "personal_preferred", "personal_required"
+        ] | None = None,
+        provider_account_id: str | None = None,
         require_callback: bool = False,
         expose_diagnostics: bool = False,
     ) -> dict[str, Any]:
@@ -2854,6 +3630,13 @@ def create_mcp_server(
             storage_owner_id=context_storage_owner_id,
         )
         bundle = _apply_effort_to_bundle(bundle, profile=resolved_profile, effort=resolved_effort)
+        provider_selection = _provider_account_selection(
+            profile=resolved_profile,
+            policy=provider_account_policy,
+            account_id=provider_account_id,
+        )
+        if provider_selection is not None:
+            bundle["provider_account"] = provider_selection
         bundle, worker_instruction = _apply_connected_account_intent_guard(
             bundle,
             worker_instruction,
@@ -2888,6 +3671,10 @@ def create_mcp_server(
                 alias=reusable_alias,
                 execution_mode=resolved_execution_mode,
             )
+        if existing_workspace and provider_selection is not None:
+            raise ValueError(
+                "Existing workspaces keep their saved provider account policy"
+            )
         project = (
             existing_workspace["project"]
             if existing_workspace
@@ -2918,6 +3705,7 @@ def create_mcp_server(
                 bootstrap_profile=bootstrap_profile,
                 bootstrap_bundle=bundle,
                 start_synchronously=False,
+                workspace_kind="named",
             )
         except GlassHiveBlockedError as exc:
             return _blocked_dispatch_result(
@@ -3082,6 +3870,10 @@ def create_mcp_server(
                 )
             ),
         ] = None,
+        provider_account_policy: Literal[
+            "legacy", "personal_preferred", "personal_required"
+        ] | None = None,
+        provider_account_id: str | None = None,
         require_callback: bool = False,
         expose_diagnostics: bool = False,
     ) -> dict[str, Any]:
@@ -3133,6 +3925,8 @@ def create_mcp_server(
             bootstrap_bundle_json=bootstrap_bundle_json,
             uploaded_files=uploaded_files,
             effort=effort,
+            provider_account_policy=provider_account_policy,
+            provider_account_id=provider_account_id,
             connected_account_content_intent=connected_account_content_intent,
             require_callback=require_callback,
             expose_diagnostics=expose_diagnostics,
@@ -3210,6 +4004,10 @@ def create_mcp_server(
             str | None,
             Field(description="Optional per-run effort override for the scheduled workspace. " + HIGH_EFFORT_SELECTION_GUIDANCE),
         ] = None,
+        provider_account_policy: Literal[
+            "legacy", "personal_preferred", "personal_required"
+        ] | None = None,
+        provider_account_id: str | None = None,
         require_callback: bool = False,
         expose_diagnostics: bool = False,
     ) -> dict[str, Any]:
@@ -3306,6 +4104,13 @@ def create_mcp_server(
             storage_owner_id=context_storage_owner_id,
         )
         bundle = _apply_effort_to_bundle(bundle, profile=resolved_profile, effort=resolved_effort)
+        provider_selection = _provider_account_selection(
+            profile=resolved_profile,
+            policy=provider_account_policy,
+            account_id=provider_account_id,
+        )
+        if provider_selection is not None:
+            bundle["provider_account"] = provider_selection
         bundle, scheduled_instruction = _apply_connected_account_intent_guard(
             bundle,
             scheduled_instruction,
@@ -3332,6 +4137,10 @@ def create_mcp_server(
                 alias=resolved_alias,
                 execution_mode=resolved_execution_mode,
             )
+        if existing_workspace and provider_selection is not None:
+            raise ValueError(
+                "Existing workspaces keep their saved provider account policy"
+            )
         project = existing_workspace["project"] if existing_workspace else client.create_project(
             owner_id=resolved_owner_id,
             title=title,
@@ -3350,6 +4159,7 @@ def create_mcp_server(
             execution_mode=resolved_execution_mode,
             bootstrap_bundle=bundle,
             start_synchronously=False,
+            workspace_kind="named",
         )
         worker_id = str(worker.get("worker_id") or "")
         if not worker_id:
@@ -3405,6 +4215,7 @@ def create_mcp_server(
             "Returns run ids, states, and recent execution metadata."
         ),
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def project_runs(project_id: str) -> list[dict[str, Any]]:
         return client.list_project_runs(project_id)
@@ -3417,6 +4228,7 @@ def create_mcp_server(
             "Do not include raw event logs in a normal user-facing answer unless they explain a blocker. Returns event ids, event types, and project-linked timestamps/details when available."
         ),
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def project_events(project_id: str) -> list[dict[str, Any]]:
         return client.list_project_events(project_id)
@@ -3429,6 +4241,7 @@ def create_mcp_server(
             "Do not list workers as boilerplate before a fresh task; prefer worker_delegate_once. Returns worker ids, states, profiles, aliases, and execution metadata when available."
         ),
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def workers_list(project_id: str) -> list[dict[str, Any]]:
         return [_normalize_worker_backend(worker) for worker in client.list_workers(project_id)]
@@ -3557,6 +4370,7 @@ def create_mcp_server(
             "Do not expose worker ids to the user unless diagnostics were requested. Returns the worker record with project, state, profile, alias, and execution mode when available."
         ),
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def worker_get(worker_id: str) -> dict[str, Any]:
         return _normalize_worker_backend(client.get_worker(worker_id))
@@ -3570,6 +4384,7 @@ def create_mcp_server(
             "Returns worker state, runtime details, recent runs, events, artifacts, and blocker evidence when available."
         ),
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def worker_live(worker_id: str) -> dict[str, Any]:
         return client.worker_live(worker_id)
@@ -3679,9 +4494,189 @@ def create_mcp_server(
         title="List Worker Schedules",
         description="List pending or completed GlassHive-native schedules for a worker. Use for explicit scheduling status or QA.",
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def worker_schedules(worker_id: str, include_done: bool = False) -> list[dict[str, Any]]:
         return client.worker_schedules(worker_id, include_done=include_done)
+
+    @server.tool(
+        name="worker_recurring_schedule_create",
+        title="Create Recurring Worker Schedule",
+        description=(
+            "Create a durable, structured schedule for an existing worker. Supported forms are once, "
+            "elapsed interval, backward-compatible daily wall clock, cron, and RFC 5545 RRULE. Supply "
+            "an IANA timezone and explicit start/end, overlap, misfire, bounded catch-up, and jitter policy "
+            "when needed. Natural-language timing is not parsed here. The returned schedule_owner and "
+            "owner_action say whether GlassHive or Viventium Cortex dispatches it; only that owner fires it. "
+            "This is additive to the unchanged one-shot worker_schedule tool."
+        ),
+        structured_output=True,
+    )
+    def worker_recurring_schedule_create(
+        worker_id: str,
+        instruction: str,
+        recurrence_type: Literal["once", "daily", "interval", "cron", "rfc5545"],
+        interval_seconds: int | None = None,
+        local_time: str = "",
+        timezone_name: str = "UTC",
+        dst_policy: Literal["next_valid_earliest", "next_valid_latest"] = "next_valid_earliest",
+        first_run_at: str | None = None,
+        cron_expression: str = "",
+        rrule: str = "",
+        starts_at: str | None = None,
+        ends_at: str | None = None,
+        enabled: bool = True,
+        overlap_policy: Literal["skip", "queue"] = "skip",
+        misfire_grace_seconds: Annotated[int, Field(ge=0, le=604800)] = 300,
+        catch_up_policy: Literal["skip", "bounded", "coalesce"] = "skip",
+        max_catch_up_occurrences: Annotated[int, Field(ge=1, le=10)] = 1,
+        jitter_seconds: Annotated[int, Field(ge=0, le=900)] = 0,
+        schedule_text: str = "",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "instruction": instruction,
+            "recurrence_type": recurrence_type,
+            "interval_seconds": interval_seconds,
+            "local_time": local_time,
+            "timezone_name": timezone_name,
+            "dst_policy": dst_policy,
+            "first_run_at": first_run_at,
+            "cron_expression": cron_expression,
+            "rrule": rrule,
+            "starts_at": starts_at,
+            "ends_at": ends_at,
+            "enabled": enabled,
+            "overlap_policy": overlap_policy,
+            "misfire_grace_seconds": misfire_grace_seconds,
+            "catch_up_policy": catch_up_policy,
+            "max_catch_up_occurrences": max_catch_up_occurrences,
+            "jitter_seconds": jitter_seconds,
+            "schedule_text": schedule_text,
+        }
+        return client.create_recurring_schedule(worker_id, payload)
+
+    @server.tool(
+        name="worker_recurring_schedules",
+        title="List Recurring Worker Schedules",
+        description=(
+            "List the current user's durable recurring schedules. Optionally scope the result to one "
+            "worker or include deactivated definitions. Each item includes the user's human "
+            "workspace_name; display that name instead of inferring one from its project."
+        ),
+        structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
+    )
+    def worker_recurring_schedules(
+        worker_id: str | None = None,
+        include_inactive: bool = False,
+    ) -> list[dict[str, Any]]:
+        return client.recurring_schedules(worker_id, include_inactive=include_inactive)
+
+    @server.tool(
+        name="worker_recurring_schedule_occurrences",
+        title="List Recurring Schedule Occurrences",
+        description="Inspect the latest immutable occurrences and run outcomes for one recurring schedule.",
+        structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
+    )
+    def worker_recurring_schedule_occurrences(
+        definition_id: str,
+        limit: Annotated[int, Field(ge=1, le=100)] = 50,
+    ) -> list[dict[str, Any]]:
+        return client.recurring_schedule_occurrences(definition_id, limit=limit)
+
+    @server.tool(
+        name="worker_recurring_schedule_update",
+        title="Update Recurring Worker Schedule",
+        description=(
+            "Update a durable schedule definition without changing immutable occurrence history. "
+            "Use enabled=false to pause and enabled=true to resume; owner and dispatch action remain fixed."
+        ),
+        structured_output=True,
+    )
+    def worker_recurring_schedule_update(
+        definition_id: str,
+        instruction: str | None = None,
+        recurrence_type: Literal["once", "daily", "interval", "cron", "rfc5545"] | None = None,
+        interval_seconds: int | None = None,
+        local_time: str | None = None,
+        timezone_name: str | None = None,
+        dst_policy: Literal["next_valid_earliest", "next_valid_latest"] | None = None,
+        cron_expression: str | None = None,
+        rrule: str | None = None,
+        starts_at: str | None = None,
+        ends_at: str | None = None,
+        enabled: bool | None = None,
+        overlap_policy: Literal["skip", "queue"] | None = None,
+        misfire_grace_seconds: Annotated[int | None, Field(ge=0, le=604800)] = None,
+        catch_up_policy: Literal["skip", "bounded", "coalesce"] | None = None,
+        max_catch_up_occurrences: Annotated[int | None, Field(ge=1, le=10)] = None,
+        jitter_seconds: Annotated[int | None, Field(ge=0, le=900)] = None,
+        schedule_text: str | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            key: value
+            for key, value in {
+                "instruction": instruction,
+                "recurrence_type": recurrence_type,
+                "interval_seconds": interval_seconds,
+                "local_time": local_time,
+                "timezone_name": timezone_name,
+                "dst_policy": dst_policy,
+                "cron_expression": cron_expression,
+                "rrule": rrule,
+                "starts_at": starts_at,
+                "ends_at": ends_at,
+                "enabled": enabled,
+                "overlap_policy": overlap_policy,
+                "misfire_grace_seconds": misfire_grace_seconds,
+                "catch_up_policy": catch_up_policy,
+                "max_catch_up_occurrences": max_catch_up_occurrences,
+                "jitter_seconds": jitter_seconds,
+                "schedule_text": schedule_text,
+            }.items()
+            if value is not None
+        }
+        return client.update_recurring_schedule(definition_id, payload)
+
+    @server.tool(
+        name="worker_recurring_schedule_deactivate",
+        title="Deactivate Recurring Worker Schedule",
+        description=(
+            "Stop future occurrences for one recurring schedule while retaining its definition and history."
+        ),
+        structured_output=True,
+    )
+    def worker_recurring_schedule_deactivate(definition_id: str) -> dict[str, Any]:
+        return client.deactivate_recurring_schedule(definition_id)
+
+    @server.tool(
+        name="worker_recurring_schedule_run_now",
+        title="Run Recurring Worker Schedule Now",
+        description=(
+            "Request one owner-scoped occurrence now without advancing the recurring cursor. "
+            "Retry with the same idempotency key to get the same occurrence; delegated schedules "
+            "return the required Viventium owner action instead of dispatching twice."
+        ),
+        structured_output=True,
+    )
+    def worker_recurring_schedule_run_now(
+        definition_id: str,
+        idempotency_key: Annotated[str, Field(min_length=8, max_length=128)],
+    ) -> dict[str, Any]:
+        return client.run_recurring_schedule_now(definition_id, idempotency_key)
+
+    @server.tool(
+        name="worker_recurring_schedule_retire",
+        title="Retire Recurring Worker Schedule",
+        description=(
+            "Permanently retire a recurring definition so it cannot be resumed. Past occurrences "
+            "and their outcomes remain available as immutable history."
+        ),
+        structured_output=True,
+    )
+    def worker_recurring_schedule_retire(definition_id: str) -> dict[str, Any]:
+        return client.retire_recurring_schedule(definition_id)
 
     @server.tool(
         name="worker_message",
@@ -3821,6 +4816,7 @@ def create_mcp_server(
             "Returns run state, output, and blocker/error details."
         ),
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def run_get(run_id: str) -> dict[str, Any]:
         run = client.get_run(run_id)
@@ -4218,6 +5214,7 @@ def create_mcp_server(
             "link data when available."
         ),
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def workspace_status(
         run_id: Annotated[str | None, Field(description="Optional run id from diagnostics or a prior explicit status result. Omit after a same-conversation launch when scoped recent dispatch is available.")] = None,
@@ -4260,6 +5257,7 @@ def create_mcp_server(
             "cadence as a floor, so very low polling intervals cannot create long-run status loops."
         ),
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     async def workspace_wait(
         run_id: Annotated[str | None, Field(description="Optional run id from diagnostics or a prior explicit status result. Omit after a same-conversation launch when scoped recent dispatch is available.")] = None,
@@ -4719,6 +5717,7 @@ def create_mcp_server(
             "before the worker has produced files unless the user asks for diagnostics."
         ),
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def workspace_artifacts(
         worker_id: Annotated[str, Field(description="Worker id from diagnostics, an explicit status result, or a known GlassHive workspace.")],
@@ -4750,6 +5749,7 @@ def create_mcp_server(
             "a scoped GlassHive file link is available."
         ),
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def workspace_artifact_download(
         worker_id: Annotated[str, Field(description="Worker id from diagnostics, an explicit status result, or a known GlassHive workspace.")],
@@ -4789,6 +5789,7 @@ def create_mcp_server(
             "Do not use for ordinary task delegation or user-facing task completion. Returns aggregate counts only, not project content or worker outputs."
         ),
         structured_output=True,
+        annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def metrics_summary() -> dict[str, Any]:
         return client.metrics()
@@ -4913,7 +5914,8 @@ def main() -> None:
         import uvicorn
 
         app = server.streamable_http_app()
-        app.add_middleware(McpHttpAuthMiddleware)
+        if server.settings.auth is None:
+            app.add_middleware(McpHttpAuthMiddleware)
         uvicorn.run(app, host=args.host, port=args.port, access_log=False)
         return
     server.run(transport=args.transport)

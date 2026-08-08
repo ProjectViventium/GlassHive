@@ -28,6 +28,13 @@ def _patch_host_runtime_requirements_ok(monkeypatch):
     monkeypatch.setattr(mcp_server, "host_runtime_requirement_issue", lambda _profile, _runtime_name: None)
 
 
+def _configure_enterprise_mcp_oauth(monkeypatch):
+    """Keep non-OAuth enterprise tests on the production fail-closed contract."""
+
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ISSUER", "https://identity.example.invalid")
+    monkeypatch.setenv("GLASSHIVE_MCP_PUBLIC_URL", "https://glasshive.example.invalid/mcp")
+
+
 class FakeApiClient:
     def list_projects(self, owner_id: str | None = None):
         items = [
@@ -72,6 +79,24 @@ class FakeApiClient:
             "updated_at": "2026-05-24T00:00:00+00:00",
         }
 
+    def provider_accounts(self):
+        return [
+            {
+                "account_id": "acct_codex_ready",
+                "provider": "codex",
+                "display_name": "My Codex",
+                "status": "ready",
+                "is_default": True,
+            },
+            {
+                "account_id": "acct_claude_ready",
+                "provider": "claude",
+                "display_name": "My Claude",
+                "status": "ready",
+                "is_default": True,
+            },
+        ]
+
     def list_project_runs(self, project_id: str):
         return [{"run_id": "run_123", "project_id": project_id, "state": "completed"}]
 
@@ -114,6 +139,7 @@ class FakeApiClient:
         bootstrap_profile: str | None = None,
         bootstrap_bundle: dict | None = None,
         start_synchronously: bool = True,
+        workspace_kind: str | None = None,
     ):
         return {
             "worker_id": "wrk_new",
@@ -130,6 +156,7 @@ class FakeApiClient:
             "state": "ready",
             "bootstrap_bundle": bootstrap_bundle,
             "start_synchronously": start_synchronously,
+            "workspace_kind": workspace_kind,
         }
 
     def find_or_resume_worker(self, **kwargs):
@@ -1273,6 +1300,7 @@ def test_enterprise_owner_and_alias_accept_generic_glasshive_identity_headers(mo
 
 def test_enterprise_worker_delegate_once_rejects_before_preflight_without_service_auth(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
     monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
     server = create_mcp_server(api_client=FakeApiClient())
 
@@ -1320,6 +1348,7 @@ def test_mcp_server_exposes_tools_and_resources(monkeypatch):
         async with Client(server) as client:
             tools = await client.list_tools()
             tool_names = {tool.name for tool in tools}
+            tools_by_name = {tool.name: tool for tool in tools}
             assert "project_create" in tool_names
             assert "workspace_launch" in tool_names
             assert "workspace_schedule" in tool_names
@@ -1332,6 +1361,24 @@ def test_mcp_server_exposes_tools_and_resources(monkeypatch):
             assert "worker_find_or_resume" in tool_names
             assert "workspace_preferences_get" in tool_names
             assert "workspace_preferences_set" in tool_names
+            for read_only_name in (
+                "workspace_preferences_get",
+                "workspace_list",
+                "workspace_template_list",
+                "worker_accounts_list",
+                "connections_list",
+                "library_list",
+                "workspace_capabilities_list",
+                "workspace_activity",
+                "worker_recurring_schedules",
+                "worker_recurring_schedule_occurrences",
+                "workspace_status",
+                "workspace_artifacts",
+            ):
+                annotations = tools_by_name[read_only_name].annotations
+                assert annotations is not None
+                assert annotations.readOnlyHint is True
+                assert annotations.destructiveHint is False
 
             created = await client.call_tool(
                 "project_create",
@@ -1473,6 +1520,101 @@ def test_workspace_launch_uses_saved_profile_and_effort_preferences(monkeypatch)
             assert assigned["bootstrap_bundle"]["env"]["WPR_CODEX_CLI_REASONING_EFFORT"] == "xhigh"
 
     asyncio.run(scenario())
+
+
+def test_workspace_launch_persists_owner_selected_provider_account(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    api = TrackingApiClient()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            launched = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Create a private reusable analysis workspace",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                    "provider_account_policy": "personal_required",
+                    "provider_account_id": "acct_codex_ready",
+                    "expose_diagnostics": True,
+                },
+            )
+            assert _tool_json(launched)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+
+    selection = api.find_or_resume_payloads[-1]["bootstrap_bundle"]["provider_account"]
+    assert selection == {
+        "policy": "personal_required",
+        "account_id": "acct_codex_ready",
+    }
+    assert api.assign_run_payloads[-1]["bootstrap_bundle"]["provider_account"] == selection
+
+
+def test_workspace_launch_personal_required_fails_without_ready_account(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+
+    class NoReadyAccountApi(TrackingApiClient):
+        def provider_accounts(self):
+            return []
+
+    api = NoReadyAccountApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="requires a ready selected or default"):
+                await client.call_tool(
+                    "workspace_launch",
+                    {
+                        "description": "Create a private workspace",
+                        "profile": "codex-cli",
+                        "execution_mode": "docker",
+                        "provider_account_policy": "personal_required",
+                    },
+                )
+
+    asyncio.run(scenario())
+    assert api.find_or_resume_payloads == []
+
+
+def test_workspace_launch_personal_preferred_falls_back_when_default_is_not_ready(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+
+    class PendingDefaultAccountApi(TrackingApiClient):
+        def provider_accounts(self):
+            return [
+                {
+                    "account_id": "acct_codex_pending",
+                    "provider": "codex",
+                    "display_name": "Pending Codex",
+                    "status": "pending",
+                    "is_default": True,
+                }
+            ]
+
+    api = PendingDefaultAccountApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            launched = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Create a private workspace with a safe fallback",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                    "provider_account_policy": "personal_preferred",
+                    "expose_diagnostics": True,
+                },
+            )
+            assert _tool_json(launched)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+    assert api.find_or_resume_payloads[-1]["bootstrap_bundle"]["provider_account"] == {
+        "policy": "personal_preferred"
+    }
 
 
 def test_workspace_launch_accepts_saved_codex_none_effort(monkeypatch):
@@ -1623,7 +1765,8 @@ def test_workspace_status_returns_view_steer_link_for_web_mcp_surfaces(monkeypat
 def test_workspace_wait_prefers_newer_worker_run_over_stale_failed_run(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive.example.test")
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
-    server = create_mcp_server(api_client=StaleRequestedRunApiClient())
+    api_client = StaleRequestedRunApiClient()
+    server = create_mcp_server(api_client=api_client)
 
     async def scenario():
         async with Client(server) as client:
@@ -2384,6 +2527,7 @@ def test_worker_schedule_and_workspace_schedule_are_glasshive_native(monkeypatch
     asyncio.run(scenario())
     assert api_client.calls == ["create_project", "find_or_resume_worker"]
     assert api_client.find_or_resume_payloads[0]["start_synchronously"] is False
+    assert api_client.find_or_resume_payloads[0]["workspace_kind"] == "named"
 
 
 def test_worker_delegate_once_exposes_diagnostics_only_when_requested(monkeypatch):
@@ -2677,6 +2821,7 @@ def test_workspace_wait_resolves_same_conversation_recent_launch_when_ids_are_om
 
 def test_enterprise_launch_without_conversation_id_is_not_remembered(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-token")
     monkeypatch.setenv("GLASSHIVE_MCP_DIAGNOSTIC_PAYLOADS_ENABLED", "true")
@@ -2728,6 +2873,7 @@ def test_enterprise_launch_without_conversation_id_is_not_remembered(monkeypatch
 
 def test_enterprise_diagnostic_payloads_are_suppressed_without_opt_in(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-token")
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
@@ -2784,6 +2930,7 @@ def test_enterprise_diagnostic_payloads_are_suppressed_without_opt_in(monkeypatc
 
 def test_enterprise_recent_launch_fallback_is_scoped_by_user_and_conversation(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
     monkeypatch.setenv("GLASSHIVE_MCP_DIAGNOSTIC_PAYLOADS_ENABLED", "true")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-token")
@@ -3004,6 +3151,7 @@ def test_workspace_continue_rejects_active_previous_run(monkeypatch):
 
 def test_enterprise_workspace_continue_rechecks_tenant_and_owner_scope(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
     monkeypatch.setattr(
@@ -3033,6 +3181,7 @@ def test_enterprise_workspace_continue_rechecks_tenant_and_owner_scope(monkeypat
 
 def test_enterprise_workspace_continue_rejects_cross_tenant_previous_run(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
     monkeypatch.setattr(
@@ -3062,6 +3211,7 @@ def test_enterprise_workspace_continue_rejects_cross_tenant_previous_run(monkeyp
 
 def test_enterprise_workspace_status_rechecks_tenant_and_owner_scope(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
     monkeypatch.setattr(
@@ -3090,6 +3240,7 @@ def test_enterprise_workspace_status_rechecks_tenant_and_owner_scope(monkeypatch
 
 def test_enterprise_workspace_artifacts_rechecks_owner_scope(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
     monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
@@ -3226,6 +3377,7 @@ def test_workspace_wait_returns_deliverable_ready_when_artifacts_exist(monkeypat
 
     async def scenario():
         async with Client(server) as client:
+            api_client.modified_at = time.time()
             waited = await client.call_tool(
                 "workspace_wait",
                 {
@@ -3269,6 +3421,7 @@ def test_workspace_wait_returns_fresh_deliverable_ready_before_timeout(monkeypat
 
     async def scenario():
         async with Client(server) as client:
+            api_client.modified_at = time.time()
             waited = await client.call_tool(
                 "workspace_wait",
                 {
@@ -3286,7 +3439,6 @@ def test_workspace_wait_returns_fresh_deliverable_ready_before_timeout(monkeypat
             assert payload["artifact_links"]["count"] == 2
 
     asyncio.run(scenario())
-    assert api_client.get_run_calls == 1
     assert api_client.get_run_calls == 1
 
 
@@ -3473,6 +3625,7 @@ def test_uploaded_file_text_prefers_owner_scoped_binary_when_available(monkeypat
     upload_path.parent.mkdir(parents=True)
     upload_path.write_bytes(b"%PDF-1.7\nsynthetic pdf bytes\n")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
     monkeypatch.setenv("GLASSHIVE_MCP_API_KEY", "service-secret")
@@ -3528,6 +3681,7 @@ def test_uploaded_file_text_does_not_cross_owner_boundary(monkeypatch, tmp_path)
     other_upload.parent.mkdir(parents=True)
     other_upload.write_bytes(b"%PDF-1.7\nother user's file\n")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
     monkeypatch.setenv("GLASSHIVE_MCP_API_KEY", "service-secret")
@@ -3575,6 +3729,7 @@ def test_binary_upload_text_without_source_reports_blocker(monkeypatch, tmp_path
     uploads_root = tmp_path / "uploads"
     (uploads_root / "user-123").mkdir(parents=True)
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
     monkeypatch.setenv("GLASSHIVE_MCP_API_KEY", "service-secret")
@@ -4473,6 +4628,50 @@ def test_workspace_launch_reuses_existing_workspace_alias_across_projects(monkey
     assert api.find_or_resume_payloads[-1]["alias"] == "marketing-sandbox"
 
 
+def test_workspace_launch_cannot_replace_existing_workspace_provider_policy(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+
+    class ExistingAliasApi(TrackingApiClient):
+        def list_projects(self, owner_id: str | None = None):
+            return [{"project_id": "prj_existing", "owner_id": "demo-owner", "title": "Research"}]
+
+        def list_workers(self, project_id: str):
+            return [
+                {
+                    "worker_id": "wrk_existing",
+                    "project_id": project_id,
+                    "owner_id": "demo-owner",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                    "alias": "research",
+                    "state": "paused",
+                }
+            ]
+
+    api = ExistingAliasApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="keep their saved provider account policy"):
+                await client.call_tool(
+                    "workspace_launch",
+                    {
+                        "description": "Resume research",
+                        "workspace_alias": "research",
+                        "reuse_existing_workspace": True,
+                        "profile": "codex-cli",
+                        "execution_mode": "docker",
+                        "provider_account_policy": "personal_required",
+                        "provider_account_id": "acct_codex_ready",
+                    },
+                )
+
+    asyncio.run(scenario())
+    assert api.find_or_resume_payloads == []
+    assert api.assign_run_payloads == []
+
+
 def test_workspace_launch_does_not_reuse_alias_unless_explicit(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
 
@@ -4589,6 +4788,7 @@ def test_worker_delegate_once_reuses_alias_when_explicit(monkeypatch):
 def test_workspace_launch_reuses_enterprise_scoped_workspace_alias(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
     monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-token")
@@ -5226,6 +5426,7 @@ def test_legacy_upload_fallback_materializes_recent_storage_owner_file(monkeypat
     upload_path.parent.mkdir(parents=True)
     upload_path.write_bytes(b"%PDF-1.7\nsynthetic pdf bytes\n")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
     monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
@@ -5446,6 +5647,32 @@ def test_enterprise_request_context_does_not_copy_cross_user_virtual_upload(monk
     assert manifest["source_ref"] == "/uploads/other-user/brief.txt"
     assert "## Attached workspace files" in bundle["project_definition"]
     assert "`uploads/brief.txt.metadata.json`" in bundle["project_definition"]
+
+
+def test_multi_user_security_mode_rejects_cross_user_virtual_upload_without_legacy_flag(monkeypatch, tmp_path):
+    uploads_root = tmp_path / "uploads"
+    own_file = uploads_root / "user-a" / "own.txt"
+    other_file = uploads_root / "user-b" / "secret.txt"
+    own_file.parent.mkdir(parents=True)
+    other_file.parent.mkdir(parents=True)
+    own_file.write_text("synthetic owner data")
+    other_file.write_text("synthetic cross-user data")
+    monkeypatch.delenv("GLASSHIVE_ENTERPRISE_MODE", raising=False)
+    monkeypatch.delenv("WPR_ENTERPRISE_MODE", raising=False)
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
+
+    assert mcp_server._trusted_virtual_upload_source(
+        "/uploads/user-a/own.txt",
+        owner_id="user-a",
+        storage_owner_id="user-a",
+    ) == str(own_file)
+    assert mcp_server._trusted_virtual_upload_source(
+        "/uploads/user-b/secret.txt",
+        owner_id="user-a",
+        storage_owner_id="user-a",
+    ) == ""
+    assert mcp_server._diagnostic_payloads_enabled() is False
 
 
 def test_runtime_env_repairs_missing_upload_root_to_local_checkout(monkeypatch, tmp_path):

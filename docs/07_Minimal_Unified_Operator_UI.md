@@ -133,6 +133,16 @@ V1 duplicate should:
 1. create a new workspace identity
 2. copy project files and project-scoped context from the selected source workspace
 3. keep browser-session state clean instead of cloning cookies or active website logins
+4. require an 8-128 character idempotency key on the workspace-catalog duplicate contract
+5. scope that key to the authenticated tenant and owner, replay the original project/workspace for
+   the same source/name request, and reject reuse for a different request
+6. keep one key on the UI action until success so retries cannot create a hidden second project
+
+The durable reservation is fail-closed. A fresh pending request cannot start a second project. A
+stale reservation is recovered only when one exact owner-scoped worker has both its persisted copy
+report and completed duplication event; ambiguous state is preserved for diagnosis or cleaned when
+it has no workspace, never silently duplicated. The legacy project-worker duplicate route remains
+unchanged for compatibility.
 
 This gives users a real branch/fork action without silently carrying over sensitive browser state.
 

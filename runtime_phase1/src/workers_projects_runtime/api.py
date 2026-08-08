@@ -6,6 +6,8 @@ import logging
 import mimetypes
 import os
 import hmac
+import re
+import stat
 import time
 from hashlib import sha256
 from collections import deque
@@ -15,21 +17,40 @@ from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from .auth import (
     AuthContext,
     EnterpriseAuthSettings,
     GlassHiveAuthError,
     header_identity_value,
+    multi_user_security_enabled,
     owner_matches_auth_context,
     scoped_alias,
 )
+from .capability_broker import CapabilityBrokerError, GlassHiveCapabilityBroker
 from .conversation_provider import install_conversation_provider_routes
+from .control_plane import ControlPlaneConflict, ControlPlaneError, ControlPlaneStore
+from .control_plane_models import (
+    ConfirmPendingChangeRequest,
+    CreateLibraryProposalRequest,
+    CreatePendingChangeRequest,
+    CreateProviderAccountRequest,
+    DuplicateWorkspaceRequest,
+    InstantiateWorkspaceTemplateRequest,
+    PublishLibraryManifestRequest,
+    ReviewLibraryProposalRequest,
+    SaveWorkspaceTemplateRequest,
+    UpdateLibraryStatusRequest,
+    UpdateWorkspaceRequest,
+    WorkspaceCatalogResponse,
+)
 from .deliverables import deliverable_payload, is_user_deliverable_relative_path
 from .failure_classification import classify_runtime_error
+from .inference_broker import GlassHiveInferenceBroker, InferenceBrokerError
 from .models import (
     AssignRunRequest,
+    CreateRecurringScheduleRequest,
     CreateProjectRequest,
     CreateWorkerRequest,
     DesktopActionRequest,
@@ -39,11 +60,17 @@ from .models import (
     LaunchFailureRequest,
     MetricsSummary,
     ProjectResponse,
+    RecurringScheduleDefinitionResponse,
+    RecurringScheduleOccurrenceResponse,
     RunResponse,
+    RunRecurringScheduleNowRequest,
+    SchedulePrincipalAuthorityRequest,
+    SchedulingCortexWorkspaceRunRequest,
     ScheduleResponse,
     ScheduleRunRequest,
     SendMessageRequest,
     TakeoverInfo,
+    UpdateRecurringScheduleRequest,
     UpdateUserPreferencesRequest,
     UpdateWorkerMetadataRequest,
     UserPreferencesResponse,
@@ -51,12 +78,22 @@ from .models import (
 )
 from .openclaw_runtime import RuntimeDependencyMissingError, StubRuntime, WorkerRuntime
 from .profile_runtime import ProfiledWorkerRuntime, _redact_text
+from .provider_accounts import ProviderSetupManager, provider_platform_support
+from .recurrence import DELEGATED_RECURRENCE_OWNER
+from .release_provenance import release_provenance
 from .runtime_env import load_viventium_runtime_env
 from .runtime_identity import derive_legacy_backend_label
+from .scheduling_owner import (
+    SCHEDULING_CORTEX_ASSERTION_HEADER,
+    SchedulingOwnerError,
+    verify_scheduling_cortex_workspace_assertion,
+)
 from .service import (
     GlassHiveProfileNotAllowedError,
     GlassHiveQuotaExceededError,
     HostWorkersDisabledError,
+    ScheduleActionRequiredError,
+    SchedulePrincipalAuthorityError,
     WorkersProjectsService,
     allowed_worker_profiles,
     merge_bootstrap_bundle,
@@ -71,7 +108,7 @@ from .signed_links import (
     verify_signed_link,
     verify_signed_link_token,
 )
-from .store import Store
+from .store import SchedulePrincipalAuthorityStoreError, Store
 from .terminal_takeover import TerminalTarget, bridge_terminal
 
 load_viventium_runtime_env()
@@ -127,7 +164,10 @@ def _build_runtime(runtime_backend: str, db_path: str, runtime: WorkerRuntime | 
         return runtime
     if runtime_backend == "stub":
         return StubRuntime()
-    return ProfiledWorkerRuntime(base_dir=str(Path(db_path).resolve().parent))
+    return ProfiledWorkerRuntime(
+        base_dir=str(Path(db_path).resolve().parent),
+        provider_account_db_path=str(Path(db_path).resolve()),
+    )
 
 
 def _workspace_link_auto_resume_enabled() -> bool:
@@ -149,16 +189,31 @@ def create_app(
     resolved_runtime_backend = (runtime_backend or os.environ.get("WPR_RUNTIME_BACKEND", "openclaw")).strip().lower()
     data_root = Path(resolved_db_path).resolve().parent
     store = Store(resolved_db_path)
+    control_plane = ControlPlaneStore(resolved_db_path)
+    provider_setup = ProviderSetupManager(
+        store=control_plane,
+        home_root=Path(
+            os.environ.get("GLASSHIVE_PROVIDER_ACCOUNT_HOME_ROOT")
+            or (data_root / "provider_accounts")
+        ).expanduser(),
+    )
     runtime_impl = _build_runtime(resolved_runtime_backend, resolved_db_path, runtime)
-    service = WorkersProjectsService(store, runtime_impl)
+    capability_broker = getattr(runtime_impl, "capability_broker", None)
+    if capability_broker is None:
+        capability_broker = GlassHiveCapabilityBroker.from_environment()
+    service = WorkersProjectsService(store, runtime_impl, control_plane_store=control_plane)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.store = store
         app.state.service = service
+        app.state.control_plane = control_plane
+        app.state.provider_setup = provider_setup
+        app.state.capability_broker = capability_broker
         try:
             yield
         finally:
+            provider_setup.shutdown()
             service.shutdown()
 
     app = FastAPI(
@@ -168,6 +223,9 @@ def create_app(
     )
     app.state.store = store
     app.state.service = service
+    app.state.control_plane = control_plane
+    app.state.provider_setup = provider_setup
+    app.state.capability_broker = capability_broker
 
     @app.exception_handler(HostWorkersDisabledError)
     async def host_workers_disabled_handler(request: Request, exc: HostWorkersDisabledError) -> JSONResponse:
@@ -249,6 +307,25 @@ def create_app(
             },
         )
 
+    @app.exception_handler(SchedulingOwnerError)
+    async def scheduling_owner_error_handler(request: Request, exc: SchedulingOwnerError) -> JSONResponse:
+        _ = request
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "detail": str(exc),
+                "error": {"code": exc.code, "message": str(exc)},
+            },
+        )
+
+    @app.exception_handler(ControlPlaneError)
+    async def control_plane_error_handler(request: Request, exc: ControlPlaneError) -> JSONResponse:
+        _ = request
+        return JSONResponse(
+            status_code=409 if isinstance(exc, ControlPlaneConflict) else 400,
+            content={"detail": str(exc)},
+        )
+
     @app.exception_handler(GlassHiveProfileNotAllowedError)
     async def profile_not_allowed_handler(request: Request, exc: GlassHiveProfileNotAllowedError) -> JSONResponse:
         _ = request
@@ -280,7 +357,10 @@ def create_app(
     if api_token and mcp_token and hmac.compare_digest(api_token, mcp_token):
         raise RuntimeError("GLASSHIVE_MCP_API_KEY must be distinct from WPR_API_TOKEN")
     auth_settings = EnterpriseAuthSettings()
-    auth_settings.validate_startup(api_token=api_token)
+    auth_settings.validate_startup(
+        api_token=api_token,
+        assertion_replay_consumer=store.consume_internal_assertion_jti,
+    )
     unauthenticated_prefixes = (
         "/health",
         "/r/",
@@ -315,22 +395,21 @@ def create_app(
                 if path_parts[3:] != ["artifacts", expected_action]:
                     return None
                 artifact_path = str(request.query_params.get("path") or "").strip().lstrip("/")
-            elif kind == "worker_view" and path_parts[3:] and path_parts[3] in {
-                "assign",
-                "desktop-action",
-                "interrupt",
-                "live",
-                "message",
-                "pause",
-                "resume",
-                "terminate",
-            }:
+            elif (
+                kind == "worker_view"
+                and request.method.upper() == "GET"
+                and path_parts[3:] == ["live"]
+            ) or (
+                kind == "worker_view"
+                and request.method.upper() == "POST"
+                and path_parts[3:] in (["message"], ["steer"])
+            ):
                 artifact_path = ""
             else:
                 return None
         elif len(path_parts) >= 3 and path_parts[0] == "ui" and path_parts[1] == "workers":
             worker_id = path_parts[2]
-            if kind != "worker_view":
+            if kind != "worker_view" or request.method.upper() != "GET" or len(path_parts) != 3:
                 return None
         else:
             return None
@@ -351,8 +430,19 @@ def create_app(
         return AuthContext(
             tenant_id=str(worker.get("tenant_id") or "local"),
             user_id=str(worker.get("owner_id") or ""),
+            role="viewer",
             auth_mode="signed_link",
             enterprise=auth_settings.enterprise,
+        )
+
+    def _viewer_communication_allowed(request: Request) -> bool:
+        if request.method.upper() != "POST":
+            return False
+        return bool(
+            re.fullmatch(
+                r"/v1/workers/[A-Za-z0-9._-]{1,128}/(?:message|steer)",
+                request.url.path,
+            )
         )
 
     def _service_token_from_headers(headers) -> str:
@@ -361,6 +451,24 @@ def create_app(
             if token:
                 return token
         return ""
+
+    @app.middleware("http")
+    async def runtime_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; connect-src 'self' ws: wss:; object-src 'none'; "
+            "base-uri 'self'; frame-ancestors 'self'",
+        )
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        forwarded_proto = str(request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+        if request.url.scheme == "https" or forwarded_proto == "https":
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        return response
 
     @app.middleware("http")
     async def optional_bearer_auth(request: Request, call_next):
@@ -372,6 +480,18 @@ def create_app(
             or request.url.path.startswith(("/v1/responses/", "/v1/requests/"))
         )
         if provider_path and _token_matches(bearer, provider_token):
+            return await call_next(request)
+        internal_scheduler_path = request.url.path == "/internal/scheduling-cortex/workspace-runs"
+        if internal_scheduler_path:
+            assertion = str(
+                request.headers.get(SCHEDULING_CORTEX_ASSERTION_HEADER) or ""
+            ).strip()
+            token = _service_token_from_headers(request.headers)
+            if (
+                not assertion
+                or (api_token and not (_token_matches(token, api_token) or _token_matches(bearer, api_token)))
+            ):
+                return JSONResponse(status_code=401, content={"detail": "Unauthorized Scheduling Cortex request"})
             return await call_next(request)
         if not api_token:
             return await call_next(request)
@@ -402,6 +522,22 @@ def create_app(
             )
         except GlassHiveAuthError as exc:
             return JSONResponse(status_code=401, content={"detail": str(exc)})
+        ctx = request.state.auth_context
+        if ctx.auth_mode == "signed_internal_assertion":
+            read_only = request.method.upper() in {"GET", "HEAD", "OPTIONS"}
+            if read_only and "workspaces:read" not in ctx.scopes:
+                return JSONResponse(status_code=403, content={"detail": "Signed assertion is missing read scope"})
+            if not read_only:
+                if ctx.role.strip().lower() == "viewer":
+                    if not _viewer_communication_allowed(request):
+                        return JSONResponse(status_code=403, content={"detail": "Viewer role cannot modify workspaces"})
+                    if "workspaces:communicate" not in ctx.scopes:
+                        return JSONResponse(
+                            status_code=403,
+                            content={"detail": "Signed assertion is missing communication scope"},
+                        )
+                elif "workspaces:write" not in ctx.scopes:
+                    return JSONResponse(status_code=403, content={"detail": "Signed assertion is missing write scope"})
         return await call_next(request)
 
     def _auth_context(request: Request | None = None) -> AuthContext:
@@ -464,7 +600,11 @@ def create_app(
     def _preference_owner(ctx: AuthContext) -> str:
         if ctx.enterprise:
             return ctx.owner_id
-        return os.environ.get("WPR_DEFAULT_OWNER_ID", "").strip() or "demo-owner"
+        return (
+            os.environ.get("GLASSHIVE_DEFAULT_OWNER_ID", "").strip()
+            or os.environ.get("WPR_DEFAULT_OWNER_ID", "").strip()
+            or "demo-owner"
+        )
 
     def _blank_preferences(tenant_id: str, owner_id: str) -> dict:
         return {
@@ -544,7 +684,7 @@ def create_app(
         try:
             project = service.require_project(project_id)
         except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
         if ctx.enterprise and (
             project.get("tenant_id") != ctx.tenant_id or project.get("owner_id") != ctx.owner_id
         ):
@@ -556,7 +696,7 @@ def create_app(
         try:
             worker = service.require_worker(worker_id)
         except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
         if ctx.enterprise and (
             worker.get("tenant_id") != ctx.tenant_id or worker.get("owner_id") != ctx.owner_id
         ):
@@ -569,7 +709,7 @@ def create_app(
         try:
             run = service.require_run(run_id)
         except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
         if ctx.enterprise:
             worker = store.get_worker(str(run.get("worker_id") or ""))
             if not worker or worker.get("tenant_id") != ctx.tenant_id or worker.get("owner_id") != ctx.owner_id:
@@ -858,42 +998,96 @@ def create_app(
         if not raw_root:
             return None
         root = Path(raw_root)
-        if not root.exists():
+        if not root.exists() or root.is_symlink():
             return None
         candidates: list[Path] = []
         for pattern in ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif"):
             candidates.extend(root.rglob(pattern))
         visible = []
         for path in candidates:
+            if path.is_symlink():
+                continue
             try:
                 rel = path.relative_to(root)
             except ValueError:
                 continue
             if not is_user_deliverable_relative_path(rel):
                 continue
-            visible.append(path)
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(root.resolve(strict=True))
+                if not resolved.is_file():
+                    continue
+                modified_at = path.stat(follow_symlinks=False).st_mtime
+            except (OSError, ValueError):
+                continue
+            visible.append((modified_at, rel))
         if not visible:
             return None
-        return max(visible, key=lambda item: item.stat().st_mtime)
+        return max(visible, key=lambda item: item[0])[1]
 
-    def _artifact_path(worker: dict, relative_path: str) -> Path:
+    def _artifact_relative_path(worker: dict, relative_path: str) -> tuple[Path, Path]:
         raw_root = str(worker.get("workspace_dir") or "").strip()
         if not raw_root:
             raise HTTPException(status_code=404, detail="Worker workspace is not available")
-        root = Path(raw_root).resolve()
-        target = (root / relative_path.strip().lstrip("/")).resolve()
-        try:
-            rel = target.relative_to(root)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Artifact path is outside the worker workspace") from exc
+        root = Path(raw_root)
+        rel = Path(relative_path.strip().lstrip("/"))
+        if not rel.parts or rel.is_absolute() or any(part in {"", ".", ".."} for part in rel.parts):
+            raise HTTPException(status_code=400, detail="Artifact path is outside the worker workspace")
         if not is_user_deliverable_relative_path(rel):
             raise HTTPException(status_code=400, detail="Artifact path is not downloadable")
-        if not target.exists() or not target.is_file():
-            raise HTTPException(status_code=404, detail="Artifact not found")
-        max_bytes = int(os.environ.get("GLASSHIVE_ARTIFACT_DOWNLOAD_MAX_BYTES", str(100 * 1024 * 1024)))
-        if max_bytes >= 0 and target.stat().st_size > max_bytes:
-            raise HTTPException(status_code=413, detail="Artifact is larger than the configured download limit")
-        return target
+        return root, rel
+
+    def _artifact_snapshot(worker: dict, relative_path: str) -> tuple[Path, bytes]:
+        """Read a regular workspace file through no-follow directory descriptors.
+
+        Returning an immutable snapshot also removes the path validation/open race that a
+        FileResponse would otherwise introduce after containment checks.
+        """
+
+        root, rel = _artifact_relative_path(worker, relative_path)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        current_fd = -1
+        file_fd = -1
+        try:
+            current_fd = os.open(root, directory_flags)
+            for component in rel.parts[:-1]:
+                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            file_fd = os.open(rel.name, file_flags, dir_fd=current_fd)
+            metadata = os.fstat(file_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise HTTPException(status_code=400, detail="Artifact path is not a regular file")
+            max_bytes = int(os.environ.get("GLASSHIVE_ARTIFACT_DOWNLOAD_MAX_BYTES", str(100 * 1024 * 1024)))
+            if max_bytes >= 0 and metadata.st_size > max_bytes:
+                raise HTTPException(status_code=413, detail="Artifact is larger than the configured download limit")
+            with os.fdopen(file_fd, "rb", closefd=True) as handle:
+                file_fd = -1
+                content = handle.read(max_bytes + 1 if max_bytes >= 0 else -1)
+            if max_bytes >= 0 and len(content) > max_bytes:
+                raise HTTPException(status_code=413, detail="Artifact is larger than the configured download limit")
+            return Path(rel.name), content
+        except HTTPException:
+            raise
+        except (FileNotFoundError, NotADirectoryError):
+            raise HTTPException(status_code=404, detail="Artifact not found") from None
+        except OSError:
+            raise HTTPException(status_code=400, detail="Artifact path is not safely downloadable") from None
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+            if current_fd >= 0:
+                os.close(current_fd)
+
+    def _artifact_download_response(name: Path, content: bytes) -> Response:
+        headers = dict(ARTIFACT_DOWNLOAD_SECURITY_HEADERS)
+        ascii_name = "".join(character if 32 <= ord(character) < 127 and character not in {'"', '\\'} else "_" for character in name.name)
+        headers["Content-Disposition"] = (
+            f"attachment; filename=\"{ascii_name or 'artifact'}\"; filename*=UTF-8''{quote(name.name)}"
+        )
+        return Response(content=content, media_type=_artifact_mime_type(name), headers=headers)
 
     def _artifact_query_url(worker_id: str, action: str, relative_path: str) -> str:
         return f"/v1/workers/{quote(worker_id)}/artifacts/{action}?path={quote(str(relative_path or ''), safe='')}"
@@ -1004,15 +1198,20 @@ def create_app(
             or media_type in {"application/json", "application/xml", "application/x-yaml"}
         )
 
-    def _read_artifact_text_preview(target: Path) -> tuple[str, bool]:
+    def _read_artifact_text_preview(content: bytes) -> tuple[str, bool]:
         max_bytes = int(os.environ.get("GLASSHIVE_ARTIFACT_PREVIEW_MAX_BYTES", str(512 * 1024)))
         max_bytes = max(4096, min(max_bytes, 5 * 1024 * 1024))
-        with target.open("rb") as handle:
-            visible = handle.read(max_bytes)
-            truncated = bool(handle.read(1))
+        visible = content[:max_bytes]
+        truncated = len(content) > max_bytes
         return visible.decode("utf-8", errors="replace"), truncated
 
-    def _artifact_open_page(worker: dict, target: Path, relative_path: str, request: Request) -> HTMLResponse:
+    def _artifact_open_page(
+        worker: dict,
+        target: Path,
+        content: bytes,
+        relative_path: str,
+        request: Request,
+    ) -> HTMLResponse:
         download_url = _signed_artifact_action_url(
             worker,
             relative_path,
@@ -1021,10 +1220,10 @@ def create_app(
         )
         workspace_url = _signed_watch_action_url(worker)
         media_type = _artifact_mime_type(target)
-        size = target.stat().st_size
+        size = len(content)
         preview = ""
         if _is_text_preview_artifact(target, media_type):
-            text, truncated = _read_artifact_text_preview(target)
+            text, truncated = _read_artifact_text_preview(content)
             truncated_note = (
                 "<p class=\"notice\">Preview is truncated. Use Download file for the complete artifact.</p>"
                 if truncated
@@ -1035,8 +1234,7 @@ def create_app(
               <pre class="artifact-preview">{escape(text)}</pre>
             """
         elif media_type.startswith("image/") and media_type != "image/svg+xml" and size <= 2 * 1024 * 1024:
-            raw = target.read_bytes()
-            encoded = base64.b64encode(raw).decode("ascii")
+            encoded = base64.b64encode(content).decode("ascii")
             preview = f'<img class="image-preview" src="data:{escape(media_type, quote=True)};base64,{encoded}" alt="{escape(target.name, quote=True)}" />'
         else:
             preview = (
@@ -1102,6 +1300,8 @@ def create_app(
             return True
         if ctx.auth_mode == "signed_link":
             return False
+        if "runtime:internal_details" in ctx.scopes:
+            return True
         return ctx.role.strip().lower() in {"admin", "operator", "owner"}
 
     def _redact_worker_for_member(worker: dict) -> dict[str, object]:
@@ -1117,6 +1317,56 @@ def create_app(
         ):
             safe.pop(key, None)
         return safe
+
+    def _workspace_catalog_item(worker: dict) -> dict[str, object]:
+        """Project only rediscovery metadata; never return runtime credentials or host paths."""
+
+        allowed = {
+            "worker_id",
+            "project_id",
+            "name",
+            "role",
+            "profile",
+            "backend",
+            "execution_mode",
+            "alias",
+            "runtime",
+            "model",
+            "state",
+            "favorite",
+            "workspace_kind",
+            "tags",
+            "last_activity_at",
+            "compute_released_at",
+            "last_run_id",
+            "duplication_report",
+            "created_at",
+            "updated_at",
+            "project_title",
+            "provider_readiness",
+            "capability_readiness",
+            "next_schedule_at",
+            "schedule_readiness",
+        }
+        item = {key: worker.get(key) for key in allowed if key in worker}
+        raw_bundle = worker.get("bootstrap_bundle_json")
+        if isinstance(raw_bundle, str) and raw_bundle.strip():
+            try:
+                bundle = json.loads(raw_bundle)
+            except json.JSONDecodeError:
+                bundle = {}
+        else:
+            bundle = raw_bundle if isinstance(raw_bundle, dict) else {}
+        selection = bundle.get("provider_account") if isinstance(bundle, dict) else None
+        if isinstance(selection, dict):
+            policy = str(selection.get("policy") or "").strip()
+            account_id = str(selection.get("account_id") or "").strip()
+            if policy in {"legacy", "personal_preferred", "personal_required"}:
+                item["provider_account"] = {
+                    "policy": policy,
+                    **({"account_id": account_id} if account_id else {}),
+                }
+        return item
 
     def _redact_runtime_details(details: dict[str, object]) -> dict[str, object]:
         allowed = {"mode", "runtime", "sandbox_state"}
@@ -1218,7 +1468,7 @@ def create_app(
     def _require_admin_api(ctx: AuthContext) -> None:
         if auth_settings.enterprise and not _admin_api_enabled():
             raise HTTPException(status_code=404, detail="Not found")
-        if ctx.enterprise and ctx.role.strip().lower() not in {"admin", "owner", "operator"}:
+        if ctx.enterprise and ctx.role.strip().lower() not in {"admin", "owner", "operator", "tenant_admin"}:
             raise HTTPException(status_code=403, detail="Admin role required")
 
     def _telemetry_for_run(
@@ -1402,6 +1652,7 @@ def create_app(
         payload: dict[str, object] = {
             "status": "ok",
             "version": app.version,
+            "release": release_provenance(),
             "runtime_backend": visible_runtime_backend,
             "default_worker_profile": default_profile,
             "allowed_worker_profiles": allowed_worker_profiles(),
@@ -1434,6 +1685,770 @@ def create_app(
         normalized = _normalize_preference_payload(payload)
         prefs = store.upsert_user_preferences(tenant_id=tenant_id, owner_id=owner_id, **normalized)
         return UserPreferencesResponse(**prefs)
+
+    def _current_principal(request: Request) -> tuple[AuthContext, str, str]:
+        ctx = _auth_context(request)
+        tenant_id = ctx.tenant_id if ctx.enterprise else "local"
+        owner_id = _preference_owner(ctx)
+        if ctx.enterprise and not owner_id:
+            raise HTTPException(status_code=401, detail="Missing authenticated user assertion")
+        return ctx, tenant_id, owner_id
+
+    def _require_human_confirmation_scope(ctx: AuthContext) -> None:
+        if not ctx.enterprise and ctx.auth_mode == "local":
+            return
+        if ctx.auth_mode != "signed_internal_assertion" or "human:confirm" not in ctx.scopes:
+            raise HTTPException(status_code=403, detail="An authenticated human confirmation session is required")
+
+    @app.get("/v1/me")
+    def current_user(request: Request) -> dict[str, object]:
+        ctx, tenant_id, owner_id = _current_principal(request)
+        return {
+            "tenant_id": tenant_id,
+            "user_id": owner_id,
+            "email": ctx.email,
+            "role": ctx.role or ("member" if ctx.enterprise else "local_operator"),
+            "auth_mode": ctx.auth_mode,
+            "scopes": list(ctx.scopes),
+        }
+
+    @app.put("/v1/admin/principals/{principal_id}/schedule-authority")
+    def update_schedule_principal_authority(
+        principal_id: str,
+        payload: SchedulePrincipalAuthorityRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        ctx, tenant_id, _ = _current_principal(request)
+        if ctx.role.strip().lower() not in {"admin", "owner", "tenant_admin"}:
+            raise HTTPException(status_code=403, detail="Tenant administrator role required")
+        target = str(principal_id or "").strip()
+        if not target or len(target) > 512 or any(ord(character) < 32 for character in target):
+            raise HTTPException(status_code=400, detail="Schedule principal id is invalid")
+        try:
+            return service.set_schedule_principal_authority(
+                tenant_id=tenant_id,
+                owner_id=target,
+                enabled=payload.enabled,
+            )
+        except SchedulingOwnerError:
+            raise
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/v1/workspaces", response_model=WorkspaceCatalogResponse)
+    def list_workspaces(
+        request: Request,
+        kind: str = "named",
+        search: str = "",
+        tags: str = "",
+        favorite: bool | None = None,
+        cursor: str | None = None,
+        limit: int = 25,
+    ) -> WorkspaceCatalogResponse:
+        _, tenant_id, owner_id = _current_principal(request)
+        workspace_kinds = {value.strip() for value in kind.split(",") if value.strip()} if kind else set()
+        tag_values = [value.strip() for value in tags.split(",") if value.strip()]
+        try:
+            result = service.list_workspace_catalog(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                workspace_kinds=workspace_kinds,
+                search=search,
+                tags=tag_values,
+                favorite=favorite,
+                cursor=cursor,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return WorkspaceCatalogResponse(
+            items=[_workspace_catalog_item(item) for item in result.get("items", [])],
+            next_cursor=result.get("next_cursor"),
+        )
+
+    @app.patch("/v1/workspaces/{worker_id}")
+    def update_workspace(
+        worker_id: str,
+        payload: UpdateWorkspaceRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        require_worker(worker_id, request)
+        try:
+            worker = service.update_worker_metadata(
+                worker_id,
+                name=payload.name,
+                favorite=payload.favorite,
+                tags=payload.tags,
+                workspace_kind=payload.workspace_kind,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _workspace_catalog_item(worker)
+
+    @app.post("/v1/workspaces/{worker_id}/duplicate", status_code=201)
+    def duplicate_workspace(
+        worker_id: str,
+        payload: DuplicateWorkspaceRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        ctx, tenant_id, owner_id = _current_principal(request)
+        source = require_worker(worker_id, request)
+        requested_name = str(payload.name or "").strip()
+        reservation = control_plane.reserve_workspace_duplication(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            idempotency_key=payload.idempotency_key,
+            source_worker_id=worker_id,
+            requested_name=requested_name,
+        )
+        if reservation.get("idempotent_replay") and reservation.get("response"):
+            return {**dict(reservation["response"]), "idempotent_replay": True}
+        if reservation.get("failed_replay"):
+            failed_worker_id = str(reservation.get("worker_id") or "").strip()
+            failure = _redact_text(str(reservation.get("error_text") or "Workspace duplication failed"))
+            suffix = f" Failed workspace: {failed_worker_id}." if failed_worker_id else ""
+            raise ControlPlaneConflict(
+                f"Workspace duplication with this idempotency key previously failed: {failure}.{suffix} "
+                "No second workspace was created."
+            )
+        if reservation.get("in_progress"):
+            try:
+                stale_after_seconds = int(
+                    str(os.environ.get("GLASSHIVE_DUPLICATION_PENDING_STALE_SECONDS") or "900")
+                )
+            except ValueError:
+                stale_after_seconds = 900
+            stale_after_seconds = max(60, min(stale_after_seconds, 24 * 60 * 60))
+            reservation_age = max(0.0, time.time() - float(reservation.get("updated_at") or 0))
+            if reservation_age < stale_after_seconds:
+                raise ControlPlaneConflict("Workspace duplication with this key is already in progress")
+
+            reserved_project_id = str(reservation.get("project_id") or "").strip()
+            reserved_project = (
+                store.get_project(reserved_project_id, tenant_id=tenant_id, owner_id=owner_id)
+                if reserved_project_id
+                else None
+            )
+            reserved_workers = (
+                store.list_workers(reserved_project_id, tenant_id=tenant_id, owner_id=owner_id)
+                if reserved_project
+                else []
+            )
+            if reserved_project and len(reserved_workers) == 1:
+                recovered_worker = reserved_workers[0]
+                recovered_report = recovered_worker.get("duplication_report")
+                recovered_events = store.list_events(
+                    str(recovered_worker.get("worker_id") or ""),
+                    tenant_id=tenant_id,
+                )
+                has_completed_event = any(
+                    str(event.get("event_type") or "") == "worker.duplicated"
+                    for event in recovered_events
+                )
+                if isinstance(recovered_report, dict) and recovered_report and has_completed_event:
+                    source_grants = control_plane.list_workspace_grants(
+                        tenant_id=tenant_id,
+                        owner_id=owner_id,
+                        worker_id=worker_id,
+                    )
+                    recovered_workspace = _workspace_catalog_item(recovered_worker)
+                    report = dict(recovered_report)
+                    report["capabilities_requiring_reapproval"] = len(source_grants)
+                    recovered_workspace["duplication_report"] = report
+                    recovered_response: dict[str, object] = {
+                        "project": reserved_project,
+                        "workspace": recovered_workspace,
+                    }
+                    control_plane.complete_workspace_duplication(
+                        tenant_id=tenant_id,
+                        owner_id=owner_id,
+                        idempotency_key=payload.idempotency_key,
+                        project_id=reserved_project_id,
+                        worker_id=str(recovered_worker["worker_id"]),
+                        response=recovered_response,
+                    )
+                    return {**recovered_response, "idempotent_replay": True}
+
+            failed_worker_id = (
+                str(reserved_workers[0].get("worker_id") or "")
+                if len(reserved_workers) == 1
+                else ""
+            )
+            if reserved_project and not reserved_workers and store.delete_project_if_empty(
+                reserved_project_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            ):
+                reserved_project_id = ""
+            elif not reserved_project:
+                reserved_project_id = ""
+            control_plane.fail_workspace_duplication(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                idempotency_key=payload.idempotency_key,
+                error_text=(
+                    "Stale workspace duplication reservation could not be safely reconciled; "
+                    "no second workspace was created"
+                ),
+                project_id=reserved_project_id,
+                worker_id=failed_worker_id,
+            )
+            if not reserved_project_id and not failed_worker_id:
+                raise ControlPlaneConflict(
+                    "Stale workspace duplication had no completed workspace; its empty state was cleaned "
+                    "up and it is safe to retry with the same idempotency key"
+                )
+            raise ControlPlaneConflict(
+                "Stale workspace duplication could not be proven complete; its original state was preserved "
+                "for diagnosis and no second workspace was created"
+            )
+
+        project: dict[str, object] = {}
+        try:
+            source_grants = control_plane.list_workspace_grants(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+            )
+            source_project = require_project(str(source.get("project_id") or ""), request)
+            source_name = str(source.get("name") or "Workspace").strip() or "Workspace"
+            duplicate_name = requested_name or f"{source_name} copy"
+            project = service.create_project(
+                owner_id,
+                f"{str(source_project.get('title') or source_name).strip()} copy",
+                str(source_project.get("goal") or ""),
+                str(source.get("profile") or "codex-cli"),
+                tenant_id=tenant_id,
+                project_id=str(reservation["project_id"]),
+            )
+            control_plane.record_workspace_duplication_project(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                idempotency_key=payload.idempotency_key,
+                project_id=str(project["project_id"]),
+            )
+            worker = service.duplicate_worker(
+                worker_id,
+                str(project["project_id"]),
+                _request_owner(ctx, owner_id),
+                duplicate_name,
+                str(source.get("role") or "main"),
+            )
+            workspace = _workspace_catalog_item(worker)
+            report = dict(workspace.get("duplication_report") or {})
+            report["capabilities_requiring_reapproval"] = len(source_grants)
+            workspace["duplication_report"] = report
+            response: dict[str, object] = {"project": project, "workspace": workspace}
+            control_plane.complete_workspace_duplication(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                idempotency_key=payload.idempotency_key,
+                project_id=str(project["project_id"]),
+                worker_id=str(worker["worker_id"]),
+                response=response,
+            )
+            return {**response, "idempotent_replay": False}
+        except Exception as exc:
+            project_id = str(project.get("project_id") or reservation.get("project_id") or "")
+            failed_worker_id = ""
+            if project_id:
+                failed_project = store.get_project(
+                    project_id,
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                )
+                if not failed_project:
+                    project_id = ""
+                else:
+                    failed_workers = store.list_workers(
+                        project_id,
+                        tenant_id=tenant_id,
+                        owner_id=owner_id,
+                    )
+                    if failed_workers:
+                        failed_worker_id = str(failed_workers[0].get("worker_id") or "")
+                    elif store.delete_project_if_empty(
+                        project_id,
+                        tenant_id=tenant_id,
+                        owner_id=owner_id,
+                    ):
+                        project_id = ""
+            failure = _redact_text(str(exc) or "Workspace duplication failed")
+            control_plane.fail_workspace_duplication(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                idempotency_key=payload.idempotency_key,
+                error_text=failure,
+                project_id=project_id,
+                worker_id=failed_worker_id,
+            )
+            if failed_worker_id:
+                raise ControlPlaneConflict(
+                    "Workspace duplication failed; its failed workspace state was preserved and retrying "
+                    "this idempotency key will return the original failure without creating another workspace"
+                ) from exc
+            if not project_id:
+                raise ControlPlaneConflict(
+                    "Workspace duplication failed before a workspace was created; the empty project was "
+                    "removed and it is safe to retry with the same idempotency key"
+                ) from exc
+            raise ControlPlaneConflict(
+                "Workspace duplication failed; retrying this idempotency key will return the original "
+                "failure without creating another project"
+            ) from exc
+
+    @app.get("/v1/workspace-templates")
+    def list_workspace_templates(request: Request) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        return {
+            "items": service.list_workspace_templates(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+        }
+
+    @app.post("/v1/workspaces/{worker_id}/templates", status_code=201)
+    def save_workspace_template(
+        worker_id: str,
+        payload: SaveWorkspaceTemplateRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        require_worker(worker_id, request)
+        return service.save_workspace_template(
+            worker_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            name=payload.name,
+            description=payload.description,
+            lineage_id=payload.lineage_id,
+        )
+
+    @app.post("/v1/workspace-templates/{template_id}/instantiate", status_code=201)
+    def instantiate_workspace_template(
+        template_id: str,
+        payload: InstantiateWorkspaceTemplateRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        try:
+            result = service.instantiate_workspace_template(
+                template_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                idempotency_key=payload.idempotency_key,
+                name=payload.name,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="Workspace template not found")
+        return {
+            **result,
+            "workspace": _workspace_catalog_item(dict(result.get("workspace") or {})),
+        }
+
+    @app.get("/v1/provider-accounts")
+    def list_provider_accounts(request: Request) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        return {"items": control_plane.list_provider_accounts(tenant_id=tenant_id, owner_id=owner_id)}
+
+    @app.post("/v1/provider-accounts", status_code=201)
+    def create_provider_account(payload: CreateProviderAccountRequest, request: Request) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        broker_route = payload.auth_method in {"api_key", "enterprise_route"}
+        if broker_route and payload.provider not in {"codex", "openai"}:
+            raise HTTPException(
+                status_code=409,
+                detail="The reviewed inference broker supports only Codex with an OpenAI API key or enterprise route",
+            )
+        support = provider_platform_support(
+            provider=payload.provider,
+            auth_method=payload.auth_method,
+        )
+        if support != "supported":
+            raise HTTPException(
+                status_code=409,
+                detail=f"This provider account route is unavailable: {support}",
+            )
+        if broker_route:
+            try:
+                GlassHiveInferenceBroker.from_environment().principal_for_owner(
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                )
+            except InferenceBrokerError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return control_plane.create_provider_account(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            provider=payload.provider,
+            label=payload.label,
+            auth_method=payload.auth_method,
+            platform_support=support,
+            secret_locator="broker://librechat-openai" if broker_route else payload.secret_locator,
+            make_default=payload.make_default,
+            status="ready" if broker_route else "disconnected",
+        )
+
+    @app.post("/v1/provider-accounts/{account_id}/setup")
+    def start_provider_account_setup(account_id: str, request: Request) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        return provider_setup.start(account_id=account_id, tenant_id=tenant_id, owner_id=owner_id)
+
+    @app.get("/v1/provider-accounts/{account_id}/setup")
+    def provider_account_setup_status(account_id: str, request: Request) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        return provider_setup.status(account_id=account_id, tenant_id=tenant_id, owner_id=owner_id)
+
+    @app.post("/v1/provider-accounts/{account_id}/setup/cancel")
+    def cancel_provider_account_setup(account_id: str, request: Request) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        return provider_setup.cancel(account_id=account_id, tenant_id=tenant_id, owner_id=owner_id)
+
+    @app.post("/v1/provider-accounts/{account_id}/verify")
+    def verify_provider_account(account_id: str, request: Request) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        account = control_plane.get_provider_account(
+            account_id=account_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+        if account is None:
+            raise ControlPlaneError("Provider account not found for this user")
+        if str(account.get("auth_method") or "") == "subscription":
+            return provider_setup.status(
+                account_id=account_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+        try:
+            GlassHiveInferenceBroker.from_environment().principal_for_owner(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+        except InferenceBrokerError:
+            updated = control_plane.update_provider_account_status(
+                account_id=account_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                status="action_required",
+                reconnect_reason="Reconnect this account in the managed connected-accounts page",
+            )
+            return {
+                "account_id": account_id,
+                "status": updated["status"],
+                "complete": True,
+                "message": updated["reconnect_reason"],
+            }
+        updated = control_plane.update_provider_account_status(
+            account_id=account_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            status="ready",
+            reconnect_reason="",
+            verified=True,
+        )
+        return {
+            "account_id": account_id,
+            "status": updated["status"],
+            "complete": True,
+            "message": "Connected account reference verified.",
+        }
+
+    @app.post("/v1/provider-accounts/{account_id}/disconnect")
+    def disconnect_provider_account(account_id: str, request: Request) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        return provider_setup.disconnect(account_id=account_id, tenant_id=tenant_id, owner_id=owner_id)
+
+    @app.delete("/v1/provider-accounts/{account_id}")
+    def forget_provider_account(account_id: str, request: Request) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        return control_plane.forget_provider_account(
+            account_id=account_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+
+    @app.get("/v1/connections")
+    def list_connections(request: Request) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        items = control_plane.list_connections(tenant_id=tenant_id, owner_id=owner_id)
+        if getattr(capability_broker, "configured", True) is False:
+            return {"items": items}
+        try:
+            readiness = capability_broker.status(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                execution_mode=_configured_default_execution_mode(),
+            )
+            broker_items = list(readiness.get("connections") or [])
+            if not broker_items:
+                broker_items = [
+                    {
+                        "connection_id": "librechat:capability-broker",
+                        "label": "Connected services",
+                        "kind": "user_scoped_capability_broker",
+                        "adapter": "librechat_capability_broker",
+                        "status": str(readiness.get("status") or "broker_unavailable"),
+                    }
+                ]
+            items.extend(broker_items)
+        except CapabilityBrokerError as exc:
+            items.append(
+                {
+                    "connection_id": "librechat:capability-broker",
+                    "label": "Connected services",
+                    "kind": "user_scoped_capability_broker",
+                    "adapter": "librechat_capability_broker",
+                    "status": (
+                        "unmapped"
+                        if exc.code == "owner_binding_required"
+                        else "broker_unavailable"
+                    ),
+                }
+            )
+        return {"items": items}
+
+    @app.get("/v1/library")
+    def list_library(request: Request) -> dict[str, object]:
+        _current_principal(request)
+        return {"items": control_plane.list_library()}
+
+    @app.post("/v1/library/proposals", status_code=201)
+    def propose_library_item(
+        payload: CreateLibraryProposalRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        return control_plane.create_library_proposal(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            manifest=payload.manifest,
+        )
+
+    @app.get("/v1/library/proposals")
+    def list_my_library_proposals(request: Request) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        return {
+            "items": control_plane.list_library_proposals(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+        }
+
+    @app.post("/v1/admin/library", status_code=201)
+    def publish_library_item(
+        payload: PublishLibraryManifestRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        ctx, _, owner_id = _current_principal(request)
+        _require_admin_api(ctx)
+        return control_plane.publish_library_manifest(
+            manifest=payload.manifest,
+            published_by=owner_id or "local-operator",
+        )
+
+    @app.get("/v1/admin/library/proposals")
+    def list_library_proposals_for_review(
+        request: Request,
+        status: str = "pending",
+    ) -> dict[str, object]:
+        ctx, tenant_id, _ = _current_principal(request)
+        _require_admin_api(ctx)
+        return {
+            "items": control_plane.list_library_proposals(
+                tenant_id=tenant_id,
+                status=status,
+            )
+        }
+
+    @app.post("/v1/admin/library/proposals/{proposal_id}/review")
+    def review_library_proposal(
+        proposal_id: str,
+        payload: ReviewLibraryProposalRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        ctx, tenant_id, owner_id = _current_principal(request)
+        _require_admin_api(ctx)
+        return control_plane.review_library_proposal(
+            proposal_id=proposal_id,
+            tenant_id=tenant_id,
+            action=payload.action,
+            reason=payload.reason,
+            actor_id=owner_id or "local-operator",
+        )
+
+    @app.patch("/v1/admin/library/{library_id}")
+    def update_library_item_status(
+        library_id: str,
+        payload: UpdateLibraryStatusRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        ctx, _, owner_id = _current_principal(request)
+        _require_admin_api(ctx)
+        return control_plane.update_library_status(
+            library_id=library_id,
+            status=payload.status,
+            reason=payload.reason,
+            actor_id=owner_id or "local-operator",
+        )
+
+    @app.get("/v1/admin/library/{library_id}/events")
+    def list_library_item_events(library_id: str, request: Request) -> dict[str, object]:
+        ctx, _, _ = _current_principal(request)
+        _require_admin_api(ctx)
+        return {"items": control_plane.list_library_events(library_id=library_id)}
+
+    @app.get("/v1/workspaces/{worker_id}/capability-grants")
+    def list_workspace_capability_grants(worker_id: str, request: Request) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        require_worker(worker_id, request)
+        return {
+            "items": control_plane.list_workspace_grants(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+            )
+        }
+
+    @app.delete("/v1/workspaces/{worker_id}/capability-grants/{grant_id}")
+    def revoke_workspace_capability_grant(
+        worker_id: str,
+        grant_id: str,
+        request: Request,
+    ) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        worker = require_worker(worker_id, request)
+        revoked = control_plane.revoke_workspace_grant(
+            grant_id=grant_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+        )
+        store.add_event(
+            str(worker.get("project_id") or ""),
+            worker_id,
+            None,
+            "workspace.capability_removed",
+            "Workspace capability removed",
+        )
+        return revoked
+
+    @app.post("/v1/pending-changes", status_code=201)
+    def create_pending_change(payload: CreatePendingChangeRequest, request: Request) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        worker: dict[str, object] | None = None
+        if payload.change_type in {"workspace_grant", "library_enable", "library_upgrade"}:
+            library_id = str(payload.payload.get("library_id") or "").strip()
+            connection_id = str(payload.payload.get("connection_id") or "").strip()
+            account_id = str(payload.payload.get("account_id") or "").strip()
+            capability_ids = [library_id, connection_id, account_id]
+            if sum(bool(value) for value in capability_ids) != 1:
+                raise HTTPException(status_code=400, detail="A workspace change must name exactly one capability")
+            if connection_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Connected services must be activated through their brokered workspace bundle",
+                )
+            if account_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Provider accounts must be selected through the workspace execution policy",
+                )
+            worker = require_worker(payload.target_id, request)
+            if str(worker.get("owner_id") or "") != owner_id:
+                raise HTTPException(status_code=404, detail="Workspace not found")
+        elif payload.change_type == "workspace_provider_account":
+            worker = require_worker(payload.target_id, request)
+            if str(worker.get("owner_id") or "") != owner_id:
+                raise HTTPException(status_code=404, detail="Workspace not found")
+        pending = control_plane.create_pending_change(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            change_type=payload.change_type,
+            target_id=payload.target_id,
+            payload=payload.payload,
+            ttl_seconds=5 * 60,
+        )
+        if worker is not None:
+            store.add_event(
+                str(worker.get("project_id") or ""),
+                str(worker.get("worker_id") or ""),
+                None,
+                "workspace.capability_review_prepared",
+                "Workspace capability review prepared",
+            )
+        return pending
+
+    @app.get("/v1/pending-changes/{change_id}")
+    def get_pending_change(change_id: str, request: Request) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        try:
+            return control_plane.get_pending_change(
+                change_id=change_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+        except ControlPlaneError as exc:
+            if "not found for this user" in str(exc):
+                raise HTTPException(status_code=404, detail="Pending change not found") from exc
+            raise
+
+    @app.post("/v1/pending-changes/{change_id}/confirm")
+    def confirm_pending_change(
+        change_id: str,
+        payload: ConfirmPendingChangeRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        ctx, tenant_id, owner_id = _current_principal(request)
+        _require_human_confirmation_scope(ctx)
+        try:
+            pending = control_plane.get_pending_change(
+                change_id=change_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            result = control_plane.confirm_pending_change(
+                change_id=change_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                confirmation_token=payload.confirmation_token,
+            )
+            worker = require_worker(str(pending.get("target_id") or ""), request)
+            pending_type = str(pending.get("change_type") or "")
+            if pending_type == "workspace_provider_account":
+                event_type = "workspace.provider_account_changed"
+                event_summary = "Workspace account selection changed for future runs"
+            elif pending_type == "library_upgrade":
+                event_type = "workspace.capability_upgraded"
+                event_summary = "Approved capability upgraded for workspace"
+            else:
+                event_type = "workspace.capability_enabled"
+                event_summary = "Approved capability enabled for workspace"
+            store.add_event(
+                str(worker.get("project_id") or ""),
+                str(worker.get("worker_id") or ""),
+                None,
+                event_type,
+                event_summary,
+            )
+            return result
+        except ControlPlaneError as exc:
+            if "not found for this user" in str(exc):
+                raise HTTPException(status_code=404, detail="Pending change not found") from exc
+            raise
+
+    @app.get("/v1/activity")
+    def list_activity(request: Request, limit: int = 50) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        return {
+            "items": store.list_owner_activity(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                limit=limit,
+            )
+        }
 
     @app.post("/v1/projects", response_model=ProjectResponse, status_code=201)
     def create_project(payload: CreateProjectRequest, request: Request) -> ProjectResponse:
@@ -1487,6 +2502,8 @@ def create_app(
             bootstrap_bundle=payload.bootstrap_bundle,
             tenant_id=tenant_id,
             start_synchronously=payload.start_synchronously,
+            workspace_kind=payload.workspace_kind,
+            tags=payload.tags,
         )
         return WorkerResponse(**worker)
 
@@ -1515,6 +2532,8 @@ def create_app(
             bootstrap_bundle=payload.bootstrap_bundle,
             tenant_id=tenant_id,
             start_synchronously=payload.start_synchronously,
+            workspace_kind=payload.workspace_kind,
+            tags=payload.tags,
         )
         return WorkerResponse(**worker)
 
@@ -1594,6 +2613,208 @@ def create_app(
         )
         return {"items": [ScheduleResponse(**item) for item in schedules]}
 
+    @app.get("/v1/recurring-schedules")
+    def list_recurring_schedules(
+        request: Request,
+        include_inactive: bool = False,
+        limit: int = 100,
+    ) -> dict[str, list[RecurringScheduleDefinitionResponse]]:
+        _, tenant_id, owner_id = _current_principal(request)
+        definitions = service.list_recurring_schedules(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            include_inactive=include_inactive,
+            limit=limit,
+        )
+        return {"items": [RecurringScheduleDefinitionResponse(**item) for item in definitions]}
+
+    @app.get("/v1/workers/{worker_id}/recurring-schedules")
+    def list_worker_recurring_schedules(
+        worker_id: str,
+        request: Request,
+        include_inactive: bool = False,
+        limit: int = 100,
+    ) -> dict[str, list[RecurringScheduleDefinitionResponse]]:
+        _, tenant_id, owner_id = _current_principal(request)
+        require_worker(worker_id, request)
+        definitions = service.list_recurring_schedules(
+            worker_id=worker_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            include_inactive=include_inactive,
+            limit=limit,
+        )
+        return {"items": [RecurringScheduleDefinitionResponse(**item) for item in definitions]}
+
+    @app.post(
+        "/v1/workers/{worker_id}/recurring-schedules",
+        response_model=RecurringScheduleDefinitionResponse,
+        status_code=201,
+    )
+    def create_worker_recurring_schedule(
+        worker_id: str,
+        payload: CreateRecurringScheduleRequest,
+        request: Request,
+    ) -> RecurringScheduleDefinitionResponse:
+        require_worker(worker_id, request)
+        try:
+            definition = service.create_recurring_schedule(
+                worker_id,
+                payload.instruction,
+                recurrence_type=payload.recurrence_type,
+                interval_seconds=payload.interval_seconds,
+                local_time=payload.local_time,
+                timezone_name=payload.timezone_name,
+                dst_policy=payload.dst_policy,
+                first_run_at=payload.first_run_at,
+                cron_expression=payload.cron_expression,
+                rrule=payload.rrule,
+                starts_at=payload.starts_at,
+                ends_at=payload.ends_at,
+                enabled=payload.enabled,
+                overlap_policy=payload.overlap_policy,
+                misfire_grace_seconds=payload.misfire_grace_seconds,
+                catch_up_policy=payload.catch_up_policy,
+                max_catch_up_occurrences=payload.max_catch_up_occurrences,
+                jitter_seconds=payload.jitter_seconds,
+                schedule_text=payload.schedule_text,
+                runtime_bundle=payload.bootstrap_bundle,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return RecurringScheduleDefinitionResponse(**definition)
+
+    @app.get(
+        "/v1/recurring-schedules/{definition_id}",
+        response_model=RecurringScheduleDefinitionResponse,
+    )
+    def get_recurring_schedule(
+        definition_id: str,
+        request: Request,
+    ) -> RecurringScheduleDefinitionResponse:
+        _, tenant_id, owner_id = _current_principal(request)
+        definition = service.get_recurring_schedule(
+            definition_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+        if not definition:
+            raise HTTPException(status_code=404, detail="Recurring schedule not found")
+        return RecurringScheduleDefinitionResponse(**definition)
+
+    @app.patch(
+        "/v1/recurring-schedules/{definition_id}",
+        response_model=RecurringScheduleDefinitionResponse,
+    )
+    def update_recurring_schedule(
+        definition_id: str,
+        payload: UpdateRecurringScheduleRequest,
+        request: Request,
+    ) -> RecurringScheduleDefinitionResponse:
+        _, tenant_id, owner_id = _current_principal(request)
+        payload_dict = payload.model_dump(exclude_none=True)
+        try:
+            definition = service.update_recurring_schedule(
+                definition_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                updates=payload_dict,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not definition:
+            raise HTTPException(status_code=404, detail="Recurring schedule not found")
+        return RecurringScheduleDefinitionResponse(**definition)
+
+    @app.delete(
+        "/v1/recurring-schedules/{definition_id}",
+        response_model=RecurringScheduleDefinitionResponse,
+    )
+    def retire_recurring_schedule(
+        definition_id: str,
+        request: Request,
+    ) -> RecurringScheduleDefinitionResponse:
+        _, tenant_id, owner_id = _current_principal(request)
+        definition = service.retire_recurring_schedule(
+            definition_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+        if not definition:
+            raise HTTPException(status_code=404, detail="Recurring schedule not found")
+        return RecurringScheduleDefinitionResponse(**definition)
+
+    @app.post("/v1/recurring-schedules/{definition_id}/run-now")
+    def run_recurring_schedule_now(
+        definition_id: str,
+        payload: RunRecurringScheduleNowRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        try:
+            result = service.run_recurring_schedule_now(
+                definition_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                idempotency_token=payload.idempotency_key,
+            )
+        except SchedulingOwnerError:
+            raise
+        except ScheduleActionRequiredError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": exc.failure_class,
+                    "message": exc.user_message,
+                    "recovery": exc.recovery,
+                },
+            ) from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not result:
+            raise HTTPException(status_code=404, detail="Recurring schedule not found")
+        return result
+
+    @app.get("/v1/recurring-schedules/{definition_id}/occurrences")
+    def list_recurring_schedule_occurrences(
+        definition_id: str,
+        request: Request,
+        limit: int = 50,
+    ) -> dict[str, list[RecurringScheduleOccurrenceResponse]]:
+        _, tenant_id, owner_id = _current_principal(request)
+        definition = service.get_recurring_schedule(
+            definition_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+        if not definition:
+            raise HTTPException(status_code=404, detail="Recurring schedule not found")
+        occurrences = service.list_recurring_schedule_occurrences(
+            definition_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            limit=limit,
+        )
+        return {"items": [RecurringScheduleOccurrenceResponse(**item) for item in occurrences]}
+
+    @app.post(
+        "/v1/recurring-schedules/{definition_id}/deactivate",
+        response_model=RecurringScheduleDefinitionResponse,
+    )
+    def deactivate_recurring_schedule(
+        definition_id: str,
+        request: Request,
+    ) -> RecurringScheduleDefinitionResponse:
+        _, tenant_id, owner_id = _current_principal(request)
+        definition = service.deactivate_recurring_schedule(
+            definition_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+        if not definition:
+            raise HTTPException(status_code=404, detail="Recurring schedule not found")
+        return RecurringScheduleDefinitionResponse(**definition)
+
     @app.get("/v1/runs/{run_id}", response_model=RunResponse)
     def get_run(run_id: str, request: Request) -> RunResponse:
         run = require_run(run_id, request)
@@ -1623,6 +2844,120 @@ def create_app(
             ),
         )
         return RunResponse(**run, effort=normalized_effort)
+
+    @app.post(
+        "/internal/scheduling-cortex/workspace-runs",
+        response_model=RunResponse,
+        status_code=202,
+    )
+    def assign_scheduling_cortex_workspace_run(
+        payload: SchedulingCortexWorkspaceRunRequest,
+        request: Request,
+    ) -> RunResponse:
+        expected_secret = str(os.environ.get("VIVENTIUM_SCHEDULER_SECRET") or "").strip()
+        assertion = str(request.headers.get(SCHEDULING_CORTEX_ASSERTION_HEADER) or "").strip()
+        if not verify_scheduling_cortex_workspace_assertion(
+            assertion,
+            secret=expected_secret,
+            request_payload=payload.model_dump(),
+        ):
+            raise HTTPException(status_code=401, detail="Unauthorized Scheduling Cortex request")
+        try:
+            recurrence_owner = service.recurring_schedule_owner()
+        except ValueError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if recurrence_owner != DELEGATED_RECURRENCE_OWNER:
+            raise HTTPException(
+                status_code=409,
+                detail="Scheduling Cortex is not the configured recurrence owner",
+            )
+        worker = store.get_worker(payload.worker_id)
+        if not worker:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        service_identity = AuthContext(
+            tenant_id=payload.tenant_id,
+            user_id=payload.owner_id,
+            role="service",
+            scopes=("runtime:access", "workspaces:write"),
+            auth_mode="scheduling_cortex",
+            enterprise=True,
+        )
+        if (
+            str(worker.get("project_id") or "") != payload.project_id
+            or str(worker.get("tenant_id") or "local") != payload.tenant_id
+            or not owner_matches_auth_context(worker.get("owner_id"), service_identity)
+        ):
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        if str(worker.get("execution_mode") or "docker") != payload.execution_mode:
+            raise HTTPException(
+                status_code=409,
+                detail="Scheduled workspace execution mode changed; refresh the recurring definition",
+            )
+        try:
+            service.revalidate_scheduling_cortex_workspace_fire(
+                worker,
+                tenant_id=payload.tenant_id,
+                owner_id=payload.owner_id,
+            )
+        except SchedulePrincipalAuthorityError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "Scheduled principal authority requires user action",
+                    "reason": exc.failure_class,
+                    "failure_class": exc.failure_class,
+                    "failure_retryable": False,
+                    "action_required": True,
+                    "detail": str(exc),
+                },
+            )
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "Scheduled workspace authority requires user action",
+                    "reason": "workspace_fire_revalidation_failed",
+                    "failure_class": "workspace_fire_revalidation_failed",
+                    "failure_retryable": False,
+                    "action_required": True,
+                    "detail": str(exc),
+                },
+            )
+        if not service.scheduling_cortex_callback_config(payload.occurrence_id):
+            raise HTTPException(
+                status_code=503,
+                detail="Scheduling Cortex callback configuration is unavailable",
+            )
+        try:
+            schedule = store.create_or_get_cortex_workspace_schedule(
+                occurrence_id=payload.occurrence_id,
+                worker_id=payload.worker_id,
+                project_id=payload.project_id,
+                tenant_id=payload.tenant_id,
+                owner_id=str(worker.get("owner_id") or payload.owner_id),
+                instruction=payload.instruction,
+                require_principal_authority=multi_user_security_enabled(),
+            )
+        except SchedulePrincipalAuthorityStoreError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "Scheduled principal authority requires user action",
+                    "reason": "principal_disabled",
+                    "failure_class": "principal_disabled",
+                    "failure_retryable": False,
+                    "action_required": True,
+                    "detail": str(exc),
+                },
+            )
+        if str(schedule.get("state") or "") == "pending":
+            schedule = store.claim_schedule(str(schedule["schedule_id"])) or store.get_schedule(
+                str(schedule["schedule_id"])
+            )
+        if not schedule:
+            raise HTTPException(status_code=409, detail="Workspace occurrence could not be claimed")
+        run = service.assign_scheduled_run(schedule)
+        return RunResponse(**run)
 
     @app.post("/v1/workers/{worker_id}/message", response_model=RunResponse, status_code=202)
     def send_message(worker_id: str, payload: SendMessageRequest, request: Request) -> RunResponse:
@@ -1724,12 +3059,13 @@ def create_app(
         )
 
     @app.get("/v1/workers/{worker_id}/artifacts/latest-image")
-    def latest_worker_image(worker_id: str, request: Request) -> FileResponse:
+    def latest_worker_image(worker_id: str, request: Request) -> Response:
         worker = require_worker(worker_id, request)
         latest = _latest_image_path(worker)
-        if latest is None or not latest.exists():
+        if latest is None:
             raise HTTPException(status_code=404, detail="No image artifacts found for this worker")
-        return FileResponse(latest)
+        target, content = _artifact_snapshot(worker, latest.as_posix())
+        return Response(content=content, media_type=_artifact_mime_type(target))
 
     def _require_authenticated_link_ref_scope(payload: dict[str, object], request: Request) -> None:
         ctx = _auth_context(request)
@@ -1799,12 +3135,12 @@ def create_app(
         kind = str(payload.get("kind") or "")
         if kind in {"artifact_download", "artifact_open"}:
             path = str(payload.get("path") or "").strip().lstrip("/")
-            target = _artifact_path(worker, path)
+            target, content = _artifact_snapshot(worker, path)
             if kind == "artifact_open":
                 store.add_event(worker["project_id"], worker_id, None, "worker.artifact_opened", target.name)
-                return _artifact_open_page(worker, target, path, request)
+                return _artifact_open_page(worker, target, content, path, request)
             store.add_event(worker["project_id"], worker_id, None, "worker.artifact_downloaded", target.name)
-            return FileResponse(target, filename=target.name, headers=ARTIFACT_DOWNLOAD_SECURITY_HEADERS)
+            return _artifact_download_response(target, content)
         raise HTTPException(status_code=400, detail="Signed link kind is not supported")
 
     @app.get("/v1/signed-links/{token}")
@@ -2121,16 +3457,16 @@ def create_app(
     @app.get("/v1/workers/{worker_id}/artifacts/open")
     def open_worker_artifact(worker_id: str, path: str, request: Request) -> HTMLResponse:
         worker = require_worker(worker_id, request)
-        target = _artifact_path(worker, path)
+        target, content = _artifact_snapshot(worker, path)
         store.add_event(worker["project_id"], worker_id, None, "worker.artifact_opened", target.name)
-        return _artifact_open_page(worker, target, path, request)
+        return _artifact_open_page(worker, target, content, path, request)
 
     @app.get("/v1/workers/{worker_id}/artifacts/download")
-    def download_worker_artifact(worker_id: str, path: str, request: Request) -> FileResponse:
+    def download_worker_artifact(worker_id: str, path: str, request: Request) -> Response:
         worker = require_worker(worker_id, request)
-        target = _artifact_path(worker, path)
+        target, content = _artifact_snapshot(worker, path)
         store.add_event(worker["project_id"], worker_id, None, "worker.artifact_downloaded", target.name)
-        return FileResponse(target, filename=target.name, headers=ARTIFACT_DOWNLOAD_SECURITY_HEADERS)
+        return _artifact_download_response(target, content)
 
     @app.get("/v1/metrics/summary", response_model=MetricsSummary)
     def metrics(request: Request) -> MetricsSummary:
@@ -3269,6 +4605,16 @@ def create_app(
                 except GlassHiveAuthError:
                     await websocket.close(code=4401)
                     return
+        if (
+            ctx.auth_mode == "signed_link"
+            or ctx.role.strip().lower() == "viewer"
+            or (
+                ctx.auth_mode == "signed_internal_assertion"
+                and "runtime:internal_details" not in ctx.scopes
+            )
+        ):
+            await websocket.close(code=4403)
+            return
         worker = store.get_worker(
             worker_id,
             tenant_id=ctx.tenant_id if ctx.enterprise else None,

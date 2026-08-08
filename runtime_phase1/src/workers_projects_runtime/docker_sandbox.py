@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -16,6 +19,7 @@ from urllib.request import Request, urlopen
 from .bootstrap import apply_bootstrap
 from .openclaw_release import (
     OPENCLAW_RUNTIME_FAST_URI_VERSION,
+    OPENCLAW_RUNTIME_LOCK_SHA256,
     OPENCLAW_RUNTIME_VERSION,
     require_reviewed_openclaw_version,
     reviewed_openclaw_env,
@@ -37,6 +41,10 @@ SAFE_DOCKER_EXEC_ENV_KEYS = {
     "LC_CTYPE",
     "LC_MESSAGES",
     "PYTHONIOENCODING",
+    # These selectors point only at the control-plane-validated, mission-scoped
+    # bind mount. Without them the CLI silently falls back to the worker home.
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
     # Provider keys are run-scoped: the worker launch script unsets them before
     # handing control to the post-run interactive shell.
     "OPENAI_API_KEY",
@@ -85,6 +93,7 @@ SAFE_DOCKER_EXEC_ENV_KEYS = {
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
 }
+VNC_PASSWORD_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~!@#$%^&*+=?"
 
 AI_WORKER_BROWSER_EXTENSION_UPDATE_URL = "https://clients2.google.com/service/update2/crx"
 AI_WORKER_BROWSER_EXTENSION_IDS = {
@@ -99,11 +108,21 @@ AI_WORKER_BROWSER_EXTENSION_POLICY_PATHS = (
     "/etc/chromium/policies/managed/glasshive-ai-worker-extensions.json",
     "/etc/opt/chrome/policies/managed/glasshive-ai-worker-extensions.json",
 )
-AI_WORKER_CODEX_NPM_SPEC = os.environ.get("WPR_SANDBOX_CODEX_NPM_SPEC", "@openai/codex@0.142.0").strip() or "@openai/codex@0.142.0"
+AI_WORKER_CODEX_NPM_SPEC = os.environ.get("WPR_SANDBOX_CODEX_NPM_SPEC", "@openai/codex@0.146.1").strip() or "@openai/codex@0.146.1"
 AI_WORKER_CLAUDE_CODE_NPM_SPEC = (
-    os.environ.get("WPR_SANDBOX_CLAUDE_CODE_NPM_SPEC", "@anthropic-ai/claude-code@2.1.186").strip()
-    or "@anthropic-ai/claude-code@2.1.186"
+    os.environ.get("WPR_SANDBOX_CLAUDE_CODE_NPM_SPEC", "@anthropic-ai/claude-code@2.1.223").strip()
+    or "@anthropic-ai/claude-code@2.1.223"
 )
+AI_WORKER_BASE_IMAGE = os.environ.get(
+    "WPR_SANDBOX_BASE_IMAGE",
+    "selenium/standalone-chromium:4.46.0-20260707@sha256:3400b92f1cddb2dfaaf358654e8f7d83d7be45192fb73c5f28c25faa28d36504",
+).strip()
+AI_WORKER_PYTHON_LOCK_PATH = (
+    Path(__file__).resolve().parents[2] / "workstation-requirements.lock"
+)
+AI_WORKER_PYTHON_LOCK_SHA256 = hashlib.sha256(
+    AI_WORKER_PYTHON_LOCK_PATH.read_bytes()
+).hexdigest()
 
 
 def _enabled_ai_worker_browser_extension_names() -> tuple[str, ...]:
@@ -379,6 +398,10 @@ class SandboxInfo:
     selenium_port: int | None = None
     openclaw_port: int | None = None
     security_options: tuple[str, ...] = ()
+    networks: tuple[str, ...] = ()
+    mounts: tuple[tuple[str, str], ...] = ()
+    desktop_auth_ready: bool | None = None
+    desktop_auth_fingerprint: str | None = None
 
 
 def _safe_docker_exec_env(env: dict[str, str] | None) -> dict[str, str]:
@@ -391,7 +414,9 @@ def _safe_docker_exec_env(env: dict[str, str] | None) -> dict[str, str]:
 
 class DockerSandboxManager:
     _build_lock = Lock()
-    _default_image = "workers-projects-runtime-workstation:phase1-node22-docs8-openclaw2026.7.1-2"
+    _desktop_credentials_lock = Lock()
+    _default_image = "workers-projects-runtime-workstation:phase1-node22-docs8-openclaw2026.7.1-4"
+    _provider_account_mount_target = "/workspace/.provider-account"
 
     def __init__(self, base_dir: str | None = None) -> None:
         self.base_dir = Path(base_dir) if base_dir else Path(__file__).resolve().parents[2] / "data"
@@ -400,6 +425,8 @@ class DockerSandboxManager:
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         self.build_root.mkdir(parents=True, exist_ok=True)
         self.image = os.environ.get("WPR_SANDBOX_IMAGE", self._default_image)
+        self._managed_image = not bool(str(os.environ.get("WPR_SANDBOX_IMAGE") or "").strip())
+        self.base_image = AI_WORKER_BASE_IMAGE
         self.user = os.environ.get("WPR_SANDBOX_USER", "seluser")
         self.home_mount = os.environ.get("WPR_SANDBOX_HOME", "/workspace/.wpr-home")
         self.workspace_mount = os.environ.get("WPR_SANDBOX_WORKSPACE", "/workspace/project")
@@ -417,8 +444,14 @@ class DockerSandboxManager:
         self.novnc_container_port = int(os.environ.get("WPR_SANDBOX_NOVNC_PORT", "7900"))
         self.selenium_container_port = int(os.environ.get("WPR_SANDBOX_SELENIUM_PORT", "4444"))
         self.openclaw_container_port = int(os.environ.get("WPR_SANDBOX_OPENCLAW_PORT", "18789"))
-        self.vnc_password = os.environ.get("WPR_SANDBOX_VNC_PASSWORD", "secret")
-        self.vnc_no_password = os.environ.get("WPR_SANDBOX_VNC_NO_PASSWORD", "1").strip().lower() in {"1", "true", "yes", "on"}
+        self.vnc_no_password = self._env_flag("WPR_SANDBOX_VNC_NO_PASSWORD", False)
+        if self.vnc_no_password and not (
+            str(os.environ.get("GLASSHIVE_SECURITY_MODE") or "").strip().lower() == "single_user"
+            and self._env_flag("WPR_ALLOW_INSECURE_LOCAL_DESKTOP", False)
+        ):
+            raise RuntimeError(
+                "GlassHive refuses a passwordless desktop unless explicit insecure local single-user mode is enabled"
+            )
         self.memory_limit = os.environ.get("WPR_SANDBOX_MEMORY", "3g").strip()
         self.memory_swap_limit = os.environ.get("WPR_SANDBOX_MEMORY_SWAP", self.memory_limit).strip()
         self.cpu_limit = os.environ.get("WPR_SANDBOX_CPUS", "2").strip()
@@ -465,21 +498,35 @@ class DockerSandboxManager:
         needs_path_repair = False
         if (
             sandbox is not None
-            and self._sandbox_needs_chromium_userns_recreate(sandbox)
+            and (
+                self._sandbox_needs_chromium_userns_recreate(sandbox)
+                or self._sandbox_needs_network_recreate(worker["worker_id"], sandbox)
+                or self._sandbox_needs_provider_mount_recreate(worker, sandbox)
+                or self._sandbox_needs_desktop_auth_recreate(worker["worker_id"], sandbox)
+            )
             and self._worker_state_allows_substrate_recreate(worker)
         ):
             self._docker(["rm", "-f", sandbox.container_name], check=False)
+            self._remove_isolated_network(sandbox.container_name)
             self._invalidate_inspect_cache(worker["worker_id"])
             sandbox = None
             needs_idle_prime = True
             needs_path_repair = True
+        if sandbox is not None and (
+            self._sandbox_needs_network_recreate(worker["worker_id"], sandbox)
+            or self._sandbox_needs_provider_mount_recreate(worker, sandbox)
+            or self._sandbox_needs_desktop_auth_recreate(worker["worker_id"], sandbox)
+        ):
+            raise RuntimeError(
+                "Worker sandbox isolation does not match this mission; pause the worker so GlassHive can recreate it safely"
+            )
         if sandbox is None:
             fast_sandbox = self.fast_sandbox_from_worker(worker)
             if fast_sandbox is not None:
                 return fast_sandbox
             self._ensure_image()
             self._invalidate_inspect_cache(worker["worker_id"])
-            self._create_container(container_name, paths)
+            self._create_container(container_name, paths, worker=worker)
             self._invalidate_inspect_cache(worker["worker_id"])
             sandbox = self.inspect(worker["worker_id"])
             needs_idle_prime = True
@@ -502,6 +549,8 @@ class DockerSandboxManager:
             raise RuntimeError("Failed to start worker sandbox")
         if needs_path_repair or (repair_paths and self._env_flag("WPR_REPAIR_RUNNING_CONTAINER_ROOTS", False)):
             self._ensure_container_writable_paths(sandbox.container_name, self._default_writable_container_paths())
+        if self._provider_account_mount(worker) is not None:
+            self._grant_provider_account_access(sandbox.container_name, worker)
         self._repair_provider_temp_ownership(sandbox.container_name)
         self._harden_secret_runtime_files(sandbox.container_name)
         if needs_idle_prime:
@@ -549,6 +598,29 @@ class DockerSandboxManager:
             status = "paused"
         pid = state.get("Pid")
         ports = entry.get("NetworkSettings", {}).get("Ports") or {}
+        networks = entry.get("NetworkSettings", {}).get("Networks") or {}
+        raw_mounts = entry.get("Mounts") or []
+        raw_environment = entry.get("Config", {}).get("Env") or []
+        container_environment = {
+            str(value).split("=", 1)[0]: str(value).split("=", 1)[1]
+            for value in raw_environment
+            if isinstance(value, str) and "=" in value
+        }
+        desktop_auth_values = (
+            container_environment.get("SE_VNC_PASSWORD", ""),
+            container_environment.get("SE_ROUTER_USERNAME", ""),
+            container_environment.get("SE_ROUTER_PASSWORD", ""),
+        )
+        desktop_auth_ready = (
+            container_environment.get("SE_VNC_NO_PASSWORD", "").strip().lower()
+            in {"0", "false", "no", "off"}
+            and all(desktop_auth_values)
+        )
+        desktop_auth_fingerprint = (
+            self._desktop_auth_fingerprint(*desktop_auth_values)
+            if desktop_auth_ready
+            else None
+        )
         sandbox = SandboxInfo(
             container_name=container_name,
             container_id=str(entry.get("Id") or "").strip() or None,
@@ -565,6 +637,21 @@ class DockerSandboxManager:
                 for option in (host_config.get("SecurityOpt") or [])
                 if option
             ),
+            networks=tuple(sorted(str(name) for name in networks if name)),
+            mounts=tuple(
+                sorted(
+                    (
+                        str(mount.get("Source") or ""),
+                        str(mount.get("Destination") or ""),
+                    )
+                    for mount in raw_mounts
+                    if isinstance(mount, dict)
+                    and str(mount.get("Source") or "")
+                    and str(mount.get("Destination") or "")
+                )
+            ),
+            desktop_auth_ready=desktop_auth_ready,
+            desktop_auth_fingerprint=desktop_auth_fingerprint,
         )
         self._inspect_cache[worker_id] = (now, sandbox)
         return sandbox
@@ -588,6 +675,7 @@ class DockerSandboxManager:
         return self.inspect(worker_id) or sandbox
 
     def terminate(self, worker_id: str) -> SandboxInfo:
+        container_name = self._container_name(worker_id)
         sandbox = self.inspect(worker_id)
         if sandbox is not None:
             remaining = sandbox
@@ -601,8 +689,9 @@ class DockerSandboxManager:
                 raise RuntimeError(
                     f"Docker sandbox {sandbox.container_name} is still running after termination"
                 )
+        self._remove_isolated_network(container_name)
         return SandboxInfo(
-            container_name=self._container_name(worker_id),
+            container_name=container_name,
             container_id=None,
             state="terminated",
             workspace_dir=str(self._paths(worker_id)["workspace_dir"]),
@@ -636,6 +725,16 @@ class DockerSandboxManager:
             f"TERM={self.term_value}",
         ]
         merged_env = _safe_docker_exec_env(env)
+        secret_keys = {
+            key
+            for key in merged_env
+            if key.endswith(("_KEY", "_TOKEN", "_SECRET", "_PASSWORD"))
+            or key in {"AWS_ACCESS_KEY_ID", "PORTKEY_VIRTUAL_KEY"}
+        }
+        if secret_keys:
+            raise ValueError(
+                "Secret-bearing worker commands must use GlassHive's managed execution path so values stay out of argv"
+            )
         for key, value in sorted(merged_env.items()):
             if value is None:
                 continue
@@ -907,7 +1006,7 @@ screen -ls | awk -v target="$target" '
         return {
             "action": normalized,
             "container_name": sandbox.container_name,
-            "view_url": self._view_url_from_sandbox(sandbox),
+            "view_url": self._view_url_from_sandbox(worker_id, sandbox),
             "status": "launched",
         }
 
@@ -915,7 +1014,7 @@ screen -ls | awk -v target="$target" '
         sandbox = self.inspect(worker_id)
         paths = self._paths(worker_id)
         view_health = self._desktop_view_health(worker_id, sandbox)
-        view_url = self._view_url_from_sandbox(sandbox) if view_health.get("healthy") else None
+        view_url = self._view_url_from_sandbox(worker_id, sandbox) if view_health.get("healthy") else None
         return {
             "driver": "docker",
             "image": sandbox.image if sandbox else self.image,
@@ -936,14 +1035,15 @@ screen -ls | awk -v target="$target" '
 
     def view_url(self, worker_id: str) -> str | None:
         sandbox = self.inspect(worker_id)
-        return self._view_url_from_sandbox(sandbox)
+        return self._view_url_from_sandbox(worker_id, sandbox)
 
-    def _view_url_from_sandbox(self, sandbox: SandboxInfo | None) -> str | None:
+    def _view_url_from_sandbox(self, worker_id: str, sandbox: SandboxInfo | None) -> str | None:
         if sandbox is None or sandbox.novnc_port is None:
             return None
+        credentials = self._desktop_credentials(worker_id)
         query = urlencode(
             {
-                **({"password": self.vnc_password} if not self.vnc_no_password else {}),
+                **({"password": credentials["vnc_password"]} if not self.vnc_no_password else {}),
                 "autoconnect": "1",
                 "resize": "scale",
                 "reconnect": "1",
@@ -955,6 +1055,8 @@ screen -ls | awk -v target="$target" '
     def _desktop_view_health(self, worker_id: str, sandbox: SandboxInfo | None) -> dict[str, object]:
         if sandbox is None or sandbox.state != "running" or sandbox.novnc_port is None:
             return {"healthy": False, "reason": "desktop_not_running"}
+        if sandbox.desktop_auth_ready is False or self._sandbox_needs_desktop_auth_recreate(worker_id, sandbox):
+            return {"healthy": False, "reason": "desktop_authentication_required"}
         now = time.monotonic()
         cached = self._novnc_health_cache.get(worker_id)
         if cached and cached[0] > now:
@@ -1185,7 +1287,9 @@ screen -ls | awk -v target="$target" '
     @staticmethod
     def _worker_state_allows_substrate_recreate(worker: dict | None) -> bool:
         state = str((worker or {}).get("state") or "").strip().lower()
-        return state in {"ready", "failed", "cancelled", "interrupted"}
+        return state in {"ready", "failed", "cancelled", "interrupted"} or (
+            state == "running" and bool((worker or {}).get("_glasshive_task_run"))
+        )
 
     def _sandbox_needs_chromium_userns_recreate(self, sandbox: SandboxInfo) -> bool:
         if not self._env_flag("WPR_SANDBOX_ALLOW_CHROMIUM_USERNS", True):
@@ -1194,6 +1298,235 @@ screen -ls | awk -v target="$target" '
         if security_options is None:
             return False
         return self.chromium_userns_security_opt not in security_options
+
+    def _network_name_for_container(self, container_name: str) -> str:
+        clean = "".join(
+            character if character.isalnum() or character in {"-", "_"} else "-"
+            for character in str(container_name or "")
+        ).strip("-_")
+        if not clean:
+            raise RuntimeError("Worker sandbox container name is invalid")
+        configured = str(os.environ.get("WPR_SANDBOX_ISOLATED_NETWORK") or "").strip()
+        if configured:
+            if not all(character.isalnum() or character in {"-", "_"} for character in configured):
+                raise RuntimeError("Worker sandbox network name is invalid")
+            return configured[:63]
+        deployment_id = hashlib.sha256(
+            str(self.runtime_root.resolve()).encode("utf-8")
+        ).hexdigest()[:12]
+        # All workstations for one deployment share the same ICC-disabled bridge.
+        # Docker's bridge isolation then denies A→B traffic; separate bridges can
+        # be routed through the host and do not provide tenant isolation.
+        return f"wpr-workers-{deployment_id}"
+
+    def _network_name(self, worker_id: str) -> str:
+        return self._network_name_for_container(self._container_name(worker_id))
+
+    def _sandbox_needs_network_recreate(self, worker_id: str, sandbox: SandboxInfo) -> bool:
+        networks = tuple(getattr(sandbox, "networks", ()) or ())
+        # Older test/compatibility projections did not retain network metadata. Real Docker inspect
+        # always reports it; an explicit shared/default network must never be accepted.
+        return bool(networks) and networks != (self._network_name(worker_id),)
+
+    def _provider_account_mount(self, worker: dict | None) -> tuple[str, str] | None:
+        candidate = worker or {}
+        raw_host = str(
+            candidate.get("_glasshive_provider_account_mount_host") or ""
+        ).strip()
+        raw_target = str(
+            candidate.get("_glasshive_provider_account_mount_target") or ""
+        ).strip()
+        if not raw_host and not raw_target:
+            return None
+        if not candidate.get("_glasshive_provider_account_bound"):
+            raise RuntimeError(
+                "Provider account mount was not validated by the GlassHive control plane"
+            )
+        if raw_target != self._provider_account_mount_target:
+            raise RuntimeError("Provider account mount target is invalid")
+        host = Path(raw_host)
+        if not host.is_absolute() or host.is_symlink() or not host.is_dir():
+            raise RuntimeError("Provider account mount source is invalid")
+        resolved = host.resolve(strict=True)
+        if resolved == Path(resolved.anchor):
+            raise RuntimeError("Provider account mount source is too broad")
+        return str(resolved), raw_target
+
+    def terminate_containers_mounting_provider_account(self, account_home: Path) -> list[str]:
+        """Remove stale GlassHive containers that still expose one account home.
+
+        A hard API crash can outlive the durable DB lease while Docker keeps the
+        bind mount.  Reuse is allowed only after every matching mount is gone.
+        """
+
+        resolved_home = str(Path(account_home).resolve(strict=True))
+        listed = self._docker(
+            ["ps", "-aq", "--filter", "name=^/wpr-"],
+            check=False,
+            capture_output=True,
+            timeout_sec=self.inspect_timeout_sec,
+        )
+        if listed.returncode != 0:
+            raise RuntimeError("GlassHive could not inspect stale provider-account mounts")
+        container_ids = [value.strip() for value in str(listed.stdout or "").splitlines() if value.strip()]
+        if not container_ids:
+            return []
+        inspected = self._docker(
+            ["inspect", *container_ids],
+            check=False,
+            capture_output=True,
+            timeout_sec=max(self.inspect_timeout_sec, 10),
+        )
+        if inspected.returncode != 0:
+            raise RuntimeError("GlassHive could not inspect stale provider-account containers")
+        try:
+            payload = json.loads(inspected.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("GlassHive provider-account mount inspection returned invalid data") from exc
+        removed: list[str] = []
+        for entry in payload if isinstance(payload, list) else []:
+            mounts = entry.get("Mounts") if isinstance(entry, dict) else None
+            if not isinstance(mounts, list) or not any(
+                str(mount.get("Source") or "") == resolved_home
+                and str(mount.get("Destination") or "") == self._provider_account_mount_target
+                for mount in mounts
+                if isinstance(mount, dict)
+            ):
+                continue
+            container_name = str(entry.get("Name") or "").lstrip("/")
+            container_id = str(entry.get("Id") or "").strip()
+            if not container_name.startswith("wpr-") or not container_id:
+                raise RuntimeError("GlassHive found an unrecognized provider-account mount owner")
+            removed_result = self._docker(
+                ["rm", "-f", container_id],
+                check=False,
+                capture_output=True,
+                timeout_sec=max(self.inspect_timeout_sec, 10),
+            )
+            if removed_result.returncode != 0:
+                raise RuntimeError("GlassHive could not remove a stale provider-account mount")
+            self._remove_isolated_network(container_name)
+            removed.append(container_name)
+        return removed
+
+    def _sandbox_needs_provider_mount_recreate(
+        self, worker: dict | None, sandbox: SandboxInfo
+    ) -> bool:
+        expected = self._provider_account_mount(worker)
+        actual = tuple(
+            mount
+            for mount in (getattr(sandbox, "mounts", ()) or ())
+            if mount[1] == self._provider_account_mount_target
+        )
+        return actual != (() if expected is None else (expected,))
+
+    def _grant_provider_account_access(
+        self,
+        container_name: str,
+        worker: dict,
+    ) -> None:
+        """Give only this rootless container's worker user access to the selected home."""
+
+        mount = self._provider_account_mount(worker)
+        if mount is None:
+            return
+        mount_target = Path(mount[1])
+        raw_environment = worker.get("_glasshive_provider_account_env")
+        if not isinstance(raw_environment, dict) or len(raw_environment) != 1:
+            raise RuntimeError("Provider account mount is missing its private runtime home")
+        runtime_home = Path(str(next(iter(raw_environment.values())) or "").strip())
+        try:
+            runtime_home.relative_to(mount_target)
+        except ValueError as exc:
+            raise RuntimeError("Provider account runtime home is outside its private mount") from exc
+        if runtime_home == mount_target:
+            raise RuntimeError("Provider account runtime home must select one provider directory")
+
+        quoted_mount = shlex.quote(str(mount_target))
+        quoted_home = shlex.quote(str(runtime_home))
+        container_user = shlex.quote(self.user.split(":", 1)[0] or self.user)
+        grant_script = (
+            "set -e; "
+            "command -v setfacl >/dev/null 2>&1; "
+            f"test -d {quoted_mount}; test -d {quoted_home}; "
+            f"setfacl -R -m u:{container_user}:rwX {quoted_mount}; "
+            f"find {quoted_mount} -type d -exec setfacl -m d:u:{container_user}:rwX {{}} +"
+        )
+        granted = self._docker_exec(
+            container_name,
+            ["bash", "-c", grant_script],
+            cwd=self.workspace_mount,
+            user="root",
+        )
+        if granted.returncode != 0:
+            raise RuntimeError(
+                "Provider account isolation requires POSIX ACL support in the reviewed worker image"
+            )
+
+        verify_script = (
+            f"set -e; test -r {quoted_home}; test -w {quoted_home}; test -x {quoted_home}"
+        )
+        verified = self._docker_exec(
+            container_name,
+            ["bash", "-c", verify_script],
+            cwd=self.workspace_mount,
+            user=self.user,
+        )
+        if verified.returncode != 0:
+            raise RuntimeError(
+                "The selected provider account home is not accessible to its isolated worker"
+            )
+
+    def _ensure_isolated_network(self, container_name: str) -> str:
+        network_name = self._network_name_for_container(container_name)
+        inspected = self._docker(
+            ["network", "inspect", network_name],
+            check=False,
+            capture_output=True,
+            timeout_sec=self.inspect_timeout_sec,
+        )
+        if inspected.returncode == 0:
+            try:
+                payload = json.loads(inspected.stdout or "[]")
+                entry = payload[0]
+            except (json.JSONDecodeError, IndexError, TypeError) as exc:
+                raise RuntimeError("Worker sandbox network inspection returned invalid data") from exc
+            options = entry.get("Options") if isinstance(entry, dict) else None
+            if not isinstance(options, dict) or str(
+                options.get("com.docker.network.bridge.enable_icc") or ""
+            ).lower() != "false":
+                raise RuntimeError("Worker sandbox network does not disable inter-container communication")
+            return network_name
+        created = self._docker(
+            [
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                "--opt",
+                "com.docker.network.bridge.enable_icc=false",
+                "--label",
+                "com.glasshive.isolated-worker-network=true",
+                network_name,
+            ],
+            check=False,
+            capture_output=True,
+            timeout_sec=self.inspect_timeout_sec,
+        )
+        if created.returncode != 0:
+            raise RuntimeError(
+                f"Failed to create isolated worker network {network_name}: "
+                f"{(created.stderr or created.stdout or '').strip()[-1000:]}"
+            )
+        return network_name
+
+    def _remove_isolated_network(self, container_name: str) -> None:
+        self._docker(
+            ["network", "rm", self._network_name_for_container(container_name)],
+            check=False,
+            capture_output=True,
+            timeout_sec=self.inspect_timeout_sec,
+        )
 
     def fast_sandbox_from_worker(self, worker: dict | None) -> SandboxInfo | None:
         if not worker or not self._worker_state_allows_fast_exec(worker):
@@ -1210,8 +1543,11 @@ screen -ls | awk -v target="$target" '
         sandbox = self.inspect(worker_id)
         if (
             sandbox is not None
-            and self._sandbox_needs_chromium_userns_recreate(sandbox)
-            and self._worker_state_allows_substrate_recreate(worker)
+            and (
+                self._sandbox_needs_chromium_userns_recreate(sandbox)
+                or self._sandbox_needs_network_recreate(worker_id, sandbox)
+                or self._sandbox_needs_provider_mount_recreate(worker, sandbox)
+            )
         ):
             return None
         return sandbox
@@ -1234,6 +1570,13 @@ screen -ls | awk -v target="$target" '
     def _ensure_host_dirs(self, paths: dict[str, Path]) -> None:
         paths["workspace_dir"].mkdir(parents=True, exist_ok=True)
         paths["home_dir"].mkdir(parents=True, exist_ok=True)
+        # Selenium's password-enabled VNC bootstrap writes its credential file
+        # below $HOME/.vnc before the interactive worker starts.  The host home
+        # bind masks the image's home, so create this private directory here.
+        vnc_dir = paths["home_dir"] / ".vnc"
+        vnc_dir.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            vnc_dir.chmod(0o700)
 
     def _seed_bootstrap(self, home_dir: Path, workspace_dir: Path, runtime_name: str, worker: dict) -> None:
         apply_bootstrap(
@@ -1264,18 +1607,46 @@ screen -ls | awk -v target="$target" '
         now = time.monotonic()
         if self._image_checked_at and self._image_checked_at + self.image_check_ttl_sec > now:
             return
-        if self._docker(["image", "inspect", self.image], check=False, timeout_sec=self.image_inspect_timeout_sec).returncode == 0:
+        inspected = self._docker(
+            ["image", "inspect", self.image],
+            check=False,
+            capture_output=True,
+            timeout_sec=self.image_inspect_timeout_sec,
+        )
+        if inspected.returncode == 0 and self._image_has_reviewed_provenance(inspected.stdout):
             self._image_checked_at = now
             return
+        if inspected.returncode == 0 and not self._managed_image:
+            raise RuntimeError(
+                "Configured worker image is missing the reviewed GlassHive provenance labels"
+            )
         with self._build_lock:
             now = time.monotonic()
             if self._image_checked_at and self._image_checked_at + self.image_check_ttl_sec > now:
                 return
-            if self._docker(["image", "inspect", self.image], check=False, timeout_sec=self.image_inspect_timeout_sec).returncode == 0:
+            inspected = self._docker(
+                ["image", "inspect", self.image],
+                check=False,
+                capture_output=True,
+                timeout_sec=self.image_inspect_timeout_sec,
+            )
+            if inspected.returncode == 0 and self._image_has_reviewed_provenance(inspected.stdout):
                 self._image_checked_at = now
                 return
+            if inspected.returncode == 0 and not self._managed_image:
+                raise RuntimeError(
+                    "Configured worker image is missing the reviewed GlassHive provenance labels"
+                )
+            if "@sha256:" not in self.base_image:
+                raise RuntimeError(
+                    "GlassHive worker base image must be pinned by immutable digest"
+                )
             dockerfile = self.build_root / "Dockerfile"
             stage_reviewed_openclaw_lock(self.build_root / "openclaw-runtime-lock")
+            shutil.copy2(
+                AI_WORKER_PYTHON_LOCK_PATH,
+                self.build_root / "workstation-requirements.lock",
+            )
             extension_policy = _ai_worker_browser_extension_policy_json()
             extension_policy_source = AI_WORKER_BROWSER_EXTENSION_POLICY_PATHS[0]
             extension_policy_dirs = " ".join(
@@ -1309,12 +1680,20 @@ screen -ls | awk -v target="$target" '
             dockerfile.write_text(
                 "\n".join(
                     [
-                        "FROM selenium/standalone-chromium:latest",
+                        f"FROM {self.base_image}",
+                        "LABEL com.glasshive.workstation.provenance=reviewed-v1",
+                        f"LABEL com.glasshive.workstation.base-image={self.base_image}",
+                        f"LABEL com.glasshive.workstation.codex-spec={AI_WORKER_CODEX_NPM_SPEC}",
+                        f"LABEL com.glasshive.workstation.claude-spec={AI_WORKER_CLAUDE_CODE_NPM_SPEC}",
+                        f"LABEL com.glasshive.workstation.openclaw-version={OPENCLAW_RUNTIME_VERSION}",
+                        f"LABEL com.glasshive.workstation.openclaw-lock-sha256={OPENCLAW_RUNTIME_LOCK_SHA256}",
+                        f"LABEL com.glasshive.workstation.python-lock-sha256={AI_WORKER_PYTHON_LOCK_SHA256}",
+                        "LABEL com.glasshive.workstation.provider-account-acl=required-v1",
                         "USER root",
-                        "RUN apt-get update && apt-get install -y --no-install-recommends bash ca-certificates curl file fonts-dejavu git gnupg jq less libreoffice-calc libreoffice-impress libreoffice-writer nano openssh-client pandoc pcmanfm poppler-utils procps python-is-python3 python3-pip ripgrep screen tmux tree vim wmctrl x11-utils xdotool xterm && rm -rf /var/lib/apt/lists/*",
+                        "RUN find /etc/apt -type f -name '*.sources' -exec sed -ri 's#https?://(archive|security).ubuntu.com/ubuntu/?#https://snapshot.ubuntu.com/ubuntu/20260707T000000Z/#g' {} +",
+                        "RUN apt-get update && apt-get install -y --no-install-recommends acl bash ca-certificates curl file fonts-dejavu git gnupg jq less libreoffice-calc libreoffice-impress libreoffice-writer nano openssh-client pandoc pcmanfm poppler-utils procps python-is-python3 python3-pip ripgrep screen tmux tree vim wmctrl x11-utils xdotool xterm && rm -rf /var/lib/apt/lists/*",
                         "RUN if [ ! -x /usr/bin/locale-check ]; then printf '%s\\n' '#!/bin/sh' 'locale_value=${1:-C.UTF-8}' 'echo LANG=$locale_value' 'echo LC_ALL=$locale_value' > /usr/bin/locale-check && chmod +x /usr/bin/locale-check; fi",
-                        "RUN mkdir -p /etc/apt/keyrings && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main' > /etc/apt/sources.list.d/nodesource.list",
-                        "RUN apt-get update && apt-get install -y --no-install-recommends nodejs && node --version && npm --version && rm -rf /var/lib/apt/lists/*",
+                        "RUN arch=$(dpkg --print-architecture) && case \"$arch\" in amd64) node_sha=eed0c5f0ab411f28783f81f051fcf7928ae8bf833e2df11f48f3fa78270025cb ;; arm64) node_sha=0018ee0bf997fce587042a2382941dcfac9f404fb994a5c3267fe7d12d8d837b ;; *) echo \"unsupported architecture: $arch\" >&2; exit 1 ;; esac && curl -fsSL \"https://deb.nodesource.com/node_22.x/pool/main/n/nodejs/nodejs_22.23.2-1nodesource1_${arch}.deb\" -o /tmp/nodejs.deb && echo \"${node_sha}  /tmp/nodejs.deb\" | sha256sum -c - && apt-get update && apt-get install -y --no-install-recommends /tmp/nodejs.deb && rm -f /tmp/nodejs.deb && node --version && npm --version && rm -rf /var/lib/apt/lists/*",
                         f"RUN npm install -g --cache /tmp/glasshive-npm-cache {npm_worker_specs} && npm cache clean --force --cache /tmp/glasshive-npm-cache && rm -rf /tmp/glasshive-npm-cache /root/.npm /home/seluser/.npm",
                         "COPY openclaw-runtime-lock/ /opt/glasshive-openclaw-runtime/",
                         (
@@ -1330,7 +1709,8 @@ screen -ls | awk -v target="$target" '
                             "&& npm cache clean --force --cache /tmp/glasshive-openclaw-npm-cache "
                             "&& rm -rf /tmp/glasshive-openclaw-npm-cache /root/.npm /home/seluser/.npm"
                         ),
-                        "RUN pip3 install --no-cache-dir selenium beautifulsoup4 markdown matplotlib openpyxl pdf2image pillow PyMuPDF PyPDF2 python-docx python-pptx reportlab requests xlsxwriter",
+                        "COPY workstation-requirements.lock /opt/glasshive-workstation-requirements.lock",
+                        "RUN pip3 install --no-cache-dir --require-hashes --no-deps -r /opt/glasshive-workstation-requirements.lock",
                         f"RUN mkdir -p {extension_policy_dirs} && {extension_policy_writes}",
                         f"RUN printf '%s\\n' {extension_check_script_lines} > /usr/local/bin/glasshive-browser-extension-check && chmod +x /usr/local/bin/glasshive-browser-extension-check && glasshive-browser-extension-check",
                         f"RUN printf '%s\\n' {native_host_bootstrap_script_lines} > /usr/local/bin/glasshive-browser-native-host-bootstrap && chmod +x /usr/local/bin/glasshive-browser-native-host-bootstrap",
@@ -1355,7 +1735,51 @@ screen -ls | awk -v target="$target" '
                 raise RuntimeError(f"Failed to build sandbox image {self.image}: {(result.stderr or result.stdout or '').strip()[-2000:]}")
             self._image_checked_at = time.monotonic()
 
-    def _create_container(self, container_name: str, paths: dict[str, Path]) -> None:
+    def _expected_image_provenance(self) -> dict[str, str]:
+        return {
+            "com.glasshive.workstation.provenance": "reviewed-v1",
+            "com.glasshive.workstation.base-image": self.base_image,
+            "com.glasshive.workstation.codex-spec": AI_WORKER_CODEX_NPM_SPEC,
+            "com.glasshive.workstation.claude-spec": AI_WORKER_CLAUDE_CODE_NPM_SPEC,
+            "com.glasshive.workstation.openclaw-version": OPENCLAW_RUNTIME_VERSION,
+            "com.glasshive.workstation.openclaw-lock-sha256": OPENCLAW_RUNTIME_LOCK_SHA256,
+            "com.glasshive.workstation.python-lock-sha256": AI_WORKER_PYTHON_LOCK_SHA256,
+            "com.glasshive.workstation.provider-account-acl": "required-v1",
+        }
+
+    def _image_has_reviewed_provenance(self, raw_inspect: str) -> bool:
+        try:
+            payload = json.loads(raw_inspect or "[]")
+            labels = payload[0]["Config"]["Labels"]
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+            return False
+        if not isinstance(labels, dict):
+            return False
+        return all(
+            str(labels.get(key) or "") == value
+            for key, value in self._expected_image_provenance().items()
+        )
+
+    def _create_container(
+        self,
+        container_name: str,
+        paths: dict[str, Path],
+        *,
+        worker: dict | None = None,
+    ) -> None:
+        network_name = self._ensure_isolated_network(container_name)
+        provider_mount = self._provider_account_mount(worker)
+        worker_id = str((worker or {}).get("worker_id") or container_name).strip()
+        desktop_credentials = self._desktop_credentials(worker_id, paths=paths)
+        secret_dir = paths.get("state_dir") or paths["home_dir"].parent
+        secret_dir.mkdir(parents=True, exist_ok=True)
+        secret_env_path = secret_dir / f".desktop-env-{secrets.token_hex(12)}"
+        descriptor = os.open(secret_env_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as secret_file:
+            secret_file.write(f"SE_VNC_PASSWORD={desktop_credentials['vnc_password']}\n")
+            secret_file.write(f"SE_ROUTER_PASSWORD={desktop_credentials['router_password']}\n")
+        if os.name != "nt":
+            secret_env_path.chmod(0o600)
         command = [
             "run",
             "-d",
@@ -1364,6 +1788,8 @@ screen -ls | awk -v target="$target" '
             container_name,
             "--hostname",
             container_name,
+            "--network",
+            network_name,
             "--workdir",
             self.workspace_mount,
             "-e",
@@ -1378,6 +1804,12 @@ screen -ls | awk -v target="$target" '
             f"XDG_CONFIG_HOME={self._browser_config_dir()}",
             "-e",
             f"SE_VNC_NO_PASSWORD={'1' if self.vnc_no_password else '0'}",
+            "-e",
+            f"SE_ROUTER_USERNAME={desktop_credentials['router_username']}",
+            "-e",
+            "SE_MASK_SECRETS=true",
+            "--env-file",
+            str(secret_env_path),
             *self._host_gateway_args(),
             *self._chromium_sandbox_args(),
             "-p",
@@ -1394,10 +1826,86 @@ screen -ls | awk -v target="$target" '
             f"{paths['home_dir']}:{self.home_mount}",
             self.image,
         ]
-        self._insert_resource_limits(command)
-        result = self._docker(command, check=False, capture_output=True)
+        try:
+            if provider_mount is not None:
+                command[-1:-1] = ["-v", f"{provider_mount[0]}:{provider_mount[1]}"]
+            self._insert_resource_limits(command)
+            result = self._docker(command, check=False, capture_output=True)
+        finally:
+            secret_env_path.unlink(missing_ok=True)
         if result.returncode != 0:
             raise RuntimeError(f"Failed to create worker sandbox {container_name}: {(result.stderr or result.stdout or '').strip()[-2000:]}")
+
+    @staticmethod
+    def _desktop_auth_fingerprint(vnc_password: str, router_username: str, router_password: str) -> str:
+        payload = "\0".join((vnc_password, router_username, router_password)).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _desktop_credentials(
+        self,
+        worker_id: str,
+        *,
+        paths: dict[str, Path] | None = None,
+    ) -> dict[str, str]:
+        resolved_paths = paths or self._paths(worker_id)
+        state_dir = resolved_paths.get("state_dir")
+        if state_dir is None:
+            state_dir = resolved_paths["home_dir"].parent / ".glasshive-state"
+        credential_path = state_dir / "desktop-credentials.json"
+        with self._desktop_credentials_lock:
+            if credential_path.exists():
+                try:
+                    payload = json.loads(credential_path.read_text())
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("Worker desktop credentials are unreadable; refusing an insecure fallback") from exc
+                credentials = {
+                    "vnc_password": str(payload.get("vnc_password") or ""),
+                    "router_username": str(payload.get("router_username") or ""),
+                    "router_password": str(payload.get("router_password") or ""),
+                }
+                if not all(credentials.values()):
+                    raise RuntimeError("Worker desktop credentials are incomplete; refusing an insecure fallback")
+                if os.name != "nt":
+                    credential_path.chmod(0o600)
+                return credentials
+
+            state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if os.name != "nt":
+                state_dir.chmod(0o700)
+            credentials = {
+                # The VNC protocol uses the first eight password bytes. Eight random
+                # printable characters provide the strongest useful secret without
+                # pretending that classic VNC accepts more than eight bytes.
+                "vnc_password": "".join(
+                    secrets.choice(VNC_PASSWORD_ALPHABET) for _ in range(8)
+                ),
+                "router_username": f"glasshive-{secrets.token_hex(4)}",
+                "router_password": secrets.token_urlsafe(32),
+            }
+            descriptor = os.open(credential_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                serialized = (json.dumps(credentials, sort_keys=True) + "\n").encode("utf-8")
+                os.write(descriptor, serialized)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            if os.name != "nt":
+                credential_path.chmod(0o600)
+            return credentials
+
+    def _sandbox_needs_desktop_auth_recreate(self, worker_id: str, sandbox: SandboxInfo) -> bool:
+        if self.vnc_no_password:
+            return False
+        if getattr(sandbox, "desktop_auth_ready", None) is None:
+            return False
+        if not sandbox.desktop_auth_ready or not getattr(sandbox, "desktop_auth_fingerprint", None):
+            return True
+        credentials = self._desktop_credentials(worker_id)
+        return sandbox.desktop_auth_fingerprint != self._desktop_auth_fingerprint(
+            credentials["vnc_password"],
+            credentials["router_username"],
+            credentials["router_password"],
+        )
 
     def _host_gateway_args(self) -> list[str]:
         if not self._env_flag("WPR_SANDBOX_ADD_HOST_GATEWAY", True):
@@ -1474,8 +1982,29 @@ screen -ls | awk -v target="$target" '
         args.extend(["-u", user or self.user])
         if cwd:
             args.extend(["-w", cwd])
-        for key, value in sorted((env or {}).items()):
-            args.extend(["-e", f"{key}={value}"])
+        env_file: Path | None = None
+        if env:
+            env_dir = self.runtime_root / ".docker-exec-env"
+            env_dir.mkdir(parents=True, exist_ok=True)
+            if os.name != "nt":
+                env_dir.chmod(0o700)
+            env_file = env_dir / f"exec-{secrets.token_hex(16)}.env"
+            descriptor = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                    for key, value in sorted(env.items()):
+                        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key)):
+                            raise ValueError("Docker exec environment contains an invalid variable name")
+                        text_value = str(value)
+                        if any(character in text_value for character in "\r\n\0"):
+                            raise ValueError("Docker exec environment values must be single-line text")
+                        output.write(f"{key}={text_value}\n")
+            except Exception:
+                env_file.unlink(missing_ok=True)
+                raise
+            if os.name != "nt":
+                env_file.chmod(0o600)
+            args.extend(["--env-file", str(env_file)])
         args.append(container_name)
         args.extend(command)
         raw_timeout = os.environ.get("WPR_DOCKER_EXEC_TIMEOUT_SEC", "15").strip()
@@ -1485,9 +2014,15 @@ screen -ls | awk -v target="$target" '
             timeout_sec = None
         if detach and fire_and_forget:
             full_command = ["docker", *args]
-            self._spawn_detached_docker_exec(full_command)
+            spawned = self._spawn_detached_docker_exec(full_command, cleanup_path=env_file)
+            if not spawned and env_file is not None:
+                env_file.unlink(missing_ok=True)
             return subprocess.CompletedProcess(full_command, returncode=0, stdout="", stderr="")
-        return self._docker(args, check=False, capture_output=True, timeout_sec=timeout_sec)
+        try:
+            return self._docker(args, check=False, capture_output=True, timeout_sec=timeout_sec)
+        finally:
+            if env_file is not None:
+                env_file.unlink(missing_ok=True)
 
     def require_reviewed_openclaw(self, container_name: str) -> str:
         result = self._docker_exec(
@@ -1536,15 +2071,27 @@ screen -ls | awk -v target="$target" '
         return version
 
     @staticmethod
-    def _spawn_detached_docker_exec(full_command: list[str]) -> None:
+    def _spawn_detached_docker_exec(
+        full_command: list[str],
+        *,
+        cleanup_path: Path | None = None,
+    ) -> bool:
         # Start a tiny shell trampoline instead of invoking the Docker CLI inside
         # the request path. Docker Desktop can take seconds to accept an
         # interactive exec; the HTTP/UI path must return immediately.
-        launch = ["sh", "-lc", f"sleep 0.1; exec {shlex.join(full_command)}"]
+        cleanup = ""
+        if cleanup_path is not None:
+            quoted_path = shlex.quote(str(cleanup_path))
+            cleanup = (
+                f"cleanup_path={quoted_path}; "
+                "trap 'rm -f -- \"$cleanup_path\"' EXIT HUP INT TERM; "
+            )
+        launch = ["sh", "-lc", f"{cleanup}sleep 0.1; {shlex.join(full_command)}"]
         try:
             subprocess.Popen(launch, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         except OSError:
-            return
+            return False
+        return True
 
     def _ensure_container_writable_paths(self, container_name: str, container_paths: list[str]) -> None:
         safe_paths = [path for path in container_paths if path and path.startswith("/")]

@@ -1,3 +1,5 @@
+import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260806g';
+
 const ACTIVE_STATES = new Set(['created', 'starting', 'queued', 'running', 'resuming']);
 const ACTIVE_RUN_STATES = new Set(['queued', 'running']);
 const INTERRUPTIBLE_STATES = new Set(['queued', 'running', 'resuming']);
@@ -6,21 +8,27 @@ const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'failed', 'termi
 const MAX_LIVE_TILE_IFRAMES = 4;
 const ACTIVE_TILE_REFRESH_MS = 7000;
 const RETAINED_TILE_REFRESH_MS = 60000;
-const GLASSHIVE_UI_REV = '20260616a';
+const GLASSHIVE_UI_REV = '20260806e';
 let workspaceRefreshInFlight = false;
+let csrfToken = '';
+let renameWorkspaceContext = null;
+let saveTemplateContext = null;
 const pageParams = new URLSearchParams(window.location.search);
 const signedToken = pageParams.get('gh_token') || '';
 
 const defaultHivePrefs = {
-  showInactive: false,
+  showInactive: true,
   showWatch: true,
   showStatus: true,
+  search: '',
 };
 
 async function loadBootstrap() {
   const response = await fetch(withAuth('/api/bootstrap'));
   if (!response.ok) throw new Error(await responseMessage(response, 'Failed to load workspace options'));
-  return response.json();
+  const payload = await response.json();
+  csrfToken = String(payload.csrf_token || '');
+  return payload;
 }
 
 function withAuth(url) {
@@ -46,6 +54,9 @@ async function responseMessage(response, fallback) {
   try {
     if (contentType.includes('application/json')) {
       const payload = await response.json();
+      if (payload.detail && typeof payload.detail === 'object') {
+        return [payload.detail.message, payload.detail.recovery].filter(Boolean).join(' ') || fallback;
+      }
       return String(payload.detail || payload.message || fallback);
     }
     const text = await response.text();
@@ -55,10 +66,45 @@ async function responseMessage(response, fallback) {
   }
 }
 
+async function getJson(url, fallback = 'Request failed') {
+  const response = await fetch(withAuth(url), { cache: 'no-store' });
+  if (!response.ok) throw new Error(await responseMessage(response, fallback));
+  return response.json();
+}
+
+function decorateCatalogWorkspace(workspace) {
+  const workerId = String(workspace?.worker_id || '');
+  const projectId = String(workspace?.project_id || '');
+  const state = rawWorkspaceState(workspace);
+  const projectTitle = String(workspace?.project_title || workspace?.name || 'Workspace');
+  return {
+    ...workspace,
+    workspace_label: projectTitle,
+    state_label: state === 'ready' ? 'retained' : state,
+    is_active: ACTIVE_STATES.has(state),
+    is_resumable: RESUME_STATES.has(state),
+    watch_url: `/watch/${encodeURIComponent(workerId)}?project_id=${encodeURIComponent(projectId)}&surface=desktop`,
+    project_url: `/ui/projects/${encodeURIComponent(projectId)}?worker_id=${encodeURIComponent(workerId)}`,
+    desktop_url: `/desktop/${encodeURIComponent(workerId)}`,
+    api_url: `/api/worker/${encodeURIComponent(workerId)}`,
+    control_url: `/api/worker/${encodeURIComponent(workerId)}`,
+  };
+}
+
+function scheduleLabel(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? raw : parsed.toLocaleString();
+}
+
 async function postJson(url, payload) {
   const response = await fetch(withAuth(url), {
     method: 'POST',
-    headers: payload ? { 'Content-Type': 'application/json' } : {},
+    headers: {
+      ...(payload ? { 'Content-Type': 'application/json' } : {}),
+      ...(csrfToken ? { 'X-GlassHive-CSRF': csrfToken } : {}),
+    },
     body: payload ? JSON.stringify(payload) : undefined,
   });
   if (!response.ok) throw new Error(await responseMessage(response, 'Request failed'));
@@ -68,11 +114,39 @@ async function postJson(url, payload) {
 async function patchJson(url, payload) {
   const response = await fetch(withAuth(url), {
     method: 'PATCH',
-    headers: payload ? { 'Content-Type': 'application/json' } : {},
+    headers: {
+      ...(payload ? { 'Content-Type': 'application/json' } : {}),
+      ...(csrfToken ? { 'X-GlassHive-CSRF': csrfToken } : {}),
+    },
     body: payload ? JSON.stringify(payload) : undefined,
   });
   if (!response.ok) throw new Error(await responseMessage(response, 'Request failed'));
   return response.json();
+}
+
+async function deleteJson(url) {
+  const response = await fetch(withAuth(url), {
+    method: 'DELETE',
+    headers: csrfToken ? { 'X-GlassHive-CSRF': csrfToken } : {},
+  });
+  if (!response.ok) throw new Error(await responseMessage(response, 'Request failed'));
+  return response.json();
+}
+
+function renderCurrentUser(identity = {}) {
+  const control = document.getElementById('current-user-control');
+  const label = document.getElementById('current-user-label');
+  if (!control || !label || !csrfToken) return;
+  const name = String(identity.display_name || '').trim();
+  const email = String(identity.email || '').trim();
+  label.textContent = name && email ? `${name} · ${email}` : name || email || 'Signed in';
+  label.title = label.textContent;
+  control.hidden = false;
+}
+
+async function signOut(scope) {
+  const response = await postJson('/auth/logout', { scope });
+  window.location.assign(String(response.redirect_url || '/login'));
 }
 
 function fileToPayload(file) {
@@ -121,6 +195,76 @@ function renderWorkspaceTypeOptions(select, help, data) {
   if (help) {
     const selected = select.selectedOptions?.[0];
     help.textContent = selected?.dataset.description || 'Runs on managed GlassHive workspace compute.';
+  }
+}
+
+function renderLaunchProviderAccounts(accountSelect, policySelect, help, data, workspaceValue) {
+  if (!accountSelect || !policySelect) return;
+  const isNewWorkspace = String(workspaceValue || '').startsWith('new:');
+  const profile = isNewWorkspace ? String(workspaceValue).split(':', 2)[1] || '' : '';
+  const supportedProviders = {
+    'codex-cli': new Set(['codex', 'openai']),
+    'claude-code': new Set(['claude', 'anthropic']),
+  }[profile];
+  const currentAccount = accountSelect.value;
+  const currentPolicy = policySelect.value || 'personal_preferred';
+
+  if (!isNewWorkspace) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'Uses saved workspace policy';
+    accountSelect.replaceChildren(option);
+    accountSelect.disabled = true;
+    policySelect.disabled = true;
+    if (help) help.textContent = 'Existing workspaces keep their saved worker account and credential policy.';
+    return;
+  }
+  if (!supportedProviders) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'Deployment-managed account';
+    accountSelect.replaceChildren(option);
+    accountSelect.disabled = true;
+    policySelect.value = 'legacy';
+    policySelect.disabled = true;
+    if (help) help.textContent = 'Personal subscriptions are available for Codex and Claude Code workers.';
+    return;
+  }
+
+  policySelect.disabled = false;
+  policySelect.value = currentPolicy;
+  const readyAccounts = (data?.provider_accounts || []).filter((account) => (
+    supportedProviders.has(String(account.provider || '').toLowerCase())
+    && String(account.status || '').toLowerCase() === 'ready'
+  ));
+  const defaultAccount = readyAccounts.find((account) => Boolean(account.is_default));
+  const defaultOption = document.createElement('option');
+  defaultOption.value = '';
+  defaultOption.textContent = defaultAccount
+    ? `Default — ${String(defaultAccount.label || defaultAccount.provider || 'personal account')}`
+    : 'No ready default account';
+  const options = [defaultOption, ...readyAccounts.map((account) => {
+    const option = document.createElement('option');
+    option.value = String(account.account_id || '');
+    option.textContent = `${String(account.label || account.provider || 'Personal account')}${account.is_default ? ' (default)' : ''}`;
+    return option;
+  })];
+  accountSelect.replaceChildren(...options);
+  accountSelect.value = options.some((option) => option.value === currentAccount) ? currentAccount : '';
+
+  const policy = policySelect.value;
+  accountSelect.disabled = policy === 'legacy' || readyAccounts.length === 0;
+  if (!help) return;
+  if (policy === 'legacy') {
+    help.textContent = 'This worker will use the deployment-managed account.';
+  } else if (policy === 'personal_required') {
+    help.textContent = defaultAccount || accountSelect.value
+      ? 'GlassHive will stop the launch if this personal account is unavailable.'
+      : 'Connect or choose a ready personal account; GlassHive will not fall back to global credentials.';
+  } else {
+    help.textContent = defaultAccount || accountSelect.value
+      ? 'Uses this personal account when ready, with deployment fallback if it becomes unavailable.'
+      : 'No ready default is connected, so this launch may use the deployment-managed account.';
   }
 }
 
@@ -246,8 +390,10 @@ function displayStateLabel(state) {
 function workspaceTileTitle(workspace) {
   const label = String(workspace?.workspace_label || '').trim();
   const name = String(workspace?.name || '').trim();
-  if (label && name && label !== name) return `${label} · ${name}`;
-  return label || name || 'Workspace';
+  // The user-editable workspace name is the primary discovery label. Project
+  // context remains available separately and must not be concatenated back
+  // into the name after a rename.
+  return name || label || 'Workspace';
 }
 
 function workspaceOptionLabel(workspace) {
@@ -376,6 +522,20 @@ function displayStateForLive(data) {
   return workerState || 'unknown';
 }
 
+function updateWorkspaceMeta(meta, profile, state, catalogDetails = null) {
+  if (!meta) return;
+  if (Array.isArray(catalogDetails)) {
+    meta.dataset.catalogDetails = JSON.stringify(catalogDetails);
+  }
+  let details = [];
+  try {
+    details = JSON.parse(meta.dataset.catalogDetails || '[]');
+  } catch {
+    details = [];
+  }
+  meta.textContent = [workspaceProfileLabel(profile), displayStateLabel(state), ...details].join(' · ');
+}
+
 async function refreshWorkspaceTile(workerId, refreshBootstrap) {
   const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);
   if (!tile) return;
@@ -401,7 +561,7 @@ async function refreshWorkspaceTile(workerId, refreshBootstrap) {
     const glass = tile.querySelector('.workspace-tile-glass');
     if (glass) setGlassPane(glass, workerId, state, Boolean(data?.runtime_details?.view_available || data?.runtime_details?.view_url), refreshBootstrap);
     const meta = tile.querySelector('[data-worker-meta]');
-    if (meta) meta.textContent = `${workspaceProfileLabel(data?.worker?.profile)} · ${displayStateLabel(state)}`;
+    updateWorkspaceMeta(meta, data?.worker?.profile, state);
     const favorite = tile.querySelector('[data-worker-favorite]');
     if (favorite && Object.prototype.hasOwnProperty.call(data?.worker || {}, 'favorite')) {
       const isFavorite = Boolean(data.worker.favorite);
@@ -453,18 +613,24 @@ function autoResizeTextarea(textarea) {
   textarea.style.height = `${Math.min(Math.max(textarea.scrollHeight, 44), 168)}px`;
 }
 
-function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', viewPrefs = defaultHivePrefs) {
+function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', viewPrefs = defaultHivePrefs, bootstrap = {}) {
   const workerId = String(workspace.worker_id || '');
   const state = workspaceStateLabel(workspace).toLowerCase();
   const isActive = isWorkspaceActive(workspace);
   const isResumable = isWorkspaceResumable(workspace);
+  const currentSelection = workspace.provider_account || {};
+  const currentPolicy = String(currentSelection.policy || 'legacy');
+  const currentAccountId = String(currentSelection.account_id || '');
+  const selectedAccount = (bootstrap.provider_accounts || []).find(
+    (account) => String(account.account_id || '') === currentAccountId,
+  );
 
   const tile = document.createElement('article');
   tile.className = 'workspace-tile';
   tile.dataset.state = isActive ? 'active' : isResumable ? 'resumable' : 'inactive';
   tile.dataset.workerId = workerId;
   tile.dataset.desktopUrl = String(workspace.desktop_url || '');
-  tile.dataset.apiUrl = String(workspace.api_url || '');
+  tile.dataset.apiUrl = String(workspace.control_url || workspace.api_url || '');
   tile.dataset.watchVisible = String(Boolean(viewPrefs.showWatch));
   tile.dataset.statusVisible = String(Boolean(viewPrefs.showStatus));
   tile.dataset.liveLoaded = 'false';
@@ -509,7 +675,44 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
 
   const meta = document.createElement('p');
   meta.dataset.workerMeta = 'true';
-  meta.textContent = `${workspaceProfileLabel(workspace.profile)} · ${displayStateLabel(state)}`;
+  const metaParts = [workspaceProfileLabel(workspace.profile), displayStateLabel(state)];
+  const providerReadiness = workspace.provider_readiness || {};
+  if (providerReadiness.readiness === 'action_required') {
+    const accountLabel = String(providerReadiness.label || selectedAccount?.label || 'saved personal account');
+    metaParts.push(`${accountLabel}: reconnect required`);
+  } else if (providerReadiness.readiness === 'ready') {
+    metaParts.push(`${String(providerReadiness.label || selectedAccount?.label || 'personal account')}: ready`);
+  } else if (providerReadiness.readiness === 'deployment_managed') {
+    metaParts.push(providerReadiness.policy === 'personal_preferred'
+      ? 'deployment account fallback'
+      : 'deployment account');
+  } else if (currentPolicy === 'legacy') {
+    metaParts.push('deployment account');
+  } else if (selectedAccount) {
+    const accountLabel = String(selectedAccount.label || selectedAccount.provider || 'personal account');
+    metaParts.push(`${accountLabel}: ${String(selectedAccount.status || 'unknown').replaceAll('_', ' ')}`);
+  } else {
+    metaParts.push('personal account: reconnect required');
+  }
+  const capabilityReadiness = workspace.capability_readiness || {};
+  if (capabilityReadiness.readiness === 'action_required') {
+    metaParts.push(`${Number(capabilityReadiness.unavailable_grants || 0)} connection${Number(capabilityReadiness.unavailable_grants || 0) === 1 ? '' : 's'} need attention`);
+  } else if (Number(capabilityReadiness.active_grants || 0) > 0) {
+    metaParts.push(`${Number(capabilityReadiness.active_grants)} connected capabilit${Number(capabilityReadiness.active_grants) === 1 ? 'y' : 'ies'}`);
+  }
+  if (workspace.next_schedule_at) metaParts.push(`Next: ${scheduleLabel(workspace.next_schedule_at)}`);
+  if (workspace.schedule_readiness === 'unavailable') metaParts.push('schedule status unavailable');
+  if ((workspace.tags || []).length) metaParts.push(`Tags: ${(workspace.tags || []).join(', ')}`);
+  const nextSchedule = (bootstrap.recurring_schedules || [])
+    .filter((schedule) => String(schedule.worker_id || '') === workerId && schedule.enabled !== false)
+    .sort((left, right) => String(left.next_run_at || '').localeCompare(String(right.next_run_at || '')))[0];
+  if (nextSchedule?.next_run_at && !workspace.next_schedule_at) {
+    const nextRun = new Date(String(nextSchedule.next_run_at));
+    metaParts.push(`Next: ${Number.isNaN(nextRun.getTime()) ? String(nextSchedule.next_run_at) : nextRun.toLocaleString()}`);
+  } else if (bootstrap.recurring_schedules_status === 'unavailable') {
+    metaParts.push('schedule status unavailable');
+  }
+  updateWorkspaceMeta(meta, workspace.profile, state, metaParts.slice(2));
   body.appendChild(meta);
 
   const report = document.createElement('button');
@@ -552,8 +755,8 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   actions.appendChild(favorite);
 
   const watch = createButton('Full watch');
-  watch.addEventListener('click', () => {
-    window.location.href = String(workspace.watch_url || '#');
+  watch.addEventListener('click', async () => {
+    await openWorkspaceSurface(workspace, watch);
   });
   actions.appendChild(watch);
 
@@ -564,10 +767,85 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   actions.appendChild(project);
 
   const duplicate = createButton('Duplicate');
-  duplicate.addEventListener('click', () => {
-    window.dispatchEvent(new CustomEvent('glasshive:duplicate-workspace', { detail: { workerId } }));
-  });
+  duplicate.addEventListener('click', () => duplicateSavedWorkspace(workspace, duplicate, refreshBootstrap));
   actions.appendChild(duplicate);
+
+  const saveTemplate = createButton('Save as template');
+  saveTemplate.addEventListener('click', () => openSaveTemplate(workspace, refreshBootstrap));
+  actions.appendChild(saveTemplate);
+
+  const accountSelect = document.createElement('select');
+  accountSelect.className = 'workspace-account-select';
+  accountSelect.setAttribute('aria-label', `Worker account for ${workspaceTileTitle(workspace)}`);
+  const deploymentOption = document.createElement('option');
+  deploymentOption.value = 'legacy:';
+  deploymentOption.textContent = 'Account · deployment-managed';
+  const supportedProviders = workspace.profile === 'codex-cli'
+    ? new Set(['codex', 'openai'])
+    : workspace.profile === 'claude-code'
+      ? new Set(['claude', 'anthropic'])
+      : new Set();
+  const accountOptions = (bootstrap.provider_accounts || [])
+    .filter((account) => supportedProviders.has(String(account.provider || '').toLowerCase()) && account.status === 'ready')
+    .flatMap((account) => {
+      const label = String(account.label || account.provider || 'my account');
+      const preferred = document.createElement('option');
+      preferred.value = `personal_preferred:${String(account.account_id || '')}`;
+      preferred.textContent = `Account · prefer ${label} (fallback allowed)`;
+      const required = document.createElement('option');
+      required.value = `personal_required:${String(account.account_id || '')}`;
+      required.textContent = `Account · only ${label}`;
+      return [preferred, required];
+    });
+  const selectedValue = `${currentPolicy}:${currentAccountId}`;
+  if (
+    currentPolicy !== 'legacy'
+    && currentAccountId
+    && !accountOptions.some((option) => option.value === selectedValue)
+  ) {
+    const unavailable = document.createElement('option');
+    unavailable.value = selectedValue;
+    unavailable.textContent = `Account · ${String(selectedAccount?.label || selectedAccount?.provider || 'saved personal account')} · reconnect required`;
+    accountOptions.unshift(unavailable);
+  }
+  accountSelect.replaceChildren(deploymentOption, ...accountOptions);
+  accountSelect.value = Array.from(accountSelect.options).some((option) => option.value === selectedValue)
+    ? selectedValue
+    : 'legacy:';
+  accountSelect.disabled = !supportedProviders.size || ['created', 'starting', 'queued', 'running', 'resuming', 'terminated'].includes(state);
+  accountSelect.addEventListener('change', async () => {
+    const priorValue = selectedValue;
+    const [policy, accountId = ''] = String(accountSelect.value || '').split(':', 2);
+    accountSelect.disabled = true;
+    try {
+      const pending = await postJson('/api/pending-changes', {
+        change_type: 'workspace_provider_account',
+        target_id: workerId,
+        payload: { policy, ...(accountId ? { account_id: accountId } : {}) },
+      });
+      const changeId = encodeURIComponent(String(pending.change_id || ''));
+      const token = encodeURIComponent(String(pending.confirmation_token || ''));
+      if (!changeId || !token) throw new Error('GlassHive could not prepare the account review.');
+      window.location.assign(`/confirm-change#change_id=${changeId}&token=${token}`);
+    } catch (error) {
+      accountSelect.value = priorValue;
+      accountSelect.disabled = false;
+      liveOutput.textContent = error.message;
+    }
+  });
+  actions.appendChild(accountSelect);
+
+  if (workspace.workspace_kind === 'ephemeral' || workspace.workspace_kind === 'legacy') {
+    const keep = createButton('Keep as workspace');
+    keep.addEventListener('click', async () => {
+      await runWorkerMetadata(workerId, { workspace_kind: 'named' }, keep, refreshBootstrap);
+    });
+    actions.appendChild(keep);
+  }
+
+  const rename = createButton('Rename');
+  rename.addEventListener('click', () => openRenameWorkspace(workspace, refreshBootstrap));
+  actions.appendChild(rename);
 
   const toggle = createButton(state === 'completed' ? 'Continue' : workerActionForState(state) === 'resume' ? 'Resume' : 'Pause', 'workspace-run-toggle');
   toggle.dataset.workerActionToggle = 'true';
@@ -633,6 +911,29 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   return tile;
 }
 
+async function openWorkspaceSurface(workspace, button) {
+  const workerId = String(workspace?.worker_id || '');
+  const shouldResume = workspace?.workspace_kind === 'named'
+    && (Boolean(workspace?.compute_released_at) || ['paused', 'idle', 'idle_terminated', 'stopped'].includes(rawWorkspaceState(workspace)));
+  const originalText = button?.textContent || '';
+  if (button) button.disabled = true;
+  try {
+    if (shouldResume) {
+      if (button) button.textContent = 'Resuming…';
+      await postJson(workerApiUrl(workerId, '/action/resume'));
+    }
+    window.location.href = String(workspace?.watch_url || '#');
+  } catch (error) {
+    const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);
+    const output = tile?.querySelector('[data-worker-output]');
+    if (output) output.textContent = error.message;
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
+}
+
 async function runWorkerAction(workerId, action, button, refreshBootstrap) {
   const originalText = button.textContent;
   button.disabled = true;
@@ -665,14 +966,82 @@ async function runWorkerMetadata(workerId, payload, button, refreshBootstrap) {
   }
 }
 
+async function duplicateSavedWorkspace(workspace, button, refreshBootstrap) {
+  const workerId = String(workspace.worker_id || '');
+  if (!workerId) return;
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Duplicating…';
+  button.dataset.idempotencyKey ||= globalThis.crypto?.randomUUID?.()
+    || `duplicate-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  try {
+    await postJson(
+      `/api/workspaces/${encodeURIComponent(workerId)}/duplicate`,
+      { idempotency_key: button.dataset.idempotencyKey },
+    );
+    delete button.dataset.idempotencyKey;
+    button.textContent = 'Duplicated';
+    await refreshBootstrap();
+  } catch (error) {
+    const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);
+    const output = tile?.querySelector('[data-worker-output]');
+    if (output) output.textContent = `${error.message} Retry will use the same request key.`;
+  } finally {
+    window.setTimeout(() => {
+      button.disabled = false;
+      button.textContent = originalText;
+    }, 900);
+  }
+}
+
+function openSaveTemplate(workspace, refreshBootstrap) {
+  const dialog = document.getElementById('save-template-dialog');
+  const name = document.getElementById('save-template-name');
+  const description = document.getElementById('save-template-description');
+  const status = document.getElementById('save-template-status');
+  if (!dialog || !name) return;
+  saveTemplateContext = {
+    workerId: String(workspace.worker_id || ''),
+    refreshBootstrap,
+  };
+  name.value = `${workspaceTileTitle(workspace)} template`;
+  if (description) description.value = '';
+  if (status) status.textContent = '';
+  dialog.showModal();
+  name.focus();
+  name.select();
+}
+
+function openRenameWorkspace(workspace, refreshBootstrap) {
+  const dialog = document.getElementById('rename-workspace-dialog');
+  const input = document.getElementById('rename-workspace-name');
+  const status = document.getElementById('rename-workspace-status');
+  if (!dialog || !input) return;
+  renameWorkspaceContext = {
+    workerId: String(workspace.worker_id || ''),
+    refreshBootstrap,
+  };
+  input.value = workspaceTileTitle(workspace);
+  const tagsInput = document.getElementById('rename-workspace-tags');
+  if (tagsInput) tagsInput.value = (workspace.tags || []).join(', ');
+  if (status) status.textContent = '';
+  dialog.showModal();
+  input.focus();
+  input.select();
+}
+
 function renderWorkspaceHive(data, refreshBootstrap, viewPrefs = defaultHivePrefs) {
   const grid = document.getElementById('workspace-hive-grid');
   const empty = document.getElementById('workspace-hive-empty');
   const summary = document.getElementById('workspace-hive-summary');
+  const loadMore = document.getElementById('workspace-load-more');
+  const catalogStatus = document.getElementById('workspace-catalog-status');
   if (!grid || !empty || !summary) return;
   const prefs = { ...defaultHivePrefs, ...viewPrefs };
+  renderWorkspaceTemplateOptions(data);
 
   const workspaces = uniqueWorkspaces(data?.existing_workspaces || []);
+  const catalogUnavailable = data?.workspace_catalog_status === 'unavailable';
   const active = workspaces.filter((workspace) => isWorkspaceActive(workspace));
   const resumable = workspaces.filter((workspace) => !isWorkspaceActive(workspace) && isWorkspaceResumable(workspace));
   const inactive = workspaces.filter((workspace) => !isWorkspaceActive(workspace) && !isWorkspaceResumable(workspace));
@@ -680,11 +1049,21 @@ function renderWorkspaceHive(data, refreshBootstrap, viewPrefs = defaultHivePref
   const visible = prefs.showInactive ? sortFavorites([...active, ...resumable, ...inactive]) : sortFavorites(active);
 
   summary.textContent = prefs.showInactive
-    ? `${active.length} active · ${resumable.length} retained · ${inactive.length} inactive`
-    : `${active.length} active · ${resumable.length + inactive.length} retained hidden`;
+    ? `${active.length} active · ${resumable.length} retained · ${inactive.length} inactive · ${workspaces.length} loaded`
+    : `${active.length} active · ${resumable.length + inactive.length} retained hidden · ${workspaces.length} loaded`;
+  if (loadMore) loadMore.hidden = !data?.workspace_catalog_next_cursor;
+  if (catalogStatus && !data?.workspace_catalog_loading) {
+    catalogStatus.textContent = catalogUnavailable
+      ? 'Your workspaces are temporarily unavailable. Refresh to retry; this does not mean they were removed.'
+      : '';
+  }
   empty.hidden = visible.length > 0;
   if (!visible.length) {
-    empty.textContent = prefs.showInactive ? 'No workspaces yet.' : 'No active workspaces right now. Turn on Inactive Workspaces to review completed or retained workspaces.';
+    empty.textContent = catalogUnavailable
+      ? 'Workspace data is unavailable right now.'
+      : prefs.showInactive
+        ? 'No workspaces yet.'
+        : 'No active workspaces right now. Turn on Inactive Workspaces to review completed or retained workspaces.';
   }
 
   const drafts = new Map(
@@ -695,10 +1074,40 @@ function renderWorkspaceHive(data, refreshBootstrap, viewPrefs = defaultHivePref
   );
   const tiles = visible.map((workspace) => {
     const workerId = String(workspace.worker_id || '');
-    return renderWorkspaceTile(workspace, refreshBootstrap, drafts.get(workerId) || '', prefs);
+    return renderWorkspaceTile(workspace, refreshBootstrap, drafts.get(workerId) || '', prefs, data || {});
   });
   grid.replaceChildren(...tiles);
   refreshVisibleWorkspaceTiles(refreshBootstrap, { force: true }).catch(() => {});
+}
+
+function renderWorkspaceTemplateOptions(data) {
+  const select = document.getElementById('workspace-template-select');
+  const button = document.getElementById('workspace-template-start');
+  const meta = document.getElementById('workspace-template-meta');
+  if (!select) return;
+  const selected = select.value;
+  const templates = Array.isArray(data?.workspace_templates) ? data.workspace_templates : [];
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = templates.length ? 'Choose a saved template' : 'No saved templates yet';
+  const options = templates.map((template) => {
+    const option = document.createElement('option');
+    option.value = String(template.template_id || '');
+    option.textContent = `${String(template.name || 'Workspace template')} · v${Number(template.version || 1)} · ${workspaceProfileLabel(template.profile)}`;
+    option.dataset.libraryCount = String((template.library_refs || []).length);
+    return option;
+  });
+  select.replaceChildren(placeholder, ...options);
+  if (options.some((option) => option.value === selected)) select.value = selected;
+  select.disabled = !templates.length;
+  if (button) button.disabled = !templates.length;
+  const chosen = templates.find((template) => String(template.template_id || '') === select.value);
+  if (meta) {
+    const capabilityCount = (chosen?.library_refs || []).length;
+    meta.textContent = chosen
+      ? `Creates a fresh paused ${workspaceProfileLabel(chosen.profile)} workspace. ${capabilityCount ? `${capabilityCount} Library capability approval${capabilityCount === 1 ? '' : 's'} will be required.` : 'No capability approval is carried over.'}`
+      : 'Templates create a fresh paused workspace. Connected capabilities require fresh approval.';
+  }
 }
 
 function findWorkspace(existing, workerId) {
@@ -760,15 +1169,19 @@ function syncWorkspaceUI(select, data, button, help) {
 
 async function main() {
   const frame = document.querySelector('.composer-frame');
-  const projectView = document.getElementById('project-view');
-  const workspaceView = document.getElementById('workspace-view');
   const tabs = Array.from(document.querySelectorAll('[data-view-tab]'));
+  const viewRegistry = new Map(
+    tabs.map((tab) => [String(tab.dataset.viewTab), document.getElementById(String(tab.getAttribute('aria-controls')))]),
+  );
   const form = document.getElementById('launch-form');
   const select = document.getElementById('workspace-option');
   const help = document.getElementById('workspace-help');
   const launchSurface = document.getElementById('launch-surface');
   const workspaceType = document.getElementById('workspace-type');
   const workspaceTypeHelp = document.getElementById('workspace-type-help');
+  const providerAccount = document.getElementById('provider-account-selection');
+  const providerAccountPolicy = document.getElementById('provider-account-policy');
+  const providerAccountHelp = document.getElementById('provider-account-help');
   const status = document.getElementById('launch-status');
   const button = document.getElementById('launch-button');
   const scheduleButton = document.getElementById('schedule-button');
@@ -784,21 +1197,140 @@ async function main() {
   const inactiveToggle = document.getElementById('show-inactive-workspaces');
   const watchToggle = document.getElementById('show-workspace-watch');
   const statusToggle = document.getElementById('show-workspace-status');
+  const workspaceSearch = document.getElementById('workspace-search');
+  const workspaceKindFilter = document.getElementById('workspace-kind-filter');
+  const workspaceTagFilter = document.getElementById('workspace-tag-filter');
+  const workspaceLoadMore = document.getElementById('workspace-load-more');
+  const workspaceCatalogStatus = document.getElementById('workspace-catalog-status');
+  const renameDialog = document.getElementById('rename-workspace-dialog');
+  const renameForm = document.getElementById('rename-workspace-form');
+  const renameInput = document.getElementById('rename-workspace-name');
+  const renameTags = document.getElementById('rename-workspace-tags');
+  const renameStatus = document.getElementById('rename-workspace-status');
+  const cancelRename = document.getElementById('cancel-workspace-rename');
+  const saveTemplateDialog = document.getElementById('save-template-dialog');
+  const saveTemplateForm = document.getElementById('save-template-form');
+  const saveTemplateName = document.getElementById('save-template-name');
+  const saveTemplateDescription = document.getElementById('save-template-description');
+  const saveTemplateStatus = document.getElementById('save-template-status');
+  const cancelSaveTemplate = document.getElementById('cancel-save-template');
+  const switchAccount = document.getElementById('switch-account');
+  const localSignOut = document.getElementById('local-sign-out');
+  const templateStartForm = document.getElementById('workspace-template-start-form');
+  const templateSelect = document.getElementById('workspace-template-select');
+  const templateInstanceName = document.getElementById('workspace-template-instance-name');
+  const templateStartStatus = document.getElementById('workspace-template-start-status');
+  const templateStartButton = document.getElementById('workspace-template-start');
   let bootstrap = null;
   let activeView = 'project';
   let hivePollTimer = 0;
+  let catalogSearchTimer = 0;
+  const catalogState = { items: [], nextCursor: null, loading: false, generation: 0 };
   const hivePrefs = () => ({
     showInactive: Boolean(inactiveToggle?.checked),
     showWatch: watchToggle ? Boolean(watchToggle.checked) : true,
     showStatus: statusToggle ? Boolean(statusToggle.checked) : true,
+    search: String(workspaceSearch?.value || ''),
   });
+
+  const workspaceViewData = () => ({
+    ...(bootstrap || {}),
+    existing_workspaces: catalogState.items,
+    workspace_catalog_next_cursor: catalogState.nextCursor,
+    workspace_catalog_loading: catalogState.loading,
+    workspace_catalog_status: bootstrap?.bootstrap_sections?.workspace_catalog || 'ready',
+  });
+
+  const fetchCatalogPage = async ({ kind, search = '', tags = '', cursor = '' }) => {
+    const query = new URLSearchParams({ kind, search, tags, limit: '25' });
+    if (cursor) query.set('cursor', cursor);
+    return getJson(`/api/workspaces?${query.toString()}`, 'GlassHive could not load workspaces.');
+  };
+
+  const refreshWorkspaceCatalog = async ({ append = false } = {}) => {
+    if (!bootstrap || (append && catalogState.loading)) return;
+    const generation = ++catalogState.generation;
+    catalogState.loading = true;
+    if (workspaceCatalogStatus) workspaceCatalogStatus.textContent = append ? 'Loading more…' : 'Loading workspaces…';
+    if (workspaceLoadMore) workspaceLoadMore.disabled = true;
+    try {
+      const payload = await fetchCatalogPage({
+        kind: String(workspaceKindFilter?.value || 'named'),
+        search: String(workspaceSearch?.value || '').trim(),
+        tags: String(workspaceTagFilter?.value || '').trim(),
+        cursor: append ? String(catalogState.nextCursor || '') : '',
+      });
+      if (generation !== catalogState.generation) return;
+      const incoming = (payload.items || []).map(decorateCatalogWorkspace);
+      catalogState.items = append ? uniqueWorkspaces([...catalogState.items, ...incoming]) : incoming;
+      catalogState.nextCursor = payload.next_cursor || null;
+      renderWorkspaceHive(workspaceViewData(), refreshBootstrap, hivePrefs());
+      if (workspaceCatalogStatus) workspaceCatalogStatus.textContent = '';
+    } catch (error) {
+      if (generation === catalogState.generation && workspaceCatalogStatus) workspaceCatalogStatus.textContent = error.message;
+    } finally {
+      if (generation !== catalogState.generation) return;
+      catalogState.loading = false;
+      if (workspaceLoadMore) workspaceLoadMore.disabled = false;
+    }
+  };
 
   const refreshBootstrap = async () => {
     const selectedValue = select.value;
     bootstrap = await loadBootstrap();
+    renderCurrentUser(bootstrap.identity || {});
+    let namedCatalog = {
+      items: bootstrap.existing_workspaces || [],
+      next_cursor: null,
+    };
+    if (bootstrap.bootstrap_sections?.workspace_catalog !== 'unavailable') {
+      try {
+        namedCatalog = await fetchCatalogPage({ kind: 'named' });
+      } catch (_error) {
+        bootstrap.bootstrap_sections ||= {};
+        bootstrap.bootstrap_sections.workspace_catalog = 'unavailable';
+      }
+    }
+    bootstrap.existing_workspaces = (namedCatalog.items || []).map(decorateCatalogWorkspace);
     renderWorkspaceOptions(select, bootstrap, selectedValue);
+    renderLaunchProviderAccounts(
+      providerAccount,
+      providerAccountPolicy,
+      providerAccountHelp,
+      bootstrap,
+      select.value,
+    );
     syncPreferenceControls(bootstrap, { defaultWorker, codexEffort, claudeEffort, openclawEffort });
-    renderWorkspaceHive(bootstrap, refreshBootstrap, hivePrefs());
+    if (
+      String(workspaceKindFilter?.value || 'named') === 'named'
+      && !String(workspaceSearch?.value || '').trim()
+      && !String(workspaceTagFilter?.value || '').trim()
+    ) {
+      catalogState.items = [...bootstrap.existing_workspaces];
+      catalogState.nextCursor = namedCatalog.next_cursor || null;
+      renderWorkspaceHive(workspaceViewData(), refreshBootstrap, hivePrefs());
+    } else {
+      await refreshWorkspaceCatalog();
+    }
+    renderActivity(
+      bootstrap.activity || bootstrap.existing_workspaces || [],
+      bootstrap.bootstrap_sections?.activity || 'ready',
+    );
+    const degradedSections = Object.entries(bootstrap.bootstrap_sections || {})
+      .filter(([, value]) => value !== 'ready')
+      .map(([name]) => name.replaceAll('_', ' '));
+    if (degradedSections.length && status) {
+      status.textContent = `Some personal data is temporarily unavailable (${degradedSections.join(', ')}). Refresh to retry; empty lists do not mean your data was removed.`;
+    }
+    if (bootstrap.bootstrap_sections?.provider_accounts !== 'ready' && providerAccountHelp) {
+      providerAccountHelp.textContent = 'Personal worker accounts could not be loaded. Refresh before choosing an account.';
+    }
+    if (bootstrap.bootstrap_sections?.workspace_templates !== 'ready' && templateStartStatus) {
+      templateStartStatus.textContent = 'Saved templates could not be loaded. Refresh to retry.';
+    }
+    if (bootstrap.bootstrap_sections?.workspace_catalog !== 'ready' && workspaceCatalogStatus) {
+      workspaceCatalogStatus.textContent = 'Your workspaces are temporarily unavailable. Refresh to retry; this does not mean they were removed.';
+    }
     syncWorkspaceUI(select, bootstrap, button, help);
     return bootstrap;
   };
@@ -809,6 +1341,26 @@ async function main() {
     hivePollTimer = 0;
   }
 
+  switchAccount?.addEventListener('click', async () => {
+    switchAccount.disabled = true;
+    try {
+      await signOut('provider');
+    } catch (error) {
+      switchAccount.disabled = false;
+      window.alert(error.message || 'GlassHive could not switch accounts.');
+    }
+  });
+
+  localSignOut?.addEventListener('click', async () => {
+    localSignOut.disabled = true;
+    try {
+      await signOut('local');
+    } catch (error) {
+      localSignOut.disabled = false;
+      window.alert(error.message || 'GlassHive could not sign out.');
+    }
+  });
+
   function startHivePolling() {
     stopHivePolling();
     hivePollTimer = window.setInterval(() => {
@@ -817,40 +1369,50 @@ async function main() {
   }
 
   function setActiveView(view, { updateHash = true } = {}) {
-    activeView = view === 'workspaces' ? 'workspaces' : 'project';
+    activeView = viewRegistry.has(view) ? view : 'project';
     frame.dataset.activeView = activeView;
-    projectView.hidden = activeView !== 'project';
-    workspaceView.hidden = activeView !== 'workspaces';
+    for (const [name, panel] of viewRegistry.entries()) {
+      if (panel) panel.hidden = name !== activeView;
+    }
     for (const tab of tabs) {
       const selected = tab.dataset.viewTab === activeView;
       tab.setAttribute('aria-selected', String(selected));
       tab.tabIndex = selected ? 0 : -1;
     }
     if (activeView === 'workspaces') {
-      if (bootstrap) renderWorkspaceHive(bootstrap, refreshBootstrap, hivePrefs());
+      if (bootstrap) renderWorkspaceHive(workspaceViewData(), refreshBootstrap, hivePrefs());
       startHivePolling();
     } else {
       stopHivePolling();
     }
+    if (activeView === 'connections' || activeView === 'library' || activeView === 'schedules') {
+      refreshControlPlane().catch((error) => {
+        const statusNode = document.getElementById('provider-account-status');
+        if (statusNode) statusNode.textContent = error.message;
+      });
+    }
     if (updateHash) {
-      const nextUrl = `${window.location.pathname}${window.location.search}${activeView === 'workspaces' ? '#workspaces' : ''}`;
+      const nextUrl = `${window.location.pathname}${window.location.search}${activeView === 'project' ? '' : `#${activeView}`}`;
       window.history.replaceState(null, '', nextUrl);
     }
   }
 
+  window.addEventListener('glasshive:control-plane-updated', () => {
+    refreshBootstrap().catch(() => {});
+  });
+  initializeControlPlane({ withAuth, postJson, patchJson, deleteJson, responseMessage, setView: setActiveView });
+
   try {
-    bootstrap = await loadBootstrap();
-    renderWorkspaceOptions(select, bootstrap);
-    syncPreferenceControls(bootstrap, { defaultWorker, codexEffort, claudeEffort, openclawEffort });
+    await refreshBootstrap();
     if (launchSurface) launchSurface.value = String(bootstrap.default_launch_surface || 'desktop');
     if (workspaceType) renderWorkspaceTypeOptions(workspaceType, workspaceTypeHelp, bootstrap);
-    renderWorkspaceHive(bootstrap, refreshBootstrap, hivePrefs());
-    syncWorkspaceUI(select, bootstrap, button, help);
   } catch (error) {
     button.disabled = true;
     if (scheduleButton) scheduleButton.disabled = true;
     select.disabled = true;
     if (workspaceType) workspaceType.disabled = true;
+    if (providerAccount) providerAccount.disabled = true;
+    if (providerAccountPolicy) providerAccountPolicy.disabled = true;
     form.classList.add('is-unavailable');
     status.textContent = error.message;
   }
@@ -872,13 +1434,44 @@ async function main() {
   for (const toggle of [inactiveToggle, watchToggle, statusToggle]) {
     toggle?.addEventListener('change', () => {
       if (!bootstrap) return;
-      renderWorkspaceHive(bootstrap, refreshBootstrap, hivePrefs());
+      renderWorkspaceHive(workspaceViewData(), refreshBootstrap, hivePrefs());
     });
   }
+
+  workspaceSearch?.addEventListener('input', () => {
+    window.clearTimeout(catalogSearchTimer);
+    catalogSearchTimer = window.setTimeout(() => refreshWorkspaceCatalog(), 250);
+  });
+
+  workspaceTagFilter?.addEventListener('input', () => {
+    window.clearTimeout(catalogSearchTimer);
+    catalogSearchTimer = window.setTimeout(() => refreshWorkspaceCatalog(), 250);
+  });
+
+  workspaceKindFilter?.addEventListener('change', () => refreshWorkspaceCatalog());
+  workspaceLoadMore?.addEventListener('click', () => refreshWorkspaceCatalog({ append: true }));
 
   select.addEventListener('change', () => {
     if (!bootstrap) return;
     syncWorkspaceUI(select, bootstrap, button, help);
+    renderLaunchProviderAccounts(
+      providerAccount,
+      providerAccountPolicy,
+      providerAccountHelp,
+      bootstrap,
+      select.value,
+    );
+  });
+
+  providerAccountPolicy?.addEventListener('change', () => {
+    if (!bootstrap) return;
+    renderLaunchProviderAccounts(
+      providerAccount,
+      providerAccountPolicy,
+      providerAccountHelp,
+      bootstrap,
+      select.value,
+    );
   });
 
   workspaceType?.addEventListener('change', () => {
@@ -889,15 +1482,114 @@ async function main() {
     if (bootstrap) syncWorkspaceUI(select, bootstrap, button, help);
   });
 
-  window.addEventListener('glasshive:duplicate-workspace', (event) => {
-    if (!bootstrap) return;
-    const workerId = String(event.detail?.workerId || '');
-    if (!workerId) return;
-    const value = `duplicate:${workerId}`;
-    renderWorkspaceOptions(select, bootstrap, value);
-    syncWorkspaceUI(select, bootstrap, button, help);
-    setActiveView('project');
-    select.focus();
+  renameDialog?.addEventListener('close', () => {
+    renameWorkspaceContext = null;
+    if (renameStatus) renameStatus.textContent = '';
+  });
+  cancelRename?.addEventListener('click', () => renameDialog?.close());
+
+  renameForm?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const context = renameWorkspaceContext;
+    const name = String(renameInput?.value || '').trim();
+    const tags = String(renameTags?.value || '')
+      .split(',')
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+    if (!context || !name) {
+      if (renameStatus) renameStatus.textContent = 'Enter a workspace name.';
+      renameInput?.focus();
+      return;
+    }
+    const submit = renameForm.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    if (renameStatus) renameStatus.textContent = 'Saving…';
+    try {
+      await postJson(`/api/worker/${encodeURIComponent(context.workerId)}/metadata`, { name, tags });
+      await context.refreshBootstrap();
+      renameDialog.close();
+    } catch (error) {
+      if (renameStatus) renameStatus.textContent = error.message;
+    } finally {
+      if (submit) submit.disabled = false;
+    }
+  });
+
+  saveTemplateDialog?.addEventListener('close', () => {
+    saveTemplateContext = null;
+    if (saveTemplateStatus) saveTemplateStatus.textContent = '';
+  });
+  cancelSaveTemplate?.addEventListener('click', () => saveTemplateDialog?.close());
+  saveTemplateForm?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const context = saveTemplateContext;
+    const name = String(saveTemplateName?.value || '').trim();
+    if (!context || !name) {
+      if (saveTemplateStatus) saveTemplateStatus.textContent = 'Enter a template name.';
+      saveTemplateName?.focus();
+      return;
+    }
+    const submit = saveTemplateForm.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    if (saveTemplateStatus) saveTemplateStatus.textContent = 'Saving immutable template…';
+    try {
+      await postJson(`/api/workspaces/${encodeURIComponent(context.workerId)}/templates`, {
+        name,
+        description: String(saveTemplateDescription?.value || '').trim(),
+      });
+      await context.refreshBootstrap();
+      saveTemplateDialog.close();
+      document.getElementById('workspace-template-panel')?.setAttribute('open', '');
+      if (templateStartStatus) templateStartStatus.textContent = 'Template saved. It is ready to create a fresh workspace.';
+    } catch (error) {
+      if (saveTemplateStatus) saveTemplateStatus.textContent = error.message;
+    } finally {
+      if (submit) submit.disabled = false;
+    }
+  });
+
+  const resetTemplateIdempotency = () => {
+    if (templateStartButton) delete templateStartButton.dataset.idempotencyKey;
+    if (bootstrap) renderWorkspaceTemplateOptions(bootstrap);
+  };
+  templateSelect?.addEventListener('change', resetTemplateIdempotency);
+  templateInstanceName?.addEventListener('input', resetTemplateIdempotency);
+  templateStartForm?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const templateId = String(templateSelect?.value || '');
+    if (!templateId || !templateStartButton) {
+      if (templateStartStatus) templateStartStatus.textContent = 'Choose a saved template first.';
+      templateSelect?.focus();
+      return;
+    }
+    templateStartButton.dataset.idempotencyKey ||= globalThis.crypto?.randomUUID?.()
+      || `template-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    templateStartButton.disabled = true;
+    templateStartButton.textContent = 'Creating…';
+    if (templateStartStatus) templateStartStatus.textContent = 'Creating a fresh paused workspace…';
+    try {
+      const payload = await postJson(
+        `/api/workspace-templates/${encodeURIComponent(templateId)}/instantiate`,
+        {
+          idempotency_key: templateStartButton.dataset.idempotencyKey,
+          ...(String(templateInstanceName?.value || '').trim()
+            ? { name: String(templateInstanceName.value).trim() }
+            : {}),
+        },
+      );
+      delete templateStartButton.dataset.idempotencyKey;
+      if (templateInstanceName) templateInstanceName.value = '';
+      await refreshBootstrap();
+      const approvals = Array.isArray(payload.approvals_required) ? payload.approvals_required.length : 0;
+      if (templateStartStatus) templateStartStatus.textContent = approvals
+        ? `Workspace created and paused. ${approvals} Library approval${approvals === 1 ? '' : 's'} must be reviewed before use. Turn on Inactive Workspaces to find it.`
+        : 'Workspace created and paused. Turn on Inactive Workspaces to find it.';
+    } catch (error) {
+      if (templateStartStatus) templateStartStatus.textContent = `${error.message} Retry will use the same request key.`;
+    } finally {
+      templateStartButton.disabled = !Array.isArray(bootstrap?.workspace_templates) || !bootstrap.workspace_templates.length;
+      templateStartButton.textContent = 'Start workspace';
+    }
   });
 
   fileInput?.addEventListener('change', () => {
@@ -972,12 +1664,19 @@ async function main() {
       launch_surface: launchSurface?.value || 'desktop',
       schedule_text: wantsSchedule ? scheduleValue : '',
       effort: selectedWorkerEffort(select.value, { codexEffort, claudeEffort, openclawEffort }),
+      provider_account_policy: select.value.startsWith('new:') ? providerAccountPolicy?.value || null : null,
+      provider_account_id: select.value.startsWith('new:') && providerAccountPolicy?.value !== 'legacy'
+        ? providerAccount?.value || null
+        : null,
       files,
     };
     try {
       const response = await fetch(withAuth('/api/launch'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(csrfToken ? { 'X-GlassHive-CSRF': csrfToken } : {}),
+        },
         body: JSON.stringify(payload),
       });
       if (!response.ok) {
@@ -1000,9 +1699,9 @@ async function main() {
     }
   });
 
-  setActiveView(window.location.hash === '#workspaces' ? 'workspaces' : 'project', { updateHash: false });
+  setActiveView(window.location.hash.replace(/^#/, '') || 'project', { updateHash: false });
   window.addEventListener('hashchange', () => {
-    setActiveView(window.location.hash === '#workspaces' ? 'workspaces' : 'project', { updateHash: false });
+    setActiveView(window.location.hash.replace(/^#/, '') || 'project', { updateHash: false });
   });
 }
 

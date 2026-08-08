@@ -10,6 +10,8 @@ import shlex
 from pathlib import Path
 from typing import Any, Callable
 
+from .auth import multi_user_security_enabled
+
 
 JsonDict = dict[str, Any]
 
@@ -122,6 +124,27 @@ DEFAULT_ENTERPRISE_WORKER_ENV_KEYS = {
     "PORTKEY_CONFIG",
     "WPR_CLAUDE_CODE_USE_API_KEY",
 }
+RUN_BOUND_PROVIDER_ENV_KEYS = {
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "OPENAI_REVERSE_PROXY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "PORTKEY_API_KEY",
+    "PORTKEY_BASE_URL",
+    "PORTKEY_PROVIDER",
+    "PORTKEY_VIRTUAL_KEY",
+    "PORTKEY_CONFIG",
+    "WPR_CLAUDE_CODE_USE_API_KEY",
+}
 DEFAULT_SECRET_ENV_MARKERS = (
     "ACCESS_KEY",
     "API_KEY",
@@ -216,7 +239,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def _enterprise_mode_enabled() -> bool:
-    return _env_flag("GLASSHIVE_ENTERPRISE_MODE") or _env_flag("WPR_ENTERPRISE_MODE")
+    return multi_user_security_enabled()
 
 
 def _bootstrap_source_secret() -> str:
@@ -359,6 +382,15 @@ def bootstrap_env_for(worker: dict[str, Any]) -> dict[str, str]:
             value = os.environ.get(key)
             if value and key not in env:
                 env[key] = value
+    if worker.get("_glasshive_provider_account_bound") or worker.get(
+        "_glasshive_inference_broker_bound"
+    ):
+        # The run launcher projects the selected personal home or short-lived
+        # broker grant explicitly. Persisted deployment credentials are sourced
+        # by the shell after docker-exec env processing and would otherwise
+        # override that run-scoped selection.
+        for key in RUN_BOUND_PROVIDER_ENV_KEYS:
+            env.pop(key, None)
     return env
 
 
@@ -380,7 +412,11 @@ def apply_bootstrap(
     profile = bootstrap_profile_for(worker, runtime_name)
     bundle = bootstrap_bundle_for(worker)
 
-    if profile not in {"clean-room", "none"} and not _enterprise_mode_enabled():
+    if (
+        profile not in {"clean-room", "none"}
+        and not _enterprise_mode_enabled()
+        and not worker.get("_glasshive_provider_account_bound")
+    ):
         if profile in {"host-login", "full-local", "codex-host"} or runtime_name in {"codex-cli", "openclaw"}:
             copy_file(Path.home() / ".codex" / "auth.json", home_dir / ".codex" / "auth.json")
         if profile in {"host-login", "full-local", "claude-host"} or runtime_name in {"claude-code", "openclaw"}:

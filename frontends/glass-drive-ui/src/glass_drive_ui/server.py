@@ -3,14 +3,17 @@ from __future__ import annotations
 import os
 import re
 import asyncio
+import base64
+import hmac
 import json
 import logging
 import shlex
 import sqlite3
+import sys
 import time
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, parse_qsl, urlencode, unquote, urlparse
 
 import httpx
@@ -29,6 +32,8 @@ from .prompt_template import (
     normalize_launch_surface,
 )
 from .runtime_client import RuntimeClient
+from .internal_assertions import InternalAssertionSigner
+from .auth_gateway import AuthGatewayError, HumanAuthGateway
 from .signed_links import (
     create_signed_link_ref,
     install_sensitive_url_log_filter,
@@ -42,14 +47,74 @@ from .signed_links import (
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SAFE_WORKER_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 SAFE_UPLOAD_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+PROVIDER_ACCOUNT_POLICIES = {"legacy", "personal_preferred", "personal_required"}
+PROFILE_ACCOUNT_PROVIDERS = {
+    "codex-cli": {"codex", "openai"},
+    "claude-code": {"claude", "anthropic"},
+}
+AUTH_SESSION_COOKIE = "glasshive_session"
+AUTH_CSRF_COOKIE = "glasshive_csrf"
+AUTH_OIDC_STATE_COOKIE = "glasshive_oidc_state"
+OIDC_START_WINDOW_SECONDS = 5 * 60
+OIDC_START_MAX_ATTEMPTS = 30
+OIDC_START_MAX_SOURCES = 4096
 NOVNC_VIEW_URL_CACHE_TTL_SECONDS = 15.0
 NOVNC_ASSET_CACHE_TTL_SECONDS = 10 * 60.0
 NOVNC_ASSET_CACHE_MAX_BYTES = 2 * 1024 * 1024
 RUNTIME_ENV_KEYS = {
+    "GLASSHIVE_RELEASE_ID",
+    "GLASSHIVE_PARENT_REVISION",
+    "GLASSHIVE_COMPONENT_REVISION",
     "GLASSHIVE_ENTERPRISE_MODE",
+    "GLASSHIVE_SECURITY_MODE",
     "GLASSHIVE_PUBLIC_LINKS_ONLY",
     "WPR_ENTERPRISE_MODE",
     "GLASSHIVE_AUTH_MODE",
+    "GLASSHIVE_HUMAN_AUTH_MODE",
+    "GLASSHIVE_ALLOW_EMAIL_LOGIN",
+    "GLASSHIVE_ALLOW_EMAIL_REGISTRATION",
+    "GLASSHIVE_ALLOWED_EMAIL_DOMAINS",
+    "GLASSHIVE_ALLOWED_ORIGINS",
+    "GLASSHIVE_AUTH_STATE_PATH",
+    "GLASSHIVE_AUTH_SESSION_TTL_SECONDS",
+    "GLASSHIVE_OIDC_ISSUER",
+    "GLASSHIVE_OIDC_CLIENT_ID",
+    "GLASSHIVE_OIDC_CLIENT_SECRET",
+    "GLASSHIVE_OIDC_REDIRECT_URI",
+    "GLASSHIVE_OIDC_POST_LOGOUT_REDIRECT_URI",
+    "GLASSHIVE_OIDC_SCOPES",
+    "GLASSHIVE_OIDC_ROLE_CLAIM",
+    "GLASSHIVE_OIDC_ROLE_MAP_JSON",
+    "GLASSHIVE_INTERNAL_ASSERTION_ISSUER",
+    "GLASSHIVE_INTERNAL_ASSERTION_AUDIENCE",
+    "GLASSHIVE_INTERNAL_ASSERTION_KEY_ID",
+    "GLASSHIVE_INTERNAL_ASSERTION_PRIVATE_KEY_FILE",
+    "GLASSHIVE_INTERNAL_ASSERTION_JWKS_URL",
+    "GLASSHIVE_MCP_OAUTH_ISSUER",
+    "GLASSHIVE_MCP_PUBLIC_URL",
+    "GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES",
+    "GLASSHIVE_MCP_OAUTH_TOKEN_TENANT_ID",
+    "GLASSHIVE_MCP_OAUTH_TOKEN_SCOPES",
+    "GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES",
+    "GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS",
+    "GLASSHIVE_MCP_CLAUDE_CLIENT_ID",
+    "GLASSHIVE_MCP_CLAUDE_CALLBACK_PORT",
+    "GLASSHIVE_MCP_CODEX_CLIENT_ID",
+    "GLASSHIVE_MCP_CODEX_CALLBACK_PORT",
+    "GLASSHIVE_MCP_CODEX_RESOURCE",
+    "GLASSHIVE_MCP_OAUTH_SUBJECT_CLAIM",
+    "GLASSHIVE_MCP_DOCUMENTATION_URL",
+    "GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS",
+    "GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH",
+    "GLASSHIVE_PROVIDER_SECRET_STORE_ENABLED",
+    "GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION",
+    "GLASSHIVE_INFERENCE_BROKER_URL",
+    "GLASSHIVE_INFERENCE_BROKER_PROXY_BASE_URL",
+    "GLASSHIVE_INFERENCE_BROKER_SECRET",
+    "GLASSHIVE_INFERENCE_BROKER_TENANT_ID",
+    "GLASSHIVE_INFERENCE_BROKER_OWNER_BINDINGS_JSON",
+    "GLASSHIVE_INFERENCE_BROKER_TIMEOUT_SECONDS",
+    "GLASSHIVE_CONNECTED_ACCOUNTS_URL",
     "GLASSHIVE_ENTERPRISE_TENANT_ID",
     "WPR_ENTERPRISE_TENANT_ID",
     "GLASSHIVE_OPERATOR_BASE_URL",
@@ -67,6 +132,39 @@ RUNTIME_ENV_KEYS = {
     "GLASSHIVE_OWNER_IDENTITY_ALIASES_FILE",
     "WPR_API_TOKEN",
 }
+
+
+class _BoundedAttemptLimiter:
+    """Small in-process throttle whose source map cannot grow without bound."""
+
+    def __init__(self, *, window_seconds: float, max_attempts: int, max_sources: int):
+        self.window_seconds = max(1.0, float(window_seconds))
+        self.max_attempts = max(1, int(max_attempts))
+        self.max_sources = max(1, int(max_sources))
+        self.attempts_by_source: dict[str, list[float]] = {}
+
+    def _prune(self, now: float) -> None:
+        for source, attempts in list(self.attempts_by_source.items()):
+            active = [value for value in attempts if now - value < self.window_seconds]
+            if active:
+                self.attempts_by_source[source] = active
+            else:
+                self.attempts_by_source.pop(source, None)
+
+    def admit(self, source: str, *, now: float | None = None) -> None:
+        timestamp = time.monotonic() if now is None else float(now)
+        self._prune(timestamp)
+        normalized_source = str(source or "unknown")[:128]
+        attempts = self.attempts_by_source.get(normalized_source, [])
+        if len(attempts) >= self.max_attempts:
+            raise HTTPException(status_code=429, detail="Too many sign-in attempts; try again shortly")
+        if normalized_source not in self.attempts_by_source and len(self.attempts_by_source) >= self.max_sources:
+            oldest_source = min(
+                self.attempts_by_source,
+                key=lambda item: self.attempts_by_source[item][-1],
+            )
+            self.attempts_by_source.pop(oldest_source, None)
+        self.attempts_by_source.setdefault(normalized_source, []).append(timestamp)
 _NOVNC_VIEW_URL_CACHE: dict[str, tuple[float, str]] = {}
 _NOVNC_ASSET_CACHE: dict[str, tuple[float, int, bytes, str]] = {}
 _NOVNC_HTTP_CLIENT: httpx.Client | None = None
@@ -94,10 +192,20 @@ def _watch_session_state_path() -> Path:
     return state_root / "glasshive" / "watch_sessions.sqlite3"
 
 
+def _harden_watch_session_state(db_path: Path) -> None:
+    if os.name == "nt":
+        return
+    db_path.parent.chmod(0o700)
+    for candidate in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        if candidate.exists() and not candidate.is_symlink():
+            candidate.chmod(0o600)
+
+
 def _watch_session_conn() -> sqlite3.Connection:
     db_path = _watch_session_state_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30)
+    _harden_watch_session_state(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         """
@@ -112,6 +220,7 @@ def _watch_session_conn() -> sqlite3.Connection:
         )
         """
     )
+    _harden_watch_session_state(db_path)
     return conn
 
 
@@ -250,7 +359,7 @@ class UploadedFileRequest(BaseModel):
 
 class LaunchRequest(BaseModel):
     description: str = Field(min_length=1)
-    success_criteria: str = Field(min_length=1)
+    success_criteria: str = ""
     context: str | None = None
     workspace_option: str | None = None
     workspace_type: str | None = None
@@ -258,6 +367,8 @@ class LaunchRequest(BaseModel):
     launch_surface: str | None = None
     schedule_text: str | None = None
     effort: str | None = None
+    provider_account_policy: Literal["legacy", "personal_preferred", "personal_required"] | None = None
+    provider_account_id: str | None = Field(default=None, max_length=128)
     files: list[UploadedFileRequest] = Field(default_factory=list)
 
 
@@ -279,9 +390,147 @@ class ActionRequest(BaseModel):
 class MetadataRequest(BaseModel):
     favorite: bool | None = None
     name: str | None = None
+    tags: list[str] | None = None
+    workspace_kind: Literal["named", "ephemeral", "legacy"] | None = None
+
+
+class DuplicateWorkspaceRequest(BaseModel):
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    name: str | None = Field(default=None, max_length=160)
+
+
+class SaveWorkspaceTemplateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    description: str = Field(default="", max_length=1000)
+    lineage_id: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+class InstantiateWorkspaceTemplateRequest(BaseModel):
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+
+
+class ProviderAccountRequest(BaseModel):
+    provider: str = Field(min_length=1, max_length=40)
+    label: str = Field(min_length=1, max_length=160)
+    auth_method: str = Field(min_length=1, max_length=40)
+    make_default: bool = False
+
+
+class PendingChangeRequest(BaseModel):
+    change_type: str = Field(min_length=1, max_length=120)
+    target_id: str = Field(min_length=1, max_length=200)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class PendingChangeConfirmRequest(BaseModel):
+    confirmation_token: str = Field(min_length=16, max_length=512)
+
+
+class AdminPrincipalUpdateRequest(BaseModel):
+    disabled: bool
+
+
+class RecurringScheduleRequest(BaseModel):
+    instruction: str = Field(min_length=1, max_length=10000)
+    recurrence_type: Literal["once", "daily", "interval", "cron", "rfc5545"]
+    interval_seconds: int | None = None
+    local_time: str = ""
+    timezone_name: str = "UTC"
+    dst_policy: Literal["next_valid_earliest", "next_valid_latest"] = "next_valid_earliest"
+    first_run_at: str | None = None
+    cron_expression: str = ""
+    rrule: str = ""
+    starts_at: str | None = None
+    ends_at: str | None = None
+    enabled: bool = True
+    overlap_policy: Literal["skip", "queue"] = "skip"
+    misfire_grace_seconds: int = Field(default=300, ge=0, le=604800)
+    catch_up_policy: Literal["skip", "bounded", "coalesce"] = "skip"
+    max_catch_up_occurrences: int = Field(default=1, ge=1, le=10)
+    jitter_seconds: int = Field(default=0, ge=0, le=900)
+    schedule_text: str = ""
+
+
+class RecurringScheduleUpdateRequest(BaseModel):
+    instruction: str | None = Field(default=None, min_length=1, max_length=10000)
+    recurrence_type: Literal["once", "daily", "interval", "cron", "rfc5545"] | None = None
+    interval_seconds: int | None = None
+    local_time: str | None = None
+    timezone_name: str | None = None
+    dst_policy: Literal["next_valid_earliest", "next_valid_latest"] | None = None
+    cron_expression: str | None = None
+    rrule: str | None = None
+    starts_at: str | None = None
+    ends_at: str | None = None
+    enabled: bool | None = None
+    overlap_policy: Literal["skip", "queue"] | None = None
+    misfire_grace_seconds: int | None = Field(default=None, ge=0, le=604800)
+    catch_up_policy: Literal["skip", "bounded", "coalesce"] | None = None
+    max_catch_up_occurrences: int | None = Field(default=None, ge=1, le=10)
+    jitter_seconds: int | None = Field(default=None, ge=0, le=900)
+    schedule_text: str | None = None
+
+
+class RecurringScheduleRunNowRequest(BaseModel):
+    idempotency_key: str = Field(min_length=8, max_length=128)
+
+
+def _recurring_path_id(value: str, label: str) -> str:
+    normalized = str(value or "").strip()
+    if not SAFE_WORKER_ID_RE.fullmatch(normalized):
+        raise HTTPException(status_code=400, detail=f"Invalid {label}")
+    return normalized
 
 
 SIGNED_QUERY_KEYS = {"gh_token", "gh_sig", "gh_exp", "gh_kind"}
+LOGIN_RETURN_SENSITIVE_QUERY_KEYS = SIGNED_QUERY_KEYS | {
+    "code",
+    "state",
+    "error_description",
+}
+OIDC_UI_ERROR_CODES = {
+    "access_denied",
+    "account_not_authorized",
+    "account_not_registered",
+    "callback_invalid",
+    "cancelled",
+    "identity_invalid",
+    "provider_configuration",
+    "provider_unavailable",
+    "sign_in_failed",
+    "state_expired",
+    "state_invalid",
+    "token_invalid",
+}
+
+
+def _canonical_codex_server_url(value: str) -> str:
+    """Mirror Rust `Url::parse(...).as_str()` for supported HTTP(S) MCP URLs."""
+    parsed = urlparse(str(value or "").strip())
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("invalid MCP server URL")
+    if any(ord(character) > 127 for character in str(value or "")) or re.search(
+        r"%(?![0-9A-Fa-f]{2})",
+        str(value or ""),
+    ):
+        raise ValueError("invalid MCP server URL encoding")
+    hostname = str(parsed.hostname).encode("idna").decode("ascii").lower()
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    port = parsed.port
+    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    netloc = host if port in {None, default_port} else f"{host}:{port}"
+    path = parsed.path or "/"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{parsed.scheme.lower()}://{netloc}{path}{query}"
+
+
+def _codex_oauth_callback_uri(mcp_url: str, callback_port: int) -> str:
+    canonical = _canonical_codex_server_url(mcp_url)
+    callback_hash = base64.urlsafe_b64encode(
+        sha256(canonical.encode("utf-8")).digest()[:9]
+    ).decode("ascii").rstrip("=")
+    return f"http://127.0.0.1:{callback_port}/callback/{callback_hash}"
 
 
 def _strip_signed_query_params(url: str) -> str:
@@ -352,49 +601,63 @@ def _append_signed_worker_token(url: str, worker_id: str, identity: dict[str, st
     return signed_link_ref_url("", ref_id)
 
 
-def flatten_workspaces(client: RuntimeClient, identity: dict[str, str] | None = None) -> list[dict[str, Any]]:
+def flatten_workspaces(
+    client: RuntimeClient,
+    identity: dict[str, str] | None = None,
+    *,
+    availability: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Build the bounded primary catalog from the runtime's owner-scoped cursor API."""
+
     items: list[dict[str, Any]] = []
     seen_worker_ids: set[str] = set()
+    try:
+        safe_catalog = client.list_workspace_catalog(kind="named", limit=25)
+        if availability is not None:
+            availability["workspace_catalog"] = "ready"
+    except Exception:
+        safe_catalog = {"items": []}
+        if availability is not None:
+            availability["workspace_catalog"] = "unavailable"
     active_states = {"created", "starting", "queued", "running", "resuming"}
     resumable_states = {"ready", "paused", "idle", "idle_terminated", "stopped"}
-    for project in client.list_projects():
-        project_id = str(project["project_id"])
-        for worker in client.list_workers(project_id):
-            worker_state = str(worker.get("state") or "").strip().lower()
-            if worker_state == "terminated":
-                continue
-            project_title = str(project.get("title") or project_id)
-            worker_name = str(worker.get("name") or worker["worker_id"])
-            worker_id = str(worker["worker_id"])
-            if worker_id in seen_worker_ids:
-                continue
-            seen_worker_ids.add(worker_id)
-            is_active = worker_state in active_states
-            is_resumable = worker_state in resumable_states
-            state_label = "retained" if worker_state == "ready" else (worker.get("state") or "")
-            watch_url = f"/watch/{worker_id}?project_id={project_id}&surface=desktop"
-            project_url = f"/ui/projects/{project_id}?worker_id={worker_id}"
-            desktop_url = f"/desktop/{worker_id}"
-            api_url = f"/api/worker/{worker_id}"
-            items.append(
-                {
-                    "project_id": project_id,
-                    "project_title": project_title,
-                    "worker_id": worker_id,
-                    "name": worker_name,
-                    "workspace_label": project_title or worker_name,
-                    "profile": worker.get("profile") or "",
-                    "state": worker.get("state") or "",
-                    "favorite": bool(worker.get("favorite")),
-                    "is_active": is_active,
-                    "is_resumable": is_resumable,
-                    "state_label": state_label,
-                    "watch_url": _append_signed_worker_token(watch_url, worker_id, identity),
-                    "project_url": _append_signed_worker_token(project_url, worker_id, identity),
-                    "desktop_url": _append_signed_worker_token(desktop_url, worker_id, identity),
-                    "api_url": _append_signed_worker_token(api_url, worker_id, identity),
-                }
-            )
+    for worker in safe_catalog.get("items", []):
+        if not isinstance(worker, dict):
+            continue
+        worker_state = str(worker.get("state") or "").strip().lower()
+        if worker_state == "terminated":
+            continue
+        project_id = str(worker.get("project_id") or "")
+        worker_id = str(worker.get("worker_id") or "")
+        if not worker_id or worker_id in seen_worker_ids:
+            continue
+        seen_worker_ids.add(worker_id)
+        project_title = str(worker.get("project_title") or worker.get("name") or project_id)
+        worker_name = str(worker.get("name") or worker_id)
+        watch_url = f"/watch/{worker_id}?project_id={project_id}&surface=desktop"
+        project_url = f"/ui/projects/{project_id}?worker_id={worker_id}"
+        desktop_url = f"/desktop/{worker_id}"
+        api_url = f"/api/worker/{worker_id}"
+        items.append(
+            {
+                **worker,
+                "project_id": project_id,
+                "project_title": project_title,
+                "worker_id": worker_id,
+                "name": worker_name,
+                "workspace_label": project_title or worker_name,
+                "is_active": worker_state in active_states,
+                "is_resumable": worker_state in resumable_states,
+                "state_label": "retained" if worker_state == "ready" else (worker.get("state") or ""),
+                "watch_url": _append_signed_worker_token(watch_url, worker_id, identity),
+                "project_url": _append_signed_worker_token(project_url, worker_id, identity),
+                "desktop_url": _append_signed_worker_token(desktop_url, worker_id, identity),
+                "api_url": _append_signed_worker_token(api_url, worker_id, identity),
+                # Browser controls run inside the authenticated GlassHive shell. Keep the
+                # navigation URLs opaque while child control paths remain same-origin.
+                "control_url": api_url,
+            }
+        )
     return items
 
 
@@ -438,8 +701,26 @@ def _public_links_only_enabled() -> bool:
     return _truthy_env("GLASSHIVE_PUBLIC_LINKS_ONLY")
 
 
+def _multi_user_security_enabled() -> bool:
+    return str(os.environ.get("GLASSHIVE_SECURITY_MODE") or "").strip().lower() == "multi_user"
+
+
+def _personal_account_isolation_ready() -> bool:
+    return (
+        not _multi_user_security_enabled()
+        or str(os.environ.get("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION") or "").strip().lower()
+        == "per_worker_container"
+    )
+
+
 def _validate_enterprise_startup() -> None:
-    enterprise = _truthy_env("GLASSHIVE_ENTERPRISE_MODE") or _truthy_env("WPR_ENTERPRISE_MODE")
+    security_mode = str(os.environ.get("GLASSHIVE_SECURITY_MODE") or "").strip().lower()
+    if security_mode not in {"", "local", "legacy_compatibility", "multi_user"}:
+        raise RuntimeError("GLASSHIVE_SECURITY_MODE must be local, legacy_compatibility, or multi_user")
+    enterprise = _multi_user_security_enabled() or _truthy_env("GLASSHIVE_ENTERPRISE_MODE") or _truthy_env("WPR_ENTERPRISE_MODE")
+    human_auth_mode = str(os.environ.get("GLASSHIVE_HUMAN_AUTH_MODE") or "").strip().lower()
+    if human_auth_mode == "oidc" and _truthy_env("GLASSHIVE_TRUST_INBOUND_IDENTITY"):
+        raise RuntimeError("OIDC human auth cannot trust inbound identity headers")
     if _public_links_only_enabled() and not str(
         os.environ.get("GLASSHIVE_SIGNED_LINK_SECRET") or ""
     ).strip():
@@ -456,6 +737,18 @@ def _validate_enterprise_startup() -> None:
         raise RuntimeError("GlassHive enterprise UI requires GLASSHIVE_SIGNED_LINK_SECRET")
     if signed_link_secret == api_token:
         raise RuntimeError("GlassHive enterprise UI requires GLASSHIVE_SIGNED_LINK_SECRET to differ from WPR_API_TOKEN")
+    if _multi_user_security_enabled() and not str(
+        os.environ.get("GLASSHIVE_ENTERPRISE_TENANT_ID") or os.environ.get("WPR_ENTERPRISE_TENANT_ID") or ""
+    ).strip():
+        raise RuntimeError("GLASSHIVE_SECURITY_MODE=multi_user requires a deployment tenant id")
+    if (
+        _multi_user_security_enabled()
+        and human_auth_mode == "trusted_proxy"
+        and not _truthy_env("GLASSHIVE_TRUSTED_PROXY_BOUNDARY_PROVEN")
+    ):
+        raise RuntimeError(
+            "Multi-user trusted-proxy auth requires a proven private ingress or mTLS boundary"
+        )
     try:
         _validate_owner_identity_config()
     except ValueError as exc:
@@ -744,6 +1037,99 @@ def _bootstrap_bundle_with_effort(bundle: dict[str, Any] | None, profile: str, e
     return next_bundle
 
 
+def _provider_account_selection_for_launch(
+    accounts: list[dict[str, Any]],
+    *,
+    profile: str,
+    requested_policy: str | None,
+    requested_account_id: str | None,
+) -> dict[str, str] | None:
+    """Resolve one owner-scoped account without changing legacy callers that omit the fields."""
+
+    account_id = str(requested_account_id or "").strip()
+    raw_policy = str(requested_policy or "").strip().lower()
+    if not raw_policy and not account_id:
+        return None
+    policy = raw_policy or "personal_required"
+    if policy not in PROVIDER_ACCOUNT_POLICIES:
+        raise HTTPException(status_code=400, detail="Unsupported worker credential policy")
+    if policy == "legacy":
+        if account_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Deployment account policy cannot include a personal account",
+            )
+        return {"policy": "legacy"}
+
+    supported_providers = PROFILE_ACCOUNT_PROVIDERS.get(profile)
+    if not supported_providers:
+        raise HTTPException(
+            status_code=409,
+            detail="Personal worker accounts are not available for this worker type",
+        )
+    normalized_accounts = [dict(account) for account in accounts if isinstance(account, dict)]
+    selected: dict[str, Any] | None = None
+    if account_id:
+        selected = next(
+            (
+                account
+                for account in normalized_accounts
+                if str(account.get("account_id") or "").strip() == account_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise HTTPException(
+                status_code=409,
+                detail="The selected personal account is not available for this user",
+            )
+        if str(selected.get("provider") or "").strip().lower() not in supported_providers:
+            raise HTTPException(
+                status_code=409,
+                detail="The selected personal account does not match this worker type",
+            )
+        if str(selected.get("status") or "").strip().lower() != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail="The selected personal account is not ready; reconnect it before launching",
+            )
+    else:
+        selected = next(
+            (
+                account
+                for account in normalized_accounts
+                if str(account.get("provider") or "").strip().lower() in supported_providers
+                and str(account.get("status") or "").strip().lower() == "ready"
+                and bool(account.get("is_default"))
+            ),
+            None,
+        )
+        if selected is None and policy == "personal_required":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No ready personal account is set as default for this worker type; "
+                    "connect one or choose a ready account before launching"
+                ),
+            )
+
+    selection = {"policy": policy}
+    if selected is not None:
+        selection["account_id"] = str(selected.get("account_id") or "").strip()
+    return selection
+
+
+def _bootstrap_bundle_with_provider_account(
+    bundle: dict[str, Any] | None,
+    selection: dict[str, str] | None,
+) -> dict[str, Any] | None:
+    if selection is None:
+        return bundle
+    next_bundle = dict(bundle or {})
+    next_bundle["provider_account"] = dict(selection)
+    return next_bundle
+
+
 def _execution_mode_from_workspace_type(workspace_type: str | None) -> str:
     requested = str(workspace_type or _default_workspace_type()).strip().lower()
     if requested == "host":
@@ -830,7 +1216,22 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     install_sensitive_url_log_filter()
     _validate_enterprise_startup()
     client = runtime_client or RuntimeClient()
-    enterprise = _truthy_env("GLASSHIVE_ENTERPRISE_MODE") or _truthy_env("WPR_ENTERPRISE_MODE")
+    human_auth = HumanAuthGateway.from_env()
+    enterprise = _multi_user_security_enabled() or _truthy_env("GLASSHIVE_ENTERPRISE_MODE") or _truthy_env("WPR_ENTERPRISE_MODE")
+    configured_auth_mode = str(os.environ.get("GLASSHIVE_AUTH_MODE") or "").strip().lower()
+    auth_mode = configured_auth_mode or ("signed_internal_assertion" if _multi_user_security_enabled() else "local")
+    if _multi_user_security_enabled() and auth_mode != "signed_internal_assertion":
+        raise RuntimeError("GLASSHIVE_SECURITY_MODE=multi_user requires signed_internal_assertion auth")
+    if _multi_user_security_enabled() and human_auth.mode != "oidc":
+        raise RuntimeError(
+            "GLASSHIVE_SECURITY_MODE=multi_user requires built-in OIDC human auth; "
+            "plaintext trusted-proxy identity is legacy/local compatibility only"
+        )
+    internal_assertion_signer = (
+        InternalAssertionSigner.from_env()
+        if enterprise and auth_mode == "signed_internal_assertion"
+        else None
+    )
     public_links_only = _public_links_only_enabled()
     app = FastAPI(
         title="GlassHive",
@@ -840,6 +1241,249 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         openapi_url=None if enterprise or public_links_only else "/openapi.json",
     )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    oidc_start_limiter = _BoundedAttemptLimiter(
+        window_seconds=OIDC_START_WINDOW_SECONDS,
+        max_attempts=OIDC_START_MAX_ATTEMPTS,
+        max_sources=OIDC_START_MAX_SOURCES,
+    )
+
+    def _admit_oidc_start(request: Request) -> None:
+        source = str(request.client.host if request.client else "unknown")[:128]
+        oidc_start_limiter.admit(source)
+
+    def _session_for_request(request: Request) -> dict[str, Any] | None:
+        if not human_auth.session_enabled:
+            return None
+        return human_auth.resolve_session(str(request.cookies.get(AUTH_SESSION_COOKIE) or ""))
+
+    def _safe_login_return_to(request: Request) -> str:
+        path = str(request.url.path or "/")
+        if not path.startswith("/") or path.startswith("//") or "\\" in path:
+            return "/"
+        query = urlencode(
+            [
+                (key, value)
+                for key, value in request.query_params.multi_items()
+                if key not in LOGIN_RETURN_SENSITIVE_QUERY_KEYS
+            ],
+            doseq=True,
+        )
+        target = f"{path}?{query}" if query else path
+        return target if len(target) <= 2048 else "/"
+
+    def _login_redirect_if_needed(
+        request: Request,
+        *,
+        worker_id: str | None = None,
+    ) -> RedirectResponse | None:
+        if not human_auth.session_enabled or _session_for_request(request) is not None:
+            return None
+        if _signed_token_from_request(request, worker_id):
+            return None
+        target = _safe_login_return_to(request)
+        return RedirectResponse(
+            f"/login?{urlencode({'return_to': target})}",
+            status_code=303,
+        )
+
+    def _oidc_error_redirect(request: Request, code: str) -> RedirectResponse:
+        bounded_code = code if code in OIDC_UI_ERROR_CODES else "sign_in_failed"
+        response = RedirectResponse(
+            f"/login?{urlencode({'auth_error': bounded_code})}",
+            status_code=303,
+        )
+        response.delete_cookie(AUTH_OIDC_STATE_COOKIE, path="/auth/oidc")
+        return response
+
+    def _set_auth_cookies(response: Response, request: Request, session: dict[str, Any]) -> None:
+        max_age = max(1, int(float(session["expires_at"]) - time.time()))
+        response.set_cookie(
+            AUTH_SESSION_COOKIE,
+            str(session["token"]),
+            max_age=max_age,
+            httponly=True,
+            secure=_request_uses_https(request),
+            samesite="lax",
+            path="/",
+        )
+        response.set_cookie(
+            AUTH_CSRF_COOKIE,
+            str(session["csrf_token"]),
+            max_age=max_age,
+            httponly=False,
+            secure=_request_uses_https(request),
+            samesite="strict",
+            path="/",
+        )
+
+    def _request_origin_allowed(request: Request) -> bool:
+        supplied = str(request.headers.get("origin") or "").strip()
+        if not supplied:
+            return True
+        allowed = {
+            str(value).strip().rstrip("/")
+            for value in str(os.environ.get("GLASSHIVE_ALLOWED_ORIGINS") or "").split(",")
+            if str(value).strip()
+        }
+        allowed.add(str(request.base_url).rstrip("/"))
+        operator_url = str(os.environ.get("GLASSHIVE_OPERATOR_BASE_URL") or "").strip()
+        if operator_url:
+            parsed = urlparse(operator_url)
+            if parsed.scheme and parsed.netloc:
+                allowed.add(f"{parsed.scheme}://{parsed.netloc}")
+        return supplied.rstrip("/") in allowed
+
+    @app.middleware("http")
+    async def browser_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
+            "connect-src 'self' ws: wss:; frame-src 'self'; object-src 'none'; base-uri 'self'; "
+            "frame-ancestors 'self'; form-action 'self'",
+        )
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        if _request_uses_https(request):
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        return response
+
+    @app.middleware("http")
+    async def session_csrf_guard(request: Request, call_next):
+        if request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
+            return await call_next(request)
+        if _enterprise_mode_enabled() and not _request_origin_allowed(request):
+            return JSONResponse(status_code=403, content={"detail": "Request origin is not allowed"})
+        if not human_auth.session_enabled:
+            return await call_next(request)
+        if request.url.path == "/auth/oidc/callback":
+            return await call_next(request)
+        if not _request_origin_allowed(request):
+            return JSONResponse(status_code=403, content={"detail": "Request origin is not allowed"})
+        # A worker-view link is already an expiring, worker-bound authorization
+        # token. Preserve its deliberately narrow message/steer compatibility
+        # path without turning signed links into a general CSRF bypass.
+        if _valid_signed_link_communication_request(request):
+            return await call_next(request)
+        supplied = str(request.headers.get("x-glasshive-csrf") or "").strip()
+        cookie_value = str(request.cookies.get(AUTH_CSRF_COOKIE) or "").strip()
+        session = _session_for_request(request)
+        valid = bool(supplied and cookie_value and hmac.compare_digest(supplied, cookie_value))
+        if valid and session is not None:
+            valid = human_auth.session_csrf_valid(session, supplied)
+        if not valid:
+            return JSONResponse(status_code=403, content={"detail": "Invalid or missing CSRF token"})
+        return await call_next(request)
+
+    @app.get("/auth/config")
+    def auth_config() -> dict[str, object]:
+        return {
+            "mode": human_auth.mode,
+            "email_login": human_auth.mode == "oidc" and _truthy_env("GLASSHIVE_ALLOW_EMAIL_LOGIN"),
+            "email_registration": (
+                human_auth.mode == "oidc" and _truthy_env("GLASSHIVE_ALLOW_EMAIL_REGISTRATION")
+            ),
+            "identity_owner": "external_provider",
+            "oidc": human_auth.mode == "oidc",
+        }
+
+    @app.get("/auth/session")
+    def auth_session(request: Request) -> JSONResponse:
+        session = _session_for_request(request)
+        csrf_cookie = str(request.cookies.get(AUTH_CSRF_COOKIE) or "").strip()
+        if session is not None and human_auth.session_csrf_valid(session, csrf_cookie):
+            payload = {key: value for key, value in session.items() if not key.startswith("_")}
+            payload.update({"authenticated": True, "csrf_token": csrf_cookie})
+            return JSONResponse(payload)
+        return JSONResponse({"authenticated": False, "csrf_token": ""})
+
+    @app.post("/auth/logout")
+    def auth_logout(
+        request: Request,
+        payload: dict[str, str] | None = Body(default=None),
+    ) -> JSONResponse:
+        requested_scope = str((payload or {}).get("scope") or "local").strip().lower()
+        human_auth.revoke_session(str(request.cookies.get(AUTH_SESSION_COOKIE) or ""))
+        redirect_url = "/login?logged_out=local"
+        completed_scope = "local"
+        if requested_scope == "provider":
+            try:
+                provider_url = human_auth.provider_logout_url()
+            except AuthGatewayError:
+                provider_url = ""
+            if provider_url:
+                redirect_url = provider_url
+                completed_scope = "provider"
+            else:
+                redirect_url = "/login?logged_out=local&provider_logout=unavailable"
+        response = JSONResponse(
+            {
+                "authenticated": False,
+                "logout_scope": completed_scope,
+                "redirect_url": redirect_url,
+            }
+        )
+        response.delete_cookie(AUTH_SESSION_COOKIE, path="/")
+        response.delete_cookie(AUTH_CSRF_COOKIE, path="/")
+        response.delete_cookie(AUTH_CSRF_COOKIE, path="/auth")
+        return response
+
+    @app.get("/auth/oidc/start")
+    def auth_oidc_start(request: Request) -> RedirectResponse:
+        _admit_oidc_start(request)
+        try:
+            flow = human_auth.begin_oidc(return_to=str(request.query_params.get("return_to") or "/"))
+        except AuthGatewayError as exc:
+            return _oidc_error_redirect(request, exc.code)
+        response = RedirectResponse(str(flow["authorization_url"]), status_code=303)
+        response.set_cookie(
+            AUTH_OIDC_STATE_COOKIE,
+            str(flow["state"]),
+            max_age=10 * 60,
+            httponly=True,
+            secure=_request_uses_https(request),
+            samesite="lax",
+            path="/auth/oidc",
+        )
+        return response
+
+    @app.get("/auth/oidc/callback")
+    def auth_oidc_callback(request: Request) -> Response:
+        error = str(request.query_params.get("error") or "").strip()
+        if error:
+            code = "access_denied" if error == "access_denied" else "cancelled"
+            return _oidc_error_redirect(request, code)
+        state = str(request.query_params.get("state") or "").strip()
+        cookie_state = str(request.cookies.get(AUTH_OIDC_STATE_COOKIE) or "").strip()
+        if not state or not cookie_state or not hmac.compare_digest(state, cookie_state):
+            return _oidc_error_redirect(request, "state_invalid")
+        try:
+            completed = human_auth.complete_oidc(
+                state=state,
+                code=str(request.query_params.get("code") or ""),
+            )
+            principal = completed["principal"]
+            session = human_auth.create_session(str(principal["user_id"]))
+        except AuthGatewayError as exc:
+            return _oidc_error_redirect(request, exc.code)
+        response = RedirectResponse(str(completed["return_to"]), status_code=303)
+        response.delete_cookie(AUTH_OIDC_STATE_COOKIE, path="/auth/oidc")
+        _set_auth_cookies(response, request, session)
+        return response
+
+    @app.get("/login")
+    def login_page() -> FileResponse:
+        if not human_auth.session_enabled:
+            raise HTTPException(status_code=404, detail="Not found")
+        return FileResponse(STATIC_DIR / "login.html")
+
+    @app.get("/.well-known/jwks.json")
+    def internal_assertion_jwks() -> dict[str, object]:
+        if internal_assertion_signer is None:
+            raise HTTPException(status_code=404, detail="Not found")
+        return internal_assertion_signer.jwks()
 
     def _incoming_identity_header(request: Request, name: str) -> str:
         aliases = {
@@ -855,7 +1499,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         return ""
 
     def _enterprise_mode_enabled() -> bool:
-        return _truthy_env("GLASSHIVE_ENTERPRISE_MODE") or _truthy_env("WPR_ENTERPRISE_MODE")
+        return _multi_user_security_enabled() or _truthy_env("GLASSHIVE_ENTERPRISE_MODE") or _truthy_env("WPR_ENTERPRISE_MODE")
 
     def _enterprise_tenant_id() -> str:
         return str(
@@ -867,6 +1511,8 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     def _allow_default_owner() -> bool:
         if not _enterprise_mode_enabled():
             return True
+        if _multi_user_security_enabled():
+            return False
         return _truthy_env("GLASSHIVE_ALLOW_LOCAL_DEMO_OWNER")
 
     def _worker_cookie_name(worker_id: str) -> str:
@@ -907,7 +1553,12 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
 
     def _request_uses_https(request: Request) -> bool:
         forwarded_proto = str(request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
-        return request.url.scheme == "https" or forwarded_proto == "https" or _truthy_env("GLASSHIVE_COOKIE_SECURE")
+        return (
+            _multi_user_security_enabled()
+            or request.url.scheme == "https"
+            or forwarded_proto == "https"
+            or _truthy_env("GLASSHIVE_COOKIE_SECURE")
+        )
 
     def _set_signed_worker_cookie(response: Response, request: Request, worker_id: str) -> None:
         token = _signed_token_from_request(request, worker_id)
@@ -988,7 +1639,8 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             "tenant_id": token_tenant_id,
             "user_id": str(payload.get("owner_id") or "").strip(),
             "email": "",
-            "role": "member",
+            "role": "viewer",
+            "auth_source": "signed_link",
         }
 
     def _watch_session_timeout_seconds(request: Request | WebSocket, worker_id: str) -> float:
@@ -1019,16 +1671,26 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         values = [value for value in (configured, signed_remaining, persisted_remaining) if value > 0]
         return float(max(1, min(values))) if values else 0.0
 
-    def _request_identity(request: Request, worker_id: str | None = None) -> dict[str, str]:
-        signed_identity = _signed_link_identity(request, worker_id)
-        if signed_identity is not None:
-            return signed_identity
-
+    def _request_identity(request: Request | WebSocket, worker_id: str | None = None) -> dict[str, str]:
         if _public_links_only_enabled():
+            signed_identity = _signed_link_identity(request, worker_id)
+            if signed_identity is not None:
+                return signed_identity
             raise HTTPException(
                 status_code=401,
                 detail="This public GlassHive surface requires a signed workspace or artifact link",
             )
+
+        session = _session_for_request(request)
+        if session is not None:
+            return {
+                "tenant_id": str(session.get("tenant_id") or "").strip(),
+                "user_id": str(session.get("user_id") or "").strip(),
+                "email": str(session.get("email") or "").strip(),
+                "display_name": str(session.get("display_name") or "").strip(),
+                "role": str(session.get("role") or "member").strip(),
+                "auth_source": "session",
+            }
 
         enterprise = _enterprise_mode_enabled()
         trust_inbound_identity = _truthy_env("GLASSHIVE_TRUST_INBOUND_IDENTITY")
@@ -1040,12 +1702,44 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         if trust_inbound_identity:
             asserted_tenant = _incoming_identity_header(request, "X-Viventium-Tenant-Id")
             asserted_user = _incoming_identity_header(request, "X-Viventium-User-Id")
-            if enterprise and asserted_tenant and tenant_id and asserted_tenant != tenant_id:
-                raise HTTPException(status_code=401, detail="GlassHive tenant assertion does not match this deployment")
-            tenant_id = asserted_tenant or tenant_id
-            user_id = asserted_user or (user_id if _allow_default_owner() else "")
-            email = _incoming_identity_header(request, "X-Viventium-User-Email")
-            role = _incoming_identity_header(request, "X-Viventium-User-Role")
+            asserted_email = _incoming_identity_header(request, "X-Viventium-User-Email")
+            asserted_role = _incoming_identity_header(request, "X-Viventium-User-Role")
+            if any((asserted_tenant, asserted_user, asserted_email, asserted_role)):
+                if enterprise and asserted_tenant and tenant_id and asserted_tenant != tenant_id:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="GlassHive tenant assertion does not match this deployment",
+                    )
+                tenant_id = asserted_tenant or tenant_id
+                user_id = asserted_user or (user_id if _allow_default_owner() else "")
+                email = asserted_email
+                role = asserted_role
+                if human_auth.allowed_email_domains and not human_auth.email_allowed(email):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="This account is outside the approved email domains",
+                    )
+                if enterprise and not user_id:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="GlassHive enterprise UI requires an authenticated user assertion from the trusted proxy",
+                    )
+                return {
+                    "tenant_id": tenant_id,
+                    "user_id": user_id,
+                    "email": email,
+                    "role": role,
+                    "auth_source": "trusted_proxy",
+                }
+
+        signed_identity = _signed_link_identity(request, worker_id)
+        if signed_identity is not None:
+            return signed_identity
+
+        if human_auth.session_enabled and not trust_inbound_identity:
+            raise HTTPException(status_code=401, detail="Sign in to continue")
+        if trust_inbound_identity:
+            user_id = user_id if _allow_default_owner() else ""
         elif not _allow_default_owner():
             user_id = ""
 
@@ -1060,7 +1754,79 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             "user_id": user_id,
             "email": email,
             "role": role,
+            "auth_source": "local",
         }
+
+    def _normalized_identity_role(identity: dict[str, str]) -> str:
+        incoming_role = str(identity.get("role") or "").strip().lower()
+        aliases = {
+            "admin": "tenant_admin",
+            "owner": "tenant_admin",
+            "operator": "member",
+            "local_operator": "member",
+        }
+        normalized = aliases.get(incoming_role, incoming_role)
+        if normalized in {"member", "viewer", "tenant_admin", "service"}:
+            return normalized
+        if not normalized and str(identity.get("auth_source") or "") != "signed_link":
+            return "member"
+        return "viewer"
+
+    def _restricted_identity(identity: dict[str, str]) -> bool:
+        return (
+            str(identity.get("auth_source") or "") == "signed_link"
+            or _normalized_identity_role(identity) == "viewer"
+        )
+
+    def _require_tenant_admin(request: Request) -> dict[str, str]:
+        identity = _request_identity(request)
+        if _normalized_identity_role(identity) != "tenant_admin":
+            raise HTTPException(status_code=403, detail="Tenant administrator role required")
+        if not human_auth.session_enabled:
+            raise HTTPException(status_code=404, detail="User administration is not available")
+        return identity
+
+    def _request_method(request: Request | WebSocket) -> str:
+        return str(getattr(request, "method", "GET") or "GET").upper()
+
+    def _signed_link_communication_allowed(
+        request: Request | WebSocket,
+        worker_id: str | None,
+        identity: dict[str, str],
+    ) -> bool:
+        if str(identity.get("auth_source") or "") != "signed_link":
+            return False
+        if _request_method(request) != "POST" or not worker_id or not SAFE_WORKER_ID_RE.fullmatch(worker_id):
+            return False
+        path = str(request.url.path or "")
+        return path in {
+            f"/api/workspace/{worker_id}/message",
+            f"/api/worker/{worker_id}/message",
+            f"/api/workspace/{worker_id}/steer",
+            f"/api/worker/{worker_id}/steer",
+        }
+
+    def _valid_signed_link_communication_request(request: Request) -> bool:
+        path_match = re.fullmatch(
+            r"/api/(?:workspace|worker)/(?P<worker_id>[A-Za-z0-9._-]{1,128})/(?P<action>message|steer)",
+            str(request.url.path or ""),
+        )
+        if request.method.upper() != "POST" or path_match is None:
+            return False
+        worker_id = path_match.group("worker_id")
+        try:
+            identity = _request_identity(request, worker_id)
+        except HTTPException:
+            return False
+        return _signed_link_communication_allowed(request, worker_id, identity)
+
+    def _require_interactive_access(request: Request | WebSocket, worker_id: str) -> None:
+        identity = _request_identity(request, worker_id)
+        if _restricted_identity(identity):
+            raise HTTPException(
+                status_code=403,
+                detail="Interactive desktop access requires a workspace member",
+            )
 
     def _trusted_proxy_identity_for_short_ref(request: Request) -> dict[str, str] | None:
         if not _enterprise_mode_enabled():
@@ -1122,26 +1888,60 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         return token, refreshed_payload
 
     def _runtime_headers_for_request(
-        request: Request,
+        request: Request | WebSocket,
         worker_id: str | None = None,
         *,
         role_override: str | None = None,
+        human_confirmation: bool = False,
     ) -> dict[str, str]:
         api_token = str(os.environ.get("WPR_API_TOKEN") or "").strip()
         identity = _request_identity(request, worker_id) if _public_links_only_enabled() else None
         if not api_token:
             if _enterprise_mode_enabled():
                 raise HTTPException(status_code=503, detail="GlassHive enterprise UI is missing service authentication")
+            if human_auth.session_enabled:
+                _request_identity(request, worker_id)
             return {}
         identity = identity or _request_identity(request, worker_id)
+        assertion_role = _normalized_identity_role(identity)
+        read_only = _request_method(request) in {"GET", "HEAD", "OPTIONS"}
+        restricted = _restricted_identity(identity)
+        narrow_communication = _signed_link_communication_allowed(request, worker_id, identity)
+        if restricted and not read_only and not narrow_communication:
+            raise HTTPException(
+                status_code=403,
+                detail="This restricted workspace identity cannot perform that action",
+            )
         headers = {"X-WPR-Token": api_token}
+        if internal_assertion_signer is not None:
+            scopes = ["runtime:access", "workspaces:read"]
+            if narrow_communication:
+                scopes.append("workspaces:communicate")
+            elif not restricted and not read_only:
+                scopes.append("workspaces:write")
+            if role_override and not restricted:
+                scopes.append("runtime:internal_details")
+            if human_confirmation and not restricted:
+                scopes.append("human:confirm")
+            headers["X-GlassHive-User-Assertion"] = internal_assertion_signer.sign(
+                subject=identity["user_id"],
+                tenant_id=identity["tenant_id"],
+                email=identity["email"],
+                role=assertion_role,
+                scopes=scopes,
+            )
+            return headers
         if identity["tenant_id"]:
             headers["X-Viventium-Tenant-Id"] = identity["tenant_id"]
         if identity["user_id"]:
             headers["X-Viventium-User-Id"] = identity["user_id"]
         if identity["email"]:
             headers["X-Viventium-User-Email"] = identity["email"]
-        role = role_override or identity["role"]
+        role = (
+            assertion_role
+            if restricted
+            else (role_override or str(identity.get("role") or "").strip())
+        )
         if role:
             headers["X-Viventium-User-Role"] = role
         return headers
@@ -1151,11 +1951,26 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         worker_id: str | None = None,
         *,
         internal_details: bool = False,
+        human_confirmation: bool = False,
     ) -> RuntimeClient:
         # The browser should never receive raw noVNC/runtime internals, but the
         # UI backend needs them to proxy the scoped desktop surface.
         role_override = "operator" if internal_details else None
-        headers = _runtime_headers_for_request(request, worker_id, role_override=role_override)
+        if internal_assertion_signer is not None and hasattr(client, "with_headers_factory"):
+            return client.with_headers_factory(
+                lambda: _runtime_headers_for_request(
+                    request,
+                    worker_id,
+                    role_override=role_override,
+                    human_confirmation=human_confirmation,
+                )
+            )
+        headers = _runtime_headers_for_request(
+            request,
+            worker_id,
+            role_override=role_override,
+            human_confirmation=human_confirmation,
+        )
         if not headers or not hasattr(client, "with_headers"):
             return client
         return client.with_headers(headers)
@@ -1164,15 +1979,30 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         api_token = str(os.environ.get("WPR_API_TOKEN") or "").strip()
         if not api_token or not hasattr(client, "with_headers"):
             return client
-        headers = {"X-WPR-Token": api_token}
         tenant_id = str(payload.get("tenant_id") or "").strip()
         owner_id = str(payload.get("owner_id") or "").strip()
-        if tenant_id:
-            headers["X-Viventium-Tenant-Id"] = tenant_id
-        if owner_id:
-            headers["X-Viventium-User-Id"] = owner_id
-        headers["X-Viventium-User-Role"] = "viewer"
-        return client.with_headers(headers)
+
+        def scoped_headers() -> dict[str, str]:
+            headers = {"X-WPR-Token": api_token}
+            if internal_assertion_signer is not None:
+                headers["X-GlassHive-User-Assertion"] = internal_assertion_signer.sign(
+                    subject=owner_id,
+                    tenant_id=tenant_id,
+                    email="",
+                    role="viewer",
+                    scopes=("runtime:access", "workspaces:read"),
+                )
+                return headers
+            if tenant_id:
+                headers["X-Viventium-Tenant-Id"] = tenant_id
+            if owner_id:
+                headers["X-Viventium-User-Id"] = owner_id
+            headers["X-Viventium-User-Role"] = "viewer"
+            return headers
+
+        if internal_assertion_signer is not None and hasattr(client, "with_headers_factory"):
+            return client.with_headers_factory(scoped_headers)
+        return client.with_headers(scoped_headers())
 
     def _record_workspace_link_open(payload: dict[str, object], worker_id: str) -> None:
         scoped_client = _client_for_short_ref_payload(payload)
@@ -1284,7 +2114,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 
-    def _runtime_status_detail(exc: httpx.HTTPStatusError, fallback: str) -> str:
+    def _runtime_status_detail(
+        exc: httpx.HTTPStatusError,
+        fallback: str,
+    ) -> str | dict[str, str]:
         response = exc.response
         if response is None:
             return fallback
@@ -1295,6 +2128,14 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         detail = body.get("detail") if isinstance(body, dict) else None
         if isinstance(detail, str) and detail.strip():
             return detail.strip()
+        if isinstance(detail, dict):
+            safe_detail = {
+                key: value.strip()[:1000]
+                for key in ("code", "message", "recovery")
+                if isinstance((value := detail.get(key)), str) and value.strip()
+            }
+            if safe_detail.get("message"):
+                return safe_detail
         return fallback
 
     def _runtime_proxy_base_url() -> str:
@@ -1323,7 +2164,29 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         query_worker_id = str(request.query_params.get("worker_id") or "").strip()
         return query_worker_id or None
 
+    def _runtime_proxy_allowed(prefix: str, path: str, method: str) -> bool:
+        normalized_method = str(method or "").upper()
+        normalized_path = str(path or "").strip("/")
+        if normalized_method not in {"GET", "HEAD"}:
+            return False
+        if prefix == "ui":
+            return bool(
+                re.fullmatch(r"(?:projects|workers)/[A-Za-z0-9._-]{1,128}", normalized_path)
+            )
+        if prefix != "v1":
+            return False
+        return bool(
+            re.fullmatch(r"signed-links/[^/]{1,16384}", normalized_path)
+            or re.fullmatch(r"link-refs/[A-Za-z0-9._-]{1,256}", normalized_path)
+            or re.fullmatch(
+                r"workers/[A-Za-z0-9._-]{1,128}/(?:live|artifacts/(?:download|open))",
+                normalized_path,
+            )
+        )
+
     async def _runtime_proxy(prefix: str, path: str, request: Request) -> Response:
+        if not _runtime_proxy_allowed(prefix, path, request.method):
+            raise HTTPException(status_code=404, detail="Not found")
         if _public_links_only_enabled() and prefix == "v1" and str(path).startswith("signed-links/"):
             raise HTTPException(status_code=404, detail="GlassHive public links use opaque references")
         worker_id = _worker_id_from_runtime_proxy_path(path, request)
@@ -1365,7 +2228,16 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"status": "ok", "runtime": client.health()}
+        release = {
+            "release_id": str(os.environ.get("GLASSHIVE_RELEASE_ID") or "").strip(),
+            "parent_revision": str(
+                os.environ.get("GLASSHIVE_PARENT_REVISION") or ""
+            ).strip(),
+            "glasshive_revision": str(
+                os.environ.get("GLASSHIVE_COMPONENT_REVISION") or ""
+            ).strip(),
+        }
+        return {"status": "ok", "release": release, "runtime": client.health()}
 
     @app.get("/r/{ref_id}")
     def open_short_link(ref_id: str, request: Request) -> Response:
@@ -1416,13 +2288,56 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         active_client = _client_for_request(request)
         identity = _request_identity(request)
         owner_id = identity["user_id"] or os.environ.get("GLASSHIVE_DEFAULT_OWNER_ID", "demo-owner")
+        bootstrap_sections: dict[str, str] = {}
         try:
             preferences = active_client.get_preferences()
+            bootstrap_sections["preferences"] = "ready"
         except Exception:
             preferences = {}
-        existing_workspaces = flatten_workspaces(active_client, identity=identity)
+            bootstrap_sections["preferences"] = "unavailable"
+        existing_workspaces = flatten_workspaces(
+            active_client,
+            identity=identity,
+            availability=bootstrap_sections,
+        )
+        try:
+            activity = active_client.list_activity(limit=50)
+            bootstrap_sections["activity"] = "ready"
+        except Exception:
+            activity = []
+            bootstrap_sections["activity"] = "unavailable"
+        try:
+            provider_accounts = active_client.list_provider_accounts()
+            bootstrap_sections["provider_accounts"] = "ready"
+        except Exception:
+            provider_accounts = []
+            bootstrap_sections["provider_accounts"] = "unavailable"
+        try:
+            workspace_templates = active_client.list_workspace_templates()
+            bootstrap_sections["workspace_templates"] = "ready"
+        except Exception:
+            workspace_templates = []
+            bootstrap_sections["workspace_templates"] = "unavailable"
+        try:
+            recurring_schedules = active_client.recurring_schedules(include_inactive=False)
+            recurring_schedules_status = "ready"
+            bootstrap_sections["recurring_schedules"] = "ready"
+        except Exception:
+            recurring_schedules = []
+            recurring_schedules_status = "unavailable"
+            bootstrap_sections["recurring_schedules"] = "unavailable"
         return {
             "owner_id": owner_id,
+            "identity": {
+                "email": identity.get("email", ""),
+                "display_name": identity.get("display_name", ""),
+                "role": identity.get("role", ""),
+            },
+            "csrf_token": (
+                str(request.cookies.get(AUTH_CSRF_COOKIE) or "")
+                if _session_for_request(request) is not None
+                else ""
+            ),
             "user_preferences": preferences,
             "default_workspace_option": _default_workspace_option(preferences),
             "deployment_default_workspace_option": f"new:{_default_worker_profile()}",
@@ -1431,8 +2346,730 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             "default_workspace_type": _default_workspace_type(),
             "workspace_type_options": _workspace_type_options(),
             "new_workspace_options": _new_workspace_options(),
+            "provider_accounts": provider_accounts,
+            "workspace_templates": workspace_templates,
+            "recurring_schedules": recurring_schedules,
+            "recurring_schedules_status": recurring_schedules_status,
             "existing_workspaces": existing_workspaces,
+            "activity": activity,
+            "bootstrap_sections": bootstrap_sections,
         }
+
+    @app.get("/api/admin/users")
+    def list_admin_users(request: Request, limit: int = 100) -> dict[str, object]:
+        _require_tenant_admin(request)
+        return {"items": human_auth.list_principals(limit=limit)}
+
+    @app.patch("/api/admin/users/{principal_id}")
+    def update_admin_user(
+        request: Request,
+        principal_id: str,
+        payload: AdminPrincipalUpdateRequest,
+    ) -> dict[str, Any]:
+        identity = _require_tenant_admin(request)
+        if payload.disabled and hmac.compare_digest(
+            str(identity.get("user_id") or ""), str(principal_id or "")
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Use another tenant administrator to disable this account",
+            )
+        active_client = _client_for_request(request)
+        try:
+            authority = active_client.set_schedule_principal_authority(
+                principal_id,
+                enabled=not payload.disabled,
+            )
+        except httpx.HTTPStatusError as exc:
+            detail = _runtime_status_detail(
+                exc,
+                "GlassHive could not update this account's scheduling authority",
+            )
+            raise HTTPException(status_code=502, detail=detail) from exc
+        except Exception as exc:
+            logger.warning(
+                "schedule principal authority update failed principal_hash=%s disabled=%s error=%s",
+                sha256(str(principal_id or "").encode("utf-8")).hexdigest()[:12],
+                payload.disabled,
+                exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="GlassHive scheduling authority is unavailable; the account was not changed",
+            ) from exc
+        try:
+            principal = human_auth.set_principal_disabled(
+                principal_id=principal_id,
+                disabled=payload.disabled,
+            )
+            return {**principal, "schedule_authority": authority}
+        except AuthGatewayError as exc:
+            if "not found" in str(exc).lower():
+                raise HTTPException(status_code=404, detail="Account was not found") from exc
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/control-plane")
+    def control_plane_bootstrap(request: Request) -> dict[str, object]:
+        active_client = _client_for_request(request)
+        recurrence_owner = str(
+            os.environ.get("GLASSHIVE_RECURRING_SCHEDULE_OWNER") or "glasshive_native"
+        ).strip().lower()
+        recurrence_owner = {
+            "native": "glasshive_native",
+            "scheduling_cortex": "viventium_cortex",
+        }.get(recurrence_owner, recurrence_owner)
+        isolation_ready = _personal_account_isolation_ready()
+        codex_subscription_support = (
+            "isolated_substrate_required"
+            if not isolation_ready
+            else "supported"
+            if _truthy_env("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS")
+            else "proof_required"
+        )
+        claude_subscription_support = (
+            "isolated_substrate_required"
+            if not isolation_ready
+            else "unsupported_macos_host"
+            if sys.platform == "darwin"
+            else "provider_permission_required"
+        )
+        claude_experimental_consumer_auth = _truthy_env(
+            "GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH"
+        )
+        inference_broker_support = (
+            "supported"
+            if all(
+                str(os.environ.get(name) or "").strip()
+                for name in (
+                    "GLASSHIVE_INFERENCE_BROKER_URL",
+                    "GLASSHIVE_INFERENCE_BROKER_SECRET",
+                    "GLASSHIVE_INFERENCE_BROKER_TENANT_ID",
+                    "GLASSHIVE_INFERENCE_BROKER_OWNER_BINDINGS_JSON",
+                )
+            )
+            else "managed_connection_required"
+        )
+        return {
+            "me": active_client.current_user(),
+            "provider_accounts": active_client.list_provider_accounts(),
+            "connections": active_client.list_connections(),
+            "library": active_client.list_library(),
+            "provider_options": [
+                {
+                    "provider": "codex",
+                    "label": "Codex",
+                    "methods": (
+                        (["subscription"] if codex_subscription_support == "supported" else [])
+                        + (["api_key", "enterprise_route"] if inference_broker_support == "supported" else [])
+                    ),
+                    "subscription_support": codex_subscription_support,
+                    "inference_broker_support": inference_broker_support,
+                },
+                {
+                    "provider": "claude",
+                    "label": "Claude Code",
+                    "methods": ["subscription"] if claude_subscription_support == "supported" else [],
+                    "subscription_support": claude_subscription_support,
+                    "inference_broker_support": "unsupported",
+                    "api_key_support": "fixed_anthropic_broker_not_implemented",
+                    "api_key_support_note": (
+                        "LibreChat may store a user-scoped Anthropic key, but GlassHive does not "
+                        "yet have a fixed Anthropic Messages broker adapter. The key is not copied "
+                        "into a worker or workspace."
+                    ),
+                    "experimental_consumer_auth": (
+                        "not_accepted_hosted_path"
+                        if claude_experimental_consumer_auth
+                        else "disabled"
+                    ),
+                },
+            ],
+            "microsoft_connection_note": (
+                "Connected services stay in your managed connected-accounts profile. GlassHive checks "
+                "their readiness for your user and gives each worker run only a short-lived broker grant."
+            ),
+            "manage_connections_url": str(
+                os.environ.get("GLASSHIVE_CONNECTED_ACCOUNTS_URL") or ""
+            ).strip(),
+            "recurrence_owner": recurrence_owner,
+            "recurrence_owner_url": str(
+                os.environ.get("GLASSHIVE_SCHEDULING_OWNER_URL") or ""
+            ).strip(),
+        }
+
+    @app.get("/api/connect-ai")
+    def connect_ai(request: Request) -> dict[str, object]:
+        _request_identity(request)
+        mcp_url = str(os.environ.get("GLASSHIVE_MCP_PUBLIC_URL") or "").strip()
+        if not mcp_url:
+            base = str(os.environ.get("GLASSHIVE_OPERATOR_BASE_URL") or request.base_url).rstrip("/")
+            mcp_url = f"{base}/mcp"
+        parsed = urlparse(mcp_url)
+        multi_user = _multi_user_security_enabled()
+        if multi_user and (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="GlassHive MCP requires a configured HTTPS public URL",
+            )
+        oauth_issuer = str(os.environ.get("GLASSHIVE_MCP_OAUTH_ISSUER") or "").strip()
+        if multi_user and not oauth_issuer:
+            raise HTTPException(
+                status_code=503,
+                detail="GlassHive MCP client connection requires a configured OAuth issuer",
+            )
+        claude_client_id = str(os.environ.get("GLASSHIVE_MCP_CLAUDE_CLIENT_ID") or "").strip()
+        claude_callback_port = str(
+            os.environ.get("GLASSHIVE_MCP_CLAUDE_CALLBACK_PORT") or ""
+        ).strip()
+        codex_client_id = str(os.environ.get("GLASSHIVE_MCP_CODEX_CLIENT_ID") or "").strip()
+        codex_callback_port = str(
+            os.environ.get("GLASSHIVE_MCP_CODEX_CALLBACK_PORT") or ""
+        ).strip()
+        codex_resource = str(os.environ.get("GLASSHIVE_MCP_CODEX_RESOURCE") or "").strip()
+        token_audiences = str(
+            os.environ.get("GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES") or ""
+        ).strip()
+        token_scopes = str(
+            os.environ.get("GLASSHIVE_MCP_OAUTH_TOKEN_SCOPES") or ""
+        ).strip()
+        required_scopes = str(
+            os.environ.get("GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES") or ""
+        ).strip()
+        raw_allowed_client_ids = str(
+            os.environ.get("GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS") or ""
+        ).strip()
+        allowed_client_ids = {
+            value for value in re.split(r"[,\s]+", raw_allowed_client_ids) if value
+        }
+        registration_policy_ready = not multi_user or bool(
+            token_audiences and token_scopes and required_scopes and allowed_client_ids
+        )
+
+        def client_is_allowed(client_id: str) -> bool:
+            return bool(
+                client_id
+                and registration_policy_ready
+                and (not multi_user or client_id in allowed_client_ids)
+            )
+
+        clients: dict[str, dict[str, object]] = {}
+        claude_callback_port_number = (
+            int(claude_callback_port) if claude_callback_port.isdigit() else 0
+        )
+        if (
+            client_is_allowed(claude_client_id)
+            and 1024 <= claude_callback_port_number <= 65535
+        ):
+            clients["claude"] = {
+                "add_command": (
+                    "claude mcp add --transport http --scope user "
+                    f"--client-id {shlex.quote(claude_client_id)} "
+                    f"--callback-port {shlex.quote(claude_callback_port)} "
+                    f"glasshive {shlex.quote(mcp_url)}"
+                ),
+                "callback_port": claude_callback_port_number,
+                "callback_uri": (
+                    f"http://localhost:{claude_callback_port_number}/callback"
+                ),
+                "login_note": (
+                    "Run /mcp in Claude Code and complete sign-in. The deployment administrator "
+                    "must pre-register this fixed callback port for the configured public client."
+                ),
+            }
+        codex_callback_port_number = (
+            int(codex_callback_port) if codex_callback_port.isdigit() else 0
+        )
+        try:
+            parsed_codex_resource = urlparse(codex_resource)
+            codex_resource_matches = bool(
+                codex_resource
+                and not parsed_codex_resource.query
+                and not parsed_codex_resource.fragment
+                and _canonical_codex_server_url(codex_resource)
+                == _canonical_codex_server_url(mcp_url)
+            )
+            codex_callback_uri = _codex_oauth_callback_uri(
+                mcp_url,
+                codex_callback_port_number,
+            )
+        except (UnicodeError, ValueError):
+            codex_resource_matches = False
+            codex_callback_uri = ""
+        if (
+            client_is_allowed(codex_client_id)
+            and 1024 <= codex_callback_port_number <= 65535
+            and codex_resource_matches
+        ):
+            codex_callback_url_override = shlex.quote(
+                'mcp_oauth_callback_url='
+                f'"http://127.0.0.1:{codex_callback_port_number}/callback"'
+            )
+            clients["codex"] = {
+                "add_command": (
+                    "codex mcp add "
+                    f"-c mcp_oauth_callback_port={codex_callback_port_number} "
+                    f"-c {codex_callback_url_override} "
+                    f"glasshive --url {shlex.quote(mcp_url)} "
+                    f"--oauth-client-id {shlex.quote(codex_client_id)} "
+                    f"--oauth-resource {shlex.quote(codex_resource)}"
+                ),
+                "login_command": (
+                    "codex mcp login "
+                    f"-c mcp_oauth_callback_port={codex_callback_port_number} "
+                    f"-c {codex_callback_url_override} glasshive"
+                ),
+                "callback_port": codex_callback_port_number,
+                "callback_uri": codex_callback_uri,
+            }
+        documentation_url = str(
+            os.environ.get("GLASSHIVE_MCP_DOCUMENTATION_URL") or ""
+        ).strip()
+        return {
+            "mcp_url": mcp_url,
+            "clients": clients,
+            "configuration_status": "ready" if clients else "action_required",
+            "configuration_note": (
+                "Copy a command below, then complete your organization's sign-in."
+                if clients
+                else "No complete pre-registered and allowlisted AI client is available for this deployment. Ask an administrator to verify its token audiences, delegated scopes, client id, and fixed callback registration."
+            ),
+            "documentation_url": documentation_url,
+            "source": {
+                "license": "FSL-1.1-ALv2",
+                "label": "Source available",
+                "repository_url": str(
+                    os.environ.get("GLASSHIVE_PUBLIC_REPOSITORY_URL")
+                    or "https://github.com/ProjectViventium/GlassHive"
+                ),
+            },
+        }
+
+    @app.get("/api/workspaces")
+    def workspace_catalog(
+        request: Request,
+        kind: str = "named",
+        search: str = "",
+        tags: str = "",
+        favorite: bool | None = None,
+        cursor: str | None = None,
+        limit: int = 25,
+    ) -> dict[str, Any]:
+        return _client_for_request(request).list_workspace_catalog(
+            kind=kind,
+            search=search,
+            tags=tags,
+            favorite=favorite,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    @app.post("/api/workspaces/{worker_id}/duplicate", status_code=201)
+    def duplicate_saved_workspace(
+        request: Request,
+        worker_id: str,
+        payload: DuplicateWorkspaceRequest,
+    ) -> dict[str, Any]:
+        active_client = _client_for_request(request, worker_id)
+        try:
+            result = active_client.duplicate_workspace(
+                worker_id,
+                idempotency_key=payload.idempotency_key,
+                name=str(payload.name or "").strip(),
+            )
+            return {
+                "project_id": (result.get("project") or {}).get("project_id"),
+                "worker": result.get("workspace") or {},
+            }
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 502
+            raise HTTPException(
+                status_code=status_code,
+                detail=_runtime_status_detail(exc, "GlassHive could not duplicate this workspace."),
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="GlassHive workspace duplication failed") from exc
+
+    @app.get("/api/workspace-templates")
+    def list_workspace_templates(request: Request) -> dict[str, Any]:
+        return {"items": _client_for_request(request).list_workspace_templates()}
+
+    @app.post("/api/workspaces/{worker_id}/templates", status_code=201)
+    def save_workspace_template(
+        request: Request,
+        worker_id: str,
+        payload: SaveWorkspaceTemplateRequest,
+    ) -> dict[str, Any]:
+        worker_id = _recurring_path_id(worker_id, "workspace id")
+        active_client = _client_for_request(request, worker_id)
+        try:
+            return active_client.save_workspace_template(
+                worker_id,
+                payload.model_dump(exclude_none=True),
+            )
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 502
+            raise HTTPException(
+                status_code=status_code,
+                detail=_runtime_status_detail(exc, "GlassHive could not save this workspace template."),
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="Workspace template save failed") from exc
+
+    @app.post("/api/workspace-templates/{template_id}/instantiate", status_code=201)
+    def instantiate_workspace_template(
+        request: Request,
+        template_id: str,
+        payload: InstantiateWorkspaceTemplateRequest,
+    ) -> dict[str, Any]:
+        template_id = _recurring_path_id(template_id, "workspace template id")
+        active_client = _client_for_request(request)
+        try:
+            return active_client.instantiate_workspace_template(
+                template_id,
+                payload.model_dump(exclude_none=True),
+            )
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 502
+            raise HTTPException(
+                status_code=status_code,
+                detail=_runtime_status_detail(exc, "GlassHive could not start this workspace template."),
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="Workspace template launch failed") from exc
+
+    @app.get("/api/recurring-schedules")
+    def recurring_schedules(
+        request: Request,
+        include_inactive: bool = False,
+    ) -> dict[str, list[dict[str, Any]]]:
+        active_client = _client_for_request(request)
+        try:
+            return {"items": active_client.recurring_schedules(include_inactive=include_inactive)}
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 502
+            raise HTTPException(
+                status_code=status_code,
+                detail=_runtime_status_detail(exc, "GlassHive schedules are not available yet."),
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="GlassHive schedules could not be loaded") from exc
+
+    @app.post("/api/workspace/{worker_id}/recurring-schedules", status_code=201)
+    def create_recurring_schedule(
+        request: Request,
+        worker_id: str,
+        payload: RecurringScheduleRequest,
+    ) -> dict[str, Any]:
+        worker_id = _recurring_path_id(worker_id, "worker id")
+        payload_dict = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+        active_client = _client_for_request(request, worker_id)
+        try:
+            return active_client.create_recurring_schedule(worker_id, payload_dict)
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 502
+            raise HTTPException(
+                status_code=status_code,
+                detail=_runtime_status_detail(exc, "GlassHive could not save this recurring schedule."),
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="GlassHive recurring schedule creation failed") from exc
+
+    @app.get("/api/recurring-schedules/{definition_id}/occurrences")
+    def recurring_schedule_occurrences(
+        request: Request,
+        definition_id: str,
+        limit: int = 50,
+    ) -> dict[str, list[dict[str, Any]]]:
+        definition_id = _recurring_path_id(definition_id, "recurring schedule id")
+        active_client = _client_for_request(request)
+        try:
+            return {
+                "items": active_client.recurring_schedule_occurrences(
+                    definition_id,
+                    limit=limit,
+                )
+            }
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 502
+            raise HTTPException(
+                status_code=status_code,
+                detail=_runtime_status_detail(exc, "Recurring schedule history is not available."),
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="Recurring schedule history could not be loaded") from exc
+
+    @app.patch("/api/recurring-schedules/{definition_id}")
+    def update_recurring_schedule(
+        request: Request,
+        definition_id: str,
+        payload: RecurringScheduleUpdateRequest,
+    ) -> dict[str, Any]:
+        definition_id = _recurring_path_id(definition_id, "recurring schedule id")
+        payload_dict = payload.model_dump(exclude_none=True)
+        active_client = _client_for_request(request)
+        try:
+            return active_client.update_recurring_schedule(definition_id, payload_dict)
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 502
+            raise HTTPException(
+                status_code=status_code,
+                detail=_runtime_status_detail(exc, "GlassHive could not update this recurring schedule."),
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="Recurring schedule update failed") from exc
+
+    @app.delete("/api/recurring-schedules/{definition_id}")
+    def retire_recurring_schedule(request: Request, definition_id: str) -> dict[str, Any]:
+        definition_id = _recurring_path_id(definition_id, "recurring schedule id")
+        active_client = _client_for_request(request)
+        try:
+            return active_client.retire_recurring_schedule(definition_id)
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 502
+            raise HTTPException(
+                status_code=status_code,
+                detail=_runtime_status_detail(exc, "GlassHive could not retire this recurring schedule."),
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="Recurring schedule retirement failed") from exc
+
+    @app.post("/api/recurring-schedules/{definition_id}/run-now")
+    def run_recurring_schedule_now(
+        request: Request,
+        definition_id: str,
+        payload: RecurringScheduleRunNowRequest,
+    ) -> dict[str, Any]:
+        definition_id = _recurring_path_id(definition_id, "recurring schedule id")
+        active_client = _client_for_request(request)
+        try:
+            return active_client.run_recurring_schedule_now(definition_id, payload.idempotency_key)
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 502
+            raise HTTPException(
+                status_code=status_code,
+                detail=_runtime_status_detail(exc, "GlassHive could not run this schedule now."),
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="Recurring schedule run-now failed") from exc
+
+    @app.post("/api/recurring-schedules/{definition_id}/deactivate")
+    def deactivate_recurring_schedule(request: Request, definition_id: str) -> dict[str, Any]:
+        definition_id = _recurring_path_id(definition_id, "recurring schedule id")
+        active_client = _client_for_request(request)
+        try:
+            return active_client.deactivate_recurring_schedule(definition_id)
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 502
+            raise HTTPException(
+                status_code=status_code,
+                detail=_runtime_status_detail(exc, "GlassHive could not stop this recurring schedule."),
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="GlassHive recurring schedule update failed") from exc
+
+    @app.post("/api/provider-accounts")
+    def create_provider_account(request: Request, payload: ProviderAccountRequest) -> dict[str, Any]:
+        provider = payload.provider.strip().lower()
+        auth_method = payload.auth_method.strip().lower()
+        if provider not in {"codex", "claude"}:
+            raise HTTPException(status_code=400, detail="Choose Codex or Claude Code")
+        if auth_method not in {"subscription", "api_key", "enterprise_route"}:
+            raise HTTPException(status_code=400, detail="Unsupported account connection method")
+        if auth_method != "subscription" and provider != "codex":
+            raise HTTPException(
+                status_code=409,
+                detail="The reviewed inference broker supports only Codex with an OpenAI API key or enterprise route",
+            )
+        if auth_method == "subscription" and not _personal_account_isolation_ready():
+            raise HTTPException(
+                status_code=409,
+                detail="Personal subscriptions require a dedicated per-worker isolation substrate in multi-user deployments",
+            )
+        if provider == "claude" and auth_method == "subscription" and sys.platform == "darwin":
+            platform_support = "unsupported_macos_host"
+        elif provider == "claude" and auth_method == "subscription" and not _truthy_env(
+            "GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH"
+        ):
+            platform_support = "provider_permission_required"
+        elif provider == "codex" and auth_method == "subscription" and not _truthy_env(
+            "GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS"
+        ):
+            platform_support = "proof_required"
+        elif auth_method in {"api_key", "enterprise_route"}:
+            platform_support = "supported"
+        else:
+            platform_support = "supported"
+        locator = (
+            "native-home://auto"
+            if auth_method == "subscription"
+            else "broker://librechat-openai"
+        )
+        return _client_for_request(request).create_provider_account(
+            {
+                "provider": provider,
+                "label": payload.label,
+                "auth_method": auth_method,
+                "platform_support": platform_support,
+                "secret_locator": locator,
+                "make_default": payload.make_default,
+            }
+        )
+
+    @app.post("/api/provider-accounts/{account_id}/setup")
+    def start_provider_account_setup(request: Request, account_id: str) -> dict[str, Any]:
+        return _client_for_request(request).start_provider_account_setup(account_id)
+
+    @app.get("/api/provider-accounts/{account_id}/setup")
+    def provider_account_setup_status(request: Request, account_id: str) -> dict[str, Any]:
+        return _client_for_request(request).provider_account_setup_status(account_id)
+
+    @app.post("/api/provider-accounts/{account_id}/setup/cancel")
+    def cancel_provider_account_setup(request: Request, account_id: str) -> dict[str, Any]:
+        return _client_for_request(request).cancel_provider_account_setup(account_id)
+
+    @app.post("/api/provider-accounts/{account_id}/verify")
+    def verify_provider_account(request: Request, account_id: str) -> dict[str, Any]:
+        return _client_for_request(request).verify_provider_account(account_id)
+
+    @app.post("/api/provider-accounts/{account_id}/disconnect")
+    def disconnect_provider_account(request: Request, account_id: str) -> dict[str, Any]:
+        return _client_for_request(request).disconnect_provider_account(account_id)
+
+    @app.delete("/api/provider-accounts/{account_id}")
+    def forget_provider_account(request: Request, account_id: str) -> dict[str, Any]:
+        return _client_for_request(request).forget_provider_account(account_id)
+
+    @app.get("/api/workspaces/{worker_id}/capability-grants")
+    def list_workspace_capability_grants(request: Request, worker_id: str) -> dict[str, Any]:
+        return {"items": _client_for_request(request).list_workspace_grants(worker_id)}
+
+    @app.delete("/api/workspaces/{worker_id}/capability-grants/{grant_id}")
+    def revoke_workspace_capability_grant(
+        request: Request,
+        worker_id: str,
+        grant_id: str,
+    ) -> dict[str, Any]:
+        return _client_for_request(request).revoke_workspace_grant(worker_id, grant_id)
+
+    @app.post("/api/pending-changes")
+    def create_pending_change(request: Request, payload: PendingChangeRequest) -> dict[str, Any]:
+        return _client_for_request(request).create_pending_change(
+            {
+                "change_type": payload.change_type,
+                "target_id": payload.target_id,
+                "payload": payload.payload,
+            }
+        )
+
+    @app.get("/api/pending-changes/{change_id}")
+    def get_pending_change(request: Request, change_id: str) -> dict[str, Any]:
+        active_client = _client_for_request(request)
+        try:
+            pending = dict(active_client.get_pending_change(change_id))
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 502
+            raise HTTPException(
+                status_code=status_code,
+                detail=_runtime_status_detail(exc, "GlassHive could not find this pending change."),
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="GlassHive pending changes are unavailable") from exc
+        payload = dict(pending.get("payload") or {})
+        try:
+            catalog = active_client.list_workspace_catalog(kind="named,ephemeral,legacy", limit=100)
+            workspace = next(
+                (
+                    item
+                    for item in catalog.get("items", [])
+                    if str(item.get("worker_id") or "") == str(pending.get("target_id") or "")
+                ),
+                {},
+            )
+            pending["target_label"] = str(workspace.get("name") or workspace.get("title") or "Workspace")
+        except Exception:
+            pending["target_label"] = "Workspace"
+        capability_label = "Approved capability"
+        effective_scopes = [str(value) for value in (payload.get("scopes") or []) if str(value).strip()]
+        if str(pending.get("change_type") or "") == "workspace_provider_account":
+            account_snapshot = dict(payload.get("account_snapshot") or {})
+            if str(payload.get("policy") or "") == "legacy":
+                capability_label = "Deployment-managed worker account"
+            else:
+                capability_label = str(
+                    account_snapshot.get("label")
+                    or account_snapshot.get("provider")
+                    or "Selected personal worker account"
+                )
+            effective_scopes = []
+        elif payload.get("library_id"):
+            snapshot = dict(payload.get("library_snapshot") or {})
+            capability_label = str(snapshot.get("display_label") or snapshot.get("stable_id") or capability_label)
+            if capability_label == "Approved capability":
+                try:
+                    library = next(
+                        (
+                            item
+                            for item in active_client.list_library()
+                            if str(item.get("library_id") or "") == str(payload.get("library_id") or "")
+                        ),
+                        {},
+                    )
+                    manifest = dict(library.get("manifest") or {})
+                    capability_label = str(
+                        manifest.get("label")
+                        or manifest.get("name")
+                        or library.get("stable_id")
+                        or capability_label
+                    )
+                except Exception:
+                    pass
+            if not effective_scopes:
+                effective_scopes = [
+                    str(value)
+                    for value in (snapshot.get("allowed_scopes") or [])
+                    if str(value).strip()
+                ]
+        elif payload.get("connection_id"):
+            connection = next(
+                (
+                    item
+                    for item in active_client.list_connections()
+                    if str(item.get("connection_id") or "") == str(payload.get("connection_id") or "")
+                ),
+                {},
+            )
+            capability_label = str(connection.get("label") or connection.get("kind") or capability_label)
+        elif payload.get("account_id"):
+            account = next(
+                (
+                    item
+                    for item in active_client.list_provider_accounts()
+                    if str(item.get("account_id") or "") == str(payload.get("account_id") or "")
+                ),
+                {},
+            )
+            capability_label = str(account.get("label") or account.get("provider") or capability_label)
+        pending["capability_label"] = capability_label
+        pending["effective_scopes"] = effective_scopes
+        return pending
+
+    @app.post("/api/pending-changes/{change_id}/confirm")
+    def confirm_pending_change(
+        request: Request,
+        change_id: str,
+        payload: PendingChangeConfirmRequest,
+    ) -> dict[str, Any]:
+        return _client_for_request(
+            request,
+            human_confirmation=True,
+        ).confirm_pending_change(change_id, payload.confirmation_token)
 
     @app.patch("/api/preferences")
     def update_preferences(request: Request, payload: PreferencesRequest) -> dict[str, Any]:
@@ -1461,6 +3098,35 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         worker_id: str | None = None
         profile: str
         created_new_worker = False
+        new_workspace = not workspace_option.startswith(("open:", "existing:", "duplicate:"))
+        requested_account_selection = bool(
+            payload.provider_account_policy or str(payload.provider_account_id or "").strip()
+        )
+        if requested_account_selection and not new_workspace:
+            raise HTTPException(
+                status_code=409,
+                detail="Credential policy is selected when creating a new workspace; existing workspaces keep their saved policy",
+            )
+        provider_account_selection: dict[str, str] | None = None
+        if new_workspace and requested_account_selection:
+            requested_profile = (
+                workspace_option.split(":", 1)[1]
+                if ":" in workspace_option
+                else _default_worker_profile()
+            )
+            try:
+                provider_accounts = active_client.list_provider_accounts()
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Personal worker accounts could not be loaded; retry before launching",
+                ) from exc
+            provider_account_selection = _provider_account_selection_for_launch(
+                provider_accounts,
+                profile=requested_profile,
+                requested_policy=payload.provider_account_policy,
+                requested_account_id=payload.provider_account_id,
+            )
 
         try:
             if workspace_option.startswith("open:") or workspace_option.startswith("existing:"):
@@ -1483,6 +3149,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                     bootstrap_bundle,
                     profile,
                     _effort_for_profile(profile, payload.effort, preferences),
+                )
+                bootstrap_bundle = _bootstrap_bundle_with_provider_account(
+                    bootstrap_bundle,
+                    provider_account_selection,
                 )
                 project = active_client.create_project(owner_id, build_project_title(payload.description), payload.description.strip(), profile)
                 project_id = str(project["project_id"])
@@ -1552,8 +3222,44 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         payload["project_title"] = _project_title_for_worker(active_client, project_id) if project_id else ""
         return _json_response_with_signed_cookie(request, worker_id, _browser_live_payload(payload))
 
+    @app.get("/api/workspace/{worker_id}/desktop-credentials")
+    def desktop_credentials(request: Request, worker_id: str) -> JSONResponse:
+        """Return only the owner-scoped noVNC password needed by the in-app client.
+
+        Raw runtime URLs and Selenium router credentials remain server-side.  The response is
+        deliberately non-cacheable and the browser keeps the password in memory only.
+        """
+
+        _require_interactive_access(request, worker_id)
+        active_client = _client_for_request(request, worker_id, internal_details=True)
+        view_url = _runtime_view_url(
+            active_client,
+            worker_id,
+            cache_key=_novnc_view_cache_key(request, worker_id),
+        )
+        parsed = urlparse(view_url)
+        password = str((parse_qs(parsed.query).get("password") or [""])[0])
+        if len(password) > 128 or any(ord(character) < 32 for character in password):
+            raise HTTPException(status_code=502, detail="Live desktop credentials are invalid")
+        if (
+            str(os.environ.get("GLASSHIVE_SECURITY_MODE") or "").strip().lower() == "multi_user"
+            and not password
+        ):
+            raise HTTPException(status_code=503, detail="Live desktop authentication is unavailable")
+        response = _json_response_with_signed_cookie(
+            request,
+            worker_id,
+            {"password": password},
+        )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+
     @app.get("/novnc/{worker_id}/{asset_path:path}")
     def novnc_asset(request: Request, worker_id: str, asset_path: str) -> Response:
+        _require_interactive_access(request, worker_id)
         active_client = _client_for_request(request, worker_id, internal_details=True)
         safe_asset_path = _validated_novnc_asset_path(asset_path)
         view_url = _runtime_view_url(
@@ -1582,6 +3288,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     @app.websocket("/novnc/{worker_id}/websockify")
     async def novnc_websocket(websocket: WebSocket, worker_id: str) -> None:
         try:
+            _require_interactive_access(websocket, worker_id)
             active_client = _client_for_request(websocket, worker_id, internal_details=True)
             view_url = _runtime_view_url(active_client, worker_id)
             parsed = urlparse(view_url)
@@ -1691,6 +3398,13 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
 
     @app.api_route("/ui/{runtime_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
     async def runtime_ui_proxy(runtime_path: str, request: Request) -> Response:
+        if request.method.upper() in {"GET", "HEAD"}:
+            redirect = _login_redirect_if_needed(
+                request,
+                worker_id=str(request.query_params.get("worker_id") or "").strip() or None,
+            )
+            if redirect is not None:
+                return redirect
         return await _runtime_proxy("ui", runtime_path, request)
 
     @app.api_route("/v1/{runtime_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
@@ -1698,18 +3412,34 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         return await _runtime_proxy("v1", runtime_path, request)
 
     @app.get("/")
-    def home(request: Request) -> FileResponse:
+    def home(request: Request) -> Response:
+        redirect = _login_redirect_if_needed(request)
+        if redirect is not None:
+            return redirect
         _require_ui_auth(request)
         return FileResponse(STATIC_DIR / "index.html")
 
+    @app.get("/confirm-change")
+    def confirm_change_page() -> FileResponse:
+        # The opaque confirmation token stays in the URL fragment and never reaches
+        # access logs. The page itself performs session/OIDC recovery before reading
+        # or applying authenticated, owner-scoped change metadata.
+        return FileResponse(STATIC_DIR / "confirm.html")
+
     @app.get("/watch/{worker_id}")
-    def watch(request: Request, worker_id: str) -> FileResponse:
+    def watch(request: Request, worker_id: str) -> Response:
+        redirect = _login_redirect_if_needed(request, worker_id=worker_id)
+        if redirect is not None:
+            return redirect
         _require_ui_auth(request, worker_id)
         return _file_response_with_signed_cookie(request, worker_id, STATIC_DIR / "watch.html")
 
     @app.get("/desktop/{worker_id}")
-    def desktop(request: Request, worker_id: str) -> FileResponse:
-        _require_ui_auth(request, worker_id)
+    def desktop(request: Request, worker_id: str) -> Response:
+        redirect = _login_redirect_if_needed(request, worker_id=worker_id)
+        if redirect is not None:
+            return redirect
+        _require_interactive_access(request, worker_id)
         return _file_response_with_signed_cookie(request, worker_id, STATIC_DIR / "desktop.html")
 
     return app

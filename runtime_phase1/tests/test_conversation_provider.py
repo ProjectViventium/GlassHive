@@ -1966,6 +1966,9 @@ def test_provider_startup_reconciles_a_request_left_running_by_process_restart(t
             event["event_type"]
             for event in store.list_provider_activity(request_record["request_id"])
         ].count("completed") == 1
+        deadline = time.time() + 5
+        while time.time() < deadline and request_record["request_id"] in provider._detached_reconciliations:
+            time.sleep(0.01)
         assert request_record["request_id"] not in provider._detached_reconciliations
     finally:
         service.shutdown()
@@ -2081,6 +2084,13 @@ def test_service_startup_monitor_recovers_a_non_provider_host_run(tmp_path):
 
         assert store.get_run(run["run_id"])["state"] == "completed"
         assert store.get_run(run["run_id"])["output_text"] == "Recovered mission result."
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if [event["event_type"] for event in store.list_events(worker["worker_id"])].count(
+                "run.completed"
+            ) == 1:
+                break
+            time.sleep(0.01)
         assert [event["event_type"] for event in store.list_events(worker["worker_id"])].count(
             "run.completed"
         ) == 1

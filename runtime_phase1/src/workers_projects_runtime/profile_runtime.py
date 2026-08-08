@@ -37,6 +37,20 @@ from .bootstrap import (
 )
 from .docker_sandbox import DockerSandboxManager
 from .failure_classification import classify_cli_failure, classify_runtime_error
+from .capability_broker import (
+    GlassHiveCapabilityBroker,
+    worker_with_ephemeral_capability_bundle,
+)
+from .inference_broker import (
+    GlassHiveInferenceBroker,
+    InferenceBrokerError,
+    validated_codex_broker_projection,
+)
+from .mission_provider_accounts import (
+    MissionProviderAccountBinder,
+    apply_bound_provider_account_environment,
+    mission_provider_account_selection,
+)
 from .openclaw_runtime import (
     RuntimeErrorBase,
     RuntimeDependencyMissingError,
@@ -63,6 +77,33 @@ logger = logging.getLogger(__name__)
 _CODEX_MCP_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 _HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off", "none", "disabled"}
+_CODEX_BROKER_CONFLICTING_ENV = {
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "OPENAI_REVERSE_PROXY",
+    "PORTKEY_API_KEY",
+    "PORTKEY_BASE_URL",
+    "PORTKEY_PROVIDER",
+    "PORTKEY_VIRTUAL_KEY",
+    "PORTKEY_CONFIG",
+}
+_RUN_SCOPED_CREDENTIAL_ENV_KEYS = tuple(
+    sorted(
+        set(_PROVIDER_ENV_KEYS)
+        | _CODEX_BROKER_CONFLICTING_ENV
+        | {
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_BEARER_TOKEN_BEDROCK",
+        }
+    )
+)
 _MAX_TELEMETRY_LINE_BYTES = 1024 * 1024
 _ACTIVE_RUN_STATUS_LOCK = Lock()
 _ACTIVE_RUN_TERMINAL_STATES = frozenset(
@@ -948,7 +989,11 @@ def _instruction_file_pointer_message(path: str) -> str:
 
 
 class ProfiledWorkerRuntime:
-    def __init__(self, base_dir: str | None = None) -> None:
+    def __init__(
+        self,
+        base_dir: str | None = None,
+        provider_account_db_path: str | None = None,
+    ) -> None:
         self.openclaw = OpenClawWorkstationRuntime(base_dir=base_dir)
         self.codex = CodexCliRuntime(base_dir=base_dir)
         self.claude = ClaudeCodeRuntime(base_dir=base_dir)
@@ -957,6 +1002,16 @@ class ProfiledWorkerRuntime:
         self.host_claude = HostClaudeCodeRuntime(base_dir=base_dir)
         self._provider_log_cache: dict[tuple[str, str], dict[str, object]] = {}
         self._provider_log_cache_lock = Lock()
+        provider_home_root = Path(
+            os.environ.get("GLASSHIVE_PROVIDER_ACCOUNT_HOME_ROOT")
+            or (self.codex.base_dir / "provider_accounts")
+        ).expanduser()
+        self.provider_account_binder = MissionProviderAccountBinder(
+            db_path=provider_account_db_path,
+            home_root=provider_home_root,
+        )
+        self.inference_broker = GlassHiveInferenceBroker.from_environment()
+        self.capability_broker = GlassHiveCapabilityBroker.from_environment()
 
     def _runtime_for_profile(self, profile: str, execution_mode: str = "docker") -> WorkerRuntime:
         if execution_mode == "host":
@@ -988,25 +1043,362 @@ class ProfiledWorkerRuntime:
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).ensure_worker_ready(worker)
 
+    def prepare_worker_workspace(self, worker: dict) -> RuntimeInfo:
+        runtime = self._runtime_for_worker(worker)
+        prepare = getattr(runtime, "prepare_worker_workspace", None)
+        if not callable(prepare):
+            raise RuntimeErrorBase("The selected worker runtime cannot prepare a workspace without starting compute")
+        return prepare(worker)
+
     def pause_worker(self, worker: dict) -> RuntimeInfo:
-        return self._runtime_for_worker(worker).pause_worker(worker)
+        try:
+            return self._runtime_for_worker(worker).pause_worker(worker)
+        finally:
+            try:
+                self._revoke_active_capability_grant(worker)
+            finally:
+                self._revoke_active_inference_grant(worker)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
-        return self._runtime_for_worker(worker).terminate_worker(worker)
+        runtime = self._runtime_for_worker(worker)
+        try:
+            return runtime.terminate_worker(worker)
+        finally:
+            try:
+                self._revoke_active_capability_grant(worker)
+            finally:
+                self._revoke_active_inference_grant(worker)
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
         runtime = self._runtime_for_worker(worker)
-        if hasattr(runtime, "interrupt_worker"):
+        try:
+            if hasattr(runtime, "interrupt_worker"):
+                try:
+                    return runtime.interrupt_worker(worker, run_id=run_id)
+                except TypeError as exc:
+                    if "run_id" not in str(exc):
+                        raise
+                    return runtime.interrupt_worker(worker)
+            return runtime.pause_worker(worker)
+        finally:
             try:
-                return runtime.interrupt_worker(worker, run_id=run_id)
-            except TypeError as exc:
-                if "run_id" not in str(exc):
-                    raise
-                return runtime.interrupt_worker(worker)
-        return runtime.pause_worker(worker)
+                self._revoke_active_capability_grant(worker, run_id=run_id)
+            finally:
+                self._revoke_active_inference_grant(worker, run_id=run_id)
 
-    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
-        return self._runtime_for_worker(worker).run_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
+    def _revoke_active_capability_grant(
+        self,
+        worker: dict,
+        *,
+        run_id: str | None = None,
+    ) -> None:
+        self.capability_broker.revoke_active(
+            tenant_id=str(worker.get("tenant_id") or "local").strip() or "local",
+            owner_id=str(worker.get("owner_id") or "").strip(),
+            worker_id=str(worker.get("worker_id") or "").strip(),
+            run_id=str(run_id).strip() if run_id else None,
+        )
+
+    def _revoke_active_inference_grant(
+        self,
+        worker: dict,
+        *,
+        run_id: str | None = None,
+    ) -> None:
+        self.inference_broker.revoke_active(
+            tenant_id=str(worker.get("tenant_id") or "local").strip() or "local",
+            owner_id=str(worker.get("owner_id") or "").strip(),
+            worker_id=str(worker.get("worker_id") or "").strip(),
+            run_id=str(run_id).strip() if run_id else None,
+        )
+
+    def _run_observed_provider_account_task(
+        self,
+        *,
+        runtime: WorkerRuntime,
+        worker: dict,
+        instruction: str,
+        timeout_sec: float | None,
+        run_id: str,
+        account_id: str,
+    ) -> str:
+        """Run with a selected account and persist only telemetry the harness observed."""
+
+        started_at = time.monotonic()
+        succeeded = False
+        try:
+            result = runtime.run_task(
+                worker,
+                instruction,
+                timeout_sec=timeout_sec,
+                run_id=run_id,
+            )
+            succeeded = True
+            return result
+        finally:
+            usage: dict[str, object] = {}
+            reader = getattr(runtime, "run_usage", None)
+            if callable(reader):
+                try:
+                    reported = reader(worker, run_id)
+                    if isinstance(reported, dict):
+                        usage = reported
+                except Exception:
+                    logger.warning(
+                        "Could not read worker-reported provider account usage",
+                        exc_info=True,
+                        extra={"worker_id": worker.get("worker_id"), "run_id": run_id},
+                    )
+
+            def reported_token(name: str) -> int | None:
+                value = usage.get(name)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    return None
+                return value
+
+            store = self.provider_account_binder.store
+            if store is not None:
+                try:
+                    store.record_provider_account_usage(
+                        account_id=account_id,
+                        tenant_id=str(worker.get("tenant_id") or "local").strip() or "local",
+                        owner_id=str(worker.get("owner_id") or "").strip(),
+                        succeeded=succeeded,
+                        duration_seconds=max(0.0, time.monotonic() - started_at),
+                        input_tokens=reported_token("input_tokens"),
+                        output_tokens=reported_token("output_tokens"),
+                    )
+                except Exception:
+                    # Usage accounting must not replace the worker's result or original failure.
+                    logger.warning(
+                        "Could not persist GlassHive-observed provider account usage",
+                        exc_info=True,
+                        extra={"worker_id": worker.get("worker_id"), "run_id": run_id},
+                    )
+
+    def _run_with_inference_broker(
+        self,
+        *,
+        runtime: WorkerRuntime,
+        worker: dict,
+        instruction: str,
+        timeout_sec: float | None,
+        run_id: str,
+        account: dict,
+        selection,
+        preferred: bool,
+    ) -> str:
+        runtime_name = str(
+            getattr(runtime, "runtime_name", "") or worker.get("profile") or ""
+        ).strip()
+        provider = str(account.get("provider") or "").strip().lower()
+        status = str(account.get("status") or "").strip().lower()
+        if runtime_name != "codex-cli" or provider not in {"codex", "openai"}:
+            raise RuntimeErrorBase(
+                "Selected provider account does not match this worker profile"
+            )
+        if status not in {"ready", "action_required", "unavailable", "error"}:
+            if preferred:
+                return runtime.run_task(
+                    {
+                        **worker,
+                        "_glasshive_provider_account_preferred_fallback": True,
+                    },
+                    instruction,
+                    timeout_sec=timeout_sec,
+                    run_id=run_id,
+                )
+            raise RuntimeErrorBase(
+                "Selected OpenAI connection is not ready; reconnect or verify it before running"
+            )
+        model = str(
+            worker.get("model")
+            or runtime.resolve_model(str(worker.get("profile") or "codex-cli"))
+            or ""
+        ).strip()
+        try:
+            with self.inference_broker.bind_run(
+                tenant_id=str(worker.get("tenant_id") or "local").strip() or "local",
+                owner_id=str(worker.get("owner_id") or "").strip(),
+                worker_id=str(worker.get("worker_id") or "").strip(),
+                run_id=run_id,
+                auth_method=str(account.get("auth_method") or "").strip(),
+                models=[model],
+            ) as projection:
+                if status != "ready":
+                    self.provider_account_binder.update_selected_account_status(
+                        worker,
+                        selection,
+                        status="ready",
+                    )
+                bound_worker = {
+                    **worker,
+                    "model": model,
+                    "_glasshive_inference_broker_bound": True,
+                    "_glasshive_inference_broker": projection,
+                }
+                return self._run_observed_provider_account_task(
+                    runtime=runtime,
+                    worker=bound_worker,
+                    instruction=instruction,
+                    timeout_sec=timeout_sec,
+                    run_id=run_id,
+                    account_id=str(account.get("account_id") or selection.account_id),
+                )
+        except InferenceBrokerError as exc:
+            unavailable_codes = {
+                "broker_unavailable",
+                "enterprise_route_unavailable",
+                "proxy_route_unavailable",
+            }
+            self.provider_account_binder.update_selected_account_status(
+                worker,
+                selection,
+                status="unavailable" if exc.code in unavailable_codes else "action_required",
+                reconnect_reason=str(exc),
+            )
+            if not preferred:
+                raise
+            return runtime.run_task(
+                {
+                    **worker,
+                    "_glasshive_provider_account_preferred_fallback": True,
+                },
+                instruction,
+                timeout_sec=timeout_sec,
+                run_id=run_id,
+            )
+
+    def _run_task_with_provider_account(
+        self,
+        worker: dict,
+        instruction: str,
+        *,
+        timeout_sec: float | None,
+        run_id: str,
+    ) -> str:
+        runtime = self._runtime_for_worker(worker)
+        selection = mission_provider_account_selection(worker)
+        if selection is None:
+            return runtime.run_task(
+                worker,
+                instruction,
+                timeout_sec=timeout_sec,
+                run_id=run_id,
+            )
+        effective_run_id = run_id
+        runtime_name = str(
+            getattr(runtime, "runtime_name", "")
+            or worker.get("profile")
+            or ""
+        ).strip()
+        account = self.provider_account_binder.selected_account_record(worker, selection)
+        if account is not None and str(account.get("auth_method") or "").strip().lower() in {
+            "api_key",
+            "enterprise_route",
+        }:
+            return self._run_with_inference_broker(
+                runtime=runtime,
+                worker=worker,
+                instruction=instruction,
+                timeout_sec=timeout_sec,
+                run_id=effective_run_id,
+                account=account,
+                selection=selection,
+                preferred=selection.policy == "personal_preferred",
+            )
+        with self.provider_account_binder.bind(
+            worker,
+            runtime_name=runtime_name,
+            run_id=effective_run_id,
+            timeout_sec=timeout_sec,
+            release_binding=(
+                getattr(runtime, "release_provider_account_binding", None)
+                if str(worker.get("execution_mode") or "docker").strip().lower() == "docker"
+                else None
+            ),
+            abort_binding=lambda bound_worker: runtime.terminate_worker(bound_worker),
+            reconcile_binding=(
+                getattr(runtime, "reconcile_provider_account_binding", None)
+                if str(worker.get("execution_mode") or "docker").strip().lower() == "docker"
+                else None
+            ),
+        ) as bound_worker:
+            if bound_worker.get("_glasshive_provider_account_bound"):
+                return self._run_observed_provider_account_task(
+                    runtime=runtime,
+                    worker=bound_worker,
+                    instruction=instruction,
+                    timeout_sec=timeout_sec,
+                    run_id=effective_run_id,
+                    account_id=selection.account_id,
+                )
+            return runtime.run_task(
+                bound_worker,
+                instruction,
+                timeout_sec=timeout_sec,
+                run_id=effective_run_id,
+            )
+
+    def _run_mode_from_worker(self, worker: dict) -> str:
+        raw_bundle = worker.get("bootstrap_bundle_json")
+        if isinstance(raw_bundle, str) and raw_bundle.strip():
+            try:
+                parsed = json.loads(raw_bundle)
+            except json.JSONDecodeError:
+                parsed = {}
+        else:
+            candidate = worker.get("bootstrap_bundle")
+            parsed = candidate if isinstance(candidate, dict) else {}
+        if not isinstance(parsed, dict):
+            return "mission"
+        return str(parsed.get("run_mode") or "mission").strip().lower()
+
+    def run_task(
+        self,
+        worker: dict,
+        instruction: str,
+        timeout_sec: float | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        """Bind fresh connected capabilities for every UI, scheduled, or MCP mission.
+
+        The grant bundle exists only in this call stack. It is never written back to the worker,
+        run database, public API response, or reusable workspace record. Direct Conversation
+        workers already carry their signed, request-scoped broker bundle from LibreChat and must
+        not be wrapped by the standalone mission issuer a second time.
+        """
+
+        effective_run_id = (run_id or secrets.token_hex(8)).strip()
+        if self._run_mode_from_worker(worker) == "conversation":
+            return self._run_task_with_provider_account(
+                worker,
+                instruction,
+                timeout_sec=timeout_sec,
+                run_id=effective_run_id,
+            )
+        tenant_id = str(worker.get("tenant_id") or "local").strip() or "local"
+        owner_id = str(worker.get("owner_id") or "").strip()
+        worker_id = str(worker.get("worker_id") or "").strip()
+        execution_mode = str(worker.get("execution_mode") or "docker").strip().lower()
+        with self.capability_broker.bind_run(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            run_id=effective_run_id,
+            execution_mode=execution_mode,
+        ) as (bundle, _readiness):
+            projected_worker = (
+                worker_with_ephemeral_capability_bundle(worker, bundle)
+                if bundle
+                else worker
+            )
+            return self._run_task_with_provider_account(
+                projected_worker,
+                instruction,
+                timeout_sec=timeout_sec,
+                run_id=effective_run_id,
+            )
 
     def run_usage(self, worker: dict, run_id: str) -> dict[str, int]:
         runtime = self._runtime_for_worker(worker)
@@ -1489,17 +1881,24 @@ class BaseCliWorkerRuntime:
         current = self._read_active_session(worker["worker_id"])
         if current and (run_id is None or current.get("run_id") == run_id):
             return current
-        screen_sessions = set(self.sandbox.list_screen_sessions(worker["worker_id"], self.runtime_name, worker=worker))
         candidate_run_ids = [run_id] if run_id else [run_root.name for run_root in self._run_root_candidates(worker["worker_id"])]
+        candidates: list[dict[str, str]] = []
         for candidate_run_id in candidate_run_ids:
             if not candidate_run_id:
                 continue
-            session_name = self._session_name_for_run_id(candidate_run_id)
+            payload = self._run_payload(worker["worker_id"], candidate_run_id)
+            if payload is not None:
+                candidates.append(payload)
+        if not candidates:
+            # Session discovery must never materialize or repair a Docker sandbox merely because a
+            # caller is terminating a synthetic, already-cleaned, or crash-recovered run.
+            return None
+        screen_sessions = set(self.sandbox.list_screen_sessions(worker["worker_id"], self.runtime_name, worker=worker))
+        for payload in candidates:
+            session_name = payload["session_name"]
             if session_name not in screen_sessions:
                 continue
-            payload = self._run_payload(worker["worker_id"], candidate_run_id)
-            if payload:
-                return payload
+            return payload
         return None
 
     def _latest_completed_run_payload(self, worker_id: str, run_id: str | None = None) -> dict[str, str] | None:
@@ -1619,6 +2018,10 @@ class BaseCliWorkerRuntime:
         sandbox = fast_sandbox or self.sandbox.ensure_ready(worker, self.runtime_name)
         return self._runtime_info(worker, pid=sandbox.pid)
 
+    def prepare_worker_workspace(self, worker: dict) -> RuntimeInfo:
+        """Materialize private worker directories without starting container compute."""
+        return self._runtime_info(worker, pid=None)
+
     def pause_worker(self, worker: dict) -> RuntimeInfo:
         self.sandbox.pause(worker["worker_id"])
         return self._runtime_info(worker, pid=None)
@@ -1641,6 +2044,17 @@ class BaseCliWorkerRuntime:
         self._stop_active_process(worker_id, worker=worker, run_id=active_run_id)
         self.sandbox.terminate(worker_id)
         return self._runtime_info(worker, pid=None)
+
+    def release_provider_account_binding(self, worker: dict) -> None:
+        """Remove the container that carries a mission-scoped credential bind mount."""
+        worker_id = str(worker.get("worker_id") or "").strip()
+        if not worker_id:
+            raise RuntimeErrorBase("Provider credential cleanup requires a worker id")
+        self._stop_active_process(worker_id, worker=worker, run_id=str(worker.get("_active_run_id") or "") or None)
+        self.sandbox.terminate(worker_id)
+
+    def reconcile_provider_account_binding(self, account_home: Path) -> None:
+        self.sandbox.terminate_containers_mounting_provider_account(account_home)
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         sandbox = self.sandbox.inspect(worker["worker_id"])
@@ -1991,6 +2405,11 @@ class BaseCliWorkerRuntime:
             worker_for_run,
         )
         command, env = self._build_command(worker_for_run, instruction, info)
+        apply_bound_provider_account_environment(
+            worker_for_run,
+            env,
+            runtime_name=self.runtime_name,
+        )
         stdin_text = self._command_stdin_text(worker_for_run, instruction, info)
         constraint_ledger, constraint_ledger_path = _write_constraint_ledger_for_run(
             worker=worker_for_run,
@@ -2056,6 +2475,7 @@ class BaseCliWorkerRuntime:
                 f"export GLASSHIVE_ACTIVE_WORKER_ID={shlex.quote(worker_for_run['worker_id'])}",
                 f"{command_invocation} > >(tee -a {shlex.quote(container_stdout)}) 2> >(tee -a {shlex.quote(container_stderr)} >&2)",
                 "status=$?",
+                "unset " + " ".join(_RUN_SCOPED_CREDENTIAL_ENV_KEYS),
                 'if [ -f "$GLASSHIVE_SECRET_ENV_KEYS_FILE" ]; then while IFS= read -r key; do [ -n "$key" ] && unset "$key"; done < "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; rm -f "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; fi',
                 "write_exit \"$status\"",
                 "printf '\\n[glasshive] run finished with exit code %s. Interactive shell remains open for takeover.\\n' \"$status\"",
@@ -2951,7 +3371,11 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             or ""
         ).strip()
 
-    def _compatible_provider_base_url(self) -> str:
+    def _compatible_provider_base_url(self, worker: dict | None = None) -> str:
+        if worker is not None:
+            projection = validated_codex_broker_projection(worker)
+            if projection is not None:
+                return str(projection["base_url"])
         return (
             os.environ.get("WPR_CODEX_CLI_BASE_URL", "").strip()
             or os.environ.get("OPENAI_BASE_URL", "").strip()
@@ -2960,18 +3384,24 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             or os.environ.get("PORTKEY_BASE_URL", "").strip()
         ).rstrip("/")
 
-    def _compatible_provider_enabled(self) -> bool:
+    def _compatible_provider_enabled(self, worker: dict | None = None) -> bool:
+        if worker is not None and validated_codex_broker_projection(worker) is not None:
+            return True
         if self._env_flag("WPR_CODEX_CLI_DISABLE_CUSTOM_PROVIDER", False):
             return False
         if self._env_flag("WPR_CODEX_CLI_USE_CUSTOM_PROVIDER", False):
             return True
         return bool(self._compatible_provider_base_url())
 
-    def _compatible_provider_id(self) -> str:
+    def _compatible_provider_id(self, worker: dict | None = None) -> str:
+        if worker is not None and validated_codex_broker_projection(worker) is not None:
+            return "glasshive_run_broker"
         raw = os.environ.get("WPR_CODEX_CLI_MODEL_PROVIDER", "glasshive_openai_compatible").strip()
         return re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_") or "glasshive_openai_compatible"
 
-    def _compatible_provider_env_key(self) -> str:
+    def _compatible_provider_env_key(self, worker: dict | None = None) -> str:
+        if worker is not None and validated_codex_broker_projection(worker) is not None:
+            return "OPENAI_API_KEY"
         configured = os.environ.get("WPR_CODEX_CLI_ENV_KEY", "").strip()
         if configured:
             return configured
@@ -3077,14 +3507,23 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         *,
         include_reasoning_effort: bool = True,
     ) -> None:
-        if not self._compatible_provider_enabled():
+        projection = validated_codex_broker_projection(worker)
+        if not self._compatible_provider_enabled(worker):
             return
-        base_url = self._compatible_provider_base_url()
+        base_url = self._compatible_provider_base_url(worker)
         if not base_url:
             return
-        provider_id = self._compatible_provider_id()
-        provider_name = os.environ.get("WPR_CODEX_CLI_PROVIDER_NAME", "GlassHive OpenAI-compatible").strip()
-        wire_api = os.environ.get("WPR_CODEX_CLI_WIRE_API", "responses").strip() or "responses"
+        provider_id = self._compatible_provider_id(worker)
+        provider_name = (
+            "GlassHive run broker"
+            if projection is not None
+            else os.environ.get("WPR_CODEX_CLI_PROVIDER_NAME", "GlassHive OpenAI-compatible").strip()
+        )
+        wire_api = (
+            "responses"
+            if projection is not None
+            else os.environ.get("WPR_CODEX_CLI_WIRE_API", "responses").strip() or "responses"
+        )
         verbosity = os.environ.get("WPR_CODEX_CLI_MODEL_VERBOSITY", "medium").strip()
         for feature in self._compatible_provider_disabled_features():
             command.extend(["--disable", feature])
@@ -3097,7 +3536,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
                 "-c",
                 f'model_providers.{provider_id}.base_url="{base_url}"',
                 "-c",
-                f'model_providers.{provider_id}.env_key="{self._compatible_provider_env_key()}"',
+                f'model_providers.{provider_id}.env_key="{self._compatible_provider_env_key(worker)}"',
                 "-c",
                 f'model_providers.{provider_id}.wire_api="{wire_api}"',
                 "-c",
@@ -3106,6 +3545,19 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
                 f"model_providers.{provider_id}.supports_websockets=false",
             ]
         )
+        if projection is not None:
+            worker_id = _toml_string(str(projection["worker_id"]))
+            run_id = _toml_string(str(projection["run_id"]))
+            command.extend(
+                [
+                    "-c",
+                    (
+                        f'model_providers.{provider_id}.http_headers='
+                        f'{{ "X-GlassHive-Worker-Id" = {worker_id}, '
+                        f'"X-GlassHive-Run-Id" = {run_id} }}'
+                    ),
+                ]
+            )
         if verbosity:
             command.extend(["-c", f'model_verbosity="{verbosity}"'])
         if include_reasoning_effort:
@@ -3126,7 +3578,12 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             else:
                 command.extend(["-m", model])
         self._append_codex_user_config_policy(command, worker)
-        self._append_codex_compatible_provider_config(command, worker, include_reasoning_effort=False)
+        if not worker.get("_glasshive_provider_account_bound"):
+            self._append_codex_compatible_provider_config(
+                command,
+                worker,
+                include_reasoning_effort=False,
+            )
         self._append_codex_reasoning_effort_config(command, worker)
         if dangerous_mode:
             if is_resume:
@@ -3152,6 +3609,16 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             "NO_PROXY",
             "SSL_CERT_FILE",
             "SSL_CERT_DIR",
+        )
+        projection = validated_codex_broker_projection(worker)
+        if projection is not None:
+            for key in _CODEX_BROKER_CONFLICTING_ENV:
+                env.pop(key, None)
+            env["OPENAI_API_KEY"] = str(projection["grant_token"])
+        apply_bound_provider_account_environment(
+            worker,
+            env,
+            runtime_name=self.runtime_name,
         )
         return command, env
 
@@ -5133,7 +5600,8 @@ raise SystemExit(exit_code)
             codex_target = codex_home / "config.toml"
             codex_target.write_text(codex_config + "\n")
             codex_target.chmod(0o600)
-            self._copy_host_codex_auth(codex_home)
+            if not worker.get("_glasshive_provider_account_bound"):
+                self._copy_host_codex_auth(codex_home)
             self._project_host_codex_capability_roots(codex_home)
 
     def _write_conversation_runtime_files(self, worker: dict, bundle: dict[str, object]) -> None:
@@ -5155,7 +5623,8 @@ raise SystemExit(exit_code)
             config_path = codex_home / "config.toml"
             config_path.write_text((codex_config.rstrip() + "\n") if codex_config else "")
             config_path.chmod(0o600)
-            self._copy_host_codex_auth(codex_home)
+            if not worker.get("_glasshive_provider_account_bound"):
+                self._copy_host_codex_auth(codex_home)
             self._project_host_codex_capability_roots(codex_home)
             return
 
@@ -5448,6 +5917,15 @@ raise SystemExit(exit_code)
             },
         )
         return self._host_runtime_info(worker, pid=self._active_pid(worker_id))
+
+    def prepare_worker_workspace(self, worker: dict) -> RuntimeInfo:
+        """Materialize a host workspace without launching an agent process."""
+        worker_id = str(worker["worker_id"])
+        self._state_dir(worker_id).mkdir(parents=True, exist_ok=True)
+        self._home_dir(worker_id).mkdir(parents=True, exist_ok=True)
+        workspace = self._host_workspace_dir(worker)
+        self._materialize_workspace(worker, workspace)
+        return self._host_runtime_info(worker, pid=None)
 
     def _active_session_argv_for_evidence(self, active_session: dict[str, object] | None) -> list[str]:
         raw = str((active_session or {}).get("argv_for_evidence_json") or "").strip()
@@ -6525,6 +7003,12 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
             else:
                 command.extend(["-m", model])
         self._append_codex_user_config_policy(command, worker)
+        if validated_codex_broker_projection(worker) is not None:
+            self._append_codex_compatible_provider_config(
+                command,
+                worker,
+                include_reasoning_effort=False,
+            )
         self._append_codex_reasoning_effort_config(command, worker)
         if dangerous_mode:
             if is_resume:
@@ -6549,6 +7033,16 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
         codex_home = self._host_codex_home(worker)
         if conversation_mode or (codex_home / "config.toml").exists():
             env["CODEX_HOME"] = str(codex_home)
+        apply_bound_provider_account_environment(
+            worker,
+            env,
+            runtime_name=self.runtime_name,
+        )
+        projection = validated_codex_broker_projection(worker)
+        if projection is not None:
+            for key in _CODEX_BROKER_CONFLICTING_ENV:
+                env.pop(key, None)
+            env["OPENAI_API_KEY"] = str(projection["grant_token"])
         return command, env
 
 
@@ -6860,6 +7354,11 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
         if not use_api_key:
             env.pop("ANTHROPIC_API_KEY", None)
         self._remove_conflicting_anthropic_credentials(env)
+        apply_bound_provider_account_environment(
+            worker,
+            env,
+            runtime_name=self.runtime_name,
+        )
         return command, env
 
 

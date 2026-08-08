@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import hashlib
 import hmac
@@ -7,6 +9,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +20,8 @@ from urllib.parse import urlencode, urlparse
 
 import httpx
 
+from .auth import multi_user_security_enabled
+
 from .deliverables import (
     PROFESSIONAL_ARTIFACT_EXTENSIONS,
     SUPPORT_ARTIFACT_DIR_NAMES,
@@ -24,8 +29,10 @@ from .deliverables import (
     is_user_deliverable_relative_path,
     is_valid_professional_artifact,
 )
+from .control_plane import PROFILE_ACCOUNT_PROVIDERS, WORKSPACE_ACCOUNT_POLICIES, ControlPlaneStore
 from .failure_classification import classify_runtime_error
-from .models import utc_now
+from .models import WorkspaceKind, normalize_workspace_kind, normalize_workspace_tags, utc_now
+from .mission_provider_accounts import mission_provider_account_selection
 from .openclaw_runtime import (
     RuntimeErrorBase,
     RuntimeInfo,
@@ -35,8 +42,20 @@ from .openclaw_runtime import (
     WorkerTerminatedError,
 )
 from .operator_urls import surface_aware_watch_url
+from .recurrence import (
+    DELEGATED_RECURRENCE_OWNER,
+    NATIVE_RECURRENCE_OWNER,
+    RECURRENCE_OWNERS,
+    canonical_recurrence_owner,
+    due_occurrences_and_next,
+    first_occurrence_at,
+    normalize_recurrence_spec,
+    parse_aware_utc,
+    recurrence_owner_storage_value,
+)
 from .runtime_env import load_viventium_runtime_env
 from .runtime_identity import derive_legacy_backend_label
+from .scheduling_owner import SchedulingOwnerIdentity, ViventiumSchedulingOwnerClient
 from .signed_links import (
     append_signed_query,
     create_signed_link_ref,
@@ -45,7 +64,7 @@ from .signed_links import (
     signed_link_ref_url,
     sign_link_token,
 )
-from .store import Store
+from .store import SchedulePrincipalAuthorityStoreError, Store
 
 
 logger = logging.getLogger(__name__)
@@ -72,6 +91,263 @@ RUN_STATE_BY_EVENT = {
     "run.cancelled": "cancelled",
 }
 _UNSET = object()
+
+
+class SchedulePrincipalAuthorityError(ValueError):
+    """A current principal no longer authorizes unattended schedule execution."""
+
+    failure_class = "principal_disabled"
+
+
+class ScheduleActionRequiredError(ValueError):
+    """A user-owned account or capability must be repaired before scheduled work can run."""
+
+    def __init__(self, failure_class: str, message: str, recovery: str) -> None:
+        super().__init__(message)
+        self.failure_class = failure_class
+        self.user_message = message
+        self.recovery = recovery
+
+
+_DUPLICATE_EXCLUDED_PATH_NAMES = frozenset(
+    {
+        ".aws",
+        ".azure",
+        ".cache",
+        ".claude",
+        ".claude.json",
+        ".codex",
+        ".config",
+        ".git",
+        ".glasshive",
+        ".glasshive-runs",
+        ".hg",
+        ".local",
+        ".mcp.json",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        ".ssh",
+        ".svn",
+        ".venv",
+        "auth.json",
+        "cookies",
+        "cookies.sqlite",
+        "credentials",
+        "credentials.json",
+        "local state",
+        "login data",
+        "mcp.json",
+        "node_modules",
+        "session",
+        "session.json",
+        "sessions",
+        "token.json",
+        "web data",
+    }
+)
+
+
+def _encode_workspace_cursor(worker: dict) -> str:
+    payload = {
+        "v": 1,
+        "favorite": 1 if bool(worker.get("favorite")) else 0,
+        "activity": str(worker.get("last_activity_at") or worker.get("updated_at") or ""),
+        "worker_id": str(worker.get("worker_id") or ""),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_workspace_cursor(cursor: str | None) -> tuple[int | None, str, str]:
+    clean_cursor = str(cursor or "").strip()
+    if not clean_cursor:
+        return None, "", ""
+    try:
+        padded = clean_cursor + ("=" * (-len(clean_cursor) % 4))
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        favorite = int(payload["favorite"])
+        activity = str(payload["activity"])
+        worker_id = str(payload["worker_id"])
+    except (ValueError, TypeError, KeyError, UnicodeError, json.JSONDecodeError, binascii.Error) as exc:
+        raise ValueError("workspace catalog cursor is invalid") from exc
+    if payload.get("v") != 1 or favorite not in {0, 1} or not activity or not worker_id:
+        raise ValueError("workspace catalog cursor is invalid")
+    return favorite, activity, worker_id
+
+
+def _workspace_duplicate_path_is_excluded(relative_path: Path) -> bool:
+    for part in relative_path.parts:
+        normalized = part.casefold()
+        if normalized in _DUPLICATE_EXCLUDED_PATH_NAMES:
+            return True
+        if normalized == ".env" or normalized.startswith(".env."):
+            return True
+    return False
+
+
+def _require_path_within_root(path: Path, root: Path, *, label: str) -> Path:
+    resolved = path.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(label) from exc
+    return resolved
+
+
+def _workspace_copy_plan(source_root: Path) -> tuple[list[tuple[Path, Path]], int, str]:
+    if source_root.is_symlink():
+        raise ValueError("unsafe workspace symlink: source root")
+    if not source_root.exists():
+        return [], 0, "missing"
+    if not source_root.is_dir():
+        raise ValueError("workspace duplicate source must be a directory")
+    files: list[tuple[Path, Path]] = []
+    max_files = _bounded_int_env("GLASSHIVE_DUPLICATE_MAX_FILES", 5_000, min_value=1, max_value=100_000)
+    max_bytes = _bounded_int_env(
+        "GLASSHIVE_DUPLICATE_MAX_BYTES",
+        512 * 1024 * 1024,
+        min_value=1024,
+        max_value=20 * 1024 * 1024 * 1024,
+    )
+    max_depth = _bounded_int_env(
+        "GLASSHIVE_DUPLICATE_MAX_DEPTH",
+        64,
+        min_value=1,
+        max_value=1_024,
+    )
+    timeout_seconds = _bounded_float_env(
+        "GLASSHIVE_DUPLICATE_TIMEOUT_SECONDS",
+        30.0,
+        min_value=1.0,
+        max_value=300.0,
+    )
+    deadline = time.monotonic() + timeout_seconds
+    total_bytes = 0
+    skipped_items = 0
+    found_items = False
+    pending = [source_root]
+    while pending:
+        if time.monotonic() > deadline:
+            raise ValueError("workspace duplicate preflight exceeded its time limit")
+        directory = pending.pop()
+        try:
+            children = sorted(directory.iterdir(), key=lambda value: value.name.casefold())
+        except OSError as exc:
+            relative_directory = directory.relative_to(source_root)
+            raise ValueError(
+                f"workspace directory could not be inspected: {relative_directory or Path('.')}"
+            ) from exc
+        for item in children:
+            found_items = True
+            relative = item.relative_to(source_root)
+            if _workspace_duplicate_path_is_excluded(relative):
+                skipped_items += 1
+                continue
+            if len(relative.parts) > max_depth:
+                raise ValueError("workspace duplicate exceeds the configured depth limit")
+            try:
+                item_stat = item.lstat()
+            except OSError as exc:
+                raise ValueError(f"workspace item could not be inspected: {relative}") from exc
+            if stat.S_ISLNK(item_stat.st_mode):
+                try:
+                    link_target = Path(os.readlink(item))
+                    # Path.resolve(strict=False) stopped raising for symlink loops in
+                    # Python 3.13. Follow the link once with stat so dangling and
+                    # looping links fail closed on every supported interpreter.
+                    item.stat()
+                    resolved_target = item.resolve(strict=False)
+                    resolved_root = source_root.resolve(strict=True)
+                except (OSError, RuntimeError) as exc:
+                    raise ValueError(f"unsafe workspace symlink: {relative}") from exc
+                if link_target.is_absolute():
+                    raise ValueError(f"unsafe workspace symlink: {relative}")
+                try:
+                    resolved_target.relative_to(resolved_root)
+                except ValueError as exc:
+                    raise ValueError(f"unsafe workspace symlink: {relative}") from exc
+                skipped_items += 1
+                continue
+            mode = item_stat.st_mode
+            if stat.S_ISDIR(mode):
+                pending.append(item)
+            elif stat.S_ISREG(mode):
+                if item_stat.st_nlink > 1:
+                    raise ValueError(f"workspace item is not an independent regular file: {relative}")
+                files.append((item, relative))
+                if len(files) > max_files:
+                    raise ValueError("workspace duplicate exceeds the configured file limit")
+                total_bytes += int(item_stat.st_size)
+                if total_bytes > max_bytes:
+                    raise ValueError("workspace duplicate exceeds the configured byte limit")
+            else:
+                raise ValueError(f"workspace item is not a regular file or directory: {relative}")
+    if files:
+        source_state = "copied"
+    elif found_items:
+        source_state = "filtered"
+    else:
+        source_state = "empty"
+    return files, skipped_items, source_state
+
+
+def _copy_regular_workspace_file(
+    source: Path,
+    target: Path,
+    source_root: Path,
+    *,
+    max_bytes: int,
+    deadline: float,
+) -> int:
+    root = source_root.resolve(strict=True)
+    if source.is_symlink():
+        raise ValueError(f"unsafe workspace file changed during duplicate: {source.relative_to(source_root)}")
+    resolved_source = _require_path_within_root(
+        source,
+        root,
+        label=f"unsafe workspace file changed during duplicate: {source.relative_to(source_root)}",
+    )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(resolved_source, flags)
+    temporary_target = target.with_name(f".{target.name}.glasshive-copy-{uuid.uuid4().hex}")
+    try:
+        opened_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink > 1:
+            raise ValueError(f"workspace item is not a regular file: {source.relative_to(source_root)}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        copied_bytes = 0
+        with os.fdopen(descriptor, "rb", closefd=False) as source_handle, temporary_target.open("xb") as target_handle:
+            while True:
+                if time.monotonic() > deadline:
+                    raise ValueError("workspace duplicate copy exceeded its time limit")
+                remaining = max_bytes - copied_bytes
+                if remaining < 0:
+                    raise ValueError("workspace duplicate exceeds the configured byte limit")
+                chunk = source_handle.read(min(1024 * 1024, remaining + 1))
+                if not chunk:
+                    break
+                copied_bytes += len(chunk)
+                if copied_bytes > max_bytes:
+                    raise ValueError("workspace duplicate exceeds the configured byte limit")
+                target_handle.write(chunk)
+        os.replace(temporary_target, target)
+        return copied_bytes
+    finally:
+        os.close(descriptor)
+        try:
+            temporary_target.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _duplicate_bootstrap_bundle(bundle: dict | None) -> dict | None:
+    if not isinstance(bundle, dict):
+        return None
+    project_definition = bundle.get("project_definition")
+    if not isinstance(project_definition, str) or not project_definition.strip():
+        return None
+    return {"project_definition": project_definition}
 
 
 def _bounded_int_env(name: str, default: int, *, min_value: int, max_value: int) -> int:
@@ -120,7 +396,26 @@ def _is_callback_status_immediate_dead_letter(status_code: int, url: str) -> boo
 
 
 def _enterprise_mode_enabled() -> bool:
-    return _env_truthy("GLASSHIVE_ENTERPRISE_MODE") or _env_truthy("WPR_ENTERPRISE_MODE")
+    return multi_user_security_enabled()
+
+
+def _recurring_schedule_owner() -> str:
+    load_viventium_runtime_env()
+    configured = str(os.environ.get("GLASSHIVE_RECURRING_SCHEDULE_OWNER") or "").strip().lower()
+    viventium_deployment = bool(
+        str(os.environ.get("VIVENTIUM_ENV_FILE") or "").strip()
+        or str(os.environ.get("VIVENTIUM_GLASSHIVE_CALLBACK_URL") or "").strip()
+    )
+    if configured and configured not in RECURRENCE_OWNERS:
+        raise ValueError(
+            "GLASSHIVE_RECURRING_SCHEDULE_OWNER must be glasshive_native or viventium_cortex"
+        )
+    configured_owner = canonical_recurrence_owner(configured) if configured else ""
+    if viventium_deployment:
+        if configured_owner == NATIVE_RECURRENCE_OWNER:
+            raise ValueError("Viventium deployments must delegate recurrence to Viventium Cortex")
+        return DELEGATED_RECURRENCE_OWNER
+    return configured_owner or NATIVE_RECURRENCE_OWNER
 
 
 class HostWorkersDisabledError(RuntimeError):
@@ -296,6 +591,23 @@ def merge_bootstrap_bundle(existing: dict | None, incoming: dict | None) -> dict
     return merged
 
 
+def _required_capability_servers(bundle: dict | None) -> list[str]:
+    if not isinstance(bundle, dict):
+        return []
+    broker = bundle.get("glasshive_capability_broker")
+    values = broker.get("allowed_servers") if isinstance(broker, dict) else None
+    if not isinstance(values, list):
+        return []
+    return sorted(
+        {
+            normalized
+            for value in values
+            if (normalized := str(value or "").strip())
+            and re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", normalized)
+        }
+    )[:32]
+
+
 class WorkersProjectsService:
     def __init__(
         self,
@@ -303,9 +615,13 @@ class WorkersProjectsService:
         runtime: WorkerRuntime,
         max_workers: int = 8,
         reconcile_on_startup: bool | None = None,
+        control_plane_store: ControlPlaneStore | None = None,
+        scheduling_owner_client: ViventiumSchedulingOwnerClient | None = None,
     ) -> None:
         self.store = store
         self.runtime = runtime
+        self.control_plane_store = control_plane_store
+        self.scheduling_owner_client = scheduling_owner_client or ViventiumSchedulingOwnerClient()
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="wpr-runner")
         # Interactive provider turns have a separate dispatch lane so autonomous mission workers
         # cannot occupy every service thread before a conversation reaches the host CLI's own
@@ -392,6 +708,40 @@ class WorkersProjectsService:
                 worker.get("worker_id"),
             )
         return resolved
+
+    def scheduling_cortex_callback_config(self, occurrence_id: str) -> dict:
+        occurrence_id = str(occurrence_id or "").strip()
+        if not occurrence_id:
+            return {}
+        load_viventium_runtime_env()
+        owner_url = str(os.environ.get("GLASSHIVE_SCHEDULING_OWNER_URL") or "").strip()
+        secret = str(os.environ.get("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET") or "").strip()
+        try:
+            parsed = urlparse(owner_url)
+        except ValueError:
+            return {}
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or not secret:
+            return {}
+        return {
+            "events_webhook_url": f"{parsed.scheme}://{parsed.netloc}{SCHEDULING_CORTEX_CALLBACK_PATH}",
+            "hmac_secret": secret,
+            "message_id": occurrence_id,
+            "callback_kind": "scheduling_cortex",
+        }
+
+    def _scheduling_cortex_callback_config_for_run(self, run: dict | None) -> dict:
+        run_id = str((run or {}).get("run_id") or "").strip()
+        if not run_id:
+            return {}
+        return self.scheduling_cortex_callback_config(
+            self.store.scheduling_cortex_occurrence_for_run(run_id)
+        )
+
+    def _callback_config_for_event(self, worker: dict, run: dict | None) -> dict:
+        run_id = str((run or {}).get("run_id") or "").strip()
+        if run_id and self.store.scheduling_cortex_occurrence_for_run(run_id):
+            return self._scheduling_cortex_callback_config_for_run(run)
+        return self._callback_config_for(worker)
 
     def _derive_callback_secret(self, secret: str, worker_id: str, run_id: str | None) -> bytes:
         binding = f"{worker_id}:{run_id or ''}".encode("utf-8")
@@ -597,7 +947,11 @@ class WorkersProjectsService:
             worker = self.store.get_worker(str(record.get("worker_id") or ""))
             if not worker:
                 continue
-            callbacks = self._callback_config_for(worker)
+            run_id = str(record.get("run_id") or "").strip()
+            callbacks = self._callback_config_for_event(
+                worker,
+                self.store.get_run(run_id) if run_id else None,
+            )
             self._deliver_callback_record(worker, record, callbacks)
 
     def _callback_retry_loop(self) -> None:
@@ -790,7 +1144,7 @@ class WorkersProjectsService:
         full_message: str = "",
         deliverable: dict[str, object] | None = None,
     ) -> None:
-        callbacks = self._callback_config_for(worker)
+        callbacks = self._callback_config_for_event(worker, run)
         url = str(callbacks.get("events_webhook_url") or callbacks.get("url") or "").strip()
         if not url:
             return
@@ -931,6 +1285,31 @@ class WorkersProjectsService:
     def _idle_reaper_interval_s(self) -> int:
         return _bounded_int_env("GLASSHIVE_IDLE_REAPER_INTERVAL_S", 60, min_value=1, max_value=3600)
 
+    def _ephemeral_retention_s(self) -> int:
+        return _bounded_int_env(
+            "GLASSHIVE_EPHEMERAL_RETENTION_S",
+            7 * 24 * 3600,
+            min_value=60,
+            max_value=365 * 24 * 3600,
+        )
+
+    def _ephemeral_gc_enabled(self) -> bool:
+        return str(os.environ.get("GLASSHIVE_EPHEMERAL_GC_ENABLED", "true")).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+            "disabled",
+        }
+
+    def _ephemeral_gc_claim_ttl_s(self) -> int:
+        return _bounded_int_env(
+            "GLASSHIVE_EPHEMERAL_GC_CLAIM_TTL_S",
+            60,
+            min_value=10,
+            max_value=3600,
+        )
+
     def _lifecycle_reaper_enabled(self) -> bool:
         orphan_reaper_enabled = str(os.environ.get("GLASSHIVE_ORPHAN_REAPER_ENABLED", "true")).strip().lower() not in {
             "0",
@@ -941,10 +1320,226 @@ class WorkersProjectsService:
         }
         return (
             orphan_reaper_enabled
+            or self._ephemeral_gc_enabled()
             or self._idle_terminate_after_s() > 0
             or self._paused_terminate_after_s() > 0
             or self._max_run_duration_s() > 0
         )
+
+    def _managed_ephemeral_storage_root(self, worker: dict) -> Path | None:
+        """Attest a canonical managed Docker root without trusting persisted paths."""
+
+        if str(worker.get("execution_mode") or "docker").strip().lower() != "docker":
+            return None
+        if str(worker.get("workspace_root") or "").strip():
+            return None
+        worker_id = str(worker.get("worker_id") or "").strip()
+        if (
+            not worker_id
+            or worker_id in {".", ".."}
+            or Path(worker_id).name != worker_id
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}", worker_id)
+        ):
+            return None
+
+        runtime_manager = self.runtime
+        selector = getattr(runtime_manager, "_runtime_for_worker", None)
+        if callable(selector):
+            try:
+                runtime_manager = selector(worker)
+            except Exception:
+                return None
+
+        path_map: dict[str, Path] = {}
+        root_value: object | None = None
+        managed_root = getattr(runtime_manager, "managed_worker_root", None)
+        if callable(managed_root):
+            try:
+                root_value = managed_root(worker)
+            except TypeError:
+                root_value = managed_root(worker_id)
+            except Exception:
+                return None
+        if root_value is None:
+            sandbox = getattr(runtime_manager, "sandbox", None)
+            paths = getattr(sandbox, "paths", None)
+            if callable(paths):
+                try:
+                    raw_paths = paths(worker_id)
+                except Exception:
+                    return None
+                if isinstance(raw_paths, dict):
+                    path_map = {
+                        str(key): Path(value).expanduser()
+                        for key, value in raw_paths.items()
+                        if value is not None
+                    }
+                    root_value = path_map.get("worker_root")
+        if root_value is None:
+            workers_dir = getattr(runtime_manager, "workers_dir", None)
+            if workers_dir is not None:
+                root_value = Path(workers_dir).expanduser() / worker_id
+        if root_value is None:
+            return None
+
+        configured_root = Path(root_value).expanduser()
+        try:
+            canonical_parent = configured_root.parent.resolve(strict=True)
+            if not canonical_parent.is_dir():
+                return None
+            root = canonical_parent / worker_id
+            if configured_root.resolve(strict=False) != root:
+                return None
+            if os.path.lexists(root):
+                if root.is_symlink() or not root.is_dir() or root.resolve(strict=True).parent != canonical_parent:
+                    return None
+        except (OSError, RuntimeError):
+            return None
+
+        expected_state = path_map.get("state_dir", root / "state").resolve(strict=False)
+        expected_workspace = path_map.get("workspace_dir", expected_state / "workspace").resolve(strict=False)
+        for persisted_name, expected in (
+            ("state_dir", expected_state),
+            ("workspace_dir", expected_workspace),
+        ):
+            raw = str(worker.get(persisted_name) or "").strip()
+            if not raw:
+                return None
+            try:
+                if Path(raw).expanduser().resolve(strict=False) != expected:
+                    return None
+            except (OSError, RuntimeError):
+                return None
+        return root
+
+    def _cleanup_workspace_gc_tombstone(
+        self,
+        tombstone: dict[str, object],
+        *,
+        claim_token: str,
+        now_epoch: float,
+    ) -> bool:
+        worker_id = str(tombstone.get("worker_id") or "")
+        audit_root = str(tombstone.get("managed_storage_root") or "").strip()
+        if not worker_id:
+            return False
+        try:
+            if audit_root:
+                attested_root = self._managed_ephemeral_storage_root(tombstone)
+                if attested_root is None or str(attested_root) != audit_root:
+                    raise RuntimeError("managed workspace storage can no longer be attested")
+                if os.path.lexists(attested_root):
+                    shutil.rmtree(attested_root)
+            return self.store.record_workspace_gc_cleanup(
+                worker_id,
+                claim_token=claim_token,
+                now_epoch=now_epoch,
+            )
+        except Exception as exc:
+            message = public_callback_message_text(str(exc)) or "workspace storage cleanup failed"
+            self.store.record_workspace_gc_cleanup(
+                worker_id,
+                claim_token=claim_token,
+                now_epoch=now_epoch,
+                error=message,
+            )
+            logger.warning("Failed to clean expired workspace storage %s: %s", worker_id, message)
+            return False
+
+    def reap_ephemeral_workspaces_once(self, *, now: datetime | None = None) -> list[dict[str, object]]:
+        """Claim, tombstone, and clean expired one-off workspaces without path trust."""
+
+        if not self._ephemeral_gc_enabled():
+            return []
+        effective_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        cutoff = effective_now - timedelta(seconds=self._ephemeral_retention_s())
+        now_epoch = effective_now.timestamp()
+        claim_ttl_s = self._ephemeral_gc_claim_ttl_s()
+
+        for pending in self.store.list_workspace_gc_cleanup_candidates(now_epoch=now_epoch, limit=50):
+            cleanup_token = f"gc_{uuid.uuid4().hex}"
+            claimed_cleanup = self.store.claim_workspace_gc_cleanup(
+                str(pending.get("worker_id") or ""),
+                claim_token=cleanup_token,
+                now_epoch=now_epoch,
+                claim_ttl_s=claim_ttl_s,
+            )
+            if claimed_cleanup is not None:
+                self._cleanup_workspace_gc_tombstone(
+                    claimed_cleanup,
+                    claim_token=cleanup_token,
+                    now_epoch=now_epoch,
+                )
+
+        candidates = self.store.list_recoverable_workspace_gc_claims(
+            now_epoch=now_epoch,
+            limit=50,
+        )
+        candidates.extend(self.store.list_ephemeral_workspace_gc_candidates(
+            updated_before=cutoff.isoformat(),
+            limit=50,
+        ))
+        reaped: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for worker in candidates:
+            worker_id = str(worker.get("worker_id") or "")
+            if not worker_id or worker_id in seen:
+                continue
+            seen.add(worker_id)
+            storage_root = self._managed_ephemeral_storage_root(worker)
+            claim_token = f"gc_{uuid.uuid4().hex}"
+            claimed = self.store.claim_ephemeral_workspace_gc(
+                worker_id,
+                updated_before=cutoff.isoformat(),
+                now_epoch=now_epoch,
+                claim_token=claim_token,
+                claim_ttl_s=claim_ttl_s,
+                managed_storage_root=str(storage_root or ""),
+            )
+            if claimed is None:
+                continue
+            try:
+                info = self.runtime.terminate_worker({**claimed, "_active_run_id": ""})
+                if info.pid:
+                    raise RuntimeError("ephemeral workspace compute is still active")
+                deleted = self.store.finalize_ephemeral_workspace_gc(
+                    worker_id,
+                    claim_token=claim_token,
+                    updated_before=cutoff.isoformat(),
+                    now_epoch=now_epoch,
+                )
+                if deleted is None:
+                    self.store.release_ephemeral_workspace_gc_claim(worker_id, claim_token=claim_token)
+                    continue
+                try:
+                    revoke_signed_link_refs_for_worker(worker_id)
+                except Exception as revoke_exc:
+                    logger.warning("Failed to revoke expired workspace links for %s: %s", worker_id, revoke_exc)
+                tombstone = self.store.claim_workspace_gc_cleanup(
+                    worker_id,
+                    claim_token=claim_token,
+                    now_epoch=now_epoch,
+                    claim_ttl_s=claim_ttl_s,
+                )
+                if tombstone is not None:
+                    self._cleanup_workspace_gc_tombstone(
+                        tombstone,
+                        claim_token=claim_token,
+                        now_epoch=now_epoch,
+                    )
+                reaped.append(
+                    {
+                        "worker_id": worker_id,
+                        "project_id": deleted.get("project_id"),
+                        "tenant_id": deleted.get("tenant_id"),
+                        "owner_id": deleted.get("owner_id"),
+                        "workspace_kind": "ephemeral",
+                    }
+                )
+            except Exception as exc:
+                self.store.release_ephemeral_workspace_gc_claim(worker_id, claim_token=claim_token)
+                logger.warning("Failed to garbage-collect ephemeral GlassHive workspace %s: %s", worker_id, exc)
+        return reaped
 
     def _worker_idle_seconds(self, worker: dict) -> float:
         raw = str(worker.get("updated_at") or "")
@@ -1187,6 +1782,7 @@ class WorkersProjectsService:
         interval = self._idle_reaper_interval_s()
         while not self._shutdown_event.wait(interval):
             self.reap_terminated_workers_once()
+            self.reap_ephemeral_workspaces_once()
             self.reap_idle_workers_once()
             self.reap_paused_workers_once()
             self.reap_expired_runs_once()
@@ -1506,8 +2102,16 @@ class WorkersProjectsService:
         goal: str,
         default_worker_profile: str,
         tenant_id: str = "local",
+        project_id: str | None = None,
     ) -> dict:
-        return self.store.create_project(owner_id, title, goal, default_worker_profile, tenant_id=tenant_id)
+        return self.store.create_project(
+            owner_id,
+            title,
+            goal,
+            default_worker_profile,
+            tenant_id=tenant_id,
+            project_id=project_id,
+        )
 
     def _initial_runtime_label(self, profile: str, execution_mode: str) -> str:
         return derive_legacy_backend_label(profile=profile, execution_mode=execution_mode, default="worker")
@@ -1537,6 +2141,8 @@ class WorkersProjectsService:
         bootstrap_bundle: dict | None = None,
         tenant_id: str = "local",
         start_synchronously: bool = True,
+        workspace_kind: WorkspaceKind | str = "legacy",
+        tags: list[str] | None = None,
     ) -> dict:
         self._ensure_execution_allowed(execution_mode)
         self._ensure_profile_allowed(profile)
@@ -1559,9 +2165,25 @@ class WorkersProjectsService:
                 workspace_root=workspace_root,
                 bootstrap_profile=bootstrap_profile,
                 bootstrap_bundle=bootstrap_bundle,
+                workspace_kind=normalize_workspace_kind(workspace_kind),
+                tags=normalize_workspace_tags(tags),
             )
         if not start_synchronously:
-            prepared = self.store.update_worker_state(worker["worker_id"], "paused", last_error="")
+            prepare_workspace = getattr(self.runtime, "prepare_worker_workspace", None)
+            if callable(prepare_workspace):
+                info = prepare_workspace(worker)
+                prepared = self.store.update_worker(
+                    worker["worker_id"],
+                    state="paused",
+                    last_error="",
+                    compute_released_at=utc_now(),
+                    state_dir=info.state_dir,
+                    workspace_dir=info.workspace_dir,
+                    session_key=info.session_key,
+                    pid=None,
+                )
+            else:
+                prepared = self.store.update_worker_state(worker["worker_id"], "paused", last_error="")
             self.store.add_event(
                 project_id,
                 worker["worker_id"],
@@ -1607,6 +2229,8 @@ class WorkersProjectsService:
         bootstrap_bundle: dict | None = None,
         tenant_id: str = "local",
         start_synchronously: bool = True,
+        workspace_kind: WorkspaceKind | str = "legacy",
+        tags: list[str] | None = None,
     ) -> dict:
         self._ensure_execution_allowed(execution_mode)
         self._ensure_profile_allowed(profile)
@@ -1619,6 +2243,8 @@ class WorkersProjectsService:
             tenant_id=tenant_id,
         )
         if existing and existing.get("state") != "terminated":
+            if self.store.workspace_gc_claim_active(str(existing.get("worker_id") or "")):
+                raise RuntimeErrorBase("Workspace is being garbage-collected")
             updates: dict[str, object] = {
                 "name": name,
                 "role": role,
@@ -1659,6 +2285,8 @@ class WorkersProjectsService:
             bootstrap_profile=bootstrap_profile,
             bootstrap_bundle=bootstrap_bundle,
             start_synchronously=start_synchronously,
+            workspace_kind=workspace_kind,
+            tags=tags,
         )
 
     def update_worker_metadata(
@@ -1667,6 +2295,8 @@ class WorkersProjectsService:
         *,
         favorite: bool | None = None,
         name: str | None = None,
+        workspace_kind: WorkspaceKind | str | None = None,
+        tags: list[str] | None = None,
     ) -> dict:
         worker = self.require_worker(worker_id)
         updates: dict[str, object] = {}
@@ -1677,11 +2307,959 @@ class WorkersProjectsService:
             if not clean_name:
                 raise ValueError("worker name cannot be empty")
             updates["name"] = clean_name[:160]
+        if workspace_kind is not None:
+            updates["workspace_kind"] = normalize_workspace_kind(workspace_kind)
+        if tags is not None:
+            updates["workspace_tags_json"] = json.dumps(
+                normalize_workspace_tags(tags),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
         if not updates:
             return worker
-        updated = self.store.update_worker(worker_id, **updates) or worker
+        updated = self.store.update_worker_unless_gc_claimed(worker_id, **updates)
+        if updated is None:
+            raise RuntimeErrorBase("Workspace is being garbage-collected")
         self.store.add_event(worker["project_id"], worker_id, None, "worker.metadata_updated", "Worker metadata updated")
         return updated
+
+    def list_workspace_catalog(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        workspace_kinds: set[str] | None = None,
+        search: str = "",
+        tags: list[str] | None = None,
+        favorite: bool | None = None,
+        cursor: str | None = None,
+        limit: int = 25,
+    ) -> dict[str, object]:
+        page_size = max(1, min(int(limit), 100))
+        normalized_kinds = {normalize_workspace_kind(value) for value in workspace_kinds or set()}
+        cursor_favorite, cursor_activity_at, cursor_worker_id = _decode_workspace_cursor(cursor)
+        rows = self.store.list_workspace_catalog(
+            tenant_id=tenant_id or "local",
+            owner_id=owner_id,
+            workspace_kinds=normalized_kinds,
+            search=search,
+            tags=normalize_workspace_tags(tags),
+            favorite=favorite,
+            cursor_favorite=cursor_favorite,
+            cursor_activity_at=cursor_activity_at,
+            cursor_worker_id=cursor_worker_id,
+            limit=page_size + 1,
+        )
+        items = rows[:page_size]
+        worker_ids = [str(item.get("worker_id") or "") for item in items]
+
+        accounts: dict[str, dict] = {}
+        if self.control_plane_store is not None:
+            accounts = {
+                str(account.get("account_id") or ""): account
+                for account in self.control_plane_store.list_provider_accounts(
+                    tenant_id=tenant_id or "local",
+                    owner_id=owner_id,
+                )
+            }
+        try:
+            capability_readiness = (
+                self.control_plane_store.workspace_capability_readiness(
+                    tenant_id=tenant_id or "local",
+                    owner_id=owner_id,
+                    worker_ids=worker_ids,
+                )
+                if self.control_plane_store is not None
+                else {
+                    worker_id: {
+                        "active_grants": 0,
+                        "unavailable_grants": 0,
+                        "readiness": "ready",
+                    }
+                    for worker_id in worker_ids
+                }
+            )
+        except Exception as exc:
+            logger.warning("Workspace catalog capability readiness is unavailable: %s", exc)
+            capability_readiness = {
+                worker_id: {
+                    "active_grants": 0,
+                    "unavailable_grants": 0,
+                    "readiness": "unavailable",
+                }
+                for worker_id in worker_ids
+            }
+
+        schedule_readiness = "ready"
+        if self.recurring_schedule_owner() == DELEGATED_RECURRENCE_OWNER:
+            try:
+                definitions = self.list_recurring_schedules(
+                    tenant_id=tenant_id or "local",
+                    owner_id=owner_id,
+                    include_inactive=False,
+                    limit=100,
+                )
+                next_schedule_by_worker: dict[str, str] = {}
+                for definition in definitions:
+                    schedule_worker_id = str(definition.get("worker_id") or "")
+                    next_at = str(
+                        definition.get("next_occurrence_at")
+                        or definition.get("next_run_at")
+                        or ""
+                    )
+                    current = next_schedule_by_worker.get(schedule_worker_id, "")
+                    if next_at and (not current or next_at < current):
+                        next_schedule_by_worker[schedule_worker_id] = next_at
+                if len(definitions) >= 100:
+                    schedule_readiness = "partial"
+            except Exception as exc:
+                logger.warning("Workspace catalog schedule readiness is unavailable: %s", exc)
+                next_schedule_by_worker = {}
+                schedule_readiness = "unavailable"
+        else:
+            next_schedule_by_worker = self.store.next_scheduled_occurrence_by_worker(
+                tenant_id=tenant_id or "local",
+                owner_id=owner_id,
+                worker_ids=worker_ids,
+            )
+
+        for item in items:
+            worker_id = str(item.get("worker_id") or "")
+            raw_bundle = item.get("bootstrap_bundle_json")
+            if isinstance(raw_bundle, str) and raw_bundle.strip():
+                try:
+                    bundle = json.loads(raw_bundle)
+                except json.JSONDecodeError:
+                    bundle = {}
+            else:
+                bundle = raw_bundle if isinstance(raw_bundle, dict) else {}
+            selection = bundle.get("provider_account") if isinstance(bundle, dict) else None
+            policy = str(selection.get("policy") or "legacy") if isinstance(selection, dict) else "legacy"
+            account_id = str(selection.get("account_id") or "") if isinstance(selection, dict) else ""
+            account = accounts.get(account_id)
+            if policy == "legacy":
+                item["provider_readiness"] = {
+                    "readiness": "deployment_managed",
+                    "policy": "legacy",
+                }
+            elif policy == "personal_preferred" and not account_id:
+                item["provider_readiness"] = {
+                    "readiness": "deployment_managed",
+                    "policy": "personal_preferred",
+                    "fallback": True,
+                }
+            elif not account_id:
+                item["provider_readiness"] = {
+                    "readiness": "action_required",
+                    "policy": policy,
+                    "status": "missing",
+                }
+            elif account is None:
+                item["provider_readiness"] = {
+                    "readiness": "action_required",
+                    "policy": policy,
+                    "account_id": account_id,
+                    "status": "missing",
+                }
+            else:
+                status = str(account.get("status") or "unknown")
+                item["provider_readiness"] = {
+                    "readiness": "ready" if status == "ready" else "action_required",
+                    "policy": policy,
+                    "account_id": account_id,
+                    "provider": str(account.get("provider") or ""),
+                    "label": str(account.get("label") or ""),
+                    "status": status,
+                }
+            item["capability_readiness"] = capability_readiness.get(
+                worker_id,
+                {"active_grants": 0, "unavailable_grants": 0, "readiness": "ready"},
+            )
+            item["next_schedule_at"] = next_schedule_by_worker.get(worker_id, "")
+            item["schedule_readiness"] = schedule_readiness
+        return {
+            "items": items,
+            "next_cursor": _encode_workspace_cursor(items[-1]) if len(rows) > page_size and items else None,
+        }
+
+    def recurring_schedule_owner(self) -> str:
+        return _recurring_schedule_owner()
+
+    def _delegated_schedule_call(
+        self,
+        action: str,
+        payload: dict[str, object],
+        *,
+        tenant_id: str,
+        owner_id: str,
+    ) -> object:
+        return self.scheduling_owner_client.call(
+            action,
+            payload,
+            identity=SchedulingOwnerIdentity(
+                tenant_id=tenant_id or "local",
+                owner_id=owner_id,
+                agent_id=str(os.environ.get("VIVENTIUM_MAIN_AGENT_ID") or "scheduling-cortex"),
+            ),
+        )
+
+    def list_recurring_schedules(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        worker_id: str | None = None,
+        include_inactive: bool = False,
+        limit: int = 100,
+    ) -> list[dict]:
+        if self.recurring_schedule_owner() == DELEGATED_RECURRENCE_OWNER:
+            result = self._delegated_schedule_call(
+                "list",
+                {
+                    "worker_id": worker_id or "",
+                    "include_inactive": include_inactive,
+                    "limit": max(1, min(int(limit), 100)),
+                },
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
+                raise RuntimeError("Viventium Scheduling Cortex returned invalid schedule data")
+            schedules = result
+        elif worker_id:
+            schedules = self.store.list_recurring_schedule_definitions(
+                worker_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                include_inactive=include_inactive,
+                limit=limit,
+            )
+        else:
+            schedules = self.store.list_recurring_schedule_definitions_for_owner(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                include_inactive=include_inactive,
+                limit=limit,
+            )
+
+        enriched: list[dict] = []
+        for schedule in schedules:
+            item = dict(schedule)
+            if self.recurring_schedule_owner() != DELEGATED_RECURRENCE_OWNER:
+                latest = self.store.list_recurring_schedule_occurrences(
+                    str(item.get("definition_id") or ""),
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                    limit=1,
+                )
+                if latest:
+                    occurrence = latest[0]
+                    outcome = str(occurrence.get("outcome") or "").strip()
+                    if outcome in {"", "pending", "manual_pending"}:
+                        outcome = str(occurrence.get("state") or "pending").strip()
+                    item["last_occurrence_at"] = occurrence.get("scheduled_for")
+                    item["last_outcome"] = outcome
+                    item["last_error"] = str(occurrence.get("last_error") or "")
+            scheduled_worker_id = str(item.get("worker_id") or "")
+            worker = self.store.get_worker(
+                scheduled_worker_id,
+                tenant_id=tenant_id or "local",
+                owner_id=owner_id,
+            )
+            if worker:
+                item["workspace_name"] = str(worker.get("name") or "")
+            enriched.append(item)
+        return enriched
+
+    def get_recurring_schedule(
+        self,
+        definition_id: str,
+        *,
+        tenant_id: str,
+        owner_id: str,
+    ) -> dict | None:
+        if self.recurring_schedule_owner() == DELEGATED_RECURRENCE_OWNER:
+            result = self._delegated_schedule_call(
+                "get",
+                {"definition_id": definition_id},
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            definition = result if isinstance(result, dict) else None
+        else:
+            definition = self.store.get_recurring_schedule_definition(
+                definition_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+        if not definition:
+            return None
+        enriched = dict(definition)
+        if self.recurring_schedule_owner() != DELEGATED_RECURRENCE_OWNER:
+            latest = self.store.list_recurring_schedule_occurrences(
+                definition_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                limit=1,
+            )
+            if latest:
+                occurrence = latest[0]
+                outcome = str(occurrence.get("outcome") or "").strip()
+                if outcome in {"", "pending", "manual_pending"}:
+                    outcome = str(occurrence.get("state") or "pending").strip()
+                enriched["last_occurrence_at"] = occurrence.get("scheduled_for")
+                enriched["last_outcome"] = outcome
+                enriched["last_error"] = str(occurrence.get("last_error") or "")
+        worker = self.store.get_worker(
+            str(enriched.get("worker_id") or ""),
+            tenant_id=tenant_id or "local",
+            owner_id=owner_id,
+        )
+        if worker:
+            enriched["workspace_name"] = str(worker.get("name") or "")
+        return enriched
+
+    def list_recurring_schedule_occurrences(
+        self,
+        definition_id: str,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        limit: int = 50,
+    ) -> list[dict]:
+        if self.recurring_schedule_owner() == DELEGATED_RECURRENCE_OWNER:
+            result = self._delegated_schedule_call(
+                "occurrences",
+                {"definition_id": definition_id, "limit": max(1, min(int(limit), 100))},
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
+                raise RuntimeError("Viventium Scheduling Cortex returned invalid occurrence data")
+            return result
+        return self.store.list_recurring_schedule_occurrences(
+            definition_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            limit=limit,
+        )
+
+    def create_recurring_schedule(
+        self,
+        worker_id: str,
+        instruction: str,
+        *,
+        recurrence_type: str,
+        interval_seconds: int | None = None,
+        local_time: str = "",
+        timezone_name: str = "UTC",
+        dst_policy: str = "next_valid_earliest",
+        first_run_at: str | None = None,
+        cron_expression: str = "",
+        rrule: str = "",
+        starts_at: str | None = None,
+        ends_at: str | None = None,
+        enabled: bool = True,
+        overlap_policy: str = "skip",
+        misfire_grace_seconds: int = 300,
+        catch_up_policy: str = "coalesce",
+        max_catch_up_occurrences: int = 1,
+        jitter_seconds: int = 0,
+        schedule_text: str = "",
+        runtime_bundle: dict | None = None,
+    ) -> dict:
+        schedule_owner = self.recurring_schedule_owner()
+        normalized_instruction = str(instruction or "").strip()
+        if not normalized_instruction:
+            raise ValueError("instruction is required")
+        worker = self.require_worker(worker_id)
+        self._ensure_execution_allowed(worker)
+        effective_starts_at = starts_at or (first_run_at if recurrence_type == "once" else None)
+        spec = normalize_recurrence_spec(
+            recurrence_type=recurrence_type,
+            interval_seconds=interval_seconds,
+            local_time=local_time,
+            timezone_name=timezone_name,
+            dst_policy=dst_policy,
+            cron_expression=cron_expression,
+            rrule=rrule,
+            starts_at=effective_starts_at,
+            ends_at=ends_at,
+            enabled=enabled,
+            overlap_policy=overlap_policy,
+            misfire_grace_seconds=misfire_grace_seconds,
+            catch_up_policy=catch_up_policy,
+            max_catch_up_occurrences=max_catch_up_occurrences,
+            jitter_seconds=jitter_seconds,
+        )
+        creation_time = datetime.now(timezone.utc).replace(microsecond=0)
+        if not spec.get("starts_at") and spec["recurrence_type"] in {"cron", "rfc5545"}:
+            spec["starts_at"] = creation_time.isoformat()
+        first_occurrence = first_occurrence_at(
+            spec,
+            now=creation_time,
+            first_run_at=first_run_at,
+        )
+        self._require_schedule_principal_authority(
+            tenant_id=str(worker.get("tenant_id") or "local"),
+            owner_id=str(worker.get("owner_id") or ""),
+            establish=True,
+        )
+        if schedule_owner == DELEGATED_RECURRENCE_OWNER:
+            effective_bundle = merge_bootstrap_bundle(
+                self._bootstrap_bundle_for(worker),
+                runtime_bundle,
+            )
+            delegated_payload = {
+                "definition_id": f"rsd_{uuid.uuid4().hex}",
+                "worker_id": worker_id,
+                "project_id": str(worker.get("project_id") or ""),
+                "instruction": normalized_instruction,
+                "schedule_text": str(schedule_text or ""),
+                "execution_mode": str(worker.get("execution_mode") or "docker"),
+                "required_capability_servers": _required_capability_servers(effective_bundle),
+                **spec,
+                "next_run_at": first_occurrence.isoformat(),
+            }
+            result = self._delegated_schedule_call(
+                "create",
+                delegated_payload,
+                tenant_id=str(worker.get("tenant_id") or "local"),
+                owner_id=str(worker.get("owner_id") or ""),
+            )
+            if not isinstance(result, dict):
+                raise RuntimeError("Viventium Scheduling Cortex returned invalid schedule data")
+            try:
+                self._require_schedule_principal_authority(
+                    tenant_id=str(worker.get("tenant_id") or "local"),
+                    owner_id=str(worker.get("owner_id") or ""),
+                    establish=False,
+                )
+            except SchedulePrincipalAuthorityError:
+                definition_id = str(result.get("definition_id") or "")
+                if definition_id:
+                    try:
+                        self._delegated_schedule_call(
+                            "deactivate",
+                            {"definition_id": definition_id},
+                            tenant_id=str(worker.get("tenant_id") or "local"),
+                            owner_id=str(worker.get("owner_id") or ""),
+                        )
+                    except Exception as cleanup_error:
+                        logger.warning(
+                            "Could not compensate delegated schedule creation after authority revocation: %s",
+                            cleanup_error,
+                        )
+                raise
+            if runtime_bundle is not None:
+                self.store.update_worker(
+                    worker_id,
+                    bootstrap_bundle_json=json.dumps(
+                        merge_bootstrap_bundle(self._bootstrap_bundle_for(worker), runtime_bundle)
+                    ),
+                )
+            self.store.add_event(
+                str(worker.get("project_id") or ""),
+                worker_id,
+                None,
+                "recurrence.created",
+                f"Recurring schedule owned by {schedule_owner} starts at {first_occurrence.isoformat()}",
+            )
+            return result
+        if runtime_bundle is not None:
+            worker = self.store.update_worker(
+                worker_id,
+                bootstrap_bundle_json=json.dumps(
+                    merge_bootstrap_bundle(self._bootstrap_bundle_for(worker), runtime_bundle)
+                ),
+            ) or worker
+        try:
+            definition = self.store.create_recurring_schedule_definition(
+                worker_id=worker_id,
+                project_id=str(worker.get("project_id") or ""),
+                tenant_id=str(worker.get("tenant_id") or "local"),
+                owner_id=str(worker.get("owner_id") or ""),
+                scheduler_owner=recurrence_owner_storage_value(schedule_owner),
+                instruction=normalized_instruction,
+                schedule_text=str(schedule_text or ""),
+                recurrence_type=str(spec["recurrence_type"]),
+                interval_seconds=(int(spec["interval_seconds"]) if spec["interval_seconds"] is not None else None),
+                local_time=str(spec["local_time"]),
+                timezone_name=str(spec["timezone_name"]),
+                dst_policy=str(spec["dst_policy"]),
+                next_run_at=first_occurrence.isoformat(),
+                cron_expression=str(spec["cron_expression"]),
+                rrule=str(spec["rrule"]),
+                starts_at=str(spec["starts_at"]) if spec["starts_at"] else None,
+                ends_at=str(spec["ends_at"]) if spec["ends_at"] else None,
+                enabled=bool(spec["enabled"]),
+                overlap_policy=str(spec["overlap_policy"]),
+                misfire_grace_seconds=int(spec["misfire_grace_seconds"]),
+                catch_up_policy=str(spec["catch_up_policy"]),
+                max_catch_up_occurrences=int(spec["max_catch_up_occurrences"]),
+                jitter_seconds=int(spec["jitter_seconds"]),
+                require_principal_authority=multi_user_security_enabled(),
+            )
+        except SchedulePrincipalAuthorityStoreError as exc:
+            raise SchedulePrincipalAuthorityError(str(exc)) from exc
+        self.store.add_event(
+            str(worker.get("project_id") or ""),
+            worker_id,
+            None,
+            "recurrence.created",
+            f"Recurring schedule owned by {schedule_owner} starts at {first_occurrence.isoformat()}",
+        )
+        return definition
+
+    def deactivate_recurring_schedule(
+        self,
+        definition_id: str,
+        *,
+        tenant_id: str,
+        owner_id: str,
+    ) -> dict | None:
+        if self.recurring_schedule_owner() == DELEGATED_RECURRENCE_OWNER:
+            result = self._delegated_schedule_call(
+                "deactivate",
+                {"definition_id": definition_id},
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            return result if isinstance(result, dict) else None
+        return self.store.deactivate_recurring_schedule_definition(
+            definition_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+
+    def update_recurring_schedule(
+        self,
+        definition_id: str,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        updates: dict[str, object],
+    ) -> dict | None:
+        if updates.get("enabled") is True:
+            self._require_schedule_principal_authority(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                establish=True,
+            )
+        if self.recurring_schedule_owner() == DELEGATED_RECURRENCE_OWNER:
+            result = self._delegated_schedule_call(
+                "update",
+                {"definition_id": definition_id, "updates": updates},
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            if updates.get("enabled") is True:
+                try:
+                    self._require_schedule_principal_authority(
+                        tenant_id=tenant_id,
+                        owner_id=owner_id,
+                        establish=False,
+                    )
+                except SchedulePrincipalAuthorityError:
+                    try:
+                        self._delegated_schedule_call(
+                            "deactivate",
+                            {"definition_id": definition_id},
+                            tenant_id=tenant_id,
+                            owner_id=owner_id,
+                        )
+                    except Exception as cleanup_error:
+                        logger.warning(
+                            "Could not compensate delegated schedule enable after authority revocation: %s",
+                            cleanup_error,
+                        )
+                    raise
+            return result if isinstance(result, dict) else None
+        current = self.store.get_recurring_schedule_definition(
+            definition_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+        if current is None:
+            return None
+        if current.get("retired_at"):
+            raise ValueError("retired schedule cannot be changed")
+        merged = {**current, **{key: value for key, value in updates.items() if value is not None}}
+        spec = normalize_recurrence_spec(
+            recurrence_type=str(merged.get("recurrence_type") or ""),
+            interval_seconds=merged.get("interval_seconds"),
+            local_time=str(merged.get("local_time") or ""),
+            timezone_name=str(merged.get("timezone_name") or "UTC"),
+            dst_policy=str(merged.get("dst_policy") or "next_valid_earliest"),
+            cron_expression=str(merged.get("cron_expression") or ""),
+            rrule=str(merged.get("rrule") or ""),
+            starts_at=str(merged.get("starts_at") or "") or None,
+            ends_at=str(merged.get("ends_at") or "") or None,
+            enabled=bool(merged.get("enabled", True)),
+            overlap_policy=str(merged.get("overlap_policy") or "skip"),
+            misfire_grace_seconds=int(merged.get("misfire_grace_seconds") or 0),
+            catch_up_policy=str(merged.get("catch_up_policy") or "skip"),
+            max_catch_up_occurrences=int(merged.get("max_catch_up_occurrences") or 1),
+            jitter_seconds=int(merged.get("jitter_seconds") or 0),
+        )
+        shape_fields = {
+            "recurrence_type",
+            "interval_seconds",
+            "local_time",
+            "timezone_name",
+            "dst_policy",
+            "cron_expression",
+            "rrule",
+            "starts_at",
+            "ends_at",
+        }
+        next_run_at = str(current.get("next_run_at") or "")
+        if bool(spec["enabled"]) and (shape_fields.intersection(updates) or not bool(current.get("enabled"))):
+            next_run_at = first_occurrence_at(
+                spec,
+                now=datetime.now(timezone.utc).replace(microsecond=0),
+            ).isoformat()
+        normalized_updates = {
+            "instruction": str(merged.get("instruction") or "").strip(),
+            "schedule_text": str(merged.get("schedule_text") or ""),
+            **spec,
+            "next_run_at": next_run_at,
+        }
+        if not normalized_updates["instruction"]:
+            raise ValueError("instruction is required")
+        try:
+            return self.store.update_recurring_schedule_definition(
+                definition_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                fields=normalized_updates,
+                require_principal_authority=(
+                    bool(normalized_updates.get("enabled")) and multi_user_security_enabled()
+                ),
+            )
+        except SchedulePrincipalAuthorityStoreError as exc:
+            raise SchedulePrincipalAuthorityError(str(exc)) from exc
+
+    def retire_recurring_schedule(
+        self,
+        definition_id: str,
+        *,
+        tenant_id: str,
+        owner_id: str,
+    ) -> dict | None:
+        if self.recurring_schedule_owner() == DELEGATED_RECURRENCE_OWNER:
+            result = self._delegated_schedule_call(
+                "retire",
+                {"definition_id": definition_id},
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            return result if isinstance(result, dict) else None
+        return self.store.retire_recurring_schedule_definition(
+            definition_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+
+    def run_recurring_schedule_now(
+        self,
+        definition_id: str,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        idempotency_token: str,
+    ) -> dict | None:
+        self._require_schedule_principal_authority(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            establish=True,
+        )
+        if self.recurring_schedule_owner() == DELEGATED_RECURRENCE_OWNER:
+            result = self._delegated_schedule_call(
+                "run_now",
+                {"definition_id": definition_id, "idempotency_key": idempotency_token},
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            return result if isinstance(result, dict) else None
+        definition = self.store.get_recurring_schedule_definition(
+            definition_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+        if definition is None or definition.get("retired_at"):
+            return None
+        self._revalidate_recurring_schedule_fire(definition)
+        scheduled_for = datetime.now(timezone.utc).isoformat()
+        try:
+            schedule = self.store.create_recurring_schedule_run_now(
+                definition_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                idempotency_token=idempotency_token,
+                scheduled_for=scheduled_for,
+                require_principal_authority=multi_user_security_enabled(),
+            )
+        except SchedulePrincipalAuthorityStoreError as exc:
+            raise SchedulePrincipalAuthorityError(str(exc)) from exc
+        if schedule is not None:
+            schedule.update(
+                {
+                    "status": "scheduled",
+                    "schedule_owner": NATIVE_RECURRENCE_OWNER,
+                    "owner_action": "dispatch_here",
+                }
+            )
+        return schedule
+
+    def _revalidate_worker_schedule_fire(
+        self,
+        worker: dict,
+        *,
+        tenant_id: str,
+        owner_id: str,
+    ) -> dict:
+        self._require_schedule_principal_authority(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            establish=False,
+        )
+        if str(worker.get("tenant_id") or "local") != str(tenant_id or "local"):
+            raise ValueError("schedule tenant no longer matches its workspace")
+        if str(worker.get("owner_id") or "") != str(owner_id or ""):
+            raise ValueError("schedule owner no longer has access to its workspace")
+        if str(worker.get("state") or "") in {"terminated", "failed"}:
+            raise ValueError("scheduled workspace is unavailable")
+        self._ensure_execution_allowed(worker)
+        self._ensure_profile_allowed(str(worker.get("profile") or ""))
+        if (
+            str(os.environ.get("GLASSHIVE_SECURITY_MODE") or "").strip().lower() == "multi_user"
+            and self.control_plane_store is None
+        ):
+            raise ValueError("standalone multi-user schedule revalidation is unavailable")
+        if self.control_plane_store is None:
+            return worker
+
+        tenant_id = str(worker.get("tenant_id") or "local")
+        owner_id = str(worker.get("owner_id") or "")
+        selection = mission_provider_account_selection(worker)
+        if selection is not None:
+            account = self.control_plane_store.get_provider_account(
+                account_id=selection.account_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            if account is None or str(account.get("status") or "") != "ready":
+                if selection.policy == "personal_required":
+                    raise ScheduleActionRequiredError(
+                        "provider_account_reconnect_required",
+                        "The selected worker account needs to be reconnected before this schedule can run.",
+                        "Open Connections, reconnect the account, and then try Run now again.",
+                    )
+
+        grants = self.control_plane_store.list_workspace_grants(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            worker_id=str(worker.get("worker_id") or ""),
+        )
+        accounts = {
+            str(item.get("account_id") or ""): item
+            for item in self.control_plane_store.list_provider_accounts(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+        }
+        connections = {
+            str(item.get("connection_id") or ""): item
+            for item in self.control_plane_store.list_connections(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+        }
+        for grant in grants:
+            account_id = str(grant.get("account_id") or "")
+            connection_id = str(grant.get("connection_id") or "")
+            if account_id and str(accounts.get(account_id, {}).get("status") or "") != "ready":
+                raise ScheduleActionRequiredError(
+                    "capability_account_reconnect_required",
+                    "A worker account used by this workspace needs to be reconnected.",
+                    "Open Connections, reconnect the account, and then try Run now again.",
+                )
+            if connection_id and str(connections.get(connection_id, {}).get("status") or "") != "ready":
+                raise ScheduleActionRequiredError(
+                    "connection_reconnect_required",
+                    "A connected service used by this workspace needs attention.",
+                    "Open Connections, repair the service connection, and then try Run now again.",
+                )
+        return worker
+
+    def _require_schedule_principal_authority(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        establish: bool,
+    ) -> dict | None:
+        if not multi_user_security_enabled():
+            return None
+        authority = self.store.get_schedule_principal_authority(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+        if authority is None and establish:
+            authority = self.store.ensure_schedule_principal_authority(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+        if authority is None:
+            raise SchedulePrincipalAuthorityError(
+                "scheduled principal authority must be renewed before this schedule can run"
+            )
+        if not bool(authority.get("enabled")):
+            raise SchedulePrincipalAuthorityError(
+                "scheduled principal has been disabled"
+            )
+        return authority
+
+    def set_schedule_principal_authority(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        enabled: bool,
+    ) -> dict:
+        result = self.store.set_schedule_principal_authority(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            enabled=enabled,
+        )
+        result["deactivated_delegated_definitions"] = 0
+        if not enabled and self.recurring_schedule_owner() == DELEGATED_RECURRENCE_OWNER:
+            delegated = self._delegated_schedule_call(
+                "deactivate_owner",
+                {},
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            if not isinstance(delegated, dict):
+                raise RuntimeError("Viventium Scheduling Cortex returned invalid authority data")
+            result["deactivated_delegated_definitions"] = int(
+                delegated.get("deactivated") or 0
+            )
+        return result
+
+    def _revalidate_recurring_schedule_fire(self, definition: dict[str, object]) -> dict:
+        worker = self.require_worker(str(definition.get("worker_id") or ""))
+        return self._revalidate_worker_schedule_fire(
+            worker,
+            tenant_id=str(definition.get("tenant_id") or "local"),
+            owner_id=str(definition.get("owner_id") or ""),
+        )
+
+    def revalidate_scheduling_cortex_workspace_fire(
+        self,
+        worker: dict,
+        *,
+        tenant_id: str,
+        owner_id: str,
+    ) -> dict:
+        """Recheck the current reusable workspace authority before a delegated fire mutates state."""
+
+        return self._revalidate_worker_schedule_fire(
+            worker,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+
+    @staticmethod
+    def _recurrence_dispatch_at(
+        definition: dict[str, object],
+        *,
+        scheduled_for: datetime,
+        detected_at: datetime,
+    ) -> datetime:
+        jitter_bound = max(0, int(definition.get("jitter_seconds") or 0))
+        if jitter_bound == 0:
+            return max(scheduled_for, detected_at)
+        digest = hashlib.sha256(
+            f"{definition.get('definition_id')}\0{scheduled_for.isoformat()}".encode("utf-8")
+        ).digest()
+        jitter = int.from_bytes(digest[:8], "big") % (jitter_bound + 1)
+        return max(scheduled_for, detected_at) + timedelta(seconds=jitter)
+
+    def _materialize_due_recurring_schedules(self, now: datetime) -> list[dict[str, object]]:
+        try:
+            owner = self.recurring_schedule_owner()
+        except ValueError as exc:
+            logger.error("GlassHive native recurrence is disabled by scheduler ownership configuration: %s", exc)
+            return []
+        if owner != NATIVE_RECURRENCE_OWNER:
+            return []
+        now_iso = now.astimezone(timezone.utc).isoformat()
+        materialized: list[dict[str, object]] = []
+        definitions = self.store.list_due_recurring_schedule_definitions(
+            now_iso,
+            scheduler_owner=recurrence_owner_storage_value(NATIVE_RECURRENCE_OWNER),
+            limit=50,
+        )
+        for definition in definitions:
+            try:
+                occurrences, next_occurrence = due_occurrences_and_next(definition, now=now)
+            except (TypeError, ValueError, OverflowError) as exc:
+                logger.error(
+                    "Skipped invalid recurring schedule definition %s: %s",
+                    definition.get("definition_id"),
+                    exc,
+                )
+                continue
+            if not occurrences:
+                continue
+            expected_next = str(definition.get("next_run_at") or "")
+            overlap = str(definition.get("overlap_policy") or "skip")
+            for index, occurrence_decision in enumerate(occurrences):
+                occurrence = occurrence_decision["scheduled_for"]
+                assert isinstance(occurrence, datetime)
+                state = str(occurrence_decision.get("state") or "pending")
+                outcome = str(occurrence_decision.get("outcome") or "pending")
+                if state == "pending" and overlap == "skip":
+                    worker_id = str(definition.get("worker_id") or "")
+                    if self.store.get_active_run(worker_id) or self.store.has_queued_runs(worker_id):
+                        state, outcome = "skipped", "overlap_skipped"
+                if state == "pending":
+                    try:
+                        self._revalidate_recurring_schedule_fire(definition)
+                    except (KeyError, RuntimeError, ValueError) as exc:
+                        state, outcome = "action_required", str(exc)
+                following = (
+                    occurrences[index + 1]["scheduled_for"]
+                    if index + 1 < len(occurrences)
+                    else next_occurrence
+                )
+                deactivate_after = following is None or state == "action_required"
+                stored_next = occurrence if following is None else following
+                assert isinstance(stored_next, datetime)
+                dispatch_at = self._recurrence_dispatch_at(
+                    definition,
+                    scheduled_for=occurrence,
+                    detected_at=now,
+                )
+                schedule = self.store.materialize_recurring_schedule_occurrence(
+                    str(definition.get("definition_id") or ""),
+                    expected_next_run_at=expected_next,
+                    scheduled_for=occurrence.isoformat(),
+                    next_run_at=stored_next.isoformat(),
+                    detected_at=now_iso,
+                    dispatch_at=dispatch_at.isoformat(),
+                    occurrence_state=state,
+                    outcome=outcome,
+                    deactivate_after=deactivate_after,
+                )
+                if schedule:
+                    materialized.append(schedule)
+                expected_next = stored_next.isoformat()
+                if state == "action_required":
+                    break
+        return materialized
 
     def schedule_run(
         self,
@@ -1707,15 +3285,24 @@ class WorkersProjectsService:
             schedule_text=schedule_text,
             delay_seconds=delay_seconds,
         )
-        schedule = self.store.create_scheduled_run(
-            worker_id=worker_id,
-            project_id=str(worker.get("project_id") or ""),
+        self._require_schedule_principal_authority(
             tenant_id=str(worker.get("tenant_id") or "local"),
             owner_id=str(worker.get("owner_id") or ""),
-            instruction=instruction,
-            schedule_text=str(schedule_text or ""),
-            run_at=resolved_run_at,
+            establish=True,
         )
+        try:
+            schedule = self.store.create_scheduled_run(
+                worker_id=worker_id,
+                project_id=str(worker.get("project_id") or ""),
+                tenant_id=str(worker.get("tenant_id") or "local"),
+                owner_id=str(worker.get("owner_id") or ""),
+                instruction=instruction,
+                schedule_text=str(schedule_text or ""),
+                run_at=resolved_run_at,
+                require_principal_authority=multi_user_security_enabled(),
+            )
+        except SchedulePrincipalAuthorityStoreError as exc:
+            raise SchedulePrincipalAuthorityError(str(exc)) from exc
         self.store.add_event(
             str(worker.get("project_id") or ""),
             worker_id,
@@ -1726,23 +3313,53 @@ class WorkersProjectsService:
         self._emit_callback(worker, "schedule.created", message=f"Scheduled run for {resolved_run_at}")
         return schedule
 
-    def process_due_schedules_once(self) -> list[dict[str, object]]:
+    def _recurring_schedule_capacity_issue(self, schedule: dict[str, object]) -> str:
+        schedule_id = str(schedule.get("schedule_id") or "")
+        if not self.store.recurring_occurrence_for_schedule(schedule_id):
+            return ""
+        tenant_id = str(schedule.get("tenant_id") or "local")
+        owner_id = str(schedule.get("owner_id") or "")
+        user_limit = _bounded_int_env(
+            "GLASSHIVE_MAX_CONCURRENT_RECURRING_RUNS_PER_USER",
+            4,
+            min_value=1,
+            max_value=1000,
+        )
+        tenant_limit = _bounded_int_env(
+            "GLASSHIVE_MAX_CONCURRENT_RECURRING_RUNS_PER_TENANT",
+            32,
+            min_value=1,
+            max_value=10000,
+        )
+        if self.store.count_active_runs(tenant_id=tenant_id, owner_id=owner_id) >= user_limit:
+            return "user_concurrency_deferred"
+        if self.store.count_active_runs(tenant_id=tenant_id) >= tenant_limit:
+            return "tenant_concurrency_deferred"
+        return ""
+
+    def process_due_schedules_once(self, now_iso: str | None = None) -> list[dict[str, object]]:
         processed: list[dict[str, object]] = []
-        due = self.store.list_due_schedules(datetime.now(timezone.utc).isoformat(), limit=50)
+        now = (
+            parse_aware_utc(now_iso, label="now_iso")
+            if now_iso is not None
+            else datetime.now(timezone.utc)
+        )
+        self.store.recover_stale_recurring_occurrence_claims(now.isoformat())
+        self._materialize_due_recurring_schedules(now)
+        due = self.store.list_due_schedules(now.isoformat(), limit=50)
         for item in due:
             schedule_id = str(item.get("schedule_id") or "")
+            capacity_issue = self._recurring_schedule_capacity_issue(item)
+            if capacity_issue:
+                self.store.mark_recurring_occurrence_retryable(schedule_id, capacity_issue)
+                continue
             claimed = self.store.claim_schedule(schedule_id)
             if not claimed:
                 continue
-            worker_id = str(claimed.get("worker_id") or "")
             try:
-                run = self.assign_run(worker_id, str(claimed.get("instruction") or ""), event_type="schedule.queued")
+                run = self.assign_scheduled_run(claimed)
                 run_id = str(run.get("run_id") or "")
-                updated = self.store.finalize_schedule(
-                    schedule_id,
-                    state="queued",
-                    queued_run_id=run_id,
-                )
+                updated = self.store.get_schedule(schedule_id)
                 current_run = self.store.get_run(run_id) if run_id else None
                 current_state = str((current_run or {}).get("state") or "")
                 if current_state in {"completed", "failed", "cancelled", "interrupted", "paused"}:
@@ -1753,10 +3370,71 @@ class WorkersProjectsService:
                         last_error=str((current_run or {}).get("error_text") or ""),
                     ) or updated
                 processed.append(updated or claimed)
+            except SchedulePrincipalAuthorityError:
+                processed.append(self.store.get_schedule(schedule_id) or claimed)
             except Exception as exc:
                 updated = self.store.finalize_schedule(schedule_id, state="failed", last_error=str(exc))
                 processed.append(updated or claimed)
         return processed
+
+    def assign_scheduled_run(
+        self,
+        schedule: dict[str, object],
+        *,
+        runtime_bundle: dict | None = None,
+    ) -> dict:
+        """Create-or-get the one stable run reserved for a claimed schedule."""
+
+        schedule_id = str(schedule.get("schedule_id") or "").strip()
+        worker_id = str(schedule.get("worker_id") or "").strip()
+        if not schedule_id or not worker_id:
+            raise ValueError("Scheduled dispatch requires schedule and worker ids")
+        worker = self.require_worker(worker_id)
+        self._revalidate_worker_schedule_fire(
+            worker,
+            tenant_id=str(schedule.get("tenant_id") or "local"),
+            owner_id=str(schedule.get("owner_id") or ""),
+        )
+        self._ensure_runtime_available(
+            str(worker.get("profile") or ""),
+            str(worker.get("execution_mode") or "docker"),
+        )
+        worker = self._refresh_worker_model_for_profile(worker)
+        if worker["state"] == "paused":
+            self.store.update_worker_state(worker_id, "starting", last_error="")
+            self.store.add_event(
+                worker["project_id"],
+                worker_id,
+                None,
+                "worker.resumed",
+                "Worker resume queued for the next run",
+            )
+            worker = self.store.get_worker(worker_id) or worker
+        try:
+            run, created = self.store.create_or_get_run_for_schedule(
+                schedule_id,
+                runtime_bundle=runtime_bundle,
+                require_principal_authority=multi_user_security_enabled(),
+            )
+        except SchedulePrincipalAuthorityStoreError as exc:
+            raise SchedulePrincipalAuthorityError(str(exc)) from exc
+        if created:
+            instruction = str(schedule.get("instruction") or "")
+            self.store.add_event(
+                worker["project_id"],
+                worker_id,
+                run["run_id"],
+                "schedule.queued",
+                instruction,
+            )
+            self._emit_callback(
+                worker,
+                "schedule.queued",
+                run=run,
+                message=instruction,
+            )
+        self._ensure_worker_processor(worker_id)
+        return run
 
     def duplicate_worker(
         self,
@@ -1767,7 +3445,7 @@ class WorkersProjectsService:
         role: str,
     ) -> dict:
         source_worker = self.require_worker(source_worker_id)
-        bootstrap_bundle = self._bootstrap_bundle_for(source_worker)
+        bootstrap_bundle = _duplicate_bootstrap_bundle(self._bootstrap_bundle_for(source_worker))
         profile = str(source_worker.get("profile") or "codex-cli")
         execution_mode = str(source_worker.get("execution_mode") or "docker")
         duplicated = self.create_worker(
@@ -1780,14 +3458,37 @@ class WorkersProjectsService:
             backend=self._legacy_backend_label(profile, execution_mode, str(source_worker.get("backend") or "")),
             execution_mode=execution_mode,
             alias=None,
-            workspace_root=str(source_worker.get("workspace_root") or "") or None,
+            workspace_root=None,
             bootstrap_profile=str(source_worker.get("bootstrap_profile") or "") or None,
             bootstrap_bundle=bootstrap_bundle,
+            workspace_kind="named",
+            tags=normalize_workspace_tags(source_worker.get("tags") if isinstance(source_worker.get("tags"), list) else []),
+            start_synchronously=False,
         )
         try:
-            self._copy_workspace_contents(source_worker, duplicated)
+            duplication_report = self._copy_workspace_contents(source_worker, duplicated)
         except Exception as exc:
-            self.store.update_worker(duplicated["worker_id"], state="failed", last_error=str(exc))
+            current_duplicate = self.store.get_worker(str(duplicated["worker_id"])) or duplicated
+            cleanup_ready = False
+            try:
+                stopped = self.runtime.terminate_worker(current_duplicate)
+                if stopped.pid:
+                    raise RuntimeError("duplicate cleanup left worker compute active")
+                self._apply_runtime_info(
+                    str(duplicated["worker_id"]),
+                    stopped,
+                    state="failed",
+                    last_error=str(exc),
+                    compute_released_at=utc_now(),
+                )
+                cleanup_ready = True
+            except Exception as cleanup_exc:
+                cleanup_message = public_callback_message_text(str(cleanup_exc)) or "duplicate cleanup failed"
+                self.store.update_worker(
+                    duplicated["worker_id"],
+                    state="failed",
+                    last_error=f"{exc}; {cleanup_message}",
+                )
             self.store.add_event(
                 project_id,
                 duplicated["worker_id"],
@@ -1795,15 +3496,322 @@ class WorkersProjectsService:
                 "worker.duplicate_failed",
                 str(exc),
             )
+            if cleanup_ready:
+                self.store.delete_unstarted_worker(
+                    str(duplicated["worker_id"]),
+                    project_id=project_id,
+                    tenant_id=str(source_worker.get("tenant_id") or "local"),
+                    owner_id=owner_id,
+                )
             raise
+        self.store.update_worker(
+            duplicated["worker_id"],
+            duplication_report_json=json.dumps(duplication_report, sort_keys=True, separators=(",", ":")),
+        )
         self.store.add_event(
             project_id,
             duplicated["worker_id"],
             None,
             "worker.duplicated",
-            f"Workspace duplicated from {source_worker_id}",
+            "Workspace duplicated: "
+            f"{duplication_report['copied_files']} files copied, "
+            f"{duplication_report['skipped_items']} items skipped",
         )
-        return self.store.get_worker(duplicated["worker_id"]) or duplicated
+        updated = self.store.get_worker(duplicated["worker_id"]) or duplicated
+        return {**updated, "duplication_report": duplication_report}
+
+    def save_workspace_template(
+        self,
+        worker_id: str,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        name: str,
+        description: str = "",
+        lineage_id: str | None = None,
+    ) -> dict[str, object]:
+        if self.control_plane_store is None:
+            raise RuntimeError("Workspace templates require the user control plane")
+        worker = self.require_worker(worker_id)
+        if str(worker.get("tenant_id") or "local") != str(tenant_id or "local") or str(
+            worker.get("owner_id") or ""
+        ) != str(owner_id or ""):
+            raise KeyError("Workspace not found")
+        self.require_project(str(worker.get("project_id") or ""))
+        library_refs = self.control_plane_store.workspace_template_library_refs(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+        )
+        source_bootstrap = self._bootstrap_bundle_for(worker)
+        sanitized_bootstrap = _duplicate_bootstrap_bundle(source_bootstrap) or {}
+        provider_account_ref: dict[str, str] | None = None
+        raw_provider_ref = source_bootstrap.get("provider_account") if isinstance(source_bootstrap, dict) else None
+        if isinstance(raw_provider_ref, dict):
+            policy = str(raw_provider_ref.get("policy") or "").strip().lower()
+            account_id = str(raw_provider_ref.get("account_id") or "").strip()
+            if policy == "legacy" and not account_id:
+                provider_account_ref = {"policy": "legacy"}
+            elif policy in {"personal_preferred", "personal_required"}:
+                if not account_id:
+                    provider_account_ref = {"policy": policy}
+                else:
+                    account = self.control_plane_store.get_provider_account(
+                        account_id=account_id,
+                        tenant_id=tenant_id,
+                        owner_id=owner_id,
+                    )
+                    supported = PROFILE_ACCOUNT_PROVIDERS.get(str(worker.get("profile") or ""), set())
+                    if account is not None and str(account.get("provider") or "").lower() in supported:
+                        provider_account_ref = {
+                            "policy": policy,
+                            "account_id": account_id,
+                            "provider": str(account.get("provider") or ""),
+                        }
+        content: dict[str, object] = {
+            "schema_version": 1,
+            "project": {
+                "title": str(name or "Workspace template").strip()[:200],
+                "goal": str(description or "").strip()[:1000],
+            },
+            "worker": {
+                "name": str(worker.get("name") or name).strip()[:160],
+                "role": str(worker.get("role") or "main").strip()[:160],
+                "profile": str(worker.get("profile") or "codex-cli").strip(),
+                "execution_mode": str(worker.get("execution_mode") or "docker").strip(),
+                "bootstrap_profile": str(worker.get("bootstrap_profile") or "").strip(),
+                "bootstrap_bundle": sanitized_bootstrap,
+                **({"provider_account_ref": provider_account_ref} if provider_account_ref else {}),
+                "tags": normalize_workspace_tags(
+                    worker.get("tags") if isinstance(worker.get("tags"), list) else []
+                ),
+            },
+            "library_refs": library_refs,
+        }
+        return self.control_plane_store.create_workspace_template(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            name=name,
+            description=description,
+            content=content,
+            lineage_id=lineage_id,
+        )
+
+    def list_workspace_templates(self, *, tenant_id: str, owner_id: str) -> list[dict[str, object]]:
+        if self.control_plane_store is None:
+            return []
+        return self.control_plane_store.list_workspace_templates(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+
+    def instantiate_workspace_template(
+        self,
+        template_id: str,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        idempotency_key: str,
+        name: str | None = None,
+    ) -> dict[str, object] | None:
+        if self.control_plane_store is None:
+            raise RuntimeError("Workspace templates require the user control plane")
+        template = self.control_plane_store.get_workspace_template(
+            template_id=template_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+        if template is None:
+            return None
+        content = template.get("content")
+        if not isinstance(content, dict) or int(content.get("schema_version") or 0) != 1:
+            raise ValueError("Workspace template schema is unsupported")
+        project_spec = content.get("project")
+        worker_spec = content.get("worker")
+        library_refs = content.get("library_refs")
+        if not isinstance(project_spec, dict) or not isinstance(worker_spec, dict) or not isinstance(library_refs, list):
+            raise ValueError("Workspace template content is invalid")
+        profile = str(worker_spec.get("profile") or "").strip()
+        execution_mode = str(worker_spec.get("execution_mode") or "").strip()
+        self._ensure_execution_allowed(execution_mode)
+        self._ensure_profile_allowed(profile)
+        approvals_required = self.control_plane_store.validate_workspace_template_libraries(
+            library_refs=[dict(item) for item in library_refs if isinstance(item, dict)],
+            profile=profile,
+        )
+        provider_account_ref = worker_spec.get("provider_account_ref")
+        provider_account_selection: dict[str, str] | None = None
+        if provider_account_ref is not None:
+            if not isinstance(provider_account_ref, dict):
+                raise ValueError("Workspace template provider account reference is invalid")
+            policy = str(provider_account_ref.get("policy") or "").strip().lower()
+            account_id = str(provider_account_ref.get("account_id") or "").strip()
+            if policy not in WORKSPACE_ACCOUNT_POLICIES:
+                raise ValueError("Workspace template provider account policy is invalid")
+            if policy == "legacy":
+                if account_id:
+                    raise ValueError("Workspace template deployment account policy is invalid")
+                provider_account_selection = {"policy": "legacy"}
+            elif not account_id:
+                if policy == "personal_required":
+                    raise ValueError("Workspace template requires a selected personal provider account")
+                provider_account_selection = {"policy": policy}
+            else:
+                account = self.control_plane_store.get_provider_account(
+                    account_id=account_id,
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                )
+                supported = PROFILE_ACCOUNT_PROVIDERS.get(profile, set())
+                if account is None:
+                    raise ValueError("Workspace template provider account is not available for this user")
+                if str(account.get("provider") or "").strip().lower() not in supported:
+                    raise ValueError("Workspace template provider account does not match the worker profile")
+                if str(account.get("status") or "").strip().lower() != "ready":
+                    raise ValueError("Workspace template provider account must be reconnected before use")
+                provider_account_selection = {"policy": policy, "account_id": account_id}
+        requested_name = str(name or worker_spec.get("name") or template.get("name") or "Workspace").strip()[:160]
+        request_payload = {"template_id": template_id, "name": requested_name}
+        reservation = self.control_plane_store.reserve_workspace_template_instantiation(
+            template_id=template_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            idempotency_key=idempotency_key,
+            request_payload=request_payload,
+        )
+        if reservation.get("idempotent_replay"):
+            project = self.store.get_project(str(reservation.get("project_id") or ""))
+            worker = self.store.get_worker(str(reservation.get("worker_id") or ""))
+            if not project or not worker:
+                raise RuntimeError("Completed template instantiation record is inconsistent")
+            return {
+                "template": {key: value for key, value in template.items() if key != "content"},
+                "project": project,
+                "workspace": worker,
+                "approvals_required": approvals_required,
+                "idempotent_replay": True,
+            }
+        reserved_project_id = str(reservation.get("project_id") or "").strip()
+        if not reserved_project_id:
+            raise RuntimeError("Template instantiation reservation has no project identity")
+        try:
+            project = self.create_project(
+                owner_id,
+                str(project_spec.get("title") or template.get("name") or "Workspace template")[:200],
+                str(project_spec.get("goal") or "")[:10000],
+                profile,
+                tenant_id=tenant_id,
+                project_id=reserved_project_id,
+            )
+            template_bootstrap = (
+                dict(worker_spec.get("bootstrap_bundle"))
+                if isinstance(worker_spec.get("bootstrap_bundle"), dict)
+                else {}
+            )
+            if provider_account_selection is not None:
+                template_bootstrap["provider_account"] = provider_account_selection
+            worker = self.create_worker(
+                project_id=str(project["project_id"]),
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                name=requested_name,
+                role=str(worker_spec.get("role") or "main")[:160],
+                profile=profile,
+                backend="",
+                execution_mode=execution_mode,
+                alias=None,
+                workspace_root=None,
+                bootstrap_profile=str(worker_spec.get("bootstrap_profile") or "") or None,
+                bootstrap_bundle=template_bootstrap or None,
+                workspace_kind="named",
+                tags=normalize_workspace_tags(
+                    worker_spec.get("tags") if isinstance(worker_spec.get("tags"), list) else []
+                ),
+                start_synchronously=False,
+            )
+            self.control_plane_store.complete_workspace_template_instantiation(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                idempotency_key=idempotency_key,
+                project_id=str(project["project_id"]),
+                worker_id=str(worker["worker_id"]),
+            )
+        except Exception:
+            current_project = self.store.get_project(
+                reserved_project_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            current_workers = (
+                self.store.list_workers(
+                    reserved_project_id,
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                )
+                if current_project
+                else []
+            )
+            failed_worker_id = (
+                str(current_workers[0].get("worker_id") or "")
+                if len(current_workers) == 1
+                else ""
+            )
+            try:
+                self.control_plane_store.fail_workspace_template_instantiation(
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                    idempotency_key=idempotency_key,
+                    project_id=reserved_project_id,
+                    worker_id=failed_worker_id or None,
+                )
+                worker_cleaned = not current_workers
+                if failed_worker_id:
+                    current_worker = current_workers[0]
+                    stopped = self.runtime.terminate_worker(current_worker)
+                    if not stopped.pid:
+                        self._apply_runtime_info(
+                            failed_worker_id,
+                            stopped,
+                            state="failed",
+                            last_error="Template instantiation was rolled back",
+                            compute_released_at=utc_now(),
+                        )
+                        worker_cleaned = self.store.delete_unstarted_worker(
+                            failed_worker_id,
+                            project_id=reserved_project_id,
+                            tenant_id=tenant_id,
+                            owner_id=owner_id,
+                        )
+                project_cleaned = current_project is None or (
+                    worker_cleaned
+                    and self.store.delete_project_if_empty(
+                        reserved_project_id,
+                        tenant_id=tenant_id,
+                        owner_id=owner_id,
+                    )
+                )
+                if worker_cleaned and project_cleaned:
+                    self.control_plane_store.complete_workspace_template_cleanup(
+                        tenant_id=tenant_id,
+                        owner_id=owner_id,
+                        idempotency_key=idempotency_key,
+                        project_id=reserved_project_id,
+                        worker_id=failed_worker_id or None,
+                    )
+            except Exception as cleanup_exc:
+                logger.error(
+                    "Template instantiation rollback could not be completed for project %s: %s",
+                    reserved_project_id,
+                    public_callback_message_text(str(cleanup_exc)) or "cleanup failed",
+                )
+            raise
+        return {
+            "template": {key: value for key, value in template.items() if key != "content"},
+            "project": project,
+            "workspace": worker,
+            "approvals_required": approvals_required,
+            "idempotent_replay": False,
+        }
 
     def assign_run(
         self,
@@ -1841,6 +3849,33 @@ class WorkersProjectsService:
         self._emit_callback(worker, event_type, run=run, message=instruction)
         self._ensure_worker_processor(worker_id)
         return run
+
+    @staticmethod
+    def _runtime_worker_for_run(worker: dict, run: dict) -> dict:
+        """Overlay one run's ephemeral authority without mutating the reusable workspace."""
+
+        raw_bundle = str(run.get("runtime_bundle_json") or "").strip()
+        if not raw_bundle:
+            return worker
+        try:
+            runtime_bundle = json.loads(raw_bundle)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Run-scoped bootstrap authority is invalid") from exc
+        if not isinstance(runtime_bundle, dict):
+            raise ValueError("Run-scoped bootstrap authority is invalid")
+        try:
+            persistent_bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
+        except json.JSONDecodeError:
+            persistent_bundle = {}
+        if not isinstance(persistent_bundle, dict):
+            persistent_bundle = {}
+        runtime_worker = dict(worker)
+        runtime_worker["bootstrap_bundle_json"] = json.dumps(
+            merge_bootstrap_bundle(persistent_bundle, runtime_bundle) or {},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return runtime_worker
 
     def record_launch_failed(self, worker_id: str, reason: str) -> dict:
         worker = self.require_worker(worker_id)
@@ -2172,6 +4207,8 @@ class WorkersProjectsService:
         worker = self.store.get_worker(worker_id)
         if not worker:
             raise KeyError("Worker not found")
+        if self.store.workspace_gc_claim_active(worker_id):
+            raise RuntimeErrorBase("Workspace is being garbage-collected")
         return worker
 
     def require_run(self, run_id: str) -> dict:
@@ -2409,7 +4446,10 @@ class WorkersProjectsService:
         return refreshed
 
     def _start_worker_again(self, worker: dict, event_type: str, message: str) -> dict:
-        self.store.update_worker_state(worker["worker_id"], "starting")
+        starting = self.store.update_worker_unless_gc_claimed(worker["worker_id"], state="starting")
+        if starting is None:
+            raise RuntimeErrorBase("Workspace is being garbage-collected")
+        worker = starting
         try:
             info = self.runtime.ensure_worker_ready(worker)
         except Exception as exc:
@@ -2463,23 +4503,70 @@ class WorkersProjectsService:
             return None
         return parsed if isinstance(parsed, dict) else None
 
-    def _copy_workspace_contents(self, source_worker: dict, target_worker: dict) -> None:
+    def _copy_workspace_contents(self, source_worker: dict, target_worker: dict) -> dict[str, object]:
         source_root_raw = str(source_worker.get("workspace_dir") or "").strip()
         target_root_raw = str(target_worker.get("workspace_dir") or "").strip()
         if not source_root_raw or not target_root_raw:
-            return
+            return {"source_state": "missing", "copied_files": 0, "skipped_items": 0}
         source_root = Path(source_root_raw)
         target_root = Path(target_root_raw)
-        if not source_root.exists():
-            return
+        if target_root.is_symlink():
+            raise ValueError("workspace duplicate target must not be a symlink")
+        if source_root.exists():
+            resolved_source = source_root.resolve(strict=True)
+            resolved_target = target_root.resolve(strict=False)
+            if resolved_target == resolved_source or resolved_source in resolved_target.parents:
+                raise ValueError("workspace duplicate target must be separate from the source")
+        files, skipped_items, source_state = _workspace_copy_plan(source_root)
         target_root.mkdir(parents=True, exist_ok=True)
-        for item in source_root.iterdir():
-            target = target_root / item.name
-            if item.is_dir():
-                shutil.copytree(item, target, dirs_exist_ok=True, symlinks=True)
-            else:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(item, target)
+        copied_files = 0
+        copied_bytes = 0
+        copied_targets: list[Path] = []
+        max_bytes = _bounded_int_env(
+            "GLASSHIVE_DUPLICATE_MAX_BYTES",
+            512 * 1024 * 1024,
+            min_value=1024,
+            max_value=20 * 1024 * 1024 * 1024,
+        )
+        deadline = time.monotonic() + _bounded_float_env(
+            "GLASSHIVE_DUPLICATE_TIMEOUT_SECONDS",
+            30.0,
+            min_value=1.0,
+            max_value=300.0,
+        )
+        try:
+            for source, relative in files:
+                if time.monotonic() > deadline:
+                    raise ValueError("workspace duplicate copy exceeded its time limit")
+                target = target_root / relative
+                copied_bytes += _copy_regular_workspace_file(
+                    source,
+                    target,
+                    source_root,
+                    max_bytes=max_bytes - copied_bytes,
+                    deadline=deadline,
+                )
+                copied_targets.append(target)
+                copied_files += 1
+        except Exception:
+            for copied_target in reversed(copied_targets):
+                try:
+                    copied_target.unlink()
+                except FileNotFoundError:
+                    pass
+                parent = copied_target.parent
+                while parent != target_root:
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        break
+                    parent = parent.parent
+            raise
+        return {
+            "source_state": source_state,
+            "copied_files": copied_files,
+            "skipped_items": skipped_items,
+        }
 
     def _refresh_runtime_info(self, worker_id: str, state: str, last_error: str = "") -> dict | None:
         worker = self.store.get_worker(worker_id)
@@ -2634,7 +4721,10 @@ class WorkersProjectsService:
                         self._requeue_retryable_run(worker, queued_run, capacity_error)
                         return
 
-                run = self.store.claim_next_queued_run(worker_id)
+                run = self.store.claim_next_queued_run(
+                    worker_id,
+                    require_schedule_principal_authority=multi_user_security_enabled(),
+                )
                 if not run:
                     self._schedule_worker_retry_after(worker_id, self.store.next_retry_after_for_worker(worker_id))
                     current = self.store.get_worker(worker_id)
@@ -2652,17 +4742,41 @@ class WorkersProjectsService:
                 if capacity_error:
                     self._requeue_retryable_run(worker, run, capacity_error)
                     return
+                if multi_user_security_enabled():
+                    try:
+                        self.store.require_schedule_principal_authority_for_run(run["run_id"])
+                    except SchedulePrincipalAuthorityStoreError:
+                        cancelled = self.store.finalize_run_if_state(
+                            run["run_id"],
+                            "running",
+                            "cancelled",
+                            error_text="principal_disabled",
+                        )
+                        if cancelled:
+                            self.store.finalize_schedule_for_run(
+                                run["run_id"],
+                                state="cancelled",
+                                last_error="principal_disabled",
+                            )
+                        continue
                 worker = self._refresh_runtime_info(worker_id, state="running", last_error="") or self.store.get_worker(worker_id) or worker
                 self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.started", run["instruction"])
                 self._emit_callback(worker, "run.started", run=run, message=run["instruction"])
 
                 try:
                     try:
-                        output = self.runtime.run_task(worker, run["instruction"], run_id=run["run_id"])
+                        output = self.runtime.run_task(
+                            self._runtime_worker_for_run(worker, run),
+                            run["instruction"],
+                            run_id=run["run_id"],
+                        )
                     except TypeError as exc:
                         if "run_id" not in str(exc):
                             raise
-                        output = self.runtime.run_task(worker, run["instruction"])
+                        output = self.runtime.run_task(
+                            self._runtime_worker_for_run(worker, run),
+                            run["instruction"],
+                        )
                 except WorkerPausedError as exc:
                     if not self._processor_is_current(worker_id, generation):
                         return

@@ -249,10 +249,20 @@ def link_ref_state_path() -> Path:
     return state_root / "glasshive" / "link_refs.sqlite3"
 
 
+def _harden_sqlite_state_path(db_path: Path) -> None:
+    if os.name == "nt":
+        return
+    db_path.parent.chmod(0o700)
+    for candidate in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        if candidate.exists() and not candidate.is_symlink():
+            candidate.chmod(0o600)
+
+
 def _link_ref_conn() -> sqlite3.Connection:
     db_path = link_ref_state_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30)
+    _harden_sqlite_state_path(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
@@ -277,6 +287,7 @@ def _link_ref_conn() -> sqlite3.Connection:
     _migrate_legacy_link_ref_rows(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_signed_link_refs_expires_at ON signed_link_refs(expires_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_signed_link_refs_scope_key ON signed_link_refs(scope_key)")
+    _harden_sqlite_state_path(db_path)
     return conn
 
 

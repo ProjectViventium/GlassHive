@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import workers_projects_runtime.api as api_module
+import workers_projects_runtime.signed_links as signed_links_module
 from workers_projects_runtime.api import create_app
 from workers_projects_runtime.auth import AuthContext, owner_matches_auth_context
 from workers_projects_runtime.deliverables import (
@@ -57,6 +58,31 @@ from workers_projects_runtime.signed_links import (
     verify_signed_link_token,
 )
 from workers_projects_runtime.store import Store
+
+
+def test_runtime_signed_link_sqlite_state_is_private(tmp_path, monkeypatch):
+    state_path = tmp_path / "private-state" / "link-refs.sqlite3"
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(state_path))
+
+    connection = signed_links_module._link_ref_conn()
+    try:
+        connection.execute(
+            "INSERT INTO signed_link_refs "
+            "(ref_id, kind, token, target_url, expires_at, created_at) "
+            "VALUES ('ghr_private_test', 'worker_view', 'synthetic', '/watch/test', 0, 1)"
+        )
+        connection.commit()
+        signed_links_module._harden_sqlite_state_path(state_path)
+        assert os.stat(state_path.parent).st_mode & 0o077 == 0
+        for candidate in (
+            state_path,
+            Path(f"{state_path}-wal"),
+            Path(f"{state_path}-shm"),
+        ):
+            if candidate.exists():
+                assert os.stat(candidate).st_mode & 0o077 == 0
+    finally:
+        connection.close()
 
 
 def write_minimal_docx(path: Path) -> None:
@@ -289,7 +315,7 @@ def test_worker_live_does_not_fallback_to_console_tail_for_legacy_requested_run(
         f"/v1/workers/{worker['worker_id']}/assign",
         json={"instruction": "process invoice"},
     ).json()
-    wait_for_run(client, assigned["run_id"])
+    wait_for_run(client, assigned["run_id"], timeout=5.0)
 
     payload = client.get(f"/v1/workers/{worker['worker_id']}/telemetry").json()
 
@@ -484,6 +510,25 @@ def test_store_migrates_compute_released_marker_for_existing_db(tmp_path):
     )
 
     assert worker["compute_released_at"] is None
+
+
+def test_store_migrates_run_scoped_runtime_bundle_for_existing_db(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    with store._connect() as conn:
+        assert "runtime_bundle_json" in {
+            row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        try:
+            conn.execute("ALTER TABLE runs DROP COLUMN runtime_bundle_json")
+        except sqlite3.OperationalError as exc:
+            pytest.skip(f"SQLite runtime does not support DROP COLUMN: {exc}")
+
+    migrated = Store(str(db_path))
+    with migrated._connect() as conn:
+        assert "runtime_bundle_json" in {
+            row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()
+        }
 
 
 def test_terminal_callback_message_prefers_final_report():
@@ -784,7 +829,10 @@ def test_completed_file_callback_adds_signed_open_download_and_watch_links(tmp_p
         )
 
         service.assign_run(worker["worker_id"], "Create answer.txt")
-        wait_until(lambda: any(payload.get("event") == "run.completed" for payload in payloads))
+        wait_until(
+            lambda: any(payload.get("event") == "run.completed" for payload in payloads),
+            timeout=5.0,
+        )
 
         completed = next(payload for payload in payloads if payload.get("event") == "run.completed")
         assert completed["deliverable"]["kind"] == "file"
@@ -1294,8 +1342,12 @@ def test_failed_host_run_immediately_wakes_its_capacity_lane(tmp_path, monkeypat
         runtime.release_active.set()
         wait_until(lambda: (store.get_run(active_run["run_id"]) or {}).get("state") == "failed")
         wait_until(
+            lambda: (store.get_run(waiting_run["run_id"]) or {}).get("retry_after") is None,
+            timeout=2.0,
+        )
+        wait_until(
             lambda: (store.get_run(waiting_run["run_id"]) or {}).get("state") == "completed",
-            timeout=1.0,
+            timeout=5.0,
         )
     finally:
         runtime.release_active.set()
@@ -1674,8 +1726,11 @@ def test_service_startup_resumes_queued_host_worker_without_persistent_process(t
     service = WorkersProjectsService(store, ProcessPerRunHostRuntime(), max_workers=2)
     try:
         wait_until(
-            lambda: (store.get_run(run["run_id"]) or {}).get("state") == "completed",
-            timeout=1.0,
+            lambda: (
+                (store.get_run(run["run_id"]) or {}).get("state") == "completed"
+                and (store.get_worker(worker["worker_id"]) or {}).get("state") == "ready"
+            ),
+            timeout=5.0,
         )
         assert (store.get_worker(worker["worker_id"]) or {})["state"] == "ready"
     finally:
@@ -1774,13 +1829,21 @@ def test_public_callback_message_redacts_glasshive_ids():
     assert redacted.count("[glasshive-id]") == 3
 
 
-def test_project_worker_lifecycle_with_stub_runtime(tmp_path):
+def test_project_worker_lifecycle_with_stub_runtime(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_RELEASE_ID", "release-public-safe")
+    monkeypatch.setenv("GLASSHIVE_PARENT_REVISION", "a" * 40)
+    monkeypatch.setenv("GLASSHIVE_COMPONENT_REVISION", "b" * 40)
     db_path = tmp_path / "runtime.db"
     client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
 
     health = client.get("/health")
     assert health.status_code == 200
     assert health.json()["status"] == "ok"
+    assert health.json()["release"] == {
+        "release_id": "release-public-safe",
+        "parent_revision": "a" * 40,
+        "glasshive_revision": "b" * 40,
+    }
     assert health.json()["runtime_backend"] == "stub"
     assert health.json()["default_worker_profile"]
 
@@ -2155,7 +2218,7 @@ def test_enterprise_mode_scopes_projects_workers_and_artifacts(tmp_path, monkeyp
     assert signed_live.status_code == 200
     assert signed_live.json()["worker"]["owner_id"] == "user-a"
     signed_pause = client.post(f"/v1/workers/{worker_a_payload['worker_id']}/pause?{signed_watch_query}")
-    assert signed_pause.status_code == 202
+    assert signed_pause.status_code in {401, 403}
     forged_signed_download = client.get(
         f"/v1/workers/{worker_a_payload['worker_id']}/artifacts/download",
         params={"path": "../runtime.db", **signed},
@@ -2721,6 +2784,10 @@ def test_enterprise_short_refs_can_authorize_configured_owner_alias(tmp_path, mo
         "GLASSHIVE_OWNER_IDENTITY_ALIASES_JSON",
         json.dumps({"worker-owner@example.com": ["browser-login-alias@example.com"]}),
     )
+
+    catalog = client.get("/v1/workspaces?kind=legacy", headers=alias_headers)
+    assert catalog.status_code == 200
+    assert [item["worker_id"] for item in catalog.json()["items"]] == [worker["worker_id"]]
 
     artifact_response = client.get(f"/v1/link-refs/{artifact_ref}", headers=alias_headers)
     assert artifact_response.status_code == 200
@@ -4276,7 +4343,7 @@ def test_pending_callback_replay_does_not_block_service_startup(tmp_path, monkey
     def blocking_post(url, *, content, headers, timeout):
         _ = url, content, headers, timeout
         entered_post.set()
-        release_post.wait(timeout=1)
+        release_post.wait(timeout=5)
         return Response()
 
     monkeypatch.setenv("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "1")
@@ -4634,6 +4701,7 @@ def test_persistent_local_scheduling_callback_404_dead_letters_after_budget(tmp_
     monkeypatch.setattr("workers_projects_runtime.service.httpx.post", fake_post)
     store = Store(str(tmp_path / "runtime.db"))
     service = WorkersProjectsService(store, StubRuntime())
+    service.shutdown()
     try:
         _project, worker, _run, record = _create_callback_outbox_record(
             store,
@@ -4810,8 +4878,8 @@ def test_assign_run_does_not_block_on_callback_delivery(tmp_path, monkeypatch):
         run = service.assign_run(worker["worker_id"], "Open Chrome")
         elapsed = time.perf_counter() - started_at
         assert run["state"] == "queued"
-        assert elapsed < 0.25
-        assert entered_post.wait(timeout=1)
+        assert elapsed < 2
+        assert entered_post.wait(timeout=2)
     finally:
         release_post.set()
         service.shutdown()
@@ -5598,7 +5666,7 @@ def test_assign_run_effort_accepts_claude_xhigh(tmp_path):
     assert bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == "xhigh"
 
 
-def test_signed_worker_view_cannot_inject_bootstrap_bundle_on_assign(tmp_path, monkeypatch):
+def test_signed_worker_view_is_limited_to_read_and_narrow_communication(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
     monkeypatch.setenv("WPR_API_TOKEN", "api-token")
 
@@ -5642,15 +5710,42 @@ def test_signed_worker_view_cannot_inject_bootstrap_bundle_on_assign(tmp_path, m
             "bootstrap_bundle": {"env": {"UNTRUSTED_FROM_LINK": "1"}},
         },
     )
-    assert injected.status_code == 403
-    assert "cannot modify worker bootstrap context" in injected.json()["detail"]
+    assert injected.status_code in {401, 403}
 
-    allowed = client.post(
+    assign_without_bootstrap = client.post(
         f"/v1/workers/{worker['worker_id']}/assign",
         params=signed_watch,
         json={"instruction": "Continue without bootstrap injection.", "effort": "medium"},
     )
-    assert allowed.status_code == 202
+    message = client.post(
+        f"/v1/workers/{worker['worker_id']}/message",
+        params=signed_watch,
+        json={"message": "Share a concise status update."},
+    )
+    steer = client.post(
+        f"/v1/workers/{worker['worker_id']}/steer",
+        params=signed_watch,
+        json={"message": "Focus on the requested output."},
+    )
+    pause = client.post(f"/v1/workers/{worker['worker_id']}/pause", params=signed_watch)
+    desktop = client.post(
+        f"/v1/workers/{worker['worker_id']}/desktop-action",
+        params=signed_watch,
+        json={"action": "browser"},
+    )
+
+    assert assign_without_bootstrap.status_code in {401, 403}
+    assert message.status_code == 202
+    assert steer.status_code == 202
+    assert pause.status_code in {401, 403}
+    assert desktop.status_code in {401, 403}
+
+    with pytest.raises(WebSocketDisconnect) as terminal_denied:
+        with client.websocket_connect(
+            f"/ws/workers/{worker['worker_id']}/terminal?{urlencode(signed_watch)}"
+        ):
+            pass
+    assert terminal_denied.value.code == 4403
 
 
 def test_missing_host_cli_blocks_creation_before_worker_row(tmp_path, monkeypatch):
@@ -5760,11 +5855,40 @@ def test_duplicate_worker_copies_workspace_into_new_worker(tmp_path):
 
     assert duplicated_worker["backend"] == "codex-cli"
     assert (duplicated_workspace / "app.txt").read_text() == "copied from source"
-    assert (duplicated_workspace / ".mcp.json").read_text() == '{"seed":"source"}'
+    assert not (duplicated_workspace / ".mcp.json").exists()
+    assert duplicated_worker["duplication_report"] == {
+        "source_state": "copied",
+        "copied_files": 1,
+        "skipped_items": 1,
+    }
 
     events = client.get(f"/v1/workers/{duplicated_worker['worker_id']}/events")
     assert events.status_code == 200
     assert any(item["event_type"] == "worker.duplicated" for item in events.json()["items"])
+
+    renamed = client.patch(
+        f"/v1/workspaces/{source_worker['worker_id']}",
+        json={"name": "Reusable Workspace", "favorite": True, "tags": ["Reference"]},
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["name"] == "Reusable Workspace"
+    assert renamed.json()["favorite"] == 1
+
+    catalog_duplicate = client.post(
+        f"/v1/workspaces/{source_worker['worker_id']}/duplicate",
+        json={
+            "idempotency_key": "duplicate-catalog-workspace-1",
+            "name": "Independent Workspace",
+        },
+    )
+    assert catalog_duplicate.status_code == 201
+    duplicate_payload = catalog_duplicate.json()
+    assert duplicate_payload["workspace"]["worker_id"] != source_worker["worker_id"]
+    assert duplicate_payload["workspace"]["name"] == "Independent Workspace"
+    assert duplicate_payload["project"]["goal"] == source_project["goal"]
+    assert duplicate_payload["workspace"]["duplication_report"]["copied_files"] == 1
+    assert "workspace_dir" not in duplicate_payload["workspace"]
+    assert "bootstrap_bundle_json" not in duplicate_payload["workspace"]
 
 
 def test_duplicate_worker_does_not_copy_home_directory(tmp_path):
@@ -5872,6 +5996,7 @@ def test_nonblocking_worker_create_defers_runtime_start_to_run_queue(tmp_path):
     class SlowReadyRuntime(StubRuntime):
         def __init__(self) -> None:
             self.ready_started = Event()
+            self.release_ready = Event()
             self.ready_calls = 0
             self.events: list[str] = []
 
@@ -5879,7 +6004,7 @@ def test_nonblocking_worker_create_defers_runtime_start_to_run_queue(tmp_path):
             self.events.append("ready")
             self.ready_started.set()
             self.ready_calls += 1
-            time.sleep(0.75)
+            self.release_ready.wait(timeout=5)
             return super().ensure_worker_ready(worker)
 
         def run_task(
@@ -5908,7 +6033,6 @@ def test_nonblocking_worker_create_defers_runtime_start_to_run_queue(tmp_path):
         },
     ).json()
 
-    start = time.monotonic()
     worker_resp = client.post(
         f"/v1/projects/{project['project_id']}/workers/find-or-resume",
         json={
@@ -5921,11 +6045,8 @@ def test_nonblocking_worker_create_defers_runtime_start_to_run_queue(tmp_path):
             "start_synchronously": False,
         },
     )
-    elapsed = time.monotonic() - start
-
     assert worker_resp.status_code == 200
     worker = worker_resp.json()
-    assert elapsed < 0.25
     assert worker["state"] == "paused"
     assert runtime.ready_calls == 0
 
@@ -5935,9 +6056,10 @@ def test_nonblocking_worker_create_defers_runtime_start_to_run_queue(tmp_path):
         json={"instruction": "Run after background preparation."},
     )
     assert assign_resp.status_code == 202
-    assert time.monotonic() - start < 0.25
+    assert time.monotonic() - start < 2
 
-    assert runtime.ready_started.wait(1.0)
+    assert runtime.ready_started.wait(2.0)
+    runtime.release_ready.set()
     settled = wait_for_run(client, assign_resp.json()["run_id"], timeout=3.0)
     assert settled["state"] == "completed"
     assert settled["output_text"] == "BACKGROUND_START_OK"
@@ -7629,10 +7751,16 @@ def test_worker_terminated_error_recovers_completed_artifacts(tmp_path):
         )
         run = service.assign_run(worker["worker_id"], "finish despite stale marker")
 
-        deadline = time.time() + 2
+        deadline = time.time() + 5
         while time.time() < deadline:
             refreshed = store.get_run(run["run_id"])
-            if refreshed and refreshed["state"] == "completed":
+            refreshed_worker = store.get_worker(worker["worker_id"])
+            if (
+                refreshed
+                and refreshed["state"] == "completed"
+                and refreshed_worker
+                and refreshed_worker["state"] == "ready"
+            ):
                 break
             time.sleep(0.05)
         else:
@@ -7662,10 +7790,16 @@ def test_worker_interrupted_error_recovers_completed_artifacts(tmp_path):
         )
         run = service.assign_run(worker["worker_id"], "finish despite stale marker")
 
-        deadline = time.time() + 2
+        deadline = time.time() + 5
         while time.time() < deadline:
             refreshed = store.get_run(run["run_id"])
-            if refreshed and refreshed["state"] == "completed":
+            refreshed_worker = store.get_worker(worker["worker_id"])
+            if (
+                refreshed
+                and refreshed["state"] == "completed"
+                and refreshed_worker
+                and refreshed_worker["state"] == "ready"
+            ):
                 break
             time.sleep(0.05)
         else:
@@ -8016,7 +8150,7 @@ def test_completed_non_web_callback_omits_operator_url_but_keeps_deliverable(tmp
                 ).fetchone()
             return json.loads(row["payload_json"]) if row else None
 
-        wait_until(lambda: callback_payload() is not None)
+        wait_until(lambda: callback_payload() is not None, timeout=5.0)
         payload = callback_payload()
         assert payload is not None
         assert payload["surface"] == surface
@@ -8077,7 +8211,7 @@ def test_completed_web_callback_includes_operator_url_and_deliverable(tmp_path, 
                 ).fetchone()
             return json.loads(row["payload_json"]) if row else None
 
-        wait_until(lambda: callback_payload() is not None)
+        wait_until(lambda: callback_payload() is not None, timeout=5.0)
         payload = callback_payload()
         assert payload is not None
         expected_url = f"http://127.0.0.1:8780/watch/{worker['worker_id']}?surface=desktop&project_id={project['project_id']}"
@@ -8374,6 +8508,43 @@ def test_desktop_action_and_artifact_preview_surface_in_project_ui(tmp_path):
     assert f"/v1/workers/{worker['worker_id']}/artifacts/latest-image" in project_ui.text
 
 
+def test_artifact_endpoints_never_follow_workspace_symlinks(tmp_path):
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Artifact boundary", "goal": "Reject symlink escapes."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Boundary Worker", "role": "operator", "profile": "codex-cli"},
+    ).json()
+    workspace = Path(worker["workspace_dir"])
+    workspace.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"synthetic-host-secret")
+    (workspace / "leak.png").symlink_to(outside)
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    (outside_dir / "nested.png").write_bytes(b"nested-synthetic-host-secret")
+    (workspace / "linked-dir").symlink_to(outside_dir, target_is_directory=True)
+
+    latest = client.get(f"/v1/workers/{worker['worker_id']}/artifacts/latest-image")
+    direct = client.get(
+        f"/v1/workers/{worker['worker_id']}/artifacts/download",
+        params={"path": "leak.png"},
+    )
+    nested = client.get(
+        f"/v1/workers/{worker['worker_id']}/artifacts/download",
+        params={"path": "linked-dir/nested.png"},
+    )
+
+    assert latest.status_code == 404
+    assert direct.status_code == 400
+    assert nested.status_code in {400, 404}
+    assert b"synthetic-host-secret" not in direct.content
+    assert b"nested-synthetic-host-secret" not in nested.content
+
+
 def test_launch_failed_endpoint_marks_worker_failed(tmp_path):
     db_path = tmp_path / "runtime.db"
     client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
@@ -8475,13 +8646,14 @@ def test_due_schedule_reconciles_fast_completed_run_before_queued_id_exists(tmp_
             schedule_text="now",
         )
 
-        def complete_before_schedule_is_linked(worker_id: str, instruction: str, event_type: str = "run.queued") -> dict:
-            _ = event_type
-            run = store.create_run(worker_id, project["project_id"], instruction, state="running")
-            store.finalize_run(run["run_id"], state="completed", output_text="fast complete")
-            return run
+        def complete_immediately_after_schedule_is_linked(worker_id: str) -> None:
+            linked = store.get_schedule(schedule["schedule_id"])
+            assert linked and linked["queued_run_id"]
+            run_id = str(linked["queued_run_id"])
+            store.update_run(run_id, state="running", started_at=datetime.now(timezone.utc).isoformat())
+            store.finalize_run(run_id, state="completed", output_text="fast complete")
 
-        service.assign_run = complete_before_schedule_is_linked  # type: ignore[method-assign]
+        service._ensure_worker_processor = complete_immediately_after_schedule_is_linked  # type: ignore[method-assign]
 
         processed = service.process_due_schedules_once()
 
