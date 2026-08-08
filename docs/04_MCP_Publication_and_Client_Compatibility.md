@@ -45,8 +45,10 @@ filename records that source commit. Synthetic values only are permitted in this
 ## Client Strategy
 
 ### LibreChat / Viventium / Standalone-Compatible Clients
-Use Glass Hive as an external MCP server. The default enterprise path is config-only and does not
-require LibreChat application-code changes.
+Use Glass Hive as an external MCP server. The standalone external-MCP path is config-only and
+requires no LibreChat application-code changes. Optional Viventium/LibreChat account, inference,
+scheduling, or callback bridges may use a separately pinned compatible integration build, but are
+not required by standalone GlassHive.
 
 For enterprise worker delegation, the host application injects a service-authenticated user
 assertion and request context into the MCP call. The neutral standalone header set is:
@@ -263,13 +265,15 @@ For broader publication:
 - `execution_mode=host` must be an explicit tool argument; the MCP server should not infer host
   execution from natural-language phrasing
 
-For Azure enterprise VM mode, the existing LibreChat integration remains config-only: LibreChat sends
-the neutral `X-GlassHive-*` service, identity, request, and upload headers to the remote GlassHive
-MCP endpoint over a locked-down channel. GlassHive trusts identity headers only after service-token
-validation and ignores model/tool-supplied `owner_id`. Direct hosted Codex and Claude clients use the
-OAuth-protected MCP resource. Partial OAuth configuration, a non-HTTPS hosted public URL, or an invalid
-resource token fails loud instead of falling back to caller identity headers or a static user bearer
-token.
+For Azure enterprise VM mode, an existing standalone LibreChat integration remains config-only:
+LibreChat sends the neutral `X-GlassHive-*` service, identity, request, and upload headers to the
+remote GlassHive MCP endpoint over a locked-down channel. Optional Viventium/LibreChat bridges are
+enabled and version-validated separately; leaving them disabled preserves existing LibreChat
+behavior and requires no application-code change. GlassHive trusts identity headers only after
+service-token validation and ignores model/tool-supplied `owner_id`. Direct hosted Codex and Claude
+clients use the OAuth-protected MCP resource. Partial OAuth configuration, a non-HTTPS hosted public
+URL, or an invalid resource token fails loud instead of falling back to caller identity headers or a
+static user bearer token.
 
 ## Compatibility Alias
 
