@@ -410,6 +410,15 @@ def _reconcile_on_startup_enabled() -> bool:
     raise ValueError("GLASSHIVE_RECONCILE_ON_STARTUP must be true or false")
 
 
+def _background_consumers_enabled() -> bool:
+    configured = str(os.environ.get("GLASSHIVE_BACKGROUND_CONSUMERS_ENABLED") or "true").strip().lower()
+    if configured in {"1", "true", "yes", "on"}:
+        return True
+    if configured in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("GLASSHIVE_BACKGROUND_CONSUMERS_ENABLED must be true or false")
+
+
 def _recurring_schedule_owner() -> str:
     load_viventium_runtime_env()
     configured = str(os.environ.get("GLASSHIVE_RECURRING_SCHEDULE_OWNER") or "").strip().lower()
@@ -655,31 +664,35 @@ class WorkersProjectsService:
         self._worker_create_lock = Lock()
         self._deliverable_promotions_lock = Lock()
         self._deliverable_promotions: set[str] = set()
+        self._callback_retry_thread: Thread | None = None
+        self._idle_reaper_thread: Thread | None = None
+        self._scheduler_thread: Thread | None = None
+        self._background_consumers_enabled = _background_consumers_enabled()
         if reconcile_on_startup is None:
             reconcile_on_startup = _reconcile_on_startup_enabled()
-        if reconcile_on_startup:
+        if self._background_consumers_enabled and reconcile_on_startup:
             self.reconcile_all_workers()
-        self.executor.submit(self._replay_pending_callbacks)
-        self._callback_retry_thread = Thread(
-            target=self._callback_retry_loop,
-            name="wpr-callback-retry",
-            daemon=True,
-        )
-        self._callback_retry_thread.start()
-        self._idle_reaper_thread: Thread | None = None
-        if self._lifecycle_reaper_enabled():
-            self._idle_reaper_thread = Thread(
-                target=self._idle_reaper_loop,
-                name="wpr-idle-reaper",
+        if self._background_consumers_enabled:
+            self.executor.submit(self._replay_pending_callbacks)
+            self._callback_retry_thread = Thread(
+                target=self._callback_retry_loop,
+                name="wpr-callback-retry",
                 daemon=True,
             )
-            self._idle_reaper_thread.start()
-        self._scheduler_thread = Thread(
-            target=self._scheduler_loop,
-            name="wpr-scheduler",
-            daemon=True,
-        )
-        self._scheduler_thread.start()
+            self._callback_retry_thread.start()
+            if self._lifecycle_reaper_enabled():
+                self._idle_reaper_thread = Thread(
+                    target=self._idle_reaper_loop,
+                    name="wpr-idle-reaper",
+                    daemon=True,
+                )
+                self._idle_reaper_thread.start()
+            self._scheduler_thread = Thread(
+                target=self._scheduler_loop,
+                name="wpr-scheduler",
+                daemon=True,
+            )
+            self._scheduler_thread.start()
 
     def shutdown(self) -> None:
         self._shutdown_event.set()
@@ -1239,6 +1252,8 @@ class WorkersProjectsService:
             url=url,
             payload_json=json.dumps(payload, ensure_ascii=False),
         )
+        if not self._background_consumers_enabled:
+            return
         self.executor.submit(self._deliver_callback_record, dict(worker), record, callbacks)
 
     def _completion_deliverable(self, worker: dict, run: dict, output_text: str, error_text: str = "") -> dict[str, object] | None:
