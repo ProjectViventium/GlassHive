@@ -4971,6 +4971,38 @@ def test_reconcile_interrupts_active_run_when_worker_process_is_missing(tmp_path
     assert any(event["event_type"] == "run.orphaned" for event in store.list_events(worker["worker_id"]))
 
 
+def test_enterprise_startup_requeues_durable_first_run_after_restart(tmp_path, monkeypatch):
+    class RestartRuntime(StubRuntime):
+        def run_task(self, worker: dict, instruction: str, run_id: str | None = None) -> str:
+            return f"FINAL REPORT:\nRecovered {instruction}"
+
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_RECONCILE_ON_STARTUP", "true")
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project("owner", "Restart", "Resume queued work", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Restart worker",
+        role="general",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="gpt-5.4",
+    )
+    store.update_worker_state(worker["worker_id"], "starting")
+    run = store.create_run(worker["worker_id"], project["project_id"], "queued work", state="queued")
+
+    service = WorkersProjectsService(store, RestartRuntime())
+    try:
+        wait_until(lambda: store.get_run(run["run_id"])["state"] == "completed")
+    finally:
+        service.shutdown()
+
+    assert store.get_run(run["run_id"])["output_text"] == "FINAL REPORT:\nRecovered queued work"
+    assert store.get_worker(worker["worker_id"])["state"] == "ready"
+
+
 def test_reconcile_orphaned_running_run_emits_interrupted_callback(tmp_path):
     class MissingProcessRuntime(StubRuntime):
         def reconcile_worker(self, worker: dict) -> RuntimeInfo:

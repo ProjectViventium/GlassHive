@@ -399,6 +399,17 @@ def _enterprise_mode_enabled() -> bool:
     return multi_user_security_enabled()
 
 
+def _reconcile_on_startup_enabled() -> bool:
+    configured = str(os.environ.get("GLASSHIVE_RECONCILE_ON_STARTUP") or "").strip().lower()
+    if not configured:
+        return not _enterprise_mode_enabled()
+    if configured in {"1", "true", "yes", "on"}:
+        return True
+    if configured in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("GLASSHIVE_RECONCILE_ON_STARTUP must be true or false")
+
+
 def _recurring_schedule_owner() -> str:
     load_viventium_runtime_env()
     configured = str(os.environ.get("GLASSHIVE_RECURRING_SCHEDULE_OWNER") or "").strip().lower()
@@ -645,7 +656,7 @@ class WorkersProjectsService:
         self._deliverable_promotions_lock = Lock()
         self._deliverable_promotions: set[str] = set()
         if reconcile_on_startup is None:
-            reconcile_on_startup = not _enterprise_mode_enabled()
+            reconcile_on_startup = _reconcile_on_startup_enabled()
         if reconcile_on_startup:
             self.reconcile_all_workers()
         self.executor.submit(self._replay_pending_callbacks)
@@ -4137,6 +4148,15 @@ class WorkersProjectsService:
             if recovered:
                 self._apply_recovered_run(worker, active_run, recovered)
                 return
+        if not active_run and self.store.has_queued_runs(worker["worker_id"]):
+            if worker["state"] == "paused":
+                return
+            # Queue processors are process-local, but queued work is durable. Restore the
+            # starting state and processor after a service restart without claiming a second
+            # run or synchronously preparing compute in an HTTP request.
+            self.store.update_worker_state(worker["worker_id"], "starting", last_error="")
+            self._ensure_worker_processor(worker["worker_id"])
+            return
         if worker["state"] == "paused":
             if active_run:
                 orphaned_run = self.store.finalize_run_if_state(
