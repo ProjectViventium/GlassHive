@@ -149,8 +149,11 @@ def test_oidc_mcp_token_verifier_binds_resource_scope_tenant_and_stable_user(mon
     missing_role_access = asyncio.run(
         viewer_verifier.verify_token(token(private_key))
     )
-    assert missing_role_access is not None
-    assert missing_role_access.claims["role"] == "viewer"
+    unmapped_role_access = asyncio.run(
+        viewer_verifier.verify_token(token(private_key, groups=["unapproved-users"]))
+    )
+    assert missing_role_access is None
+    assert unmapped_role_access is None
 
 
 def test_mcp_token_tenant_validation_is_independent_from_glasshive_tenant(
@@ -200,6 +203,53 @@ def test_mcp_token_tenant_validation_is_independent_from_glasshive_tenant(
     assert accepted_entra.claims["tenant_id"] == "glasshive-tenant-public-safe"
     assert accepted_entra.claims["upstream_tenant_id"] == TENANT
     assert rejected_entra is None
+
+
+def test_mapped_mcp_role_is_required_before_principal_enrollment(
+    tmp_path,
+    monkeypatch,
+    signing_material,
+):
+    private_key, public_jwk = signing_material
+    state_path = tmp_path / "auth.sqlite3"
+    create_auth_state(state_path)
+
+    def fake_get(url, **kwargs):
+        if url == f"{ISSUER}/.well-known/openid-configuration":
+            return FakeResponse({"issuer": ISSUER, "jwks_uri": f"{ISSUER}/jwks"})
+        if url == f"{ISSUER}/jwks":
+            return FakeResponse({"keys": [public_jwk]})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(oauth_module.httpx, "get", fake_get)
+    verifier = OidcJwtTokenVerifier(
+        issuer=ISSUER,
+        audience=TOKEN_AUDIENCE,
+        resource=RESOURCE,
+        token_scopes=(TOKEN_SCOPE,),
+        deployment_tenant_id=TENANT,
+        token_tenant_id=TENANT,
+        role_claim="roles",
+        role_map={"GlassHive.Member": "member"},
+        allowed_client_ids=("mcp-public-client",),
+        auth_state_path=str(state_path),
+        require_auth_state=True,
+    )
+
+    assert asyncio.run(verifier.verify_token(token(private_key))) is None
+    assert asyncio.run(
+        verifier.verify_token(token(private_key, roles=["Unapproved.Role"]))
+    ) is None
+    with sqlite3.connect(state_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM auth_principals").fetchone()[0] == 0
+
+    approved = asyncio.run(
+        verifier.verify_token(token(private_key, roles=["GlassHive.Member"]))
+    )
+    assert approved is not None
+    assert approved.claims["role"] == "member"
+    with sqlite3.connect(state_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM auth_principals").fetchone()[0] == 1
 
 
 def test_oidc_mcp_token_verifier_rejects_unapproved_or_ambiguous_client(monkeypatch, signing_material):
