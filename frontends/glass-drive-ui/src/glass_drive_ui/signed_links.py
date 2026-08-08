@@ -258,37 +258,41 @@ def _harden_sqlite_state_path(db_path: Path) -> None:
             candidate.chmod(0o600)
 
 
-def _link_ref_conn() -> sqlite3.Connection:
+def _link_ref_conn(*, timeout_seconds: float = 30.0) -> sqlite3.Connection:
     db_path = link_ref_state_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=30)
-    _harden_sqlite_state_path(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS signed_link_refs (
-            ref_id TEXT PRIMARY KEY,
-            kind TEXT NOT NULL,
-            token TEXT NOT NULL,
-            target_url TEXT NOT NULL DEFAULT '',
-            expires_at INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            payload_json TEXT NOT NULL DEFAULT '',
-            scope_key TEXT NOT NULL DEFAULT ''
+    conn = sqlite3.connect(db_path, timeout=max(0.0, float(timeout_seconds)))
+    try:
+        _harden_sqlite_state_path(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signed_link_refs (
+                ref_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                token TEXT NOT NULL,
+                target_url TEXT NOT NULL DEFAULT '',
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '',
+                scope_key TEXT NOT NULL DEFAULT ''
+            )
+            """
         )
-        """
-    )
-    columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(signed_link_refs)").fetchall()}
-    if "payload_json" not in columns:
-        conn.execute("ALTER TABLE signed_link_refs ADD COLUMN payload_json TEXT NOT NULL DEFAULT ''")
-    if "scope_key" not in columns:
-        conn.execute("ALTER TABLE signed_link_refs ADD COLUMN scope_key TEXT NOT NULL DEFAULT ''")
-    _migrate_legacy_link_ref_rows(conn)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_signed_link_refs_expires_at ON signed_link_refs(expires_at)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_signed_link_refs_scope_key ON signed_link_refs(scope_key)")
-    _harden_sqlite_state_path(db_path)
-    return conn
+        columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(signed_link_refs)").fetchall()}
+        if "payload_json" not in columns:
+            conn.execute("ALTER TABLE signed_link_refs ADD COLUMN payload_json TEXT NOT NULL DEFAULT ''")
+        if "scope_key" not in columns:
+            conn.execute("ALTER TABLE signed_link_refs ADD COLUMN scope_key TEXT NOT NULL DEFAULT ''")
+        _migrate_legacy_link_ref_rows(conn)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signed_link_refs_expires_at ON signed_link_refs(expires_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signed_link_refs_scope_key ON signed_link_refs(scope_key)")
+        _harden_sqlite_state_path(db_path)
+        return conn
+    except Exception:
+        conn.close()
+        raise
 
 
 def _payload_json(payload: dict[str, object]) -> str:
@@ -332,7 +336,12 @@ def _migrate_legacy_link_ref_rows(conn: sqlite3.Connection) -> None:
             )
 
 
-def create_signed_link_ref(*, token: str, target_url: str = "") -> str:
+def create_signed_link_ref(
+    *,
+    token: str,
+    target_url: str = "",
+    sqlite_timeout_seconds: float = 30.0,
+) -> str:
     payload = verify_signed_link_token(token)
     if not payload:
         return ""
@@ -341,7 +350,7 @@ def create_signed_link_ref(*, token: str, target_url: str = "") -> str:
     expires_at = now + ref_ttl if ref_ttl > 0 else 0
     payload_json = _payload_json(payload)
     scope_key = _scope_key(payload, target_url)
-    with _link_ref_conn() as conn:
+    with _link_ref_conn(timeout_seconds=sqlite_timeout_seconds) as conn:
         conn.execute("DELETE FROM signed_link_refs WHERE expires_at > 0 AND expires_at < ?", (now,))
         existing = conn.execute(
             """

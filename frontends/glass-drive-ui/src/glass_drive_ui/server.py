@@ -200,30 +200,39 @@ def _harden_watch_session_state(db_path: Path) -> None:
             candidate.chmod(0o600)
 
 
-def _watch_session_conn() -> sqlite3.Connection:
+def _watch_session_conn(*, timeout_seconds: float = 30.0) -> sqlite3.Connection:
     db_path = _watch_session_state_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=30)
-    _harden_watch_session_state(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS watch_sessions (
-            tenant_id TEXT NOT NULL,
-            owner_id TEXT NOT NULL,
-            worker_id TEXT NOT NULL,
-            started_at INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (tenant_id, owner_id, worker_id)
+    conn = sqlite3.connect(db_path, timeout=max(0.0, float(timeout_seconds)))
+    try:
+        _harden_watch_session_state(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS watch_sessions (
+                tenant_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (tenant_id, owner_id, worker_id)
+            )
+            """
         )
-        """
-    )
-    _harden_watch_session_state(db_path)
-    return conn
+        _harden_watch_session_state(db_path)
+        return conn
+    except Exception:
+        conn.close()
+        raise
 
 
-def _watch_session_expires_at(worker_id: str, identity: dict[str, str] | None) -> int | None:
+def _watch_session_expires_at(
+    worker_id: str,
+    identity: dict[str, str] | None,
+    *,
+    sqlite_timeout_seconds: float = 30.0,
+) -> int | None:
     cap_seconds = _watch_session_cap_seconds()
     if cap_seconds <= 0 or not identity:
         return None
@@ -232,7 +241,7 @@ def _watch_session_expires_at(worker_id: str, identity: dict[str, str] | None) -
     if not tenant_id or not owner_id:
         return None
     now = int(time.time())
-    with _watch_session_conn() as conn:
+    with _watch_session_conn(timeout_seconds=sqlite_timeout_seconds) as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("DELETE FROM watch_sessions WHERE expires_at < ?", (now - 24 * 3600,))
         row = conn.execute(
@@ -573,11 +582,20 @@ def _validate_short_ref_redirect_target(target_url: str, request: Request) -> st
     return target
 
 
-def _worker_view_token(worker_id: str, identity: dict[str, str] | None) -> str:
+def _worker_view_token(
+    worker_id: str,
+    identity: dict[str, str] | None,
+    *,
+    storage_timeout_seconds: float = 30.0,
+) -> str:
     if not identity:
         return ""
     ttl_seconds = None
-    expires_at = _watch_session_expires_at(worker_id, identity)
+    expires_at = _watch_session_expires_at(
+        worker_id,
+        identity,
+        sqlite_timeout_seconds=storage_timeout_seconds,
+    )
     if expires_at is not None:
         ttl_seconds = max(1, expires_at - int(time.time()))
     return sign_link_token(
@@ -589,12 +607,26 @@ def _worker_view_token(worker_id: str, identity: dict[str, str] | None) -> str:
     )
 
 
-def _append_signed_worker_token(url: str, worker_id: str, identity: dict[str, str] | None) -> str:
+def _append_signed_worker_token(
+    url: str,
+    worker_id: str,
+    identity: dict[str, str] | None,
+    *,
+    storage_timeout_seconds: float = 30.0,
+) -> str:
     target_url = _strip_signed_query_params(url)
-    token = _worker_view_token(worker_id, identity)
+    token = _worker_view_token(
+        worker_id,
+        identity,
+        storage_timeout_seconds=storage_timeout_seconds,
+    )
     if not token:
         return target_url
-    ref_id = create_signed_link_ref(token=token, target_url=target_url)
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=target_url,
+        sqlite_timeout_seconds=storage_timeout_seconds,
+    )
     if not ref_id:
         return target_url
     return signed_link_ref_url("", ref_id)
@@ -3156,8 +3188,13 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         )
         watch_url = f"/watch/{worker_id}?project_id={project_id}&surface={surface}"
         try:
-            launch_watch_url = _append_signed_worker_token(watch_url, str(worker_id), identity)
-        except (OSError, sqlite3.OperationalError):
+            launch_watch_url = _append_signed_worker_token(
+                watch_url,
+                str(worker_id),
+                identity,
+                storage_timeout_seconds=0.1,
+            )
+        except (OSError, sqlite3.Error):
             # Project, worker, and run are already durable. An authenticated browser can use the
             # ordinary owner-scoped route, so do not turn auxiliary short-link state failure into
             # a retry that duplicates work. Keep storage paths and exception text out of logs.

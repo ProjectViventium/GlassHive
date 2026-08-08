@@ -404,7 +404,20 @@ function workspaceOptionLabel(workspace) {
 
 function workerActionForState(state) {
   const normalized = String(state || '').trim().toLowerCase();
-  return RESUME_STATES.has(normalized) || TERMINAL_ATTENTION_STATES.has(normalized) ? 'resume' : 'pause';
+  return RESUME_STATES.has(normalized) ? 'resume' : 'pause';
+}
+
+function syncTileSteerAvailability(tile, state) {
+  const normalized = String(state || '').trim().toLowerCase();
+  tile.dataset.displayState = normalized;
+  const closed = normalized === 'terminated';
+  const input = tile.querySelector('.workspace-steer textarea');
+  const button = tile.querySelector('.workspace-steer button[type="submit"]');
+  if (input) {
+    input.disabled = closed;
+    input.placeholder = closed ? 'This workspace is closed' : 'Steer this workspace';
+  }
+  if (button) button.disabled = closed;
 }
 
 function workerDesktopUrl(workerId, signedUrl = '') {
@@ -453,6 +466,7 @@ function updateTileControlLabels(tile, state) {
   const action = workerActionForState(state);
   const toggle = tile.querySelector('[data-worker-action-toggle]');
   if (toggle) {
+    toggle.hidden = TERMINAL_ATTENTION_STATES.has(normalized) || normalized === 'terminated';
     toggle.dataset.action = action;
     toggle.textContent = normalized === 'completed' ? 'Continue' : action === 'resume' ? 'Resume' : 'Pause';
     toggle.disabled = DISABLED_CONTROL_STATES.has(normalized);
@@ -464,6 +478,7 @@ function updateTileControlLabels(tile, state) {
   }
   const stateLabel = tile.querySelector('[data-worker-state]');
   if (stateLabel) stateLabel.textContent = displayStateLabel(state);
+  syncTileSteerAvailability(tile, state);
 }
 
 function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) {
@@ -502,6 +517,22 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
     return;
   }
 
+  if (TERMINAL_ATTENTION_STATES.has(normalized)) {
+    const note = document.createElement('div');
+    note.className = 'workspace-glass-note';
+    note.textContent = 'Needs attention · Send a corrected follow-up below';
+    pane.replaceChildren(note);
+    return;
+  }
+
+  if (normalized === 'terminated') {
+    const note = document.createElement('div');
+    note.className = 'workspace-glass-note';
+    note.textContent = 'Workspace closed';
+    pane.replaceChildren(note);
+    return;
+  }
+
   const wakeButton = createButton(normalized === 'completed' ? 'Completed' : 'Resume workspace', 'workspace-glass-action');
   if (normalized === 'completed') {
     wakeButton.dataset.intent = 'completed';
@@ -516,6 +547,7 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
 function displayStateForLive(data) {
   const workerState = String(data?.worker?.state || '').trim().toLowerCase();
   const runState = String(data?.latest_run?.state || '').trim().toLowerCase();
+  if (workerState === 'terminated') return 'terminated';
   if (runState === 'completed') return 'completed';
   if (ACTIVE_RUN_STATES.has(runState)) return runState;
   if (['failed', 'cancelled', 'interrupted'].includes(runState)) return runState;
@@ -853,6 +885,7 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   const toggle = createButton(state === 'completed' ? 'Continue' : workerActionForState(state) === 'resume' ? 'Resume' : 'Pause', 'workspace-run-toggle');
   toggle.dataset.workerActionToggle = 'true';
   toggle.dataset.action = workerActionForState(state);
+  toggle.hidden = TERMINAL_ATTENTION_STATES.has(state) || state === 'terminated';
   toggle.disabled = DISABLED_CONTROL_STATES.has(state);
   toggle.addEventListener('click', async () => {
     await runWorkerAction(workerId, toggle.dataset.action, toggle, refreshBootstrap);
@@ -905,11 +938,12 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
     } catch (error) {
       liveOutput.textContent = error.message;
     } finally {
-      steerButton.disabled = false;
+      syncTileSteerAvailability(tile, tile.dataset.displayState || state);
     }
   });
 
   tile.append(glass, body, actions, steerForm);
+  syncTileSteerAvailability(tile, state);
   requestAnimationFrame(() => autoResizeTextarea(steerInput));
   return tile;
 }

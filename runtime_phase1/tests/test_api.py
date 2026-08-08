@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import workers_projects_runtime.api as api_module
+import workers_projects_runtime.service as service_module
 import workers_projects_runtime.signed_links as signed_links_module
 from workers_projects_runtime.api import create_app
 from workers_projects_runtime.auth import AuthContext, owner_matches_auth_context
@@ -5001,6 +5002,69 @@ def test_enterprise_startup_requeues_durable_first_run_after_restart(tmp_path, m
 
     assert store.get_run(run["run_id"])["output_text"] == "FINAL REPORT:\nRecovered queued work"
     assert store.get_worker(worker["worker_id"])["state"] == "ready"
+
+
+def test_passive_rehearsal_does_not_run_callbacks_schedules_or_reapers(tmp_path, monkeypatch):
+    callback_requests: list[str] = []
+
+    def fake_post(url: str, **_kwargs):
+        callback_requests.append(url)
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setenv("GLASSHIVE_BACKGROUND_CONSUMERS_ENABLED", "false")
+    monkeypatch.setenv("GLASSHIVE_RECONCILE_ON_STARTUP", "true")
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "1")
+    monkeypatch.setattr(service_module.httpx, "post", fake_post)
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project("owner", "Passive rehearsal", "Inspect cloned state", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Passive worker",
+        role="general",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="gpt-5.4",
+        bootstrap_bundle={
+            "callbacks": {
+                "events_webhook_url": "https://callback.example.test/glasshive",
+                "hmac_secret": "synthetic-callback-secret",
+            }
+        },
+    )
+    store.upsert_callback_outbox(
+        callback_id="cb_passive_rehearsal",
+        project_id=project["project_id"],
+        worker_id=worker["worker_id"],
+        run_id=None,
+        event_type="run.completed",
+        url="https://callback.example.test/glasshive",
+        payload_json=json.dumps({"callback_id": "cb_passive_rehearsal", "event": "run.completed"}),
+    )
+
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        service._emit_callback(worker, "run.started", message="Do not deliver from rehearsal")
+        service.create_recurring_schedule(
+            worker["worker_id"],
+            "Do not execute from rehearsal",
+            recurrence_type="once",
+            first_run_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+            misfire_grace_seconds=300,
+        )
+        time.sleep(1.2)
+    finally:
+        service.shutdown()
+
+    assert callback_requests == []
+    pending_callbacks = store.list_pending_callbacks(limit=10)
+    assert len(pending_callbacks) == 2
+    assert {record["status"] for record in pending_callbacks} == {"pending"}
+    assert store.list_runs_for_worker(worker["worker_id"]) == []
+    assert service._callback_retry_thread is None
+    assert service._idle_reaper_thread is None
+    assert service._scheduler_thread is None
 
 
 def test_reconcile_orphaned_running_run_emits_interrupted_callback(tmp_path):

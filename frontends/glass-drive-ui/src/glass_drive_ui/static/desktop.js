@@ -101,8 +101,8 @@ function settledWorkspaceStatus(data) {
   }
   if (workerState === 'terminated') {
     return {
-      title: 'Workspace parked',
-      detail: 'Compute is stopped to save resources. The workspace files remain available, and GlassHive will resume when you send more work.',
+      title: 'Workspace closed',
+      detail: 'This workspace was closed. Return to Workspaces to create new work.',
     };
   }
   if (['failed', 'cancelled', 'interrupted'].includes(runState) || workerState === 'failed') {

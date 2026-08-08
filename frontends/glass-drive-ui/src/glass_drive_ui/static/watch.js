@@ -98,6 +98,7 @@ function syncDocumentTitle(workerName, projectTitle) {
 function displayStateForLive(data) {
   const workerState = String(data?.worker?.state || '').trim().toLowerCase();
   const runState = String(data?.latest_run?.state || '').trim().toLowerCase();
+  if (workerState === 'terminated') return 'terminated';
   if (runState === 'completed') return 'completed';
   if (['queued', 'running'].includes(runState)) return runState;
   if (['failed', 'cancelled', 'interrupted'].includes(runState)) return runState;
@@ -219,6 +220,7 @@ function syncProjectWorkspaceLinks() {
 }
 
 function syncSendAffordance() {
+  if (steerInput.disabled) return;
   const queueMode = queueModifierActive || longPressArmed;
   sendButton.dataset.mode = queueMode ? 'queue' : 'steer';
   sendButton.textContent = queueMode ? 'Queue' : 'Send';
@@ -238,7 +240,8 @@ function syncSendAffordance() {
 function syncRunToggle(state) {
   if (!runToggleButton) return;
   const normalized = String(state || '').trim().toLowerCase();
-  const shouldResume = normalized === 'paused' || normalized === 'idle' || normalized === 'idle_terminated' || normalized === 'stopped' || normalized === 'completed' || TERMINAL_ATTENTION_STATES.has(normalized);
+  runToggleButton.hidden = TERMINAL_ATTENTION_STATES.has(normalized) || normalized === 'terminated';
+  const shouldResume = normalized === 'paused' || normalized === 'idle' || normalized === 'idle_terminated' || normalized === 'stopped' || normalized === 'completed';
   const disabled = ['created', 'starting', 'terminated'].includes(normalized);
   runToggleButton.dataset.action = shouldResume ? 'resume' : 'pause';
   runToggleButton.textContent = normalized === 'completed' ? 'Continue' : shouldResume ? 'Resume' : 'Pause';
@@ -250,6 +253,19 @@ function syncRunToggle(state) {
     ? 'Resume this workspace'
     : 'Pause this workspace';
   runToggleButton.disabled = disabled;
+}
+
+function syncSteerAvailability(state) {
+  const closed = String(state || '').trim().toLowerCase() === 'terminated';
+  steerInput.disabled = closed;
+  sendButton.disabled = closed;
+  steerInput.placeholder = closed ? 'This workspace is closed' : 'Steer this workspace';
+  if (closed) {
+    guidancePrimary.textContent = 'This workspace is closed. Return to Workspaces to create new work.';
+    guidanceQueue.textContent = '';
+    return;
+  }
+  syncSendAffordance();
 }
 
 function autoResizeSteerInput() {
@@ -660,7 +676,7 @@ function setOverlay(state, detail) {
   const needsAttention = TERMINAL_ATTENTION_STATES.has(state);
   const connecting = !completed && attachStartedAt && !frameReady && Date.now() - attachStartedAt < 12000;
   const filePreviewActive = activeSurface === 'desktop' && Boolean(filePreviewUrl());
-  const waiting = state === 'starting' || state === 'paused' || state === 'idle' || state === 'idle_terminated' || state === 'stopped' || needsAttention || connecting;
+  const waiting = state === 'starting' || state === 'paused' || state === 'idle' || state === 'idle_terminated' || state === 'stopped' || state === 'terminated' || needsAttention || connecting;
   overlay.hidden = !waiting;
   if (stage) {
     stage.dataset.overlayActive = String(waiting);
@@ -672,7 +688,16 @@ function setOverlay(state, detail) {
       overlayLabel.textContent = 'Workspace needs attention';
     }
     overlayTitle.textContent = 'Workspace needs attention';
-    overlayDetail.textContent = 'The latest run did not complete. Review the status details, then use Resume or send a corrected follow-up.';
+    overlayDetail.textContent = 'The latest run did not complete. Review the status details, then send a corrected follow-up.';
+    return;
+  }
+
+  if (state === 'terminated') {
+    if (overlayLabel) {
+      overlayLabel.textContent = 'Workspace closed';
+    }
+    overlayTitle.textContent = 'Workspace closed';
+    overlayDetail.textContent = 'This workspace was shut down. Return to Workspaces to create new work.';
     return;
   }
 
@@ -750,6 +775,7 @@ async function refresh() {
     syncDocumentTitle(currentProjectTitle, worker.name);
     statePill.textContent = displayStateLabel(displayState);
     syncRunToggle(displayState);
+    syncSteerAvailability(displayState);
 
     currentDesktopAvailable = Boolean(runtime.view_available || runtime.view_url);
   currentDesktopUrl = currentDesktopAvailable ? withUiRev(withAuth(`${uiBase}/desktop/${workerId}`)) : '';
@@ -959,5 +985,6 @@ syncMenuLabels();
 syncProjectWorkspaceLinks();
 syncSendAffordance();
 syncRunToggle('starting');
+syncSteerAvailability('starting');
 autoResizeSteerInput();
 refresh().catch(() => {});

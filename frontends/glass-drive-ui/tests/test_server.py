@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from hashlib import sha256
 from pathlib import Path
@@ -1109,6 +1110,89 @@ def test_authenticated_launch_survives_signed_watch_state_failure_without_duplic
     assert len(runtime.assign_requests) == 1
 
 
+@pytest.mark.parametrize("locked_state", ["link_ref", "watch_session"])
+def test_authenticated_launch_signed_watch_state_lock_falls_back_within_request_budget(
+    tmp_path,
+    monkeypatch,
+    locked_state,
+):
+    link_ref_path = tmp_path / "locked-link-refs.sqlite3"
+    watch_session_path = tmp_path / "locked-watch-sessions.sqlite3"
+    monkeypatch.setenv("WPR_API_TOKEN", "synthetic-ui-service-token")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "synthetic-signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(link_ref_path))
+    monkeypatch.setenv("GLASSHIVE_WATCH_SESSION_STATE_PATH", str(watch_session_path))
+    monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "1800")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    with signed_links_module._link_ref_conn():
+        pass
+    with server_module._watch_session_conn():
+        pass
+    locked_path = link_ref_path if locked_state == "link_ref" else watch_session_path
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    lock_ready = threading.Event()
+
+    def hold_writer_lock():
+        with sqlite3.connect(locked_path, timeout=0.1) as lock:
+            lock.execute("BEGIN IMMEDIATE")
+            lock_ready.set()
+            time.sleep(0.75)
+            lock.rollback()
+
+    lock_thread = threading.Thread(target=hold_writer_lock)
+    lock_thread.start()
+    assert lock_ready.wait(timeout=1.0)
+
+    started_at = time.monotonic()
+    try:
+        response = client.post('/api/launch', json={
+            'description': 'Create one durable workspace without waiting on auxiliary state',
+            'workspace_option': 'new:codex-cli',
+        })
+        elapsed = time.monotonic() - started_at
+    finally:
+        lock_thread.join(timeout=2.0)
+
+    assert response.status_code == 200, response.text
+    assert elapsed < 0.5
+    assert response.json()["watch_url"].startswith("/watch/wrk_new?")
+    assert len(runtime.create_project_requests) == 1
+    assert len(runtime.create_worker_requests) == 1
+    assert len(runtime.assign_requests) == 1
+
+
+@pytest.mark.parametrize("corrupt_state", ["link_ref", "watch_session"])
+def test_authenticated_launch_survives_corrupt_auxiliary_watch_state_without_duplicate_work(
+    tmp_path,
+    monkeypatch,
+    corrupt_state,
+):
+    link_ref_path = tmp_path / "link-refs.sqlite3"
+    watch_session_path = tmp_path / "watch-sessions.sqlite3"
+    monkeypatch.setenv("WPR_API_TOKEN", "synthetic-ui-service-token")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "synthetic-signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(link_ref_path))
+    monkeypatch.setenv("GLASSHIVE_WATCH_SESSION_STATE_PATH", str(watch_session_path))
+    monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "1800")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    corrupt_path = link_ref_path if corrupt_state == "link_ref" else watch_session_path
+    corrupt_path.write_bytes(b"synthetic non-SQLite state")
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.post('/api/launch', json={
+        'description': 'Create one durable workspace despite corrupt auxiliary state',
+        'workspace_option': 'new:codex-cli',
+    })
+
+    assert response.status_code == 200, response.text
+    assert response.json()["watch_url"].startswith("/watch/wrk_new?")
+    assert len(runtime.create_project_requests) == 1
+    assert len(runtime.create_worker_requests) == 1
+    assert len(runtime.assign_requests) == 1
+
+
 def test_launch_honors_available_host_workspace_type(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
@@ -1811,12 +1895,32 @@ def test_workspace_status_scripts_never_label_failed_terminal_runs_completed():
 
     app_script = (static_dir / 'app.js').read_text(encoding='utf-8')
     watch_script = (static_dir / 'watch.js').read_text(encoding='utf-8')
+    desktop_script = (static_dir / 'desktop.js').read_text(encoding='utf-8')
+    watch_markup = (static_dir / 'watch.html').read_text(encoding='utf-8')
+    terminated_priority = "if (workerState === 'terminated') return 'terminated';"
+    for script in (app_script, watch_script):
+        assert terminated_priority in script
+        assert script.index(terminated_priority) < script.index(failed_branch)
     assert "const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);" in app_script
-    assert "RESUME_STATES.has(normalized) || TERMINAL_ATTENTION_STATES.has(normalized)" in app_script
+    assert "RESUME_STATES.has(normalized) || TERMINAL_ATTENTION_STATES.has(normalized)" not in app_script
+    assert "toggle.hidden = TERMINAL_ATTENTION_STATES.has(normalized)" in app_script
+    assert "function syncTileSteerAvailability(tile, state)" in app_script
+    assert app_script.count("syncTileSteerAvailability(tile, state);") >= 2
+    assert "tile.dataset.displayState = normalized" in app_script
+    assert "syncTileSteerAvailability(tile, tile.dataset.displayState || state);" in app_script
+    assert "Send a corrected follow-up below" in app_script
     assert "const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);" in watch_script
-    assert "TERMINAL_ATTENTION_STATES.has(normalized)" in watch_script
+    assert "runToggleButton.hidden = TERMINAL_ATTENTION_STATES.has(normalized)" in watch_script
     assert "TERMINAL_ATTENTION_STATES.has(state)" in watch_script
     assert "Workspace needs attention" in watch_script
+    assert "then use Resume or send a corrected follow-up" not in watch_script
+    assert "then send a corrected follow-up" in watch_script
+    assert "steerInput.disabled = closed" in watch_script
+    assert "sendButton.disabled = closed" in watch_script
+    assert "This workspace is closed" in watch_script
+    assert "GlassHive will resume when you send more work" not in desktop_script
+    assert "This workspace was closed" in desktop_script
+    assert ">Close workspace</button>" in watch_markup
 
 
 def test_browser_action_accepts_explicit_url():

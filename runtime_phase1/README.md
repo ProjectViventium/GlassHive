@@ -52,6 +52,12 @@ one-shot queue.
 - A delayed tick materializes only the latest eligible occurrence and records it before advancing,
   so retries and concurrent ticks do not duplicate a firing.
 
+Hosted migration rehearsals set `GLASSHIVE_BACKGROUND_CONSUMERS_ENABLED=false`. This passive mode
+disables startup queue reconciliation, both immediate and replay/retry callback delivery, lifecycle
+reapers, and the scheduler while a cloned database is inspected. Newly emitted callback records stay
+durably pending for the live phase. The live single-runtime service sets the flag back to `true`; a
+passive rehearsal must never deliver callbacks or execute copied queued/scheduled work.
+
 ## Bootstrap Contract
 
 Each worker can now carry:
