@@ -228,9 +228,10 @@ Browser OIDC login is the authoritative durable role-sync surface. A fully verif
 updates the principal from the configured immutable role/group claim, including promotions and
 demotions; already-open sessions read the current principal role from durable state. MCP access-token
 roles may establish the first role only when enrollment is enabled and must never overwrite an
-existing durable role. Email and `preferred_username` remain mutable display metadata and never own
-a workspace or grant admission. Enforce tenant/domain membership at the IdP through tenant and
-app-role/group assignment policy.
+existing durable role. When a role map is configured, both browser and MCP tokens must contain a
+mapped role before access or enrollment; a missing or unmapped claim fails closed. Email and
+`preferred_username` remain mutable display metadata and never own a workspace or grant admission.
+Enforce tenant/domain membership at the IdP through tenant and app-role/group assignment policy.
 
 Provider account switching also requires the IdP to advertise an `end_session_endpoint` and to
 pre-register the exact `human_auth.oidc.post_logout_redirect_uri` emitted by the compiler (by

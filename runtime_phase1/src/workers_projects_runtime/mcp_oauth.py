@@ -243,7 +243,7 @@ class OidcJwtTokenVerifier:
         self._loaded_at = 0.0
         self._lock = threading.RLock()
 
-    def _role(self, claims: dict[str, Any]) -> str:
+    def _role(self, claims: dict[str, Any]) -> str | None:
         raw_values = claims.get(self.role_claim)
         values = raw_values if isinstance(raw_values, list) else [raw_values]
         mapped = {
@@ -253,10 +253,9 @@ class OidcJwtTokenVerifier:
         for preferred in ("tenant_admin", "service", "viewer", "member"):
             if preferred in mapped and preferred in HUMAN_ROLES:
                 return preferred
-        # When an operator configured a role map, an access token that omits the
-        # mapped claim must not regain member writes that the browser identity
-        # may have intentionally reduced to viewer.
-        return "viewer" if self.role_map else "member"
+        # A configured map is an admission boundary, not only a privilege reducer.
+        # Missing or unmapped claims must fail closed on both browser and MCP paths.
+        return None if self.role_map else "member"
 
     def _refresh_keys(self, *, force: bool = False) -> None:
         with self._lock:
@@ -366,6 +365,8 @@ class OidcJwtTokenVerifier:
             else principal_id(self.issuer, upstream_subject)
         )
         role = self._role(claims)
+        if role is None:
+            return None
         token_role = role
         if self.require_auth_state:
             try:
