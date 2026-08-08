@@ -2,9 +2,10 @@ import { initializeControlPlane, refreshControlPlane, renderActivity } from './c
 
 const ACTIVE_STATES = new Set(['created', 'starting', 'queued', 'running', 'resuming']);
 const ACTIVE_RUN_STATES = new Set(['queued', 'running']);
+const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);
 const INTERRUPTIBLE_STATES = new Set(['queued', 'running', 'resuming']);
 const RESUME_STATES = new Set(['ready', 'paused', 'idle', 'idle_terminated', 'stopped', 'completed', 'retained']);
-const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'failed', 'terminated']);
+const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'terminated']);
 const MAX_LIVE_TILE_IFRAMES = 4;
 const ACTIVE_TILE_REFRESH_MS = 7000;
 const RETAINED_TILE_REFRESH_MS = 60000;
@@ -402,7 +403,8 @@ function workspaceOptionLabel(workspace) {
 }
 
 function workerActionForState(state) {
-  return RESUME_STATES.has(String(state || '').trim().toLowerCase()) ? 'resume' : 'pause';
+  const normalized = String(state || '').trim().toLowerCase();
+  return RESUME_STATES.has(normalized) || TERMINAL_ATTENTION_STATES.has(normalized) ? 'resume' : 'pause';
 }
 
 function workerDesktopUrl(workerId, signedUrl = '') {
@@ -516,6 +518,7 @@ function displayStateForLive(data) {
   const runState = String(data?.latest_run?.state || '').trim().toLowerCase();
   if (runState === 'completed') return 'completed';
   if (ACTIVE_RUN_STATES.has(runState)) return runState;
+  if (['failed', 'cancelled', 'interrupted'].includes(runState)) return runState;
   if (['paused', 'idle', 'idle_terminated', 'stopped', 'ready'].includes(workerState) && !ACTIVE_RUN_STATES.has(runState)) {
     return workerState === 'ready' ? 'completed' : workerState;
   }

@@ -765,7 +765,7 @@ def test_bootstrap_and_launch_flow():
     assert launch.status_code == 200
     assert launch.json()['watch_url'].startswith('/watch/wrk_new')
     assert 'surface=desktop' in launch.json()['watch_url']
-    assert fake.create_worker_requests[-1]['start_synchronously'] is True
+    assert fake.create_worker_requests[-1]['start_synchronously'] is False
 
 
 def test_bootstrap_labels_degraded_personal_sections_instead_of_claiming_empty_state():
@@ -915,6 +915,7 @@ def test_launch_personal_preferred_without_ready_default_keeps_explicit_fallback
     assert runtime.create_worker_requests[-1]['bootstrap_bundle']['provider_account'] == {
         'policy': 'personal_preferred',
     }
+    assert runtime.create_worker_requests[-1]['start_synchronously'] is False
 
 
 def test_launch_rejects_new_credential_selection_for_existing_workspace_before_mutation():
@@ -1083,6 +1084,29 @@ def test_launch_watch_url_uses_short_ref_when_signed_links_enabled(monkeypatch):
     assert redirect.status_code == 307
     assert redirect.headers["location"].startswith("/watch/wrk_new?")
     assert "gh_token=" not in redirect.headers["location"]
+
+
+def test_authenticated_launch_survives_signed_watch_state_failure_without_duplicate_work(
+    monkeypatch,
+):
+    runtime = FakeRuntimeClient()
+    monkeypatch.setattr(
+        server_module,
+        "_append_signed_worker_token",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("synthetic watch state unavailable")),
+    )
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.post('/api/launch', json={
+        'description': 'Create one durable workspace',
+        'workspace_option': 'new:codex-cli',
+    })
+
+    assert response.status_code == 200, response.text
+    assert response.json()["watch_url"].startswith("/watch/wrk_new?")
+    assert len(runtime.create_project_requests) == 1
+    assert len(runtime.create_worker_requests) == 1
+    assert len(runtime.assign_requests) == 1
 
 
 def test_launch_honors_available_host_workspace_type(monkeypatch):
@@ -1731,7 +1755,7 @@ def test_worker_lifecycle_endpoint_supports_workspace_hive_controls():
     assert runtime.lifecycle_requests == [{"worker_id": "wrk_1", "action": "resume"}]
 
 
-def test_launch_uses_desktop_surface_for_browser_projects():
+def test_launch_uses_desktop_surface_without_blocking_on_desktop_startup():
     runtime = FakeRuntimeClient()
     client = TestClient(create_app(runtime_client=runtime))
     launch = client.post('/api/launch', json={
@@ -1742,12 +1766,10 @@ def test_launch_uses_desktop_surface_for_browser_projects():
     })
     assert launch.status_code == 200
     assert 'surface=desktop' in launch.json()['watch_url']
-    assert runtime.desktop_actions == [
-        {'worker_id': 'wrk_new', 'action': 'terminal', 'url': None, 'run_id': 'run_1'},
-    ]
+    assert runtime.desktop_actions == []
 
 
-def test_launch_preopens_browser_for_explicit_external_navigation():
+def test_launch_defers_explicit_external_navigation_to_the_queued_worker():
     runtime = FakeRuntimeClient()
     client = TestClient(create_app(runtime_client=runtime))
     launch = client.post('/api/launch', json={
@@ -1758,10 +1780,43 @@ def test_launch_preopens_browser_for_explicit_external_navigation():
     })
     assert launch.status_code == 200
     assert 'surface=desktop' in launch.json()['watch_url']
-    assert runtime.desktop_actions == [
-        {'worker_id': 'wrk_new', 'action': 'browser', 'url': 'https://example.com', 'run_id': None},
-        {'worker_id': 'wrk_new', 'action': 'terminal', 'url': None, 'run_id': 'run_1'},
-    ]
+    assert runtime.desktop_actions == []
+
+
+def test_launch_never_enters_cold_desktop_startup_before_returning():
+    class ColdDesktopRuntime(FakeRuntimeClient):
+        def desktop_action(self, worker_id: str, action: str, url: str | None = None, run_id: str | None = None):
+            raise AssertionError("desktop startup must remain outside the launch request")
+
+    runtime = ColdDesktopRuntime()
+    response = TestClient(create_app(runtime_client=runtime)).post('/api/launch', json={
+        'description': 'Create and verify a browser-visible result',
+        'workspace_option': 'new:codex-cli',
+    })
+
+    assert response.status_code == 200, response.text
+    assert len(runtime.create_project_requests) == 1
+    assert len(runtime.create_worker_requests) == 1
+    assert len(runtime.assign_requests) == 1
+
+
+def test_workspace_status_scripts_never_label_failed_terminal_runs_completed():
+    static_dir = Path(server_module.STATIC_DIR)
+
+    for script_name in ('app.js', 'watch.js'):
+        script = (static_dir / script_name).read_text(encoding='utf-8')
+        failed_branch = "if (['failed', 'cancelled', 'interrupted'].includes(runState)) return runState;"
+        assert failed_branch in script
+        assert script.index(failed_branch) < script.index("workerState === 'ready' ? 'completed'")
+
+    app_script = (static_dir / 'app.js').read_text(encoding='utf-8')
+    watch_script = (static_dir / 'watch.js').read_text(encoding='utf-8')
+    assert "const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);" in app_script
+    assert "RESUME_STATES.has(normalized) || TERMINAL_ATTENTION_STATES.has(normalized)" in app_script
+    assert "const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);" in watch_script
+    assert "TERMINAL_ATTENTION_STATES.has(normalized)" in watch_script
+    assert "TERMINAL_ATTENTION_STATES.has(state)" in watch_script
+    assert "Workspace needs attention" in watch_script
 
 
 def test_browser_action_accepts_explicit_url():

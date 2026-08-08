@@ -12,6 +12,7 @@ from workers_projects_runtime.openclaw_release import (
     OPENCLAW_RUNTIME_VERSION,
     require_reviewed_openclaw_version,
     reviewed_openclaw_env,
+    stage_reviewed_openclaw_lock,
 )
 from workers_projects_runtime.profile_runtime import HostOpenClawRuntime, OpenClawWorkstationRuntime
 from workers_projects_runtime.runtime_requirements import (
@@ -70,6 +71,21 @@ def test_committed_openclaw_lock_contains_reviewed_tarball_and_override():
             if path.endswith(f"node_modules/{name}")
         }
         assert installed_versions == {version}
+
+
+def test_reviewed_openclaw_lock_staging_can_refresh_read_only_prior_output(tmp_path):
+    destination = tmp_path / "openclaw-runtime-lock"
+
+    stage_reviewed_openclaw_lock(destination)
+    for name in ("package.json", "package-lock.json"):
+        (destination / name).chmod(0o444)
+
+    stage_reviewed_openclaw_lock(destination)
+
+    runtime_phase1 = Path(__file__).resolve().parents[1]
+    source = runtime_phase1 / "runtime_locks" / "openclaw"
+    for name in ("package.json", "package-lock.json"):
+        assert (destination / name).read_bytes() == (source / name).read_bytes()
 
 
 def test_runtime_sources_have_no_mutable_or_rejected_openclaw_install():

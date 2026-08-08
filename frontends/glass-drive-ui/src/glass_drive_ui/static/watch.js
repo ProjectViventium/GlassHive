@@ -12,6 +12,7 @@ const queueShortcutLabel = isApplePlatform ? '⌘+Enter' : 'Ctrl+Enter';
 const LONG_PRESS_MS = 550;
 const ACTIVE_REFRESH_MS = 2000;
 const IDLE_REFRESH_MS = 10000;
+const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);
 const GLASSHIVE_UI_REV = '20260626a';
 const workspaceApiBase = `/api/workspace/${workerId}`;
 
@@ -99,6 +100,7 @@ function displayStateForLive(data) {
   const runState = String(data?.latest_run?.state || '').trim().toLowerCase();
   if (runState === 'completed') return 'completed';
   if (['queued', 'running'].includes(runState)) return runState;
+  if (['failed', 'cancelled', 'interrupted'].includes(runState)) return runState;
   if (['paused', 'idle', 'idle_terminated', 'stopped', 'ready'].includes(workerState)) {
     return workerState === 'ready' ? 'completed' : workerState;
   }
@@ -236,8 +238,8 @@ function syncSendAffordance() {
 function syncRunToggle(state) {
   if (!runToggleButton) return;
   const normalized = String(state || '').trim().toLowerCase();
-  const shouldResume = normalized === 'paused' || normalized === 'idle' || normalized === 'idle_terminated' || normalized === 'stopped' || normalized === 'completed';
-  const disabled = ['created', 'starting', 'failed', 'terminated'].includes(normalized);
+  const shouldResume = normalized === 'paused' || normalized === 'idle' || normalized === 'idle_terminated' || normalized === 'stopped' || normalized === 'completed' || TERMINAL_ATTENTION_STATES.has(normalized);
+  const disabled = ['created', 'starting', 'terminated'].includes(normalized);
   runToggleButton.dataset.action = shouldResume ? 'resume' : 'pause';
   runToggleButton.textContent = normalized === 'completed' ? 'Continue' : shouldResume ? 'Resume' : 'Pause';
   runToggleButton.setAttribute('aria-label', normalized === 'completed' ? 'Continue workspace' : shouldResume ? 'Resume workspace' : 'Pause workspace');
@@ -299,7 +301,7 @@ function setSurface(surface, { force = false } = {}) {
   activeSurface = surface === 'desktop' ? 'desktop' : 'terminal';
   syncMenuLabels();
   const state = String(statePill.textContent || 'starting').trim().toLowerCase();
-  if (['created', 'starting', 'paused', 'idle', 'idle_terminated', 'stopped', 'failed', 'terminated'].includes(state)) {
+  if (['created', 'starting', 'paused', 'idle', 'idle_terminated', 'stopped', 'terminated'].includes(state) || TERMINAL_ATTENTION_STATES.has(state)) {
     clearAttachedView();
     setOverlay(state);
     return;
@@ -655,14 +657,24 @@ async function submitFooterInstruction(mode) {
 
 function setOverlay(state, detail) {
   const completed = state === 'completed';
+  const needsAttention = TERMINAL_ATTENTION_STATES.has(state);
   const connecting = !completed && attachStartedAt && !frameReady && Date.now() - attachStartedAt < 12000;
   const filePreviewActive = activeSurface === 'desktop' && Boolean(filePreviewUrl());
-  const waiting = state === 'starting' || state === 'paused' || state === 'idle' || state === 'idle_terminated' || state === 'stopped' || connecting;
+  const waiting = state === 'starting' || state === 'paused' || state === 'idle' || state === 'idle_terminated' || state === 'stopped' || needsAttention || connecting;
   overlay.hidden = !waiting;
   if (stage) {
     stage.dataset.overlayActive = String(waiting);
   }
   if (!waiting) return;
+
+  if (needsAttention) {
+    if (overlayLabel) {
+      overlayLabel.textContent = 'Workspace needs attention';
+    }
+    overlayTitle.textContent = 'Workspace needs attention';
+    overlayDetail.textContent = 'The latest run did not complete. Review the status details, then use Resume or send a corrected follow-up.';
+    return;
+  }
 
   if (state === 'paused') {
     if (overlayLabel) {

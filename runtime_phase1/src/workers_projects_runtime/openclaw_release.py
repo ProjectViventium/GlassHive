@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shlex
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -121,5 +123,19 @@ def stage_reviewed_openclaw_lock(destination: Path) -> None:
     lock_root = OPENCLAW_RUNTIME_LOCK_DIR
     validate_reviewed_openclaw_lock(lock_root)
     destination.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(lock_root / "package.json", destination / "package.json")
-    shutil.copy2(lock_root / "package-lock.json", destination / "package-lock.json")
+    for name in ("package.json", "package-lock.json"):
+        target = destination / name
+        with tempfile.NamedTemporaryFile(
+            dir=destination,
+            prefix=f".{name}.",
+            delete=False,
+        ) as handle:
+            staged = Path(handle.name)
+        try:
+            # The reviewed source is intentionally read-only in sealed releases. Replacing a
+            # same-directory temporary file keeps retries idempotent without making prior output
+            # writable or exposing a partially copied build input.
+            shutil.copy2(lock_root / name, staged)
+            os.replace(staged, target)
+        finally:
+            staged.unlink(missing_ok=True)

@@ -27,7 +27,6 @@ from pydantic import BaseModel, Field
 from .prompt_template import (
     build_operator_brief,
     build_project_title,
-    desktop_action_for_launch,
     initial_watch_surface_for_launch,
     normalize_launch_surface,
 )
@@ -669,19 +668,6 @@ def _project_title_for_worker(client: RuntimeClient, project_id: str) -> str:
         return project_id
 
 
-def _launch_browser_url(description: str) -> str | None:
-    lowered = description.strip()
-    match = re.search(r"https?://[^\s<>'\"`]+", lowered, flags=re.IGNORECASE)
-    if match:
-        return match.group(0).rstrip(").,;")
-    domain = re.search(r"\b([a-z0-9-]+(?:\.[a-z0-9-]+)+)\b", lowered, flags=re.IGNORECASE)
-    if domain:
-        host = domain.group(1)
-        if host.lower() not in {"localhost", "127.0.0.1", "0.0.0.0"}:
-            return f"https://{host}"
-    return None
-
-
 def _env_flag(name: str, default: bool) -> bool:
     raw = str(os.environ.get(name, "")).strip().lower()
     if not raw:
@@ -885,10 +871,6 @@ def _owner_matches_identity(owner_id: object, identity: dict[str, str]) -> bool:
 
 def _default_launch_surface() -> str:
     return normalize_launch_surface(os.environ.get("GLASSHIVE_DEFAULT_LAUNCH_SURFACE", "desktop"))
-
-
-def _show_live_terminal_in_desktop() -> bool:
-    return _env_flag("GLASSHIVE_SHOW_LIVE_TERMINAL_IN_DESKTOP", True)
 
 
 def _launch_surface_options() -> list[dict[str, str]]:
@@ -1190,25 +1172,6 @@ def _bootstrap_bundle_for_uploads(files: list[UploadedFileRequest]) -> dict[str,
             "force a downloadable file when a concise chat result satisfies the request."
         ),
     }
-
-
-def _launch_desktop_surfaces(
-    client: RuntimeClient,
-    *,
-    worker_id: str,
-    profile: str,
-    description: str,
-    run_id: str,
-    surface: str,
-) -> None:
-    if surface != "desktop":
-        return
-    action = desktop_action_for_launch(profile, description)
-    browser_url = _launch_browser_url(description) if action == "browser" else None
-    if action == "browser" and browser_url:
-        client.desktop_action(worker_id, "browser", url=browser_url)
-    if _show_live_terminal_in_desktop():
-        client.desktop_action(worker_id, "terminal", run_id=run_id)
 
 
 def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
@@ -3164,7 +3127,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                     role=payload.success_criteria.strip()[:160] or "main",
                     bootstrap_bundle=bootstrap_bundle,
                     execution_mode=execution_mode,
-                    start_synchronously=not bool(schedule_text),
+                    # Cold image preparation belongs to the durable worker queue, not the
+                    # browser request budget. The immediately assigned run transitions this
+                    # prepared workspace to starting and the watch surface reports progress.
+                    start_synchronously=False,
                 )
                 worker_id = str(worker["worker_id"])
                 created_new_worker = True
@@ -3188,20 +3154,18 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             payload.description,
             launch_surface=payload.launch_surface or _default_launch_surface(),
         )
-        if not scheduled:
-            try:
-                _launch_desktop_surfaces(
-                    active_client,
-                    worker_id=str(worker_id),
-                    profile=profile,
-                    description=payload.description,
-                    run_id=str((run or {}).get("run_id") or ""),
-                    surface=surface,
-                )
-            except Exception:
-                pass
-
         watch_url = f"/watch/{worker_id}?project_id={project_id}&surface={surface}"
+        try:
+            launch_watch_url = _append_signed_worker_token(watch_url, str(worker_id), identity)
+        except (OSError, sqlite3.OperationalError):
+            # Project, worker, and run are already durable. An authenticated browser can use the
+            # ordinary owner-scoped route, so do not turn auxiliary short-link state failure into
+            # a retry that duplicates work. Keep storage paths and exception text out of logs.
+            logger.warning(
+                "Signed launch link storage unavailable after durable launch for worker %s",
+                worker_id,
+            )
+            launch_watch_url = watch_url
         return {
             "project_id": project_id,
             "worker_id": str(worker_id),
@@ -3209,7 +3173,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             "schedule_id": (scheduled or {}).get("schedule_id"),
             "scheduled_for": (scheduled or {}).get("run_at"),
             "status": "scheduled" if scheduled else "dispatched",
-            "watch_url": _append_signed_worker_token(watch_url, str(worker_id), identity),
+            "watch_url": launch_watch_url,
         }
 
     @app.get("/api/workspace/{worker_id}/live")
