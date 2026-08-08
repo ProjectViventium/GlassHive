@@ -224,7 +224,20 @@ async function connectDesktop() {
 
     const wsScheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${wsScheme}//${window.location.host}${withAuth(`/novnc/${workerId}/websockify`)}`;
-    const password = '';
+    const credentialResponse = await fetch(
+      withAuth(`/api/workspace/${workerId}/desktop-credentials`),
+      {
+        cache: 'no-store',
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json' },
+      },
+    );
+    if (!credentialResponse.ok) {
+      setStatus('Desktop authentication unavailable', 'GlassHive could not securely attach this live desktop. Retry after the worker finishes starting.');
+      return;
+    }
+    const credentialPayload = await credentialResponse.json();
+    const password = String(credentialPayload.password || '');
 
     if (rfb && wsUrl === currentWsUrl && password === currentPassword) {
       return;
@@ -266,7 +279,7 @@ async function connectDesktop() {
     }
 
     rfb = new RFB(stage, wsUrl, {
-      credentials: password ? { password } : {},
+      credentials: { password },
     });
     rfb.scaleViewport = true;
     rfb.background = '#000';

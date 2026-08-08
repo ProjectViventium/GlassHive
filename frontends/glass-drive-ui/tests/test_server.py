@@ -11,12 +11,17 @@ from hashlib import sha256
 from pathlib import Path
 
 import httpx
+import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import glass_drive_ui.server as server_module
 import glass_drive_ui.signed_links as signed_links_module
+import glass_drive_ui.internal_assertions as internal_assertions_module
+from glass_drive_ui.auth_gateway import AuthGatewayError
 from glass_drive_ui.server import create_app
 from glass_drive_ui.signed_links import (
     SensitiveUrlLogFilter,
@@ -33,6 +38,43 @@ def worker_cookie_name(worker_id: str) -> str:
     return f"glasshive_gh_token_{digest}"
 
 
+def test_ui_credential_bearing_sqlite_state_is_private(tmp_path, monkeypatch):
+    link_path = tmp_path / "private-state" / "link-refs.sqlite3"
+    watch_path = tmp_path / "private-state" / "watch-sessions.sqlite3"
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(link_path))
+    monkeypatch.setenv("GLASSHIVE_WATCH_SESSION_STATE_PATH", str(watch_path))
+
+    link_connection = signed_links_module._link_ref_conn()
+    watch_connection = server_module._watch_session_conn()
+    try:
+        link_connection.execute(
+            "INSERT INTO signed_link_refs "
+            "(ref_id, kind, token, target_url, expires_at, created_at) "
+            "VALUES ('ghr_private_test', 'worker_view', 'synthetic', '/watch/test', 0, 1)"
+        )
+        link_connection.commit()
+        watch_connection.execute(
+            "INSERT INTO watch_sessions "
+            "(tenant_id, owner_id, worker_id, started_at, expires_at, updated_at) "
+            "VALUES ('tenant', 'owner', 'worker', 1, 2, 1)"
+        )
+        watch_connection.commit()
+        signed_links_module._harden_sqlite_state_path(link_path)
+        server_module._harden_watch_session_state(watch_path)
+        assert os.stat(link_path.parent).st_mode & 0o077 == 0
+        for state_path in (link_path, watch_path):
+            for candidate in (
+                state_path,
+                Path(f"{state_path}-wal"),
+                Path(f"{state_path}-shm"),
+            ):
+                if candidate.exists():
+                    assert os.stat(candidate).st_mode & 0o077 == 0
+    finally:
+        link_connection.close()
+        watch_connection.close()
+
+
 @pytest.fixture(autouse=True)
 def clear_glasshive_ui_env(monkeypatch, tmp_path):
     for name in (
@@ -40,6 +82,7 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "GLASSHIVE_DEFAULT_OWNER_ID",
         "GLASSHIVE_ENTERPRISE_MODE",
         "GLASSHIVE_PUBLIC_LINKS_ONLY",
+        "GLASSHIVE_SECURITY_MODE",
         "WPR_ENTERPRISE_MODE",
         "GLASSHIVE_AUTH_MODE",
         "GLASSHIVE_ENTERPRISE_TENANT_ID",
@@ -56,10 +99,46 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "GLASSHIVE_LINK_REF_TTL_SECONDS",
         "GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME",
         "GLASSHIVE_HOST_WORKERS_ENABLED",
+        "GLASSHIVE_RELEASE_ID",
+        "GLASSHIVE_PARENT_REVISION",
+        "GLASSHIVE_COMPONENT_REVISION",
         "GLASSHIVE_DEFAULT_WORKER_PROFILE",
         "GLASSHIVE_ALLOWED_WORKER_PROFILES",
         "GLASSHIVE_WATCH_SESSION_STATE_PATH",
         "GLASSHIVE_MAX_WATCH_SESSION_DURATION_S",
+        "GLASSHIVE_INTERNAL_ASSERTION_PRIVATE_KEY_FILE",
+        "GLASSHIVE_INTERNAL_ASSERTION_ISSUER",
+        "GLASSHIVE_INTERNAL_ASSERTION_AUDIENCE",
+        "GLASSHIVE_INTERNAL_ASSERTION_KEY_ID",
+        "GLASSHIVE_INTERNAL_ASSERTION_PREVIOUS_JWKS_FILE",
+        "GLASSHIVE_INTERNAL_ASSERTION_PREVIOUS_KEYS_EXPIRE_AT",
+        "GLASSHIVE_HUMAN_AUTH_MODE",
+        "GLASSHIVE_AUTH_STATE_PATH",
+        "GLASSHIVE_ALLOW_EMAIL_LOGIN",
+        "GLASSHIVE_ALLOW_EMAIL_REGISTRATION",
+        "GLASSHIVE_ALLOWED_EMAIL_DOMAINS",
+        "GLASSHIVE_AUTH_SESSION_TTL_SECONDS",
+        "GLASSHIVE_AUTH_MAX_ATTEMPTS",
+        "GLASSHIVE_OIDC_ISSUER",
+        "GLASSHIVE_OIDC_CLIENT_ID",
+        "GLASSHIVE_OIDC_CLIENT_SECRET",
+        "GLASSHIVE_OIDC_REDIRECT_URI",
+        "GLASSHIVE_OIDC_POST_LOGOUT_REDIRECT_URI",
+        "GLASSHIVE_OIDC_SCOPES",
+        "GLASSHIVE_OIDC_ROLE_CLAIM",
+        "GLASSHIVE_OIDC_ROLE_MAP_JSON",
+        "GLASSHIVE_OIDC_PRINCIPAL_CLAIM",
+        "GLASSHIVE_OIDC_EMAIL_CLAIM",
+        "GLASSHIVE_OIDC_EMAIL_CLAIM_TRUSTED",
+        "GLASSHIVE_MCP_OAUTH_SUBJECT_CLAIM",
+        "GLASSHIVE_PRINCIPAL_ID_FORMAT",
+        "GLASSHIVE_TRUSTED_PROXY_BOUNDARY_PROVEN",
+        "GLASSHIVE_SCHEDULING_OWNER",
+        "GLASSHIVE_SCHEDULING_OWNER_URL",
+        "GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS",
+        "GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH",
+        "GLASSHIVE_PROVIDER_SECRET_STORE_ENABLED",
+        "GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION",
         "WPR_DEFAULT_EXECUTION_MODE",
         "WPR_ALLOWED_WORKER_PROFILES",
         "WPR_LINK_REF_TTL_SECONDS",
@@ -96,6 +175,21 @@ class FakeRuntimeClient:
         self.lifecycle_requests = []
         self.worker_live_requests = []
         self.worker_view_open_requests = []
+        self.provider_account_requests = []
+        self.provider_setup_requests = []
+        self.provider_disconnect_requests = []
+        self.provider_verify_requests = []
+        self.provider_forget_requests = []
+        self.workspace_grant_requests = []
+        self.pending_change_requests = []
+        self.pending_change_reads = []
+        self.pending_confirm_requests = []
+        self.recurring_schedule_requests = []
+        self.workspace_duplicate_requests = []
+        self.workspace_template_requests = []
+        self.activity_requests = []
+        self.schedule_authority_requests = []
+        self.schedule_authority_error = None
 
     def health(self):
         return {"status": "ok"}
@@ -112,6 +206,173 @@ class FakeRuntimeClient:
             {"worker_id": "wrk_1", "name": "Main Worker", "profile": "codex-cli", "state": "ready"},
             {"worker_id": "wrk_dead", "name": "Old Worker", "profile": "codex-cli", "state": "terminated"},
         ]
+
+    def current_user(self):
+        return {"tenant_id": "local", "user_id": "demo-owner", "email": "", "role": "local_operator"}
+
+    def set_schedule_principal_authority(self, principal_id: str, *, enabled: bool):
+        self.schedule_authority_requests.append(
+            {"principal_id": principal_id, "enabled": enabled}
+        )
+        if self.schedule_authority_error is not None:
+            raise self.schedule_authority_error
+        return {
+            "principal_id": principal_id,
+            "enabled": enabled,
+            "native_schedules_deactivated": 1 if not enabled else 0,
+            "delegated_schedules_deactivated": 1 if not enabled else 0,
+        }
+
+    def list_provider_accounts(self):
+        return [{
+            "account_id": "acct_1",
+            "provider": "codex",
+            "label": "Personal Codex",
+            "status": "ready",
+            "is_default": True,
+        }]
+
+    def create_provider_account(self, payload: dict):
+        self.provider_account_requests.append(payload)
+        return {"account_id": "acct_new", **{key: value for key, value in payload.items() if key != "secret_locator"}}
+
+    def start_provider_account_setup(self, account_id: str):
+        self.provider_setup_requests.append({"action": "start", "account_id": account_id})
+        return {"account_id": account_id, "status": "connecting", "instructions": "Visit the provider", "complete": False}
+
+    def provider_account_setup_status(self, account_id: str):
+        self.provider_setup_requests.append({"action": "status", "account_id": account_id})
+        return {"account_id": account_id, "status": "ready", "instructions": "", "complete": True}
+
+    def cancel_provider_account_setup(self, account_id: str):
+        self.provider_setup_requests.append({"action": "cancel", "account_id": account_id})
+        return {"account_id": account_id, "status": "action_required", "complete": True}
+
+    def disconnect_provider_account(self, account_id: str):
+        self.provider_disconnect_requests.append(account_id)
+        return {"account_id": account_id, "status": "disconnected", "complete": True}
+
+    def verify_provider_account(self, account_id: str):
+        self.provider_verify_requests.append(account_id)
+        return {"account_id": account_id, "status": "ready", "complete": True}
+
+    def forget_provider_account(self, account_id: str):
+        self.provider_forget_requests.append(account_id)
+        return {"account_id": account_id, "status": "forgotten"}
+
+    def list_connections(self):
+        return [{"connection_id": "conn_1", "label": "Team documents", "status": "ready"}]
+
+    def list_library(self):
+        return [{
+            "library_id": "lib_1",
+            "stable_id": "skill.synthetic.summary",
+            "version": "1.0.0",
+            "scopes": ["documents:read"],
+            "activation_status": "ready",
+            "manifest": {"activatable": True},
+        }]
+
+    def list_activity(self, *, limit=50):
+        self.activity_requests.append(limit)
+        return [{"event_id": "evt_1", "workspace_name": "Main Worker", "event_type": "worker.created"}]
+
+    def list_workspace_catalog(self, **kwargs):
+        requested = {value for value in str(kwargs.get("kind") or "named").split(",") if value}
+        items = []
+        for project in self.list_projects():
+            for worker in self.list_workers(project["project_id"]):
+                workspace_kind = str(worker.get("workspace_kind") or "named")
+                if requested and workspace_kind not in requested:
+                    continue
+                items.append(
+                    {
+                        **worker,
+                        "project_id": project["project_id"],
+                        "project_title": project["title"],
+                        "workspace_kind": workspace_kind,
+                        "favorite": bool(worker.get("favorite")),
+                        "tags": list(worker.get("tags") or []),
+                    }
+                )
+        return {"items": items, "next_cursor": None}
+
+    def duplicate_workspace(self, worker_id: str, *, idempotency_key: str, name: str = ""):
+        self.workspace_duplicate_requests.append(
+            {"worker_id": worker_id, "idempotency_key": idempotency_key, "name": name}
+        )
+        return {
+            "project": {"project_id": "prj_duplicate"},
+            "workspace": {"worker_id": "wrk_dup", "name": name or "Main Worker copy"},
+        }
+
+    def list_workspace_templates(self):
+        return [{
+            "template_id": "wst_synthetic",
+            "lineage_id": "wsl_synthetic",
+            "version": 1,
+            "name": "Synthetic research desk",
+            "description": "A reusable, private workspace intent.",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+            "content_hash": "sha256:synthetic",
+            "library_refs": [{
+                "stable_id": "skill.synthetic.summary",
+                "version": "1.0.0",
+                "content_hash": "sha256:library-synthetic",
+                "scopes": ["documents:read"],
+            }],
+        }]
+
+    def save_workspace_template(self, worker_id: str, payload: dict):
+        self.workspace_template_requests.append(
+            {"action": "save", "worker_id": worker_id, "payload": payload}
+        )
+        return {**self.list_workspace_templates()[0], **payload}
+
+    def instantiate_workspace_template(self, template_id: str, payload: dict):
+        self.workspace_template_requests.append(
+            {"action": "instantiate", "template_id": template_id, "payload": payload}
+        )
+        return {
+            "project": {"project_id": "prj_template"},
+            "workspace": {
+                "worker_id": "wrk_template",
+                "name": payload.get("name") or "Synthetic research desk",
+                "state": "paused",
+            },
+            "approvals_required": self.list_workspace_templates()[0]["library_refs"],
+            "idempotent_replay": False,
+        }
+
+    def create_pending_change(self, payload: dict):
+        self.pending_change_requests.append(payload)
+        return {"change_id": "chg_1", "confirmation_token": "synthetic-confirmation-token", "status": "pending"}
+
+    def list_workspace_grants(self, worker_id: str):
+        self.workspace_grant_requests.append({"action": "list", "worker_id": worker_id})
+        return [{"grant_id": "grant_1", "worker_id": worker_id, "library_id": "lib_1"}]
+
+    def revoke_workspace_grant(self, worker_id: str, grant_id: str):
+        self.workspace_grant_requests.append(
+            {"action": "revoke", "worker_id": worker_id, "grant_id": grant_id}
+        )
+        return {"grant_id": grant_id, "worker_id": worker_id, "revoked_at": 1}
+
+    def get_pending_change(self, change_id: str):
+        self.pending_change_reads.append(change_id)
+        return {
+            "change_id": change_id,
+            "change_type": "library_enable",
+            "target_id": "wrk_1",
+            "payload": {"library_id": "lib_1", "scopes": ["files:read"]},
+            "status": "pending",
+            "expires_at": 4102444800,
+        }
+
+    def confirm_pending_change(self, change_id: str, confirmation_token: str):
+        self.pending_confirm_requests.append({"change_id": change_id, "confirmation_token": confirmation_token})
+        return {"change_id": change_id, "status": "confirmed"}
 
     def get_worker(self, worker_id: str):
         self.get_worker_requests.append(worker_id)
@@ -147,7 +408,7 @@ class FakeRuntimeClient:
         self.worker_live_requests.append(worker_id)
         return {
             "worker": {"worker_id": worker_id, "name": "Main Worker", "project_id": "prj_1", "profile": "codex-cli", "state": "ready"},
-            "runtime_details": {"view_url": "http://127.0.0.1:60812/?autoconnect=1"},
+            "runtime_details": {"view_url": "http://127.0.0.1:60812/?autoconnect=1&password=synthetic-vnc"},
             "latest_output": "OK",
             "deliverable": {
                 "kind": "webpage",
@@ -172,11 +433,23 @@ class FakeRuntimeClient:
         self.create_worker_requests.append({"project_id": project_id, "owner_id": owner_id, "profile": profile, **kwargs})
         return {"worker_id": "wrk_new"}
 
-    def duplicate_worker(self, project_id: str, source_worker_id: str, owner_id: str):
+    def duplicate_worker(
+        self,
+        project_id: str,
+        source_worker_id: str,
+        owner_id: str,
+        *,
+        name: str = "Main Workspace",
+    ):
         self.duplicate_requests.append(
-            {"project_id": project_id, "source_worker_id": source_worker_id, "owner_id": owner_id}
+            {
+                "project_id": project_id,
+                "source_worker_id": source_worker_id,
+                "owner_id": owner_id,
+                "name": name,
+            }
         )
-        return {"worker_id": "wrk_dup"}
+        return {"worker_id": "wrk_dup", "name": name}
 
     def assign_run(self, worker_id: str, instruction: str):
         self.assign_requests.append({"worker_id": worker_id, "instruction": instruction})
@@ -187,6 +460,72 @@ class FakeRuntimeClient:
     def schedule_run(self, worker_id: str, instruction: str, **kwargs):
         self.schedule_requests.append({"worker_id": worker_id, "instruction": instruction, **kwargs})
         return {"schedule_id": "sch_1", "worker_id": worker_id, "run_at": "2026-05-23T19:00:00+00:00", "state": "pending"}
+
+    def create_recurring_schedule(self, worker_id: str, payload: dict):
+        self.recurring_schedule_requests.append({"action": "create", "worker_id": worker_id, "payload": payload})
+        return {
+            "definition_id": "rsd_public_safe",
+            "worker_id": worker_id,
+            "instruction": payload["instruction"],
+            "recurrence_type": payload["recurrence_type"],
+            "interval_seconds": payload.get("interval_seconds"),
+            "local_time": payload.get("local_time", ""),
+            "timezone_name": payload.get("timezone_name", "UTC"),
+            "dst_policy": payload.get("dst_policy", "elapsed"),
+            "next_run_at": "2027-01-02T14:00:00+00:00",
+            "active": True,
+        }
+
+    def recurring_schedules(self, *, include_inactive: bool = False):
+        self.recurring_schedule_requests.append({"action": "list", "include_inactive": include_inactive})
+        return [
+            {
+                "definition_id": "rsd_public_safe",
+                "worker_id": "wrk_1",
+                "instruction": "Run the synthetic check.",
+                "recurrence_type": "interval",
+                "interval_seconds": 3600,
+                "local_time": "",
+                "timezone_name": "UTC",
+                "dst_policy": "elapsed",
+                "next_run_at": "2027-01-02T14:00:00+00:00",
+                "active": True,
+            }
+        ]
+
+    def recurring_schedule_occurrences(self, definition_id: str, *, limit: int = 50):
+        self.recurring_schedule_requests.append(
+            {"action": "occurrences", "definition_id": definition_id, "limit": limit}
+        )
+        return [{"occurrence_id": "occ_public_safe", "definition_id": definition_id, "state": "completed"}]
+
+    def deactivate_recurring_schedule(self, definition_id: str):
+        self.recurring_schedule_requests.append({"action": "deactivate", "definition_id": definition_id})
+        return {"definition_id": definition_id, "active": False}
+
+    def update_recurring_schedule(self, definition_id: str, payload: dict):
+        self.recurring_schedule_requests.append(
+            {"action": "update", "definition_id": definition_id, "payload": payload}
+        )
+        return {
+            "definition_id": definition_id,
+            "active": bool(payload.get("enabled", True)),
+            "enabled": bool(payload.get("enabled", True)),
+        }
+
+    def run_recurring_schedule_now(self, definition_id: str, idempotency_key: str):
+        self.recurring_schedule_requests.append(
+            {"action": "run_now", "definition_id": definition_id, "idempotency_key": idempotency_key}
+        )
+        return {"definition_id": definition_id, "status": "scheduled", "schedule_id": "sch_manual"}
+
+    def retire_recurring_schedule(self, definition_id: str):
+        self.recurring_schedule_requests.append({"action": "retire", "definition_id": definition_id})
+        return {
+            "definition_id": definition_id,
+            "active": False,
+            "retired_at": "2027-01-01T00:00:00+00:00",
+        }
 
     def update_worker_metadata(self, worker_id: str, payload: dict):
         self.metadata_requests.append({"worker_id": worker_id, "payload": payload})
@@ -291,6 +630,48 @@ def set_enterprise_ui_env(
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
 
 
+def configure_internal_assertion_signer(tmp_path, monkeypatch):
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key_path = tmp_path / "gateway-private-key.pem"
+    key_path.write_bytes(
+        private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    key_path.chmod(0o600)
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "signed_internal_assertion")
+    monkeypatch.setenv("GLASSHIVE_INTERNAL_ASSERTION_PRIVATE_KEY_FILE", str(key_path))
+    monkeypatch.setenv("GLASSHIVE_INTERNAL_ASSERTION_ISSUER", "https://gateway.example.invalid")
+    monkeypatch.setenv("GLASSHIVE_INTERNAL_ASSERTION_AUDIENCE", "glasshive-runtime")
+    monkeypatch.setenv("GLASSHIVE_INTERNAL_ASSERTION_KEY_ID", "gateway-test-key")
+    return private_key
+
+
+def test_oidc_start_attempt_limiter_prunes_expired_sources_and_stays_bounded():
+    limiter = server_module._BoundedAttemptLimiter(
+        window_seconds=10,
+        max_attempts=1,
+        max_sources=3,
+    )
+
+    limiter.admit("source-a", now=0)
+    limiter.admit("source-b", now=1)
+    limiter.admit("source-c", now=2)
+    limiter.admit("source-d", now=3)
+
+    assert len(limiter.attempts_by_source) == 3
+    assert "source-a" not in limiter.attempts_by_source
+
+    with pytest.raises(server_module.HTTPException) as limited:
+        limiter.admit("source-d", now=4)
+    assert limited.value.status_code == 429
+
+    limiter.admit("source-e", now=20)
+    assert limiter.attempts_by_source == {"source-e": [20]}
+
+
 def test_ui_loads_enterprise_service_auth_from_runtime_env_file(tmp_path, monkeypatch):
     env_file = tmp_path / "runtime.env"
     link_ref_state = tmp_path / "shared-link-refs.sqlite3"
@@ -329,6 +710,28 @@ def test_ui_loads_enterprise_service_auth_from_runtime_env_file(tmp_path, monkey
     assert fake.header_contexts[0]["X-Viventium-User-Id"] == "qa-user"
 
 
+def test_health_reports_gateway_and_runtime_release_provenance(monkeypatch):
+    expected_release = {
+        "release_id": "release_public_safe",
+        "parent_revision": "a" * 40,
+        "glasshive_revision": "b" * 40,
+    }
+    monkeypatch.setenv("GLASSHIVE_RELEASE_ID", expected_release["release_id"])
+    monkeypatch.setenv("GLASSHIVE_PARENT_REVISION", expected_release["parent_revision"])
+    monkeypatch.setenv("GLASSHIVE_COMPONENT_REVISION", expected_release["glasshive_revision"])
+    runtime = FakeRuntimeClient()
+    runtime.health = lambda: {"status": "ok", "release": expected_release}
+
+    response = TestClient(create_app(runtime_client=runtime)).get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "release": expected_release,
+        "runtime": {"status": "ok", "release": expected_release},
+    }
+
+
 def test_bootstrap_and_launch_flow():
     fake = FakeRuntimeClient()
     client = TestClient(create_app(runtime_client=fake))
@@ -339,6 +742,10 @@ def test_bootstrap_and_launch_flow():
     assert boot.json()['default_launch_surface'] == 'desktop'
     assert boot.json()['default_workspace_type'] == 'sandboxed'
     assert boot.json()['workspace_type_options'][0]['label'] == 'Sandboxed Workspace'
+    assert boot.json()['provider_accounts'][0]['account_id'] == 'acct_1'
+    assert boot.json()['recurring_schedules_status'] == 'ready'
+    assert set(boot.json()['bootstrap_sections'].values()) == {'ready'}
+    assert boot.json()['recurring_schedules'][0]['worker_id'] == 'wrk_1'
     assert len(boot.json()['existing_workspaces']) == 1
     assert boot.json()['existing_workspaces'][0]['is_active'] is False
     assert boot.json()['existing_workspaces'][0]['is_resumable'] is True
@@ -347,6 +754,7 @@ def test_bootstrap_and_launch_flow():
     assert boot.json()['existing_workspaces'][0]['project_url'] == '/ui/projects/prj_1?worker_id=wrk_1'
     assert boot.json()['existing_workspaces'][0]['desktop_url'] == '/desktop/wrk_1'
     assert boot.json()['existing_workspaces'][0]['api_url'] == '/api/worker/wrk_1'
+    assert boot.json()['existing_workspaces'][0]['control_url'] == '/api/worker/wrk_1'
 
     launch = client.post('/api/launch', json={
         'description': 'Research a self-hosted worker runtime',
@@ -358,6 +766,234 @@ def test_bootstrap_and_launch_flow():
     assert launch.json()['watch_url'].startswith('/watch/wrk_new')
     assert 'surface=desktop' in launch.json()['watch_url']
     assert fake.create_worker_requests[-1]['start_synchronously'] is True
+
+
+def test_bootstrap_labels_degraded_personal_sections_instead_of_claiming_empty_state():
+    class DegradedRuntime(FakeRuntimeClient):
+        def get_preferences(self):
+            raise RuntimeError("synthetic unavailable")
+
+        def list_activity(self, *, limit=50):
+            raise RuntimeError("synthetic unavailable")
+
+        def list_provider_accounts(self):
+            raise RuntimeError("synthetic unavailable")
+
+        def list_workspace_templates(self):
+            raise RuntimeError("synthetic unavailable")
+
+        def recurring_schedules(self, *, include_inactive: bool = False):
+            raise RuntimeError("synthetic unavailable")
+
+    response = TestClient(create_app(runtime_client=DegradedRuntime())).get('/api/bootstrap')
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['bootstrap_sections']['workspace_catalog'] == 'ready'
+    assert all(
+        payload['bootstrap_sections'][section] == 'unavailable'
+        for section in (
+            'preferences',
+            'activity',
+            'provider_accounts',
+            'workspace_templates',
+            'recurring_schedules',
+        )
+    )
+    assert payload['provider_accounts'] == []
+    assert payload['workspace_templates'] == []
+    assert payload['activity'] == []
+    assert payload['recurring_schedules_status'] == 'unavailable'
+
+
+def test_bootstrap_labels_degraded_workspace_catalog_instead_of_claiming_no_workspaces():
+    class DegradedWorkspaceRuntime(FakeRuntimeClient):
+        def list_workspace_catalog(self, **kwargs):
+            raise RuntimeError("synthetic workspace catalog unavailable")
+
+    response = TestClient(create_app(runtime_client=DegradedWorkspaceRuntime())).get('/api/bootstrap')
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['bootstrap_sections']['workspace_catalog'] == 'unavailable'
+    assert payload['existing_workspaces'] == []
+
+
+def test_browser_avoids_workspace_fetch_when_bootstrap_marks_catalog_unavailable():
+    app_js = (Path(server_module.STATIC_DIR) / 'app.js').read_text(encoding='utf-8')
+
+    assert "bootstrap.bootstrap_sections?.workspace_catalog !== 'unavailable'" in app_js
+    assert 'Your workspaces are temporarily unavailable.' in app_js
+
+
+def test_launch_personal_preferred_resolves_ready_default_for_selected_profile():
+    runtime = FakeRuntimeClient()
+    runtime.list_provider_accounts = lambda: [
+        {
+            "account_id": "acct_claude_default",
+            "provider": "claude",
+            "label": "Claude account",
+            "status": "ready",
+            "is_default": True,
+        },
+        {
+            "account_id": "acct_codex_default",
+            "provider": "codex",
+            "label": "Codex account",
+            "status": "ready",
+            "is_default": True,
+        },
+    ]
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.post('/api/launch', json={
+        'description': 'Use my default Codex subscription',
+        'workspace_option': 'new:codex-cli',
+        'provider_account_policy': 'personal_preferred',
+    })
+
+    assert response.status_code == 200, response.text
+    assert runtime.create_worker_requests[-1]['bootstrap_bundle']['provider_account'] == {
+        'policy': 'personal_preferred',
+        'account_id': 'acct_codex_default',
+    }
+
+
+def test_launch_personal_required_carries_explicit_account_and_never_falls_back():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.post('/api/launch', json={
+        'description': 'Use only my subscription',
+        'workspace_option': 'new:codex-cli',
+        'provider_account_policy': 'personal_required',
+        'provider_account_id': 'acct_1',
+    })
+
+    assert response.status_code == 200, response.text
+    assert runtime.create_worker_requests[-1]['bootstrap_bundle']['provider_account'] == {
+        'policy': 'personal_required',
+        'account_id': 'acct_1',
+    }
+
+
+def test_launch_personal_required_without_ready_default_fails_before_project_creation():
+    runtime = FakeRuntimeClient()
+    runtime.list_provider_accounts = lambda: [{
+        "account_id": "acct_not_ready",
+        "provider": "codex",
+        "label": "Reconnect me",
+        "status": "action_required",
+        "is_default": True,
+    }]
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.post('/api/launch', json={
+        'description': 'Do not use a deployment account',
+        'workspace_option': 'new:codex-cli',
+        'provider_account_policy': 'personal_required',
+    })
+
+    assert response.status_code == 409
+    assert 'ready personal account' in response.json()['detail'].lower()
+    assert runtime.create_project_requests == []
+    assert runtime.create_worker_requests == []
+
+
+def test_launch_personal_preferred_without_ready_default_keeps_explicit_fallback_policy():
+    runtime = FakeRuntimeClient()
+    runtime.list_provider_accounts = lambda: []
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.post('/api/launch', json={
+        'description': 'Prefer my subscription when one is ready',
+        'workspace_option': 'new:codex-cli',
+        'provider_account_policy': 'personal_preferred',
+    })
+
+    assert response.status_code == 200, response.text
+    assert runtime.create_worker_requests[-1]['bootstrap_bundle']['provider_account'] == {
+        'policy': 'personal_preferred',
+    }
+
+
+def test_launch_rejects_new_credential_selection_for_existing_workspace_before_mutation():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.post('/api/launch', json={
+        'description': 'Continue the saved workspace',
+        'workspace_option': 'open:wrk_1',
+        'provider_account_policy': 'personal_required',
+        'provider_account_id': 'acct_1',
+    })
+
+    assert response.status_code == 409
+    assert 'saved policy' in response.json()['detail'].lower()
+    assert runtime.create_project_requests == []
+    assert runtime.create_worker_requests == []
+
+
+@pytest.mark.parametrize(
+    ('accounts', 'account_id', 'expected_detail'),
+    [
+        (
+            [{
+                "account_id": "acct_claude",
+                "provider": "claude",
+                "label": "Claude account",
+                "status": "ready",
+                "is_default": True,
+            }],
+            'acct_claude',
+            'does not match',
+        ),
+        (
+            [{
+                "account_id": "acct_codex",
+                "provider": "codex",
+                "label": "Codex account",
+                "status": "action_required",
+                "is_default": True,
+            }],
+            'acct_codex',
+            'not ready',
+        ),
+    ],
+)
+def test_launch_rejects_mismatched_or_unready_explicit_personal_account(
+    accounts,
+    account_id,
+    expected_detail,
+):
+    runtime = FakeRuntimeClient()
+    runtime.list_provider_accounts = lambda: accounts
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.post('/api/launch', json={
+        'description': 'Use the selected account',
+        'workspace_option': 'new:codex-cli',
+        'provider_account_policy': 'personal_required',
+        'provider_account_id': account_id,
+    })
+
+    assert response.status_code == 409
+    assert expected_detail in response.json()['detail'].lower()
+    assert runtime.create_project_requests == []
+    assert runtime.create_worker_requests == []
+
+
+def test_launch_without_credential_fields_preserves_legacy_bootstrap_contract():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.post('/api/launch', json={
+        'description': 'Use the existing compatibility behavior',
+        'workspace_option': 'new:codex-cli',
+    })
+
+    assert response.status_code == 200, response.text
+    assert 'provider_account' not in (runtime.create_worker_requests[-1]['bootstrap_bundle'] or {})
 
 
 def test_launch_applies_codex_effort_to_new_workspace_bootstrap():
@@ -646,11 +1282,41 @@ def test_bootstrap_dedupes_workspace_rows_by_worker_id():
     assert [item["worker_id"] for item in boot.json()["existing_workspaces"]] == ["wrk_1"]
 
 
+def test_bootstrap_uses_bounded_primary_catalog_instead_of_scanning_projects():
+    class CatalogOnlyRuntime(FakeRuntimeClient):
+        def list_projects(self):
+            raise AssertionError("bootstrap must not scan every project")
+
+        def list_workspace_catalog(self, **kwargs):
+            assert kwargs == {"kind": "named", "limit": 25}
+            return {
+                "items": [
+                    {
+                        "worker_id": "wrk_catalog",
+                        "project_id": "prj_catalog",
+                        "project_title": "Catalog project",
+                        "name": "Catalog workspace",
+                        "profile": "codex-cli",
+                        "state": "paused",
+                        "workspace_kind": "named",
+                        "tags": ["research"],
+                    }
+                ],
+                "next_cursor": "cursor-more",
+            }
+
+    response = TestClient(create_app(runtime_client=CatalogOnlyRuntime())).get("/api/bootstrap")
+
+    assert response.status_code == 200
+    assert response.json()["existing_workspaces"][0]["worker_id"] == "wrk_catalog"
+    assert response.json()["existing_workspaces"][0]["is_resumable"] is True
+
+
 def test_bootstrap_exposes_paused_workers_as_resumable_workspaces():
     class PausedRuntime(FakeRuntimeClient):
         def list_workers(self, project_id: str):
             return [
-                {"worker_id": "wrk_idle", "name": "Idle Worker", "profile": "codex-cli", "state": "paused"},
+                {"worker_id": "wrk_idle", "name": "Idle Worker", "profile": "codex-cli", "state": "paused", "workspace_kind": "named"},
                 {"worker_id": "wrk_dead", "name": "Old Worker", "profile": "codex-cli", "state": "terminated"},
             ]
 
@@ -669,14 +1335,17 @@ def test_bootstrap_exposes_paused_workers_as_resumable_workspaces():
             "profile": "codex-cli",
             "state": "paused",
             "favorite": False,
+                "workspace_kind": "named",
+            "tags": [],
             "is_active": False,
             "is_resumable": True,
             "state_label": "paused",
             "watch_url": "/watch/wrk_idle?project_id=prj_1&surface=desktop",
             "project_url": "/ui/projects/prj_1?worker_id=wrk_idle",
-            "desktop_url": "/desktop/wrk_idle",
-            "api_url": "/api/worker/wrk_idle",
-        }
+                "desktop_url": "/desktop/wrk_idle",
+                "api_url": "/api/worker/wrk_idle",
+                "control_url": "/api/worker/wrk_idle",
+            }
     ]
 
 
@@ -712,6 +1381,12 @@ def test_watch_assets_render():
     assert live.json()['runtime_details']['view_available'] is True
     assert 'view_url' not in live.json()['runtime_details']
     assert live.json()['project_title'] == 'Alpha'
+    credentials = client.get('/api/workspace/wrk_1/desktop-credentials')
+    assert credentials.status_code == 200
+    assert credentials.json() == {'password': 'synthetic-vnc'}
+    assert credentials.headers['cache-control'] == 'no-store, max-age=0'
+    assert credentials.headers['pragma'] == 'no-cache'
+    assert credentials.headers['referrer-policy'] == 'no-referrer'
 
 
 def test_worker_view_signed_token_respects_watch_session_cap(monkeypatch):
@@ -812,7 +1487,8 @@ def test_runtime_minted_watch_tokens_can_reopen_after_expired_session_deadline(t
 
 def test_active_novnc_websocket_closes_at_watch_session_cap(tmp_path, monkeypatch):
     secret = "signed-link-secret"
-    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
+    set_enterprise_ui_env(monkeypatch, signed_secret=secret)
+    monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
     monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "1")
     monkeypatch.setenv("GLASSHIVE_WATCH_SESSION_STATE_PATH", str(tmp_path / "watch-sessions.sqlite3"))
     token = signed_worker_token(secret)
@@ -851,7 +1527,14 @@ def test_active_novnc_websocket_closes_at_watch_session_cap(tmp_path, monkeypatc
     monkeypatch.setattr(server_module.websockets, "connect", fake_connect)
     client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
 
-    with client.websocket_connect(f"/novnc/wrk_1/websockify?gh_token={token}") as websocket:
+    with client.websocket_connect(
+        f"/novnc/wrk_1/websockify?gh_token={token}",
+        headers={
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "user-a",
+            "X-Viventium-User-Role": "member",
+        },
+    ) as websocket:
         with pytest.raises(WebSocketDisconnect) as exc:
             websocket.receive_text()
 
@@ -890,10 +1573,83 @@ def test_launcher_workspace_hive_static_controls():
     assert "Open status" in app_js
     assert "Status Report" in index_html
     assert "Inactive Workspaces" in index_html
-    assert "glasshive:duplicate-workspace" in app_js
+    assert "/api/workspaces/${encodeURIComponent(workerId)}/duplicate" in app_js
+    assert "button.dataset.idempotencyKey ||= globalThis.crypto?.randomUUID?.()" in app_js
+    assert "idempotency_key: button.dataset.idempotencyKey" in app_js
+    assert "delete button.dataset.idempotencyKey" in app_js
+    assert 'id="workspace-template-panel"' in index_html
+    assert 'id="workspace-template-start-form"' in index_html
+    assert 'id="save-template-dialog"' in index_html
+    assert "/api/workspaces/${encodeURIComponent(context.workerId)}/templates" in app_js
+    assert "/api/workspace-templates/${encodeURIComponent(templateId)}/instantiate" in app_js
+    assert "fresh paused workspace" in index_html
+    assert "opaque worker-account reference—not files, sign-ins, credential homes, schedules, or history" in index_html
+    assert "Choose a saved template first." in app_js
+    assert "rename-workspace-dialog" in index_html
+    assert "window.prompt" not in app_js
     assert "Duplicate selected workspace" in app_js
+    assert 'data-view-tab="connections"' in index_html
+    assert 'data-view-tab="library"' in index_html
+    assert 'data-view-tab="schedules"' in index_html
+    assert 'data-view-tab="activity"' in index_html
+    assert 'id="workspace-search"' in index_html
+    assert 'id="workspace-kind-filter"' in index_html
+    assert '<option value="named">Saved workspaces</option>' in index_html
+    assert 'id="workspace-tag-filter"' in index_html
+    assert 'id="workspace-load-more"' in index_html
+    assert 'id="rename-workspace-tags"' in index_html
+    assert "fetchCatalogPage" in app_js
+    assert "if (workspaceCatalogStatus) workspaceCatalogStatus.textContent = '';" in app_js
+    assert "cursor: append ? String(catalogState.nextCursor || '') : ''" in app_js
+    assert "workspace.provider_readiness" in app_js
+    assert "deployment account fallback" in app_js
+    assert "function updateWorkspaceMeta" in app_js
+    assert "meta.dataset.catalogDetails" in app_js
+    assert "updateWorkspaceMeta(meta, data?.worker?.profile, state);" in app_js
+    assert "workspace.capability_readiness" in app_js
+    assert "workspace.next_schedule_at" in app_js
+    assert "nextSchedule?.next_run_at && !workspace.next_schedule_at" in app_js
+    assert "glasshive:control-plane-updated" in app_js
+    assert "payload.detail && typeof payload.detail === 'object'" in app_js
+    assert "openWorkspaceSurface" in app_js
+    assert "{ name, tags }" in app_js
+    assert "Workspace details" in index_html
+    assert "viewRegistry" in app_js
+    control_plane_js = (static_dir / "control-plane.js").read_text(encoding="utf-8")
+    assert "window.dispatchEvent(new CustomEvent('glasshive:control-plane-updated'))" in control_plane_js
+    assert "No duplicate occurrence was created; retry is safe" in control_plane_js
+    assert "schedule.last_outcome || schedule.last_error" in control_plane_js
+    assert "Latest result:" in control_plane_js
+    assert "clients.codex?.login_command" in control_plane_js
+    assert "Follow the copy-and-paste steps" in index_html
+    assert "Copy one command" not in index_html
+    assert "function referenceRow" in control_plane_js
+    assert "Registration reference" in control_plane_js
+    assert "referenceRow('Codex · Registered callback'" in control_plane_js
+    assert "referenceRow('Claude Code · Registered callback'" in control_plane_js
+    assert "/api/control-plane" in control_plane_js
+    assert "/api/connect-ai" in control_plane_js
+    assert "provider-account-form" in control_plane_js
+    assert "pollSetup" in control_plane_js
+    assert 'id="library-request-form"' in index_html
+    assert "submitLibraryRequest" in control_plane_js
+    assert "/api/workspace/${encodeURIComponent(workspaceId)}/message" in control_plane_js
+    assert "message: requestText" in control_plane_js
+    assert "api.withAuth(`/watch/${encodeURIComponent(workspaceId)}?surface=desktop`)" in control_plane_js
+    assert "workspace.control_url || workspace.api_url" in app_js
+    assert "loadWorkspaceChoices" in control_plane_js
+    assert "loadAllWorkspacePages" not in control_plane_js
+    assert 'value="api_key"' in index_html
+    assert 'value="enterprise_route"' in index_html
+    assert "Add connected account" in control_plane_js
+    assert "controlPlane?.manage_connections_url" in control_plane_js
+    assert "linked · verifies on run" in control_plane_js
+    assert "GlassHive will verify it when this workspace runs" in control_plane_js
     assert "/novnc/${workerId}/websockify" in desktop_js
     assert "runtime.view_available" in desktop_js
+    assert "/desktop-credentials" in desktop_js
+    assert "cache: 'no-store'" in desktop_js
+    assert "localStorage" not in desktop_js
     assert "desktopRefreshInFlight" in desktop_js
     assert "scheduleDesktopRefresh" in desktop_js
     assert "isSettledWorkspaceState" in desktop_js
@@ -910,6 +1666,11 @@ def test_launcher_workspace_hive_static_controls():
     assert 'id="schedule-text"' in index_html
     assert 'id="schedule-button"' in index_html
     assert 'id="workspace-type"' in index_html
+    assert 'id="provider-account-selection"' in index_html
+    assert 'id="provider-account-policy"' in index_html
+    assert "provider_account_id" in app_js
+    assert "provider_account_policy" in app_js
+    assert "renderLaunchProviderAccounts" in app_js
     assert 'Initial watch surface' not in index_html
     assert "renderWorkspaceTypeOptions" in app_js
     assert "idle_terminated" in app_js
@@ -1071,8 +1832,102 @@ def test_launch_duplicate_workspace_uses_runtime_duplicate_endpoint():
     assert launch.status_code == 200
     assert launch.json()['watch_url'].startswith('/watch/wrk_dup')
     assert runtime.duplicate_requests == [
-        {'project_id': 'prj_new', 'source_worker_id': 'wrk_1', 'owner_id': 'demo-owner'},
+        {
+            'project_id': 'prj_new',
+            'source_worker_id': 'wrk_1',
+            'owner_id': 'demo-owner',
+            'name': 'Main Workspace',
+        },
     ]
+
+
+def test_saved_workspace_duplicate_is_one_click_and_uses_a_fresh_identity():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    missing_key = client.post('/api/workspaces/wrk_1/duplicate', json={})
+    short_key = client.post('/api/workspaces/wrk_1/duplicate', json={'idempotency_key': 'short'})
+    response = client.post(
+        '/api/workspaces/wrk_1/duplicate',
+        json={'idempotency_key': 'duplicate-browser-session-1'},
+    )
+
+    assert missing_key.status_code == 422
+    assert short_key.status_code == 422
+    assert response.status_code == 201
+    assert response.json()['worker']['worker_id'] == 'wrk_dup'
+    assert runtime.workspace_duplicate_requests == [
+        {
+            'worker_id': 'wrk_1',
+            'idempotency_key': 'duplicate-browser-session-1',
+            'name': '',
+        }
+    ]
+
+
+def test_workspace_templates_list_save_and_instantiate_through_the_bff():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    listed = client.get('/api/workspace-templates')
+    saved = client.post(
+        '/api/workspaces/wrk_1/templates',
+        json={'name': 'My research desk', 'description': 'Reusable intent only'},
+    )
+    started = client.post(
+        '/api/workspace-templates/wst_synthetic/instantiate',
+        json={'idempotency_key': 'template-attempt-0001', 'name': 'Fresh research desk'},
+    )
+
+    assert listed.status_code == 200
+    assert listed.json()['items'][0]['template_id'] == 'wst_synthetic'
+    assert saved.status_code == 201
+    assert saved.json()['name'] == 'My research desk'
+    assert started.status_code == 201
+    assert started.json()['workspace'] == {
+        'worker_id': 'wrk_template',
+        'name': 'Fresh research desk',
+        'state': 'paused',
+    }
+    assert started.json()['approvals_required'][0]['stable_id'] == 'skill.synthetic.summary'
+    assert runtime.workspace_template_requests == [
+        {
+            'action': 'save',
+            'worker_id': 'wrk_1',
+            'payload': {'name': 'My research desk', 'description': 'Reusable intent only'},
+        },
+        {
+            'action': 'instantiate',
+            'template_id': 'wst_synthetic',
+            'payload': {'idempotency_key': 'template-attempt-0001', 'name': 'Fresh research desk'},
+        },
+    ]
+
+
+def test_human_confirmation_page_loads_scoped_metadata_and_never_embeds_token():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    page = client.get('/confirm-change')
+    metadata = client.get('/api/pending-changes/chg_1')
+
+    assert page.status_code == 200
+    assert 'Human approval required' in page.text
+    assert 'confirmation_token' not in page.text
+    assert metadata.status_code == 200
+    assert metadata.json()['target_label'] == 'Main Worker'
+    assert metadata.json()['capability_label'] == 'skill.synthetic.summary'
+    assert runtime.pending_change_reads == ['chg_1']
+
+
+def test_confirmation_script_keeps_token_in_fragment_or_session_storage_only():
+    script = (Path(server_module.STATIC_DIR) / 'confirm.js').read_text(encoding='utf-8')
+
+    assert "window.location.hash" in script
+    assert "history.replaceState(null, '', '/confirm-change')" in script
+    assert "sessionStorage" in script
+    assert "return_to=%2Fconfirm-change" in script
+    assert "return_to=%2Fconfirm-change%23" not in script
 
 
 def test_launch_open_workspace_reuses_existing_worker():
@@ -1182,7 +2037,66 @@ def test_signed_watch_token_authenticates_runtime_calls(monkeypatch):
     assert runtime.header_contexts[-1]["X-WPR-Token"] == secret
     assert runtime.header_contexts[-1]["X-Viventium-Tenant-Id"] == "tenant-alpha"
     assert runtime.header_contexts[-1]["X-Viventium-User-Id"] == "user-a"
-    assert runtime.header_contexts[-1]["X-Viventium-User-Role"] == "operator"
+    assert runtime.header_contexts[-1]["X-Viventium-User-Role"] == "viewer"
+
+
+def test_signed_watch_token_allows_only_read_and_narrow_communication(monkeypatch):
+    secret = "ui-signed-link-secret"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    token = signed_worker_token(secret)
+
+    assert client.get(f"/api/worker/wrk_1/live?gh_token={token}").status_code == 200
+    assert client.post(
+        f"/api/worker/wrk_1/message?gh_token={token}",
+        json={"message": "Share a concise progress update."},
+    ).status_code == 200
+    assert client.post(
+        f"/api/worker/wrk_1/steer?gh_token={token}",
+        json={"message": "Focus on the requested output."},
+    ).status_code == 200
+
+    forbidden = (
+        client.patch(
+            f"/api/worker/wrk_1/metadata?gh_token={token}",
+            json={"favorite": True},
+        ),
+        client.post(f"/api/worker/wrk_1/action/pause?gh_token={token}"),
+        client.post(f"/api/worker/wrk_1/action/terminate?gh_token={token}"),
+    )
+    assert [response.status_code for response in forbidden] == [403, 403, 403]
+    assert runtime.metadata_requests == []
+    assert runtime.lifecycle_requests == []
+    assert runtime.message_requests == [
+        {"worker_id": "wrk_1", "message": "Share a concise progress update."}
+    ]
+    assert runtime.steer_requests == [
+        {"worker_id": "wrk_1", "message": "Focus on the requested output."}
+    ]
+    assert all(
+        headers.get("X-Viventium-User-Role") == "viewer"
+        for headers in runtime.header_contexts
+    )
+
+
+def test_signed_watch_token_cannot_open_interactive_desktop_or_credentials(monkeypatch):
+    secret = "ui-signed-link-secret"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    token = signed_worker_token(secret)
+
+    assert client.get(f"/desktop/wrk_1?gh_token={token}").status_code == 403
+    credentials = client.get(f"/api/workspace/wrk_1/desktop-credentials?gh_token={token}")
+    assert credentials.status_code == 403
+    assert "password" not in credentials.text.lower()
+    assert client.get(f"/novnc/wrk_1/core/rfb.js?gh_token={token}").status_code == 403
+    with pytest.raises(WebSocketDisconnect) as denied:
+        with client.websocket_connect(f"/novnc/wrk_1/websockify?gh_token={token}"):
+            pass
+    assert denied.value.code == 1008
+    assert runtime.worker_live_requests == []
 
 
 def test_bootstrap_signs_workspace_links_in_enterprise_mode(monkeypatch):
@@ -1209,6 +2123,7 @@ def test_bootstrap_signs_workspace_links_in_enterprise_mode(monkeypatch):
     assert str(project_ref["target_url"]).startswith("/ui/projects/prj_1?")
     assert str(desktop_ref["target_url"]) == "/desktop/wrk_1"
     assert str(api_ref["target_url"]) == "/api/worker/wrk_1"
+    assert workspace["control_url"] == "/api/worker/wrk_1"
     assert client.get(workspace["watch_url"], headers=headers).status_code == 200
     assert client.get(workspace["desktop_url"], headers=headers).status_code == 200
 
@@ -1241,6 +2156,7 @@ def test_signed_watch_token_is_worker_scoped_for_control_and_desktop_routes(monk
         ("post", "/api/worker/wrk_1/action/interrupt", None),
         ("post", "/api/worker/wrk_1/action/terminate", None),
         ("get", "/desktop/wrk_1", None),
+        ("get", "/api/workspace/wrk_1/desktop-credentials", None),
         ("get", "/novnc/wrk_1/core/rfb.js", None),
     ]
 
@@ -1295,7 +2211,7 @@ def test_runtime_proxy_strips_signed_query_params_before_upstream(monkeypatch):
     assert captured["headers"]["X-Viventium-User-Id"] == "user-a"
 
 
-def test_novnc_submodule_imports_can_inherit_signed_token_from_referer(monkeypatch):
+def test_novnc_submodule_imports_reject_signed_token_from_referer(monkeypatch):
     secret = "ui-signed-link-secret"
     monkeypatch.setenv("WPR_API_TOKEN", secret)
     runtime = FakeRuntimeClient()
@@ -1327,8 +2243,8 @@ def test_novnc_submodule_imports_can_inherit_signed_token_from_referer(monkeypat
         headers={'referer': f'http://glasshive.example.test/novnc/wrk_1/core/rfb.js?gh_token={token}'},
     )
 
-    assert response.status_code == 200
-    assert runtime.header_contexts[-1]["X-Viventium-User-Id"] == "user-a"
+    assert response.status_code == 403
+    assert runtime.header_contexts == []
 
 
 def test_signed_watch_sets_worker_scoped_cookie(monkeypatch):
@@ -1600,6 +2516,15 @@ def test_ui_sensitive_url_log_filter_redacts_signed_tokens():
     assert redact_sensitive_url_text("gh_sig=signature&gh_token=secret-token") == (
         "gh_sig=[redacted]&gh_token=[redacted]"
     )
+    oidc_callback = (
+        "/auth/oidc/callback?code=authorization-secret&state=state-secret"
+        "&error_description=private-provider-detail&error=access_denied"
+    )
+    oidc_redacted = redact_sensitive_url_text(oidc_callback)
+    assert "authorization-secret" not in oidc_redacted
+    assert "state-secret" not in oidc_redacted
+    assert "private-provider-detail" not in oidc_redacted
+    assert "error=access_denied" in oidc_redacted
     record = logging.LogRecord(
         name="uvicorn.access",
         level=logging.INFO,
@@ -1671,7 +2596,7 @@ def test_signed_watch_does_not_set_cookie_for_different_worker(monkeypatch):
     assert "set-cookie" not in response.headers
 
 
-def test_novnc_submodule_imports_can_inherit_signed_token_from_cookie(monkeypatch):
+def test_novnc_submodule_imports_reject_signed_token_from_cookie(monkeypatch):
     secret = "ui-signed-link-secret"
     monkeypatch.setenv("WPR_API_TOKEN", secret)
     runtime = FakeRuntimeClient()
@@ -1701,9 +2626,8 @@ def test_novnc_submodule_imports_can_inherit_signed_token_from_cookie(monkeypatc
     client.cookies.set(worker_cookie_name("wrk_1"), token)
     response = client.get('/novnc/wrk_1/core/input/util.js')
 
-    assert response.status_code == 200
-    assert runtime.header_contexts[-1]["X-Viventium-Tenant-Id"] == "tenant-alpha"
-    assert runtime.header_contexts[-1]["X-Viventium-User-Id"] == "user-a"
+    assert response.status_code == 403
+    assert runtime.header_contexts == []
 
 
 def test_novnc_rejects_invalid_asset_path():
@@ -1783,7 +2707,7 @@ def test_public_links_only_ui_rejects_operator_surfaces_without_signed_session(m
     assert client.get("/").status_code == 401
     assert client.get("/api/bootstrap").status_code == 401
     assert client.get("/watch/wrk_1").status_code == 401
-    assert client.get("/v1/workers/wrk_1").status_code == 401
+    assert client.get("/v1/workers/wrk_1").status_code == 404
 
 
 def test_public_links_only_worker_ref_opens_scoped_watch_session(monkeypatch):
@@ -2043,7 +2967,36 @@ def test_enterprise_watch_shell_accepts_signed_worker_link(monkeypatch):
     token = signed_worker_token(signed_secret)
 
     assert client.get(f"/watch/wrk_1?gh_token={token}").status_code == 200
-    assert client.get(f"/desktop/wrk_1?gh_token={token}").status_code == 200
+    assert client.get(f"/desktop/wrk_1?gh_token={token}").status_code == 403
+
+
+def test_viewer_identity_is_read_only_and_cannot_use_signed_link_as_privilege_escalation(monkeypatch):
+    signed_secret = "ui-signed-link-secret"
+    set_enterprise_ui_env(monkeypatch, signed_secret=signed_secret)
+    monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    token = signed_worker_token(signed_secret)
+    headers = {
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+        "X-Viventium-User-Role": "viewer",
+    }
+
+    assert client.get(f"/api/worker/wrk_1/live?gh_token={token}", headers=headers).status_code == 200
+    assert client.post(
+        f"/api/worker/wrk_1/message?gh_token={token}",
+        headers=headers,
+        json={"message": "This viewer must remain read-only."},
+    ).status_code == 403
+    assert client.post(
+        f"/api/worker/wrk_1/action/pause?gh_token={token}",
+        headers=headers,
+    ).status_code == 403
+    assert client.get(f"/desktop/wrk_1?gh_token={token}", headers=headers).status_code == 403
+    assert runtime.message_requests == []
+    assert runtime.lifecycle_requests == []
+    assert runtime.header_contexts[-1]["X-Viventium-User-Role"] == "viewer"
 
 
 def test_enterprise_signed_worker_link_is_tenant_scoped(monkeypatch):
@@ -2102,7 +3055,7 @@ def test_enterprise_signed_artifact_link_proxies_without_user_assertion(monkeypa
     assert captured["headers"]["X-WPR-Token"] == service_secret
     assert captured["headers"]["X-Viventium-Tenant-Id"] == "tenant-alpha"
     assert captured["headers"]["X-Viventium-User-Id"] == "user-a"
-    assert captured["headers"]["X-Viventium-User-Role"] == "member"
+    assert captured["headers"]["X-Viventium-User-Role"] == "viewer"
 
 
 def test_enterprise_signed_artifact_open_link_proxies_without_user_assertion(monkeypatch):
@@ -2148,7 +3101,7 @@ def test_enterprise_signed_artifact_open_link_proxies_without_user_assertion(mon
     assert captured["headers"]["X-WPR-Token"] == service_secret
     assert captured["headers"]["X-Viventium-Tenant-Id"] == "tenant-alpha"
     assert captured["headers"]["X-Viventium-User-Id"] == "user-a"
-    assert captured["headers"]["X-Viventium-User-Role"] == "member"
+    assert captured["headers"]["X-Viventium-User-Role"] == "viewer"
 
 
 def test_enterprise_artifact_link_ref_uses_worker_cookie_identity(monkeypatch):
@@ -2219,7 +3172,7 @@ def test_enterprise_artifact_link_ref_uses_worker_cookie_identity(monkeypatch):
     assert captured["headers"]["X-WPR-Token"] == service_secret
     assert captured["headers"]["X-Viventium-Tenant-Id"] == "tenant-alpha"
     assert captured["headers"]["X-Viventium-User-Id"] == "user-a"
-    assert captured["headers"]["X-Viventium-User-Role"] == "member"
+    assert captured["headers"]["X-Viventium-User-Role"] == "viewer"
 
 
 def test_signed_runtime_proxy_sets_worker_scoped_cookie(monkeypatch):
@@ -2474,6 +3427,33 @@ def test_enterprise_live_api_hides_raw_desktop_url_but_backend_requests_internal
     assert runtime.header_contexts[-1]["X-Viventium-User-Role"] == "operator"
 
 
+def test_multi_user_desktop_credentials_fail_closed_without_vnc_password(monkeypatch):
+    service_secret = "ui-service-secret"
+    set_enterprise_ui_env(monkeypatch, service_secret=service_secret)
+    monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
+
+    class PasswordlessRuntime(FakeRuntimeClient):
+        def worker_live(self, worker_id: str):
+            payload = super().worker_live(worker_id)
+            payload["runtime_details"]["view_url"] = "http://127.0.0.1:60812/?autoconnect=1"
+            return payload
+
+    runtime = PasswordlessRuntime()
+    client = TestClient(create_app(runtime_client=runtime))
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    response = client.get(
+        "/api/workspace/wrk_1/desktop-credentials",
+        headers={
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "user-a",
+            "X-Viventium-User-Role": "member",
+        },
+    )
+
+    assert response.status_code == 503
+    assert "password" not in response.text.lower()
+
+
 def test_enterprise_trusted_identity_rejects_tenant_mismatch(monkeypatch):
     set_enterprise_ui_env(monkeypatch)
     monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
@@ -2554,6 +3534,1136 @@ def test_runtime_ui_proxy_injects_enterprise_identity(monkeypatch):
     assert captured["headers"]["X-Viventium-User-Role"] == "member"
 
 
+def test_runtime_proxy_is_default_deny_for_unlisted_runtime_routes(monkeypatch):
+    captured = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, *args, **kwargs):
+            captured.append((args, kwargs))
+            raise AssertionError("unlisted route reached the private runtime")
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    assert client.get("/v1/projects").status_code == 404
+    assert client.post("/v1/workers/wrk_1/terminate").status_code == 404
+    assert client.get("/ui").status_code == 404
+    assert captured == []
+
+
+def test_control_plane_bff_exposes_user_scoped_existing_substrates(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS", "true")
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.get("/api/control-plane")
+    workspaces = client.get("/api/workspaces?kind=named&search=main")
+    metadata = client.post(
+        "/api/worker/wrk_1/metadata",
+        json={"name": "Planning workspace", "tags": ["finance", "quarterly"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["me"]["user_id"] == "demo-owner"
+    assert response.json()["provider_accounts"][0]["provider"] == "codex"
+    assert response.json()["connections"][0]["connection_id"] == "conn_1"
+    assert response.json()["library"][0]["library_id"] == "lib_1"
+    assert response.json()["provider_options"][0]["subscription_support"] == "supported"
+    assert workspaces.status_code == 200
+    assert workspaces.json()["items"][0]["workspace_kind"] == "named"
+    assert metadata.status_code == 200
+    assert runtime.metadata_requests[-1] == {
+        "worker_id": "wrk_1",
+        "payload": {"name": "Planning workspace", "tags": ["finance", "quarterly"]},
+    }
+
+
+def test_recurring_schedule_bff_routes_use_the_scoped_runtime_client():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    listed = client.get("/api/recurring-schedules?include_inactive=true")
+    created = client.post(
+        "/api/workspace/wrk_1/recurring-schedules",
+        json={
+            "instruction": "Run the synthetic check.",
+            "recurrence_type": "interval",
+            "interval_seconds": 3600,
+            "timezone_name": "UTC",
+        },
+    )
+    occurrences = client.get("/api/recurring-schedules/rsd_public_safe/occurrences?limit=10")
+    deactivated = client.post("/api/recurring-schedules/rsd_public_safe/deactivate")
+
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["items"][0]["definition_id"] == "rsd_public_safe"
+    assert created.status_code == 201, created.text
+    assert created.json()["worker_id"] == "wrk_1"
+    assert occurrences.status_code == 200, occurrences.text
+    assert occurrences.json()["items"][0]["occurrence_id"] == "occ_public_safe"
+    assert deactivated.status_code == 200, deactivated.text
+    assert deactivated.json()["active"] is False
+    assert runtime.recurring_schedule_requests == [
+        {"action": "list", "include_inactive": True},
+        {
+            "action": "create",
+            "worker_id": "wrk_1",
+            "payload": {
+                "instruction": "Run the synthetic check.",
+                "recurrence_type": "interval",
+                "interval_seconds": 3600,
+                "local_time": "",
+                "timezone_name": "UTC",
+                    "dst_policy": "next_valid_earliest",
+                    "first_run_at": None,
+                    "cron_expression": "",
+                    "rrule": "",
+                    "starts_at": None,
+                    "ends_at": None,
+                    "enabled": True,
+                    "overlap_policy": "skip",
+                    "misfire_grace_seconds": 300,
+                    "catch_up_policy": "skip",
+                    "max_catch_up_occurrences": 1,
+                    "jitter_seconds": 0,
+                    "schedule_text": "",
+            },
+        },
+        {"action": "occurrences", "definition_id": "rsd_public_safe", "limit": 10},
+        {"action": "deactivate", "definition_id": "rsd_public_safe"},
+    ]
+
+
+def test_recurring_schedule_bff_forwards_full_structured_contract():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    created = client.post(
+        "/api/workspace/wrk_1/recurring-schedules",
+        json={
+            "instruction": "Run the synthetic weekday check.",
+            "recurrence_type": "cron",
+            "cron_expression": "0 9 * * 1-5",
+            "timezone_name": "America/Toronto",
+            "starts_at": "2027-01-01T00:00:00-05:00",
+            "ends_at": "2027-06-30T23:59:59-04:00",
+            "enabled": True,
+            "overlap_policy": "skip",
+            "misfire_grace_seconds": 600,
+            "catch_up_policy": "bounded",
+            "max_catch_up_occurrences": 2,
+            "jitter_seconds": 120,
+        },
+    )
+
+    assert created.status_code == 201, created.text
+    payload = runtime.recurring_schedule_requests[-1]["payload"]
+    assert payload["recurrence_type"] == "cron"
+    assert payload["cron_expression"] == "0 9 * * 1-5"
+    assert payload["overlap_policy"] == "skip"
+    assert payload["catch_up_policy"] == "bounded"
+    assert payload["max_catch_up_occurrences"] == 2
+    assert payload["jitter_seconds"] == 120
+
+
+def test_recurring_schedule_bff_updates_enabled_state_without_replacing_history():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.patch(
+        "/api/recurring-schedules/rsd_public_safe",
+        json={"enabled": True},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["enabled"] is True
+    assert runtime.recurring_schedule_requests == [
+        {
+            "action": "update",
+            "definition_id": "rsd_public_safe",
+            "payload": {"enabled": True},
+        }
+    ]
+
+
+def test_recurring_schedule_bff_run_now_and_retire_preserve_owner_scoping():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    run_now = client.post(
+        "/api/recurring-schedules/rsd_public_safe/run-now",
+        json={"idempotency_key": "manual-public-safe-1"},
+    )
+    retired = client.delete("/api/recurring-schedules/rsd_public_safe")
+
+    assert run_now.status_code == 200, run_now.text
+    assert run_now.json()["status"] == "scheduled"
+    assert retired.status_code == 200, retired.text
+    assert retired.json()["retired_at"]
+    assert runtime.recurring_schedule_requests == [
+        {
+            "action": "run_now",
+            "definition_id": "rsd_public_safe",
+            "idempotency_key": "manual-public-safe-1",
+        },
+        {"action": "retire", "definition_id": "rsd_public_safe"},
+    ]
+
+
+def test_recurring_schedule_bff_uses_signed_user_assertion(tmp_path, monkeypatch):
+    set_enterprise_ui_env(monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
+    configure_internal_assertion_signer(tmp_path, monkeypatch)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.get(
+        "/api/recurring-schedules",
+        headers={
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "member-public-safe",
+            "X-Viventium-User-Email": "member@example.invalid",
+            "X-Viventium-User-Role": "member",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    scoped_headers = runtime.header_contexts[-1]
+    assert scoped_headers["X-WPR-Token"] == "ui-service-secret"
+    assert scoped_headers["X-GlassHive-User-Assertion"]
+    assert "X-Viventium-User-Id" not in scoped_headers
+
+
+def test_recurring_schedule_bff_rejects_invalid_payload_before_runtime_call():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.post(
+        "/api/workspace/wrk_1/recurring-schedules",
+        json={
+            "instruction": "",
+            "recurrence_type": "weekly",
+        },
+    )
+
+    assert response.status_code == 422
+    assert runtime.recurring_schedule_requests == []
+
+    invalid_id = client.post(
+        "/api/recurring-schedules/../deactivate",
+    )
+    assert invalid_id.status_code in {400, 404}
+    assert runtime.recurring_schedule_requests == []
+
+
+def test_recurring_schedule_ui_has_structured_accessible_controls():
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    page = client.get("/")
+
+    assert page.status_code == 200
+    assert 'id="recurring-schedule-form"' in page.text
+    assert 'id="recurring-schedule-workspace"' in page.text
+    assert 'id="recurring-schedule-instruction"' in page.text
+    assert 'id="recurring-schedule-type"' in page.text
+    assert 'id="recurring-schedule-timezone"' in page.text
+    assert 'value="once"' in page.text
+    assert 'value="cron"' in page.text
+    assert 'value="rfc5545"' in page.text
+    assert 'id="recurring-schedule-starts-at"' in page.text
+    assert 'id="recurring-schedule-once-field"' in page.text
+    assert 'id="recurring-schedule-ends-at"' in page.text
+    assert 'id="recurring-schedule-enabled"' in page.text
+    assert 'id="recurring-schedule-overlap-policy"' in page.text
+    assert 'id="recurring-schedule-misfire-grace"' in page.text
+    assert 'id="recurring-schedule-catch-up-policy"' in page.text
+    assert 'id="recurring-schedule-jitter"' in page.text
+    assert 'id="recurring-schedule-status"' in page.text
+    assert 'id="recurring-schedule-cancel-edit"' in page.text
+    assert 'id="recurring-schedule-submit"' in page.text
+    control_plane_script = (server_module.STATIC_DIR / "control-plane.js").read_text(encoding="utf-8")
+    assert "renderSchedules" in control_plane_script
+    assert "dispatch_via_viventium_cortex" in control_plane_script
+    assert "runScheduleNow" in control_plane_script
+    assert "retireSchedule" in control_plane_script
+    assert "editSchedule" in control_plane_script
+    assert "onceField.hidden = kind !== 'once'" in control_plane_script
+    assert "{ enabled: false }" in control_plane_script
+    assert "if (controlPlane?.recurrence_owner === 'viventium_cortex') return" not in control_plane_script
+
+
+def _configure_multi_user_connect_test(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "legacy_compatibility")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "signed_internal_assertion")
+    monkeypatch.setenv("GLASSHIVE_HUMAN_AUTH_MODE", "trusted_proxy")
+    monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
+    monkeypatch.setenv("GLASSHIVE_TRUSTED_PROXY_BOUNDARY_PROVEN", "true")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "ui-service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "ui-signed-link-secret")
+    configure_internal_assertion_signer(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_MCP_PUBLIC_URL", "https://glasshive.example.test/mcp")
+
+
+def _multi_user_headers() -> dict[str, str]:
+    return {
+        "X-Viventium-Tenant-Id": "tenant-alpha",
+        "X-Viventium-User-Id": "user-a",
+        "X-Viventium-User-Role": "member",
+    }
+
+
+def _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch) -> None:
+    _configure_multi_user_connect_test(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_HUMAN_AUTH_MODE", "oidc")
+    monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "false")
+    monkeypatch.setenv("GLASSHIVE_TRUSTED_PROXY_BOUNDARY_PROVEN", "false")
+
+    class FakeHumanAuth:
+        mode = "oidc"
+        session_enabled = True
+
+        def resolve_session(self, token):
+            if token != "connect-session":
+                return None
+            return {
+                "tenant_id": "tenant-alpha",
+                "user_id": "user-a",
+                "email": "member@example.invalid",
+                "role": "member",
+            }
+
+    monkeypatch.setattr(server_module.HumanAuthGateway, "from_env", lambda: FakeHumanAuth())
+
+
+def test_connect_ai_fails_loud_when_multi_user_oauth_is_not_configured(tmp_path, monkeypatch):
+    _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch)
+    monkeypatch.delenv("GLASSHIVE_MCP_OAUTH_ISSUER", raising=False)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    client.cookies.set("glasshive_session", "connect-session")
+
+    response = client.get("/api/connect-ai")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "GlassHive MCP client connection requires a configured OAuth issuer"
+
+
+def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tmp_path, monkeypatch):
+    _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ISSUER", "https://identity.example.test")
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES",
+        "00000000-0000-4000-8000-000000000123",
+    )
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_SCOPES", "user_impersonation")
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES",
+        "api://00000000-0000-4000-8000-000000000123/user_impersonation",
+    )
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS",
+        "registered-codex-client registered-claude-client",
+    )
+    monkeypatch.setenv("GLASSHIVE_MCP_CLAUDE_CLIENT_ID", "registered-claude-client")
+    monkeypatch.setenv("GLASSHIVE_MCP_CLAUDE_CALLBACK_PORT", "49152")
+    monkeypatch.setenv("GLASSHIVE_MCP_CODEX_CLIENT_ID", "registered-codex-client")
+    monkeypatch.setenv("GLASSHIVE_MCP_CODEX_CALLBACK_PORT", "49153")
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_CODEX_RESOURCE",
+        "https://glasshive.example.test/mcp",
+    )
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_DOCUMENTATION_URL",
+        "https://docs.example.test/glasshive-client-registration",
+    )
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    client.cookies.set("glasshive_session", "connect-session")
+
+    response = client.get("/api/connect-ai")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["clients"]["codex"]["add_command"] == (
+        "codex mcp add -c mcp_oauth_callback_port=49153 "
+        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive "
+        "--url https://glasshive.example.test/mcp "
+        "--oauth-client-id registered-codex-client "
+        "--oauth-resource https://glasshive.example.test/mcp"
+    )
+    assert payload["clients"]["codex"]["login_command"] == (
+        "codex mcp login -c mcp_oauth_callback_port=49153 "
+        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive"
+    )
+    assert payload["clients"]["codex"]["callback_uri"] == (
+        "http://127.0.0.1:49153/callback/0MLa49XNV_Yw"
+    )
+    assert payload["clients"]["claude"]["add_command"] == (
+        "claude mcp add --transport http --scope user "
+        "--client-id registered-claude-client --callback-port 49152 "
+        "glasshive https://glasshive.example.test/mcp"
+    )
+    assert payload["clients"]["claude"]["callback_port"] == 49152
+    assert payload["clients"]["claude"]["callback_uri"] == (
+        "http://localhost:49152/callback"
+    )
+    assert payload["configuration_status"] == "ready"
+    assert payload["documentation_url"].endswith("/glasshive-client-registration")
+    assert payload["source"]["license"] == "FSL-1.1-ALv2"
+    control_plane_script = (
+        server_module.STATIC_DIR / "control-plane.js"
+    ).read_text(encoding="utf-8")
+    assert "clients.codex?.callback_uri" in control_plane_script
+    assert "clients.claude?.callback_uri" in control_plane_script
+
+
+def test_connect_ai_hides_false_commands_without_pre_registered_client(tmp_path, monkeypatch):
+    _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ISSUER", "https://identity.example.test")
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES",
+        "00000000-0000-4000-8000-000000000123",
+    )
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_SCOPES", "user_impersonation")
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES",
+        "api://00000000-0000-4000-8000-000000000123/user_impersonation",
+    )
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS",
+        "registered-codex-client registered-claude-client",
+    )
+    for name in (
+        "GLASSHIVE_MCP_CLAUDE_CLIENT_ID",
+        "GLASSHIVE_MCP_CLAUDE_CALLBACK_PORT",
+        "GLASSHIVE_MCP_CODEX_CLIENT_ID",
+        "GLASSHIVE_MCP_CODEX_CALLBACK_PORT",
+        "GLASSHIVE_MCP_CODEX_RESOURCE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    client.cookies.set("glasshive_session", "connect-session")
+
+    response = client.get("/api/connect-ai")
+
+    assert response.status_code == 200
+    assert response.json()["clients"] == {}
+    assert response.json()["configuration_status"] == "action_required"
+    assert "pre-registered" in response.json()["configuration_note"]
+    assert "mcp add" not in response.text
+
+
+def test_connect_ai_fails_closed_on_oauth_audience_scope_or_allowlist_drift(
+    tmp_path,
+    monkeypatch,
+):
+    _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ISSUER", "https://identity.example.test")
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES",
+        "00000000-0000-4000-8000-000000000123",
+    )
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_SCOPES", "user_impersonation")
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES",
+        "api://00000000-0000-4000-8000-000000000123/user_impersonation",
+    )
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS", "registered-claude-client")
+    monkeypatch.setenv("GLASSHIVE_MCP_CLAUDE_CLIENT_ID", "registered-claude-client")
+    monkeypatch.setenv("GLASSHIVE_MCP_CLAUDE_CALLBACK_PORT", "49152")
+    monkeypatch.setenv("GLASSHIVE_MCP_CODEX_CLIENT_ID", "unapproved-codex-client")
+    monkeypatch.setenv("GLASSHIVE_MCP_CODEX_CALLBACK_PORT", "49153")
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_CODEX_RESOURCE",
+        "https://glasshive.example.test/mcp",
+    )
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    client.cookies.set("glasshive_session", "connect-session")
+
+    allowlist_drift = client.get("/api/connect-ai")
+
+    assert allowlist_drift.status_code == 200
+    assert set(allowlist_drift.json()["clients"]) == {"claude"}
+    assert "unapproved-codex-client" not in allowlist_drift.text
+
+    monkeypatch.delenv("GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES")
+    audience_drift = client.get("/api/connect-ai")
+
+    assert audience_drift.status_code == 200
+    assert audience_drift.json()["clients"] == {}
+    assert audience_drift.json()["configuration_status"] == "action_required"
+    assert "mcp add" not in audience_drift.text
+
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES",
+        "00000000-0000-4000-8000-000000000123",
+    )
+    monkeypatch.delenv("GLASSHIVE_MCP_OAUTH_TOKEN_SCOPES")
+    token_scope_drift = client.get("/api/connect-ai")
+
+    assert token_scope_drift.status_code == 200
+    assert token_scope_drift.json()["clients"] == {}
+    assert token_scope_drift.json()["configuration_status"] == "action_required"
+
+
+def test_trusted_proxy_domain_policy_rejects_an_outside_account(tmp_path, monkeypatch):
+    _configure_multi_user_connect_test(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_EMAIL_DOMAINS", "example.test")
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ISSUER", "https://identity.example.test")
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    headers = _multi_user_headers()
+    headers["X-Viventium-User-Email"] = "member@outside.test"
+
+    response = client.get("/api/connect-ai", headers=headers)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "This account is outside the approved email domains"
+
+
+def test_provider_account_bff_generates_opaque_locator_and_honest_platform_status(monkeypatch):
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.post(
+        "/api/provider-accounts",
+        json={
+            "provider": "codex",
+            "label": "My Codex",
+            "auth_method": "subscription",
+            "make_default": True,
+        },
+    )
+
+    assert response.status_code == 200
+    request_payload = runtime.provider_account_requests[-1]
+    assert request_payload["secret_locator"] == "native-home://auto"
+    assert request_payload["platform_support"] == "proof_required"
+    assert "token" not in json.dumps(request_payload).lower()
+
+
+def test_control_plane_never_advertises_unimplemented_claude_secret_or_consumer_auth(
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get("/api/control-plane")
+
+    assert response.status_code == 200
+    claude = next(
+        option
+        for option in response.json()["provider_options"]
+        if option["provider"] == "claude"
+    )
+    assert "api_key" not in claude["methods"]
+    assert "subscription" not in claude["methods"]
+    assert claude["api_key_support"] == "fixed_anthropic_broker_not_implemented"
+    assert claude["experimental_consumer_auth"] == "not_accepted_hosted_path"
+    assert "not copied" in claude["api_key_support_note"]
+
+
+def test_provider_account_bff_registers_only_opaque_broker_metadata(monkeypatch):
+    monkeypatch.setenv(
+        "GLASSHIVE_INFERENCE_BROKER_URL",
+        "https://librechat.example.test/api/viventium/glasshive/inference",
+    )
+    monkeypatch.setenv(
+        "GLASSHIVE_INFERENCE_BROKER_SECRET",
+        "synthetic-broker-secret-with-at-least-32-characters",
+    )
+    monkeypatch.setenv("GLASSHIVE_INFERENCE_BROKER_TENANT_ID", "broker-tenant")
+    monkeypatch.setenv(
+        "GLASSHIVE_INFERENCE_BROKER_OWNER_BINDINGS_JSON",
+        '[{"glasshive_tenant_id":"local","glasshive_owner_id":"demo-owner","librechat_user_id":"user-a","proof":"operator_verified"}]',
+    )
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    control_plane = client.get("/api/control-plane")
+    response = client.post(
+        "/api/provider-accounts",
+        json={
+            "provider": "codex",
+            "label": "Personal OpenAI",
+            "auth_method": "api_key",
+            "make_default": True,
+        },
+    )
+
+    assert response.status_code == 200
+    codex = next(
+        item
+        for item in control_plane.json()["provider_options"]
+        if item["provider"] == "codex"
+    )
+    assert codex["inference_broker_support"] == "supported"
+    assert {"api_key", "enterprise_route"}.issubset(codex["methods"])
+    request_payload = runtime.provider_account_requests[-1]
+    assert request_payload["secret_locator"] == "broker://librechat-openai"
+    assert request_payload["platform_support"] == "supported"
+    assert "api_key" not in request_payload.keys()
+    assert "token" not in json.dumps(request_payload).lower()
+
+
+def test_provider_account_bff_never_registers_claude_against_openai_broker(monkeypatch):
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.post(
+        "/api/provider-accounts",
+        json={
+            "provider": "claude",
+            "label": "Unsupported Claude route",
+            "auth_method": "api_key",
+        },
+    )
+
+    assert response.status_code == 409
+    assert runtime.provider_account_requests == []
+
+
+def test_multi_user_codex_account_route_opens_only_with_reviewed_container_isolation(
+    tmp_path,
+    monkeypatch,
+):
+    _configure_multi_user_connect_test(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS", "true")
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    control_plane = client.get("/api/control-plane", headers=_multi_user_headers())
+    created = client.post(
+        "/api/provider-accounts",
+        headers=_multi_user_headers(),
+        json={
+            "provider": "codex",
+            "label": "Private Codex",
+            "auth_method": "subscription",
+            "make_default": True,
+        },
+    )
+
+    assert control_plane.status_code == 200
+    codex = next(
+        item for item in control_plane.json()["provider_options"] if item["provider"] == "codex"
+    )
+    assert codex["subscription_support"] == "supported"
+    assert created.status_code == 200
+    assert runtime.provider_account_requests[-1]["platform_support"] == "supported"
+
+
+def test_provider_account_setup_bff_is_user_scoped_through_signed_runtime_client():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    started = client.post("/api/provider-accounts/acct_public_safe/setup")
+    status = client.get("/api/provider-accounts/acct_public_safe/setup")
+    cancelled = client.post("/api/provider-accounts/acct_public_safe/setup/cancel")
+
+    assert started.status_code == 200
+    assert started.json()["status"] == "connecting"
+    assert status.json()["status"] == "ready"
+    assert cancelled.json()["status"] == "action_required"
+    assert runtime.provider_setup_requests == [
+        {"action": "start", "account_id": "acct_public_safe"},
+        {"action": "status", "account_id": "acct_public_safe"},
+        {"action": "cancel", "account_id": "acct_public_safe"},
+    ]
+
+
+def test_provider_disconnect_and_workspace_capability_revoke_are_user_scoped():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    disconnected = client.post("/api/provider-accounts/acct_public_safe/disconnect")
+    grants = client.get("/api/workspaces/wrk_1/capability-grants")
+    revoked = client.delete("/api/workspaces/wrk_1/capability-grants/grant_1")
+
+    assert disconnected.status_code == 200
+    assert disconnected.json()["status"] == "disconnected"
+    assert grants.status_code == 200
+    assert grants.json()["items"][0]["grant_id"] == "grant_1"
+    assert revoked.status_code == 200
+    assert revoked.json()["revoked_at"] == 1
+    assert runtime.provider_disconnect_requests == ["acct_public_safe"]
+    assert runtime.workspace_grant_requests == [
+        {"action": "list", "worker_id": "wrk_1"},
+        {"action": "revoke", "worker_id": "wrk_1", "grant_id": "grant_1"},
+    ]
+
+
+def test_provider_verify_and_forget_are_user_scoped_through_the_runtime_client():
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    verified = client.post("/api/provider-accounts/acct_public_safe/verify")
+    forgotten = client.delete("/api/provider-accounts/acct_public_safe")
+
+    assert verified.status_code == 200
+    assert verified.json()["status"] == "ready"
+    assert forgotten.status_code == 200
+    assert forgotten.json()["status"] == "forgotten"
+    assert runtime.provider_verify_requests == ["acct_public_safe"]
+    assert runtime.provider_forget_requests == ["acct_public_safe"]
+
+
+def test_control_plane_ui_exposes_safe_disconnect_and_capability_remove_paths():
+    script = (Path(server_module.STATIC_DIR) / "control-plane.js").read_text(encoding="utf-8")
+
+    assert "Disconnecting…" in script
+    assert "Reconnect" in script
+    assert "Test connection" in script
+    assert "Forget" in script
+    assert "last_verified_at" in script
+    assert "last_used_at" in script
+    assert "observed_runs" in script
+    assert "observed_failures" in script
+    assert "observed_duration_seconds" in script
+    assert "Observed by GlassHive" in script
+    assert "Tokens reported by worker" in script
+    assert "/verify" in script
+    assert "Activity is temporarily unavailable" in script
+    assert "Reconnect the affected account or connection" in script
+    app_script = (Path(server_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
+    assert "empty lists do not mean your data was removed" in app_script
+    assert "Remove from workspace" in script
+    assert "Upgrade workspace" in script
+    assert "change_type: replacementGrant ? 'library_upgrade' : 'library_enable'" in script
+    assert "replaces_grant_id" in script
+    assert "api.deleteJson" in script
+    assert "Keep as workspace" in (Path(server_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
+    confirm_page = (Path(server_module.STATIC_DIR) / "confirm.html").read_text(encoding="utf-8")
+    confirm_script = (Path(server_module.STATIC_DIR) / "confirm.js").read_text(encoding="utf-8")
+    assert 'id="confirm-provenance"' in confirm_page
+    assert 'id="confirm-dependencies"' in confirm_page
+    assert "library_plan_snapshot" in confirm_script
+    assert "librarySnapshot.content_hash" in confirm_script
+
+
+def test_main_ui_exposes_current_user_and_explicit_account_logout_actions():
+    page = (Path(server_module.STATIC_DIR) / "index.html").read_text(encoding="utf-8")
+    script = (Path(server_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="current-user-label"' in page
+    assert 'id="switch-account"' in page
+    assert 'id="local-sign-out"' in page
+    assert "renderCurrentUser(bootstrap.identity || {})" in script
+    assert "await signOut('provider')" in script
+    assert "await signOut('local')" in script
+    assert "'X-GlassHive-CSRF': csrfToken" in script
+
+
+def test_oidc_identity_owner_advertises_configured_email_login_and_registration(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_HUMAN_AUTH_MODE", "oidc")
+    monkeypatch.setenv("GLASSHIVE_AUTH_STATE_PATH", str(tmp_path / "auth.sqlite3"))
+    monkeypatch.setenv("GLASSHIVE_OIDC_ISSUER", "https://identity.example.test")
+    monkeypatch.setenv("GLASSHIVE_OIDC_CLIENT_ID", "glasshive-ui")
+    monkeypatch.setenv(
+        "GLASSHIVE_OIDC_REDIRECT_URI",
+        "https://glasshive.example.test/auth/oidc/callback",
+    )
+    monkeypatch.setenv("GLASSHIVE_ALLOW_EMAIL_LOGIN", "true")
+    monkeypatch.setenv("GLASSHIVE_ALLOW_EMAIL_REGISTRATION", "true")
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    config = client.get("/auth/config")
+    auth_script = (Path(server_module.STATIC_DIR) / "auth.js").read_text(encoding="utf-8")
+
+    assert config.status_code == 200
+    assert config.json() == {
+        "mode": "oidc",
+        "email_login": True,
+        "email_registration": True,
+        "identity_owner": "external_provider",
+        "oidc": True,
+    }
+    assert "Continue with email or organization" in auth_script
+
+
+class _FakeOidcHumanAuth:
+    mode = "oidc"
+    session_enabled = True
+    allowed_email_domains: tuple[str, ...] = ()
+
+    def __init__(self) -> None:
+        self.completed: object = None
+        self.revoked: list[str] = []
+        self.provider_logout = ""
+
+    def resolve_session(self, token):
+        if token != "opaque-session":
+            return None
+        return {
+            "tenant_id": "local",
+            "user_id": "stable-user-id",
+            "email": "member@example.invalid",
+            "display_name": "Example Member",
+            "role": "member",
+            "_csrf_hash": "unused-by-fake",
+        }
+
+    def session_csrf_valid(self, session, supplied):
+        return bool(session and supplied == "synthetic-csrf")
+
+    def begin_oidc(self, *, return_to="/"):
+        if isinstance(self.completed, AuthGatewayError) and self.completed.code == "provider_unavailable":
+            raise self.completed
+        return {
+            "authorization_url": "https://identity.example.invalid/authorize",
+            "state": "opaque-state",
+            "nonce": "opaque-nonce",
+        }
+
+    def complete_oidc(self, *, state, code):
+        if isinstance(self.completed, AuthGatewayError):
+            raise self.completed
+        return {
+            "principal": {
+                "user_id": "stable-user-id",
+                "email": "member@example.invalid",
+                "display_name": "Example Member",
+                "role": "member",
+            },
+            "return_to": "/workspaces",
+        }
+
+    def create_session(self, principal_id):
+        assert principal_id == "stable-user-id"
+        return {
+            "token": "new-session",
+            "csrf_token": "new-csrf",
+            "expires_at": server_module.time.time() + 3600,
+        }
+
+    def revoke_session(self, token):
+        self.revoked.append(token)
+
+    def provider_logout_url(self):
+        return self.provider_logout
+
+    def email_allowed(self, email):
+        return True
+
+
+def test_oidc_unhappy_paths_redirect_to_bounded_retry_ux_without_callback_secrets(
+    monkeypatch,
+    caplog,
+):
+    auth = _FakeOidcHumanAuth()
+    monkeypatch.setattr(server_module.HumanAuthGateway, "from_env", lambda: auth)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    with caplog.at_level(logging.INFO):
+        denied = client.get(
+            "/auth/oidc/callback?error=access_denied&error_description=outside-domain-secret",
+            follow_redirects=False,
+        )
+    assert denied.status_code == 303
+    assert denied.headers["location"] == "/login?auth_error=access_denied"
+    assert "outside-domain-secret" not in denied.headers["location"]
+    assert "outside-domain-secret" not in caplog.text
+
+    cancelled = client.get(
+        "/auth/oidc/callback?error=user_cancelled&error_description=private-provider-copy",
+        follow_redirects=False,
+    )
+    assert cancelled.headers["location"] == "/login?auth_error=cancelled"
+
+    invalid_state = client.get(
+        "/auth/oidc/callback?state=attacker-state&code=private-code",
+        follow_redirects=False,
+    )
+    assert invalid_state.headers["location"] == "/login?auth_error=state_invalid"
+
+    auth.completed = AuthGatewayError("expired or replayed", code="state_expired")
+    client.cookies.set("glasshive_oidc_state", "opaque-state")
+    replayed = client.get(
+        "/auth/oidc/callback?state=opaque-state&code=private-code",
+        follow_redirects=False,
+    )
+    assert replayed.headers["location"] == "/login?auth_error=state_expired"
+
+    auth.completed = AuthGatewayError("issuer or audience mismatch", code="token_invalid")
+    client.cookies.set("glasshive_oidc_state", "opaque-state")
+    invalid_token = client.get(
+        "/auth/oidc/callback?state=opaque-state&code=another-private-code",
+        follow_redirects=False,
+    )
+    assert invalid_token.headers["location"] == "/login?auth_error=token_invalid"
+
+    auth.completed = AuthGatewayError("provider outage", code="provider_unavailable")
+    unavailable = client.get("/auth/oidc/start", follow_redirects=False)
+    assert unavailable.headers["location"] == "/login?auth_error=provider_unavailable"
+
+    auth.completed = None
+    client.cookies.set("glasshive_oidc_state", "opaque-state")
+    retried = client.get(
+        "/auth/oidc/callback?state=opaque-state&code=retry-private-code",
+        follow_redirects=False,
+    )
+    assert retried.status_code == 303
+    assert retried.headers["location"] == "/workspaces"
+    assert "glasshive_session=new-session" in retried.headers["set-cookie"]
+
+
+def test_login_dom_has_bounded_actionable_error_copy_and_preserves_safe_return_target():
+    auth_script = (Path(server_module.STATIC_DIR) / "auth.js").read_text(encoding="utf-8")
+    login_page = (Path(server_module.STATIC_DIR) / "login.html").read_text(encoding="utf-8")
+
+    for code in (
+        "access_denied",
+        "account_not_authorized",
+        "account_not_registered",
+        "cancelled",
+        "provider_unavailable",
+        "state_expired",
+        "state_invalid",
+        "token_invalid",
+    ):
+        assert f"{code}:" in auth_script
+    assert "error_description" not in auth_script
+    assert "encodeURIComponent(returnTo)" in auth_script
+    assert 'id="auth-status"' in login_page
+
+
+@pytest.mark.parametrize(
+    ("mcp_url", "canonical", "callback_uri"),
+    [
+        (
+            "https://glasshive.example.com/mcp",
+            "https://glasshive.example.com/mcp",
+            "http://127.0.0.1:49153/callback/t-bKRAz0k2fk",
+        ),
+        (
+            "https://GLASSHIVE.EXAMPLE.TEST:443/mcp",
+            "https://glasshive.example.test/mcp",
+            "http://127.0.0.1:49153/callback/0MLa49XNV_Yw",
+        ),
+        (
+            "https://glasshive.example.test/a%2fb/%7Euser",
+            "https://glasshive.example.test/a%2fb/%7Euser",
+            "http://127.0.0.1:49153/callback/4UHUnvnRKbLF",
+        ),
+        (
+            "https://glasshive.example.test/mcp?x=1#ignored",
+            "https://glasshive.example.test/mcp?x=1",
+            "http://127.0.0.1:49153/callback/UEcxre_7-GPO",
+        ),
+    ],
+)
+def test_codex_callback_uri_matches_rust_url_canonicalization(
+    mcp_url,
+    canonical,
+    callback_uri,
+):
+    assert server_module._canonical_codex_server_url(mcp_url) == canonical
+    assert server_module._codex_oauth_callback_uri(mcp_url, 49153) == callback_uri
+
+
+def test_logout_is_csrf_protected_and_distinguishes_local_from_provider_scope(monkeypatch):
+    auth = _FakeOidcHumanAuth()
+    auth.provider_logout = (
+        "https://identity.example.invalid/logout?post_logout_redirect_uri="
+        "https%3A%2F%2Fglasshive.example.invalid%2Flogin"
+    )
+    monkeypatch.setattr(server_module.HumanAuthGateway, "from_env", lambda: auth)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    client.cookies.set("glasshive_session", "opaque-session")
+    client.cookies.set("glasshive_csrf", "synthetic-csrf")
+
+    rejected = client.post("/auth/logout", json={"scope": "provider"})
+    assert rejected.status_code == 403
+
+    switched = client.post(
+        "/auth/logout",
+        headers={"X-GlassHive-CSRF": "synthetic-csrf"},
+        json={"scope": "provider"},
+    )
+    assert switched.status_code == 200
+    assert switched.json() == {
+        "authenticated": False,
+        "logout_scope": "provider",
+        "redirect_url": auth.provider_logout,
+    }
+    assert auth.revoked == ["opaque-session"]
+
+    client.cookies.set("glasshive_session", "opaque-session")
+    client.cookies.set("glasshive_csrf", "synthetic-csrf")
+    local = client.post(
+        "/auth/logout",
+        headers={"X-GlassHive-CSRF": "synthetic-csrf"},
+        json={"scope": "local"},
+    )
+    assert local.json()["logout_scope"] == "local"
+    assert local.json()["redirect_url"] == "/login?logged_out=local"
+
+
+def test_unauthenticated_ui_routes_preserve_safe_deep_links_but_not_signed_secrets(monkeypatch):
+    auth = _FakeOidcHumanAuth()
+    monkeypatch.setattr(server_module.HumanAuthGateway, "from_env", lambda: auth)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    home = client.get("/", follow_redirects=False)
+    watch = client.get(
+        "/watch/wrk_1?project_id=prj_1&surface=desktop",
+        follow_redirects=False,
+    )
+    project = client.get(
+        "/ui/projects/prj_1?worker_id=wrk_1",
+        follow_redirects=False,
+    )
+
+    assert home.headers["location"] == "/login?return_to=%2F"
+    assert "return_to=%2Fwatch%2Fwrk_1%3Fproject_id%3Dprj_1%26surface%3Ddesktop" in watch.headers["location"]
+    assert "return_to=%2Fui%2Fprojects%2Fprj_1%3Fworker_id%3Dwrk_1" in project.headers["location"]
+
+    # A signed-link attempt remains on the signed-link path and is never copied into
+    # a login return URL, even when the token is invalid or expired.
+    signed = client.get(
+        "/watch/wrk_1?gh_token=private-signed-token",
+        follow_redirects=False,
+    )
+    assert signed.status_code == 401
+    assert "location" not in signed.headers
+
+
+def test_session_authenticated_writes_reject_cross_origin_even_with_valid_csrf(monkeypatch):
+    class FakeHumanAuth:
+        mode = "oidc"
+        session_enabled = True
+
+        def resolve_session(self, token):
+            if token != "opaque-session":
+                return None
+            return {
+                "tenant_id": "local",
+                "user_id": "user-public-safe",
+                "email": "member@example.invalid",
+                "role": "member",
+                "csrf_token": "synthetic-csrf",
+            }
+
+        def session_csrf_valid(self, session, supplied):
+            return bool(session and supplied == "synthetic-csrf")
+
+    monkeypatch.setattr(server_module.HumanAuthGateway, "from_env", lambda: FakeHumanAuth())
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    client.cookies.set("glasshive_session", "opaque-session")
+    client.cookies.set("glasshive_csrf", "synthetic-csrf")
+
+    response = client.post(
+        "/api/provider-accounts",
+        headers={"Origin": "https://attacker.example.invalid", "X-GlassHive-CSRF": "synthetic-csrf"},
+        json={"provider": "codex", "label": "Unsafe", "auth_method": "subscription"},
+    )
+
+    assert response.status_code == 403
+    assert "origin" in response.json()["detail"].lower()
+    assert runtime.provider_account_requests == []
+
+
+def test_oidc_csrf_preserves_only_valid_signed_link_communication(tmp_path, monkeypatch):
+    signed_secret = "ui-signed-link-secret"
+    set_enterprise_ui_env(monkeypatch, signed_secret=signed_secret)
+    configure_internal_assertion_signer(tmp_path, monkeypatch)
+    monkeypatch.setattr(server_module.HumanAuthGateway, "from_env", lambda: _FakeOidcHumanAuth())
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    token = signed_worker_token(signed_secret)
+
+    message = client.post(
+        f"/api/worker/wrk_1/message?gh_token={token}",
+        headers={"Origin": "http://testserver"},
+        json={"message": "Share a concise progress update."},
+    )
+    steer = client.post(
+        f"/api/workspace/wrk_1/steer?gh_token={token}",
+        headers={"Origin": "http://testserver"},
+        json={"message": "Focus on the requested output."},
+    )
+    forbidden_metadata = client.patch(
+        f"/api/worker/wrk_1/metadata?gh_token={token}",
+        headers={"Origin": "http://testserver"},
+        json={"favorite": True},
+    )
+    forged_message = client.post(
+        "/api/worker/wrk_1/message?gh_token=not-a-valid-signed-link",
+        headers={"Origin": "http://testserver"},
+        json={"message": "Do not deliver this."},
+    )
+    cross_origin = client.post(
+        f"/api/worker/wrk_1/message?gh_token={token}",
+        headers={"Origin": "https://attacker.example.invalid"},
+        json={"message": "Do not deliver this either."},
+    )
+
+    assert message.status_code == 200
+    assert steer.status_code == 200
+    assert forbidden_metadata.status_code == 403
+    assert "csrf" in forbidden_metadata.json()["detail"].lower()
+    assert forged_message.status_code == 403
+    assert "csrf" in forged_message.json()["detail"].lower()
+    assert cross_origin.status_code == 403
+    assert "origin" in cross_origin.json()["detail"].lower()
+    assert runtime.message_requests == [
+        {"worker_id": "wrk_1", "message": "Share a concise progress update."}
+    ]
+    assert runtime.steer_requests == [
+        {"worker_id": "wrk_1", "message": "Focus on the requested output."}
+    ]
+    assert runtime.metadata_requests == []
+
+    forged_link_response = client.post(
+        "/api/provider-accounts?gh_token=not-a-valid-signed-link",
+        json={"provider": "codex", "label": "Unsafe", "auth_method": "subscription"},
+    )
+
+    assert forged_link_response.status_code == 403
+    assert "csrf" in forged_link_response.json()["detail"].lower()
+    assert runtime.provider_account_requests == []
+
+
+def test_trusted_proxy_writes_reject_cross_origin(tmp_path, monkeypatch):
+    _configure_multi_user_connect_test(tmp_path, monkeypatch)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.post(
+        "/api/worker/wrk_1/metadata",
+        headers={**_multi_user_headers(), "Origin": "https://attacker.example.invalid"},
+        json={"favorite": True},
+    )
+
+    assert response.status_code == 403
+    assert "origin" in response.json()["detail"].lower()
+    assert runtime.metadata_requests == []
+
+
+def test_oidc_mode_cannot_trust_raw_inbound_identity_headers(tmp_path, monkeypatch):
+    _configure_multi_user_connect_test(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_HUMAN_AUTH_MODE", "oidc")
+    monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
+
+    with pytest.raises(RuntimeError, match="cannot trust inbound identity"):
+        create_app(runtime_client=FakeRuntimeClient())
+
+
 def test_worker_steer_endpoint_uses_runtime_steer():
     runtime = FakeRuntimeClient()
     client = TestClient(create_app(runtime_client=runtime))
@@ -2625,3 +4735,321 @@ def test_worker_metadata_endpoint_updates_favorite():
 
     assert response.status_code == 200
     assert runtime.metadata_requests == [{'worker_id': 'wrk_1', 'payload': {'favorite': True}}]
+
+
+def test_enterprise_bff_signs_short_lived_internal_user_assertion(tmp_path, monkeypatch):
+    set_enterprise_ui_env(monkeypatch)
+    private_key = configure_internal_assertion_signer(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.get(
+        "/api/bootstrap",
+        headers={
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "user-a",
+            "X-Viventium-User-Email": "user-a@example.invalid",
+            "X-Viventium-User-Role": "member",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    runtime_headers = runtime.header_contexts[-1]
+    assert runtime_headers["X-WPR-Token"] == "ui-service-secret"
+    assert "X-Viventium-User-Id" not in runtime_headers
+    assertion = runtime_headers["X-GlassHive-User-Assertion"]
+    claims = jwt.decode(
+        assertion,
+        private_key.public_key(),
+        algorithms=["RS256"],
+        audience="glasshive-runtime",
+        issuer="https://gateway.example.invalid",
+    )
+    assert claims["sub"] == "user-a"
+    assert claims["tenant_id"] == "tenant-alpha"
+    assert claims["role"] == "member"
+    assert set(claims["scope"].split()) >= {"runtime:access", "workspaces:read"}
+    assert claims["exp"] - claims["iat"] <= 90
+    assert claims["jti"]
+
+    confirm = client.post(
+        "/api/pending-changes/chg_1/confirm",
+        headers={
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "user-a",
+            "X-Viventium-User-Email": "user-a@example.invalid",
+            "X-Viventium-User-Role": "member",
+        },
+        json={"confirmation_token": "synthetic-confirmation-token"},
+    )
+    assert confirm.status_code == 200
+    confirm_claims = jwt.decode(
+        runtime.header_contexts[-1]["X-GlassHive-User-Assertion"],
+        private_key.public_key(),
+        algorithms=["RS256"],
+        audience="glasshive-runtime",
+        issuer="https://gateway.example.invalid",
+    )
+    assert "human:confirm" in confirm_claims["scope"].split()
+
+    metadata = client.post(
+        "/api/worker/wrk_1/metadata",
+        headers={
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "user-a",
+            "X-Viventium-User-Role": "member",
+        },
+        json={"favorite": True},
+    )
+    assert metadata.status_code == 200
+    metadata_claims = jwt.decode(
+        runtime.header_contexts[-1]["X-GlassHive-User-Assertion"],
+        private_key.public_key(),
+        algorithms=["RS256"],
+        audience="glasshive-runtime",
+        issuer="https://gateway.example.invalid",
+    )
+    assert "human:confirm" not in metadata_claims["scope"].split()
+
+
+def test_signed_workspace_link_assertion_has_viewer_communication_scope_only(tmp_path, monkeypatch):
+    signed_secret = "ui-signed-link-secret"
+    set_enterprise_ui_env(monkeypatch, signed_secret=signed_secret)
+    private_key = configure_internal_assertion_signer(tmp_path, monkeypatch)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    token = signed_worker_token(signed_secret)
+
+    response = client.post(
+        f"/api/worker/wrk_1/message?gh_token={token}",
+        json={"message": "Share a concise progress update."},
+    )
+
+    assert response.status_code == 200
+    claims = jwt.decode(
+        runtime.header_contexts[-1]["X-GlassHive-User-Assertion"],
+        private_key.public_key(),
+        algorithms=["RS256"],
+        audience="glasshive-runtime",
+        issuer="https://gateway.example.invalid",
+    )
+    scopes = set(claims["scope"].split())
+    assert claims["role"] == "viewer"
+    assert "workspaces:communicate" in scopes
+    assert "workspaces:write" not in scopes
+    assert "runtime:internal_details" not in scopes
+
+
+def test_internal_assertion_jwks_publishes_public_key_only(tmp_path, monkeypatch):
+    set_enterprise_ui_env(monkeypatch)
+    configure_internal_assertion_signer(tmp_path, monkeypatch)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get("/.well-known/jwks.json")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["keys"][0]["kid"] == "gateway-test-key"
+    assert payload["keys"][0]["kty"] == "RSA"
+    assert "d" not in payload["keys"][0]
+
+
+def test_internal_assertion_jwks_keeps_previous_public_key_for_bounded_rotation(
+    tmp_path,
+    monkeypatch,
+):
+    set_enterprise_ui_env(monkeypatch)
+    configure_internal_assertion_signer(tmp_path, monkeypatch)
+    previous_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    previous_public_jwk = json.loads(
+        jwt.algorithms.RSAAlgorithm.to_jwk(previous_private_key.public_key())
+    )
+    previous_public_jwk.update(
+        {"kid": "gateway-previous-key", "use": "sig", "alg": "RS256"}
+    )
+    previous_jwks_path = tmp_path / "gateway-previous-public-jwks.json"
+    previous_jwks_path.write_text(
+        json.dumps({"keys": [previous_public_jwk]}),
+        encoding="utf-8",
+    )
+    now = 2_000_000_000
+    monkeypatch.setattr(internal_assertions_module.time, "time", lambda: now)
+    monkeypatch.setenv(
+        "GLASSHIVE_INTERNAL_ASSERTION_PREVIOUS_JWKS_FILE",
+        str(previous_jwks_path),
+    )
+    monkeypatch.setenv(
+        "GLASSHIVE_INTERNAL_ASSERTION_PREVIOUS_KEYS_EXPIRE_AT",
+        str(now + 600),
+    )
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    overlapping = client.get("/.well-known/jwks.json")
+    assert overlapping.status_code == 200
+    assert [key["kid"] for key in overlapping.json()["keys"]] == [
+        "gateway-test-key",
+        "gateway-previous-key",
+    ]
+    assert all("d" not in key for key in overlapping.json()["keys"])
+
+    monkeypatch.setattr(internal_assertions_module.time, "time", lambda: now + 601)
+    expired = client.get("/.well-known/jwks.json")
+    assert expired.status_code == 200
+    assert [key["kid"] for key in expired.json()["keys"]] == ["gateway-test-key"]
+
+
+def test_internal_assertion_mode_fails_closed_without_dedicated_private_key(monkeypatch):
+    set_enterprise_ui_env(monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "signed_internal_assertion")
+    monkeypatch.setenv("GLASSHIVE_INTERNAL_ASSERTION_ISSUER", "https://gateway.example.invalid")
+    monkeypatch.setenv("GLASSHIVE_INTERNAL_ASSERTION_AUDIENCE", "glasshive-runtime")
+
+    with pytest.raises(RuntimeError, match="private signing key"):
+        create_app(runtime_client=FakeRuntimeClient())
+
+
+def test_multi_user_security_mode_rejects_plaintext_trusted_proxy_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_HUMAN_AUTH_MODE", "trusted_proxy")
+    monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
+    monkeypatch.setenv("GLASSHIVE_TRUSTED_PROXY_BOUNDARY_PROVEN", "true")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "ui-service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "ui-signed-link-secret")
+    configure_internal_assertion_signer(tmp_path, monkeypatch)
+    monkeypatch.delenv("GLASSHIVE_AUTH_MODE", raising=False)
+
+    with pytest.raises(RuntimeError, match="requires built-in OIDC"):
+        create_app(runtime_client=FakeRuntimeClient())
+
+
+def test_multi_user_security_mode_refuses_disabled_human_auth(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "ui-service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "ui-signed-link-secret")
+    configure_internal_assertion_signer(tmp_path, monkeypatch)
+    monkeypatch.delenv("GLASSHIVE_AUTH_MODE", raising=False)
+
+    with pytest.raises(RuntimeError, match="human auth"):
+        create_app(runtime_client=FakeRuntimeClient())
+
+
+def test_tenant_admin_can_disable_another_user_but_not_self(monkeypatch):
+    mutation_order = []
+
+    class FakeHumanAuth:
+        mode = "oidc"
+        session_enabled = True
+        allowed_email_domains = ()
+
+        def __init__(self):
+            self.updated = []
+
+        def resolve_session(self, token):
+            if token != "admin-session":
+                return None
+            return {
+                "tenant_id": "tenant-alpha",
+                "user_id": "admin-user",
+                "email": "admin@example.invalid",
+                "role": "tenant_admin",
+                "_csrf_hash": "synthetic",
+            }
+
+        def session_csrf_valid(self, session, supplied):
+            return bool(session and supplied == "admin-csrf")
+
+        def list_principals(self, *, limit=100):
+            return [{"user_id": "member-user", "disabled": False}][:limit]
+
+        def set_principal_disabled(self, *, principal_id, disabled):
+            mutation_order.append("human_auth")
+            self.updated.append((principal_id, disabled))
+            return {"user_id": principal_id, "disabled": disabled}
+
+    auth = FakeHumanAuth()
+    monkeypatch.setattr(server_module.HumanAuthGateway, "from_env", lambda: auth)
+    runtime = FakeRuntimeClient()
+    original_authority_update = runtime.set_schedule_principal_authority
+
+    def record_authority_update(principal_id, *, enabled):
+        mutation_order.append("schedule_authority")
+        return original_authority_update(principal_id, enabled=enabled)
+
+    runtime.set_schedule_principal_authority = record_authority_update
+    client = TestClient(create_app(runtime_client=runtime))
+    client.cookies.set("glasshive_session", "admin-session")
+    client.cookies.set("glasshive_csrf", "admin-csrf")
+
+    listed = client.get("/api/admin/users")
+    disabled = client.patch(
+        "/api/admin/users/member-user",
+        headers={"Origin": "http://testserver", "X-GlassHive-CSRF": "admin-csrf"},
+        json={"disabled": True},
+    )
+    self_disable = client.patch(
+        "/api/admin/users/admin-user",
+        headers={"Origin": "http://testserver", "X-GlassHive-CSRF": "admin-csrf"},
+        json={"disabled": True},
+    )
+
+    assert listed.status_code == 200
+    assert listed.json()["items"] == [{"user_id": "member-user", "disabled": False}]
+    assert disabled.status_code == 200
+    assert auth.updated == [("member-user", True)]
+    assert runtime.schedule_authority_requests == [
+        {"principal_id": "member-user", "enabled": False}
+    ]
+    assert mutation_order == ["schedule_authority", "human_auth"]
+    assert self_disable.status_code == 409
+
+
+def test_tenant_admin_disable_fails_closed_when_schedule_authority_is_unavailable(monkeypatch):
+    class FakeHumanAuth:
+        mode = "oidc"
+        session_enabled = True
+        allowed_email_domains = ()
+
+        def __init__(self):
+            self.updated = []
+
+        def resolve_session(self, token):
+            if token != "admin-session":
+                return None
+            return {
+                "tenant_id": "tenant-alpha",
+                "user_id": "admin-user",
+                "email": "admin@example.invalid",
+                "role": "tenant_admin",
+                "_csrf_hash": "synthetic",
+            }
+
+        def session_csrf_valid(self, session, supplied):
+            return bool(session and supplied == "admin-csrf")
+
+        def set_principal_disabled(self, *, principal_id, disabled):
+            self.updated.append((principal_id, disabled))
+            return {"user_id": principal_id, "disabled": disabled}
+
+    auth = FakeHumanAuth()
+    runtime = FakeRuntimeClient()
+    runtime.schedule_authority_error = RuntimeError("synthetic authority outage")
+    monkeypatch.setattr(server_module.HumanAuthGateway, "from_env", lambda: auth)
+    client = TestClient(create_app(runtime_client=runtime))
+    client.cookies.set("glasshive_session", "admin-session")
+    client.cookies.set("glasshive_csrf", "admin-csrf")
+
+    response = client.patch(
+        "/api/admin/users/member-user",
+        headers={"Origin": "http://testserver", "X-GlassHive-CSRF": "admin-csrf"},
+        json={"disabled": True},
+    )
+
+    assert response.status_code == 503
+    assert "account was not changed" in response.json()["detail"]
+    assert runtime.schedule_authority_requests == [
+        {"principal_id": "member-user", "enabled": False}
+    ]
+    assert auth.updated == []

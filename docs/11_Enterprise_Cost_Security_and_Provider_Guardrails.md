@@ -144,6 +144,78 @@ workers/workspaces can exist or run; provider quota errors mean the model route,
 rate limit rejected the request. Fix provider quota by changing the model route, budget, key, or
 deployment capacity, not by raising GlassHive worker caps.
 
+Provider-account cards show only what GlassHive directly observed: account-bound worker runs,
+failed outcomes, elapsed worker-dispatch time, and—only when the worker harness reports them—input
+and output tokens. Lease acquisition does not count as a run, and the same accounting boundary
+applies to native subscription homes and brokered API-key or enterprise routes. These counters do
+not claim provider-side subscription usage, remaining quota, billing, or rate-limit state.
+
+## Per-user LibreChat inference broker
+
+An optional LibreChat inference broker can let a Codex mission worker use the authenticated user's
+encrypted OpenAI API key or an approved enterprise OpenAI route without exposing that credential to
+GlassHive. GlassHive stores only a provider-account reference. When a run actually starts, it mints
+a 60-second issuer assertion, receives an in-memory grant bound to the exact broker tenant, user,
+worker, run, adapter, route, and model list, and revokes that grant on completion, failure,
+interruption, or termination. Workspaces, templates, schedules, the control-plane database, and run
+evidence must never contain a broker grant.
+
+The deployment owns these settings:
+
+- `GLASSHIVE_INFERENCE_BROKER_URL`: fixed HTTPS issuer/revocation endpoint
+- `GLASSHIVE_INFERENCE_BROKER_PROXY_BASE_URL`: fixed HTTPS broker route prefix when different
+  from the issuer URL (for example, `https://host.example/api/viventium/glasshive/inference`).
+  Do not append `/openai/v1`; the reviewed adapter adds that fixed suffix itself.
+- `GLASSHIVE_INFERENCE_BROKER_SECRET`: shared signing secret, at least 32 characters
+- `GLASSHIVE_INFERENCE_BROKER_TENANT_ID`: LibreChat broker tenant
+- `GLASSHIVE_INFERENCE_BROKER_OWNER_BINDINGS_JSON`: reviewed canonical GlassHive-owner to
+  LibreChat-user mappings. Each list entry declares `glasshive_tenant_id`, `glasshive_owner_id`,
+  `librechat_user_id`, and either `operator_verified` or `shared_oidc_subject` proof.
+
+The enterprise OpenAI-compatible origin is a trusted deployment setting, not user input. It may be
+an approved private enterprise gateway, so public-IP-only validation would break legitimate
+deployments; operators must review its DNS, TLS, network egress, and credential boundary before
+enabling it. Browser, MCP, worker, and grant requests cannot override the origin, suffix, adapter,
+authorization header, or extra upstream headers. The broker uses a fixed suffix, disables automatic
+redirect following, and rejects every upstream `3xx` response. Personal API-key traffic always uses
+the fixed OpenAI API origin and ignores stored or caller-supplied base URLs and headers.
+
+The mapping is mandatory and exact; GlassHive fails closed rather than assuming that similarly
+named accounts are the same principal. The Codex route advertises only `openai_responses_v1` and
+projects the grant through the provider API-key environment plus fixed worker/run headers. Current
+Codex accepts only the Responses wire protocol for custom providers; a Chat Completions broker
+adapter may remain available to separately verified harnesses but must not be projected into Codex.
+See the [official Codex configuration reference](https://developers.openai.com/codex/config-reference).
+This route does not imply or advertise Claude consumer OAuth or Codex/ChatGPT subscription OAuth.
+
+## Native personal-account container boundary
+
+Multi-user native subscription missions fail closed unless the deployment declares the reviewed
+`per_worker_container` isolation mode. In that mode GlassHive mounts only the selected account home
+at `/workspace/.provider-account`, points Codex or Claude at its provider-specific child directory,
+and removes conflicting deployment gateway/key environment variables. Rootless Docker maps the
+container's non-root worker to a subordinate host uid, so a correct bind mount of the host-owned
+`0700`/`0600` tree is not sufficient by itself. The reviewed workstation image includes POSIX ACL
+support; startup grants and then verifies access for only the container worker user. There is no
+world-writable fallback. GlassHive removes the credential-bearing container and tightens the
+credential tree again before releasing the short, heartbeated exclusive mission lease.
+
+If the ACL grant/access check, stale-mount reconciliation, container removal, permission tightening,
+or lease heartbeat fails, the mission stops and the account becomes action-required. Deployments
+without this exact substrate keep reporting `isolated_substrate_required` instead of falling back to
+the deployment-wide provider route.
+
+Direct connected-service capabilities use a separate issuer endpoint but the same no-token-copy
+boundary. In `shared_oidc_subject` mode, GlassHive and LibreChat must use the exact same configured
+OIDC issuer and principal claim. LibreChat derives and uniquely indexes GlassHive's opaque
+`usr_<issuer+subject hash>` only during authenticated OIDC login; existing users backfill on
+re-login, a missing/wrong issuer or claim creates no link, and email is never a fallback. An
+`operator_verified` deployment instead uses the explicit owner mapping above. Direct assertions
+are tenant/action bound, grant and revoke are worker/run bound, and each signed nonce is checked in
+the shared replay cache before user or grant work. Status is read-only, grant identity is
+deterministic for the exact user/worker/run, and revoke is idempotent, so even a simultaneous cache
+race cannot widen scope or duplicate a distinct grant.
+
 ## Provider Secret Exposure
 
 In enterprise mode, provider secrets should not be left in interactive shell startup files. The

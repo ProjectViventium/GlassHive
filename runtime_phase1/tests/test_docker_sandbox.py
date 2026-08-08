@@ -14,6 +14,7 @@ import pytest
 from workers_projects_runtime.docker_sandbox import (
     DockerSandboxManager,
     SandboxInfo,
+    VNC_PASSWORD_ALPHABET,
     _ai_worker_browser_extension_check_script,
     _ai_worker_browser_native_host_bootstrap_script,
     _safe_docker_exec_env,
@@ -41,6 +42,20 @@ def test_safe_docker_exec_env_preserves_claude_headless_oauth_only():
 
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-token"
     assert env["ANTHROPIC_API_KEY"] == "api-key"
+    assert "UNRELATED_SECRET" not in env
+
+
+def test_safe_docker_exec_env_preserves_bound_provider_home_selectors():
+    env = _safe_docker_exec_env(
+        {
+            "CODEX_HOME": "/workspace/.provider-account/codex",
+            "CLAUDE_CONFIG_DIR": "/workspace/.provider-account/claude",
+            "UNRELATED_SECRET": "must-not-pass",
+        }
+    )
+
+    assert env["CODEX_HOME"] == "/workspace/.provider-account/codex"
+    assert env["CLAUDE_CONFIG_DIR"] == "/workspace/.provider-account/claude"
     assert "UNRELATED_SECRET" not in env
 
 
@@ -93,6 +108,8 @@ def test_create_container_adds_host_gateway_alias_for_broker_reachability(tmp_pa
 
     def fake_docker(args: list[str], **kwargs):
         captured.append(args)
+        if args[:2] == ["network", "inspect"]:
+            return subprocess.CompletedProcess(["docker", *args], returncode=1, stdout="", stderr="not found")
         return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="cid", stderr="")
 
     manager._docker = fake_docker  # type: ignore[method-assign]
@@ -106,6 +123,7 @@ def test_create_container_adds_host_gateway_alias_for_broker_reachability(tmp_pa
 
     command = captured[-1]
     assert "--add-host" in command
+    assert command[command.index("--network") + 1] == manager._network_name_for_container("wpr-test")
     assert "host.docker.internal:host-gateway" in command
     assert "--security-opt" in command
     assert "seccomp=unconfined" in command
@@ -146,6 +164,162 @@ def test_create_container_adds_host_gateway_alias_for_broker_reachability(tmp_pa
     assert "seccomp=unconfined" not in captured[-1]
 
 
+def test_create_container_mounts_only_a_trusted_bound_provider_account_home(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    account_home = tmp_path / "provider-accounts" / "acct-safe"
+    account_home.mkdir(parents=True)
+    captured: list[list[str]] = []
+
+    def fake_docker(args: list[str], **kwargs):
+        captured.append(args)
+        if args[:2] == ["network", "inspect"]:
+            return subprocess.CompletedProcess(["docker", *args], 1, "", "not found")
+        return subprocess.CompletedProcess(["docker", *args], 0, "cid", "")
+
+    manager._docker = fake_docker  # type: ignore[method-assign]
+    manager._create_container(
+        "wpr-test",
+        {
+            "workspace_dir": tmp_path / "workspace",
+            "home_dir": tmp_path / "home",
+        },
+        worker={
+            "_glasshive_provider_account_bound": True,
+            "_glasshive_provider_account_mount_host": str(account_home),
+            "_glasshive_provider_account_mount_target": "/workspace/.provider-account",
+        },
+    )
+
+    command = captured[-1]
+    assert (
+        f"{account_home.resolve()}:/workspace/.provider-account"
+        in command
+    )
+
+
+def test_bound_provider_account_mount_grants_and_verifies_only_worker_user_access(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    account_home = tmp_path / "provider-accounts" / "acct-safe"
+    (account_home / "codex").mkdir(parents=True)
+    calls: list[tuple[str | None, list[str]]] = []
+
+    def fake_docker_exec(
+        container_name,
+        command,
+        *,
+        env=None,
+        cwd=None,
+        detach=False,
+        fire_and_forget=False,
+        user=None,
+    ):
+        calls.append((user, command))
+        return subprocess.CompletedProcess(["docker"], 0, "", "")
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+    worker = {
+        "_glasshive_provider_account_bound": True,
+        "_glasshive_provider_account_mount_host": str(account_home),
+        "_glasshive_provider_account_mount_target": "/workspace/.provider-account",
+        "_glasshive_provider_account_env": {
+            "CODEX_HOME": "/workspace/.provider-account/codex"
+        },
+    }
+
+    manager._grant_provider_account_access("wpr-test", worker)  # type: ignore[attr-defined]
+
+    assert len(calls) == 2
+    assert calls[0][0] == "root"
+    grant_script = calls[0][1][-1]
+    assert "command -v setfacl" in grant_script
+    assert "setfacl -R -m u:seluser:rwX" in grant_script
+    assert "chmod" not in grant_script
+    assert calls[1][0] == "seluser"
+    verify_script = calls[1][1][-1]
+    assert "test -r /workspace/.provider-account/codex" in verify_script
+    assert "test -w /workspace/.provider-account/codex" in verify_script
+
+
+def test_provider_account_mount_requires_private_binder_marker(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    account_home = tmp_path / "provider-accounts" / "acct-untrusted"
+    account_home.mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="validated by the GlassHive control plane"):
+        manager._provider_account_mount(  # type: ignore[attr-defined]
+            {
+                "_glasshive_provider_account_mount_host": str(account_home),
+                "_glasshive_provider_account_mount_target": "/workspace/.provider-account",
+            }
+        )
+
+
+def test_sandbox_network_isolation_detects_default_bridge_and_accepts_shared_icc_disabled_network(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    common = {
+        "container_name": "wpr-wrk-test",
+        "container_id": "cid",
+        "state": "ready",
+        "workspace_dir": str(tmp_path / "workspace"),
+        "home_dir": str(tmp_path / "home"),
+        "pid": 123,
+        "image": "img",
+    }
+
+    assert manager._sandbox_needs_network_recreate(  # type: ignore[attr-defined]
+        "wrk_test", SandboxInfo(**common, networks=("bridge",))
+    ) is True
+    assert manager._sandbox_needs_network_recreate(  # type: ignore[attr-defined]
+        "wrk_test",
+        SandboxInfo(
+            **common,
+            networks=(manager._network_name_for_container("wpr-wrk-test"),),
+        ),
+    ) is False
+    assert manager._network_name_for_container("wpr-one") == manager._network_name_for_container("wpr-two")
+
+
+def test_stale_provider_account_mount_is_removed_before_reuse(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    account_home = tmp_path / "provider-accounts" / "acct-safe"
+    account_home.mkdir(parents=True)
+    commands: list[list[str]] = []
+
+    def fake_docker(args: list[str], *, check: bool = True, capture_output: bool = False, **kwargs):
+        commands.append(list(args))
+        if args[:2] == ["ps", "-aq"]:
+            return subprocess.CompletedProcess(["docker", *args], 0, stdout="cid-stale\n", stderr="")
+        if args and args[0] == "inspect":
+            return subprocess.CompletedProcess(
+                ["docker", *args],
+                0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "Id": "cid-stale",
+                            "Name": "/wpr-stale-worker",
+                            "Mounts": [
+                                {
+                                    "Source": str(account_home.resolve()),
+                                    "Destination": "/workspace/.provider-account",
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(["docker", *args], 0, stdout="", stderr="")
+
+    manager._docker = fake_docker  # type: ignore[method-assign]
+
+    removed = manager.terminate_containers_mounting_provider_account(account_home)
+
+    assert removed == ["wpr-stale-worker"]
+    assert ["rm", "-f", "cid-stale"] in commands
+    assert any(command[:2] == ["network", "rm"] for command in commands)
+
+
 def test_describe_self_heals_novnc_when_service_port_resets(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     calls: list[tuple[str, object]] = []
@@ -176,12 +350,81 @@ def test_describe_self_heals_novnc_when_service_port_resets(tmp_path):
     details = manager.describe("wrk_test")
 
     assert details["view_available"] is True
-    assert details["view_url"] == "http://127.0.0.1:57900/?autoconnect=1&resize=scale&reconnect=1&show_dot=1"
+    view_url = str(details["view_url"])
+    assert view_url.startswith("http://127.0.0.1:57900/?")
+    assert "autoconnect=1" in view_url
+    assert "password=" in view_url
     assert details["view_health"] == {"healthy": True, "repaired": True, "reason": "ok"}
     assert calls
     repair_script = str(calls[0][1])
     assert "TMPDIR=/tmp" in repair_script
     assert manager._browser_tmp_dir() not in repair_script
+
+
+def test_container_uses_unique_required_desktop_and_grid_credentials(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    commands: list[list[str]] = []
+    secret_environments: list[dict[str, str]] = []
+
+    def fake_docker(args: list[str], *, check: bool = True, capture_output: bool = False, **kwargs):
+        commands.append(list(args))
+        if args and args[0] == "run":
+            env_path = Path(args[args.index("--env-file") + 1])
+            assert env_path.stat().st_mode & 0o777 == 0o600
+            secret_environments.append(
+                dict(line.split("=", 1) for line in env_path.read_text(encoding="utf-8").splitlines())
+            )
+        return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="container-id", stderr="")
+
+    manager._docker = fake_docker  # type: ignore[method-assign]
+    manager._ensure_isolated_network = lambda _name: "wpr-wrk-one-net"  # type: ignore[method-assign]
+    paths_one = manager.paths("wrk_one")
+    paths_two = manager.paths("wrk_two")
+    manager._ensure_host_dirs(paths_one)  # type: ignore[attr-defined]
+    manager._ensure_host_dirs(paths_two)  # type: ignore[attr-defined]
+
+    manager._create_container("wpr-wrk-one", paths_one, worker={"worker_id": "wrk_one"})  # type: ignore[attr-defined]
+    manager._create_container("wpr-wrk-two", paths_two, worker={"worker_id": "wrk_two"})  # type: ignore[attr-defined]
+
+    run_commands = [command for command in commands if command and command[0] == "run"]
+    assert len(run_commands) == 2
+
+    def env_values(command: list[str]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for index, value in enumerate(command[:-1]):
+            if value == "-e" and "=" in command[index + 1]:
+                key, raw = command[index + 1].split("=", 1)
+                result[key] = raw
+        return result
+
+    first = env_values(run_commands[0])
+    assert first["SE_VNC_NO_PASSWORD"] == "0"
+    assert first["SE_ROUTER_USERNAME"]
+    assert first["SE_MASK_SECRETS"] == "true"
+    assert "SE_VNC_PASSWORD" not in first
+    assert "SE_ROUTER_PASSWORD" not in first
+    assert all("SE_VNC_PASSWORD=" not in value for value in run_commands[0])
+    assert all("SE_ROUTER_PASSWORD=" not in value for value in run_commands[0])
+    assert secret_environments[0]["SE_VNC_PASSWORD"] != secret_environments[1]["SE_VNC_PASSWORD"]
+    assert len(secret_environments[0]["SE_VNC_PASSWORD"]) == 8
+    assert set(secret_environments[0]["SE_VNC_PASSWORD"]).issubset(set(VNC_PASSWORD_ALPHABET))
+    assert len(set(VNC_PASSWORD_ALPHABET)) >= 64
+    assert secret_environments[0]["SE_ROUTER_PASSWORD"] != secret_environments[1]["SE_ROUTER_PASSWORD"]
+    assert not Path(run_commands[0][run_commands[0].index("--env-file") + 1]).exists()
+    assert (paths_one["state_dir"] / "desktop-credentials.json").stat().st_mode & 0o777 == 0o600
+    assert (paths_one["home_dir"] / ".vnc").is_dir()
+    assert (paths_one["home_dir"] / ".vnc").stat().st_mode & 0o777 == 0o700
+
+
+def test_passwordless_desktop_requires_explicit_insecure_local_opt_in(tmp_path, monkeypatch):
+    monkeypatch.setenv("WPR_SANDBOX_VNC_NO_PASSWORD", "true")
+    with pytest.raises(RuntimeError, match="passwordless desktop"):
+        DockerSandboxManager(base_dir=str(tmp_path))
+
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "single_user")
+    monkeypatch.setenv("WPR_ALLOW_INSECURE_LOCAL_DESKTOP", "true")
+    manager = DockerSandboxManager(base_dir=str(tmp_path / "allowed"))
+    assert manager.vnc_no_password is True
 
 
 def test_inspect_reports_paused_when_docker_state_is_paused(tmp_path):
@@ -256,7 +499,7 @@ def test_ensure_ready_creates_container_when_only_projected_paths_exist(tmp_path
     manager._require_docker = lambda: None  # type: ignore[method-assign]
     manager._ensure_image = lambda: None  # type: ignore[method-assign]
     manager.inspect = fake_inspect  # type: ignore[method-assign]
-    manager._create_container = lambda container_name, paths: created.append(container_name)  # type: ignore[method-assign]
+    manager._create_container = lambda container_name, paths, worker=None: created.append(container_name)  # type: ignore[method-assign]
     manager._ensure_container_writable_paths = lambda container_name, paths: None  # type: ignore[method-assign]
     manager._repair_provider_temp_ownership = lambda container_name: None  # type: ignore[method-assign]
     manager._harden_secret_runtime_files = lambda container_name: None  # type: ignore[method-assign]
@@ -313,9 +556,12 @@ def test_ensure_ready_recreates_ready_container_missing_chromium_userns(tmp_path
             calls.append("rm")
             removed = True
             return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="", stderr="")
+        if args[:2] == ["network", "rm"]:
+            calls.append("network-rm")
+            return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected docker call: {args}")
 
-    def fake_create_container(container_name, paths):
+    def fake_create_container(container_name, paths, worker=None):
         nonlocal created
         calls.append(f"create:{container_name}")
         created = True
@@ -340,9 +586,10 @@ def test_ensure_ready_recreates_ready_container_missing_chromium_userns(tmp_path
     assert calls == [
         "require",
         "host_dirs",
-        "seed",
-        "rm",
-        "image",
+            "seed",
+            "rm",
+            "network-rm",
+            "image",
         "create:wpr-wrk-test",
         "writable",
         "provider_tmp",
@@ -414,9 +661,12 @@ def test_terminate_invalidates_inspect_cache_before_idle_resume(tmp_path):
             calls.append("rm")
             exists = False
             return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="", stderr="")
+        if args[:2] == ["network", "rm"]:
+            calls.append("network-rm")
+            return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected docker call: {args}")
 
-    def fake_create_container(container_name, paths):
+    def fake_create_container(container_name, paths, worker=None):
         nonlocal exists
         calls.append("create")
         exists = True
@@ -487,6 +737,31 @@ def test_docker_exec_timeout_returns_failed_result(tmp_path, monkeypatch):
     assert "timed out after 2s" in result.stderr
 
 
+def test_docker_exec_keeps_secret_environment_values_out_of_argv(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    observed: dict[str, object] = {}
+
+    def fake_docker(args: list[str], **kwargs):
+        observed["args"] = list(args)
+        env_path = Path(args[args.index("--env-file") + 1])
+        observed["env_path"] = env_path
+        observed["env_text"] = env_path.read_text(encoding="utf-8")
+        assert env_path.stat().st_mode & 0o777 == 0o600
+        return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="", stderr="")
+
+    manager._docker = fake_docker  # type: ignore[method-assign]
+    result = manager._docker_exec(
+        "wpr-test",
+        ["bash", "-lc", "true"],
+        env={"OPENAI_API_KEY": "synthetic-secret-value", "HOME": "/workspace/.wpr-home"},
+    )
+
+    assert result.returncode == 0
+    assert "synthetic-secret-value" in str(observed["env_text"])
+    assert all("synthetic-secret-value" not in value for value in observed["args"])
+    assert not Path(observed["env_path"]).exists()
+
+
 def test_docker_exec_detach_uses_popen_without_waiting(tmp_path, monkeypatch):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     calls: list[list[str]] = []
@@ -514,7 +789,9 @@ def test_docker_exec_detach_uses_popen_without_waiting(tmp_path, monkeypatch):
         time.sleep(0.01)
     assert len(calls) == 1
     assert calls[0][:2] == ["sh", "-lc"]
-    assert calls[0][2].startswith("sleep 0.1; exec docker exec -d -u seluser")
+    assert "sleep 0.1; docker exec -d -u seluser" in calls[0][2]
+    assert "--env-file" in calls[0][2]
+    assert "HOME=/workspace/.wpr-home" not in calls[0][2]
     assert "wpr-test bash -lc 'sleep 60'" in calls[0][2]
 
 
@@ -828,7 +1105,7 @@ def test_ensure_ready_builds_container_when_projected_worker_inspect_misses(tmp_
     manager._seed_bootstrap = lambda *args, **kwargs: calls.append("seed")  # type: ignore[method-assign]
     manager.inspect = fake_inspect  # type: ignore[method-assign]
     manager._ensure_image = lambda: calls.append("image")  # type: ignore[method-assign]
-    manager._create_container = lambda container_name, paths: calls.append(f"create:{container_name}")  # type: ignore[method-assign]
+    manager._create_container = lambda container_name, paths, worker=None: calls.append(f"create:{container_name}")  # type: ignore[method-assign]
     manager._ensure_container_writable_paths = lambda *args, **kwargs: calls.append("writable")  # type: ignore[method-assign]
     manager._repair_provider_temp_ownership = lambda container_name: calls.append("provider_tmp")  # type: ignore[method-assign]
     manager._harden_secret_runtime_files = lambda container_name: calls.append("harden")  # type: ignore[method-assign]
@@ -859,7 +1136,10 @@ def test_ensure_image_uses_short_probe_and_caches_success(tmp_path):
 
     def fake_docker(args: list[str], *, check: bool = True, capture_output: bool = False, timeout_sec=None):
         calls.append((args, timeout_sec))
-        return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="", stderr="")
+        payload = [{"Config": {"Labels": manager._expected_image_provenance()}}]
+        return subprocess.CompletedProcess(
+            ["docker", *args], returncode=0, stdout=json.dumps(payload), stderr=""
+        )
 
     manager._docker = fake_docker  # type: ignore[method-assign]
 
@@ -901,15 +1181,18 @@ def test_ensure_image_includes_document_delivery_toolchain(tmp_path):
     manager._ensure_image()
 
     dockerfile = (manager.build_root / "Dockerfile").read_text()
+    requirements_lock = (manager.build_root / "workstation-requirements.lock").read_text()
     assert "libreoffice-writer" in dockerfile
     assert "libreoffice-impress" in dockerfile
     assert "pandoc" in dockerfile
     assert "poppler-utils" in dockerfile
-    assert "python-docx" in dockerfile
-    assert "python-pptx" in dockerfile
-    assert "reportlab" in dockerfile
-    assert "requests" in dockerfile
-    assert "PyMuPDF" in dockerfile
+    assert "acl" in dockerfile
+    assert "python-docx==" in requirements_lock
+    assert "python-pptx==" in requirements_lock
+    assert "reportlab==" in requirements_lock
+    assert "requests==" in requirements_lock
+    assert "pymupdf==" in requirements_lock
+    assert "--require-hashes --no-deps" in dockerfile
     assert "/usr/bin/locale-check" in dockerfile
 
 
@@ -926,9 +1209,15 @@ def test_ensure_image_defaults_to_no_forced_ai_worker_browser_extensions(tmp_pat
     manager._ensure_image()
 
     dockerfile = (manager.build_root / "Dockerfile").read_text()
-    assert manager.image.endswith(":phase1-node22-docs8-openclaw2026.7.1-2")
-    assert "@openai/codex@0.142.0" in dockerfile
-    assert "@anthropic-ai/claude-code@2.1.186" in dockerfile
+    assert manager.image.endswith(":phase1-node22-docs8-openclaw2026.7.1-4")
+    assert "FROM selenium/standalone-chromium:4.46.0-20260707@sha256:" in dockerfile
+    assert "com.glasshive.workstation.provenance=reviewed-v1" in dockerfile
+    assert "com.glasshive.workstation.provider-account-acl=required-v1" in dockerfile
+    assert "snapshot.ubuntu.com/ubuntu/20260707T000000Z" in dockerfile
+    assert "nodejs_22.23.2-1nodesource1_${arch}.deb" in dockerfile
+    assert "sha256sum -c -" in dockerfile
+    assert "@openai/codex@0.146.1" in dockerfile
+    assert "@anthropic-ai/claude-code@2.1.223" in dockerfile
     assert "--cache /tmp/glasshive-npm-cache" in dockerfile
     assert "rm -rf /tmp/glasshive-npm-cache /root/.npm /home/seluser/.npm" in dockerfile
     assert "/etc/chromium/policies/managed/glasshive-ai-worker-extensions.json" in dockerfile
@@ -939,6 +1228,24 @@ def test_ensure_image_defaults_to_no_forced_ai_worker_browser_extensions(tmp_pat
     assert "hehggadaopoacecdllhhajmbjkdcmajg;https://clients2.google.com/service/update2/crx" not in dockerfile
     assert "glasshive-browser-extension-check" in dockerfile
     assert "glasshive-browser-native-host-bootstrap" in dockerfile
+
+
+def test_custom_worker_image_without_reviewed_provenance_fails_closed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_SANDBOX_IMAGE", "example.invalid/custom-worker:test")
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+
+    def fake_docker(args: list[str], **kwargs):
+        payload = [{"Config": {"Labels": {}}}]
+        return subprocess.CompletedProcess(
+            ["docker", *args], returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+
+    manager._docker = fake_docker  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="provenance labels"):
+        manager._ensure_image()
 
 
 def test_ensure_image_consumes_reviewed_openclaw_lock_and_disables_bonjour(tmp_path):
@@ -1471,6 +1778,8 @@ def test_create_container_applies_default_resource_caps(tmp_path):
 
     def fake_docker(args: list[str], *, check: bool = True, capture_output: bool = False, **kwargs):
         commands.append(args)
+        if args[:2] == ["network", "inspect"]:
+            return subprocess.CompletedProcess(["docker", *args], returncode=1, stdout="", stderr="not found")
         return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="cid", stderr="")
 
     manager._docker = fake_docker  # type: ignore[method-assign]
@@ -1483,7 +1792,7 @@ def test_create_container_applies_default_resource_caps(tmp_path):
         },
     )
 
-    command = commands[0]
+    command = next(item for item in commands if item and item[0] == "run")
     assert command[command.index("--shm-size") + 1] == "1g"
     assert command[command.index("--memory") + 1] == "3g"
     assert command[command.index("--memory-swap") + 1] == "3g"

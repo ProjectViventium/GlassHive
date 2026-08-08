@@ -12,13 +12,14 @@ def normalize_launch_surface(value: str | None) -> str:
 
 def build_operator_brief(description: str, success_criteria: str, context: str | None = None) -> str:
     body = (context or "").strip() or "No additional context provided."
+    criteria = success_criteria.strip() or "Complete the requested outcome and verify that the result works."
     return (
         "You are the main worker for this project.\n\n"
         "Project Definition\n"
         "Describe your project:\n"
         f"{description.strip()}\n\n"
         "Success Criteria:\n"
-        f"{success_criteria.strip()}\n\n"
+        f"{criteria}\n\n"
         "Context:\n"
         f"{body}\n\n"
         "Execution Rules:\n"

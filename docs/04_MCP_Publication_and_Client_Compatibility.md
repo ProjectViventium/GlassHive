@@ -20,6 +20,28 @@ Current official guidance from Claude Code and modern MCP tooling points in the 
 - clients benefit from dynamic tool updates through `list_changed`
 - scope-aware MCP configuration matters for safety and portability
 
+## Frozen public compatibility baseline
+
+`runtime_phase1/tests/fixtures/public_compatibility_origin_main_449eb5d.json` is the public-safe
+golden contract for the preceding supported release. Its provenance is the public `origin/main`
+commit recorded inside the fixture. It captures every legacy HTTP operation and request/response
+schema (60 operations and 30 OpenAPI components), every legacy MCP tool name and complete input
+schema (32 tools), plus the bootstrap/context headers, callback payload and signing shape,
+Chat Completions and Responses fields, and provider/model attestations that OpenAPI alone cannot
+describe.
+
+`runtime_phase1/tests/test_public_compatibility_contract.py` compares the running candidate with
+that frozen baseline. New routes, tools, and optional fields may be added. Existing operations,
+tool names, fields, media types, status schemas, enum constraints, callback fields, signing
+protocols, model mappings, and required response fields may not disappear or silently change; new
+request fields must remain optional. The legacy one-shot schedule response therefore keeps its
+original state enum, while recurring-schedule occurrence states use their own additive response
+model.
+
+Do not regenerate the golden from the candidate under test. A future baseline update requires an
+explicit release decision, a public source commit, a reviewed semantic diff, and a new fixture whose
+filename records that source commit. Synthetic values only are permitted in this contract.
+
 ## Client Strategy
 
 ### LibreChat / Viventium / Standalone-Compatible Clients
@@ -157,6 +179,75 @@ Support:
 ### Codex / ChatGPT-compatible MCP consumers
 Prefer remote HTTP MCP with auth in front of the server when not loopback-only.
 
+### Hosted user connection
+
+The designed Glass Drive **Connect AI** panel is the source of truth for a deployment's public HTTPS
+MCP URL. It emits the official client commands rather than asking users to edit hidden configuration:
+
+```text
+codex mcp add -c mcp_oauth_callback_port=<REGISTERED_PORT> -c 'mcp_oauth_callback_url="http://127.0.0.1:<REGISTERED_PORT>/callback"' glasshive --url <MCP_URL> --oauth-client-id <REGISTERED_CLIENT_ID> --oauth-resource <MCP_URL>
+codex mcp login -c mcp_oauth_callback_port=<REGISTERED_PORT> -c 'mcp_oauth_callback_url="http://127.0.0.1:<REGISTERED_PORT>/callback"' glasshive
+claude mcp add --transport http --scope user --client-id <REGISTERED_CLIENT_ID> --callback-port <REGISTERED_PORT> glasshive <MCP_URL>
+```
+
+Connect AI also shows the exact redirect URI that the administrator must pre-register. Claude Code
+uses `http://localhost:<port>/callback`. Current Codex derives
+`http://127.0.0.1:<port>/callback/<server-hash>` from the canonical MCP URL; copy the URI shown by
+the deployment rather than calculating or guessing it. Both Codex commands override the fixed port
+and base callback URL so an ambient user-level `mcp_oauth_callback_url` cannot redirect this
+registration to a different host or path.
+
+The public HTTPS MCP URL is the RFC 8707 resource sent by Codex and returned in protected-resource
+metadata. It is not implicitly the JWT `aud`. Entra v2 access tokens normally use the API app's
+client-id GUID as `aud`, while delegated scopes use the authorization server's full recognized value
+such as `api://<api-app-client-id>/user_impersonation`. Multi-user MCP therefore requires explicit
+`GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES` independently of `GLASSHIVE_MCP_PUBLIC_URL` and validates
+issuer, one of those exact token audiences, non-conflicting tenant claims, stable subject, required
+scopes, and one explicitly
+allowlisted OAuth client before minting a short-lived internal runtime assertion. Configure approved
+client registrations with `GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS` and the provider's unambiguous
+client claim names with `GLASSHIVE_MCP_OAUTH_CLIENT_ID_CLAIMS`; rotate registrations by overlapping
+old and new IDs only for the bounded rollout window. Entra does not provide MCP dynamic client
+registration, so Connect AI emits no client command until the deployment config also supplies the
+same pre-registered Codex/Claude client ID, each fixed callback port, explicit token audiences and
+scopes, and the canonical Codex public resource. Resource drift, missing verifier policy, or a client
+ID outside the allowlist remains `action_required` and produces no copyable command. When enrollment
+is enabled, a first fully verified MCP login enrolls the same hashed
+issuer/subject principal used by Glass Drive, while a locally disabled principal is rejected on the
+next request. Access tokens and provider credentials are never forwarded into a worker.
+
+`enterprise.tenant_id` is the deployment's GlassHive ownership namespace; it is not assumed to be
+the upstream token's `tid`. Set optional `mcp_oauth.token_tenant_id` only when the authorization
+server emits a stable tenant claim that this deployment must validate. For Entra, use the directory
+tenant GUID. Generic OIDC deployments may omit it. The token's validated tenant is audit context;
+the internal assertion continues to use the independent GlassHive ownership namespace.
+
+Browser OIDC login is the authoritative durable role-sync surface. A fully verified browser login
+updates the principal from the configured immutable role/group claim, including promotions and
+demotions; already-open sessions read the current principal role from durable state. MCP access-token
+roles may establish the first role only when enrollment is enabled and must never overwrite an
+existing durable role. Email and `preferred_username` remain mutable display metadata and never own
+a workspace or grant admission. Enforce tenant/domain membership at the IdP through tenant and
+app-role/group assignment policy.
+
+Provider account switching also requires the IdP to advertise an `end_session_endpoint` and to
+pre-register the exact `human_auth.oidc.post_logout_redirect_uri` emitted by the compiler (by
+default, `<operator-public-origin>/login`). Without that provider capability GlassHive still clears
+its own session and says that provider-level account switching is unavailable.
+
+The MCP control plane is additive: `workspace_list`, `workspace_rename`, `workspace_duplicate`,
+`worker_accounts_list`, `connections_list`, `library_list`, `workspace_activity`, and
+`workspace_capability_prepare` share the same user-scoped runtime resources as the UI. A capability
+proposal returns a browser confirmation URL. Only an authenticated human session with CSRF and
+`human:confirm` scope can consume its time-bounded single-use token; the model cannot self-approve.
+
+`workspace_duplicate` requires an 8-128 character `idempotency_key`. Clients must reuse that key for
+retries of the same source/name request; the runtime durably returns the original project/workspace,
+rejects different requests that reuse the key, and scopes keys by authenticated tenant and owner.
+
+The versioned non-secret companion skill at `skills/connect-glasshive/SKILL.md` points clients back to
+this canonical repository and official flow. It does not embed a deployment URL or credential.
+
 ## Publication Rules
 
 For local-only use:
@@ -172,13 +263,13 @@ For broader publication:
 - `execution_mode=host` must be an explicit tool argument; the MCP server should not infer host
   execution from natural-language phrasing
 
-For Azure enterprise VM mode, the default LibreChat integration remains config-only: LibreChat sends
+For Azure enterprise VM mode, the existing LibreChat integration remains config-only: LibreChat sends
 the neutral `X-GlassHive-*` service, identity, request, and upload headers to the remote GlassHive
 MCP endpoint over a locked-down channel. GlassHive trusts identity headers only after service-token
-validation and ignores model/tool-supplied `owner_id`. Optional MCP OAuth/OIDC can be enabled for
-enterprises that want a second consent flow, but it is not the seamless default. Until server-side
-token validation is present, GlassHive runtime authorization stays `first_party_assertion` and
-OAuth/OIDC auth modes fail closed by default.
+validation and ignores model/tool-supplied `owner_id`. Direct hosted Codex and Claude clients use the
+OAuth-protected MCP resource. Partial OAuth configuration, a non-HTTPS hosted public URL, or an invalid
+resource token fails loud instead of falling back to caller identity headers or a static user bearer
+token.
 
 ## Compatibility Alias
 

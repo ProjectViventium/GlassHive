@@ -1,0 +1,643 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from pathlib import Path
+
+import pytest
+
+from workers_projects_runtime.control_plane import ControlPlaneError, ControlPlaneStore
+from workers_projects_runtime.api import _build_runtime
+from workers_projects_runtime.mission_provider_accounts import MissionProviderAccountBinder
+from workers_projects_runtime.openclaw_runtime import RuntimeErrorBase, RuntimeInfo
+from workers_projects_runtime.provider_accounts import ProviderAccountHomeManager
+from workers_projects_runtime.profile_runtime import (
+    HostClaudeCodeRuntime,
+    HostCodexCliRuntime,
+    ProfiledWorkerRuntime,
+)
+
+
+class RecordingRuntime:
+    def __init__(self, callback=None) -> None:
+        self.callback = callback
+        self.worker: dict | None = None
+        self.released_workers: list[str] = []
+        self.reconciled_homes: list[Path] = []
+        self.release_callback = None
+
+    def run_task(
+        self,
+        worker: dict,
+        instruction: str,
+        timeout_sec: float | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        self.worker = dict(worker)
+        if self.callback is not None:
+            self.callback(worker, instruction, timeout_sec, run_id)
+        return "synthetic result"
+
+    def release_provider_account_binding(self, worker: dict) -> None:
+        self.released_workers.append(str(worker.get("worker_id") or ""))
+        if self.release_callback is not None:
+            self.release_callback(worker)
+
+    def reconcile_provider_account_binding(self, account_home: Path) -> None:
+        self.reconciled_homes.append(Path(account_home))
+
+
+def _account(
+    store: ControlPlaneStore,
+    *,
+    provider: str = "codex",
+    owner_id: str = "user-a",
+    auth_method: str = "subscription",
+) -> dict:
+    return store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id=owner_id,
+        provider=provider,
+        label=f"{provider.title()} account",
+        auth_method=auth_method,
+        platform_support="supported",
+        secret_locator=f"native-home://{provider}-{owner_id}",
+        status="ready",
+    )
+
+
+def _worker(account_id: str | None, *, profile: str = "codex-cli", policy: str = "personal_required") -> dict:
+    selection: dict[str, str] = {"policy": policy}
+    if account_id is not None:
+        selection["account_id"] = account_id
+    return {
+        "worker_id": "wrk_personal",
+        "tenant_id": "tenant-a",
+        "owner_id": "user-a",
+        "profile": profile,
+        "execution_mode": "host",
+        "bootstrap_bundle_json": json.dumps(
+            {"run_mode": "mission", "provider_account": selection}
+        ),
+    }
+
+
+def test_multi_user_docker_mission_projects_only_the_selected_account_home(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    observed: dict[str, object] = {}
+
+    def inspect_binding(worker, _instruction, _timeout_sec, _run_id):
+        observed["worker"] = dict(worker)
+
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    runtime.codex = RecordingRuntime(inspect_binding)  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv(
+        "GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container"
+    )
+    worker = _worker(account["account_id"])
+    worker["execution_mode"] = "docker"
+
+    runtime.run_task(worker, "isolated mission", run_id="run_container_isolated")
+
+    bound = observed["worker"]
+    assert bound["_glasshive_provider_account_env"] == {  # type: ignore[index]
+        "CODEX_HOME": "/workspace/.provider-account/codex"
+    }
+    mount_home = Path(  # type: ignore[index]
+        bound["_glasshive_provider_account_mount_host"]
+    )
+    assert mount_home.is_dir()
+    assert bound["_glasshive_provider_account_mount_target"] == (  # type: ignore[index]
+        "/workspace/.provider-account"
+    )
+    assert store.active_provider_lease(
+        account["account_id"], "codex-cli:mission"
+    ) is None
+    assert runtime.codex.released_workers == ["wrk_personal"]  # type: ignore[attr-defined]
+
+
+def test_docker_provider_mount_is_removed_before_lease_release(tmp_path, monkeypatch):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    recorder = RecordingRuntime()
+    observed: dict[str, object] = {}
+    cleanup_order: list[str] = []
+
+    def observe_release(_worker: dict) -> None:
+        cleanup_order.append("container_removed")
+        observed["lease_during_release"] = store.active_provider_lease(
+            account["account_id"], "codex-cli:mission"
+        )
+
+    def observe_permission_tightening(self, *, account_home: Path) -> None:
+        assert account_home.is_dir()
+        cleanup_order.append("permissions_tightened")
+
+    recorder.release_callback = observe_release
+    monkeypatch.setattr(
+        ProviderAccountHomeManager,
+        "tighten_permissions",
+        observe_permission_tightening,
+    )
+    runtime.codex = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = _worker(account["account_id"])
+    worker["execution_mode"] = "docker"
+
+    runtime.run_task(worker, "release the mount", run_id="run_release_mount")
+
+    assert recorder.released_workers == ["wrk_personal"]
+    assert cleanup_order == ["container_removed", "permissions_tightened"]
+    assert observed["lease_during_release"] is not None
+    assert store.active_provider_lease(account["account_id"], "codex-cli:mission") is None
+
+
+def test_stale_provider_mount_reconciliation_fails_closed_before_second_binding(tmp_path, monkeypatch):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    recorder = RecordingRuntime()
+
+    def refuse_stale_mount(_account_home: Path) -> None:
+        raise RuntimeError("synthetic stale provider mount")
+
+    recorder.reconcile_provider_account_binding = refuse_stale_mount  # type: ignore[method-assign]
+    runtime.codex = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = _worker(account["account_id"])
+    worker["execution_mode"] = "docker"
+
+    with pytest.raises(RuntimeErrorBase, match="stale provider credentials"):
+        runtime.run_task(worker, "must not overlap", run_id="run-after-crash")
+
+    quarantined = store.get_provider_account(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+    assert quarantined is not None
+    assert quarantined["status"] == "action_required"
+    assert store.active_provider_lease(account["account_id"], "codex-cli:mission") is None
+    assert recorder.worker is None
+
+
+def test_lease_heartbeat_loss_stops_docker_binding_and_fails_mission(tmp_path, monkeypatch):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+
+    def slow_run(_worker, _instruction, _timeout_sec, _run_id):
+        time.sleep(0.14)
+
+    recorder = RecordingRuntime(slow_run)
+    runtime.codex = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_LEASE_HEARTBEAT_SECONDS", "0.05")
+
+    def fail_heartbeat(self, **_kwargs):
+        raise ControlPlaneError("synthetic lease store outage")
+
+    monkeypatch.setattr(ControlPlaneStore, "heartbeat_provider_lease", fail_heartbeat)
+    worker = _worker(account["account_id"])
+    worker["execution_mode"] = "docker"
+
+    with pytest.raises(RuntimeErrorBase, match="lease renewal failed"):
+        runtime.run_task(worker, "must stop on lease loss", run_id="run_lease_loss")
+
+    assert recorder.released_workers == ["wrk_personal"]
+    updated = store.get_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )
+    assert updated is not None
+    assert updated["status"] == "action_required"
+
+
+def test_sqlite_lease_heartbeat_loss_stops_docker_binding_and_fails_mission(tmp_path, monkeypatch):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+
+    def slow_run(_worker, _instruction, _timeout_sec, _run_id):
+        time.sleep(0.14)
+
+    recorder = RecordingRuntime(slow_run)
+    runtime.codex = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_LEASE_HEARTBEAT_SECONDS", "0.05")
+
+    def fail_heartbeat(self, **_kwargs):
+        raise sqlite3.OperationalError("synthetic database outage")
+
+    monkeypatch.setattr(ControlPlaneStore, "heartbeat_provider_lease", fail_heartbeat)
+    worker = _worker(account["account_id"])
+    worker["execution_mode"] = "docker"
+
+    with pytest.raises(RuntimeErrorBase, match="lease renewal failed"):
+        runtime.run_task(worker, "must stop on sqlite lease loss", run_id="run_sqlite_lease_loss")
+
+    assert recorder.released_workers == ["wrk_personal"]
+
+
+def test_profiled_runtime_binds_private_home_and_holds_exclusive_lease_for_entire_mission(tmp_path):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    observed: dict[str, object] = {}
+
+    def inspect_during_run(worker, _instruction, _timeout_sec, _run_id):
+        observed["env"] = dict(worker["_glasshive_provider_account_env"])
+        observed["lease"] = store.active_provider_lease(
+            account["account_id"], "codex-cli:mission"
+        )
+
+    recorder = RecordingRuntime(inspect_during_run)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    runtime.host_codex = recorder  # type: ignore[assignment]
+
+    assert runtime.run_task(
+        _worker(account["account_id"]),
+        "Run the synthetic mission",
+        run_id="run_personal",
+    ) == "synthetic result"
+
+    assert observed["lease"] is not None
+    assert observed["lease"]["worker_id"] == "wrk_personal"  # type: ignore[index]
+    private_home = Path(observed["env"]["CODEX_HOME"])  # type: ignore[index]
+    assert private_home.is_dir()
+    assert private_home.parent.parent.parent.parent == tmp_path / "provider_accounts"
+    assert private_home != Path.home() / ".codex"
+    assert store.active_provider_lease(account["account_id"], "codex-cli:mission") is None
+
+
+def test_runtime_factory_wires_the_exact_control_plane_database_into_mission_binding(tmp_path):
+    database = tmp_path / "nondefault-name.sqlite3"
+    ControlPlaneStore(str(database))
+
+    runtime = _build_runtime("openclaw", str(database), None)
+
+    assert isinstance(runtime, ProfiledWorkerRuntime)
+    assert runtime.provider_account_binder.store is not None
+    assert runtime.provider_account_binder.store.db_path == database.resolve()
+
+
+def test_personal_required_fails_closed_for_missing_cross_user_busy_and_docker_accounts(tmp_path):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    other_account = _account(store, owner_id="user-b")
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    runtime.host_codex = RecordingRuntime()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeErrorBase, match="requires a provider account"):
+        runtime.run_task(_worker(None), "missing", run_id="run_missing")
+
+    with pytest.raises(RuntimeErrorBase, match="not available for this user"):
+        runtime.run_task(_worker(other_account["account_id"]), "cross-user", run_id="run_cross")
+
+    lease = store.acquire_provider_lease(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        lane="codex-cli:mission",
+        worker_id="wrk_busy",
+        run_id="run_busy",
+        ttl_seconds=60,
+    )
+    try:
+        with pytest.raises(RuntimeErrorBase, match="already in use"):
+            runtime.run_task(_worker(account["account_id"]), "busy", run_id="run_second")
+    finally:
+        store.release_provider_lease(
+            lease_id=lease["lease_id"], tenant_id="tenant-a", owner_id="user-a"
+        )
+
+    docker_worker = _worker(account["account_id"])
+    docker_worker["execution_mode"] = "docker"
+    runtime.codex = RecordingRuntime()  # type: ignore[assignment]
+    with pytest.raises(RuntimeErrorBase, match="host-native"):
+        runtime.run_task(docker_worker, "unsupported substrate", run_id="run_docker")
+
+
+def test_personal_preferred_uses_the_legacy_route_when_personal_binding_is_unavailable(tmp_path):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    ready = _account(store)
+    disconnected = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="codex",
+        label="Disconnected",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://disconnected-preferred",
+        status="disconnected",
+    )
+    recorder = RecordingRuntime()
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    runtime.host_codex = recorder  # type: ignore[assignment]
+
+    for account_id, run_id in (
+        ("acct_missing", "run_preferred_missing"),
+        (disconnected["account_id"], "run_preferred_disconnected"),
+    ):
+        runtime.run_task(
+            _worker(account_id, policy="personal_preferred"),
+            "preferred fallback",
+            run_id=run_id,
+        )
+        assert recorder.worker is not None
+        assert recorder.worker["_glasshive_provider_account_preferred_fallback"] is True
+        assert "_glasshive_provider_account_env" not in recorder.worker
+
+    lease = store.acquire_provider_lease(
+        account_id=ready["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        lane="codex-cli:mission",
+        worker_id="wrk_busy",
+        run_id="run_busy",
+        ttl_seconds=60,
+    )
+    try:
+        runtime.run_task(
+            _worker(ready["account_id"], policy="personal_preferred"),
+            "preferred busy fallback",
+            run_id="run_preferred_busy",
+        )
+        assert recorder.worker is not None
+        assert recorder.worker["_glasshive_provider_account_preferred_fallback"] is True
+    finally:
+        store.release_provider_lease(
+            lease_id=lease["lease_id"], tenant_id="tenant-a", owner_id="user-a"
+        )
+
+
+@pytest.mark.parametrize("policy", ["personal_required", "personal_preferred"])
+def test_personal_subscription_missions_fail_closed_without_multi_user_substrate_isolation(
+    tmp_path, monkeypatch, policy
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    runtime.host_codex = RecordingRuntime()  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+
+    with pytest.raises(RuntimeErrorBase, match="dedicated OS or container boundary"):
+        runtime.run_task(
+            _worker(account["account_id"], policy=policy),
+            "must not reach a shared service UID",
+            run_id=f"run_{policy}",
+        )
+
+
+def test_provider_account_lease_is_released_when_the_mission_runtime_fails(tmp_path):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+
+    def fail_during_run(_worker, _instruction, _timeout_sec, _run_id):
+        assert store.active_provider_lease(
+            account["account_id"], "codex-cli:mission"
+        ) is not None
+        raise RuntimeErrorBase("synthetic mission failure")
+
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    runtime.host_codex = RecordingRuntime(fail_during_run)  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeErrorBase, match="synthetic mission failure"):
+        runtime.run_task(
+            _worker(account["account_id"]),
+            "fail safely",
+            run_id="run_failure",
+        )
+    assert store.active_provider_lease(
+        account["account_id"], "codex-cli:mission"
+    ) is None
+
+
+def test_provider_account_lease_heartbeats_while_mission_is_running(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    calls: list[str] = []
+    original = ControlPlaneStore.heartbeat_provider_lease
+
+    def record_heartbeat(self, **kwargs):
+        calls.append(str(kwargs["lease_id"]))
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(
+        ControlPlaneStore, "heartbeat_provider_lease", record_heartbeat
+    )
+    monkeypatch.setenv(
+        "GLASSHIVE_PROVIDER_ACCOUNT_LEASE_HEARTBEAT_SECONDS", "0.05"
+    )
+
+    def wait_during_run(_worker, _instruction, _timeout_sec, _run_id):
+        time.sleep(0.14)
+
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path), provider_account_db_path=str(database)
+    )
+    runtime.host_codex = RecordingRuntime(wait_during_run)  # type: ignore[assignment]
+
+    runtime.run_task(
+        _worker(account["account_id"]), "heartbeat", run_id="run_heartbeat"
+    )
+
+    assert calls
+
+
+def test_provider_account_default_lease_is_a_short_heartbeated_crash_window(monkeypatch):
+    monkeypatch.delenv("GLASSHIVE_PROVIDER_ACCOUNT_LEASE_TTL_SECONDS", raising=False)
+
+    assert MissionProviderAccountBinder._lease_ttl_seconds(None) == 180
+    assert MissionProviderAccountBinder._lease_ttl_seconds(24 * 60 * 60) == 180
+
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_LEASE_TTL_SECONDS", "999999")
+    assert MissionProviderAccountBinder._lease_ttl_seconds(None) == 60 * 60
+
+
+def test_legacy_and_unselected_optional_missions_preserve_existing_runtime_path(tmp_path):
+    database = tmp_path / "runtime.db"
+    ControlPlaneStore(str(database))
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    recorder = RecordingRuntime()
+    runtime.host_codex = recorder  # type: ignore[assignment]
+    legacy_worker = {
+        "worker_id": "wrk_legacy",
+        "tenant_id": "tenant-a",
+        "owner_id": "user-a",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "bootstrap_bundle_json": json.dumps({"run_mode": "mission"}),
+    }
+
+    runtime.run_task(legacy_worker, "legacy", run_id="run_legacy")
+    assert recorder.worker is not None
+    assert "_glasshive_provider_account_env" not in recorder.worker
+
+    optional_worker = _worker(None, policy="personal_preferred")
+    runtime.run_task(optional_worker, "preferred", run_id="run_preferred")
+    assert recorder.worker is not None
+    assert "_glasshive_provider_account_env" not in recorder.worker
+
+    legacy_optional_worker = _worker(None, policy="personal_optional")
+    runtime.run_task(legacy_optional_worker, "optional", run_id="run_optional")
+    assert recorder.worker is not None
+    assert "_glasshive_provider_account_env" not in recorder.worker
+
+
+def test_selected_account_provider_must_match_worker_profile_and_be_ready(tmp_path):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    claude = _account(store, provider="claude", auth_method="enterprise_route")
+    disconnected = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="codex",
+        label="Disconnected",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://disconnected",
+        status="disconnected",
+    )
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    runtime.host_codex = RecordingRuntime()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeErrorBase, match="does not match"):
+        runtime.run_task(_worker(claude["account_id"]), "wrong provider", run_id="run_wrong")
+    with pytest.raises(RuntimeErrorBase, match="not ready"):
+        runtime.run_task(_worker(disconnected["account_id"]), "not ready", run_id="run_not_ready")
+
+
+def test_host_command_builders_apply_only_the_bound_native_provider_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "global-codex"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "global-claude"))
+    codex_home = tmp_path / "personal-codex" / "codex"
+    claude_home = tmp_path / "personal-claude" / "claude"
+    codex_home.mkdir(parents=True)
+    claude_home.mkdir(parents=True)
+    info = RuntimeInfo(
+        runtime="test",
+        model="test-model",
+        gateway_url="",
+        gateway_port=None,
+        gateway_token=None,
+        session_key=None,
+        state_dir=str(tmp_path),
+        workspace_dir=str(tmp_path),
+        pid=None,
+    )
+
+    codex = HostCodexCliRuntime(base_dir=str(tmp_path / "codex-runtime"))
+    codex._assert_host_codex_worker_policy = lambda worker: None  # type: ignore[method-assign]
+    codex_worker = _worker("acct_synthetic")
+    codex_bundle = json.loads(codex_worker["bootstrap_bundle_json"])
+    codex_bundle["env"] = {
+        "OPENAI_API_KEY": "synthetic-competing-key",
+        "OPENAI_BASE_URL": "https://synthetic.invalid",
+    }
+    codex_worker["bootstrap_bundle_json"] = json.dumps(codex_bundle)
+    codex_worker["_glasshive_provider_account_env"] = {"CODEX_HOME": str(codex_home)}
+    codex_worker["_glasshive_provider_account_bound"] = True
+    _, codex_env = codex._build_command(codex_worker, "mission", info)
+    assert codex_env["CODEX_HOME"] == str(codex_home)
+    assert codex_env["CODEX_HOME"] != str(tmp_path / "global-codex")
+    assert "OPENAI_API_KEY" not in codex_env
+    assert "OPENAI_BASE_URL" not in codex_env
+
+    claude = HostClaudeCodeRuntime(base_dir=str(tmp_path / "claude-runtime"))
+    claude_worker = _worker("acct_synthetic", profile="claude-code")
+    claude_bundle = json.loads(claude_worker["bootstrap_bundle_json"])
+    claude_bundle["env"] = {
+        "ANTHROPIC_API_KEY": "synthetic-competing-key",
+        "ANTHROPIC_BASE_URL": "https://synthetic.invalid",
+    }
+    claude_worker["bootstrap_bundle_json"] = json.dumps(claude_bundle)
+    claude_worker["_glasshive_provider_account_env"] = {
+        "CLAUDE_CONFIG_DIR": str(claude_home)
+    }
+    claude_worker["_glasshive_provider_account_bound"] = True
+    _, claude_env = claude._build_command(claude_worker, "mission", info)
+    assert claude_env["CLAUDE_CONFIG_DIR"] == str(claude_home)
+    assert claude_env["CLAUDE_CONFIG_DIR"] != str(tmp_path / "global-claude")
+    assert "ANTHROPIC_API_KEY" not in claude_env
+    assert "ANTHROPIC_BASE_URL" not in claude_env
+
+
+def test_bound_codex_mission_never_copies_process_global_auth_into_worker_state(tmp_path, monkeypatch):
+    global_home = tmp_path / "global-codex"
+    global_home.mkdir()
+    (global_home / "auth.json").write_text('{"synthetic_global_credential":"must-not-copy"}')
+    monkeypatch.setenv("CODEX_HOME", str(global_home))
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "runtime"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    worker = _worker("acct_synthetic")
+    worker["_glasshive_provider_account_env"] = {
+        "CODEX_HOME": str(tmp_path / "personal" / "codex")
+    }
+    worker["_glasshive_provider_account_bound"] = True
+
+    runtime._write_host_project_mcp_files(
+        worker,
+        workspace,
+        {"codex_config_append": '[mcp_servers.synthetic]\ncommand = "synthetic"'},
+    )
+
+    assert not (runtime._host_codex_home(worker) / "auth.json").exists()

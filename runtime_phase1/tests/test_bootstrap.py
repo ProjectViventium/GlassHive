@@ -197,6 +197,49 @@ def test_enterprise_bootstrap_keeps_provider_secrets_out_of_interactive_runtime_
     assert oct((tmp_path / "home" / ".glasshive" / "secret-runtime.keys").stat().st_mode & 0o777) == "0o600"
 
 
+@pytest.mark.parametrize(
+    "binding_marker",
+    ["_glasshive_provider_account_bound", "_glasshive_inference_broker_bound"],
+)
+def test_run_bound_credentials_cannot_be_clobbered_by_persisted_runtime_env(
+    tmp_path,
+    monkeypatch,
+    binding_marker,
+):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _clear_ambient_provider_env(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-deployment-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://deployment-gateway.example.test/v1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-deployment-anthropic-key")
+    worker = {
+        binding_marker: True,
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "env": {
+                    "OPENAI_API_KEY": "synthetic-bundle-key",
+                    "OPENAI_BASE_URL": "https://bundle-gateway.example.test/v1",
+                    "ANTHROPIC_API_KEY": "synthetic-bundle-anthropic-key",
+                }
+            }
+        ),
+    }
+
+    refresh_runtime_env_for_worker(tmp_path / "home", worker)
+
+    glasshive_dir = tmp_path / "home" / ".glasshive"
+    persisted = "\n".join(
+        path.read_text()
+        for path in (
+            glasshive_dir / "runtime.env",
+            glasshive_dir / "secret-runtime.env",
+        )
+        if path.exists()
+    )
+    assert "OPENAI_API_KEY" not in persisted
+    assert "OPENAI_BASE_URL" not in persisted
+    assert "ANTHROPIC_API_KEY" not in persisted
+
+
 def test_enterprise_bootstrap_replaces_persisted_sandbox_owned_secret_file(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     _clear_ambient_provider_env(monkeypatch)
@@ -377,6 +420,44 @@ def test_enterprise_bootstrap_rejects_unsigned_source_path(tmp_path, monkeypatch
     other_user_file.write_text("other user's data")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", str(uploads_root))
+
+    worker = {
+        "tenant_id": "tenant-alpha",
+        "owner_id": "user-a",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "files": [
+                    {
+                        "scope": "workspace",
+                        "path": "uploads/brief.txt",
+                        "source_path": str(other_user_file),
+                    }
+                ]
+            }
+        ),
+    }
+
+    with pytest.raises(PermissionError, match="not authorized"):
+        apply_bootstrap(
+            home_dir=tmp_path / "home",
+            workspace_dir=tmp_path / "workspace",
+            runtime_name="codex-cli",
+            worker=worker,
+            copy_file=lambda source, target: target.write_text(source.read_text()),
+            copy_tree=lambda source, target: None,
+        )
+
+
+def test_multi_user_security_mode_rejects_unsigned_source_path_without_legacy_flag(tmp_path, monkeypatch):
+    uploads_root = tmp_path / "uploads"
+    other_user_file = uploads_root / "user-b" / "brief.txt"
+    other_user_file.parent.mkdir(parents=True)
+    other_user_file.write_text("synthetic cross-user data")
+    monkeypatch.delenv("GLASSHIVE_ENTERPRISE_MODE", raising=False)
+    monkeypatch.delenv("WPR_ENTERPRISE_MODE", raising=False)
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("WPR_API_TOKEN", "synthetic-service-secret")
     monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", str(uploads_root))
 
     worker = {

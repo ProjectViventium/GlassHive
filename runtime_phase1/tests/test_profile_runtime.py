@@ -35,7 +35,7 @@ def _patch_host_codex_requirement_probe(monkeypatch):
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.144.1\n",
+            stdout="codex-cli 0.146.1\n",
             stderr="",
         ),
     )
@@ -582,7 +582,7 @@ def test_host_native_configured_timeout_survives_api_restart_and_stops_child_gro
         command,
         run_root=run_root,
         exit_path=exit_path,
-        timeout_sec=0.2,
+        timeout_sec=1.0,
     )
     with stdout_path.open("w") as stdout_handle, stderr_path.open("w") as stderr_handle:
         process = subprocess.Popen(
@@ -608,12 +608,16 @@ def test_host_native_configured_timeout_survives_api_restart_and_stops_child_gro
                 "exit_path": str(exit_path),
                 "model": "gpt-5.6-sol",
                 "process_pid": process.pid,
-                "timeout_seconds": 0.2,
+                "timeout_seconds": 1.0,
                 "run_mode": "conversation",
             },
         )
         started = time.monotonic()
         assert runtime_after_restart.reconcile_worker(worker).pid == process.pid
+        child_start_deadline = time.monotonic() + 0.5
+        while not child_pid_path.exists() and time.monotonic() < child_start_deadline:
+            time.sleep(0.01)
+        assert child_pid_path.exists()
 
         deadline = time.monotonic() + 5
         while not exit_path.exists() and time.monotonic() < deadline:
@@ -632,7 +636,7 @@ def test_host_native_configured_timeout_survives_api_restart_and_stops_child_gro
         assert recovered is not None
         assert recovered["state"] == "failed"
         assert "exited with code 124" in recovered["error_text"]
-        assert "timed out after 0.2s" in recovered["error_text"]
+        assert "timed out after 1s" in recovered["error_text"]
         assert not (life / "glasshive-run").exists()
     finally:
         if process.poll() is None:
@@ -1536,7 +1540,7 @@ def test_host_codex_runtime_materializes_required_workspace_files(tmp_path, monk
 
     def fake_run(args, **_kwargs):
         if "--version" in args:
-            return subprocess.CompletedProcess(args, returncode=0, stdout="codex-cli 0.144.1\n", stderr="")
+            return subprocess.CompletedProcess(args, returncode=0, stdout="codex-cli 0.146.1\n", stderr="")
         xattr_calls.append(args)
         return subprocess.CompletedProcess(args, returncode=0, stdout="", stderr="")
 
@@ -1610,7 +1614,7 @@ def test_host_runtime_content_hygiene_helper_strips_and_flags_page_chrome(tmp_pa
         return subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
+            stdout="codex-cli 0.146.1\n" if "--version" in args else "",
             stderr="",
         )
 
@@ -2082,7 +2086,7 @@ def test_host_cli_run_gives_supervisor_private_instruction_file(tmp_path, monkey
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
+            stdout="codex-cli 0.146.1\n" if "--version" in args else "",
             stderr="",
         ),
     )
@@ -2138,7 +2142,7 @@ def test_host_cli_run_writes_constraint_ledger_and_evidence(tmp_path, monkeypatc
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
+            stdout="codex-cli 0.146.1\n" if "--version" in args else "",
             stderr="",
         ),
     )
@@ -2207,7 +2211,7 @@ def test_host_cli_run_fails_when_evidence_contract_fails(tmp_path, monkeypatch):
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
+            stdout="codex-cli 0.146.1\n" if "--version" in args else "",
             stderr="",
         ),
     )
@@ -2277,7 +2281,7 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
+            stdout="codex-cli 0.146.1\n" if "--version" in args else "",
             stderr="",
         ),
     )
@@ -2357,7 +2361,7 @@ def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monke
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
+            stdout="codex-cli 0.146.1\n" if "--version" in args else "",
             stderr="",
         ),
     )
@@ -2436,7 +2440,7 @@ def test_host_codex_run_sends_instruction_via_stdin_not_argv(tmp_path, monkeypat
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
+            stdout="codex-cli 0.146.1\n" if "--version" in args else "",
             stderr="",
         ),
     )
@@ -2521,7 +2525,7 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
         lambda args, **kwargs: subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
+            stdout="codex-cli 0.146.1\n" if "--version" in args else "",
             stderr="",
         ),
     )
@@ -2591,7 +2595,7 @@ def test_host_codex_runtime_default_prompts_require_final_report(tmp_path, monke
         return subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
+            stdout="codex-cli 0.146.1\n" if "--version" in args else "",
             stderr="",
         )
 
@@ -2677,7 +2681,7 @@ def test_host_runtime_materializes_project_mcp_bootstrap_with_owner_only_files(t
         return subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
+            stdout="codex-cli 0.146.1\n" if "--version" in args else "",
             stderr="",
         )
 
@@ -2946,7 +2950,7 @@ def test_host_runtime_live_description_refreshes_stale_prompt_files(tmp_path, mo
         return subprocess.CompletedProcess(
             args,
             returncode=0,
-            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
+            stdout="codex-cli 0.146.1\n" if "--version" in args else "",
             stderr="",
         )
 
@@ -3947,7 +3951,7 @@ def test_host_claude_command_enables_chrome_by_default(tmp_path, monkeypatch):
     fake_claude.write_text(
         "#!/usr/bin/env bash\n"
         "if [[ \"$1\" == \"--help\" ]]; then echo 'Usage: claude [options] --effort --chrome'; exit 0; fi\n"
-        "echo '2.1.178 (Claude Code)'\n"
+        "echo '2.1.223 (Claude Code)'\n"
     )
     fake_claude.chmod(0o755)
     runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
@@ -4005,7 +4009,7 @@ def test_host_claude_xhigh_effort_rejects_older_effort_contract(tmp_path, monkey
     fake_claude.write_text(
         "#!/usr/bin/env bash\n"
         "if [[ \"$1\" == \"--help\" ]]; then echo 'Usage: claude [options] --effort <level> (low, medium, high, max)'; exit 0; fi\n"
-        "echo '2.1.178 (Claude Code)'\n"
+        "echo '2.1.223 (Claude Code)'\n"
     )
     fake_claude.chmod(0o755)
     runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
@@ -4281,6 +4285,9 @@ def test_docker_cli_runtime_sources_runtime_and_openclaw_env_files(tmp_path):
         assert "GLASSHIVE_ACTIVE_RUN_ID=run_capture" in script
         assert "GLASSHIVE_RUN_ID=run_capture" in script
         assert "GLASSHIVE_ACTIVE_WORKER_ID=wrk_capture" in script
+        assert "unset " in script
+        assert "OPENAI_API_KEY" in script
+        assert "CLAUDE_CODE_OAUTH_TOKEN" in script
         (run_root / "stdout.log").write_text("FINAL REPORT:\nok")
         (run_root / "stderr.log").write_text("")
         (run_root / "exit_code").write_text("0")
@@ -4612,6 +4619,44 @@ def test_docker_codex_command_projects_openai_compatible_provider(tmp_path, monk
     assert env["OPENAI_BASE_URL"] == "https://models.example.test/openai/v1"
 
 
+def test_bound_docker_codex_subscription_does_not_use_deployment_provider(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_personal_provider",
+        "name": "Personal Codex Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.2-chat",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "provider_account": {
+                    "policy": "personal_required",
+                    "account_id": "acct_personal",
+                }
+            }
+        ),
+        "_glasshive_provider_account_bound": True,
+        "_glasshive_provider_account_env": {
+            "CODEX_HOME": "/workspace/.provider-account/codex",
+        },
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://deployment-gateway.example.test/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-deployment-key")
+
+    command, env = runtime._build_command(
+        worker,
+        "Use my subscription.",
+        runtime._runtime_info(worker),
+    )
+
+    joined = "\n".join(command)
+    assert 'model_provider="glasshive_openai_compatible"' not in joined
+    assert "deployment-gateway.example.test" not in joined
+    assert env["CODEX_HOME"] == "/workspace/.provider-account/codex"
+    assert "OPENAI_API_KEY" not in env
+    assert "OPENAI_BASE_URL" not in env
+
+
 def test_codex_cli_provider_can_explicitly_lock_down_user_config_and_native_features(tmp_path, monkeypatch):
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     worker = {
@@ -4826,7 +4871,7 @@ def test_host_runtime_preflight_accepts_configured_version(tmp_path, monkeypatch
     runtime.preflight_worker_profile("codex-cli", "host")
 
 
-def test_host_runtime_preflight_rejects_codex_too_old_for_default_automation_model(
+def test_host_runtime_preflight_rejects_codex_below_reviewed_compatibility_floor(
     tmp_path, monkeypatch
 ):
     fake_codex = tmp_path / "codex"
@@ -4905,7 +4950,7 @@ def test_host_runtime_preflight_accepts_required_mcp_capability(tmp_path, monkey
         "  echo 'node_repl enabled'\n"
         "  exit 0\n"
         "fi\n"
-        "echo 'codex-cli 0.144.1'\n"
+        "echo 'codex-cli 0.146.1'\n"
     )
     fake_codex.chmod(0o755)
     monkeypatch.setenv(
@@ -4932,7 +4977,7 @@ def test_host_claude_preflight_rejects_cli_without_chrome_support(tmp_path, monk
     fake_claude = tmp_path / "claude"
     fake_claude.write_text(
         "#!/usr/bin/env bash\n"
-        "if [[ \"$1\" == \"--version\" ]]; then echo '2.1.178 (Claude Code)'; exit 0; fi\n"
+        "if [[ \"$1\" == \"--version\" ]]; then echo '2.1.223 (Claude Code)'; exit 0; fi\n"
         "echo 'Usage: claude [options] --effort'\n"
     )
     fake_claude.chmod(0o755)
@@ -4953,7 +4998,7 @@ def test_host_claude_preflight_allows_explicit_chrome_lockdown(tmp_path, monkeyp
     fake_claude = tmp_path / "claude"
     fake_claude.write_text(
         "#!/usr/bin/env bash\n"
-        "if [[ \"$1\" == \"--version\" ]]; then echo '2.1.178 (Claude Code)'; exit 0; fi\n"
+        "if [[ \"$1\" == \"--version\" ]]; then echo '2.1.223 (Claude Code)'; exit 0; fi\n"
         "echo 'Usage: claude [options] --effort'\n"
     )
     fake_claude.chmod(0o755)
@@ -4972,7 +5017,7 @@ def test_host_claude_preflight_rejects_max_effort_without_effort_support(tmp_pat
     fake_claude.write_text(
         "#!/usr/bin/env bash\n"
         "if [[ \"$1\" == \"--help\" ]]; then echo 'Usage: claude [options] --chrome'; exit 0; fi\n"
-        "echo '2.1.178 (Claude Code)'\n"
+        "echo '2.1.223 (Claude Code)'\n"
     )
     fake_claude.chmod(0o755)
     monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", str(fake_claude))
@@ -5004,7 +5049,7 @@ def test_host_codex_runtime_uses_configured_binary_path(tmp_path, monkeypatch):
     fake_codex = tmp_path / "codex"
     fake_codex.write_text(
         "#!/usr/bin/env bash\n"
-        "if [[ \"$1\" == \"--version\" ]]; then echo 'codex-cli 0.144.1'; exit 0; fi\n"
+        "if [[ \"$1\" == \"--version\" ]]; then echo 'codex-cli 0.146.1'; exit 0; fi\n"
         "echo 'codex test'\n"
     )
     fake_codex.chmod(0o755)

@@ -17,6 +17,41 @@ It keeps the Python package name `workers_projects_runtime` for compatibility, b
   - `bootstrap_profile`
   - `bootstrap_bundle`
 
+## Workspace Catalog And Retention
+
+Workspace discovery is owner-scoped and cursor-paginated. The primary catalog contains `named`
+workspaces; one-off `ephemeral` runs and migrated `legacy` rows require their explicit filters.
+Catalog rows expose only rediscovery metadata, including normalized tags, provider/capability
+readiness, and the next scheduled occurrence.
+
+Named workspace files and private state survive compute reaping and runtime restart. Expired
+Docker-managed ephemeral workspaces are garbage-collected after seven days by default. Configure
+`GLASSHIVE_EPHEMERAL_RETENTION_S` (60 seconds to 365 days) or disable the policy with
+`GLASSHIVE_EPHEMERAL_GC_ENABLED=false`. The reaper fails closed for active work, future schedules,
+active account leases, pending confirmations, idempotency records, host/user workspace roots, or
+unrecognized storage layouts; it never deletes named or legacy state.
+
+## Recurring Schedule Ownership
+
+Legacy one-shot schedules remain GlassHive-native and retain their existing API and database
+contract. Standalone recurrence is additive: durable definitions are stored separately from
+immutable occurrence rows, and each occurrence is atomically materialized into the existing
+one-shot queue.
+
+- Standalone GlassHive defaults `GLASSHIVE_RECURRING_SCHEDULE_OWNER` to `glasshive_native`.
+  The legacy `native` value remains accepted without rewriting stored definitions.
+- Viventium deployments must use `viventium_cortex`; the legacy `scheduling_cortex` value remains
+  accepted. GlassHive delegates recurrence CRUD and polling to Scheduling Cortex over an
+  authenticated owner boundary and does not store a second local recurrence definition. Cortex
+  dispatches each occurrence into the existing one-shot queue with a stable idempotency key.
+  Owner configuration or availability failures fail closed before any local recurrence row is
+  written, and Viventium runtime markers reject standalone-native ownership.
+- Interval recurrence is elapsed UTC time. Daily recurrence uses an explicit IANA timezone.
+- `next_valid_earliest` advances nonexistent spring-forward wall times to the first valid minute and
+  chooses the earlier fall-back instant. `next_valid_latest` uses the later fall-back instant.
+- A delayed tick materializes only the latest eligible occurrence and records it before advancing,
+  so retries and concurrent ticks do not duplicate a firing.
+
 ## Bootstrap Contract
 
 Each worker can now carry:
@@ -93,6 +128,34 @@ grant full access, which disables harness sandbox and approval gates.
 Conversation streams never expose hidden chain-of-thought. Claude stream-json currently provides
 assistant-text deltas. Codex exec JSON currently provides safe activity while running and the
 assistant message on completion; this is declared as `incremental_text: false` in model metadata.
+
+## Curated Library Registry
+
+Library items are versioned, non-secret bootstrap extensions for native Codex and Claude workers.
+They do not add a second plugin runtime and cannot execute installer shell commands. A manifest must
+pin its stable id, semantic version, activation hash, structured HTTPS/curated provenance, supported
+profiles, requested scopes, closed non-secret JSON configuration schema, exact dependencies,
+declarative `bootstrap_contract` health probe, and safe upgrade/remove behavior. The profile adapter
+accepts only workspace files and the native profile's reviewed project configuration fields.
+
+The supported lifecycle is:
+
+1. An authenticated user or MCP worker may submit a validated proposal at
+   `POST /v1/library/proposals`; this does not publish or install anything.
+2. A tenant administrator with the separately enabled admin API reviews the tenant queue and uses
+   `POST /v1/admin/library/proposals/{proposal_id}/review`, or a trusted registry publishes an
+   already-reviewed manifest with `POST /v1/admin/library`.
+3. A user or worker prepares a workspace enable/upgrade. The authenticated human reviews an
+   immutable, time-bounded pending change in the browser.
+4. Confirmation revalidates the complete dependency graph, runs the profile adapter and health
+   probes, then atomically updates the reusable bootstrap and records the grant/probe evidence.
+   Any adapter or probe failure rolls the transaction back and leaves the confirmation pending.
+5. Removing the newest grant restores the exact prior bootstrap. Catalog disable/removal is a
+   soft, audited lifecycle operation and fails closed while active grants or available dependents
+   remain. Removed versions cannot be restored; publish a new version instead.
+
+MCP intentionally exposes proposal, browse, prepare-upgrade, and remove-grant tools, but no publish
+or confirmation tool. Scope widening during an upgrade is rejected even if proposed by a worker.
 
 ## Run
 

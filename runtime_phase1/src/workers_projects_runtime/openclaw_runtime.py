@@ -120,6 +120,8 @@ class WorkerRuntime(Protocol):
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo: ...
 
+    def prepare_worker_workspace(self, worker: dict) -> RuntimeInfo: ...
+
     def pause_worker(self, worker: dict) -> RuntimeInfo: ...
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo: ...
@@ -168,6 +170,9 @@ class StubRuntime:
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         return self._runtime_info(worker, pid=99999)
+
+    def prepare_worker_workspace(self, worker: dict) -> RuntimeInfo:
+        return self._runtime_info(worker, pid=None)
 
     def pause_worker(self, worker: dict) -> RuntimeInfo:
         return self._runtime_info(worker, pid=None)

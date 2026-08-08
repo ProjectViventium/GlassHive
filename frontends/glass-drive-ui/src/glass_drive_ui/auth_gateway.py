@@ -1,0 +1,703 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
+import base64
+import ipaddress
+import json
+import os
+import secrets
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlencode, urlparse
+
+import httpx
+import jwt
+
+
+HUMAN_AUTH_MODES = {"disabled", "trusted_proxy", "oidc"}
+HUMAN_ROLES = {"member", "viewer", "tenant_admin", "service"}
+
+
+class AuthGatewayError(RuntimeError):
+    def __init__(self, message: str, *, code: str = "sign_in_failed") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = str(os.environ.get(name) or "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on", "enabled"}
+
+
+def _default_state_path() -> Path:
+    configured = str(os.environ.get("GLASSHIVE_AUTH_STATE_PATH") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "GlassHive" / "auth.sqlite3"
+    state_home = str(os.environ.get("XDG_STATE_HOME") or "").strip()
+    return (Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state") / "glasshive" / "auth.sqlite3"
+
+
+def _hash_secret(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _principal_id(issuer: str, subject: str) -> str:
+    digest = hashlib.sha256(f"{issuer}\0{subject}".encode("utf-8")).hexdigest()
+    return f"usr_{digest[:32]}"
+
+
+def _normalize_email(value: object) -> str:
+    text = str(value or "").strip()
+    if len(text) > 320 or text.count("@") != 1 or any(character.isspace() for character in text):
+        raise AuthGatewayError("Enter a valid email address")
+    local, domain = text.rsplit("@", 1)
+    if not local or not domain or len(local) > 64:
+        raise AuthGatewayError("Enter a valid email address")
+    try:
+        ascii_domain = domain.rstrip(".").encode("idna").decode("ascii").casefold()
+    except UnicodeError as exc:
+        raise AuthGatewayError("Enter a valid email address") from exc
+    if not ascii_domain or "." not in ascii_domain:
+        raise AuthGatewayError("Enter a valid email address")
+    return f"{local.casefold()}@{ascii_domain}"
+
+
+def _secure_oidc_url(value: str, *, allow_loopback_http: bool) -> bool:
+    try:
+        parsed = urlparse(str(value or "").strip())
+        _ = parsed.port
+    except ValueError:
+        return False
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        return False
+    if parsed.scheme == "https":
+        if allow_loopback_http:
+            return True
+        hostname = str(parsed.hostname or "").strip().lower().rstrip(".")
+        if hostname == "localhost" or hostname.endswith(".localhost"):
+            return False
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            return True
+        return address.is_global
+    return bool(
+        allow_loopback_http
+        and parsed.scheme == "http"
+        and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    )
+
+
+class HumanAuthGateway:
+    def __init__(
+        self,
+        *,
+        mode: str,
+        state_path: Path,
+        allowed_email_domains: tuple[str, ...],
+        oidc_issuer: str,
+        oidc_client_id: str,
+        oidc_redirect_uri: str,
+        oidc_client_secret: str,
+        session_ttl_seconds: int,
+    ) -> None:
+        self.mode = mode
+        self.state_path = state_path
+        self.allowed_email_domains = allowed_email_domains
+        self.oidc_issuer = oidc_issuer
+        self.oidc_client_id = oidc_client_id
+        self.oidc_redirect_uri = oidc_redirect_uri
+        self.oidc_client_secret = oidc_client_secret
+        self.oidc_principal_claim = str(
+            os.environ.get("GLASSHIVE_OIDC_PRINCIPAL_CLAIM") or "sub"
+        ).strip()
+        self.oidc_email_claim = str(os.environ.get("GLASSHIVE_OIDC_EMAIL_CLAIM") or "email").strip()
+        self.oidc_email_claim_trusted = _env_bool("GLASSHIVE_OIDC_EMAIL_CLAIM_TRUSTED")
+        self.allow_registration = _env_bool("GLASSHIVE_ALLOW_EMAIL_REGISTRATION")
+        self.oidc_post_logout_redirect_uri = str(
+            os.environ.get("GLASSHIVE_OIDC_POST_LOGOUT_REDIRECT_URI") or ""
+        ).strip()
+        self.session_ttl_seconds = session_ttl_seconds
+        if self.session_enabled:
+            self._initialize()
+
+    @classmethod
+    def from_env(cls) -> "HumanAuthGateway":
+        mode = str(os.environ.get("GLASSHIVE_HUMAN_AUTH_MODE") or "disabled").strip().lower()
+        if mode in {"email", "hybrid"}:
+            raise RuntimeError(
+                "GlassHive email/password auth must be provided by Viventium/LibreChat or another external identity provider"
+            )
+        if mode not in HUMAN_AUTH_MODES:
+            raise RuntimeError("GLASSHIVE_HUMAN_AUTH_MODE must be disabled, trusted_proxy, or oidc")
+        domains: list[str] = []
+        for item in str(os.environ.get("GLASSHIVE_ALLOWED_EMAIL_DOMAINS") or "").replace(",", " ").split():
+            try:
+                normalized = item.strip().rstrip(".").encode("idna").decode("ascii").casefold()
+            except UnicodeError as exc:
+                raise RuntimeError("GLASSHIVE_ALLOWED_EMAIL_DOMAINS contains an invalid domain") from exc
+            if normalized and normalized not in domains:
+                domains.append(normalized)
+        oidc_issuer = str(os.environ.get("GLASSHIVE_OIDC_ISSUER") or "").strip().rstrip("/")
+        oidc_client_id = str(os.environ.get("GLASSHIVE_OIDC_CLIENT_ID") or "").strip()
+        oidc_redirect_uri = str(os.environ.get("GLASSHIVE_OIDC_REDIRECT_URI") or "").strip()
+        oidc_client_secret = str(os.environ.get("GLASSHIVE_OIDC_CLIENT_SECRET") or "").strip()
+        if mode == "oidc" and not all((oidc_issuer, oidc_client_id, oidc_redirect_uri)):
+            raise RuntimeError("OIDC human auth requires issuer, client ID, and redirect URI")
+        if mode == "oidc":
+            multi_user = str(os.environ.get("GLASSHIVE_SECURITY_MODE") or "").strip().lower() == "multi_user"
+            if not _secure_oidc_url(oidc_issuer, allow_loopback_http=not multi_user):
+                raise RuntimeError("OIDC issuer must use HTTPS")
+            if not _secure_oidc_url(oidc_redirect_uri, allow_loopback_http=not multi_user):
+                raise RuntimeError("OIDC redirect URI must use HTTPS")
+            post_logout_redirect_uri = str(
+                os.environ.get("GLASSHIVE_OIDC_POST_LOGOUT_REDIRECT_URI") or ""
+            ).strip()
+            if post_logout_redirect_uri and not _secure_oidc_url(
+                post_logout_redirect_uri,
+                allow_loopback_http=not multi_user,
+            ):
+                raise RuntimeError("OIDC post-logout redirect URI must use HTTPS")
+            principal_claim = str(os.environ.get("GLASSHIVE_OIDC_PRINCIPAL_CLAIM") or "").strip()
+            if multi_user and not principal_claim:
+                raise RuntimeError(
+                    "Multi-user OIDC requires GLASSHIVE_OIDC_PRINCIPAL_CLAIM so browser and MCP ownership stay identical"
+                )
+            legacy_mcp_claim = str(os.environ.get("GLASSHIVE_MCP_OAUTH_SUBJECT_CLAIM") or "").strip()
+            if principal_claim and legacy_mcp_claim and principal_claim != legacy_mcp_claim:
+                raise RuntimeError("Browser and MCP principal claim configuration must match")
+        try:
+            session_ttl_seconds = int(str(os.environ.get("GLASSHIVE_AUTH_SESSION_TTL_SECONDS") or "43200"))
+        except ValueError as exc:
+            raise RuntimeError("GlassHive auth limits must be integers") from exc
+        if session_ttl_seconds < 300 or session_ttl_seconds > 30 * 24 * 60 * 60:
+            raise RuntimeError("GLASSHIVE_AUTH_SESSION_TTL_SECONDS is outside the supported range")
+        return cls(
+            mode=mode,
+            state_path=_default_state_path(),
+            allowed_email_domains=tuple(domains),
+            oidc_issuer=oidc_issuer,
+            oidc_client_id=oidc_client_id,
+            oidc_redirect_uri=oidc_redirect_uri,
+            oidc_client_secret=oidc_client_secret,
+            session_ttl_seconds=session_ttl_seconds,
+        )
+
+    @property
+    def session_enabled(self) -> bool:
+        return self.mode == "oidc"
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.state_path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        if os.name != "nt":
+            for path in (
+                self.state_path,
+                Path(f"{self.state_path}-wal"),
+                Path(f"{self.state_path}-shm"),
+            ):
+                try:
+                    path.chmod(0o600)
+                except FileNotFoundError:
+                    # SQLite may unlink transient WAL/SHM files between lookup and chmod.
+                    continue
+        return connection
+
+    def _initialize(self) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            self.state_path.parent.chmod(0o700)
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS auth_principals (
+                    user_id TEXT PRIMARY KEY,
+                    issuer TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    email TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
+                    role TEXT NOT NULL DEFAULT 'member',
+                    disabled_at REAL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    UNIQUE(issuer, subject)
+                );
+                CREATE TABLE IF NOT EXISTS auth_sessions (
+                    session_hash TEXT PRIMARY KEY,
+                    principal_id TEXT NOT NULL REFERENCES auth_principals(user_id) ON DELETE CASCADE,
+                    csrf_hash TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    revoked_at REAL,
+                    created_at REAL NOT NULL,
+                    last_seen_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_auth_sessions_principal ON auth_sessions(principal_id, expires_at);
+                CREATE TABLE IF NOT EXISTS auth_oidc_flows (
+                    state_hash TEXT PRIMARY KEY,
+                    nonce TEXT NOT NULL,
+                    verifier TEXT NOT NULL,
+                    return_to TEXT NOT NULL,
+                    expires_at REAL NOT NULL
+                );
+                """
+            )
+        if os.name != "nt" and self.state_path.exists():
+            self.state_path.chmod(0o600)
+        if os.name != "nt":
+            self.state_path.chmod(0o600)
+
+    def _domain_allowed(self, email: str) -> bool:
+        domain = email.rsplit("@", 1)[1]
+        return any(domain == allowed or domain.endswith(f".{allowed}") for allowed in self.allowed_email_domains)
+
+    def email_allowed(self, email: str) -> bool:
+        if not self.allowed_email_domains:
+            return True
+        try:
+            normalized = _normalize_email(email)
+        except AuthGatewayError:
+            return False
+        return self._domain_allowed(normalized)
+
+    def _principal_payload(self, row: sqlite3.Row) -> dict[str, str]:
+        return {
+            "tenant_id": str(os.environ.get("GLASSHIVE_ENTERPRISE_TENANT_ID") or "local").strip(),
+            "user_id": str(row["user_id"]),
+            "email": str(row["email"] or ""),
+            "display_name": str(row["display_name"] or ""),
+            "role": str(row["role"] or "member"),
+        }
+
+    def upsert_oidc_principal(
+        self,
+        *,
+        issuer: str,
+        subject: str,
+        email: str,
+        display_name: str,
+        role: str,
+    ) -> dict[str, str]:
+        issuer = str(issuer or "").strip().rstrip("/")
+        subject = str(subject or "").strip()
+        if not issuer or not subject:
+            raise AuthGatewayError("OIDC identity is missing issuer or subject")
+        normalized_email = _normalize_email(email) if email else ""
+        normalized_role = role if role in HUMAN_ROLES else "member"
+        user_id = _principal_id(issuer, subject)
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO auth_principals
+                    (user_id, issuer, subject, email, display_name, role, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(issuer, subject) DO UPDATE SET
+                    email = excluded.email,
+                    display_name = excluded.display_name,
+                    role = excluded.role,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, issuer, subject, normalized_email, str(display_name or "").strip()[:200], normalized_role, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM auth_principals WHERE issuer = ? AND subject = ?",
+                (issuer, subject),
+            ).fetchone()
+        assert row is not None
+        return self._principal_payload(row)
+
+    def find_oidc_principal(self, *, issuer: str, subject: str) -> dict[str, str] | None:
+        normalized_issuer = str(issuer or "").strip().rstrip("/")
+        normalized_subject = str(subject or "").strip()
+        if not normalized_issuer or not normalized_subject:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM auth_principals WHERE issuer = ? AND subject = ?",
+                (normalized_issuer, normalized_subject),
+            ).fetchone()
+        return self._principal_payload(row) if row is not None else None
+
+    def reconcile_oidc_principal(
+        self,
+        *,
+        issuer: str,
+        subject: str,
+        email: str,
+        display_name: str,
+        role: str,
+    ) -> dict[str, str]:
+        existing = self.find_oidc_principal(issuer=issuer, subject=subject)
+        if existing is None and not self.allow_registration:
+            raise AuthGatewayError(
+                "This account has not been approved for GlassHive",
+                code="account_not_registered",
+            )
+        return self.upsert_oidc_principal(
+            issuer=issuer,
+            subject=subject,
+            email=email,
+            display_name=display_name,
+            role=role,
+        )
+
+    def create_session(self, principal_id: str) -> dict[str, Any]:
+        token = secrets.token_urlsafe(48)
+        csrf_token = secrets.token_urlsafe(32)
+        now = time.time()
+        expires_at = now + self.session_ttl_seconds
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT user_id FROM auth_principals WHERE user_id = ? AND disabled_at IS NULL",
+                (principal_id,),
+            ).fetchone()
+            if row is None:
+                raise AuthGatewayError("Account is unavailable")
+            conn.execute(
+                """
+                INSERT INTO auth_sessions
+                    (session_hash, principal_id, csrf_hash, expires_at, created_at, last_seen_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (_hash_secret(token), principal_id, _hash_secret(csrf_token), expires_at, now, now),
+            )
+        return {"token": token, "csrf_token": csrf_token, "expires_at": expires_at}
+
+    def resolve_session(self, token: str) -> dict[str, Any] | None:
+        if not token:
+            return None
+        now = time.time()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT p.*, s.csrf_hash, s.expires_at
+                FROM auth_sessions s
+                JOIN auth_principals p ON p.user_id = s.principal_id
+                WHERE s.session_hash = ?
+                  AND s.revoked_at IS NULL
+                  AND s.expires_at > ?
+                  AND p.disabled_at IS NULL
+                """,
+                (_hash_secret(token), now),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                "UPDATE auth_sessions SET last_seen_at = ? WHERE session_hash = ?",
+                (now, _hash_secret(token)),
+            )
+        payload: dict[str, Any] = self._principal_payload(row)
+        payload["expires_at"] = float(row["expires_at"])
+        payload["_csrf_hash"] = str(row["csrf_hash"])
+        payload["auth_source"] = "session"
+        return payload
+
+    def session_csrf_valid(self, session: dict[str, Any], token: str) -> bool:
+        expected = str(session.get("_csrf_hash") or "")
+        return bool(expected and token and hmac.compare_digest(expected, _hash_secret(token)))
+
+    def revoke_session(self, token: str) -> None:
+        if not token:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE auth_sessions SET revoked_at = ? WHERE session_hash = ? AND revoked_at IS NULL",
+                (time.time(), _hash_secret(token)),
+            )
+
+    def list_principals(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(int(limit), 500))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, email, display_name, role, disabled_at, created_at, updated_at
+                FROM auth_principals
+                ORDER BY created_at, user_id
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
+        return [
+            {
+                "user_id": str(row["user_id"]),
+                "email": str(row["email"] or ""),
+                "display_name": str(row["display_name"] or ""),
+                "role": str(row["role"] or "member"),
+                "disabled": row["disabled_at"] is not None,
+                "disabled_at": float(row["disabled_at"]) if row["disabled_at"] is not None else None,
+                "created_at": float(row["created_at"]),
+                "updated_at": float(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
+    def set_principal_disabled(self, *, principal_id: str, disabled: bool) -> dict[str, Any]:
+        user_id = str(principal_id or "").strip()
+        if not user_id:
+            raise AuthGatewayError("Account id is required")
+        now = time.time()
+        disabled_at = now if disabled else None
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "UPDATE auth_principals SET disabled_at = ?, updated_at = ? WHERE user_id = ?",
+                (disabled_at, now, user_id),
+            )
+            if cursor.rowcount != 1:
+                raise AuthGatewayError("Account was not found")
+            if disabled:
+                conn.execute(
+                    "UPDATE auth_sessions SET revoked_at = ? WHERE principal_id = ? AND revoked_at IS NULL",
+                    (now, user_id),
+                )
+            row = conn.execute(
+                """
+                SELECT user_id, email, display_name, role, disabled_at, created_at, updated_at
+                FROM auth_principals WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+        assert row is not None
+        return {
+            "user_id": str(row["user_id"]),
+            "email": str(row["email"] or ""),
+            "display_name": str(row["display_name"] or ""),
+            "role": str(row["role"] or "member"),
+            "disabled": row["disabled_at"] is not None,
+            "disabled_at": float(row["disabled_at"]) if row["disabled_at"] is not None else None,
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+        }
+
+    def _oidc_configuration(self) -> dict[str, str]:
+        if self.mode not in {"oidc", "hybrid"}:
+            raise AuthGatewayError("OIDC login is disabled")
+        try:
+            response = httpx.get(
+                f"{self.oidc_issuer}/.well-known/openid-configuration",
+                timeout=10.0,
+                follow_redirects=False,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            raise AuthGatewayError(
+                "OIDC provider metadata is unavailable",
+                code="provider_unavailable",
+            ) from exc
+        if not isinstance(payload, dict) or str(payload.get("issuer") or "").rstrip("/") != self.oidc_issuer:
+            raise AuthGatewayError(
+                "OIDC provider issuer does not match configuration",
+                code="provider_configuration",
+            )
+        result: dict[str, str] = {"issuer": self.oidc_issuer}
+        for name in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
+            value = str(payload.get(name) or "").strip()
+            parsed = urlparse(value)
+            if parsed.scheme != "https" or not parsed.netloc:
+                raise AuthGatewayError(
+                    f"OIDC provider metadata has an invalid {name}",
+                    code="provider_configuration",
+                )
+            result[name] = value
+        end_session_endpoint = str(payload.get("end_session_endpoint") or "").strip()
+        if end_session_endpoint:
+            parsed = urlparse(end_session_endpoint)
+            if parsed.scheme == "https" and parsed.netloc and not parsed.fragment:
+                result["end_session_endpoint"] = end_session_endpoint
+        return result
+
+    def provider_logout_url(self) -> str:
+        if not self.oidc_post_logout_redirect_uri:
+            return ""
+        configuration = self._oidc_configuration()
+        endpoint = str(configuration.get("end_session_endpoint") or "").strip()
+        if not endpoint:
+            return ""
+        separator = "&" if urlparse(endpoint).query else "?"
+        return f"{endpoint}{separator}{urlencode({'post_logout_redirect_uri': self.oidc_post_logout_redirect_uri, 'client_id': self.oidc_client_id})}"
+
+    def begin_oidc(self, *, return_to: str = "/") -> dict[str, str]:
+        configuration = self._oidc_configuration()
+        safe_return_to = str(return_to or "/").strip()
+        if (
+            not safe_return_to.startswith("/")
+            or safe_return_to.startswith("//")
+            or "\\" in safe_return_to
+        ):
+            safe_return_to = "/"
+        state = secrets.token_urlsafe(32)
+        nonce = secrets.token_urlsafe(32)
+        verifier = secrets.token_urlsafe(64)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM auth_oidc_flows WHERE expires_at <= ?",
+                (time.time(),),
+            )
+            conn.execute(
+                "INSERT INTO auth_oidc_flows (state_hash, nonce, verifier, return_to, expires_at) VALUES (?, ?, ?, ?, ?)",
+                (_hash_secret(state), nonce, verifier, safe_return_to, time.time() + 10 * 60),
+            )
+        query = urlencode(
+            {
+                "response_type": "code",
+                "client_id": self.oidc_client_id,
+                "redirect_uri": self.oidc_redirect_uri,
+                "scope": str(os.environ.get("GLASSHIVE_OIDC_SCOPES") or "openid profile email").strip(),
+                "state": state,
+                "nonce": nonce,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+            }
+        )
+        return {
+            "authorization_url": f"{configuration['authorization_endpoint']}?{query}",
+            "state": state,
+            "nonce": nonce,
+        }
+
+    def _oidc_role(self, claims: dict[str, Any]) -> str:
+        claim_name = str(os.environ.get("GLASSHIVE_OIDC_ROLE_CLAIM") or "roles").strip()
+        raw_values = claims.get(claim_name)
+        values = raw_values if isinstance(raw_values, list) else [raw_values]
+        try:
+            role_map = json.loads(str(os.environ.get("GLASSHIVE_OIDC_ROLE_MAP_JSON") or "{}"))
+        except json.JSONDecodeError as exc:
+            raise AuthGatewayError("OIDC role map configuration is invalid") from exc
+        if not isinstance(role_map, dict):
+            raise AuthGatewayError("OIDC role map configuration is invalid")
+        mapped: set[str] = set()
+        for value in values:
+            role = str(role_map.get(str(value)) or "").strip()
+            if role in HUMAN_ROLES:
+                mapped.add(role)
+        for preferred in ("tenant_admin", "service", "viewer", "member"):
+            if preferred in mapped:
+                return preferred
+        if role_map:
+            raise AuthGatewayError(
+                "This account does not have an approved GlassHive role",
+                code="account_not_authorized",
+            )
+        return "member"
+
+    def complete_oidc(self, *, state: str, code: str) -> dict[str, Any]:
+        if not state or not code:
+            raise AuthGatewayError(
+                "OIDC callback is missing state or code",
+                code="callback_invalid",
+            )
+        state_hash = _hash_secret(state)
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            flow = conn.execute(
+                "SELECT * FROM auth_oidc_flows WHERE state_hash = ? AND expires_at > ?",
+                (state_hash, now),
+            ).fetchone()
+            if flow is None:
+                raise AuthGatewayError(
+                    "OIDC login state expired or already used",
+                    code="state_expired",
+                )
+            conn.execute("DELETE FROM auth_oidc_flows WHERE state_hash = ?", (state_hash,))
+        configuration = self._oidc_configuration()
+        token_data = {
+            "grant_type": "authorization_code",
+            "client_id": self.oidc_client_id,
+            "code": code,
+            "redirect_uri": self.oidc_redirect_uri,
+            "code_verifier": str(flow["verifier"]),
+        }
+        request_kwargs: dict[str, Any] = {
+            "data": token_data,
+            "timeout": 15.0,
+            "follow_redirects": False,
+        }
+        if self.oidc_client_secret:
+            request_kwargs["auth"] = (self.oidc_client_id, self.oidc_client_secret)
+        try:
+            response = httpx.post(configuration["token_endpoint"], **request_kwargs)
+            response.raise_for_status()
+            token_payload = response.json()
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            raise AuthGatewayError(
+                "OIDC token exchange failed",
+                code="provider_unavailable",
+            ) from exc
+        id_token = str(token_payload.get("id_token") or "") if isinstance(token_payload, dict) else ""
+        if not id_token:
+            raise AuthGatewayError(
+                "OIDC provider did not return an ID token",
+                code="token_invalid",
+            )
+        try:
+            jwks_response = httpx.get(configuration["jwks_uri"], timeout=10.0, follow_redirects=False)
+            jwks_response.raise_for_status()
+            jwks = jwks_response.json()
+            header = jwt.get_unverified_header(id_token)
+            key_id = str(header.get("kid") or "")
+            key_data = next(
+                item
+                for item in jwks.get("keys", [])
+                if isinstance(item, dict) and str(item.get("kid") or "") == key_id
+            )
+            claims = jwt.decode(
+                id_token,
+                jwt.PyJWK.from_dict(key_data).key,
+                algorithms=["RS256"],
+                audience=self.oidc_client_id,
+                issuer=self.oidc_issuer,
+                leeway=30,
+                options={"require": ["iss", "aud", "sub", "nonce", "iat", "exp"]},
+            )
+        except StopIteration as exc:
+            raise AuthGatewayError(
+                "OIDC signing key is not trusted",
+                code="token_invalid",
+            ) from exc
+        except (httpx.HTTPError, ValueError, TypeError, jwt.PyJWTError) as exc:
+            raise AuthGatewayError(
+                "OIDC ID token validation failed",
+                code="token_invalid",
+            ) from exc
+        if not hmac.compare_digest(str(claims.get("nonce") or ""), str(flow["nonce"])):
+            raise AuthGatewayError("OIDC nonce validation failed", code="token_invalid")
+        raw_audience = claims.get("aud")
+        if isinstance(raw_audience, list) and len(raw_audience) > 1:
+            if not hmac.compare_digest(str(claims.get("azp") or ""), self.oidc_client_id):
+                raise AuthGatewayError(
+                    "OIDC authorized party does not match the GlassHive client",
+                    code="token_invalid",
+                )
+        subject = str(claims.get(self.oidc_principal_claim) or "").strip()
+        if not subject:
+            raise AuthGatewayError(
+                "OIDC identity is missing the configured stable principal claim",
+                code="identity_invalid",
+            )
+        email = str(claims.get(self.oidc_email_claim) or "").strip()
+        email_is_verified = claims.get("email_verified") is True or self.oidc_email_claim_trusted
+        if email and not email_is_verified:
+            email = ""
+        # Email-like claims are mutable display metadata. Admission and ownership are
+        # anchored exclusively to the validated issuer plus configured stable claim;
+        # tenant/domain restrictions belong in IdP policy or immutable role/group claims.
+        principal = self.reconcile_oidc_principal(
+            issuer=str(claims.get("iss") or ""),
+            subject=subject,
+            email=email,
+            display_name=str(claims.get("name") or ""),
+            role=self._oidc_role(claims),
+        )
+        return {"principal": principal, "return_to": str(flow["return_to"])}

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sign in · GlassHive</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260806b" />
+  </head>
+  <body class="auth-body">
+    <main class="auth-shell">
+      <div class="ambient ambient-a"></div>
+      <div class="ambient ambient-b"></div>
+      <section class="auth-card" aria-labelledby="auth-title">
+        <div class="auth-brand">GlassHive</div>
+        <div class="auth-copy">
+          <p class="auth-eyebrow">Your private worker workspace</p>
+          <h1 id="auth-title">Welcome back</h1>
+          <p>Sign in once to return to your workspaces, accounts, connections, and schedules.</p>
+        </div>
+        <a id="oidc-login" class="primary-button auth-provider-button" href="/auth/oidc/start" hidden>
+          Continue with your organization
+        </a>
+        <p id="auth-status" class="auth-status" aria-live="polite"></p>
+        <p class="auth-footnote">Email sign-in or registration, password reset, approval, and domain policy—when enabled—are managed by your organization’s identity service, never by worker containers.</p>
+      </section>
+    </main>
+    <script src="/static/auth.js?v=20260806b" type="module"></script>
+  </body>
+</html>
