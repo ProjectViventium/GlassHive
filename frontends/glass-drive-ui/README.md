@@ -54,13 +54,21 @@ Env:
 ## Hosted human authentication
 
 Hosted multi-user GlassHive uses the configured OIDC provider for both organization SSO and, when
-the provider supports it, provider-hosted email/password login. GlassHive never receives or stores
-the password and exposes no public sign-up route.
+the provider supports it, provider-hosted email/password login. Deployments may also opt into a
+separate GlassHive-local password for an already-approved OIDC identity. The local option is off by
+default, never changes the issuer + immutable-subject ownership key shared with MCP, and exposes no
+public sign-up, invitation, or self-service reset route.
 
 - `GLASSHIVE_HUMAN_AUTH_MODE=oidc` enables the existing Authorization Code + PKCE gateway.
 - `GLASSHIVE_PROVIDER_EMAIL_LOGIN=true` truthfully labels the same provider redirect as supporting
   email or organization login. It does not enable a GlassHive password form.
 - `GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT=false` keeps first-login principal creation closed.
+- `GLASSHIVE_LOCAL_PASSWORD_LOGIN=true` shows the local email/password form in addition to OIDC.
+- `GLASSHIVE_LOCAL_AUTH_THROTTLE_KEY` is a gateway-only random secret of at least 32 bytes used to
+  HMAC source-rate-limit keys; it is required when local password login is enabled and must remain
+  stable across restarts. It does not bypass principal preapproval or add an MCP password grant.
+- `GLASSHIVE_LOCAL_AUTH_ALLOWED_EMAIL_DOMAINS` optionally limits local credential locators without
+  changing OIDC/MCP admission. Never reuse email as a principal or workspace ownership key.
 - `GLASSHIVE_ALLOW_EMAIL_LOGIN` and `GLASSHIVE_ALLOW_EMAIL_REGISTRATION` remain compatibility
   aliases for one release; new deployments should use the canonical keys above.
 
@@ -81,6 +89,26 @@ Output contains only the opaque GlassHive user ID. Delete only that exact tempor
 command returns; the secret manager may instead supply an already-ephemeral descriptor. It fails
 with retry guidance while a rollout holds the shared mutation lock. Never infer or merge principals
 by email; issuer + subject is the durable ownership key shared with MCP.
+
+To attach or rotate a local password, keep the feature hidden while staging if desired and have the
+deployment secret manager generate a high-entropy value of at least 24 characters with at least 12
+distinct characters. Send an operator-only JSON object containing the exact preapproved `subject`,
+a `login_email`, and that password through standard input. The wrapper never places those fields in
+argv, environment, or output:
+
+```bash
+umask 077
+sudo /opt/viventium/current/deploy/glasshive/systemd/glasshive_auth_admin.py \
+  set-local-password --stdin-json < /run/private/glasshive-local-credential.json
+```
+
+The gateway stores only a salted Argon2id PHC verifier in its private auth database. Rotation
+revokes that principal's active local-password browser sessions. `disable-local-password`,
+`enable-local-password`, and `unlock-local-password` take stdin JSON containing only the exact
+subject. Before disabling the feature or rolling back to an older release, run
+`revoke-local-sessions`; local sessions live in a separate table, so an older OIDC-only binary
+cannot accept them. OIDC sessions remain independent. Delete only the exact temporary input file
+after the command succeeds.
 
 ## Public-link-only mode
 

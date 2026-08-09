@@ -117,6 +117,9 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "GLASSHIVE_AUTH_STATE_PATH",
         "GLASSHIVE_PROVIDER_EMAIL_LOGIN",
         "GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT",
+        "GLASSHIVE_LOCAL_PASSWORD_LOGIN",
+        "GLASSHIVE_LOCAL_AUTH_ALLOWED_EMAIL_DOMAINS",
+        "GLASSHIVE_LOCAL_AUTH_THROTTLE_KEY",
         "GLASSHIVE_ALLOW_EMAIL_LOGIN",
         "GLASSHIVE_ALLOW_EMAIL_REGISTRATION",
         "GLASSHIVE_ALLOWED_EMAIL_DOMAINS",
@@ -4568,6 +4571,8 @@ def test_oidc_identity_owner_advertises_provider_email_login_with_closed_enrollm
         "email_login": True,
         "email_registration": False,
         "provider_email_login": True,
+        "local_password_login": False,
+        "local_password_signup": False,
         "principal_enrollment": False,
         "identity_owner": "external_provider",
         "oidc": True,
@@ -4577,6 +4582,152 @@ def test_oidc_identity_owner_advertises_provider_email_login_with_closed_enrollm
     assert "provisioned by an administrator" in auth_script
     assert client.get("/auth/email/login").status_code == 404
     assert client.get("/auth/email/register").status_code == 404
+
+
+def test_local_password_login_is_explicit_same_origin_and_has_no_signup_surface(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_HUMAN_AUTH_MODE", "oidc")
+    monkeypatch.setenv("GLASSHIVE_AUTH_STATE_PATH", str(tmp_path / "auth.sqlite3"))
+    monkeypatch.setenv("GLASSHIVE_OIDC_ISSUER", "https://identity.example.test")
+    monkeypatch.setenv("GLASSHIVE_OIDC_CLIENT_ID", "glasshive-ui")
+    monkeypatch.setenv(
+        "GLASSHIVE_OIDC_REDIRECT_URI",
+        "https://glasshive.example.test/auth/oidc/callback",
+    )
+    monkeypatch.setenv("GLASSHIVE_LOCAL_PASSWORD_LOGIN", "true")
+    monkeypatch.setenv(
+        "GLASSHIVE_LOCAL_AUTH_THROTTLE_KEY",
+        "synthetic-throttle-key-for-server-tests",
+    )
+    gateway = server_module.HumanAuthGateway.from_env()
+    principal = gateway.preapprove_oidc_principal(subject="local-browser-subject", role="member")
+    gateway.provision_local_password(
+        subject="local-browser-subject",
+        login_email="browser-login@example.invalid",
+        password="browser synthetic passphrase",
+    )
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    config = client.get("/auth/config")
+    page = client.get("/login")
+    login_csrf = client.cookies.get("glasshive_login_csrf")
+
+    assert config.json()["local_password_login"] is True
+    assert config.json()["local_password_signup"] is False
+    assert 'id="local-login"' in page.text
+    assert '/static/auth.js?v=20260809c' in page.text
+    assert page.headers["cache-control"] == "no-store, no-cache, private, max-age=0"
+    assert login_csrf
+    assert client.get("/auth/email/register").status_code == 404
+    assert client.post("/auth/email/register", json={}).status_code == 404
+    assert client.get("/auth/email/reset").status_code == 404
+    assert client.post("/auth/email/reset", json={}).status_code == 404
+
+    no_origin = client.post(
+        "/auth/email/login",
+        headers={"X-GlassHive-CSRF": login_csrf},
+        json={
+            "email": "browser-login@example.invalid",
+            "password": "browser synthetic passphrase",
+            "return_to": "/workspaces",
+        },
+    )
+    no_csrf = client.post(
+        "/auth/email/login",
+        headers={"Origin": "http://testserver"},
+        json={
+            "email": "browser-login@example.invalid",
+            "password": "browser synthetic passphrase",
+            "return_to": "/workspaces",
+        },
+    )
+    assert no_origin.status_code == 403
+    assert no_csrf.status_code == 403
+
+    unknown = client.post(
+        "/auth/email/login",
+        headers={
+            "Origin": "http://testserver",
+            "X-GlassHive-CSRF": login_csrf,
+        },
+        json={"email": "unknown@example.invalid", "password": "wrong synthetic passphrase"},
+    )
+    wrong = client.post(
+        "/auth/email/login",
+        headers={
+            "Origin": "http://testserver",
+            "X-GlassHive-CSRF": login_csrf,
+        },
+        json={"email": "browser-login@example.invalid", "password": "wrong synthetic passphrase"},
+    )
+    assert (unknown.status_code, unknown.json()) == (wrong.status_code, wrong.json()) == (
+        401,
+        {"detail": "Email or password is incorrect"},
+    )
+
+    original_authenticate = server_module.HumanAuthGateway.authenticate_local_password
+    monkeypatch.setattr(
+        server_module.HumanAuthGateway,
+        "authenticate_local_password",
+        lambda _self, **_kwargs: (_ for _ in ()).throw(
+            AuthGatewayError("busy", code="sign_in_busy")
+        ),
+    )
+    busy = client.post(
+        "/auth/email/login",
+        headers={"Origin": "http://testserver", "X-GlassHive-CSRF": login_csrf},
+        json={
+            "email": "browser-login@example.invalid",
+            "password": "browser synthetic passphrase",
+        },
+    )
+    assert busy.status_code == 503
+    assert busy.json() == {"detail": "Sign-in is temporarily busy; retry shortly"}
+    monkeypatch.setattr(
+        server_module.HumanAuthGateway,
+        "authenticate_local_password",
+        original_authenticate,
+    )
+
+    for malformed_body in (
+        b'{"email":"broken\\ud800@example.invalid","password":"synthetic password value"}',
+        b'{"email":"browser-login@example.invalid","password":"broken\\ud800"}',
+        b'{"email":"browser-login@example.invalid","password":"browser synthetic passphrase","return_to":"/broken\\ud800"}',
+    ):
+        malformed = client.post(
+            "/auth/email/login",
+            headers={
+                "Content-Type": "application/json",
+                "Origin": "http://testserver",
+                "X-GlassHive-CSRF": login_csrf,
+            },
+            content=malformed_body,
+        )
+        assert malformed.status_code == 400
+        assert malformed.json() == {"detail": "Invalid sign-in request"}
+    with sqlite3.connect(gateway.state_path) as connection:
+        assert connection.execute("SELECT count(*) FROM auth_local_sessions").fetchone() == (0,)
+
+    accepted = client.post(
+        "/auth/email/login",
+        headers={
+            "Origin": "http://testserver",
+            "X-GlassHive-CSRF": login_csrf,
+        },
+        json={
+            "email": "browser-login@example.invalid",
+            "password": "browser synthetic passphrase",
+            "return_to": "/workspaces",
+        },
+    )
+    assert accepted.status_code == 200
+    assert accepted.json() == {"authenticated": True, "redirect_url": "/workspaces"}
+    session = client.get("/auth/session").json()
+    assert session["authenticated"] is True
+    assert session["user_id"] == principal["user_id"]
+    assert session["auth_method"] == "local_password"
 
 
 class _FakeOidcHumanAuth:

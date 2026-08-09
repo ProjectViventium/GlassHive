@@ -21,10 +21,22 @@
         <a id="oidc-login" class="primary-button auth-provider-button" href="/auth/oidc/start" hidden>
           Continue with your organization
         </a>
+        <div id="auth-divider" class="auth-divider" hidden>or</div>
+        <form id="local-login" class="auth-form" hidden novalidate>
+          <label>
+            Email
+            <input id="local-email" name="email" type="email" autocomplete="email" maxlength="320" required />
+          </label>
+          <label>
+            Password
+            <input id="local-password" name="password" type="password" autocomplete="current-password" maxlength="128" required />
+          </label>
+          <button id="local-submit" class="primary-button" type="submit">Sign in with email</button>
+        </form>
         <p id="auth-status" class="auth-status" aria-live="polite"></p>
-        <p class="auth-footnote">Email sign-in, password reset, approval, and domain policy—when enabled—are managed by your organization’s identity service, never by worker containers. GlassHive does not offer public sign-up.</p>
+        <p class="auth-footnote">Local email sign-in is available only for accounts explicitly provisioned by a GlassHive administrator. Organization sign-in remains with your identity provider. GlassHive offers no public sign-up or self-service password reset, and worker containers never receive browser credentials.</p>
       </section>
     </main>
-    <script src="/static/auth.js?v=20260809a" type="module"></script>
+    <script src="/static/auth.js?v=20260809c" type="module"></script>
   </body>
 </html>
