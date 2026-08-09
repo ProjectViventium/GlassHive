@@ -363,7 +363,8 @@ def test_describe_self_heals_novnc_when_service_port_resets(tmp_path):
     assert manager._browser_tmp_dir() not in repair_script
 
 
-def test_container_uses_unique_required_desktop_and_grid_credentials(tmp_path):
+def test_container_uses_unique_required_desktop_and_grid_credentials(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     commands: list[list[str]] = []
     secret_environments: list[dict[str, str]] = []
@@ -384,6 +385,10 @@ def test_container_uses_unique_required_desktop_and_grid_credentials(tmp_path):
     paths_two = manager.paths("wrk_two")
     manager._ensure_host_dirs(paths_one)  # type: ignore[attr-defined]
     manager._ensure_host_dirs(paths_two)  # type: ignore[attr-defined]
+
+    for paths in (paths_one, paths_two):
+        for key in ("worker_root", "state_dir", "workspace_dir", "home_dir"):
+            assert paths[key].stat().st_mode & 0o777 == 0o700
 
     manager._create_container("wpr-wrk-one", paths_one, worker={"worker_id": "wrk_one"})  # type: ignore[attr-defined]
     manager._create_container("wpr-wrk-two", paths_two, worker={"worker_id": "wrk_two"})  # type: ignore[attr-defined]
@@ -416,6 +421,43 @@ def test_container_uses_unique_required_desktop_and_grid_credentials(tmp_path):
     assert (paths_one["state_dir"] / "desktop-credentials.json").stat().st_mode & 0o777 == 0o600
     assert (paths_one["home_dir"] / ".vnc").is_dir()
     assert (paths_one["home_dir"] / ".vnc").stat().st_mode & 0o777 == 0o700
+
+
+def test_local_running_sandbox_readiness_keeps_container_acl_mask(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "local")
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    paths = manager.paths("wrk_local")
+    paths["workspace_dir"].mkdir(parents=True)
+    paths["home_dir"].mkdir(parents=True)
+    for key in ("worker_root", "state_dir", "workspace_dir", "home_dir"):
+        paths[key].chmod(0o770)
+
+    sandbox = SandboxInfo(
+        container_name="wpr-wrk-local",
+        container_id="cid",
+        state="running",
+        workspace_dir=str(paths["workspace_dir"]),
+        home_dir=str(paths["home_dir"]),
+        pid=1234,
+        image="img",
+    )
+    manager._require_docker = lambda: None  # type: ignore[method-assign]
+    manager._seed_bootstrap = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    manager.inspect = lambda worker_id: sandbox  # type: ignore[method-assign]
+    manager._sandbox_needs_chromium_userns_recreate = lambda resolved: False  # type: ignore[method-assign]
+    manager._sandbox_needs_network_recreate = lambda worker_id, resolved: False  # type: ignore[method-assign]
+    manager._sandbox_needs_provider_mount_recreate = lambda worker, resolved: False  # type: ignore[method-assign]
+    manager._sandbox_needs_desktop_auth_recreate = lambda worker_id, resolved: False  # type: ignore[method-assign]
+    manager._ensure_container_writable_paths = lambda *args: pytest.fail("local running sandbox was unexpectedly repaired")  # type: ignore[method-assign]
+    manager._repair_provider_temp_ownership = lambda container_name: None  # type: ignore[method-assign]
+    manager._harden_secret_runtime_files = lambda container_name: None  # type: ignore[method-assign]
+
+    resolved = manager.ensure_ready({"worker_id": "wrk_local"}, "codex-cli")
+
+    assert resolved is sandbox
+    for key in ("worker_root", "state_dir", "workspace_dir", "home_dir"):
+        assert paths[key].stat().st_mode & 0o777 == 0o770
+    assert (paths["home_dir"] / ".vnc").stat().st_mode & 0o777 == 0o700
 
 
 def test_passwordless_desktop_requires_explicit_insecure_local_opt_in(tmp_path, monkeypatch):
@@ -1745,6 +1787,43 @@ def test_ensure_ready_repairs_bind_mount_ownership_before_prime(tmp_path):
     assert calls[4:] == ["background", "prime"]
 
 
+@pytest.mark.parametrize("projected", [False, True])
+def test_multi_user_ensure_ready_always_repairs_private_roots(tmp_path, monkeypatch, projected):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[tuple[str, object]] = []
+
+    class FakeSandbox:
+        container_name = "wpr-test"
+        container_id = "cid"
+        state = "running"
+        workspace_dir = str(tmp_path / "workspace")
+        home_dir = str(tmp_path / "home")
+        pid = 1234
+        image = "img"
+        novnc_port = 57900
+        selenium_port = 57901
+        openclaw_port = 57902
+
+    sandbox = FakeSandbox()
+    manager._require_docker = lambda: None  # type: ignore[method-assign]
+    manager._ensure_host_dirs = lambda paths: calls.append(("host", paths))  # type: ignore[method-assign]
+    manager._seed_bootstrap = lambda *args, **kwargs: calls.append(("seed", args))  # type: ignore[method-assign]
+    manager.inspect = lambda worker_id: None if projected else sandbox  # type: ignore[method-assign]
+    manager.fast_sandbox_from_worker = lambda worker: sandbox if projected else None  # type: ignore[method-assign]
+    manager._ensure_container_writable_paths = lambda container_name, paths: calls.append(("repair", paths))  # type: ignore[method-assign]
+    manager._repair_provider_temp_ownership = lambda container_name: None  # type: ignore[method-assign]
+    manager._harden_secret_runtime_files = lambda container_name: None  # type: ignore[method-assign]
+
+    resolved = manager.ensure_ready(
+        {"worker_id": "wrk_test", "container_id": "cid" if projected else ""},
+        "codex-cli",
+    )
+
+    assert resolved is sandbox
+    assert ("repair", manager._default_writable_container_paths()) in calls
+
+
 def test_ensure_container_writable_paths_repairs_specific_run_dir(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     calls: list[tuple[str | None, list[str]]] = []
@@ -1780,6 +1859,68 @@ def test_ensure_container_writable_paths_repairs_specific_run_dir(tmp_path):
             ],
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("environment_name", "environment_value"),
+    [
+        ("GLASSHIVE_ENTERPRISE_MODE", "true"),
+        ("GLASSHIVE_ENTERPRISE_MODE", "enabled"),
+        ("WPR_ENTERPRISE_MODE", "1"),
+        ("WPR_ENTERPRISE_MODE", "enabled"),
+        ("GLASSHIVE_SECURITY_MODE", "multi_user"),
+    ],
+)
+def test_enterprise_writable_path_repair_fails_closed_without_posix_acl(
+    tmp_path,
+    monkeypatch,
+    environment_name,
+    environment_value,
+):
+    monkeypatch.setenv(environment_name, environment_value)
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[list[str]] = []
+
+    def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
+        calls.append(command)
+        return subprocess.CompletedProcess(["docker"], returncode=1, stdout="", stderr="setfacl unavailable")
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="POSIX ACL"):
+        manager._ensure_container_writable_paths(
+            "wpr-test",
+            ["/workspace/.wpr-home/.glasshive-runs/run_123"],
+        )
+
+    assert len(calls) == 1
+    repair_script = calls[0][-1]
+    assert "command -v setfacl" in repair_script
+    assert "u:root:rwX" in repair_script
+    assert "g::---,o::---,m::rwX" in repair_script
+    assert "d:u:root:rwX" in repair_script
+    assert "d:g::---,d:o::---,d:m::rwX" in repair_script
+    assert "chmod -R a+rwX" not in repair_script
+
+
+def test_explicit_single_user_security_mode_keeps_local_acl_compatibility(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "local")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "enabled")
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[list[str]] = []
+
+    def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
+        calls.append(command)
+        return subprocess.CompletedProcess(["docker"], returncode=0, stdout="", stderr="")
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+
+    manager._ensure_container_writable_paths(
+        "wpr-test",
+        ["/workspace/.wpr-home/.glasshive-runs/run_123"],
+    )
+
+    assert "chmod -R a+rwX" in calls[0][-1]
 
 
 def test_repair_provider_temp_ownership_restores_claude_runtime_directory(tmp_path):
