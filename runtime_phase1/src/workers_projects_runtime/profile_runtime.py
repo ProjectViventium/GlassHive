@@ -1879,6 +1879,21 @@ class BaseCliWorkerRuntime:
             "exit_path": str(run_root / "exit_code"),
         }
 
+    @staticmethod
+    def _read_completed_exit_code(exit_path: Path) -> int | None:
+        """Return a durable exit code, treating a private empty marker as unfinished."""
+
+        try:
+            raw_exit_code = exit_path.read_text().strip()
+        except FileNotFoundError:
+            return None
+        if not raw_exit_code:
+            return None
+        try:
+            return int(raw_exit_code)
+        except ValueError:
+            return 1
+
     def _infer_active_session(self, worker: dict, run_id: str | None = None) -> dict[str, str] | None:
         current = self._read_active_session(worker["worker_id"])
         if current and (run_id is None or current.get("run_id") == run_id):
@@ -1906,15 +1921,26 @@ class BaseCliWorkerRuntime:
     def _latest_completed_run_payload(self, worker_id: str, run_id: str | None = None) -> dict[str, str] | None:
         current = self._read_active_session(worker_id)
         if current and (run_id is None or current.get("run_id") == run_id):
-            return current
+            current_exit = Path(str(current.get("exit_path") or ""))
+            current_stdout = Path(str(current.get("stdout_path") or ""))
+            if self._read_completed_exit_code(current_exit) is not None or self._stdout_has_complete_response(
+                current_stdout
+            ):
+                return current
         if run_id:
             payload = self._run_payload(worker_id, run_id)
-            if payload and Path(str(payload.get("exit_path") or "")).exists():
-                return payload
+            if payload:
+                exit_path = Path(str(payload.get("exit_path") or ""))
+                stdout_path = Path(str(payload.get("stdout_path") or ""))
+                if self._read_completed_exit_code(exit_path) is not None or self._stdout_has_complete_response(
+                    stdout_path
+                ):
+                    return payload
             return None
         for run_root in self._run_root_candidates(worker_id):
             exit_path = run_root / "exit_code"
-            if not exit_path.exists():
+            stdout_path = run_root / "stdout.log"
+            if self._read_completed_exit_code(exit_path) is None and not self._stdout_has_complete_response(stdout_path):
                 continue
             return {
                 "session_name": self._session_name_for_run_id(run_root.name),
@@ -2095,11 +2121,9 @@ class BaseCliWorkerRuntime:
         next_inspect_at = 0.0
         paused = False
         while True:
-            if exit_path.exists():
-                try:
-                    return int(exit_path.read_text().strip() or "0")
-                except ValueError:
-                    return 1
+            completed_exit_code = self._read_completed_exit_code(exit_path)
+            if completed_exit_code is not None:
+                return completed_exit_code
             if stdout_path and self._stdout_has_complete_response(stdout_path):
                 now = time.monotonic()
                 if completed_seen_at is None:
@@ -2285,22 +2309,20 @@ class BaseCliWorkerRuntime:
         exit_path = Path(str(active_session.get("exit_path") or "").strip())
         stdout_path = Path(str(active_session.get("stdout_path") or "").strip())
         stderr_path = Path(str(active_session.get("stderr_path") or "").strip())
-        if not exit_path.exists():
+        exit_code = self._read_completed_exit_code(exit_path)
+        if exit_code is None:
             if not self._stdout_has_complete_response(stdout_path):
                 return None
             try:
                 exit_path.write_text("0")
             except OSError:
                 return None
+            exit_code = 0
             self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
         stdout = stdout_path.read_text() if stdout_path.exists() else ""
         stderr = stderr_path.read_text() if stderr_path.exists() else ""
         effective_run_id = str(run_id or active_session.get("run_id") or "").strip()
         usage, telemetry = self._record_run_metrics(worker["worker_id"], effective_run_id, stdout)
-        try:
-            exit_code = int(exit_path.read_text().strip() or "0")
-        except ValueError:
-            exit_code = 1
         if exit_code != 0:
             classification = classify_cli_failure(
                 stdout=stdout,
@@ -2432,9 +2454,11 @@ class BaseCliWorkerRuntime:
         host_exit = run_root / "exit_code"
         host_script = run_root / "run.sh"
         host_stdin = run_root / "instruction.stdin"
-        # Preserve host ownership across the bind mount so the service can read
-        # the completed transcript after the container process exits.
-        for transcript_path in (host_stdout, host_stderr):
+        # Preserve host ownership across the bind mount so the verifier can read
+        # worker output without widening access to workspace or profile data.
+        # The worker-specific ACL repairs below grant the container user write
+        # access while the empty exit marker remains incomplete until populated.
+        for transcript_path in (host_stdout, host_stderr, host_exit):
             transcript_path.touch(exist_ok=True)
             transcript_path.chmod(0o600)
 
@@ -2459,7 +2483,7 @@ class BaseCliWorkerRuntime:
                 f"mkdir -p {shlex.quote(container_run_root)}",
                 (
                     "write_exit() { "
-                    f"if [ ! -f {shlex.quote(container_exit)} ]; then "
+                    f"if [ ! -s {shlex.quote(container_exit)} ]; then "
                     f"printf '%s' \"$1\" > {shlex.quote(container_exit)}; "
                     "fi; "
                     "}"

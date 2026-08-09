@@ -4159,6 +4159,45 @@ def test_docker_cli_runtime_accepts_no_default_run_timeout(tmp_path):
         thread.join(timeout=1)
 
 
+def test_docker_cli_runtime_waits_for_precreated_exit_marker_to_be_written(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    exit_path = tmp_path / "exit_code"
+    exit_path.touch()
+    exit_path.chmod(0o600)
+    runtime.sandbox.inspect = lambda worker_id: None  # type: ignore[method-assign]
+
+    def finish_run():
+        time.sleep(0.05)
+        exit_path.write_text("7")
+
+    thread = threading.Thread(target=finish_run)
+    thread.start()
+    try:
+        assert runtime._wait_for_exit_code("wrk_test", exit_path, None) == 7
+    finally:
+        thread.join(timeout=1)
+
+
+def test_docker_cli_runtime_completion_discovery_ignores_empty_exit_marker(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker_id = "wrk_empty_exit"
+    run_id = "run_empty_exit"
+    run_root = runtime._run_root(worker_id, run_id)
+    run_root.mkdir(parents=True)
+    exit_path = run_root / "exit_code"
+    exit_path.touch()
+    exit_path.chmod(0o600)
+
+    assert runtime._latest_completed_run_payload(worker_id, run_id=run_id) is None
+    runtime._write_active_session(worker_id, runtime._run_payload(worker_id, run_id) or {})
+    assert runtime._latest_completed_run_payload(worker_id, run_id=run_id) is None
+
+    exit_path.write_text("0")
+    completed = runtime._latest_completed_run_payload(worker_id, run_id=run_id)
+    assert completed is not None
+    assert completed["run_id"] == run_id
+
+
 def test_docker_cli_runtime_throttles_wait_loop_inspect(tmp_path, monkeypatch):
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     exit_path = tmp_path / "exit_code"
@@ -4279,7 +4318,11 @@ def test_docker_cli_runtime_sources_runtime_and_openclaw_env_files(tmp_path):
     def fake_start_screen_session(worker_id, runtime_name, session_name, command, *, env=None, worker=None):
         run_root = runtime._run_root(worker_id, run_id)
         script = (run_root / "run.sh").read_text()
-        assert "if [ ! -f /workspace/.wpr-home/.glasshive-runs/run_capture/exit_code ]; then" in script
+        exit_path = run_root / "exit_code"
+        assert exit_path.exists()
+        assert exit_path.read_bytes() == b""
+        assert stat.S_IMODE(exit_path.stat().st_mode) == 0o600
+        assert "if [ ! -s /workspace/.wpr-home/.glasshive-runs/run_capture/exit_code ]; then" in script
         assert '$HOME/.glasshive/runtime.env' in script
         assert '$HOME/.wpr-openclaw/openclaw.env' in script
         assert "GLASSHIVE_ACTIVE_RUN_ID=run_capture" in script
