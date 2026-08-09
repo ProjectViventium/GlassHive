@@ -17,6 +17,7 @@ from urllib.error import URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+from .auth import multi_user_security_enabled
 from .bootstrap import apply_bootstrap
 from .openclaw_release import (
     OPENCLAW_RUNTIME_FAST_URI_VERSION,
@@ -501,6 +502,9 @@ class DockerSandboxManager:
             return default
         return raw in {"1", "true", "yes", "on"}
 
+    def _private_acl_required(self) -> bool:
+        return multi_user_security_enabled()
+
     def ensure_ready(
         self,
         worker: dict,
@@ -513,6 +517,7 @@ class DockerSandboxManager:
         paths = self._paths(worker["worker_id"])
         self._ensure_host_dirs(paths)
         self._seed_bootstrap(paths["home_dir"], paths["workspace_dir"], runtime_name, worker)
+        private_acl_required = self._private_acl_required()
         container_name = self._container_name(worker["worker_id"])
         sandbox = self.inspect(worker["worker_id"])
         needs_idle_prime = False
@@ -544,14 +549,17 @@ class DockerSandboxManager:
         if sandbox is None:
             fast_sandbox = self.fast_sandbox_from_worker(worker)
             if fast_sandbox is not None:
-                return fast_sandbox
-            self._ensure_image()
-            self._invalidate_inspect_cache(worker["worker_id"])
-            self._create_container(container_name, paths, worker=worker)
-            self._invalidate_inspect_cache(worker["worker_id"])
-            sandbox = self.inspect(worker["worker_id"])
-            needs_idle_prime = True
-            needs_path_repair = True
+                if not private_acl_required:
+                    return fast_sandbox
+                sandbox = fast_sandbox
+            else:
+                self._ensure_image()
+                self._invalidate_inspect_cache(worker["worker_id"])
+                self._create_container(container_name, paths, worker=worker)
+                self._invalidate_inspect_cache(worker["worker_id"])
+                sandbox = self.inspect(worker["worker_id"])
+                needs_idle_prime = True
+                needs_path_repair = True
         if sandbox is None:
             raise RuntimeError("Failed to create worker sandbox")
         if sandbox.state == "paused" and start_if_paused:
@@ -568,7 +576,11 @@ class DockerSandboxManager:
             needs_path_repair = True
         if sandbox is None:
             raise RuntimeError("Failed to start worker sandbox")
-        if needs_path_repair or (repair_paths and self._env_flag("WPR_REPAIR_RUNNING_CONTAINER_ROOTS", False)):
+        if (
+            private_acl_required
+            or needs_path_repair
+            or (repair_paths and self._env_flag("WPR_REPAIR_RUNNING_CONTAINER_ROOTS", False))
+        ):
             self._ensure_container_writable_paths(sandbox.container_name, self._default_writable_container_paths())
         if self._provider_account_mount(worker) is not None:
             self._grant_provider_account_access(sandbox.container_name, worker)
@@ -1597,6 +1609,9 @@ screen -ls | awk -v target="$target" '
         vnc_dir = paths["home_dir"] / ".vnc"
         vnc_dir.mkdir(parents=True, exist_ok=True)
         if os.name != "nt":
+            if self._private_acl_required():
+                for key in ("worker_root", "state_dir", "workspace_dir", "home_dir"):
+                    paths[key].chmod(0o700)
             vnc_dir.chmod(0o700)
 
     def _seed_bootstrap(self, home_dir: Path, workspace_dir: Path, runtime_name: str, worker: dict) -> None:
@@ -2123,16 +2138,37 @@ screen -ls | awk -v target="$target" '
         quoted_paths = " ".join(shlex.quote(path) for path in safe_paths)
         container_user = shlex.quote(self.user.split(":", 1)[0] or self.user)
         host_uid = shlex.quote(str(os.getuid()))
-        script = (
-            "set -e; "
-            f"mkdir -p {quoted_paths}; "
-            "if command -v setfacl >/dev/null 2>&1 "
-            f"&& setfacl -R -m u:{container_user}:rwX,u:{host_uid}:rwX {quoted_paths} 2>/dev/null; then "
-            f"find {quoted_paths} -type d -exec setfacl -m d:u:{container_user}:rwX,d:u:{host_uid}:rwX {{}} + 2>/dev/null || true; "
-            "else "
-            f"chmod -R a+rwX {quoted_paths} 2>/dev/null || true; "
-            "fi"
-        )
+        private_acl_required = self._private_acl_required()
+        if private_acl_required:
+            access_acl = (
+                f"u:{container_user}:rwX,u:root:rwX,u:{host_uid}:rwX,"
+                "g::---,o::---,m::rwX"
+            )
+            default_acl = (
+                f"d:u:{container_user}:rwX,d:u:root:rwX,d:u:{host_uid}:rwX,"
+                "d:g::---,d:o::---,d:m::rwX"
+            )
+            script = (
+                "set -e; "
+                f"mkdir -p {quoted_paths}; "
+                "command -v setfacl >/dev/null 2>&1; "
+                f"setfacl -R -m {access_acl} {quoted_paths}; "
+                f"find {quoted_paths} -type d -exec setfacl -m {default_acl} {{}} +"
+            )
+        else:
+            # Single-user local compatibility retains the historical fallback for
+            # bind mounts that do not support POSIX ACLs. Enterprise/multi-user
+            # deployments must never widen worker-private state to world access.
+            script = (
+                "set -e; "
+                f"mkdir -p {quoted_paths}; "
+                "if command -v setfacl >/dev/null 2>&1 "
+                f"&& setfacl -R -m u:{container_user}:rwX,u:{host_uid}:rwX {quoted_paths} 2>/dev/null; then "
+                f"find {quoted_paths} -type d -exec setfacl -m d:u:{container_user}:rwX,d:u:{host_uid}:rwX {{}} + 2>/dev/null || true; "
+                "else "
+                f"chmod -R a+rwX {quoted_paths} 2>/dev/null || true; "
+                "fi"
+            )
         result = self._docker_exec(
             container_name,
             ["bash", "-c", script],
@@ -2144,6 +2180,10 @@ screen -ls | awk -v target="$target" '
             user="root",
         )
         if result.returncode != 0:
+            if private_acl_required:
+                raise RuntimeError(
+                    "Enterprise GlassHive requires POSIX ACL support for private worker paths"
+                )
             detail = (result.stderr or result.stdout or "").strip()[-1200:]
             raise RuntimeError(f"Failed to prepare writable sandbox paths in {container_name}: {detail}")
 
