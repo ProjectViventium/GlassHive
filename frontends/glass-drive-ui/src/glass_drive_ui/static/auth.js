@@ -35,13 +35,15 @@ async function initialize() {
     return;
   }
   if (!config.oidc) throw new Error('Sign-in is provided by the configured external identity gateway.');
-  if (config.email_login) {
-    oidcButton.textContent = config.email_registration
-      ? 'Continue with email or organization · create an account if needed'
-      : 'Continue with email or organization';
+  if (config.provider_email_login || config.email_login) {
+    oidcButton.textContent = 'Continue with email or organization';
   }
   oidcButton.href = `/auth/oidc/start?return_to=${encodeURIComponent(returnTo)}`;
   oidcButton.hidden = false;
+
+  if (config.principal_enrollment === false) {
+    status.textContent = 'New access must be provisioned by an administrator.';
+  }
 
   const authError = String(pageParams.get('auth_error') || '');
   if (errorMessages[authError]) status.textContent = errorMessages[authError];

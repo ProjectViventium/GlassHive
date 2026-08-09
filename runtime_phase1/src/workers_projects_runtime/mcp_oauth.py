@@ -60,6 +60,17 @@ def _boolean_env(name: str, *, default: bool) -> bool:
     raise McpOAuthConfigurationError(f"{name} must be a boolean")
 
 
+def _canonical_boolean_env(
+    name: str,
+    legacy_name: str,
+    *,
+    default: bool,
+) -> bool:
+    if str(os.environ.get(name) or "").strip():
+        return _boolean_env(name, default=default)
+    return _boolean_env(legacy_name, default=default)
+
+
 def _auth_state_connection(auth_state_path: str) -> sqlite3.Connection:
     raw_path = str(auth_state_path or "").strip()
     if not raw_path:
@@ -550,9 +561,10 @@ def oauth_from_env() -> tuple[OidcJwtTokenVerifier, AuthSettings] | None:
         client_id_claims=client_id_claims,
         auth_state_path=str(os.environ.get("GLASSHIVE_AUTH_STATE_PATH") or "").strip(),
         require_auth_state=effective_multi_user,
-        allow_registration=_boolean_env(
+        allow_registration=_canonical_boolean_env(
+            "GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT",
             "GLASSHIVE_ALLOW_EMAIL_REGISTRATION",
-            default=True,
+            default=False,
         ),
     )
     settings = AuthSettings(
