@@ -8,6 +8,7 @@ import secrets
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -123,6 +124,23 @@ AI_WORKER_PYTHON_LOCK_PATH = (
 AI_WORKER_PYTHON_LOCK_SHA256 = hashlib.sha256(
     AI_WORKER_PYTHON_LOCK_PATH.read_bytes()
 ).hexdigest()
+
+
+def _stage_reviewed_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        delete=False,
+    ) as handle:
+        staged = Path(handle.name)
+    try:
+        # Reviewed inputs are read-only in sealed releases. A same-directory
+        # replacement keeps retries atomic even when a prior copy is 0444.
+        shutil.copy2(source, staged)
+        os.replace(staged, destination)
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def _enabled_ai_worker_browser_extension_names() -> tuple[str, ...]:
@@ -1643,7 +1661,7 @@ screen -ls | awk -v target="$target" '
                 )
             dockerfile = self.build_root / "Dockerfile"
             stage_reviewed_openclaw_lock(self.build_root / "openclaw-runtime-lock")
-            shutil.copy2(
+            _stage_reviewed_file(
                 AI_WORKER_PYTHON_LOCK_PATH,
                 self.build_root / "workstation-requirements.lock",
             )
