@@ -1,4 +1,9 @@
 const oidcButton = document.querySelector('#oidc-login');
+const localForm = document.querySelector('#local-login');
+const localEmail = document.querySelector('#local-email');
+const localPassword = document.querySelector('#local-password');
+const localSubmit = document.querySelector('#local-submit');
+const authDivider = document.querySelector('#auth-divider');
 const status = document.querySelector('#auth-status');
 const pageParams = new URLSearchParams(window.location.search);
 const requestedReturnTo = String(pageParams.get('return_to') || '/');
@@ -22,6 +27,43 @@ const errorMessages = {
   token_invalid: 'GlassHive could not verify the organization sign-in response. Retry, or ask an administrator to review the app registration.',
 };
 
+function cookieValue(name) {
+  const prefix = `${encodeURIComponent(name)}=`;
+  const match = document.cookie.split(';').map((item) => item.trim()).find((item) => item.startsWith(prefix));
+  return match ? decodeURIComponent(match.slice(prefix.length)) : '';
+}
+
+localForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  localSubmit.disabled = true;
+  status.textContent = 'Signing in…';
+  try {
+    const csrfToken = cookieValue('glasshive_login_csrf');
+    const response = await fetch('/auth/email/login', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-GlassHive-CSRF': csrfToken,
+      },
+      body: JSON.stringify({
+        email: localEmail.value,
+        password: localPassword.value,
+        return_to: returnTo,
+      }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || 'Email or password is incorrect');
+    localPassword.value = '';
+    window.location.replace(String(payload.redirect_url || '/'));
+  } catch (error) {
+    localPassword.value = '';
+    status.textContent = error.message || 'Email or password is incorrect';
+  } finally {
+    localSubmit.disabled = false;
+  }
+});
+
 async function initialize() {
   const [configResponse, sessionResponse] = await Promise.all([
     fetch('/auth/config'),
@@ -34,12 +76,20 @@ async function initialize() {
     window.location.replace(returnTo);
     return;
   }
-  if (!config.oidc) throw new Error('Sign-in is provided by the configured external identity gateway.');
-  if (config.provider_email_login || config.email_login) {
-    oidcButton.textContent = 'Continue with email or organization';
+  if (config.oidc) {
+    if (config.provider_email_login) {
+      oidcButton.textContent = 'Continue with email or organization';
+    }
+    oidcButton.href = `/auth/oidc/start?return_to=${encodeURIComponent(returnTo)}`;
+    oidcButton.hidden = false;
   }
-  oidcButton.href = `/auth/oidc/start?return_to=${encodeURIComponent(returnTo)}`;
-  oidcButton.hidden = false;
+  if (config.local_password_login) {
+    localForm.hidden = false;
+    authDivider.hidden = !config.oidc;
+  }
+  if (!config.oidc && !config.local_password_login) {
+    throw new Error('Sign-in is unavailable.');
+  }
 
   if (config.principal_enrollment === false) {
     status.textContent = 'New access must be provisioned by an administrator.';

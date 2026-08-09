@@ -9,23 +9,48 @@ import os
 import secrets
 import sqlite3
 import sys
+import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
 import httpx
 import jwt
+from cryptography.exceptions import InvalidKey
+from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 
 
 HUMAN_AUTH_MODES = {"disabled", "trusted_proxy", "oidc"}
 HUMAN_ROLES = {"member", "viewer", "tenant_admin", "service"}
+LOCAL_PASSWORD_MEMORY_KIB = 19 * 1024
+LOCAL_PASSWORD_ITERATIONS = 2
+LOCAL_PASSWORD_LANES = 1
+LOCAL_PASSWORD_LENGTH = 32
+LOCAL_PASSWORD_MIN_CHARACTERS = 24
+LOCAL_PASSWORD_MIN_UNIQUE_CHARACTERS = 12
+LOCAL_PASSWORD_MAX_CHARACTERS = 128
+LOCAL_ACCOUNT_MAX_FAILURES = 5
+LOCAL_SOURCE_MAX_FAILURES = 20
+LOCAL_FAILURE_WINDOW_SECONDS = 15 * 60
+LOCAL_LOCK_BASE_SECONDS = 30
+LOCAL_LOCK_MAX_SECONDS = 15 * 60
+LOCAL_SOURCE_LOCK_SECONDS = 5 * 60
+LOCAL_THROTTLE_RETENTION_SECONDS = 24 * 60 * 60
+LOCAL_THROTTLE_MAX_SOURCES = 10_000
+LOCAL_KDF_MAX_CONCURRENCY = 4
+_PASSWORD_KDF_SLOTS = threading.BoundedSemaphore(LOCAL_KDF_MAX_CONCURRENCY)
 
 
 class AuthGatewayError(RuntimeError):
     def __init__(self, message: str, *, code: str = "sign_in_failed") -> None:
         super().__init__(message)
         self.code = code
+
+
+class _PasswordKdfBusy(RuntimeError):
+    pass
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -39,6 +64,18 @@ def _canonical_env_bool(name: str, legacy_name: str, default: bool = False) -> b
     if str(os.environ.get(name) or "").strip():
         return _env_bool(name, default)
     return _env_bool(legacy_name, default)
+
+
+def _configured_domains(name: str) -> tuple[str, ...]:
+    domains: list[str] = []
+    for item in str(os.environ.get(name) or "").replace(",", " ").split():
+        try:
+            normalized = item.strip().rstrip(".").encode("idna").decode("ascii").casefold()
+        except UnicodeError as exc:
+            raise RuntimeError(f"{name} contains an invalid domain") from exc
+        if normalized and normalized not in domains:
+            domains.append(normalized)
+    return tuple(domains)
 
 
 def _default_state_path() -> Path:
@@ -60,8 +97,49 @@ def _principal_id(issuer: str, subject: str) -> str:
     return f"usr_{digest[:32]}"
 
 
+def _normalize_subject(value: object) -> str:
+    if not isinstance(value, str):
+        raise AuthGatewayError("Enter the provider's exact stable subject")
+    normalized = value.strip()
+    try:
+        normalized.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise AuthGatewayError("Enter the provider's exact stable subject") from exc
+    if (
+        not normalized
+        or len(normalized) > 512
+        or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
+    ):
+        raise AuthGatewayError("Enter the provider's exact stable subject")
+    return normalized
+
+
+def _normalize_display_name(value: object) -> str:
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        raise AuthGatewayError("Enter a valid display name")
+    normalized = unicodedata.normalize("NFC", value).strip()
+    try:
+        normalized.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise AuthGatewayError("Enter a valid display name") from exc
+    if (
+        len(normalized) > 200
+        or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
+    ):
+        raise AuthGatewayError("Enter a valid display name")
+    return normalized
+
+
 def _normalize_email(value: object) -> str:
-    text = str(value or "").strip()
+    if not isinstance(value, str):
+        raise AuthGatewayError("Enter a valid email address")
+    text = value.strip()
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise AuthGatewayError("Enter a valid email address") from exc
     if len(text) > 320 or text.count("@") != 1 or any(character.isspace() for character in text):
         raise AuthGatewayError("Enter a valid email address")
     local, domain = text.rsplit("@", 1)
@@ -74,6 +152,70 @@ def _normalize_email(value: object) -> str:
     if not ascii_domain or "." not in ascii_domain:
         raise AuthGatewayError("Enter a valid email address")
     return f"{local.casefold()}@{ascii_domain}"
+
+
+def _normalized_password(value: object, *, provisioning: bool) -> str:
+    if not isinstance(value, str):
+        raise AuthGatewayError("Enter a valid password")
+    normalized = unicodedata.normalize("NFC", value)
+    try:
+        normalized_bytes = normalized.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise AuthGatewayError("Enter a valid password") from exc
+    if (
+        not normalized
+        or len(normalized) > LOCAL_PASSWORD_MAX_CHARACTERS
+        or len(normalized_bytes) > 1024
+        or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
+    ):
+        raise AuthGatewayError("Enter a valid password")
+    if provisioning and (
+        len(normalized) < LOCAL_PASSWORD_MIN_CHARACTERS
+        or len(set(normalized.casefold())) < LOCAL_PASSWORD_MIN_UNIQUE_CHARACTERS
+    ):
+        raise AuthGatewayError(
+            f"Password must be at least {LOCAL_PASSWORD_MIN_CHARACTERS} characters with at least "
+            f"{LOCAL_PASSWORD_MIN_UNIQUE_CHARACTERS} distinct characters"
+        )
+    return normalized
+
+
+def _password_phc(password: str) -> str:
+    if not _PASSWORD_KDF_SLOTS.acquire(timeout=5.0):
+        raise AuthGatewayError("Password service is busy; retry shortly")
+    try:
+        return Argon2id(
+            salt=os.urandom(16),
+            length=LOCAL_PASSWORD_LENGTH,
+            iterations=LOCAL_PASSWORD_ITERATIONS,
+            lanes=LOCAL_PASSWORD_LANES,
+            memory_cost=LOCAL_PASSWORD_MEMORY_KIB,
+        ).derive_phc_encoded(password.encode("utf-8"))
+    finally:
+        _PASSWORD_KDF_SLOTS.release()
+
+
+def _password_matches(password: str, password_phc: str) -> bool:
+    if not _PASSWORD_KDF_SLOTS.acquire(blocking=False):
+        raise _PasswordKdfBusy("password verifier capacity is busy")
+    try:
+        Argon2id.verify_phc_encoded(password.encode("utf-8"), password_phc)
+    except (InvalidKey, ValueError):
+        return False
+    finally:
+        _PASSWORD_KDF_SLOTS.release()
+    return True
+
+
+def _password_phc_needs_rehash(password_phc: str) -> bool:
+    return not (
+        password_phc.startswith("$argon2id$v=19$")
+        and f"m={LOCAL_PASSWORD_MEMORY_KIB},t={LOCAL_PASSWORD_ITERATIONS},p={LOCAL_PASSWORD_LANES}$"
+        in password_phc
+    )
+
+
+_DUMMY_PASSWORD_PHC = _password_phc("synthetic unavailable credential")
 
 
 def _secure_oidc_url(value: str, *, allow_loopback_http: bool) -> bool:
@@ -135,6 +277,18 @@ class HumanAuthGateway:
             "GLASSHIVE_PROVIDER_EMAIL_LOGIN",
             "GLASSHIVE_ALLOW_EMAIL_LOGIN",
         )
+        self.local_password_login = _env_bool("GLASSHIVE_LOCAL_PASSWORD_LOGIN")
+        self.local_allowed_email_domains = _configured_domains(
+            "GLASSHIVE_LOCAL_AUTH_ALLOWED_EMAIL_DOMAINS"
+        )
+        throttle_key = str(
+            os.environ.get("GLASSHIVE_LOCAL_AUTH_THROTTLE_KEY") or ""
+        ).encode("utf-8")
+        if self.local_password_login and len(throttle_key) < 32:
+            raise RuntimeError(
+                "Local password login requires GLASSHIVE_LOCAL_AUTH_THROTTLE_KEY with at least 32 bytes"
+            )
+        self.local_auth_throttle_key = throttle_key
         self.oidc_post_logout_redirect_uri = str(
             os.environ.get("GLASSHIVE_OIDC_POST_LOGOUT_REDIRECT_URI") or ""
         ).strip()
@@ -151,14 +305,7 @@ class HumanAuthGateway:
             )
         if mode not in HUMAN_AUTH_MODES:
             raise RuntimeError("GLASSHIVE_HUMAN_AUTH_MODE must be disabled, trusted_proxy, or oidc")
-        domains: list[str] = []
-        for item in str(os.environ.get("GLASSHIVE_ALLOWED_EMAIL_DOMAINS") or "").replace(",", " ").split():
-            try:
-                normalized = item.strip().rstrip(".").encode("idna").decode("ascii").casefold()
-            except UnicodeError as exc:
-                raise RuntimeError("GLASSHIVE_ALLOWED_EMAIL_DOMAINS contains an invalid domain") from exc
-            if normalized and normalized not in domains:
-                domains.append(normalized)
+        domains = list(_configured_domains("GLASSHIVE_ALLOWED_EMAIL_DOMAINS"))
         oidc_issuer = str(os.environ.get("GLASSHIVE_OIDC_ISSUER") or "").strip().rstrip("/")
         oidc_client_id = str(os.environ.get("GLASSHIVE_OIDC_CLIENT_ID") or "").strip()
         oidc_redirect_uri = str(os.environ.get("GLASSHIVE_OIDC_REDIRECT_URI") or "").strip()
@@ -261,8 +408,48 @@ class HumanAuthGateway:
                     return_to TEXT NOT NULL,
                     expires_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS auth_local_credentials (
+                    principal_id TEXT PRIMARY KEY REFERENCES auth_principals(user_id) ON DELETE CASCADE,
+                    login_email TEXT NOT NULL UNIQUE,
+                    password_phc TEXT NOT NULL,
+                    password_version INTEGER NOT NULL DEFAULT 1,
+                    failed_attempts INTEGER NOT NULL DEFAULT 0,
+                    locked_until REAL,
+                    last_failed_at REAL,
+                    disabled_at REAL,
+                    password_changed_at REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS auth_local_source_attempts (
+                    source_hash TEXT PRIMARY KEY,
+                    failed_attempts INTEGER NOT NULL,
+                    window_started REAL NOT NULL,
+                    locked_until REAL,
+                    last_failed_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS auth_local_sessions (
+                    session_hash TEXT PRIMARY KEY,
+                    principal_id TEXT NOT NULL REFERENCES auth_principals(user_id) ON DELETE CASCADE,
+                    csrf_hash TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    revoked_at REAL,
+                    created_at REAL NOT NULL,
+                    last_seen_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_auth_local_sessions_principal
+                    ON auth_local_sessions(principal_id, expires_at);
                 """
             )
+            if not self.local_password_login:
+                now = time.time()
+                conn.execute(
+                    """
+                    UPDATE auth_local_sessions SET revoked_at = ?
+                    WHERE revoked_at IS NULL
+                    """,
+                    (now,),
+                )
         if os.name != "nt" and self.state_path.exists():
             self.state_path.chmod(0o600)
         if os.name != "nt":
@@ -300,10 +487,11 @@ class HumanAuthGateway:
         role: str,
     ) -> dict[str, str]:
         issuer = str(issuer or "").strip().rstrip("/")
-        subject = str(subject or "").strip()
-        if not issuer or not subject:
+        subject = _normalize_subject(subject)
+        if not issuer:
             raise AuthGatewayError("OIDC identity is missing issuer or subject")
         normalized_email = _normalize_email(email) if email else ""
+        normalized_display_name = _normalize_display_name(display_name)
         normalized_role = role if role in HUMAN_ROLES else "member"
         user_id = _principal_id(issuer, subject)
         now = time.time()
@@ -319,7 +507,7 @@ class HumanAuthGateway:
                     role = excluded.role,
                     updated_at = excluded.updated_at
                 """,
-                (user_id, issuer, subject, normalized_email, str(display_name or "").strip()[:200], normalized_role, now, now),
+                (user_id, issuer, subject, normalized_email, normalized_display_name, normalized_role, now, now),
             )
             row = conn.execute(
                 "SELECT * FROM auth_principals WHERE issuer = ? AND subject = ?",
@@ -341,13 +529,7 @@ class HumanAuthGateway:
         The immutable provider subject is the only ownership key. Email remains
         display metadata and is deliberately never used to find or merge users.
         """
-        normalized_subject = str(subject or "").strip()
-        if (
-            not normalized_subject
-            or len(normalized_subject) > 512
-            or any(ord(character) < 32 or ord(character) == 127 for character in normalized_subject)
-        ):
-            raise AuthGatewayError("Enter the provider's exact stable subject")
+        normalized_subject = _normalize_subject(subject)
         normalized_role = str(role or "").strip()
         if normalized_role not in HUMAN_ROLES:
             raise AuthGatewayError("Choose an approved GlassHive role")
@@ -386,8 +568,11 @@ class HumanAuthGateway:
 
     def find_oidc_principal(self, *, issuer: str, subject: str) -> dict[str, str] | None:
         normalized_issuer = str(issuer or "").strip().rstrip("/")
-        normalized_subject = str(subject or "").strip()
-        if not normalized_issuer or not normalized_subject:
+        try:
+            normalized_subject = _normalize_subject(subject)
+        except AuthGatewayError:
+            return None
+        if not normalized_issuer:
             return None
         with self._connect() as conn:
             row = conn.execute(
@@ -419,27 +604,60 @@ class HumanAuthGateway:
             role=role,
         )
 
-    def create_session(self, principal_id: str) -> dict[str, Any]:
+    def _create_session_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        principal_id: str,
+        auth_method: str,
+    ) -> dict[str, Any]:
+        if auth_method not in {"oidc", "local_password"}:
+            raise AuthGatewayError("Unsupported authentication method")
         token = secrets.token_urlsafe(48)
         csrf_token = secrets.token_urlsafe(32)
         now = time.time()
         expires_at = now + self.session_ttl_seconds
+        row = conn.execute(
+            "SELECT user_id FROM auth_principals WHERE user_id = ? AND disabled_at IS NULL",
+            (principal_id,),
+        ).fetchone()
+        if row is None:
+            raise AuthGatewayError("Account is unavailable")
+        session_table = "auth_local_sessions" if auth_method == "local_password" else "auth_sessions"
+        conn.execute(
+            f"""
+            INSERT INTO {session_table}
+                (session_hash, principal_id, csrf_hash, expires_at, created_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _hash_secret(token),
+                principal_id,
+                _hash_secret(csrf_token),
+                expires_at,
+                now,
+                now,
+            ),
+        )
+        return {
+            "token": token,
+            "csrf_token": csrf_token,
+            "expires_at": expires_at,
+            "auth_method": auth_method,
+        }
+
+    def create_session(
+        self,
+        principal_id: str,
+        *,
+        auth_method: str = "oidc",
+    ) -> dict[str, Any]:
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT user_id FROM auth_principals WHERE user_id = ? AND disabled_at IS NULL",
-                (principal_id,),
-            ).fetchone()
-            if row is None:
-                raise AuthGatewayError("Account is unavailable")
-            conn.execute(
-                """
-                INSERT INTO auth_sessions
-                    (session_hash, principal_id, csrf_hash, expires_at, created_at, last_seen_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (_hash_secret(token), principal_id, _hash_secret(csrf_token), expires_at, now, now),
+            return self._create_session_in_connection(
+                conn,
+                principal_id=principal_id,
+                auth_method=auth_method,
             )
-        return {"token": token, "csrf_token": csrf_token, "expires_at": expires_at}
 
     def resolve_session(self, token: str) -> dict[str, Any] | None:
         if not token:
@@ -448,7 +666,7 @@ class HumanAuthGateway:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT p.*, s.csrf_hash, s.expires_at
+                SELECT p.*, s.csrf_hash, s.expires_at, 'oidc' AS auth_method
                 FROM auth_sessions s
                 JOIN auth_principals p ON p.user_id = s.principal_id
                 WHERE s.session_hash = ?
@@ -458,15 +676,32 @@ class HumanAuthGateway:
                 """,
                 (_hash_secret(token), now),
             ).fetchone()
+            session_table = "auth_sessions"
+            if row is None and self.local_password_login:
+                row = conn.execute(
+                    """
+                    SELECT p.*, s.csrf_hash, s.expires_at, 'local_password' AS auth_method
+                    FROM auth_local_sessions s
+                    JOIN auth_principals p ON p.user_id = s.principal_id
+                    WHERE s.session_hash = ?
+                      AND s.revoked_at IS NULL
+                      AND s.expires_at > ?
+                      AND p.disabled_at IS NULL
+                      AND p.issuer = ?
+                    """,
+                    (_hash_secret(token), now, self.oidc_issuer),
+                ).fetchone()
+                session_table = "auth_local_sessions"
             if row is None:
                 return None
             conn.execute(
-                "UPDATE auth_sessions SET last_seen_at = ? WHERE session_hash = ?",
+                f"UPDATE {session_table} SET last_seen_at = ? WHERE session_hash = ?",
                 (now, _hash_secret(token)),
             )
         payload: dict[str, Any] = self._principal_payload(row)
         payload["expires_at"] = float(row["expires_at"])
         payload["_csrf_hash"] = str(row["csrf_hash"])
+        payload["auth_method"] = str(row["auth_method"] or "oidc")
         payload["auth_source"] = "session"
         return payload
 
@@ -482,6 +717,387 @@ class HumanAuthGateway:
                 "UPDATE auth_sessions SET revoked_at = ? WHERE session_hash = ? AND revoked_at IS NULL",
                 (time.time(), _hash_secret(token)),
             )
+            conn.execute(
+                "UPDATE auth_local_sessions SET revoked_at = ? WHERE session_hash = ? AND revoked_at IS NULL",
+                (time.time(), _hash_secret(token)),
+            )
+
+    def revoke_local_sessions(self, *, principal_id: str = "") -> int:
+        now = time.time()
+        query = "UPDATE auth_local_sessions SET revoked_at = ? WHERE revoked_at IS NULL"
+        parameters: tuple[object, ...] = (now,)
+        if principal_id:
+            query += " AND principal_id = ?"
+            parameters = (now, str(principal_id).strip())
+        with self._connect() as conn:
+            cursor = conn.execute(query, parameters)
+        return max(0, int(cursor.rowcount))
+
+    def _local_principal_row(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        subject: str,
+    ) -> sqlite3.Row:
+        normalized_subject = _normalize_subject(subject)
+        row = conn.execute(
+            """
+            SELECT * FROM auth_principals
+            WHERE issuer = ? AND subject = ? AND disabled_at IS NULL
+            """,
+            (self.oidc_issuer, normalized_subject),
+        ).fetchone()
+        if row is None:
+            raise AuthGatewayError(
+                "The exact provider subject must be preapproved before adding a local password"
+            )
+        return row
+
+    def provision_local_password(
+        self,
+        *,
+        subject: str,
+        login_email: str,
+        password: str,
+    ) -> dict[str, str]:
+        if self.mode != "oidc" or not self.oidc_issuer:
+            raise AuthGatewayError(
+                "Local password login requires the configured OIDC identity namespace"
+            )
+        normalized_subject = _normalize_subject(subject)
+        normalized_email = _normalize_email(login_email)
+        if self.local_allowed_email_domains:
+            domain = normalized_email.rsplit("@", 1)[1]
+            if not any(
+                domain == allowed or domain.endswith(f".{allowed}")
+                for allowed in self.local_allowed_email_domains
+            ):
+                raise AuthGatewayError("Local login email domain is not approved")
+        normalized_password = _normalized_password(password, provisioning=True)
+        password_phc = _password_phc(normalized_password)
+        now = time.time()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                principal = self._local_principal_row(conn, subject=normalized_subject)
+                conn.execute(
+                    """
+                    INSERT INTO auth_local_credentials (
+                        principal_id, login_email, password_phc, password_version,
+                        failed_attempts, locked_until, last_failed_at, disabled_at,
+                        password_changed_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, 1, 0, NULL, NULL, NULL, ?, ?, ?)
+                    ON CONFLICT(principal_id) DO UPDATE SET
+                        login_email = excluded.login_email,
+                        password_phc = excluded.password_phc,
+                        password_version = auth_local_credentials.password_version + 1,
+                        failed_attempts = 0,
+                        locked_until = NULL,
+                        last_failed_at = NULL,
+                        password_changed_at = excluded.password_changed_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(principal["user_id"]),
+                        normalized_email,
+                        password_phc,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE auth_local_sessions SET revoked_at = ?
+                    WHERE principal_id = ? AND revoked_at IS NULL
+                    """,
+                    (now, str(principal["user_id"])),
+                )
+                payload = self._principal_payload(principal)
+        except sqlite3.IntegrityError as exc:
+            raise AuthGatewayError("That local login email is already assigned") from exc
+        return payload
+
+    @staticmethod
+    def _local_failure() -> AuthGatewayError:
+        return AuthGatewayError(
+            "Email or password is incorrect",
+            code="sign_in_failed",
+        )
+
+    def _source_key(self, source: object) -> str:
+        normalized_source = str(source or "unknown").strip()[:256] or "unknown"
+        return hmac.new(
+            self.local_auth_throttle_key,
+            normalized_source.encode("utf-8", errors="replace"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    @staticmethod
+    def _throttle_locked(row: sqlite3.Row | None, now: float) -> bool:
+        return bool(
+            row is not None
+            and row["locked_until"] is not None
+            and float(row["locked_until"]) > now
+        )
+
+    def _record_source_failure(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        source_hash: str,
+        now: float,
+    ) -> None:
+        row = conn.execute(
+            "SELECT * FROM auth_local_source_attempts WHERE source_hash = ?",
+            (source_hash,),
+        ).fetchone()
+        if row is None or now - float(row["window_started"]) > LOCAL_FAILURE_WINDOW_SECONDS:
+            failures = 1
+            window_started = now
+        else:
+            failures = int(row["failed_attempts"]) + 1
+            window_started = float(row["window_started"])
+        locked_until = (
+            now + LOCAL_SOURCE_LOCK_SECONDS
+            if failures >= LOCAL_SOURCE_MAX_FAILURES
+            else None
+        )
+        conn.execute(
+            """
+            INSERT INTO auth_local_source_attempts
+                (source_hash, failed_attempts, window_started, locked_until, last_failed_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(source_hash) DO UPDATE SET
+                failed_attempts = excluded.failed_attempts,
+                window_started = excluded.window_started,
+                locked_until = excluded.locked_until,
+                last_failed_at = excluded.last_failed_at
+            """,
+            (source_hash, failures, window_started, locked_until, now),
+        )
+        conn.execute(
+            "DELETE FROM auth_local_source_attempts WHERE last_failed_at < ?",
+            (now - LOCAL_THROTTLE_RETENTION_SECONDS,),
+        )
+        count = int(
+            conn.execute("SELECT count(*) FROM auth_local_source_attempts").fetchone()[0]
+        )
+        excess = max(0, count - LOCAL_THROTTLE_MAX_SOURCES)
+        if excess:
+            conn.execute(
+                """
+                DELETE FROM auth_local_source_attempts WHERE source_hash IN (
+                    SELECT source_hash FROM auth_local_source_attempts
+                    ORDER BY last_failed_at, source_hash LIMIT ?
+                )
+                """,
+                (excess,),
+            )
+
+    def _record_account_failure(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        principal_id: str,
+        now: float,
+    ) -> None:
+        row = conn.execute(
+            "SELECT failed_attempts, last_failed_at FROM auth_local_credentials WHERE principal_id = ?",
+            (principal_id,),
+        ).fetchone()
+        if row is None:
+            return
+        last_failed_at = float(row["last_failed_at"] or 0)
+        failures = (
+            1
+            if not last_failed_at or now - last_failed_at > LOCAL_FAILURE_WINDOW_SECONDS
+            else int(row["failed_attempts"]) + 1
+        )
+        locked_until: float | None = None
+        if failures >= LOCAL_ACCOUNT_MAX_FAILURES:
+            multiplier = 2 ** min(8, failures - LOCAL_ACCOUNT_MAX_FAILURES)
+            locked_until = now + min(
+                LOCAL_LOCK_MAX_SECONDS,
+                LOCAL_LOCK_BASE_SECONDS * multiplier,
+            )
+        conn.execute(
+            """
+            UPDATE auth_local_credentials
+            SET failed_attempts = ?, locked_until = ?, last_failed_at = ?, updated_at = ?
+            WHERE principal_id = ?
+            """,
+            (failures, locked_until, now, now, principal_id),
+        )
+
+    def authenticate_local_password(
+        self,
+        *,
+        login_email: str,
+        password: str,
+        source: str,
+    ) -> dict[str, Any]:
+        if not self.local_password_login:
+            raise AuthGatewayError("Local password login is disabled")
+        try:
+            normalized_email = _normalize_email(login_email)
+        except AuthGatewayError:
+            normalized_email = "invalid@example.invalid"
+        local_domain_allowed = not self.local_allowed_email_domains or any(
+            normalized_email.rsplit("@", 1)[1] == allowed
+            or normalized_email.rsplit("@", 1)[1].endswith(f".{allowed}")
+            for allowed in self.local_allowed_email_domains
+        )
+        try:
+            normalized_password = _normalized_password(password, provisioning=False)
+            valid_password_shape = True
+        except AuthGatewayError:
+            normalized_password = "synthetic unavailable credential"
+            valid_password_shape = False
+        source_hash = self._source_key(source)
+        now = time.time()
+        with self._connect() as conn:
+            credential = conn.execute(
+                """
+                SELECT c.*, p.disabled_at AS principal_disabled_at
+                FROM auth_local_credentials c
+                JOIN auth_principals p ON p.user_id = c.principal_id
+                WHERE c.login_email = ? AND p.issuer = ?
+                """,
+                (normalized_email, self.oidc_issuer),
+            ).fetchone()
+            source_attempt = conn.execute(
+                "SELECT * FROM auth_local_source_attempts WHERE source_hash = ?",
+                (source_hash,),
+            ).fetchone()
+        if self._throttle_locked(source_attempt, now):
+            raise self._local_failure()
+        verified_phc = str(credential["password_phc"]) if credential is not None else _DUMMY_PASSWORD_PHC
+        try:
+            password_verified = _password_matches(normalized_password, verified_phc)
+        except _PasswordKdfBusy as exc:
+            raise AuthGatewayError(
+                "Sign-in is temporarily busy; retry shortly",
+                code="sign_in_busy",
+            ) from exc
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """
+                SELECT c.*, p.disabled_at AS principal_disabled_at
+                FROM auth_local_credentials c
+                JOIN auth_principals p ON p.user_id = c.principal_id
+                WHERE c.login_email = ? AND p.issuer = ?
+                """,
+                (normalized_email, self.oidc_issuer),
+            ).fetchone()
+            source_attempt = conn.execute(
+                "SELECT * FROM auth_local_source_attempts WHERE source_hash = ?",
+                (source_hash,),
+            ).fetchone()
+            allowed = bool(
+                local_domain_allowed
+                and valid_password_shape
+                and password_verified
+                and current is not None
+                and hmac.compare_digest(str(current["password_phc"]), verified_phc)
+                and current["disabled_at"] is None
+                and current["principal_disabled_at"] is None
+                and not self._throttle_locked(current, now)
+                and not self._throttle_locked(source_attempt, now)
+            )
+            if not allowed:
+                current_matches_verified = bool(
+                    current is not None
+                    and credential is not None
+                    and hmac.compare_digest(str(current["password_phc"]), verified_phc)
+                    and int(current["password_version"]) == int(credential["password_version"])
+                )
+                if current_matches_verified:
+                    self._record_account_failure(
+                        conn,
+                        principal_id=str(current["principal_id"]),
+                        now=now,
+                    )
+                self._record_source_failure(conn, source_hash=source_hash, now=now)
+                conn.commit()
+                raise self._local_failure()
+            principal_id = str(current["principal_id"])
+            if _password_phc_needs_rehash(verified_phc):
+                conn.execute(
+                    """
+                    UPDATE auth_local_credentials
+                    SET password_phc = ?, password_version = password_version + 1,
+                        password_changed_at = ?, updated_at = ?
+                    WHERE principal_id = ? AND password_phc = ?
+                    """,
+                    (
+                        _password_phc(normalized_password),
+                        now,
+                        now,
+                        principal_id,
+                        verified_phc,
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE auth_local_credentials
+                SET failed_attempts = 0, locked_until = NULL, last_failed_at = NULL, updated_at = ?
+                WHERE principal_id = ?
+                """,
+                (now, principal_id),
+            )
+            return self._create_session_in_connection(
+                conn,
+                principal_id=principal_id,
+                auth_method="local_password",
+            )
+
+    def unlock_local_password(self, *, subject: str) -> dict[str, str]:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            principal = self._local_principal_row(conn, subject=subject)
+            cursor = conn.execute(
+                """
+                UPDATE auth_local_credentials
+                SET failed_attempts = 0, locked_until = NULL, last_failed_at = NULL, updated_at = ?
+                WHERE principal_id = ?
+                """,
+                (time.time(), str(principal["user_id"])),
+            )
+            if cursor.rowcount != 1:
+                raise AuthGatewayError("Local password credential was not found")
+            return self._principal_payload(principal)
+
+    def set_local_password_disabled(
+        self,
+        *,
+        subject: str,
+        disabled: bool,
+    ) -> dict[str, str]:
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            principal = self._local_principal_row(conn, subject=subject)
+            cursor = conn.execute(
+                """
+                UPDATE auth_local_credentials
+                SET disabled_at = ?, updated_at = ? WHERE principal_id = ?
+                """,
+                (now if disabled else None, now, str(principal["user_id"])),
+            )
+            if cursor.rowcount != 1:
+                raise AuthGatewayError("Local password credential was not found")
+            if disabled:
+                conn.execute(
+                    """
+                    UPDATE auth_local_sessions SET revoked_at = ?
+                    WHERE principal_id = ? AND revoked_at IS NULL
+                    """,
+                    (now, str(principal["user_id"])),
+                )
+            return self._principal_payload(principal)
 
     def list_principals(self, *, limit: int = 100) -> list[dict[str, Any]]:
         bounded_limit = max(1, min(int(limit), 500))
@@ -526,6 +1142,10 @@ class HumanAuthGateway:
             if disabled:
                 conn.execute(
                     "UPDATE auth_sessions SET revoked_at = ? WHERE principal_id = ? AND revoked_at IS NULL",
+                    (now, user_id),
+                )
+                conn.execute(
+                    "UPDATE auth_local_sessions SET revoked_at = ? WHERE principal_id = ? AND revoked_at IS NULL",
                     (now, user_id),
                 )
             row = conn.execute(

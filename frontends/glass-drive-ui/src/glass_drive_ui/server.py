@@ -7,6 +7,7 @@ import base64
 import hmac
 import json
 import logging
+import secrets
 import shlex
 import sqlite3
 import sys
@@ -23,6 +24,7 @@ from starlette.websockets import WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from .prompt_template import (
     build_operator_brief,
@@ -54,6 +56,8 @@ PROFILE_ACCOUNT_PROVIDERS = {
 AUTH_SESSION_COOKIE = "glasshive_session"
 AUTH_CSRF_COOKIE = "glasshive_csrf"
 AUTH_OIDC_STATE_COOKIE = "glasshive_oidc_state"
+AUTH_LOGIN_CSRF_COOKIE = "glasshive_login_csrf"
+LOCAL_LOGIN_MAX_BODY_BYTES = 4096
 OIDC_START_WINDOW_SECONDS = 5 * 60
 OIDC_START_MAX_ATTEMPTS = 30
 OIDC_START_MAX_SOURCES = 4096
@@ -74,6 +78,9 @@ RUNTIME_ENV_KEYS = {
     "GLASSHIVE_ALLOW_EMAIL_REGISTRATION",
     "GLASSHIVE_PROVIDER_EMAIL_LOGIN",
     "GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT",
+    "GLASSHIVE_LOCAL_PASSWORD_LOGIN",
+    "GLASSHIVE_LOCAL_AUTH_ALLOWED_EMAIL_DOMAINS",
+    "GLASSHIVE_LOCAL_AUTH_THROTTLE_KEY",
     "GLASSHIVE_ALLOWED_EMAIL_DOMAINS",
     "GLASSHIVE_ALLOWED_ORIGINS",
     "GLASSHIVE_AUTH_STATE_PATH",
@@ -1357,6 +1364,15 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             return await call_next(request)
         if request.url.path == "/auth/oidc/callback":
             return await call_next(request)
+        if request.url.path in {
+            "/auth/email/login",
+            "/auth/email/register",
+            "/auth/email/reset",
+        }:
+            # This unauthenticated endpoint owns a separate strict-Origin and
+            # double-submit login-CSRF contract below. Registration and reset
+            # remain deliberately unimplemented and therefore reach a real 404.
+            return await call_next(request)
         if not _request_origin_allowed(request):
             return JSONResponse(status_code=403, content={"detail": "Request origin is not allowed"})
         # A worker-view link is already an expiring, worker-bound authorization
@@ -1377,13 +1393,18 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     @app.get("/auth/config")
     def auth_config() -> dict[str, object]:
         provider_email_login = human_auth.mode == "oidc" and human_auth.provider_email_login
+        local_password_login = human_auth.mode == "oidc" and bool(
+            getattr(human_auth, "local_password_login", False)
+        )
         return {
             "mode": human_auth.mode,
             # Keep the two legacy keys for older login assets, but do not claim
             # GlassHive itself creates identity-provider accounts.
-            "email_login": provider_email_login,
+            "email_login": provider_email_login or local_password_login,
             "email_registration": False,
             "provider_email_login": provider_email_login,
+            "local_password_login": local_password_login,
+            "local_password_signup": False,
             "principal_enrollment": human_auth.mode == "oidc" and human_auth.allow_registration,
             "identity_owner": "external_provider",
             "oidc": human_auth.mode == "oidc",
@@ -1473,11 +1494,117 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         _set_auth_cookies(response, request, session)
         return response
 
+    @app.get("/auth/email/login")
+    def auth_email_login_get() -> None:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    @app.post("/auth/email/login")
+    async def auth_email_login(request: Request) -> JSONResponse:
+        if human_auth.mode != "oidc" or not bool(
+            getattr(human_auth, "local_password_login", False)
+        ):
+            raise HTTPException(status_code=404, detail="Not found")
+        origin = str(request.headers.get("origin") or "").strip()
+        if not origin or not _request_origin_allowed(request):
+            return JSONResponse(status_code=403, content={"detail": "Request origin is not allowed"})
+        supplied_csrf = str(request.headers.get("x-glasshive-csrf") or "").strip()
+        cookie_csrf = str(request.cookies.get(AUTH_LOGIN_CSRF_COOKIE) or "").strip()
+        if not supplied_csrf or not cookie_csrf or not hmac.compare_digest(supplied_csrf, cookie_csrf):
+            return JSONResponse(status_code=403, content={"detail": "Invalid login request"})
+        content_type = str(request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            return JSONResponse(status_code=415, content={"detail": "JSON is required"})
+        try:
+            content_length = int(str(request.headers.get("content-length") or "0"))
+        except ValueError:
+            content_length = LOCAL_LOGIN_MAX_BODY_BYTES + 1
+        if content_length > LOCAL_LOGIN_MAX_BODY_BYTES:
+            return JSONResponse(status_code=413, content={"detail": "Sign-in request is too large"})
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > LOCAL_LOGIN_MAX_BODY_BYTES:
+                return JSONResponse(status_code=413, content={"detail": "Sign-in request is too large"})
+        try:
+            payload = json.loads(bytes(body))
+        except (TypeError, ValueError, UnicodeDecodeError):
+            payload = None
+        if not isinstance(payload, dict):
+            return JSONResponse(status_code=400, content={"detail": "Invalid sign-in request"})
+        email = payload.get("email")
+        password = payload.get("password")
+        return_to_value = payload.get("return_to", "/")
+        try:
+            email_bytes = email.encode("utf-8") if isinstance(email, str) else b""
+            password_bytes = password.encode("utf-8") if isinstance(password, str) else b""
+            return_to_bytes = (
+                return_to_value.encode("utf-8")
+                if isinstance(return_to_value, str)
+                else b""
+            )
+        except UnicodeEncodeError:
+            return JSONResponse(status_code=400, content={"detail": "Invalid sign-in request"})
+        if (
+            not isinstance(email, str)
+            or not isinstance(password, str)
+            or not isinstance(return_to_value, str)
+            or len(email) > 320
+            or len(email_bytes) > 1280
+            or len(password) > 128
+            or len(password_bytes) > 1024
+            or len(return_to_value) > 2048
+            or len(return_to_bytes) > 8192
+        ):
+            return JSONResponse(status_code=400, content={"detail": "Invalid sign-in request"})
+        safe_return_to = return_to_value
+        if (
+            not safe_return_to.startswith("/")
+            or safe_return_to.startswith("//")
+            or "\\" in safe_return_to
+        ):
+            safe_return_to = "/"
+        try:
+            session = await run_in_threadpool(
+                human_auth.authenticate_local_password,
+                login_email=email,
+                password=password,
+                source=str(request.client.host if request.client else "unknown")[:256],
+            )
+        except AuthGatewayError as exc:
+            if exc.code == "sign_in_busy":
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "Sign-in is temporarily busy; retry shortly"},
+                )
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Email or password is incorrect"},
+            )
+        response = JSONResponse(
+            {"authenticated": True, "redirect_url": safe_return_to}
+        )
+        _set_auth_cookies(response, request, session)
+        response.delete_cookie(AUTH_LOGIN_CSRF_COOKIE, path="/")
+        return response
+
     @app.get("/login")
-    def login_page() -> FileResponse:
+    def login_page(request: Request) -> FileResponse:
         if not human_auth.session_enabled:
             raise HTTPException(status_code=404, detail="Not found")
-        return FileResponse(STATIC_DIR / "login.html")
+        response = FileResponse(STATIC_DIR / "login.html")
+        response.headers["Cache-Control"] = "no-store, no-cache, private, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        if bool(getattr(human_auth, "local_password_login", False)):
+            response.set_cookie(
+                AUTH_LOGIN_CSRF_COOKIE,
+                secrets.token_urlsafe(32),
+                max_age=10 * 60,
+                httponly=False,
+                secure=_request_uses_https(request),
+                samesite="strict",
+                path="/",
+            )
+        return response
 
     @app.get("/.well-known/jwks.json")
     def internal_assertion_jwks() -> dict[str, object]:
