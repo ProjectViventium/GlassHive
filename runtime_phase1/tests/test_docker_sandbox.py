@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from workers_projects_runtime.docker_sandbox import (
+    AI_WORKER_APT_SNAPSHOT,
     AI_WORKER_PYTHON_LOCK_PATH,
     DockerSandboxManager,
     SandboxInfo,
@@ -1236,11 +1237,13 @@ def test_ensure_image_defaults_to_no_forced_ai_worker_browser_extensions(tmp_pat
     manager._ensure_image()
 
     dockerfile = (manager.build_root / "Dockerfile").read_text()
-    assert manager.image.endswith(":phase1-node22-docs8-openclaw2026.7.1-4")
+    assert manager.image.endswith(":phase1-node22-docs8-openclaw2026.7.1-5")
     assert "FROM selenium/standalone-chromium:4.46.0-20260707@sha256:" in dockerfile
     assert "com.glasshive.workstation.provenance=reviewed-v1" in dockerfile
     assert "com.glasshive.workstation.provider-account-acl=required-v1" in dockerfile
-    assert "snapshot.ubuntu.com/ubuntu/20260707T000000Z" in dockerfile
+    assert AI_WORKER_APT_SNAPSHOT == "20260801T000000Z"
+    assert f"com.glasshive.workstation.apt-snapshot={AI_WORKER_APT_SNAPSHOT}" in dockerfile
+    assert f"snapshot.ubuntu.com/ubuntu/{AI_WORKER_APT_SNAPSHOT}" in dockerfile
     assert "nodejs_22.23.2-1nodesource1_${arch}.deb" in dockerfile
     assert "sha256sum -c -" in dockerfile
     assert "@openai/codex@0.146.1" in dockerfile

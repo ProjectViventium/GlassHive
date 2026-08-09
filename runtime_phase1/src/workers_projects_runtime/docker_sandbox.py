@@ -118,6 +118,9 @@ AI_WORKER_BASE_IMAGE = os.environ.get(
     "WPR_SANDBOX_BASE_IMAGE",
     "selenium/standalone-chromium:4.46.0-20260707@sha256:3400b92f1cddb2dfaaf358654e8f7d83d7be45192fb73c5f28c25faa28d36504",
 ).strip()
+# This snapshot is the first reviewed Ubuntu archive that contains the same
+# curl/libcurl build already present in the pinned Selenium base image.
+AI_WORKER_APT_SNAPSHOT = "20260801T000000Z"
 AI_WORKER_PYTHON_LOCK_PATH = (
     Path(__file__).resolve().parents[2] / "workstation-requirements.lock"
 )
@@ -433,7 +436,7 @@ def _safe_docker_exec_env(env: dict[str, str] | None) -> dict[str, str]:
 class DockerSandboxManager:
     _build_lock = Lock()
     _desktop_credentials_lock = Lock()
-    _default_image = "workers-projects-runtime-workstation:phase1-node22-docs8-openclaw2026.7.1-4"
+    _default_image = "workers-projects-runtime-workstation:phase1-node22-docs8-openclaw2026.7.1-5"
     _provider_account_mount_target = "/workspace/.provider-account"
 
     def __init__(self, base_dir: str | None = None) -> None:
@@ -1701,6 +1704,7 @@ screen -ls | awk -v target="$target" '
                         f"FROM {self.base_image}",
                         "LABEL com.glasshive.workstation.provenance=reviewed-v1",
                         f"LABEL com.glasshive.workstation.base-image={self.base_image}",
+                        f"LABEL com.glasshive.workstation.apt-snapshot={AI_WORKER_APT_SNAPSHOT}",
                         f"LABEL com.glasshive.workstation.codex-spec={AI_WORKER_CODEX_NPM_SPEC}",
                         f"LABEL com.glasshive.workstation.claude-spec={AI_WORKER_CLAUDE_CODE_NPM_SPEC}",
                         f"LABEL com.glasshive.workstation.openclaw-version={OPENCLAW_RUNTIME_VERSION}",
@@ -1708,7 +1712,7 @@ screen -ls | awk -v target="$target" '
                         f"LABEL com.glasshive.workstation.python-lock-sha256={AI_WORKER_PYTHON_LOCK_SHA256}",
                         "LABEL com.glasshive.workstation.provider-account-acl=required-v1",
                         "USER root",
-                        "RUN find /etc/apt -type f -name '*.sources' -exec sed -ri 's#https?://(archive|security).ubuntu.com/ubuntu/?#https://snapshot.ubuntu.com/ubuntu/20260707T000000Z/#g' {} +",
+                        f"RUN find /etc/apt -type f -name '*.sources' -exec sed -ri 's#https?://(archive|security).ubuntu.com/ubuntu/?#https://snapshot.ubuntu.com/ubuntu/{AI_WORKER_APT_SNAPSHOT}/#g' {{}} +",
                         "RUN apt-get update && apt-get install -y --no-install-recommends acl bash ca-certificates curl file fonts-dejavu git gnupg jq less libreoffice-calc libreoffice-impress libreoffice-writer nano openssh-client pandoc pcmanfm poppler-utils procps python-is-python3 python3-pip ripgrep screen tmux tree vim wmctrl x11-utils xdotool xterm && rm -rf /var/lib/apt/lists/*",
                         "RUN if [ ! -x /usr/bin/locale-check ]; then printf '%s\\n' '#!/bin/sh' 'locale_value=${1:-C.UTF-8}' 'echo LANG=$locale_value' 'echo LC_ALL=$locale_value' > /usr/bin/locale-check && chmod +x /usr/bin/locale-check; fi",
                         "RUN arch=$(dpkg --print-architecture) && case \"$arch\" in amd64) node_sha=eed0c5f0ab411f28783f81f051fcf7928ae8bf833e2df11f48f3fa78270025cb ;; arm64) node_sha=0018ee0bf997fce587042a2382941dcfac9f404fb994a5c3267fe7d12d8d837b ;; *) echo \"unsupported architecture: $arch\" >&2; exit 1 ;; esac && curl -fsSL \"https://deb.nodesource.com/node_22.x/pool/main/n/nodejs/nodejs_22.23.2-1nodesource1_${arch}.deb\" -o /tmp/nodejs.deb && echo \"${node_sha}  /tmp/nodejs.deb\" | sha256sum -c - && apt-get update && apt-get install -y --no-install-recommends /tmp/nodejs.deb && rm -f /tmp/nodejs.deb && node --version && npm --version && rm -rf /var/lib/apt/lists/*",
@@ -1757,6 +1761,7 @@ screen -ls | awk -v target="$target" '
         return {
             "com.glasshive.workstation.provenance": "reviewed-v1",
             "com.glasshive.workstation.base-image": self.base_image,
+            "com.glasshive.workstation.apt-snapshot": AI_WORKER_APT_SNAPSHOT,
             "com.glasshive.workstation.codex-spec": AI_WORKER_CODEX_NPM_SPEC,
             "com.glasshive.workstation.claude-spec": AI_WORKER_CLAUDE_CODE_NPM_SPEC,
             "com.glasshive.workstation.openclaw-version": OPENCLAW_RUNTIME_VERSION,
