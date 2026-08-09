@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from workers_projects_runtime.docker_sandbox import (
+    AI_WORKER_PYTHON_LOCK_PATH,
     DockerSandboxManager,
     SandboxInfo,
     VNC_PASSWORD_ALPHABET,
@@ -1194,6 +1195,32 @@ def test_ensure_image_includes_document_delivery_toolchain(tmp_path):
     assert "pymupdf==" in requirements_lock
     assert "--require-hashes --no-deps" in dockerfile
     assert "/usr/bin/locale-check" in dockerfile
+
+
+def test_ensure_image_retry_replaces_read_only_reviewed_requirements_lock(tmp_path):
+    def fake_docker(
+        args: list[str],
+        *,
+        check: bool = True,
+        capture_output: bool = False,
+        timeout_sec=None,
+    ):
+        if args[:2] == ["image", "inspect"]:
+            return subprocess.CompletedProcess(["docker", *args], returncode=1, stdout="", stderr="")
+        return subprocess.CompletedProcess(["docker", *args], returncode=0, stdout="", stderr="")
+
+    first = DockerSandboxManager(base_dir=str(tmp_path))
+    first._docker = fake_docker  # type: ignore[method-assign]
+    first._ensure_image()
+
+    requirements_lock = first.build_root / "workstation-requirements.lock"
+    requirements_lock.chmod(0o444)
+
+    retried = DockerSandboxManager(base_dir=str(tmp_path))
+    retried._docker = fake_docker  # type: ignore[method-assign]
+    retried._ensure_image()
+
+    assert requirements_lock.read_bytes() == AI_WORKER_PYTHON_LOCK_PATH.read_bytes()
 
 
 def test_ensure_image_defaults_to_no_forced_ai_worker_browser_extensions(tmp_path):
