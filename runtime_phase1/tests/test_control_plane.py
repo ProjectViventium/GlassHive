@@ -16,7 +16,11 @@ from workers_projects_runtime.control_plane import (
     ControlPlaneStore,
 )
 from library_test_support import library_manifest, register_manifest
-from workers_projects_runtime.provider_accounts import ProviderAccountHomeManager, ProviderSetupManager
+from workers_projects_runtime.provider_accounts import (
+    ProviderAccountHomeManager,
+    ProviderSetupManager,
+    _provider_setup_guidance,
+)
 from workers_projects_runtime.provider_accounts import provider_platform_support
 from workers_projects_runtime.schema_version import record_schema_version, require_compatible_schema
 
@@ -454,7 +458,7 @@ if sys.argv[1:] == ['login', '--device-auth']:
             'GLASSHIVE_INFERENCE_BROKER_SECRET': os.environ.get('GLASSHIVE_INFERENCE_BROKER_SECRET'),
             'VIVENTIUM_CALL_SESSION_SECRET': os.environ.get('VIVENTIUM_CALL_SESSION_SECRET'),
         }, handle)
-    print('Visit https://provider.example.test/device and enter SAFE-CODE', flush=True)
+    print('Open https://auth.openai.com/codex/device and enter one-time code SAFE-CODE', flush=True)
     raise SystemExit(0)
 if sys.argv[1:] == ['login', 'status']:
     raise SystemExit(0)
@@ -496,6 +500,10 @@ raise SystemExit(2)
 
     assert result["status"] == "ready"
     assert "SAFE-CODE" in result["instructions"]
+    assert result["provider"] == "codex"
+    assert result["setup_url"] == "https://auth.openai.com/codex/device"
+    assert result["setup_code"] == "SAFE-CODE"
+    assert result["help_url"] == "https://chatgpt.com/#settings/Security"
     captured = json.loads(capture.read_text(encoding="utf-8"))
     assert captured["OPENAI_API_KEY"] is None
     assert captured["OPENAI_BASE_URL"] is None
@@ -547,6 +555,42 @@ raise SystemExit(2)
     assert not Path(captured["CODEX_HOME"]).parent.exists()
     assert store.active_provider_lease(account["account_id"], "default") is None
     assert lease["lease_id"]
+
+
+def test_provider_setup_guidance_extracts_only_reviewed_provider_destinations():
+    codex = _provider_setup_guidance(
+        "codex",
+        """
+Follow these steps to sign in with ChatGPT using device code authorization:
+1. Open https://auth.openai.com/codex/device
+2. You will need the one-time code shown in your browser.
+3. Enter this one-time code: TEST-CODE1
+""",
+    )
+    assert codex == {
+        "provider": "codex",
+        "setup_url": "https://auth.openai.com/codex/device",
+        "setup_code": "TEST-CODE1",
+        "help_url": "https://chatgpt.com/#settings/Security",
+    }
+
+    malicious = _provider_setup_guidance(
+        "codex",
+        "Open https://attacker.example/device and enter one-time code EVIL-CODE",
+    )
+    assert malicious["setup_url"] == ""
+    assert malicious["setup_code"] == ""
+
+    claude = _provider_setup_guidance(
+        "claude",
+        "Open https://claude.ai/oauth/authorize?code=true to continue",
+    )
+    assert claude == {
+        "provider": "claude",
+        "setup_url": "https://claude.ai/oauth/authorize?code=true",
+        "setup_code": "",
+        "help_url": "",
+    }
 
 
 def test_provider_disconnect_preserves_private_home_when_native_logout_fails(tmp_path, monkeypatch):

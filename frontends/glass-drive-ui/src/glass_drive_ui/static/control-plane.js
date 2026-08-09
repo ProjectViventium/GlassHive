@@ -18,6 +18,7 @@ const scheduleOccurrences = new Map();
 let editingScheduleId = '';
 let activeSetupAccount = '';
 let setupPollTimer = 0;
+const copyResetTimers = new WeakMap();
 
 function node(tag, className = '', text = '') {
   const element = document.createElement(tag);
@@ -54,16 +55,21 @@ function observedDuration(value) {
 }
 
 function providerAccountDetails(account) {
+  const provider = String(account.provider || 'AI').replaceAll('_', ' ');
+  const method = String(account.auth_method || 'account').replaceAll('_', ' ');
+  return `${provider} · ${method}`;
+}
+
+function providerAccountUsage(account) {
   const details = [
-    `${String(account.provider || '').replaceAll('_', ' ')} · ${String(account.auth_method || 'personal account').replaceAll('_', ' ')}`,
     providerTimestamp('Verified', account.last_verified_at),
     providerTimestamp('Last used', account.last_used_at),
   ];
   const observedRuns = Number(account.observed_runs || 0);
-  const observedFailures = Number(account.observed_failures || 0);
   if (observedRuns > 0) {
+    const observedFailures = Math.max(0, Number(account.observed_failures || 0));
     details.push(
-      `Observed by GlassHive: ${observedRuns} worker run${observedRuns === 1 ? '' : 's'} · `
+      `Observed by GlassHive: ${observedRuns} run${observedRuns === 1 ? '' : 's'} · `
       + `${observedFailures} failed · ${observedDuration(account.observed_duration_seconds)}`,
     );
   }
@@ -73,8 +79,54 @@ function providerAccountDetails(account) {
     const outputTokens = Math.max(0, Number(account.observed_output_tokens || 0));
     details.push(`Tokens reported by worker: ${inputTokens.toLocaleString()} input · ${outputTokens.toLocaleString()} output`);
   }
-  if (account.reconnect_reason && account.status !== 'ready') details.push(String(account.reconnect_reason));
   return details.filter(Boolean).join(' · ');
+}
+
+async function copyText(value, button, fallbackNode = null) {
+  const text = String(value || '');
+  if (!text) return false;
+  let copied = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    copied = true;
+  } catch {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.className = 'clipboard-fallback';
+    document.body.append(textarea);
+    textarea.select();
+    try {
+      copied = document.execCommand('copy');
+    } catch {
+      copied = false;
+    }
+    textarea.remove();
+  }
+  if (!copied && fallbackNode) {
+    const range = document.createRange();
+    range.selectNodeContents(fallbackNode);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+  }
+  if (button) {
+    const previous = button.dataset.copyLabel || button.textContent;
+    button.dataset.copyLabel = previous;
+    const existingTimer = copyResetTimers.get(button);
+    if (existingTimer) window.clearTimeout(existingTimer);
+    button.textContent = copied ? 'Copied' : 'Selected';
+    copyResetTimers.set(button, window.setTimeout(() => {
+      button.textContent = previous;
+      copyResetTimers.delete(button);
+    }, 1800));
+  }
+  return copied;
+}
+
+function setProviderStatus(message = '') {
+  const status = document.getElementById('provider-account-status');
+  if (!status) return;
+  status.textContent = String(message || '');
 }
 
 async function reconnectProviderAccount(account, button) {
@@ -95,8 +147,7 @@ async function reconnectProviderAccount(account, button) {
       showSetup(result);
     }
   } catch (error) {
-    const status = document.getElementById('provider-account-status');
-    if (status) status.textContent = error.message;
+    setProviderStatus(error.message);
     button.disabled = false;
     button.textContent = String(account.auth_method || '') === 'subscription' ? 'Reconnect' : 'Reconnect & test';
   }
@@ -111,8 +162,7 @@ async function verifyProviderAccount(account, button) {
     await loadControlPlane();
     showSetup(result);
   } catch (error) {
-    const status = document.getElementById('provider-account-status');
-    if (status) status.textContent = error.message;
+    setProviderStatus(error.message);
     button.disabled = false;
     button.textContent = 'Test connection';
   }
@@ -120,34 +170,33 @@ async function verifyProviderAccount(account, button) {
 
 function renderProviderAccounts() {
   const list = document.getElementById('provider-account-list');
-  const count = document.getElementById('account-count');
   if (!list || !controlPlane) return;
   const accounts = controlPlane.provider_accounts || [];
-  if (count) count.textContent = String(accounts.length);
+  const addAccount = document.querySelector('#add-provider-account > summary');
+  if (addAccount) addAccount.textContent = accounts.length ? 'Connect another account' : 'Connect an AI account';
   if (!accounts.length) {
-    list.replaceChildren(emptyList('No personal worker account connected'));
+    list.replaceChildren(node('p', 'connections-empty', 'No AI account connected yet.'));
     return;
   }
   const rows = accounts.map((account) => {
     const row = node('article', 'connection-row');
+    row.dataset.accountId = String(account.account_id || '');
     const copy = node('div', 'connection-copy');
     copy.append(
       node('strong', '', String(account.label || account.provider || 'Worker account')),
       node('span', '', providerAccountDetails(account)),
     );
-    const actions = node('div', 'connection-actions');
+    if (account.reconnect_reason && account.status !== 'ready') {
+      copy.append(node('span', 'connection-recovery', String(account.reconnect_reason)));
+    }
+    const actions = node('div', 'connection-actions connection-actions-primary');
     const brokerBacked = ['api_key', 'enterprise_route'].includes(String(account.auth_method || ''));
     actions.append(statusChip(
       brokerBacked && account.status === 'ready'
         ? 'linked · verifies on run'
         : (account.status || account.platform_support),
     ));
-    if (account.status === 'ready') {
-      const test = node('button', 'quiet-button', 'Test connection');
-      test.type = 'button';
-      test.addEventListener('click', () => verifyProviderAccount(account, test));
-      actions.append(test);
-    } else if (account.status === 'connecting' && String(account.auth_method || '') === 'subscription') {
+    if (account.status === 'connecting' && String(account.auth_method || '') === 'subscription') {
       const continueSetup = node('button', 'quiet-button', 'Continue setup');
       continueSetup.type = 'button';
       continueSetup.addEventListener('click', () => {
@@ -168,8 +217,20 @@ function renderProviderAccounts() {
       manage.href = String(controlPlane.manage_connections_url);
       actions.append(manage);
     }
+    const more = node('details', 'connection-more');
+    const moreSummary = node('summary', '', 'More');
+    moreSummary.setAttribute('aria-label', `More actions for ${String(account.label || account.provider || 'account')}`);
+    const moreActions = node('div', 'connection-more-actions');
+    const usage = providerAccountUsage(account);
+    if (usage) moreActions.append(node('span', 'connection-more-note', usage));
+    if (account.status === 'ready') {
+      const test = node('button', 'text-button', 'Test connection');
+      test.type = 'button';
+      test.addEventListener('click', () => verifyProviderAccount(account, test));
+      moreActions.append(test);
+    }
     if (account.status !== 'disconnected') {
-      const disconnect = node('button', 'quiet-button', 'Disconnect');
+      const disconnect = node('button', 'text-button', 'Disconnect');
       disconnect.type = 'button';
       disconnect.addEventListener('click', async () => {
         const question = brokerBacked
@@ -186,10 +247,10 @@ function renderProviderAccounts() {
           disconnect.disabled = false;
         }
       });
-      actions.append(disconnect);
+      moreActions.append(disconnect);
     }
     if (account.status === 'disconnected') {
-      const forget = node('button', 'quiet-button', 'Forget');
+      const forget = node('button', 'text-button danger-text-button', 'Forget');
       forget.type = 'button';
       forget.addEventListener('click', async () => {
         if (!window.confirm(`Forget ${String(account.label || account.provider || 'this account')} from GlassHive? Its disconnected metadata will be removed.`)) return;
@@ -199,13 +260,16 @@ function renderProviderAccounts() {
           await api.deleteJson(`/api/provider-accounts/${encodeURIComponent(String(account.account_id || ''))}`);
           await loadControlPlane();
         } catch (error) {
-          const status = document.getElementById('provider-account-status');
-          if (status) status.textContent = error.message;
+          setProviderStatus(error.message);
           forget.disabled = false;
           forget.textContent = 'Forget';
         }
       });
-      actions.append(forget);
+      moreActions.append(forget);
+    }
+    if (moreActions.childElementCount) {
+      more.append(moreSummary, moreActions);
+      actions.append(more);
     }
     row.append(copy, actions);
     return row;
@@ -215,12 +279,12 @@ function renderProviderAccounts() {
 
 function renderConnections() {
   const list = document.getElementById('data-connection-list');
-  const note = document.getElementById('microsoft-connection-note');
   const manage = document.getElementById('manage-connections-link');
+  const card = document.getElementById('connected-services-card');
   if (!list || !controlPlane) return;
   const connections = controlPlane.connections || [];
   if (!connections.length) {
-    list.replaceChildren(emptyList('No connected service yet'));
+    list.replaceChildren();
   } else {
     list.replaceChildren(...connections.map((connection) => {
       const row = node('article', 'connection-row');
@@ -233,8 +297,8 @@ function renderConnections() {
       return row;
     }));
   }
-  if (note) note.textContent = String(controlPlane.microsoft_connection_note || '');
   const manageUrl = String(controlPlane?.manage_connections_url || '');
+  if (card) card.hidden = !connections.length && !manageUrl;
   if (manage && manageUrl) {
     manage.href = manageUrl;
     manage.hidden = false;
@@ -249,19 +313,7 @@ function commandRow(label, command) {
   copy.append(node('strong', '', label), node('code', '', command));
   const button = node('button', 'quiet-button', 'Copy');
   button.type = 'button';
-  button.addEventListener('click', async () => {
-    try {
-      await navigator.clipboard.writeText(command);
-      button.textContent = 'Copied';
-    } catch {
-      button.textContent = 'Select command';
-      const range = document.createRange();
-      range.selectNodeContents(copy.querySelector('code'));
-      window.getSelection()?.removeAllRanges();
-      window.getSelection()?.addRange(range);
-    }
-    window.setTimeout(() => { button.textContent = 'Copy'; }, 1800);
-  });
+  button.addEventListener('click', () => copyText(command, button, copy.querySelector('code')));
   row.append(copy, button);
   return row;
 }
@@ -984,18 +1036,17 @@ async function submitRecurringSchedule(event) {
 function renderSupportHint() {
   const provider = document.getElementById('provider-account-provider')?.value || 'codex';
   const method = document.getElementById('provider-account-method')?.value || 'subscription';
-  const status = document.getElementById('provider-account-status');
   const submit = document.querySelector('#provider-account-form button[type="submit"]');
-  if (!status || !controlPlane || method !== 'subscription') {
+  if (!controlPlane || method !== 'subscription') {
     const option = (controlPlane?.provider_options || []).find((item) => item.provider === provider);
     const supported = provider === 'codex' && option?.inference_broker_support === 'supported';
-    if (status) status.textContent = !supported
+    setProviderStatus(!supported
       ? (provider === 'claude'
         ? 'Claude API and enterprise routes are not exposed by the reviewed OpenAI inference broker.'
         : 'Use Manage connected accounts first; this deployment has not enabled the user-scoped inference broker.')
       : (method === 'api_key'
         ? 'Connect your OpenAI key in Manage connected accounts, then add its private GlassHive reference here. The key never enters GlassHive.'
-        : 'Add the approved enterprise OpenAI route as a private GlassHive reference for this account.');
+        : 'Add the approved enterprise OpenAI route as a private GlassHive reference for this account.'));
     if (submit) {
       submit.textContent = supported ? 'Add connected account' : 'Connection unavailable';
       submit.disabled = !supported;
@@ -1003,9 +1054,11 @@ function renderSupportHint() {
     return;
   }
   const option = (controlPlane.provider_options || []).find((item) => item.provider === provider);
-  status.textContent = SUPPORT_COPY[option?.subscription_support] || '';
+  setProviderStatus(option?.subscription_support === 'supported'
+    ? ''
+    : (SUPPORT_COPY[option?.subscription_support] || 'This connection is not available.'));
   if (submit) {
-    submit.textContent = 'Start setup';
+    submit.textContent = provider === 'claude' ? 'Connect Claude' : 'Connect Codex';
     submit.disabled = option?.subscription_support !== 'supported';
   }
 }
@@ -1013,15 +1066,97 @@ function renderSupportHint() {
 function showSetup(payload) {
   const panel = document.getElementById('provider-setup-panel');
   const instructions = document.getElementById('provider-setup-instructions');
-  const status = document.getElementById('provider-account-status');
-  if (instructions) instructions.textContent = String(payload.instructions || payload.message || 'Waiting for the provider to return sign-in instructions…');
+  const setupGuidance = document.getElementById('provider-setup-guidance');
+  const setupLink = document.getElementById('provider-setup-link');
+  const setupCode = document.getElementById('provider-setup-code');
+  const setupCodeRow = document.getElementById('provider-setup-code-row');
+  const setupHelp = document.getElementById('provider-setup-help');
+  const technical = document.getElementById('provider-setup-technical');
+  const restart = document.getElementById('restart-provider-setup');
+  const provider = String(payload.provider || 'codex');
+  const setupUrl = String(payload.setup_url || '');
+  const code = String(payload.setup_code || '');
+  const helpUrl = String(payload.help_url || '');
+  const rawInstructions = String(payload.instructions || payload.message || '').trim();
+  const waitingForGuidance = !payload.complete && !rawInstructions;
+  const needsFallback = !payload.complete
+    && !waitingForGuidance
+    && (!setupUrl || (provider === 'codex' && !code));
+  const accountId = String(payload.account_id || activeSetupAccount || '');
+  const accountRow = [...document.querySelectorAll('.connection-row')]
+    .find((candidate) => candidate.dataset.accountId === accountId);
+  const accountChip = accountRow?.querySelector('.status-chip');
+  const accountAction = accountRow?.querySelector('.connection-actions-primary > button');
+  const accountMore = accountRow?.querySelector('.connection-more');
+  if (instructions) instructions.textContent = rawInstructions || 'Preparing sign-in…';
   if (panel) panel.hidden = Boolean(payload.complete);
-  if (status) {
-    status.textContent = payload.status === 'ready'
-      ? 'Personal worker account connected and ready.'
-      : payload.complete
-        ? String(payload.message || 'Sign-in did not complete. Start setup again when ready.')
-        : 'Use the private provider link or code below. GlassHive will verify completion automatically.';
+  if (setupLink) {
+    setupLink.href = setupUrl || '#';
+    const providerName = provider === 'claude' ? 'Claude' : provider === 'codex' ? 'Codex' : 'provider';
+    setupLink.textContent = `Open ${providerName} sign-in`;
+    setupLink.hidden = !setupUrl;
+  }
+  if (setupCode) setupCode.textContent = code;
+  if (setupCodeRow) setupCodeRow.hidden = !code;
+  if (setupHelp) {
+    setupHelp.href = helpUrl || '#';
+    setupHelp.textContent = 'Open ChatGPT security settings';
+    setupHelp.hidden = !helpUrl;
+  }
+  if (setupGuidance) setupGuidance.textContent = needsFallback
+    ? 'Use the provider instructions below.'
+    : waitingForGuidance
+      ? 'Starting secure sign-in…'
+      : (provider === 'codex' ? 'Open sign-in, then enter the code.' : 'Open sign-in to continue.');
+  if (technical && needsFallback) {
+    technical.open = true;
+    technical.dataset.autoOpened = 'true';
+  } else if (technical?.dataset.autoOpened === 'true') {
+    technical.open = false;
+    delete technical.dataset.autoOpened;
+  }
+  if (!payload.complete && accountChip) {
+    accountChip.textContent = 'connecting';
+    accountChip.dataset.status = 'connecting';
+  }
+  if (!payload.complete && accountAction) accountAction.hidden = true;
+  if (accountMore) accountMore.hidden = !payload.complete;
+  if (restart) restart.hidden = !activeSetupAccount || Boolean(payload.complete);
+  setProviderStatus(payload.status === 'ready'
+    ? 'Connected.'
+    : payload.complete
+      ? String(payload.message || 'Sign-in was not completed. Try again.')
+      : (needsFallback ? 'Sign-in details changed. Follow the technical details below.' : ''));
+}
+
+async function cancelActiveSetup({ reload = true } = {}) {
+  if (!activeSetupAccount) return null;
+  const accountId = activeSetupAccount;
+  const payload = await api.postJson(`/api/provider-accounts/${encodeURIComponent(accountId)}/setup/cancel`);
+  activeSetupAccount = '';
+  stopSetupPolling();
+  showSetup(payload);
+  if (reload) await loadControlPlane();
+  return { accountId, payload };
+}
+
+async function restartActiveSetup(button) {
+  if (!activeSetupAccount) return;
+  button.disabled = true;
+  button.textContent = 'Restarting…';
+  try {
+    const cancelled = await cancelActiveSetup({ reload: false });
+    if (!cancelled?.accountId) return;
+    const payload = await api.postJson(`/api/provider-accounts/${encodeURIComponent(cancelled.accountId)}/setup`);
+    activeSetupAccount = cancelled.accountId;
+    showSetup(payload);
+    setupPollTimer = window.setTimeout(pollSetup, 900);
+  } catch (error) {
+    await loadControlPlane().catch(() => {});
+    setProviderStatus(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Restart sign-in';
   }
 }
 
@@ -1045,8 +1180,7 @@ async function pollSetup() {
       return;
     }
   } catch (error) {
-    const status = document.getElementById('provider-account-status');
-    if (status) status.textContent = error.message;
+    setProviderStatus(error.message);
   }
   setupPollTimer = window.setTimeout(pollSetup, 1500);
 }
@@ -1091,7 +1225,6 @@ async function submitProviderAccount(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const button = form.querySelector('button[type="submit"]');
-  const status = document.getElementById('provider-account-status');
   const provider = document.getElementById('provider-account-provider').value;
   const method = document.getElementById('provider-account-method').value;
   const option = (controlPlane?.provider_options || []).find((item) => item.provider === provider);
@@ -1099,11 +1232,11 @@ async function submitProviderAccount(event) {
     (method === 'subscription' && option?.subscription_support !== 'supported')
     || (method !== 'subscription' && (provider !== 'codex' || option?.inference_broker_support !== 'supported'))
   ) {
-    if (status) status.textContent = SUPPORT_COPY[option?.subscription_support] || 'This account route is not available.';
+    setProviderStatus(SUPPORT_COPY[option?.subscription_support] || 'This account route is not available.');
     return;
   }
   button.disabled = true;
-  if (status) status.textContent = 'Creating private setup…';
+  setProviderStatus('Creating setup…');
   try {
     const payload = {
       provider: document.getElementById('provider-account-provider').value,
@@ -1113,6 +1246,8 @@ async function submitProviderAccount(event) {
     };
     const created = await api.postJson('/api/provider-accounts', payload);
     form.reset();
+    const disclosure = document.getElementById('add-provider-account');
+    if (disclosure) disclosure.open = false;
     await loadControlPlane();
     if (created.platform_support === 'supported' && created.auth_method === 'subscription') {
       const setup = await api.postJson(`/api/provider-accounts/${encodeURIComponent(created.account_id)}/setup`);
@@ -1120,14 +1255,14 @@ async function submitProviderAccount(event) {
       showSetup(setup);
       stopSetupPolling();
       setupPollTimer = window.setTimeout(pollSetup, 900);
-    } else if (status) {
-      status.textContent = created.auth_method !== 'subscription'
+    } else {
+      setProviderStatus(created.auth_method !== 'subscription'
         ? 'Connected-account reference added. GlassHive will verify it when this workspace runs.'
         : (SUPPORT_COPY[created.platform_support]
-          || (created.status === 'ready' ? 'Account ready.' : 'Private setup created. Complete sign-in before using it.'));
+          || (created.status === 'ready' ? 'Account ready.' : 'Complete sign-in before using this account.')));
     }
   } catch (error) {
-    if (status) status.textContent = error.message;
+    setProviderStatus(error.message);
   } finally {
     button.disabled = false;
   }
@@ -1181,9 +1316,12 @@ export function initializeControlPlane(dependencies) {
   document.getElementById('provider-account-form')?.addEventListener('submit', submitProviderAccount);
   document.getElementById('provider-account-provider')?.addEventListener('change', renderSupportHint);
   document.getElementById('provider-account-method')?.addEventListener('change', renderSupportHint);
+  document.getElementById('add-provider-account')?.addEventListener('toggle', (event) => {
+    if (event.currentTarget.open) renderSupportHint();
+    else if (document.getElementById('provider-setup-panel')?.hidden) setProviderStatus('');
+  });
   document.getElementById('refresh-connections')?.addEventListener('click', () => loadControlPlane().catch((error) => {
-    const status = document.getElementById('provider-account-status');
-    if (status) status.textContent = error.message;
+    setProviderStatus(error.message);
   }));
   document.getElementById('new-schedule-action')?.addEventListener('click', () => {
     dependencies.setView('schedules');
@@ -1194,6 +1332,13 @@ export function initializeControlPlane(dependencies) {
   document.getElementById('recurring-schedule-type')?.addEventListener('change', syncRecurringScheduleFields);
   document.getElementById('recurring-schedule-catch-up-policy')?.addEventListener('change', syncRecurringScheduleFields);
   document.getElementById('refresh-schedules')?.addEventListener('click', () => loadSchedules());
+  document.getElementById('copy-provider-setup-code')?.addEventListener('click', (event) => {
+    const codeNode = document.getElementById('provider-setup-code');
+    copyText(codeNode?.textContent || '', event.currentTarget, codeNode);
+  });
+  document.getElementById('restart-provider-setup')?.addEventListener('click', (event) => {
+    restartActiveSetup(event.currentTarget);
+  });
   const timezone = document.getElementById('recurring-schedule-timezone');
   const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   if (timezone && browserTimezone) timezone.value = browserTimezone;
@@ -1201,14 +1346,9 @@ export function initializeControlPlane(dependencies) {
   document.getElementById('cancel-provider-setup')?.addEventListener('click', async () => {
     if (!activeSetupAccount) return;
     try {
-      const payload = await api.postJson(`/api/provider-accounts/${encodeURIComponent(activeSetupAccount)}/setup/cancel`);
-      activeSetupAccount = '';
-      stopSetupPolling();
-      showSetup(payload);
-      await loadControlPlane();
+      await cancelActiveSetup();
     } catch (error) {
-      const status = document.getElementById('provider-account-status');
-      if (status) status.textContent = error.message;
+      setProviderStatus(error.message);
     }
   });
 }

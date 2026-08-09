@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import fcntl
 
@@ -50,6 +51,58 @@ PROVIDER_SETUP_ENV_ALLOWLIST = {
     "https_proxy",
     "no_proxy",
 }
+
+_SETUP_URL = re.compile(r"https://[^\s'\"<>]+")
+_CODEX_DEVICE_CODE = re.compile(
+    r"(?i:one-time\s+code(?:\s*\([^)]*\))?)\s*:?\s*"
+    r"([A-Z0-9]{4,8}-[A-Z0-9]{4,8})(?![A-Z0-9-])",
+)
+_CODEX_SECURITY_SETTINGS_URL = "https://chatgpt.com/#settings/Security"
+
+
+def _provider_setup_guidance(provider: str, output: str) -> dict[str, str]:
+    """Extract bounded, clickable guidance without trusting arbitrary CLI output as a URL."""
+
+    normalized_provider = str(provider or "").strip().lower()
+    canonical_provider = (
+        "codex"
+        if normalized_provider in {"codex", "openai"}
+        else "claude"
+        if normalized_provider in {"claude", "anthropic"}
+        else normalized_provider or "unknown"
+    )
+    setup_url = ""
+    for match in _SETUP_URL.finditer(str(output or "")):
+        candidate = match.group(0).rstrip(".,;:)")
+        parsed = urlsplit(candidate)
+        if parsed.scheme != "https" or parsed.username or parsed.password:
+            continue
+        hostname = str(parsed.hostname or "").lower()
+        if normalized_provider in {"codex", "openai"}:
+            if hostname == "auth.openai.com" and parsed.path.rstrip("/") == "/codex/device":
+                setup_url = candidate
+                break
+        elif normalized_provider in {"claude", "anthropic"}:
+            if hostname in {"claude.ai", "console.anthropic.com"}:
+                setup_url = candidate
+                break
+
+    setup_code = ""
+    if setup_url and normalized_provider in {"codex", "openai"}:
+        code_match = _CODEX_DEVICE_CODE.search(str(output or ""))
+        if code_match:
+            setup_code = code_match.group(1).upper()
+
+    return {
+        "provider": canonical_provider,
+        "setup_url": setup_url,
+        "setup_code": setup_code,
+        "help_url": (
+            _CODEX_SECURITY_SETTINGS_URL
+            if normalized_provider in {"codex", "openai"}
+            else ""
+        ),
+    }
 
 
 def _env_enabled(name: str) -> bool:
@@ -573,7 +626,13 @@ class ProviderSetupManager:
             return_code = session.process.poll() if session is not None else None
             output = session.output if session is not None else ""
         if session is not None and return_code is None:
-            return {"account_id": account_id, "status": "connecting", "instructions": output, "complete": False}
+            return {
+                "account_id": account_id,
+                "status": "connecting",
+                "instructions": output,
+                "complete": False,
+                **_provider_setup_guidance(provider, output),
+            }
         authenticated = verify and self._verify(provider=provider, environment=environment, account_home=account_home)
         if authenticated:
             self.homes.tighten_permissions(account_home=account_home)
@@ -602,6 +661,7 @@ class ProviderSetupManager:
             "status": updated.get("status", status),
             "instructions": output,
             "complete": True,
+            **_provider_setup_guidance(provider, output),
         }
 
     def cancel(self, *, account_id: str, tenant_id: str, owner_id: str) -> dict[str, object]:

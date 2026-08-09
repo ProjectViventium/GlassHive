@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>GlassHive</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260806b" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260809a" />
   </head>
   <body class="launch-body">
     <main class="launch-shell">
@@ -207,70 +207,89 @@
         <section id="connections-view" class="control-plane-view" role="tabpanel" aria-labelledby="connections-tab" hidden>
           <header class="control-plane-head">
             <div>
-              <span class="section-kicker">Private to your account</span>
               <h1>Connections</h1>
-              <p>Choose which worker account and connected services your workspaces may use. GlassHive stores references, never credential bytes.</p>
             </div>
-            <button id="refresh-connections" class="quiet-button" type="button">Refresh</button>
+            <button id="refresh-connections" class="quiet-button" type="button" aria-label="Refresh connections">Refresh</button>
           </header>
-          <div class="control-plane-grid control-plane-grid-wide">
-            <section class="control-card control-card-featured">
+          <div class="connections-stack">
+            <section class="control-card connections-primary-card">
               <div class="control-card-head">
                 <div>
-                  <span class="section-kicker">Worker accounts</span>
-                  <h2>Use your own Codex or Claude</h2>
+                  <h2>AI accounts</h2>
                 </div>
-                <span id="account-count" class="count-chip">0</span>
               </div>
               <div id="provider-account-list" class="connection-list" aria-live="polite"></div>
-              <form id="provider-account-form" class="account-form">
-                <label>
-                  <span>Worker</span>
-                  <select id="provider-account-provider" name="provider">
-                    <option value="codex">Codex</option>
-                    <option value="claude">Claude Code</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Connection</span>
-                  <select id="provider-account-method" name="auth_method">
-                    <option value="subscription">Existing subscription</option>
-                    <option value="api_key">API key · secure account store</option>
-                    <option value="enterprise_route">Enterprise provider route</option>
-                  </select>
-                </label>
-                <label class="account-label-field">
-                  <span>Name</span>
-                  <input id="provider-account-label" name="label" type="text" maxlength="160" placeholder="Personal Codex" required />
-                </label>
-                <label class="default-account-toggle">
-                  <input id="provider-account-default" name="make_default" type="checkbox" />
-                  <span>Use by default for this worker type</span>
-                </label>
-                <button class="primary-button compact-button" type="submit">Start setup</button>
-              </form>
               <p id="provider-account-status" class="inline-status" aria-live="polite"></p>
               <div id="provider-setup-panel" class="provider-setup-panel" hidden>
-                <strong>Finish sign-in</strong>
-                <pre id="provider-setup-instructions"></pre>
-                <button id="cancel-provider-setup" class="quiet-button" type="button">Cancel setup</button>
+                <div class="setup-guide-head">
+                  <div>
+                    <strong>Finish connecting</strong>
+                    <span id="provider-setup-guidance">Open sign-in, then enter the code.</span>
+                  </div>
+                </div>
+                <a id="provider-setup-link" class="primary-button setup-primary-action" href="#" target="_blank" rel="noopener" hidden>Open sign-in</a>
+                <div id="provider-setup-code-row" class="setup-code-row" hidden>
+                  <div>
+                    <span>One-time code</span>
+                    <code id="provider-setup-code"></code>
+                  </div>
+                  <button id="copy-provider-setup-code" class="quiet-button" type="button">Copy code</button>
+                </div>
+                <div class="setup-secondary-actions">
+                  <button id="cancel-provider-setup" class="text-button" type="button">Cancel</button>
+                </div>
+                <details id="provider-setup-technical" class="setup-technical">
+                  <summary>Having trouble?</summary>
+                  <div class="setup-troubleshooting-actions">
+                    <a id="provider-setup-help" class="setup-help-link" href="#" target="_blank" rel="noopener" hidden>Open ChatGPT security settings</a>
+                    <button id="restart-provider-setup" class="text-button" type="button">Restart sign-in</button>
+                  </div>
+                  <div id="provider-setup-instructions" class="setup-instructions"></div>
+                </details>
               </div>
+              <details id="add-provider-account" class="connection-disclosure">
+                <summary>Connect another account</summary>
+                <form id="provider-account-form" class="account-form">
+                  <label>
+                    <span>AI</span>
+                    <select id="provider-account-provider" name="provider">
+                      <option value="codex">Codex</option>
+                      <option value="claude">Claude Code</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Sign in with</span>
+                    <select id="provider-account-method" name="auth_method">
+                      <option value="subscription">My subscription</option>
+                      <option value="api_key">Connected API key</option>
+                      <option value="enterprise_route">Enterprise route</option>
+                    </select>
+                  </label>
+                  <label class="account-label-field">
+                    <span>Name</span>
+                    <input id="provider-account-label" name="label" type="text" maxlength="160" placeholder="Personal Codex" required />
+                  </label>
+                  <label class="default-account-toggle">
+                    <input id="provider-account-default" name="make_default" type="checkbox" />
+                    <span>Use by default</span>
+                  </label>
+                  <button class="primary-button compact-button" type="submit">Connect</button>
+                </form>
+              </details>
             </section>
-            <section class="control-card">
-              <span class="section-kicker">Connected services</span>
-              <h2>Tools and data</h2>
-              <p>Accounts such as Microsoft 365 and SharePoint stay user-scoped and are granted to a workspace only when needed.</p>
+            <section id="connected-services-card" class="control-card compact-connections-card" hidden>
+              <h2>Connected tools</h2>
               <div id="data-connection-list" class="connection-list" aria-live="polite"></div>
-              <a id="manage-connections-link" class="card-action" href="#" hidden>Manage connected accounts</a>
-              <p id="microsoft-connection-note" class="card-note"></p>
+              <a id="manage-connections-link" class="card-action" href="#" hidden>Manage tools</a>
             </section>
-            <section class="control-card connect-ai-card">
-              <span class="section-kicker">Bring your own AI</span>
-              <h2>Connect Claude or Codex to GlassHive</h2>
-              <p>Follow the copy-and-paste steps for the AI client you already use. After you sign in, it can create, find, resume, and schedule your workspaces.</p>
-              <div id="connect-ai-commands" class="command-list" aria-live="polite"></div>
-              <p id="connect-ai-source" class="card-note"></p>
-            </section>
+            <details id="connect-ai-advanced" class="connection-disclosure connect-ai-card">
+              <summary>External AI clients</summary>
+              <div class="advanced-connection-content">
+                <p>Use these commands only when connecting the Codex or Claude desktop client to GlassHive.</p>
+                <div id="connect-ai-commands" class="command-list" aria-live="polite"></div>
+                <p id="connect-ai-source" class="card-note"></p>
+              </div>
+            </details>
           </div>
         </section>
         <section id="library-view" class="control-plane-view" role="tabpanel" aria-labelledby="library-tab" hidden>
@@ -497,6 +516,6 @@
         </div>
       </form>
     </dialog>
-    <script src="/static/app.js?v=20260806k" type="module"></script>
+    <script src="/static/app.js?v=20260809a" type="module"></script>
   </body>
 </html>
