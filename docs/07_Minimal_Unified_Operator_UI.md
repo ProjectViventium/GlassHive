@@ -76,6 +76,9 @@ Calm dark glass over a bright signal core, like a modern appliance or Tesla cont
    - `Cmd/Ctrl+Enter` and modifier-click send must also queue the follow-up
    - the footer must explain this visibly in the UI, not only in hidden docs or shortcuts
    - once queued, the UI/runtime contract must keep the workspace marked `running` until that queued follow-up actually settles
+22a. Session-authenticated watch actions must forward the current double-submit CSRF cookie in the
+    `X-GlassHive-CSRF` header on every state-changing request. Worker-bound signed links retain only
+    their deliberately narrow communication exception; the watch UI must not broaden that bypass.
 23. Exact run interruption depends on standard process utilities being present inside the sandbox image:
    - workstation images must include `ps`, `awk`, and `pkill`/procps
    - GlassHive uses those tools to stop the exact `.glasshive-runs/<run_id>` process tree during steer redirects

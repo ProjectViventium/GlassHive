@@ -13,7 +13,7 @@ const LONG_PRESS_MS = 550;
 const ACTIVE_REFRESH_MS = 2000;
 const IDLE_REFRESH_MS = 10000;
 const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);
-const GLASSHIVE_UI_REV = '20260626a';
+const GLASSHIVE_UI_REV = '20260809a';
 const workspaceApiBase = `/api/workspace/${workerId}`;
 
 const frame = document.getElementById('desktop-frame');
@@ -88,6 +88,26 @@ function withUiRev(url) {
   const value = String(url || '');
   if (!value || /(?:^|[?&])gh_ui_rev=/.test(value)) return value;
   return `${value}${value.includes('?') ? '&' : '?'}gh_ui_rev=${encodeURIComponent(GLASSHIVE_UI_REV)}`;
+}
+
+function currentCsrfToken() {
+  const prefix = 'glasshive_csrf=';
+  const entry = document.cookie
+    .split(';')
+    .map((value) => value.trim())
+    .find((value) => value.startsWith(prefix));
+  if (!entry) return '';
+  const value = entry.slice(prefix.length);
+  try {
+    return decodeURIComponent(value);
+  } catch (_error) {
+    return value;
+  }
+}
+
+function csrfHeaders(headers = {}) {
+  const token = currentCsrfToken();
+  return token ? { ...headers, 'X-GlassHive-CSRF': token } : headers;
 }
 
 function syncDocumentTitle(workerName, projectTitle) {
@@ -628,7 +648,7 @@ function renderOutput(data) {
 async function postAction(action, payload) {
   const response = await fetch(withAuth(`${workspaceApiBase}/${action.startsWith('action:') ? 'action/' + action.split(':', 2)[1] : action}`), {
     method: 'POST',
-    headers: payload ? { 'Content-Type': 'application/json' } : {},
+    headers: csrfHeaders(payload ? { 'Content-Type': 'application/json' } : {}),
     body: payload ? JSON.stringify(payload) : undefined,
   });
   if (!response.ok) {
@@ -644,7 +664,7 @@ async function submitFooterInstruction(mode) {
   try {
     const response = await fetch(withAuth(`${workspaceApiBase}/${path}`), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: csrfHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ message }),
     });
     if (!response.ok) {

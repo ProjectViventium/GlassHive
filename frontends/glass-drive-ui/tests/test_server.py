@@ -1841,7 +1841,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "Use Resume to continue from the same state" in watch_js
     assert "IDLE_REFRESH_MS" in watch_js
     assert "refreshInFlight" in watch_js
-    assert "const GLASSHIVE_UI_REV = '20260626a'" in watch_js
+    assert "const GLASSHIVE_UI_REV = '20260809a'" in watch_js
     assert "const workspaceApiBase = `/api/workspace/${workerId}`" in watch_js
     assert "/api/worker/${workerId}/live" not in watch_js
     assert '@app.get("/api/workspace/{worker_id}/live")' in (Path(server_module.__file__).read_text(encoding="utf-8"))
@@ -1861,7 +1861,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "gh_token|gh_sig|token|signature|sig" in watch_js
     assert "data.artifacts?.items || []" in watch_js
     assert "Workspace files" in watch_js
-    assert "watch.js?v=20260626a" in watch_html
+    assert "watch.js?v=20260809a" in watch_html
     assert ".artifact-row" in styles_css
     assert "artifact-list-more" in watch_js
     assert ".artifact-list-more" in styles_css
@@ -1878,6 +1878,15 @@ def test_launcher_workspace_hive_static_controls():
     assert '"brand controls"' in styles_css
     assert '.watch-meta-line p' in styles_css
     assert 'white-space: normal' in styles_css
+
+
+def test_watch_authenticated_actions_forward_current_csrf_cookie():
+    watch_js = (Path(server_module.STATIC_DIR) / "watch.js").read_text(encoding="utf-8")
+
+    assert "glasshive_csrf" in watch_js
+    assert "function csrfHeaders(headers = {})" in watch_js
+    assert "'X-GlassHive-CSRF': token" in watch_js
+    assert watch_js.count("headers: csrfHeaders(") == 2
 
 
 def test_worker_lifecycle_endpoint_supports_workspace_hive_controls():
