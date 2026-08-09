@@ -1786,7 +1786,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "schedule.last_outcome || schedule.last_error" in control_plane_js
     assert "Latest result:" in control_plane_js
     assert "clients.codex?.login_command" in control_plane_js
-    assert "Follow the copy-and-paste steps" in index_html
+    assert "External AI clients" in index_html
     assert "Copy one command" not in index_html
     assert "function referenceRow" in control_plane_js
     assert "Registration reference" in control_plane_js
@@ -4529,6 +4529,38 @@ def test_control_plane_ui_exposes_safe_disconnect_and_capability_remove_paths():
     assert 'id="confirm-dependencies"' in confirm_page
     assert "library_plan_snapshot" in confirm_script
     assert "librarySnapshot.content_hash" in confirm_script
+
+
+def test_connections_ui_keeps_primary_account_setup_short_and_actionable():
+    page = (Path(server_module.STATIC_DIR) / "index.html").read_text(encoding="utf-8")
+    script = (Path(server_module.STATIC_DIR) / "control-plane.js").read_text(encoding="utf-8")
+
+    assert 'id="add-provider-account"' in page
+    assert 'id="connect-ai-advanced"' in page
+    assert '<summary>External AI clients</summary>' in page
+    assert "Your AI accounts and tools." not in page
+    assert "Connect the subscription your workers should use." not in page
+    assert 'id="provider-setup-link"' in page
+    assert 'id="provider-setup-code"' in page
+    assert 'id="copy-provider-setup-code"' in page
+    assert 'id="restart-provider-setup"' in page
+    assert 'id="provider-setup-state"' not in page
+    assert '<pre id="provider-setup-instructions"' not in page
+    assert 'id="provider-account-status" class="inline-status" aria-live="polite" hidden' not in page
+    assert "credential bytes" not in page
+    assert "short-lived broker grant" not in page
+    assert "short-lived broker grant" not in script
+    assert 'id="microsoft-connection-note"' not in page
+    assert 'id="connected-services-card" class="control-card compact-connections-card" hidden' in page
+    assert "copyText" in script
+    assert "Open ${providerName} sign-in" in script
+    assert "Copy code" in page
+    assert "Open ChatGPT security settings" in script
+    assert "Having trouble?" in page
+    assert "technical.dataset.autoOpened = 'true'" in script
+    assert "technical.open = false" in script
+    assert "accountMore.hidden = !payload.complete" in script
+    assert "copyResetTimers" in script
 
 
 def test_main_ui_exposes_current_user_and_explicit_account_logout_actions():
