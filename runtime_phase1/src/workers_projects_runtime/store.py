@@ -27,6 +27,10 @@ class SchedulePrincipalAuthorityStoreError(ValueError):
     """A write lost the race with principal schedule-authority revocation."""
 
 
+class WorkerClosedStoreError(ValueError):
+    """A run reservation lost the race with permanent workspace closure."""
+
+
 def _workspace_tags_json(values: list[str] | tuple[str, ...] | None) -> str:
     return json.dumps(normalize_workspace_tags(values), ensure_ascii=False, separators=(",", ":"))
 
@@ -2056,14 +2060,26 @@ class Store:
             row = conn.execute(query, params).fetchone()
         return self._row(row)
 
-    def update_worker(self, worker_id: str, **fields: Any) -> dict[str, Any] | None:
+    def update_worker(
+        self,
+        worker_id: str,
+        **fields: Any,
+    ) -> dict[str, Any] | None:
         if not fields:
             return self.get_worker(worker_id)
         fields["updated_at"] = utc_now()
         assignments = ", ".join(f"{key} = :{key}" for key in fields.keys())
         fields["worker_id"] = worker_id
+        target_state = str(fields.get("state") or "")
+        protect_close = (
+            "state" in fields
+            and target_state not in {"terminating", "termination_failed", "terminated"}
+        )
+        where = "worker_id = :worker_id"
+        if protect_close:
+            where += " AND state NOT IN ('terminating', 'termination_failed', 'terminated')"
         with self._connect() as conn:
-            conn.execute(f"UPDATE workers SET {assignments} WHERE worker_id = :worker_id", fields)
+            conn.execute(f"UPDATE workers SET {assignments} WHERE {where}", fields)
             row = conn.execute("SELECT * FROM workers WHERE worker_id = ?", (worker_id,)).fetchone()
         return self._row(row)
 
@@ -2075,6 +2091,11 @@ class Store:
         fields["updated_at"] = utc_now()
         assignments = ", ".join(f"{key} = :{key}" for key in fields.keys())
         fields["worker_id"] = worker_id
+        target_state = str(fields.get("state") or "")
+        protect_close = "state" in fields and target_state not in {"terminating", "termination_failed", "terminated"}
+        where = "worker_id = :worker_id"
+        if protect_close:
+            where += " AND state NOT IN ('terminating', 'termination_failed', 'terminated')"
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             claimed = conn.execute(
@@ -2087,7 +2108,7 @@ class Store:
             if claimed is not None:
                 return None
             changed = conn.execute(
-                f"UPDATE workers SET {assignments} WHERE worker_id = :worker_id",
+                f"UPDATE workers SET {assignments} WHERE {where}",
                 fields,
             )
             if changed.rowcount != 1:
@@ -2100,6 +2121,140 @@ class Store:
         if last_error is not None:
             fields["last_error"] = last_error
         return self.update_worker(worker_id, **fields)
+
+    def begin_worker_termination(self, worker_id: str) -> tuple[dict[str, Any] | None, bool]:
+        """Publish permanent close intent once before any external runtime teardown."""
+
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            worker = conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            if worker is None:
+                conn.execute("COMMIT")
+                return None, False
+            if str(worker["state"] or "") in {"terminating", "terminated"}:
+                conn.execute("COMMIT")
+                return self._row(worker), False
+            conn.execute(
+                "UPDATE workers SET state = 'terminating', last_error = '', updated_at = ? WHERE worker_id = ?",
+                (now, worker_id),
+            )
+            conn.execute(
+                """
+                UPDATE recurring_schedule_occurrences
+                SET state = 'cancelled', outcome = 'workspace_closed', terminal_at = ?
+                WHERE scheduled_run_id IN (
+                    SELECT schedule_id FROM scheduled_runs WHERE worker_id = ?
+                )
+                  AND state NOT IN ('completed', 'failed', 'cancelled', 'skipped')
+                """,
+                (now, worker_id),
+            )
+            conn.execute(
+                """
+                UPDATE scheduled_runs
+                SET state = 'cancelled', last_error = 'workspace_closed', updated_at = ?
+                WHERE worker_id = ?
+                  AND state NOT IN ('completed', 'failed', 'cancelled')
+                """,
+                (now, worker_id),
+            )
+            conn.execute(
+                """
+                UPDATE recurring_schedule_definitions
+                SET enabled = 0, active = 0, updated_at = ?
+                WHERE worker_id = ? AND active = 1
+                """,
+                (now, worker_id),
+            )
+            updated = conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            conn.execute("COMMIT")
+        return self._row(updated), True
+
+    def fail_worker_termination(self, worker_id: str, message: str) -> dict[str, Any] | None:
+        """Let only the owning close attempt make a failed teardown retryable."""
+
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE workers
+                SET state = 'termination_failed', last_error = ?, updated_at = ?
+                WHERE worker_id = ? AND state = 'terminating'
+                """,
+                (message, now, worker_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            conn.execute("COMMIT")
+        return self._row(row)
+
+    def record_worker_termination_cleanup_failure(
+        self,
+        worker_id: str,
+        message: str,
+    ) -> dict[str, Any] | None:
+        """Keep a failed post-close runtime cleanup sticky over a successful close writer."""
+
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE workers
+                SET state = 'termination_failed', last_error = ?, updated_at = ?
+                WHERE worker_id = ?
+                  AND state IN ('terminating', 'termination_failed', 'terminated')
+                """,
+                (message, now, worker_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            conn.execute("COMMIT")
+        return self._row(row)
+
+    def complete_worker_termination(
+        self,
+        worker_id: str,
+        **fields: Any,
+    ) -> dict[str, Any] | None:
+        """Publish terminal runtime data only while this close attempt still owns the CAS."""
+
+        now = utc_now()
+        values = {
+            **fields,
+            "state": "terminated",
+            "last_error": "",
+            "updated_at": now,
+            "worker_id": worker_id,
+        }
+        assignments = ", ".join(
+            f"{key} = :{key}" for key in values if key != "worker_id"
+        )
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                f"UPDATE workers SET {assignments} "
+                "WHERE worker_id = :worker_id AND state = 'terminating'",
+                values,
+            )
+            row = conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            conn.execute("COMMIT")
+        return self._row(row)
 
     def count_workers(
         self,
@@ -2131,7 +2286,15 @@ class Store:
         with self._connect() as conn:
             return int(conn.execute(query, params).fetchone()[0])
 
-    def create_run(self, worker_id: str, project_id: str, instruction: str, state: str = "queued") -> dict[str, Any]:
+    def create_run(
+        self,
+        worker_id: str,
+        project_id: str,
+        instruction: str,
+        state: str = "queued",
+        *,
+        resume_paused: bool = False,
+    ) -> dict[str, Any]:
         run_id = f"run_{uuid.uuid4().hex[:10]}"
         queued_at = utc_now()
         data = {
@@ -2163,6 +2326,15 @@ class Store:
             ).fetchone()
             if worker is None:
                 raise ValueError("Worker not found for project")
+            if str(worker["state"] or "") in {"terminating", "termination_failed", "terminated"}:
+                raise WorkerClosedStoreError(
+                    "Workspace is closed; create a new workspace for new work"
+                )
+            if resume_paused and str(worker["state"] or "") == "paused":
+                conn.execute(
+                    "UPDATE workers SET state = 'starting', last_error = '', updated_at = ? WHERE worker_id = ?",
+                    (queued_at, worker_id),
+                )
             if conn.execute(
                 """
                 SELECT 1 FROM workspace_gc_tombstones
@@ -2248,6 +2420,24 @@ class Store:
             if str(schedule["state"] or "") != "running":
                 conn.execute("ROLLBACK")
                 raise RuntimeError("Scheduled run must be claimed before dispatch")
+
+            worker = conn.execute(
+                "SELECT state FROM workers WHERE worker_id = ? AND project_id = ?",
+                (schedule["worker_id"], schedule["project_id"]),
+            ).fetchone()
+            if worker is None:
+                conn.execute("ROLLBACK")
+                raise ValueError("Scheduled workspace no longer exists")
+            if str(worker["state"] or "") in {"terminating", "termination_failed", "terminated"}:
+                conn.execute("ROLLBACK")
+                raise WorkerClosedStoreError(
+                    "Workspace is closed; create a new workspace for new work"
+                )
+            if str(worker["state"] or "") == "paused":
+                conn.execute(
+                    "UPDATE workers SET state = 'starting', last_error = '', updated_at = ? WHERE worker_id = ?",
+                    (queued_at, schedule["worker_id"]),
+                )
 
             existing = conn.execute(
                 "SELECT * FROM runs WHERE run_id = ?",
@@ -2405,6 +2595,17 @@ class Store:
         now_iso = utc_now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            worker = conn.execute(
+                "SELECT state FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            if worker is None or str(worker["state"] or "") in {
+                "terminating",
+                "termination_failed",
+                "terminated",
+            }:
+                conn.execute("COMMIT")
+                return None
             while True:
                 row = conn.execute(
                     """
@@ -2817,6 +3018,16 @@ class Store:
         }
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            worker = conn.execute(
+                "SELECT state FROM workers WHERE worker_id = ? AND project_id = ?",
+                (worker_id, project_id),
+            ).fetchone()
+            if worker is None:
+                raise ValueError("Scheduled workspace no longer exists")
+            if str(worker["state"] or "") in {"terminating", "termination_failed", "terminated"}:
+                raise WorkerClosedStoreError(
+                    "Workspace is closed; create a new workspace for new work"
+                )
             if require_principal_authority:
                 self._require_schedule_principal_authority_in_transaction(
                     conn,
@@ -3201,6 +3412,32 @@ class Store:
         assignments = ", ".join(f"{key} = ?" for key in updates)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if bool(updates.get("enabled")):
+                definition_worker = conn.execute(
+                    """
+                    SELECT workers.state
+                    FROM recurring_schedule_definitions
+                    LEFT JOIN workers
+                      ON workers.worker_id = recurring_schedule_definitions.worker_id
+                     AND workers.project_id = recurring_schedule_definitions.project_id
+                    WHERE recurring_schedule_definitions.definition_id = ?
+                      AND recurring_schedule_definitions.tenant_id = ?
+                      AND recurring_schedule_definitions.owner_id = ?
+                    """,
+                    (definition_id, tenant_id or "local", owner_id),
+                ).fetchone()
+                if definition_worker is not None and definition_worker["state"] is None:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Scheduled workspace no longer exists")
+                if definition_worker is not None and str(definition_worker["state"] or "") in {
+                    "terminating",
+                    "termination_failed",
+                    "terminated",
+                }:
+                    conn.execute("ROLLBACK")
+                    raise WorkerClosedStoreError(
+                        "Workspace is closed; create a new workspace for new work"
+                    )
             if require_principal_authority:
                 self._require_schedule_principal_authority_in_transaction(
                     conn,
@@ -3433,6 +3670,28 @@ class Store:
                     tenant_id=tenant_id,
                     owner_id=owner_id,
                 )
+            definition = conn.execute(
+                """
+                SELECT * FROM recurring_schedule_definitions
+                WHERE definition_id = ? AND tenant_id = ? AND owner_id = ? AND retired_at IS NULL
+                """,
+                (definition_id, tenant_id or "local", owner_id),
+            ).fetchone()
+            if definition is None:
+                conn.execute("COMMIT")
+                return None
+            worker = conn.execute(
+                "SELECT state FROM workers WHERE worker_id = ? AND project_id = ?",
+                (definition["worker_id"], definition["project_id"]),
+            ).fetchone()
+            if worker is None:
+                conn.execute("ROLLBACK")
+                raise ValueError("Scheduled workspace no longer exists")
+            if str(worker["state"] or "") in {"terminating", "termination_failed", "terminated"}:
+                conn.execute("ROLLBACK")
+                raise WorkerClosedStoreError(
+                    "Workspace is closed; create a new workspace for new work"
+                )
             existing = conn.execute(
                 "SELECT * FROM recurring_schedule_occurrences WHERE idempotency_key = ?",
                 (idempotency_key,),
@@ -3446,16 +3705,6 @@ class Store:
                 result = self._row(schedule) or {}
                 result.update({"occurrence_id": existing["occurrence_id"], "idempotency_key": idempotency_key})
                 return result
-            definition = conn.execute(
-                """
-                SELECT * FROM recurring_schedule_definitions
-                WHERE definition_id = ? AND tenant_id = ? AND owner_id = ? AND retired_at IS NULL
-                """,
-                (definition_id, tenant_id or "local", owner_id),
-            ).fetchone()
-            if definition is None:
-                conn.execute("COMMIT")
-                return None
             schedule_id = f"sch_{uuid.uuid4().hex[:10]}"
             conn.execute(
                 """
@@ -3597,6 +3846,16 @@ class Store:
         }
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            worker = conn.execute(
+                "SELECT state FROM workers WHERE worker_id = ? AND project_id = ?",
+                (worker_id, project_id),
+            ).fetchone()
+            if worker is None:
+                raise ValueError("Scheduled workspace no longer exists")
+            if str(worker["state"] or "") in {"terminating", "termination_failed", "terminated"}:
+                raise WorkerClosedStoreError(
+                    "Workspace is closed; create a new workspace for new work"
+                )
             if require_principal_authority:
                 self._require_schedule_principal_authority_in_transaction(
                     conn,
@@ -3656,6 +3915,16 @@ class Store:
         }
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            worker = conn.execute(
+                "SELECT state FROM workers WHERE worker_id = ? AND project_id = ?",
+                (worker_id, project_id),
+            ).fetchone()
+            if worker is None:
+                raise ValueError("Scheduled workspace no longer exists")
+            if str(worker["state"] or "") in {"terminating", "termination_failed", "terminated"}:
+                raise WorkerClosedStoreError(
+                    "Workspace is closed; create a new workspace for new work"
+                )
             if require_principal_authority:
                 self._require_schedule_principal_authority_in_transaction(
                     conn,
@@ -4045,6 +4314,14 @@ class Store:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return self._rows(rows)
+
+    def has_run_event(self, run_id: str, event_type: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM events WHERE run_id = ? AND event_type = ? LIMIT 1",
+                (run_id, event_type),
+            ).fetchone()
+        return row is not None
 
     def list_project_events(self, project_id: str, tenant_id: str | None = None) -> list[dict[str, Any]]:
         query = "SELECT * FROM events WHERE project_id = ?"

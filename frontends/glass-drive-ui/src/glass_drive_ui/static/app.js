@@ -5,7 +5,7 @@ const ACTIVE_RUN_STATES = new Set(['queued', 'running']);
 const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);
 const INTERRUPTIBLE_STATES = new Set(['queued', 'running', 'resuming']);
 const RESUME_STATES = new Set(['ready', 'paused', 'idle', 'idle_terminated', 'stopped', 'completed', 'retained']);
-const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'terminated']);
+const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'terminating', 'termination_failed', 'terminated']);
 const MAX_LIVE_TILE_IFRAMES = 4;
 const ACTIVE_TILE_REFRESH_MS = 7000;
 const RETAINED_TILE_REFRESH_MS = 60000;
@@ -354,7 +354,7 @@ function uniqueWorkspaces(workspaces) {
 }
 
 function rawWorkspaceState(workspace) {
-  return String(workspace?.state || 'unknown').trim().toLowerCase() || 'unknown';
+  return String(workspace?.close_state || workspace?.state || 'unknown').trim().toLowerCase() || 'unknown';
 }
 
 function workspaceStateLabel(workspace) {
@@ -383,6 +383,8 @@ function displayStateLabel(state) {
   const normalized = String(state || '').trim().toLowerCase();
   if (normalized === 'completed') return 'Completed';
   if (normalized === 'idle_terminated') return 'Idle stopped';
+  if (normalized === 'terminating') return 'Closing';
+  if (normalized === 'termination_failed') return 'Close needs attention';
   if (normalized === 'ready') return 'Ready';
   if (normalized === 'retained') return 'Retained';
   return normalized || 'unknown';
@@ -410,7 +412,7 @@ function workerActionForState(state) {
 function syncTileSteerAvailability(tile, state) {
   const normalized = String(state || '').trim().toLowerCase();
   tile.dataset.displayState = normalized;
-  const closed = normalized === 'terminated';
+  const closed = ['terminating', 'termination_failed', 'terminated'].includes(normalized);
   const input = tile.querySelector('.workspace-steer textarea');
   const button = tile.querySelector('.workspace-steer button[type="submit"]');
   if (input) {
@@ -466,7 +468,7 @@ function updateTileControlLabels(tile, state) {
   const action = workerActionForState(state);
   const toggle = tile.querySelector('[data-worker-action-toggle]');
   if (toggle) {
-    toggle.hidden = TERMINAL_ATTENTION_STATES.has(normalized) || normalized === 'terminated';
+    toggle.hidden = TERMINAL_ATTENTION_STATES.has(normalized) || ['terminating', 'termination_failed', 'terminated'].includes(normalized);
     toggle.dataset.action = action;
     toggle.textContent = normalized === 'completed' ? 'Continue' : action === 'resume' ? 'Resume' : 'Pause';
     toggle.disabled = DISABLED_CONTROL_STATES.has(normalized);
@@ -525,10 +527,10 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
     return;
   }
 
-  if (normalized === 'terminated') {
+  if (['terminating', 'termination_failed', 'terminated'].includes(normalized)) {
     const note = document.createElement('div');
     note.className = 'workspace-glass-note';
-    note.textContent = 'Workspace closed';
+    note.textContent = normalized === 'terminating' ? 'Workspace closing' : normalized === 'termination_failed' ? 'Close needs attention' : 'Workspace closed';
     pane.replaceChildren(note);
     return;
   }
@@ -545,9 +547,9 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
 }
 
 function displayStateForLive(data) {
-  const workerState = String(data?.worker?.state || '').trim().toLowerCase();
+  const workerState = String(data?.worker?.close_state || data?.worker?.state || '').trim().toLowerCase();
   const runState = String(data?.latest_run?.state || '').trim().toLowerCase();
-  if (workerState === 'terminated') return 'terminated';
+  if (['terminating', 'termination_failed', 'terminated'].includes(workerState)) return workerState;
   if (runState === 'completed') return 'completed';
   if (ACTIVE_RUN_STATES.has(runState)) return runState;
   if (['failed', 'cancelled', 'interrupted'].includes(runState)) return runState;
@@ -683,7 +685,12 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   const glassPane = document.createElement('div');
   glassPane.className = 'workspace-glass-content';
   glassPane.dataset.workerGlass = 'true';
-  if (isActive) {
+  if (['terminating', 'termination_failed', 'terminated'].includes(state)) {
+    const note = document.createElement('div');
+    note.className = 'workspace-glass-note';
+    note.textContent = state === 'terminating' ? 'Workspace closing' : state === 'termination_failed' ? 'Close needs attention' : 'Workspace closed';
+    glassPane.appendChild(note);
+  } else if (isActive) {
     const note = document.createElement('div');
     note.className = 'workspace-glass-note';
     note.textContent = 'Checking live surface...';
@@ -847,7 +854,7 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   accountSelect.value = Array.from(accountSelect.options).some((option) => option.value === selectedValue)
     ? selectedValue
     : 'legacy:';
-  accountSelect.disabled = !supportedProviders.size || ['created', 'starting', 'queued', 'running', 'resuming', 'terminated'].includes(state);
+  accountSelect.disabled = !supportedProviders.size || ['created', 'starting', 'queued', 'running', 'resuming', 'terminating', 'termination_failed', 'terminated'].includes(state);
   accountSelect.addEventListener('change', async () => {
     const priorValue = selectedValue;
     const [policy, accountId = ''] = String(accountSelect.value || '').split(':', 2);
@@ -885,7 +892,7 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   const toggle = createButton(state === 'completed' ? 'Continue' : workerActionForState(state) === 'resume' ? 'Resume' : 'Pause', 'workspace-run-toggle');
   toggle.dataset.workerActionToggle = 'true';
   toggle.dataset.action = workerActionForState(state);
-  toggle.hidden = TERMINAL_ATTENTION_STATES.has(state) || state === 'terminated';
+  toggle.hidden = TERMINAL_ATTENTION_STATES.has(state) || ['terminating', 'termination_failed', 'terminated'].includes(state);
   toggle.disabled = DISABLED_CONTROL_STATES.has(state);
   toggle.addEventListener('click', async () => {
     await runWorkerAction(workerId, toggle.dataset.action, toggle, refreshBootstrap);

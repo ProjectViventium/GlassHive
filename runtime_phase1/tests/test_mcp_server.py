@@ -8,6 +8,7 @@ import time
 from urllib.parse import urlsplit
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
+import httpx
 import pytest
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
@@ -360,6 +361,61 @@ class RecordingWorkersProjectsApiClient(mcp_server.WorkersProjectsApiClient):
         if path.endswith("/runs") or path.endswith("/events") or path.endswith("/workers") or "/schedules" in path:
             return {"items": []}
         return {"ok": True}
+
+
+def test_runtime_client_preserves_safe_closed_workspace_detail(monkeypatch):
+    class ClosedResponseClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def request(self, method, url, *, json=None, headers=None):
+            request = httpx.Request(method, url)
+            return httpx.Response(
+                409,
+                json={"detail": "Workspace is closed; create a new workspace for new work"},
+                request=request,
+            )
+
+    monkeypatch.setattr(mcp_server.httpx, "Client", ClosedResponseClient)
+    monkeypatch.setattr(mcp_server, "_require_enterprise_mcp_service_auth", lambda _headers: None)
+    monkeypatch.setattr(mcp_server, "_request_headers", lambda: {})
+    client = mcp_server.WorkersProjectsApiClient(
+        base_url="http://glasshive.example.test",
+        api_token="",
+    )
+
+    with pytest.raises(mcp_server.GlassHiveApiError) as exc_info:
+        client.assign_run("wrk_closed", "Do not strand this work")
+
+    assert exc_info.value.status_code == 409
+    assert str(exc_info.value) == "Workspace is closed; create a new workspace for new work"
+
+
+def test_worker_message_tool_surfaces_closed_workspace_recovery():
+    class ClosedWorkspaceApi(FakeApiClient):
+        def send_message(self, worker_id: str, message: str):
+            raise mcp_server.GlassHiveApiError(
+                409,
+                "Workspace is closed; create a new workspace for new work",
+            )
+
+    server = create_mcp_server(api_client=ClosedWorkspaceApi())
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="closed; create a new workspace"):
+                await client.call_tool(
+                    "worker_message",
+                    {"worker_id": "wrk_closed", "message": "Do not strand this work"},
+                )
+
+    asyncio.run(scenario())
 
 
 class PollingApiClient(FakeApiClient):
@@ -1758,6 +1814,31 @@ def test_workspace_status_returns_view_steer_link_for_web_mcp_surfaces(monkeypat
             assert "watch/wrk_poll" in record["target_url"]
             assert "gh_token=" in record["target_url"]
             assert payload["view_steer"]["include_in_response"] is True
+
+    asyncio.run(scenario())
+
+
+def test_workspace_status_preserves_truthful_close_failure_state(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive.example.test")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+
+    class CloseFailureApiClient(PollingApiClient):
+        def worker_live(self, worker_id: str):
+            payload = super().worker_live(worker_id)
+            payload["worker"].update(
+                {"state": "terminated", "close_state": "termination_failed"}
+            )
+            return payload
+
+    server = create_mcp_server(api_client=CloseFailureApiClient(["cancelled"]))
+
+    async def scenario():
+        async with Client(server) as client:
+            status = await client.call_tool(
+                "workspace_status",
+                {"run_id": "run_poll", "worker_id": "wrk_poll"},
+            )
+            assert _tool_json(status)["worker_state"] == "termination_failed"
 
     asyncio.run(scenario())
 

@@ -655,8 +655,8 @@ def flatten_workspaces(
     for worker in safe_catalog.get("items", []):
         if not isinstance(worker, dict):
             continue
-        worker_state = str(worker.get("state") or "").strip().lower()
-        if worker_state == "terminated":
+        worker_state = str(worker.get("close_state") or worker.get("state") or "").strip().lower()
+        if worker_state in {"terminating", "termination_failed", "terminated"}:
             continue
         project_id = str(worker.get("project_id") or "")
         worker_id = str(worker.get("worker_id") or "")
@@ -2062,11 +2062,20 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
 
     def _runtime_view_url(active_client: RuntimeClient, worker_id: str, *, cache_key: str | None = None) -> str:
         now = time.monotonic()
+        payload = _worker_live_or_http(active_client, worker_id)
+        worker = payload.get("worker") or {}
+        if str(worker.get("close_state") or worker.get("state") or "").strip().lower() in {
+            "terminating",
+            "termination_failed",
+            "terminated",
+        }:
+            if cache_key:
+                _NOVNC_VIEW_URL_CACHE.pop(cache_key, None)
+            raise HTTPException(status_code=409, detail="Workspace is closed; create a new workspace for new work")
         if cache_key:
             cached = _NOVNC_VIEW_URL_CACHE.get(cache_key)
             if cached and cached[0] > now:
                 return cached[1]
-        payload = _worker_live_or_http(active_client, worker_id)
         runtime = payload.get("runtime_details") or {}
         view_url = str(runtime.get("view_url") or "").strip()
         if not view_url:
@@ -2132,6 +2141,16 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             if safe_detail.get("message"):
                 return safe_detail
         return fallback
+
+    def _runtime_http_exception(
+        exc: httpx.HTTPStatusError,
+        fallback: str,
+    ) -> HTTPException:
+        status_code = exc.response.status_code if exc.response is not None else 502
+        return HTTPException(
+            status_code=status_code,
+            detail=_runtime_status_detail(exc, fallback),
+        )
 
     def _runtime_proxy_base_url() -> str:
         return str(getattr(client, "base_url", "") or os.environ.get("GLASSHIVE_RUNTIME_BASE_URL", "http://127.0.0.1:8766")).rstrip("/")
@@ -2955,13 +2974,24 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
 
     @app.post("/api/pending-changes")
     def create_pending_change(request: Request, payload: PendingChangeRequest) -> dict[str, Any]:
-        return _client_for_request(request).create_pending_change(
-            {
-                "change_type": payload.change_type,
-                "target_id": payload.target_id,
-                "payload": payload.payload,
-            }
-        )
+        try:
+            return _client_for_request(request).create_pending_change(
+                {
+                    "change_type": payload.change_type,
+                    "target_id": payload.target_id,
+                    "payload": payload.payload,
+                }
+            )
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc,
+                "GlassHive could not prepare this workspace change.",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="GlassHive workspace changes are unavailable",
+            ) from exc
 
     @app.get("/api/pending-changes/{change_id}")
     def get_pending_change(request: Request, change_id: str) -> dict[str, Any]:
@@ -3061,10 +3091,21 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         change_id: str,
         payload: PendingChangeConfirmRequest,
     ) -> dict[str, Any]:
-        return _client_for_request(
-            request,
-            human_confirmation=True,
-        ).confirm_pending_change(change_id, payload.confirmation_token)
+        try:
+            return _client_for_request(
+                request,
+                human_confirmation=True,
+            ).confirm_pending_change(change_id, payload.confirmation_token)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc,
+                "GlassHive could not confirm this workspace change.",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="GlassHive workspace changes are unavailable",
+            ) from exc
 
     @app.patch("/api/preferences")
     def update_preferences(request: Request, payload: PreferencesRequest) -> dict[str, Any]:
@@ -3172,6 +3213,14 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 scheduled = active_client.schedule_run(str(worker_id), brief, schedule_text=schedule_text)
             else:
                 run = active_client.assign_run(str(worker_id), brief)
+        except httpx.HTTPStatusError as exc:
+            reason = _runtime_status_detail(exc, _format_launch_error(exc))
+            if created_new_worker and worker_id:
+                try:
+                    active_client.launch_failed(str(worker_id), str(reason))
+                except Exception:
+                    pass
+            raise _runtime_http_exception(exc, _format_launch_error(exc)) from exc
         except Exception as exc:
             reason = _format_launch_error(exc)
             if created_new_worker and worker_id:
@@ -3331,9 +3380,28 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                     await upstream.close()
                     await websocket.close(code=1008, reason="GlassHive watch session expired")
 
+                async def enforce_workspace_open() -> None:
+                    while True:
+                        await asyncio.sleep(0.25)
+                        try:
+                            live = await asyncio.to_thread(active_client.worker_live, worker_id)
+                            live_worker = live.get("worker") if isinstance(live, dict) else None
+                            state = str(
+                                (live_worker or {}).get("close_state")
+                                or (live_worker or {}).get("state")
+                                or ""
+                            ).strip().lower()
+                        except Exception:
+                            state = "terminated"
+                        if state in {"terminating", "termination_failed", "terminated"}:
+                            await upstream.close()
+                            await websocket.close(code=1008, reason="Workspace closed")
+                            return
+
                 tasks = {
                     asyncio.create_task(browser_to_sandbox()),
                     asyncio.create_task(sandbox_to_browser()),
+                    asyncio.create_task(enforce_workspace_open()),
                 }
                 if session_timeout > 0:
                     tasks.add(asyncio.create_task(enforce_session_timeout()))
@@ -3353,12 +3421,28 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     @app.post("/api/workspace/{worker_id}/message")
     @app.post("/api/worker/{worker_id}/message")
     def worker_message(request: Request, worker_id: str, payload: MessageRequest) -> dict[str, Any]:
-        return _client_for_request(request, worker_id).message(worker_id, payload.message)
+        try:
+            return _client_for_request(request, worker_id).message(worker_id, payload.message)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc,
+                "GlassHive could not queue that workspace message.",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="GlassHive workspace message failed") from exc
 
     @app.post("/api/workspace/{worker_id}/steer")
     @app.post("/api/worker/{worker_id}/steer")
     def worker_steer(request: Request, worker_id: str, payload: MessageRequest) -> dict[str, Any]:
-        return _client_for_request(request, worker_id).steer(worker_id, payload.message)
+        try:
+            return _client_for_request(request, worker_id).steer(worker_id, payload.message)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc,
+                "GlassHive could not steer that workspace.",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="GlassHive workspace steer failed") from exc
 
     @app.api_route("/api/workspace/{worker_id}/metadata", methods=["POST", "PATCH"])
     @app.api_route("/api/worker/{worker_id}/metadata", methods=["POST", "PATCH"])
@@ -3388,10 +3472,9 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             if action in {"terminal", "files", "browser", "focus_browser", "codex", "claude", "openclaw"}:
                 return active_client.desktop_action(worker_id, action, url=(payload.url if payload else None))
         except httpx.HTTPStatusError as exc:
-            status_code = exc.response.status_code if exc.response is not None else 502
-            raise HTTPException(
-                status_code=status_code,
-                detail=_runtime_status_detail(exc, "GlassHive could not apply that workspace action yet."),
+            raise _runtime_http_exception(
+                exc,
+                "GlassHive could not apply that workspace action yet.",
             ) from exc
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail="GlassHive workspace action failed") from exc

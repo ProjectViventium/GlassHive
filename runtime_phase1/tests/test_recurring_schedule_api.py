@@ -149,6 +149,99 @@ def test_recurring_schedule_api_rejects_invalid_spec_and_fails_closed_when_owner
     ) == []
 
 
+def test_recurring_schedule_api_rejects_closed_workspace_without_persisting_definition(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "native")
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub"))
+    worker = _create_worker(client)
+
+    terminated = client.post(f"/v1/workers/{worker['worker_id']}/terminate")
+    assert terminated.status_code == 202
+    assert terminated.json()["state"] == "terminated"
+
+    created = client.post(
+        f"/v1/workers/{worker['worker_id']}/recurring-schedules",
+        json={
+            "instruction": "Do not persist this recurring task.",
+            "recurrence_type": "interval",
+            "interval_seconds": 3600,
+            "timezone_name": "UTC",
+            "first_run_at": "2027-01-02T14:00:00+00:00",
+        },
+    )
+
+    assert created.status_code == 409, created.text
+    assert "closed" in created.json()["detail"].lower()
+    assert client.app.state.store.list_recurring_schedule_definitions(
+        worker["worker_id"], tenant_id="local", owner_id="demo-owner"
+    ) == []
+
+
+def test_closed_workspace_cannot_reenable_native_recurring_schedule(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "native")
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub"))
+    worker = _create_worker(client)
+    created = client.post(
+        f"/v1/workers/{worker['worker_id']}/recurring-schedules",
+        json={
+            "instruction": "Do not revive after close.",
+            "recurrence_type": "interval",
+            "interval_seconds": 3600,
+            "timezone_name": "UTC",
+            "first_run_at": "2027-01-02T14:00:00+00:00",
+        },
+    )
+    assert created.status_code == 201, created.text
+    definition_id = created.json()["definition_id"]
+    assert client.post(f"/v1/workers/{worker['worker_id']}/terminate").status_code == 202
+
+    enabled = client.patch(
+        f"/v1/recurring-schedules/{definition_id}",
+        json={"enabled": True},
+    )
+
+    assert enabled.status_code == 409, enabled.text
+    stored = client.app.state.store.get_recurring_schedule_definition(
+        definition_id,
+        tenant_id="local",
+        owner_id="demo-owner",
+    )
+    assert stored["active"] is False
+    assert stored["enabled"] is False
+
+
+def test_recurring_schedule_creation_losing_race_to_workspace_close_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "native")
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub"))
+    worker = _create_worker(client)
+    store = client.app.state.store
+    original_create = store.create_recurring_schedule_definition
+
+    def close_then_create(**kwargs):
+        store.update_worker_state(worker["worker_id"], "terminated")
+        return original_create(**kwargs)
+
+    monkeypatch.setattr(store, "create_recurring_schedule_definition", close_then_create)
+    created = client.post(
+        f"/v1/workers/{worker['worker_id']}/recurring-schedules",
+        json={
+            "instruction": "Do not persist after closure wins.",
+            "recurrence_type": "interval",
+            "interval_seconds": 3600,
+            "timezone_name": "UTC",
+            "first_run_at": "2027-01-02T14:00:00+00:00",
+        },
+    )
+
+    assert created.status_code == 409, created.text
+    assert "closed" in created.json()["detail"].lower()
+    assert store.list_recurring_schedule_definitions(
+        worker["worker_id"], tenant_id="local", owner_id="demo-owner"
+    ) == []
+
+
 def test_recurring_schedule_api_reads_the_authoritative_delegated_definition(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "viventium_cortex")
     monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
@@ -584,6 +677,51 @@ def test_principal_disable_race_is_rechecked_inside_delegated_schedule_reservati
     assert response.json()["failure_class"] == "principal_disabled"
     assert client.app.state.store.list_runs_for_worker(worker["worker_id"]) == []
     assert client.app.state.store.list_schedules_for_worker(worker["worker_id"]) == []
+
+
+def test_workspace_close_after_cortex_reservation_cancels_occurrence_without_run(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "viventium_cortex")
+    monkeypatch.setenv("VIVENTIUM_SCHEDULER_SECRET", "synthetic-scheduler-secret")
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "synthetic-callback-secret")
+    monkeypatch.setenv("GLASSHIVE_SCHEDULING_OWNER_URL", "http://127.0.0.1:7110/mcp")
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub"))
+    worker = _create_worker(client)
+    store = client.app.state.store
+    original_reserve = store.create_or_get_cortex_workspace_schedule
+
+    def reserve_then_close(**kwargs):
+        schedule = original_reserve(**kwargs)
+        store.update_worker_state(worker["worker_id"], "terminating")
+        return schedule
+
+    monkeypatch.setattr(store, "create_or_get_cortex_workspace_schedule", reserve_then_close)
+    payload = {
+        "occurrence_id": "sp_run_close_race",
+        "task_id": "rsd_close_race",
+        "tenant_id": "local",
+        "owner_id": "demo-owner",
+        "project_id": worker["project_id"],
+        "worker_id": worker["worker_id"],
+        "execution_mode": "docker",
+        "instruction": "Do not run after workspace closure wins.",
+    }
+
+    response = client.post(
+        "/internal/scheduling-cortex/workspace-runs",
+        headers=_scheduler_headers(payload),
+        json=payload,
+    )
+
+    assert response.status_code == 409, response.text
+    assert "closed" in response.json()["detail"].lower()
+    schedules = store.list_schedules_for_worker(worker["worker_id"], include_done=True)
+    assert len(schedules) == 1
+    assert schedules[0]["state"] == "cancelled"
+    assert store.list_runs_for_worker(worker["worker_id"]) == []
 
 
 def test_scheduling_cortex_internal_dispatch_fails_before_mutation_without_callback_config(

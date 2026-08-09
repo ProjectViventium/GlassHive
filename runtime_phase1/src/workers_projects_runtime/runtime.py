@@ -323,7 +323,7 @@ class OpenClawRuntimeManager:
                 if latest["state"] in {"paused", "resuming", "starting"}:
                     latest = self.store.update_worker(worker["worker_id"], state="ready") or latest
                 return latest
-            if latest["state"] == "terminated":
+            if latest["state"] in {"terminating", "termination_failed", "terminated"}:
                 raise RuntimeError("Worker is terminated")
             return await self.create_worker_runtime(latest)
 

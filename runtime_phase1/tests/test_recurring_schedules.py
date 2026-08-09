@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import date, datetime, time, timezone
+from threading import Event, Thread
 
 import pytest
 
 from workers_projects_runtime import recurrence as recurrence_module
 from workers_projects_runtime.openclaw_runtime import StubRuntime
-from workers_projects_runtime.control_plane import ControlPlaneStore
+from workers_projects_runtime.control_plane import ControlPlaneConflict, ControlPlaneStore
 from workers_projects_runtime.recurrence import (
     due_occurrences_and_next,
     first_occurrence_at,
@@ -25,7 +26,7 @@ from workers_projects_runtime.service import (
     SchedulePrincipalAuthorityError,
     WorkersProjectsService,
 )
-from workers_projects_runtime.store import Store
+from workers_projects_runtime.store import Store, WorkerClosedStoreError
 
 
 def test_delegated_owner_client_uses_scoped_identity_and_internal_route():
@@ -149,11 +150,10 @@ def test_native_daily_recurrence_materializes_latest_occurrence_once_and_persist
             schedule_text="daily at 9 AM",
         )
 
-        def queue_only(worker_id: str, instruction: str, event_type: str = "run.queued") -> dict:
-            assert event_type == "schedule.queued"
-            return store.create_run(worker_id, worker["project_id"], instruction, state="queued")
-
-        service.assign_run = queue_only  # type: ignore[method-assign]
+        # Keep this persistence test deterministic: exercise the real atomic
+        # schedule-to-run reservation while leaving execution to the separate
+        # worker-processor tests.
+        service._ensure_worker_processor = lambda worker_id: None  # type: ignore[method-assign]
 
         first = service.process_due_schedules_once(now_iso="2026-03-09T14:30:00+00:00")
         second = service.process_due_schedules_once(now_iso="2026-03-09T14:30:00+00:00")
@@ -337,6 +337,43 @@ def test_recurring_dispatch_atomically_reuses_one_run_after_crash_boundary(tmp_p
         assert linked is not None
         assert linked["state"] == "queued"
         assert linked["queued_run_id"] == first_run["run_id"]
+    finally:
+        service.shutdown()
+
+
+def test_scheduled_dispatch_cannot_reserve_run_after_workspace_closes(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "native")
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        worker = _worker(store)
+        definition = service.create_recurring_schedule(
+            worker["worker_id"],
+            "Do not run after permanent closure.",
+            recurrence_type="once",
+            starts_at="2027-01-02T03:04:05+00:00",
+        )
+        schedule = store.materialize_recurring_schedule_occurrence(
+            definition["definition_id"],
+            expected_next_run_at="2027-01-02T03:04:05+00:00",
+            scheduled_for="2027-01-02T03:04:05+00:00",
+            next_run_at="2027-01-02T03:04:05+00:00",
+            detected_at="2027-01-02T03:04:05+00:00",
+            deactivate_after=True,
+        )
+        assert schedule is not None
+        assert store.claim_schedule(schedule["schedule_id"]) is not None
+        store.update_worker_state(worker["worker_id"], "terminated")
+
+        with pytest.raises(WorkerClosedStoreError, match="closed"):
+            store.create_or_get_run_for_schedule(schedule["schedule_id"])
+
+        assert store.list_runs_for_worker(worker["worker_id"]) == []
+        unlinked = store.get_schedule(schedule["schedule_id"])
+        assert unlinked is not None
+        assert unlinked["state"] == "running"
+        assert unlinked["queued_run_id"] is None
     finally:
         service.shutdown()
 
@@ -1030,6 +1067,216 @@ def test_delegated_creation_compensates_when_principal_is_disabled_during_owner_
         service.shutdown()
 
 
+def test_delegated_creation_compensates_when_workspace_closes_during_owner_call(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "scheduling_cortex")
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+
+    class OwnerClient:
+        def __init__(self) -> None:
+            self.actions = []
+
+        def call(self, action, payload, *, identity):
+            self.actions.append(action)
+            if action == "create":
+                worker = store.list_all_workers()[0]
+                store.update_worker_state(worker["worker_id"], "terminating")
+                return {
+                    **payload,
+                    "tenant_id": identity.tenant_id,
+                    "owner_id": identity.owner_id,
+                    "active": True,
+                }
+            if action == "deactivate":
+                return {**payload, "active": False}
+            raise AssertionError(action)
+
+    owner_client = OwnerClient()
+    service = WorkersProjectsService(store, StubRuntime(), scheduling_owner_client=owner_client)
+    try:
+        worker = _worker(store)
+
+        with pytest.raises(ControlPlaneConflict, match="closed"):
+            service.create_recurring_schedule(
+                worker["worker_id"],
+                "Do not leave this delegated definition active.",
+                recurrence_type="interval",
+                interval_seconds=3600,
+                timezone_name="UTC",
+                first_run_at="2027-01-02T03:04:05+00:00",
+            )
+
+        assert owner_client.actions == ["create", "deactivate"]
+    finally:
+        service.shutdown()
+
+
+def test_delegated_creation_cleanup_failure_after_close_is_durable_and_retryable(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "scheduling_cortex")
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+
+    class OwnerClient:
+        def __init__(self) -> None:
+            self.create_started = Event()
+            self.release_create = Event()
+            self.fail_deactivate = True
+            self.active: set[str] = set()
+
+        def call(self, action, payload, *, identity):
+            _ = identity
+            if action == "create":
+                self.create_started.set()
+                assert self.release_create.wait(timeout=3)
+                self.active.add(str(payload["definition_id"]))
+                return {**payload, "active": True}
+            if action == "list":
+                return [
+                    {
+                        "definition_id": definition_id,
+                        "worker_id": payload["worker_id"],
+                        "active": True,
+                    }
+                    for definition_id in sorted(self.active)
+                ]
+            if action == "deactivate":
+                if self.fail_deactivate:
+                    raise RuntimeError("synthetic compensation unavailable")
+                self.active.discard(str(payload["definition_id"]))
+                return {"definition_id": payload["definition_id"], "active": False}
+            raise AssertionError(action)
+
+    owner_client = OwnerClient()
+    service = WorkersProjectsService(
+        store,
+        StubRuntime(),
+        scheduling_owner_client=owner_client,
+    )
+    worker = _worker(store)
+    errors: list[BaseException] = []
+
+    def create() -> None:
+        try:
+            service.create_recurring_schedule(
+                worker["worker_id"],
+                "Do not survive workspace closure.",
+                recurrence_type="interval",
+                interval_seconds=3600,
+                timezone_name="UTC",
+                first_run_at="2027-01-02T03:04:05+00:00",
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    create_thread = Thread(target=create)
+    create_thread.start()
+    try:
+        assert owner_client.create_started.wait(timeout=2)
+        assert service.terminate_worker(worker["worker_id"])["state"] == "terminated"
+        owner_client.release_create.set()
+        create_thread.join(timeout=3)
+
+        assert not create_thread.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], ControlPlaneConflict)
+        assert owner_client.active
+        assert store.get_worker(worker["worker_id"])["state"] == "termination_failed"
+
+        owner_client.fail_deactivate = False
+        assert service.terminate_worker(worker["worker_id"])["state"] == "terminated"
+        assert owner_client.active == set()
+    finally:
+        owner_client.release_create.set()
+        create_thread.join(timeout=1)
+        service.shutdown()
+
+
+def test_close_deactivates_all_delegated_workspace_schedules(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "scheduling_cortex")
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+
+    class OwnerClient:
+        def __init__(self) -> None:
+            self.active = {"rsd_one", "rsd_two"}
+            self.actions: list[tuple[str, str]] = []
+
+        def call(self, action, payload, *, identity):
+            self.actions.append((action, str(payload.get("definition_id") or "")))
+            if action == "list":
+                return [
+                    {"definition_id": definition_id, "worker_id": payload["worker_id"], "active": True}
+                    for definition_id in sorted(self.active)
+                ]
+            if action == "deactivate":
+                self.active.discard(str(payload["definition_id"]))
+                return {"definition_id": payload["definition_id"], "active": False}
+            raise AssertionError(action)
+
+    owner_client = OwnerClient()
+    service = WorkersProjectsService(store, StubRuntime(), scheduling_owner_client=owner_client)
+    try:
+        worker = _worker(store)
+        closed = service.terminate_worker(worker["worker_id"])
+
+        assert closed["state"] == "terminated"
+        assert owner_client.active == set()
+        assert owner_client.actions == [
+            ("list", ""),
+            ("deactivate", "rsd_one"),
+            ("deactivate", "rsd_two"),
+        ]
+    finally:
+        service.shutdown()
+
+
+def test_delegated_close_cleanup_failure_stays_closed_and_retries(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "scheduling_cortex")
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+
+    class OwnerClient:
+        def __init__(self) -> None:
+            self.fail = True
+            self.active = {"rsd_retry"}
+
+        def call(self, action, payload, *, identity):
+            if self.fail:
+                raise RuntimeError("synthetic delegated owner unavailable")
+            if action == "list":
+                return [
+                    {"definition_id": definition_id, "worker_id": payload["worker_id"], "active": True}
+                    for definition_id in sorted(self.active)
+                ]
+            if action == "deactivate":
+                self.active.discard(str(payload["definition_id"]))
+                return {"definition_id": payload["definition_id"], "active": False}
+            raise AssertionError(action)
+
+    owner_client = OwnerClient()
+    service = WorkersProjectsService(store, StubRuntime(), scheduling_owner_client=owner_client)
+    try:
+        worker = _worker(store)
+        with pytest.raises(RuntimeError, match="synthetic delegated owner unavailable"):
+            service.terminate_worker(worker["worker_id"])
+        assert store.get_worker(worker["worker_id"])["state"] == "termination_failed"
+        with pytest.raises(ControlPlaneConflict, match="closed"):
+            service.assign_run(worker["worker_id"], "Do not run while cleanup is pending.")
+
+        owner_client.fail = False
+        retried = service.terminate_worker(worker["worker_id"])
+        assert retried["state"] == "terminated"
+        assert owner_client.active == set()
+    finally:
+        service.shutdown()
+
+
 def test_standalone_multi_user_deployment_can_select_native_owner_with_fire_revalidation(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
     monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "glasshive_native")
@@ -1212,6 +1459,44 @@ def test_manual_run_now_disable_after_revalidation_cannot_create_occurrence(tmp_
                 idempotency_token="manual-disable-race",
             )
         assert store.list_schedules_for_worker(worker["worker_id"]) == []
+    finally:
+        service.shutdown()
+
+
+def test_manual_run_now_losing_race_to_workspace_close_creates_no_occurrence(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "glasshive_native")
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    try:
+        worker = _worker(store)
+        definition = service.create_recurring_schedule(
+            worker["worker_id"],
+            "Do not materialize after closure wins.",
+            recurrence_type="interval",
+            interval_seconds=3600,
+            first_run_at="2027-01-02T03:04:05+00:00",
+        )
+        original_create = store.create_recurring_schedule_run_now
+
+        def close_then_create(*args, **kwargs):
+            store.update_worker_state(worker["worker_id"], "terminating")
+            return original_create(*args, **kwargs)
+
+        monkeypatch.setattr(store, "create_recurring_schedule_run_now", close_then_create)
+
+        with pytest.raises(ControlPlaneConflict, match="closed"):
+            service.run_recurring_schedule_now(
+                definition["definition_id"],
+                tenant_id="tenant-one",
+                owner_id="owner-one",
+                idempotency_token="manual-close-race",
+            )
+
+        assert store.list_schedules_for_worker(worker["worker_id"], include_done=True) == []
+        assert store.list_recurring_schedule_occurrences(
+            definition["definition_id"], tenant_id="tenant-one", owner_id="owner-one"
+        ) == []
     finally:
         service.shutdown()
 

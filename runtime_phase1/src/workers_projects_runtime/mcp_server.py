@@ -116,6 +116,13 @@ class GlassHiveBlockedError(RuntimeError):
         self.payload = payload
 
 
+class GlassHiveApiError(RuntimeError):
+    def __init__(self, status_code: int, detail: str) -> None:
+        clean_detail = str(detail or "GlassHive rejected the request").strip()[:1000]
+        super().__init__(clean_detail or "GlassHive rejected the request")
+        self.status_code = int(status_code)
+
+
 def _blocking_wait_max_seconds() -> float:
     return max(0.0, float(os.environ.get("WPR_MCP_BLOCKING_WAIT_MAX_SEC", "45") or "45"))
 
@@ -2282,6 +2289,9 @@ class WorkersProjectsApiClient:
                     payload = {}
                 if isinstance(payload, dict) and payload.get("failure_class"):
                     raise GlassHiveBlockedError(payload)
+                detail = payload.get("detail") if isinstance(payload, dict) else None
+                if 400 <= response.status_code < 500 and isinstance(detail, str) and detail.strip():
+                    raise GlassHiveApiError(response.status_code, detail)
             response.raise_for_status()
             if response.headers.get("content-type", "").startswith("application/json"):
                 return response.json()
@@ -2521,7 +2531,7 @@ class WorkersProjectsApiClient:
             if not project_id:
                 continue
             for worker in self.list_workers(project_id):
-                if worker.get("state") == "terminated":
+                if str(worker.get("state") or "") in {"terminating", "termination_failed", "terminated"}:
                     continue
                 if execution_mode and worker.get("execution_mode") and worker.get("execution_mode") != execution_mode:
                     continue
@@ -4308,7 +4318,7 @@ def create_mcp_server(
         name="worker_find_or_resume",
         title="Find Or Resume Worker",
         description=(
-            "Find an existing non-terminated worker by alias for a project/owner, or create one. "
+            "Find an existing open worker by alias for a project/owner, or create one. "
             "Omit execution_mode to use the configured default. Set execution_mode='host' only when GlassHive instructions say host-native workers are enabled and the task depends on the user's real computer/session: signed-in browser profile, desktop apps, local files/projects, installed CLIs, or OS/window control. "
             "Use execution_mode='docker' for isolated sandbox, disposable browser, or risky untrusted work. "
             "Do not use for fresh one-off tasks when worker_delegate_once can create/resume and queue the run in one call. "
@@ -5038,7 +5048,9 @@ def create_mcp_server(
                 _header_value(_request_headers(), HEADER_SURFACE),
             )
         run_state = str((effective_run or {}).get("state") or "").strip() or None
-        worker_state = str((worker or {}).get("state") or "").strip() or None
+        worker_state = str(
+            (worker or {}).get("close_state") or (worker or {}).get("state") or ""
+        ).strip() or None
         terminal = bool(effective_run and _terminal_run_state(effective_run))
         failure_payload = _run_failure_payload(effective_run)
         artifact_links: dict[str, Any] | None = None

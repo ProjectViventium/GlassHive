@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import sqlite3
+
 from fastapi.testclient import TestClient
 
 from workers_projects_runtime.api import create_app
 from workers_projects_runtime.control_plane import ControlPlaneStore
+from workers_projects_runtime.store import Store
 
 
 def _workspace(client: TestClient, *, profile: str = "codex-cli") -> dict:
@@ -152,6 +155,56 @@ def test_workspace_account_switch_revalidates_profile_status_and_active_lease(tm
     )
     assert stale.status_code == 409
     assert "reconnected" in stale.json()["detail"].lower()
+
+
+def test_workspace_account_switch_rejects_closed_workspace_before_and_after_review(tmp_path, monkeypatch):
+    database = tmp_path / "runtime.db"
+    client = TestClient(create_app(db_path=str(database), runtime_backend="stub"))
+    workspace = _workspace(client)
+    store = ControlPlaneStore(str(database))
+    account = _ready_account(store)
+    request = {
+        "change_type": "workspace_provider_account",
+        "target_id": workspace["worker_id"],
+        "payload": {"policy": "personal_required", "account_id": account["account_id"]},
+    }
+
+    prepared = client.post("/v1/pending-changes", json=request)
+    assert prepared.status_code == 201
+    Store(str(database)).update_worker_state(workspace["worker_id"], "termination_failed")
+
+    confirm = client.post(
+        f"/v1/pending-changes/{prepared.json()['change_id']}/confirm",
+        json={"confirmation_token": prepared.json()["confirmation_token"]},
+    )
+    assert confirm.status_code == 409
+    assert confirm.json()["detail"] == "Workspace is closed; create a new workspace for new work"
+
+    rejected = client.post("/v1/pending-changes", json=request)
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"] == "Workspace is closed; create a new workspace for new work"
+
+    racing_workspace = _workspace(client)
+    racing_request = {**request, "target_id": racing_workspace["worker_id"]}
+    control_plane = client.app.state.control_plane
+    original_create = control_plane.create_pending_change
+
+    def close_before_reservation(**kwargs):
+        Store(str(database)).update_worker_state(
+            racing_workspace["worker_id"], "termination_failed"
+        )
+        return original_create(**kwargs)
+
+    monkeypatch.setattr(control_plane, "create_pending_change", close_before_reservation)
+    raced = client.post("/v1/pending-changes", json=racing_request)
+    assert raced.status_code == 409
+    assert raced.json()["detail"] == "Workspace is closed; create a new workspace for new work"
+    with sqlite3.connect(database) as conn:
+        pending_count = conn.execute(
+            "SELECT COUNT(*) FROM control_plane_pending_changes WHERE target_id = ?",
+            (racing_workspace["worker_id"],),
+        ).fetchone()[0]
+    assert pending_count == 0
 
 
 def test_workspace_account_switch_does_not_leak_cross_owner_accounts(tmp_path, monkeypatch):
