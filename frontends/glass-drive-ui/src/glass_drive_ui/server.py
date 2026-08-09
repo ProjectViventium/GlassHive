@@ -72,6 +72,8 @@ RUNTIME_ENV_KEYS = {
     "GLASSHIVE_HUMAN_AUTH_MODE",
     "GLASSHIVE_ALLOW_EMAIL_LOGIN",
     "GLASSHIVE_ALLOW_EMAIL_REGISTRATION",
+    "GLASSHIVE_PROVIDER_EMAIL_LOGIN",
+    "GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT",
     "GLASSHIVE_ALLOWED_EMAIL_DOMAINS",
     "GLASSHIVE_ALLOWED_ORIGINS",
     "GLASSHIVE_AUTH_STATE_PATH",
@@ -1374,12 +1376,15 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
 
     @app.get("/auth/config")
     def auth_config() -> dict[str, object]:
+        provider_email_login = human_auth.mode == "oidc" and human_auth.provider_email_login
         return {
             "mode": human_auth.mode,
-            "email_login": human_auth.mode == "oidc" and _truthy_env("GLASSHIVE_ALLOW_EMAIL_LOGIN"),
-            "email_registration": (
-                human_auth.mode == "oidc" and _truthy_env("GLASSHIVE_ALLOW_EMAIL_REGISTRATION")
-            ),
+            # Keep the two legacy keys for older login assets, but do not claim
+            # GlassHive itself creates identity-provider accounts.
+            "email_login": provider_email_login,
+            "email_registration": False,
+            "provider_email_login": provider_email_login,
+            "principal_enrollment": human_auth.mode == "oidc" and human_auth.allow_registration,
             "identity_owner": "external_provider",
             "oidc": human_auth.mode == "oidc",
         }

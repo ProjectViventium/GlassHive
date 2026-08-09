@@ -115,6 +115,8 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "GLASSHIVE_INTERNAL_ASSERTION_PREVIOUS_KEYS_EXPIRE_AT",
         "GLASSHIVE_HUMAN_AUTH_MODE",
         "GLASSHIVE_AUTH_STATE_PATH",
+        "GLASSHIVE_PROVIDER_EMAIL_LOGIN",
+        "GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT",
         "GLASSHIVE_ALLOW_EMAIL_LOGIN",
         "GLASSHIVE_ALLOW_EMAIL_REGISTRATION",
         "GLASSHIVE_ALLOWED_EMAIL_DOMAINS",
@@ -4539,7 +4541,7 @@ def test_main_ui_exposes_current_user_and_explicit_account_logout_actions():
     assert "'X-GlassHive-CSRF': csrfToken" in script
 
 
-def test_oidc_identity_owner_advertises_configured_email_login_and_registration(
+def test_oidc_identity_owner_advertises_provider_email_login_with_closed_enrollment(
     tmp_path,
     monkeypatch,
 ):
@@ -4551,8 +4553,10 @@ def test_oidc_identity_owner_advertises_configured_email_login_and_registration(
         "GLASSHIVE_OIDC_REDIRECT_URI",
         "https://glasshive.example.test/auth/oidc/callback",
     )
-    monkeypatch.setenv("GLASSHIVE_ALLOW_EMAIL_LOGIN", "true")
+    monkeypatch.setenv("GLASSHIVE_ALLOW_EMAIL_LOGIN", "false")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_EMAIL_LOGIN", "true")
     monkeypatch.setenv("GLASSHIVE_ALLOW_EMAIL_REGISTRATION", "true")
+    monkeypatch.setenv("GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT", "false")
     client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
 
     config = client.get("/auth/config")
@@ -4562,11 +4566,17 @@ def test_oidc_identity_owner_advertises_configured_email_login_and_registration(
     assert config.json() == {
         "mode": "oidc",
         "email_login": True,
-        "email_registration": True,
+        "email_registration": False,
+        "provider_email_login": True,
+        "principal_enrollment": False,
         "identity_owner": "external_provider",
         "oidc": True,
     }
     assert "Continue with email or organization" in auth_script
+    assert "create an account if needed" not in auth_script
+    assert "provisioned by an administrator" in auth_script
+    assert client.get("/auth/email/login").status_code == 404
+    assert client.get("/auth/email/register").status_code == 404
 
 
 class _FakeOidcHumanAuth:

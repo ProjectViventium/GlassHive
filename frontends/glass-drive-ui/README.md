@@ -51,6 +51,37 @@ Env:
   `gh_token`, bearer tokens, service-token headers, and artifact signed-link paths before logs leave
   the VM.
 
+## Hosted human authentication
+
+Hosted multi-user GlassHive uses the configured OIDC provider for both organization SSO and, when
+the provider supports it, provider-hosted email/password login. GlassHive never receives or stores
+the password and exposes no public sign-up route.
+
+- `GLASSHIVE_HUMAN_AUTH_MODE=oidc` enables the existing Authorization Code + PKCE gateway.
+- `GLASSHIVE_PROVIDER_EMAIL_LOGIN=true` truthfully labels the same provider redirect as supporting
+  email or organization login. It does not enable a GlassHive password form.
+- `GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT=false` keeps first-login principal creation closed.
+- `GLASSHIVE_ALLOW_EMAIL_LOGIN` and `GLASSHIVE_ALLOW_EMAIL_REGISTRATION` remain compatibility
+  aliases for one release; new deployments should use the canonical keys above.
+
+With enrollment closed, an administrator preapproves the provider's exact immutable subject. Have
+the deployment secret manager write the JSON to an operator-only file or file descriptor; do not
+place the JSON in the command line or shell history. For a short-lived file:
+
+```bash
+umask 077
+sudo /opt/viventium/current/deploy/glasshive/systemd/glasshive_auth_admin.py \
+  preapprove-oidc --stdin-json < /run/private/glasshive-principal.json
+```
+
+The JSON object contains `subject`, optional display-only `email` and `display_name`, and `role`.
+The installed wrapper selects the sealed active-release interpreter and executes a transient,
+hardened one-shot unit under the gateway identity with both reviewed gateway EnvironmentFiles.
+Output contains only the opaque GlassHive user ID. Delete only that exact temporary input after the
+command returns; the secret manager may instead supply an already-ephemeral descriptor. It fails
+with retry guidance while a rollout holds the shared mutation lock. Never infer or merge principals
+by email; issuer + subject is the durable ownership key shared with MCP.
+
 ## Public-link-only mode
 
 Set `GLASSHIVE_PUBLIC_LINKS_ONLY=true` when this UI endpoint should expose only health/static

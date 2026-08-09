@@ -310,6 +310,123 @@ def test_closed_registration_accepts_existing_oidc_principal_only(tmp_path, monk
     assert denied.value.code == "account_not_registered"
 
 
+def test_admin_preapproval_uses_configured_issuer_and_immutable_subject(
+    tmp_path,
+    monkeypatch,
+):
+    configure_oidc(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_ALLOW_EMAIL_REGISTRATION", "true")
+    monkeypatch.setenv("GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT", "false")
+    gateway = HumanAuthGateway.from_env()
+
+    preapproved = gateway.preapprove_oidc_principal(
+        subject="stable-object-id",
+        email="member@example.invalid",
+        display_name="Example Member",
+        role="member",
+    )
+    repeated = gateway.preapprove_oidc_principal(
+        subject="stable-object-id",
+        email="renamed@example.invalid",
+        display_name="Renamed Member",
+        role="viewer",
+    )
+    reconciled = gateway.reconcile_oidc_principal(
+        issuer="https://identity.example.invalid",
+        subject="stable-object-id",
+        email="renamed@example.invalid",
+        display_name="Renamed Member",
+        role="viewer",
+    )
+
+    assert gateway.allow_registration is False
+    assert preapproved["user_id"] == repeated["user_id"] == reconciled["user_id"]
+    assert repeated["role"] == "viewer"
+    with sqlite3.connect(gateway.state_path) as conn:
+        row = conn.execute(
+            "SELECT issuer, subject FROM auth_principals WHERE user_id = ?",
+            (preapproved["user_id"],),
+        ).fetchone()
+    assert row == ("https://identity.example.invalid", "stable-object-id")
+
+
+def test_admin_preapproval_never_merges_distinct_subjects_by_email(tmp_path, monkeypatch):
+    configure_oidc(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT", "false")
+    gateway = HumanAuthGateway.from_env()
+
+    first = gateway.preapprove_oidc_principal(
+        subject="first-object-id",
+        email="shared@example.invalid",
+        display_name="First Member",
+        role="member",
+    )
+    second = gateway.preapprove_oidc_principal(
+        subject="second-object-id",
+        email="shared@example.invalid",
+        display_name="Second Member",
+        role="member",
+    )
+
+    assert first["user_id"] != second["user_id"]
+    with sqlite3.connect(gateway.state_path) as conn:
+        assert conn.execute("SELECT count(*) FROM auth_principals").fetchone() == (2,)
+
+
+@pytest.mark.parametrize(
+    ("subject", "role", "message"),
+    [
+        ("", "member", "stable subject"),
+        ("bad\nsubject", "member", "stable subject"),
+        ("x" * 513, "member", "stable subject"),
+        ("stable-object-id", "owner", "approved GlassHive role"),
+    ],
+)
+def test_admin_preapproval_rejects_invalid_immutable_identity(
+    tmp_path,
+    monkeypatch,
+    subject,
+    role,
+    message,
+):
+    configure_oidc(tmp_path, monkeypatch)
+    gateway = HumanAuthGateway.from_env()
+
+    with pytest.raises(AuthGatewayError, match=message):
+        gateway.preapprove_oidc_principal(
+            subject=subject,
+            email="member@example.invalid",
+            display_name="Example Member",
+            role=role,
+        )
+
+
+def test_provider_email_and_principal_enrollment_settings_use_canonical_precedence(
+    tmp_path,
+    monkeypatch,
+):
+    configure_oidc(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_ALLOW_EMAIL_LOGIN", "false")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_EMAIL_LOGIN", "true")
+    monkeypatch.setenv("GLASSHIVE_ALLOW_EMAIL_REGISTRATION", "true")
+    monkeypatch.setenv("GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT", "false")
+
+    gateway = HumanAuthGateway.from_env()
+
+    assert gateway.provider_email_login is True
+    assert gateway.allow_registration is False
+
+
+def test_admin_preapproval_requires_the_configured_oidc_gateway(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_HUMAN_AUTH_MODE", "disabled")
+    monkeypatch.setenv("GLASSHIVE_AUTH_STATE_PATH", str(tmp_path / "auth.sqlite3"))
+    monkeypatch.setenv("GLASSHIVE_OIDC_ISSUER", "https://identity.example.invalid")
+    gateway = HumanAuthGateway.from_env()
+
+    with pytest.raises(AuthGatewayError, match="OIDC issuer is unavailable"):
+        gateway.preapprove_oidc_principal(subject="stable-object-id")
+
+
 def test_provider_logout_requires_registered_post_logout_uri(tmp_path, monkeypatch):
     configure_oidc(tmp_path, monkeypatch)
     monkeypatch.setenv(

@@ -35,6 +35,12 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value in {"1", "true", "yes", "on", "enabled"}
 
 
+def _canonical_env_bool(name: str, legacy_name: str, default: bool = False) -> bool:
+    if str(os.environ.get(name) or "").strip():
+        return _env_bool(name, default)
+    return _env_bool(legacy_name, default)
+
+
 def _default_state_path() -> Path:
     configured = str(os.environ.get("GLASSHIVE_AUTH_STATE_PATH") or "").strip()
     if configured:
@@ -121,7 +127,14 @@ class HumanAuthGateway:
         ).strip()
         self.oidc_email_claim = str(os.environ.get("GLASSHIVE_OIDC_EMAIL_CLAIM") or "email").strip()
         self.oidc_email_claim_trusted = _env_bool("GLASSHIVE_OIDC_EMAIL_CLAIM_TRUSTED")
-        self.allow_registration = _env_bool("GLASSHIVE_ALLOW_EMAIL_REGISTRATION")
+        self.allow_registration = _canonical_env_bool(
+            "GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT",
+            "GLASSHIVE_ALLOW_EMAIL_REGISTRATION",
+        )
+        self.provider_email_login = _canonical_env_bool(
+            "GLASSHIVE_PROVIDER_EMAIL_LOGIN",
+            "GLASSHIVE_ALLOW_EMAIL_LOGIN",
+        )
         self.oidc_post_logout_redirect_uri = str(
             os.environ.get("GLASSHIVE_OIDC_POST_LOGOUT_REDIRECT_URI") or ""
         ).strip()
@@ -314,6 +327,62 @@ class HumanAuthGateway:
             ).fetchone()
         assert row is not None
         return self._principal_payload(row)
+
+    def preapprove_oidc_principal(
+        self,
+        *,
+        subject: str,
+        email: str = "",
+        display_name: str = "",
+        role: str = "member",
+    ) -> dict[str, str]:
+        """Idempotently admit one exact external identity without opening enrollment.
+
+        The immutable provider subject is the only ownership key. Email remains
+        display metadata and is deliberately never used to find or merge users.
+        """
+        normalized_subject = str(subject or "").strip()
+        if (
+            not normalized_subject
+            or len(normalized_subject) > 512
+            or any(ord(character) < 32 or ord(character) == 127 for character in normalized_subject)
+        ):
+            raise AuthGatewayError("Enter the provider's exact stable subject")
+        normalized_role = str(role or "").strip()
+        if normalized_role not in HUMAN_ROLES:
+            raise AuthGatewayError("Choose an approved GlassHive role")
+        if self.mode != "oidc" or not self.oidc_issuer:
+            raise AuthGatewayError("OIDC issuer is unavailable", code="provider_configuration")
+        existing = self.find_oidc_principal(issuer=self.oidc_issuer, subject=normalized_subject)
+        if existing is not None and self._principal_disabled(
+            issuer=self.oidc_issuer,
+            subject=normalized_subject,
+        ):
+            raise AuthGatewayError(
+                "Account is disabled; use the approved re-enable workflow",
+                code="account_disabled",
+            )
+        principal = self.upsert_oidc_principal(
+            issuer=self.oidc_issuer,
+            subject=normalized_subject,
+            email=email,
+            display_name=display_name,
+            role=normalized_role,
+        )
+        if self._principal_disabled(issuer=self.oidc_issuer, subject=normalized_subject):
+            raise AuthGatewayError(
+                "Account is disabled; use the approved re-enable workflow",
+                code="account_disabled",
+            )
+        return principal
+
+    def _principal_disabled(self, *, issuer: str, subject: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT disabled_at FROM auth_principals WHERE issuer = ? AND subject = ?",
+                (str(issuer).strip().rstrip("/"), str(subject).strip()),
+            ).fetchone()
+        return row is not None and row["disabled_at"] is not None
 
     def find_oidc_principal(self, *, issuer: str, subject: str) -> dict[str, str] | None:
         normalized_issuer = str(issuer or "").strip().rstrip("/")

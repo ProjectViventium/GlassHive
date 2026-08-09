@@ -605,6 +605,75 @@ def test_mcp_oauth_rejects_invalid_registration_policy(monkeypatch):
         oauth_from_env()
 
 
+def test_mcp_canonical_closed_enrollment_rejects_unknown_subject(
+    tmp_path,
+    monkeypatch,
+    signing_material,
+):
+    private_key, public_jwk = signing_material
+    state_path = tmp_path / "auth.sqlite3"
+    create_auth_state(state_path)
+
+    def fake_get(url, **kwargs):
+        if url == f"{ISSUER}/.well-known/openid-configuration":
+            return FakeResponse({"issuer": ISSUER, "jwks_uri": f"{ISSUER}/jwks"})
+        if url == f"{ISSUER}/jwks":
+            return FakeResponse({"keys": [public_jwk]})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(oauth_module.httpx, "get", fake_get)
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", TENANT)
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ISSUER", ISSUER)
+    monkeypatch.setenv("GLASSHIVE_OIDC_ISSUER", ISSUER)
+    monkeypatch.setenv("GLASSHIVE_MCP_PUBLIC_URL", RESOURCE)
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES", AUTHORIZATION_SCOPE)
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_SCOPES", TOKEN_SCOPE)
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES", TOKEN_AUDIENCE)
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_TENANT_ID", TENANT)
+    monkeypatch.setenv("GLASSHIVE_OIDC_PRINCIPAL_CLAIM", "sub")
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS", "mcp-public-client")
+    monkeypatch.setenv("GLASSHIVE_OIDC_ROLE_MAP_JSON", '{"GlassHive.Member":"member"}')
+    monkeypatch.setenv("GLASSHIVE_AUTH_STATE_PATH", str(state_path))
+    monkeypatch.setenv("GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT", "false")
+    monkeypatch.setenv("GLASSHIVE_ALLOW_EMAIL_REGISTRATION", "true")
+
+    verifier, _settings = oauth_from_env()
+    access = asyncio.run(
+        verifier.verify_token(token(private_key, roles=["GlassHive.Member"]))
+    )
+
+    assert verifier.allow_registration is False
+    assert access is None
+    with sqlite3.connect(state_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM auth_principals").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("canonical", "legacy", "expected"),
+    [
+        ("true", "false", True),
+        ("false", "true", False),
+        (None, "false", False),
+    ],
+)
+def test_mcp_enrollment_policy_uses_canonical_then_legacy(
+    monkeypatch,
+    canonical,
+    legacy,
+    expected,
+):
+    if canonical is not None:
+        monkeypatch.setenv("GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT", canonical)
+    monkeypatch.setenv("GLASSHIVE_ALLOW_EMAIL_REGISTRATION", legacy)
+
+    assert oauth_module._canonical_boolean_env(
+        "GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT",
+        "GLASSHIVE_ALLOW_EMAIL_REGISTRATION",
+        default=False,
+    ) is expected
+
+
 def test_entra_v2_request_scope_is_distinct_from_access_token_scope(
     tmp_path,
     monkeypatch,
@@ -634,6 +703,7 @@ def test_entra_v2_request_scope_is_distinct_from_access_token_scope(
     monkeypatch.setenv("GLASSHIVE_OIDC_PRINCIPAL_CLAIM", "oid")
     monkeypatch.setenv("GLASSHIVE_PRINCIPAL_ID_FORMAT", "hashed_issuer_subject")
     monkeypatch.setenv("GLASSHIVE_AUTH_STATE_PATH", str(state_path))
+    monkeypatch.setenv("GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT", "true")
 
     verifier, settings = oauth_from_env()
     accepted = asyncio.run(
