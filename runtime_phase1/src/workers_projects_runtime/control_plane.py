@@ -43,7 +43,13 @@ PROFILE_ACCOUNT_PROVIDERS = {
     "claude-code": {"claude", "anthropic"},
 }
 WORKSPACE_ACCOUNT_POLICIES = {"legacy", "personal_preferred", "personal_required"}
-ACCOUNT_SWITCH_BLOCKED_WORKER_STATES = {"starting", "running", "terminating", "terminated"}
+ACCOUNT_SWITCH_BLOCKED_WORKER_STATES = {
+    "starting",
+    "running",
+    "terminating",
+    "termination_failed",
+    "terminated",
+}
 
 
 class ControlPlaneError(RuntimeError):
@@ -2042,6 +2048,11 @@ class ControlPlaneStore:
         now = time.time()
         pending_payload = dict(payload)
         with self._connect() as conn:
+            # The target-state check and pending-change reservation are one
+            # linearized decision. Close may win before this transaction (and
+            # the preparation is rejected), or after it (and confirmation is
+            # rejected), but it cannot slip between the check and INSERT.
+            conn.execute("BEGIN IMMEDIATE")
             if str(change_type).strip() in {"workspace_grant", "library_enable", "library_upgrade"}:
                 library_id = str(pending_payload.get("library_id") or "").strip()
                 if library_id:
@@ -2149,13 +2160,21 @@ class ControlPlaneStore:
             elif str(change_type).strip() == "workspace_provider_account":
                 worker = conn.execute(
                     """
-                    SELECT worker_id, profile FROM workers
+                    SELECT worker_id, profile, state FROM workers
                     WHERE worker_id = ? AND tenant_id = ? AND owner_id = ?
                     """,
                     (str(target_id), tenant_id, owner_id),
                 ).fetchone()
                 if worker is None:
                     raise ControlPlaneError("Target workspace is no longer available for this user")
+                if str(worker["state"] or "") in {
+                    "terminating",
+                    "termination_failed",
+                    "terminated",
+                }:
+                    raise ControlPlaneConflict(
+                        "Workspace is closed; create a new workspace for new work"
+                    )
                 policy = str(pending_payload.get("policy") or "").strip().lower()
                 account_id = str(pending_payload.get("account_id") or "").strip()
                 if policy not in WORKSPACE_ACCOUNT_POLICIES:
@@ -2512,6 +2531,10 @@ class ControlPlaneStore:
                     raise ControlPlaneError("Target workspace is no longer available for this user")
                 worker_state = str(worker["state"] or "").strip().lower()
                 if worker_state in ACCOUNT_SWITCH_BLOCKED_WORKER_STATES:
+                    if worker_state in {"terminating", "termination_failed", "terminated"}:
+                        raise ControlPlaneConflict(
+                            "Workspace is closed; create a new workspace for new work"
+                        )
                     raise ControlPlaneConflict(
                         "Pause the workspace and wait for active work to finish before switching accounts"
                     )

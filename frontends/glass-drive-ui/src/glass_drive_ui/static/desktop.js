@@ -24,7 +24,7 @@ let settledDesktopSuppressed = false;
 const ACTIVE_RUN_STATES = new Set(['queued', 'running']);
 const SETTLED_RUN_STATES = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
 const ACTIVE_WORKER_STATES = new Set(['created', 'starting', 'ready', 'running', 'resuming', 'interrupting']);
-const PARKED_WORKER_STATES = new Set(['paused', 'terminated', 'failed']);
+const PARKED_WORKER_STATES = new Set(['paused', 'terminating', 'termination_failed', 'terminated', 'failed']);
 
 function normalizedState(value) {
   return String(value || '').trim().toLowerCase();
@@ -53,7 +53,7 @@ function buildDesktopTitle(workerName, projectTitle) {
 
 function refreshDelayForLiveState(data) {
   if (document.hidden) return 15000;
-  const workerState = normalizedState(data?.worker?.state);
+  const workerState = normalizedState(data?.worker?.close_state || data?.worker?.state);
   const runState = normalizedState(data?.latest_run?.state);
   return ACTIVE_RUN_STATES.has(runState) || ['created', 'starting', 'resuming', 'interrupting'].includes(workerState)
     ? 5000
@@ -66,7 +66,7 @@ function viewHealthHealthy(data) {
 }
 
 function isSettledWorkspaceState(data) {
-  const workerState = normalizedState(data?.worker?.state);
+  const workerState = normalizedState(data?.worker?.close_state || data?.worker?.state);
   const runState = normalizedState(data?.latest_run?.state);
   if (ACTIVE_RUN_STATES.has(runState)) {
     return false;
@@ -81,10 +81,22 @@ function isSettledWorkspaceState(data) {
 }
 
 function settledWorkspaceStatus(data) {
-  const workerState = normalizedState(data?.worker?.state);
+  const workerState = normalizedState(data?.worker?.close_state || data?.worker?.state);
   const runState = normalizedState(data?.latest_run?.state);
   const hasFiles = Boolean(data?.artifacts?.items?.length || data?.deliverable);
 
+  if (['terminating', 'termination_failed', 'terminated'].includes(workerState)) {
+    const closing = workerState === 'terminating';
+    const closeFailed = workerState === 'termination_failed';
+    return {
+      title: closing ? 'Workspace closing' : closeFailed ? 'Close needs attention' : 'Workspace closed',
+      detail: closing
+        ? 'GlassHive is safely stopping this workspace.'
+        : closeFailed
+        ? 'GlassHive could not confirm compute shutdown. Retry Close workspace; new work remains blocked.'
+        : 'This workspace was closed. Return to Workspaces to create new work.',
+    };
+  }
   if (runState === 'completed') {
     return {
       title: 'Workspace complete',
@@ -97,12 +109,6 @@ function settledWorkspaceStatus(data) {
     return {
       title: 'Workspace paused',
       detail: 'Compute is stopped for this workspace. Resume or send follow-up work to reattach a fresh desktop session.',
-    };
-  }
-  if (workerState === 'terminated') {
-    return {
-      title: 'Workspace closed',
-      detail: 'This workspace was closed. Return to Workspaces to create new work.',
     };
   }
   if (['failed', 'cancelled', 'interrupted'].includes(runState) || workerState === 'failed') {

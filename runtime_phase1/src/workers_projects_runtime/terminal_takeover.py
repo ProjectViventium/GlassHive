@@ -8,6 +8,7 @@ import struct
 import subprocess
 import termios
 from dataclasses import dataclass
+from typing import Callable
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -33,7 +34,12 @@ def _set_winsize(fd: int, rows: int, cols: int) -> None:
         return
 
 
-async def bridge_terminal(websocket: WebSocket, target: TerminalTarget) -> None:
+async def bridge_terminal(
+    websocket: WebSocket,
+    target: TerminalTarget,
+    *,
+    should_close: Callable[[], bool] | None = None,
+) -> None:
     await websocket.accept()
     master_fd, slave_fd = pty.openpty()
     process = subprocess.Popen(
@@ -78,10 +84,24 @@ async def bridge_terminal(websocket: WebSocket, target: TerminalTarget) -> None:
                 if data:
                     os.write(master_fd, data.encode())
 
+    async def close_monitor() -> None:
+        while True:
+            await asyncio.sleep(0.2)
+            if should_close and should_close():
+                try:
+                    await websocket.close(code=1008, reason="Workspace closed")
+                except RuntimeError:
+                    pass
+                return
+
     reader_task = asyncio.create_task(reader())
     writer_task = asyncio.create_task(writer())
+    monitor_task = asyncio.create_task(close_monitor()) if should_close else None
     try:
-        done, pending = await asyncio.wait({reader_task, writer_task}, return_when=asyncio.FIRST_COMPLETED)
+        tasks = {reader_task, writer_task}
+        if monitor_task:
+            tasks.add(monitor_task)
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
         for task in done:
@@ -89,7 +109,9 @@ async def bridge_terminal(websocket: WebSocket, target: TerminalTarget) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        for task in (reader_task, writer_task):
+        for task in (reader_task, writer_task, monitor_task):
+            if task is None:
+                continue
             if not task.done():
                 task.cancel()
         try:

@@ -13,6 +13,7 @@ import stat
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread, Timer
@@ -29,7 +30,12 @@ from .deliverables import (
     is_user_deliverable_relative_path,
     is_valid_professional_artifact,
 )
-from .control_plane import PROFILE_ACCOUNT_PROVIDERS, WORKSPACE_ACCOUNT_POLICIES, ControlPlaneStore
+from .control_plane import (
+    PROFILE_ACCOUNT_PROVIDERS,
+    WORKSPACE_ACCOUNT_POLICIES,
+    ControlPlaneConflict,
+    ControlPlaneStore,
+)
 from .failure_classification import classify_runtime_error
 from .models import WorkspaceKind, normalize_workspace_kind, normalize_workspace_tags, utc_now
 from .mission_provider_accounts import mission_provider_account_selection
@@ -64,10 +70,11 @@ from .signed_links import (
     signed_link_ref_url,
     sign_link_token,
 )
-from .store import SchedulePrincipalAuthorityStoreError, Store
+from .store import SchedulePrincipalAuthorityStoreError, Store, WorkerClosedStoreError
 
 
 logger = logging.getLogger(__name__)
+CLOSED_WORKER_STATES = {"terminating", "termination_failed", "terminated"}
 TERMINAL_CALLBACK_MESSAGE_LIMIT = 4000
 FINAL_REPORT_PATTERN = re.compile(
     r"(?mi)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*)?"
@@ -661,6 +668,7 @@ class WorkersProjectsService:
         self._processors_lock = Lock()
         self._active_processors: set[str] = set()
         self._processor_generations: dict[str, int] = {}
+        self._runtime_start_locks: dict[str, Lock] = {}
         self._worker_create_lock = Lock()
         self._deliverable_promotions_lock = Lock()
         self._deliverable_promotions: set[str] = set()
@@ -989,6 +997,10 @@ class WorkersProjectsService:
             self._replay_pending_callbacks()
 
     def _ensure_execution_allowed(self, worker_or_mode: dict | str) -> None:
+        if isinstance(worker_or_mode, dict) and str(worker_or_mode.get("state") or "") in CLOSED_WORKER_STATES:
+            raise ControlPlaneConflict(
+                "Workspace is closed; create a new workspace for new work"
+            )
         execution_mode = (
             str(worker_or_mode.get("execution_mode") or "docker")
             if isinstance(worker_or_mode, dict)
@@ -998,6 +1010,175 @@ class WorkersProjectsService:
             raise HostWorkersDisabledError(
                 "GlassHive host-native workers are disabled by Viventium config"
             )
+
+    def _runtime_start_lock(self, worker_id: str) -> Lock:
+        with self._processors_lock:
+            return self._runtime_start_locks.setdefault(worker_id, Lock())
+
+    @contextmanager
+    def _runtime_lifecycle_start_guard(self, worker_id: str):
+        """Fence non-run readiness starts against permanent workspace Close."""
+
+        with self._runtime_start_lock(worker_id):
+            current = self.require_worker(worker_id)
+            self._ensure_execution_allowed(current)
+            yield
+
+    def _ensure_worker_ready_with_lifecycle_fence(self, worker: dict) -> RuntimeInfo:
+        worker_id = str(worker["worker_id"])
+
+        def persist_runtime_info(info: RuntimeInfo) -> None:
+            updated = self._apply_runtime_info(
+                worker_id,
+                info,
+                state="starting",
+                last_error="",
+            )
+            if updated and str(updated.get("state") or "") in CLOSED_WORKER_STATES:
+                raise ControlPlaneConflict(
+                    "Workspace is closed; create a new workspace for new work"
+                )
+
+        return self.runtime.ensure_worker_ready(
+            {
+                **worker,
+                "_runtime_start_guard": lambda: self._runtime_lifecycle_start_guard(
+                    worker_id
+                ),
+                "_runtime_info_callback": persist_runtime_info,
+            }
+        )
+
+    def _finalize_worker_ready_after_start(
+        self,
+        worker: dict,
+        info: RuntimeInfo,
+        *,
+        event_type: str,
+        message: str,
+        context: str,
+        emit_callback: bool = False,
+    ) -> dict:
+        worker_id = str(worker["worker_id"])
+        try:
+            with self._runtime_lifecycle_start_guard(worker_id):
+                updated = self._apply_runtime_info(
+                    worker_id,
+                    info,
+                    state="ready",
+                    last_error="",
+                    compute_released_at=None,
+                )
+                if updated and str(updated.get("state") or "") in CLOSED_WORKER_STATES:
+                    raise ControlPlaneConflict(
+                        "Workspace is closed; create a new workspace for new work"
+                    )
+                self.store.add_event(
+                    str(worker["project_id"]),
+                    worker_id,
+                    None,
+                    event_type,
+                    message,
+                )
+                if emit_callback:
+                    self._emit_callback(
+                        updated or worker,
+                        event_type,
+                        message="Worker ready",
+                    )
+                return updated or worker
+        except ControlPlaneConflict:
+            self._reject_closed_after_runtime_activity(
+                worker_id,
+                fallback_worker=worker,
+                context=context,
+            )
+            raise
+
+    @contextmanager
+    def _runtime_execution_start_guard(
+        self,
+        worker_id: str,
+        generation: int,
+        run_id: str,
+    ):
+        """Serialize the real external start boundary with durable Close ownership."""
+
+        with self._runtime_start_lock(worker_id):
+            current = self.store.get_worker(worker_id)
+            run = self.store.get_run(run_id)
+            if (
+                not self._processor_is_current(worker_id, generation)
+                or not current
+                or str(current.get("state") or "") in CLOSED_WORKER_STATES
+                or not run
+                or str(run.get("state") or "") != "running"
+            ):
+                current_state = str((current or {}).get("state") or "")
+                run_state = str((run or {}).get("state") or "")
+                if current and current_state in CLOSED_WORKER_STATES:
+                    try:
+                        self.runtime.terminate_worker(
+                            {**current, "_active_run_id": run_id}
+                        )
+                    except Exception as cleanup_error:
+                        message = public_callback_message_text(str(cleanup_error)) or "Worker close-race cleanup failed"
+                        self.store.record_worker_termination_cleanup_failure(worker_id, message)
+                elif current and (current_state == "paused" or (run and run_state != "running")):
+                    try:
+                        if current_state == "paused":
+                            self.runtime.pause_worker(
+                                {**current, "_active_run_id": run_id}
+                            )
+                        else:
+                            try:
+                                self.runtime.interrupt_worker(current, run_id=run_id)
+                            except TypeError as exc:
+                                if "run_id" not in str(exc):
+                                    raise
+                                self.runtime.interrupt_worker(current)
+                    except Exception:
+                        logger.error(
+                            "Failed to clean up a staged runtime after %s control won for %s",
+                            current_state or run_state or "operator",
+                            worker_id,
+                        )
+                raise WorkerTerminatedError("Workspace was closed before the run could start")
+            yield
+
+    def _reject_closed_after_runtime_activity(
+        self,
+        worker_id: str,
+        *,
+        fallback_worker: dict,
+        active_run_id: str = "",
+        context: str,
+    ) -> dict:
+        """Compensate runtime work that lost a race to permanent workspace closure."""
+
+        current = self.store.get_worker(worker_id) or fallback_worker
+        if str(current.get("state") or "") not in CLOSED_WORKER_STATES:
+            return current
+        try:
+            cleanup_info = self.runtime.terminate_worker(
+                {**current, "_active_run_id": active_run_id}
+            )
+            if cleanup_info.pid:
+                raise RuntimeError(
+                    f"Worker compute is still active after {context} close-race cleanup "
+                    f"(pid={cleanup_info.pid})"
+                )
+        except Exception as cleanup_error:
+            message = public_callback_message_text(str(cleanup_error)) or "Worker close-race cleanup failed"
+            self.store.record_worker_termination_cleanup_failure(worker_id, message)
+            logger.error(
+                "Failed to clean up runtime recreated by %s after workspace close for %s",
+                context,
+                worker_id,
+            )
+        raise ControlPlaneConflict(
+            "Workspace is closed; create a new workspace for new work"
+        )
 
     def _ensure_profile_allowed(self, profile: str) -> None:
         allowed = allowed_worker_profiles()
@@ -1252,7 +1433,7 @@ class WorkersProjectsService:
             url=url,
             payload_json=json.dumps(payload, ensure_ascii=False),
         )
-        if not self._background_consumers_enabled:
+        if not getattr(self, "_background_consumers_enabled", True):
             return
         self.executor.submit(self._deliver_callback_record, dict(worker), record, callbacks)
 
@@ -1585,7 +1766,7 @@ class WorkersProjectsService:
         reaped: list[dict[str, object]] = []
         for worker in self.store.list_all_workers():
             worker_id = str(worker.get("worker_id") or "")
-            if not worker_id or worker.get("state") in {"terminated", "paused", "running", "starting"}:
+            if not worker_id or worker.get("state") in {"terminating", "termination_failed", "terminated", "paused", "running", "starting"}:
                 continue
             if self.store.get_active_run(worker_id) or self.store.has_queued_runs(worker_id):
                 continue
@@ -1819,7 +2000,10 @@ class WorkersProjectsService:
     def _scheduler_loop(self) -> None:
         interval = self._scheduler_interval_s()
         while not self._shutdown_event.wait(interval):
-            self.process_due_schedules_once()
+            try:
+                self.process_due_schedules_once()
+            except Exception:
+                logger.exception("GlassHive scheduler iteration failed; the scheduler will retry")
 
     def _retry_base_delay_s(self, failure_class: str) -> float:
         if failure_class == "host_worker_busy":
@@ -2220,25 +2404,29 @@ class WorkersProjectsService:
             return prepared or self.store.get_worker(worker["worker_id"]) or worker
         self.store.update_worker_state(worker["worker_id"], "starting")
         try:
-            info = self.runtime.ensure_worker_ready(worker)
+            info = self._ensure_worker_ready_with_lifecycle_fence(worker)
         except Exception as exc:
             updated = self.store.update_worker(
                 worker["worker_id"],
                 state="failed",
                 last_error=str(exc),
             )
+            if updated and str(updated.get("state") or "") in CLOSED_WORKER_STATES:
+                self._reject_closed_after_runtime_activity(
+                    worker["worker_id"],
+                    fallback_worker=updated,
+                    context="workspace creation",
+                )
             self.store.add_event(project_id, worker["worker_id"], None, "worker.failed", str(exc))
             return updated or worker
-        updated = self._apply_runtime_info(
-            worker["worker_id"],
+        return self._finalize_worker_ready_after_start(
+            worker,
             info,
-            state="ready",
-            last_error="",
-            compute_released_at=None,
+            event_type="worker.ready",
+            message=f"Worker ready on {info.gateway_url}",
+            context="workspace creation",
+            emit_callback=True,
         )
-        self.store.add_event(project_id, worker["worker_id"], None, "worker.ready", f"Worker ready on {info.gateway_url}")
-        self._emit_callback(updated or worker, "worker.ready", message="Worker ready")
-        return updated or worker
 
     def find_or_create_worker(
         self,
@@ -2268,35 +2456,44 @@ class WorkersProjectsService:
             execution_mode=execution_mode,
             tenant_id=tenant_id,
         )
-        if existing and existing.get("state") != "terminated":
-            if self.store.workspace_gc_claim_active(str(existing.get("worker_id") or "")):
-                raise RuntimeErrorBase("Workspace is being garbage-collected")
-            updates: dict[str, object] = {
-                "name": name,
-                "role": role,
-                "profile": profile,
-                "backend": self._legacy_backend_label(profile, execution_mode, backend),
-                "runtime": self._initial_runtime_label(profile, execution_mode),
-            }
-            if workspace_root is not None:
-                updates["workspace_root"] = workspace_root
-            if bootstrap_profile is not None:
-                updates["bootstrap_profile"] = bootstrap_profile
-            if bootstrap_bundle is not None:
-                updates["bootstrap_bundle_json"] = json.dumps(
-                    merge_bootstrap_bundle(self._bootstrap_bundle_for(existing), bootstrap_bundle)
-                )
-            existing = self.store.update_worker(existing["worker_id"], **updates) or existing
-            self.store.add_event(
-                project_id,
-                existing["worker_id"],
-                None,
-                "worker.resumed_by_alias",
-                f"Reusing worker alias {alias}",
-            )
-            existing = self._refresh_worker_model_for_profile(existing)
-            self._emit_callback(existing, "worker.resumed_by_alias", message=f"Reusing worker alias {alias}")
-            return existing
+        if existing and str(existing.get("state") or "") not in CLOSED_WORKER_STATES:
+            existing_worker_id = str(existing.get("worker_id") or "")
+            with self._runtime_start_lock(existing_worker_id):
+                existing = self.store.get_worker(existing_worker_id) or existing
+                if str(existing.get("state") or "") not in CLOSED_WORKER_STATES:
+                    if self.store.workspace_gc_claim_active(existing_worker_id):
+                        raise RuntimeErrorBase("Workspace is being garbage-collected")
+                    updates: dict[str, object] = {
+                        "name": name,
+                        "role": role,
+                        "profile": profile,
+                        "backend": self._legacy_backend_label(profile, execution_mode, backend),
+                        "runtime": self._initial_runtime_label(profile, execution_mode),
+                    }
+                    if workspace_root is not None:
+                        updates["workspace_root"] = workspace_root
+                    if bootstrap_profile is not None:
+                        updates["bootstrap_profile"] = bootstrap_profile
+                    if bootstrap_bundle is not None:
+                        updates["bootstrap_bundle_json"] = json.dumps(
+                            merge_bootstrap_bundle(self._bootstrap_bundle_for(existing), bootstrap_bundle)
+                        )
+                    existing = self.store.update_worker(existing_worker_id, **updates) or existing
+                    if str(existing.get("state") or "") in CLOSED_WORKER_STATES:
+                        existing = None
+                else:
+                    existing = None
+                if existing is not None:
+                    self.store.add_event(
+                        project_id,
+                        existing["worker_id"],
+                        None,
+                        "worker.resumed_by_alias",
+                        f"Reusing worker alias {alias}",
+                    )
+                    existing = self._refresh_worker_model_for_profile(existing)
+                    self._emit_callback(existing, "worker.resumed_by_alias", message=f"Reusing worker alias {alias}")
+                    return existing
         return self.create_worker(
             project_id=project_id,
             tenant_id=tenant_id,
@@ -2528,6 +2725,45 @@ class WorkersProjectsService:
                 agent_id=str(os.environ.get("VIVENTIUM_MAIN_AGENT_ID") or "scheduling-cortex"),
             ),
         )
+
+    def _deactivate_delegated_schedules_for_closed_worker(self, worker: dict) -> int:
+        """Deactivate every authoritative delegated definition before Close is complete."""
+
+        if self.recurring_schedule_owner() != DELEGATED_RECURRENCE_OWNER:
+            return 0
+        tenant_id = str(worker.get("tenant_id") or "local")
+        owner_id = str(worker.get("owner_id") or "")
+        worker_id = str(worker.get("worker_id") or "")
+        deactivated = 0
+        for _ in range(100):
+            result = self._delegated_schedule_call(
+                "list",
+                {"worker_id": worker_id, "include_inactive": False, "limit": 100},
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
+                raise RuntimeError("Viventium Scheduling Cortex returned invalid schedule data")
+            definition_ids = [
+                str(item.get("definition_id") or "").strip()
+                for item in result
+                if str(item.get("definition_id") or "").strip()
+            ]
+            if not definition_ids:
+                return deactivated
+            for definition_id in definition_ids:
+                response = self._delegated_schedule_call(
+                    "deactivate",
+                    {"definition_id": definition_id},
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                )
+                if not isinstance(response, dict):
+                    raise RuntimeError("Viventium Scheduling Cortex returned invalid schedule data")
+                deactivated += 1
+            if len(definition_ids) < 100:
+                return deactivated
+        raise RuntimeError("Delegated workspace schedule cleanup did not converge")
 
     def list_recurring_schedules(
         self,
@@ -2777,6 +3013,28 @@ class WorkersProjectsService:
                             cleanup_error,
                         )
                 raise
+            try:
+                self._ensure_execution_allowed(self.require_worker(worker_id))
+            except ControlPlaneConflict:
+                definition_id = str(result.get("definition_id") or "")
+                if definition_id:
+                    try:
+                        self._delegated_schedule_call(
+                            "deactivate",
+                            {"definition_id": definition_id},
+                            tenant_id=str(worker.get("tenant_id") or "local"),
+                            owner_id=str(worker.get("owner_id") or ""),
+                        )
+                    except Exception as cleanup_error:
+                        logger.warning(
+                            "Could not compensate delegated schedule creation after workspace closure: %s",
+                            cleanup_error,
+                        )
+                        self.store.record_worker_termination_cleanup_failure(
+                            worker_id,
+                            "Delegated schedule cleanup failed after workspace closure",
+                        )
+                raise
             if runtime_bundle is not None:
                 self.store.update_worker(
                     worker_id,
@@ -2828,6 +3086,8 @@ class WorkersProjectsService:
             )
         except SchedulePrincipalAuthorityStoreError as exc:
             raise SchedulePrincipalAuthorityError(str(exc)) from exc
+        except WorkerClosedStoreError as exc:
+            raise ControlPlaneConflict(str(exc)) from exc
         self.store.add_event(
             str(worker.get("project_id") or ""),
             worker_id,
@@ -2873,6 +3133,23 @@ class WorkersProjectsService:
                 establish=True,
             )
         if self.recurring_schedule_owner() == DELEGATED_RECURRENCE_OWNER:
+            current = self._delegated_schedule_call(
+                "get",
+                {"definition_id": definition_id},
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            current_worker = (
+                self.store.get_worker(
+                    str(current.get("worker_id") or ""),
+                    tenant_id=tenant_id or "local",
+                    owner_id=owner_id,
+                )
+                if isinstance(current, dict)
+                else None
+            )
+            if current_worker:
+                self._ensure_execution_allowed(current_worker)
             result = self._delegated_schedule_call(
                 "update",
                 {"definition_id": definition_id, "updates": updates},
@@ -2899,6 +3176,34 @@ class WorkersProjectsService:
                             "Could not compensate delegated schedule enable after authority revocation: %s",
                             cleanup_error,
                         )
+                    raise
+            if current_worker:
+                latest_worker = self.store.get_worker(
+                    str(current_worker.get("worker_id") or ""),
+                    tenant_id=tenant_id or "local",
+                    owner_id=owner_id,
+                )
+                try:
+                    if latest_worker:
+                        self._ensure_execution_allowed(latest_worker)
+                except ControlPlaneConflict:
+                    if updates.get("enabled") is True:
+                        try:
+                            self._delegated_schedule_call(
+                                "deactivate",
+                                {"definition_id": definition_id},
+                                tenant_id=tenant_id,
+                                owner_id=owner_id,
+                            )
+                        except Exception as cleanup_error:
+                            logger.warning(
+                                "Could not compensate delegated schedule update after workspace close: %s",
+                                cleanup_error,
+                            )
+                            self.store.record_worker_termination_cleanup_failure(
+                                str(current_worker.get("worker_id") or ""),
+                                "Delegated schedule cleanup failed after workspace closure",
+                            )
                     raise
             return result if isinstance(result, dict) else None
         current = self.store.get_recurring_schedule_definition(
@@ -2965,6 +3270,8 @@ class WorkersProjectsService:
             )
         except SchedulePrincipalAuthorityStoreError as exc:
             raise SchedulePrincipalAuthorityError(str(exc)) from exc
+        except WorkerClosedStoreError as exc:
+            raise ControlPlaneConflict(str(exc)) from exc
 
     def retire_recurring_schedule(
         self,
@@ -3001,12 +3308,37 @@ class WorkersProjectsService:
             establish=True,
         )
         if self.recurring_schedule_owner() == DELEGATED_RECURRENCE_OWNER:
+            current = self._delegated_schedule_call(
+                "get",
+                {"definition_id": definition_id},
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            current_worker = (
+                self.store.get_worker(
+                    str(current.get("worker_id") or ""),
+                    tenant_id=tenant_id or "local",
+                    owner_id=owner_id,
+                )
+                if isinstance(current, dict)
+                else None
+            )
+            if current_worker:
+                self._ensure_execution_allowed(current_worker)
             result = self._delegated_schedule_call(
                 "run_now",
                 {"definition_id": definition_id, "idempotency_key": idempotency_token},
                 tenant_id=tenant_id,
                 owner_id=owner_id,
             )
+            if current_worker:
+                latest_worker = self.store.get_worker(
+                    str(current_worker.get("worker_id") or ""),
+                    tenant_id=tenant_id or "local",
+                    owner_id=owner_id,
+                )
+                if latest_worker:
+                    self._ensure_execution_allowed(latest_worker)
             return result if isinstance(result, dict) else None
         definition = self.store.get_recurring_schedule_definition(
             definition_id,
@@ -3028,6 +3360,8 @@ class WorkersProjectsService:
             )
         except SchedulePrincipalAuthorityStoreError as exc:
             raise SchedulePrincipalAuthorityError(str(exc)) from exc
+        except WorkerClosedStoreError as exc:
+            raise ControlPlaneConflict(str(exc)) from exc
         if schedule is not None:
             schedule.update(
                 {
@@ -3054,9 +3388,9 @@ class WorkersProjectsService:
             raise ValueError("schedule tenant no longer matches its workspace")
         if str(worker.get("owner_id") or "") != str(owner_id or ""):
             raise ValueError("schedule owner no longer has access to its workspace")
-        if str(worker.get("state") or "") in {"terminated", "failed"}:
-            raise ValueError("scheduled workspace is unavailable")
         self._ensure_execution_allowed(worker)
+        if str(worker.get("state") or "") == "failed":
+            raise ValueError("scheduled workspace is unavailable")
         self._ensure_profile_allowed(str(worker.get("profile") or ""))
         if (
             str(os.environ.get("GLASSHIVE_SECURITY_MODE") or "").strip().lower() == "multi_user"
@@ -3269,17 +3603,20 @@ class WorkersProjectsService:
                     scheduled_for=occurrence,
                     detected_at=now,
                 )
-                schedule = self.store.materialize_recurring_schedule_occurrence(
-                    str(definition.get("definition_id") or ""),
-                    expected_next_run_at=expected_next,
-                    scheduled_for=occurrence.isoformat(),
-                    next_run_at=stored_next.isoformat(),
-                    detected_at=now_iso,
-                    dispatch_at=dispatch_at.isoformat(),
-                    occurrence_state=state,
-                    outcome=outcome,
-                    deactivate_after=deactivate_after,
-                )
+                try:
+                    schedule = self.store.materialize_recurring_schedule_occurrence(
+                        str(definition.get("definition_id") or ""),
+                        expected_next_run_at=expected_next,
+                        scheduled_for=occurrence.isoformat(),
+                        next_run_at=stored_next.isoformat(),
+                        detected_at=now_iso,
+                        dispatch_at=dispatch_at.isoformat(),
+                        occurrence_state=state,
+                        outcome=outcome,
+                        deactivate_after=deactivate_after,
+                    )
+                except WorkerClosedStoreError:
+                    break
                 if schedule:
                     materialized.append(schedule)
                 expected_next = stored_next.isoformat()
@@ -3329,6 +3666,8 @@ class WorkersProjectsService:
             )
         except SchedulePrincipalAuthorityStoreError as exc:
             raise SchedulePrincipalAuthorityError(str(exc)) from exc
+        except WorkerClosedStoreError as exc:
+            raise ControlPlaneConflict(str(exc)) from exc
         self.store.add_event(
             str(worker.get("project_id") or ""),
             worker_id,
@@ -3398,6 +3737,8 @@ class WorkersProjectsService:
                 processed.append(updated or claimed)
             except SchedulePrincipalAuthorityError:
                 processed.append(self.store.get_schedule(schedule_id) or claimed)
+            except ControlPlaneConflict:
+                processed.append(self.store.get_schedule(schedule_id) or claimed)
             except Exception as exc:
                 updated = self.store.finalize_schedule(schedule_id, state="failed", last_error=str(exc))
                 processed.append(updated or claimed)
@@ -3426,16 +3767,7 @@ class WorkersProjectsService:
             str(worker.get("execution_mode") or "docker"),
         )
         worker = self._refresh_worker_model_for_profile(worker)
-        if worker["state"] == "paused":
-            self.store.update_worker_state(worker_id, "starting", last_error="")
-            self.store.add_event(
-                worker["project_id"],
-                worker_id,
-                None,
-                "worker.resumed",
-                "Worker resume queued for the next run",
-            )
-            worker = self.store.get_worker(worker_id) or worker
+        resumed = worker["state"] == "paused"
         try:
             run, created = self.store.create_or_get_run_for_schedule(
                 schedule_id,
@@ -3444,6 +3776,18 @@ class WorkersProjectsService:
             )
         except SchedulePrincipalAuthorityStoreError as exc:
             raise SchedulePrincipalAuthorityError(str(exc)) from exc
+        except WorkerClosedStoreError as exc:
+            self.store.finalize_schedule(schedule_id, state="cancelled", last_error=str(exc))
+            raise ControlPlaneConflict(str(exc)) from exc
+        if resumed:
+            self.store.add_event(
+                worker["project_id"],
+                worker_id,
+                None,
+                "worker.resumed",
+                "Worker resume queued for the next run",
+            )
+            worker = self.store.get_worker(worker_id) or worker
         if created:
             instruction = str(schedule.get("instruction") or "")
             self.store.add_event(
@@ -3860,8 +4204,18 @@ class WorkersProjectsService:
                     merge_bootstrap_bundle(self._bootstrap_bundle_for(worker), runtime_bundle)
                 ),
             ) or worker
-        if worker["state"] == "paused":
-            self.store.update_worker_state(worker_id, "starting", last_error="")
+        resumed = worker["state"] == "paused"
+        try:
+            run = self.store.create_run(
+                worker_id,
+                worker["project_id"],
+                instruction,
+                state="queued",
+                resume_paused=True,
+            )
+        except WorkerClosedStoreError as exc:
+            raise ControlPlaneConflict(str(exc)) from exc
+        if resumed:
             self.store.add_event(
                 worker["project_id"],
                 worker_id,
@@ -3870,7 +4224,6 @@ class WorkersProjectsService:
                 "Worker resume queued for the next run",
             )
             worker = self.store.get_worker(worker_id) or worker
-        run = self.store.create_run(worker_id, worker["project_id"], instruction, state="queued")
         self.store.add_event(worker["project_id"], worker_id, run["run_id"], event_type, instruction)
         self._emit_callback(worker, event_type, run=run, message=instruction)
         self._ensure_worker_processor(worker_id)
@@ -3905,6 +4258,7 @@ class WorkersProjectsService:
 
     def record_launch_failed(self, worker_id: str, reason: str) -> dict:
         worker = self.require_worker(worker_id)
+        self._ensure_execution_allowed(worker)
         self.store.cancel_pending_runs(worker_id, error_text=reason, state="failed")
         updated = self.store.update_worker(worker_id, state="failed", last_error=reason)
         self.store.add_event(worker["project_id"], worker_id, None, "worker.launch_failed", reason)
@@ -3955,6 +4309,12 @@ class WorkersProjectsService:
         except Exception as exc:
             self.store.update_worker(worker_id, state=str(worker.get("state") or "failed"), last_error=str(exc))
             raise
+        self._reject_closed_after_runtime_activity(
+            worker_id,
+            fallback_worker=worker,
+            active_run_id=str((active_run or {}).get("run_id") or ""),
+            context="a desktop action",
+        )
         target_state = "running" if active_run else "ready"
         self._refresh_runtime_info(worker_id, state=target_state, last_error="")
         self.store.add_event(
@@ -3968,21 +4328,59 @@ class WorkersProjectsService:
 
     def pause_worker(self, worker_id: str) -> dict:
         worker = self.require_worker(worker_id)
-        active_run = self.store.get_active_run(worker_id)
+        self._ensure_execution_allowed(worker)
+        # Decide whether this is an already-started, freeze-capable run while
+        # holding the same boundary lock used by the external runtime start.
+        # Otherwise a start could publish run.started between this decision and
+        # processor invalidation, turning a real running task into a stranded
+        # pre-start pause.
+        with self._runtime_start_lock(worker_id):
+            worker = self.require_worker(worker_id)
+            self._ensure_execution_allowed(worker)
+            active_run = self.store.get_active_run(worker_id)
+            run_started = bool(
+                active_run
+                and self.store.has_run_event(active_run["run_id"], "run.started")
+            )
+            if not run_started:
+                self._invalidate_worker_processor(worker_id)
         runtime_worker = {
             **worker,
             "_active_run_id": str((active_run or {}).get("run_id") or ""),
         }
         info = self.runtime.pause_worker(runtime_worker)
         updated = self._apply_runtime_info(worker_id, info, state="paused", last_error=worker.get("last_error") or "")
+        if updated and str(updated.get("state") or "") in CLOSED_WORKER_STATES:
+            raise ControlPlaneConflict(
+                "Workspace is closed; create a new workspace for new work"
+            )
+        paused_run = None
+        if active_run and not run_started:
+            paused_run = self.store.finalize_run_if_state(
+                active_run["run_id"],
+                "running",
+                "paused",
+                output_text=active_run.get("output_text", ""),
+                error_text="Paused by operator",
+            )
+            if paused_run:
+                self.store.finalize_schedule_for_run(
+                    active_run["run_id"],
+                    state="failed",
+                    last_error="Paused by operator",
+                )
         self._wake_host_capacity_waiters(updated or worker)
-        active_run = self.store.get_active_run(worker_id)
         self.store.add_event(worker["project_id"], worker_id, active_run["run_id"] if active_run else None, "worker.paused", "Worker paused")
-        self._emit_callback(worker, "worker.paused", run=active_run, message="Worker paused")
+        self._emit_callback(worker, "worker.paused", run=paused_run or active_run, message="Worker paused")
         return updated or worker
 
     def interrupt_worker(self, worker_id: str, run_id: str | None = None) -> dict:
         worker = self.require_worker(worker_id)
+        self._ensure_execution_allowed(worker)
+        self._invalidate_worker_processor(worker_id)
+        with self._runtime_start_lock(worker_id):
+            worker = self.require_worker(worker_id)
+            self._ensure_execution_allowed(worker)
         active_run = self.store.get_active_run(worker_id)
         if run_id and (not active_run or str(active_run.get("run_id") or "") != str(run_id)):
             return worker
@@ -3996,16 +4394,33 @@ class WorkersProjectsService:
                 raise
             info = self.runtime.interrupt_worker(worker)
         updated = self._apply_runtime_info(worker_id, info, state="ready", last_error="")
+        if updated and str(updated.get("state") or "") in CLOSED_WORKER_STATES:
+            raise ControlPlaneConflict(
+                "Workspace is closed; create a new workspace for new work"
+            )
+        interrupted_run = None
         if active_run:
-            self.store.finalize_run(
+            interrupted_run = self.store.finalize_run_if_state(
                 active_run["run_id"],
-                state="interrupted",
+                "running",
+                "interrupted",
                 output_text=active_run.get("output_text", ""),
                 error_text="Interrupted by operator",
             )
+            if interrupted_run is None:
+                current = self.store.get_worker(worker_id)
+                if current and str(current.get("state") or "") in CLOSED_WORKER_STATES:
+                    raise ControlPlaneConflict(
+                        "Workspace is closed; create a new workspace for new work"
+                    )
         self._wake_host_capacity_waiters(updated or worker)
         self.store.add_event(worker["project_id"], worker_id, active_run["run_id"] if active_run else None, "worker.interrupted", "Worker interrupted")
-        self._emit_callback(worker, "worker.interrupted", run=active_run, message="Worker interrupted")
+        self._emit_callback(
+            worker,
+            "worker.interrupted",
+            run=interrupted_run or active_run,
+            message="Worker interrupted",
+        )
         return updated or worker
 
     def cancel_run(self, worker_id: str, run_id: str) -> dict:
@@ -4100,14 +4515,38 @@ class WorkersProjectsService:
             self._ensure_worker_processor(worker_id)
         return updated
 
-    def terminate_worker(self, worker_id: str) -> dict:
+    def terminate_worker(self, worker_id: str, *, _reclaim_existing: bool = False) -> dict:
+        self._invalidate_worker_processor(worker_id)
+        observed = self.require_worker(worker_id)
+        if (
+            not _reclaim_existing
+            and str(observed.get("state") or "") in {"terminating", "terminated"}
+        ):
+            return observed
+        with self._runtime_start_lock(worker_id):
+            return self._terminate_worker_with_start_fence(
+                worker_id,
+                reclaim_existing=_reclaim_existing,
+            )
+
+    def _terminate_worker_with_start_fence(
+        self,
+        worker_id: str,
+        *,
+        reclaim_existing: bool,
+    ) -> dict:
         worker = self.require_worker(worker_id)
+        claimed_worker, owns_termination = self.store.begin_worker_termination(worker_id)
+        worker = claimed_worker or worker
+        if not owns_termination and not (
+            reclaim_existing and str(worker.get("state") or "") == "terminating"
+        ):
+            return worker
         active_run = self.store.get_active_run(worker_id)
         runtime_worker = {
             **worker,
             "_active_run_id": str((active_run or {}).get("run_id") or ""),
         }
-        self._invalidate_worker_processor(worker_id)
         self.store.cancel_pending_runs(worker_id, error_text="Worker terminated by operator", state="cancelled")
         try:
             info = self.runtime.terminate_worker(runtime_worker)
@@ -4115,7 +4554,7 @@ class WorkersProjectsService:
                 raise RuntimeError(f"Worker compute is still active after termination (pid={info.pid})")
         except Exception as exc:
             message = public_callback_message_text(str(exc)) or "Worker compute termination failed"
-            self.store.update_worker(worker_id, state="failed", last_error=message)
+            self.store.fail_worker_termination(worker_id, message)
             self.store.add_event(
                 worker["project_id"],
                 worker_id,
@@ -4124,13 +4563,36 @@ class WorkersProjectsService:
                 message,
             )
             raise
-        updated = self._apply_runtime_info(
+        try:
+            self._deactivate_delegated_schedules_for_closed_worker(worker)
+        except Exception as exc:
+            message = public_callback_message_text(str(exc)) or "Delegated schedule cleanup failed"
+            self.store.fail_worker_termination(worker_id, message)
+            self.store.add_event(
+                worker["project_id"],
+                worker_id,
+                None,
+                "worker.termination_failed",
+                message,
+            )
+            raise
+        updated = self.store.complete_worker_termination(
             worker_id,
-            info,
-            state="terminated",
-            last_error="",
+            runtime=info.runtime,
+            model=info.model,
+            gateway_url=info.gateway_url,
+            gateway_port=info.gateway_port,
+            gateway_token=info.gateway_token,
+            session_key=info.session_key,
+            state_dir=info.state_dir,
+            workspace_dir=info.workspace_dir,
+            pid=info.pid,
+            takeover_url=f"/ui/workers/{worker_id}",
+            control_url=f"/ui/workers/{worker_id}",
             compute_released_at=utc_now(),
         )
+        if updated and str(updated.get("state") or "") == "termination_failed":
+            raise RuntimeErrorBase("Workspace close needs attention before cleanup can complete")
         self._wake_host_capacity_waiters(updated or worker)
         self.store.add_event(worker["project_id"], worker_id, None, "worker.terminated", "Worker terminated")
         revoke_signed_link_refs_for_worker(worker_id)
@@ -4154,6 +4616,12 @@ class WorkersProjectsService:
                 )
 
     def _reconcile_worker_row(self, worker: dict) -> None:
+        if worker["state"] == "terminating":
+            self.terminate_worker(str(worker["worker_id"]), _reclaim_existing=True)
+            return
+        if worker["state"] == "termination_failed":
+            self.terminate_worker(str(worker["worker_id"]))
+            return
         if worker["state"] in {"terminated", "failed"}:
             self._reconcile_terminated_worker_compute(worker)
             return
@@ -4457,7 +4925,11 @@ class WorkersProjectsService:
 
     def heal_worker(self, worker_id: str) -> dict | None:
         worker = self.store.get_worker(worker_id)
-        if not worker or worker.get("state") in {"paused"}:
+        if (
+            not worker
+            or worker.get("state") == "paused"
+            or str(worker.get("state") or "") in CLOSED_WORKER_STATES
+        ):
             return worker
         active_run = self.store.get_active_run(worker_id)
         if not active_run:
@@ -4476,30 +4948,44 @@ class WorkersProjectsService:
             # processor stop touching worker state until a replacement generation is spawned.
             self._active_processors.discard(worker_id)
         refreshed = self.store.get_worker(worker_id)
-        if refreshed and refreshed["state"] not in {"paused", "terminated"} and self.store.has_queued_runs(worker_id):
+        if (
+            refreshed
+            and refreshed["state"] != "paused"
+            and str(refreshed["state"] or "") not in CLOSED_WORKER_STATES
+            and self.store.has_queued_runs(worker_id)
+        ):
             self._ensure_worker_processor(worker_id)
         return refreshed
 
     def _start_worker_again(self, worker: dict, event_type: str, message: str) -> dict:
         starting = self.store.update_worker_unless_gc_claimed(worker["worker_id"], state="starting")
         if starting is None:
+            current = self.store.get_worker(worker["worker_id"])
+            if current and str(current.get("state") or "") in CLOSED_WORKER_STATES:
+                raise ControlPlaneConflict(
+                    "Workspace is closed; create a new workspace for new work"
+                )
             raise RuntimeErrorBase("Workspace is being garbage-collected")
         worker = starting
         try:
-            info = self.runtime.ensure_worker_ready(worker)
+            info = self._ensure_worker_ready_with_lifecycle_fence(worker)
         except Exception as exc:
             updated = self.store.update_worker(worker["worker_id"], state="failed", last_error=str(exc))
+            if updated and str(updated.get("state") or "") in CLOSED_WORKER_STATES:
+                self._reject_closed_after_runtime_activity(
+                    worker["worker_id"],
+                    fallback_worker=updated,
+                    context="workspace readiness",
+                )
             self.store.add_event(worker["project_id"], worker["worker_id"], None, "worker.failed", str(exc))
             return updated or worker
-        updated = self._apply_runtime_info(
-            worker["worker_id"],
+        return self._finalize_worker_ready_after_start(
+            worker,
             info,
-            state="ready",
-            last_error="",
-            compute_released_at=None,
+            event_type=event_type,
+            message=message,
+            context="workspace readiness",
         )
-        self.store.add_event(worker["project_id"], worker["worker_id"], None, event_type, message)
-        return updated or worker
 
     def _apply_runtime_info(
         self,
@@ -4711,7 +5197,7 @@ class WorkersProjectsService:
                 if not self._processor_is_current(worker_id, generation):
                     return
                 worker = self.store.get_worker(worker_id)
-                if not worker or worker["state"] in {"paused", "terminated"}:
+                if not worker or worker["state"] in {"paused", "terminating", "termination_failed", "terminated"}:
                     return
 
                 active_run = self.store.get_active_run(worker_id)
@@ -4766,13 +5252,34 @@ class WorkersProjectsService:
                     if (
                         self._processor_is_current(worker_id, generation)
                         and current
-                        and current["state"] not in {"paused", "terminated", "failed"}
+                        and current["state"] not in {"paused", "failed"}
+                        and str(current["state"] or "") not in CLOSED_WORKER_STATES
                         and not self.store.get_active_run(worker_id)
                     ):
                         self.store.update_worker_state(worker_id, "ready", last_error="")
                     return
 
-                worker = self.store.get_worker(worker_id) or worker
+                current = self.store.get_worker(worker_id)
+                if (
+                    not self._processor_is_current(worker_id, generation)
+                    or not current
+                    or str(current.get("state") or "") in CLOSED_WORKER_STATES
+                ):
+                    if current and str(current.get("state") or "") in CLOSED_WORKER_STATES:
+                        self.store.finalize_run_if_state(
+                            run["run_id"],
+                            "running",
+                            "cancelled",
+                            error_text="workspace_closed",
+                        )
+                        self.store.finalize_schedule_for_run(
+                            run["run_id"],
+                            state="cancelled",
+                            last_error="workspace_closed",
+                        )
+                    return
+
+                worker = current
                 capacity_error = self._runtime_capacity_error(worker)
                 if capacity_error:
                     self._requeue_retryable_run(worker, run, capacity_error)
@@ -4795,13 +5302,49 @@ class WorkersProjectsService:
                             )
                         continue
                 worker = self._refresh_runtime_info(worker_id, state="running", last_error="") or self.store.get_worker(worker_id) or worker
-                self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.started", run["instruction"])
-                self._emit_callback(worker, "run.started", run=run, message=run["instruction"])
+                started_notified = Event()
+
+                def notify_started() -> None:
+                    if started_notified.is_set():
+                        return
+                    started_notified.set()
+                    self.store.add_event(
+                        worker["project_id"],
+                        worker_id,
+                        run["run_id"],
+                        "run.started",
+                        run["instruction"],
+                    )
+                    self._emit_callback(
+                        worker,
+                        "run.started",
+                        run=run,
+                        message=run["instruction"],
+                    )
+
+                def persist_runtime_info(info: RuntimeInfo) -> None:
+                    self._apply_runtime_info(
+                        worker_id,
+                        info,
+                        state="running",
+                        last_error="",
+                    )
+
+                runtime_worker = {
+                    **self._runtime_worker_for_run(worker, run),
+                    "_runtime_start_guard": lambda: self._runtime_execution_start_guard(
+                        worker_id,
+                        generation,
+                        run["run_id"],
+                    ),
+                    "_runtime_started_callback": notify_started,
+                    "_runtime_info_callback": persist_runtime_info,
+                }
 
                 try:
                     try:
                         output = self.runtime.run_task(
-                            self._runtime_worker_for_run(worker, run),
+                            runtime_worker,
                             run["instruction"],
                             run_id=run["run_id"],
                         )
@@ -4809,9 +5352,10 @@ class WorkersProjectsService:
                         if "run_id" not in str(exc):
                             raise
                         output = self.runtime.run_task(
-                            self._runtime_worker_for_run(worker, run),
+                            runtime_worker,
                             run["instruction"],
                         )
+                    notify_started()
                 except WorkerPausedError as exc:
                     if not self._processor_is_current(worker_id, generation):
                         return
@@ -4858,12 +5402,16 @@ class WorkersProjectsService:
                     final_state = "failed"
                     if worker_state == "paused":
                         final_state = "interrupted"
-                    elif worker_state == "terminated":
+                    elif worker_state in CLOSED_WORKER_STATES:
                         final_state = "cancelled"
                     refreshed_worker = (
                         self._refresh_runtime_info(
                             worker_id,
-                            state=worker_state if worker_state in {"paused", "terminated"} else "ready",
+                            state=(
+                                worker_state
+                                if worker_state == "paused" or worker_state in CLOSED_WORKER_STATES
+                                else "ready"
+                            ),
                             last_error=str(exc),
                         )
                         or self.store.get_worker(worker_id)
@@ -4904,7 +5452,13 @@ class WorkersProjectsService:
                         state="cancelled" if final_state == "cancelled" else "failed",
                         last_error=str(exc),
                     )
-                    self.store.update_worker_state(worker_id, worker_state if worker_state in {"paused", "terminated"} else "ready", last_error=str(exc))
+                    self.store.update_worker_state(
+                        worker_id,
+                        worker_state
+                        if worker_state == "paused" or worker_state in CLOSED_WORKER_STATES
+                        else "ready",
+                        last_error=str(exc),
+                    )
                     self.store.add_event(worker["project_id"], worker_id, run["run_id"], f"run.{final_state}", str(exc))
                     failed_run = {**run, "state": final_state, "error_text": str(exc), **failure_fields}
                     callback_worker = self.store.get_worker(worker_id) or refreshed_worker
@@ -4922,7 +5476,7 @@ class WorkersProjectsService:
                         deliverable=deliverable,
                     )
                     self._wake_host_capacity_waiters(callback_worker)
-                    if worker_state in {"paused", "terminated"}:
+                    if worker_state == "paused" or worker_state in CLOSED_WORKER_STATES:
                         return
                     continue
                 except Exception as exc:
@@ -4977,6 +5531,6 @@ class WorkersProjectsService:
         finally:
             if self._release_processor(worker_id, generation):
                 pending = self.store.get_worker(worker_id)
-                if pending and pending["state"] not in {"paused", "terminated"}:
+                if pending and pending["state"] not in {"paused", "terminating", "termination_failed", "terminated"}:
                     if self.store.peek_next_queued_run(worker_id):
                         self._ensure_worker_processor(worker_id)

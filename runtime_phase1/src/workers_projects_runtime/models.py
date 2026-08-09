@@ -18,6 +18,7 @@ WorkerState = Literal[
     "failed",
     "terminated",
 ]
+WorkerCloseState = Literal["terminating", "termination_failed", "terminated"]
 RunState = Literal["queued", "running", "interrupted", "paused", "completed", "failed", "cancelled"]
 ScheduleState = Literal["pending", "running", "queued", "completed", "failed", "cancelled"]
 RecurringScheduleOccurrenceState = Literal[
@@ -141,6 +142,7 @@ class WorkerResponse(BaseModel):
     runtime: str = ""
     model: str = ""
     state: WorkerState
+    close_state: WorkerCloseState | None = None
     bootstrap_profile: str | None = None
     gateway_url: str | None = None
     takeover_url: str | None = None
@@ -167,6 +169,13 @@ class WorkerResponse(BaseModel):
     def derive_legacy_backend_from_profile(cls, data):
         if not isinstance(data, dict):
             return data
+        raw_state = str(data.get("state") or "")
+        if raw_state in {"terminating", "termination_failed"}:
+            data = dict(data)
+            data["close_state"] = raw_state
+            # Keep the frozen public state enum compatible while the optional close-state field
+            # carries truthful close progress for modern clients.
+            data["state"] = "terminated"
         backend = derive_legacy_backend_label(
             profile=data.get("profile"),
             runtime=data.get("runtime"),

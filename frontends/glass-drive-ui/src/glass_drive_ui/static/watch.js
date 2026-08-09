@@ -60,6 +60,7 @@ let attachStartedAt = 0;
 let retryTimers = [];
 let frameReady = false;
 let currentRunState = '';
+let currentDisplayState = 'starting';
 let currentSummary = 'No run output yet.';
 let currentFullOutput = 'No run output yet.';
 let currentProjectTitle = projectId || 'Project';
@@ -96,9 +97,9 @@ function syncDocumentTitle(workerName, projectTitle) {
 }
 
 function displayStateForLive(data) {
-  const workerState = String(data?.worker?.state || '').trim().toLowerCase();
+  const workerState = String(data?.worker?.close_state || data?.worker?.state || '').trim().toLowerCase();
   const runState = String(data?.latest_run?.state || '').trim().toLowerCase();
-  if (workerState === 'terminated') return 'terminated';
+  if (['terminating', 'termination_failed', 'terminated'].includes(workerState)) return workerState;
   if (runState === 'completed') return 'completed';
   if (['queued', 'running'].includes(runState)) return runState;
   if (['failed', 'cancelled', 'interrupted'].includes(runState)) return runState;
@@ -112,6 +113,8 @@ function displayStateLabel(state) {
   const normalized = String(state || '').trim().toLowerCase();
   if (normalized === 'completed') return 'Completed';
   if (normalized === 'idle_terminated') return 'Idle stopped';
+  if (normalized === 'terminating') return 'Closing';
+  if (normalized === 'termination_failed') return 'Close needs attention';
   return normalized || 'starting';
 }
 
@@ -240,9 +243,9 @@ function syncSendAffordance() {
 function syncRunToggle(state) {
   if (!runToggleButton) return;
   const normalized = String(state || '').trim().toLowerCase();
-  runToggleButton.hidden = TERMINAL_ATTENTION_STATES.has(normalized) || normalized === 'terminated';
+  runToggleButton.hidden = TERMINAL_ATTENTION_STATES.has(normalized) || ['terminating', 'termination_failed', 'terminated'].includes(normalized);
   const shouldResume = normalized === 'paused' || normalized === 'idle' || normalized === 'idle_terminated' || normalized === 'stopped' || normalized === 'completed';
-  const disabled = ['created', 'starting', 'terminated'].includes(normalized);
+  const disabled = ['created', 'starting', 'terminating', 'termination_failed', 'terminated'].includes(normalized);
   runToggleButton.dataset.action = shouldResume ? 'resume' : 'pause';
   runToggleButton.textContent = normalized === 'completed' ? 'Continue' : shouldResume ? 'Resume' : 'Pause';
   runToggleButton.setAttribute('aria-label', normalized === 'completed' ? 'Continue workspace' : shouldResume ? 'Resume workspace' : 'Pause workspace');
@@ -256,7 +259,7 @@ function syncRunToggle(state) {
 }
 
 function syncSteerAvailability(state) {
-  const closed = String(state || '').trim().toLowerCase() === 'terminated';
+  const closed = ['terminating', 'termination_failed', 'terminated'].includes(String(state || '').trim().toLowerCase());
   steerInput.disabled = closed;
   sendButton.disabled = closed;
   steerInput.placeholder = closed ? 'This workspace is closed' : 'Steer this workspace';
@@ -316,8 +319,8 @@ function syncMenuLabels() {
 function setSurface(surface, { force = false } = {}) {
   activeSurface = surface === 'desktop' ? 'desktop' : 'terminal';
   syncMenuLabels();
-  const state = String(statePill.textContent || 'starting').trim().toLowerCase();
-  if (['created', 'starting', 'paused', 'idle', 'idle_terminated', 'stopped', 'terminated'].includes(state) || TERMINAL_ATTENTION_STATES.has(state)) {
+  const state = currentDisplayState;
+  if (['created', 'starting', 'paused', 'idle', 'idle_terminated', 'stopped', 'terminating', 'termination_failed', 'terminated'].includes(state) || TERMINAL_ATTENTION_STATES.has(state)) {
     clearAttachedView();
     setOverlay(state);
     return;
@@ -456,7 +459,7 @@ function summarizeOutput(data) {
   }
 
   if (!raw) {
-    const idle = data.worker?.state === 'ready' ? 'Workspace is ready for the next instruction.' : 'No run output yet.';
+    const idle = data.worker?.state === 'ready' && !data.worker?.close_state ? 'Workspace is ready for the next instruction.' : 'No run output yet.';
     return {
       label: 'Workspace status',
       panelTitle: 'Workspace status',
@@ -676,7 +679,7 @@ function setOverlay(state, detail) {
   const needsAttention = TERMINAL_ATTENTION_STATES.has(state);
   const connecting = !completed && attachStartedAt && !frameReady && Date.now() - attachStartedAt < 12000;
   const filePreviewActive = activeSurface === 'desktop' && Boolean(filePreviewUrl());
-  const waiting = state === 'starting' || state === 'paused' || state === 'idle' || state === 'idle_terminated' || state === 'stopped' || state === 'terminated' || needsAttention || connecting;
+  const waiting = state === 'starting' || state === 'paused' || state === 'idle' || state === 'idle_terminated' || state === 'stopped' || state === 'terminating' || state === 'termination_failed' || state === 'terminated' || needsAttention || connecting;
   overlay.hidden = !waiting;
   if (stage) {
     stage.dataset.overlayActive = String(waiting);
@@ -692,12 +695,18 @@ function setOverlay(state, detail) {
     return;
   }
 
-  if (state === 'terminated') {
+  if (['terminating', 'termination_failed', 'terminated'].includes(state)) {
+    const closing = state === 'terminating';
+    const closeFailed = state === 'termination_failed';
     if (overlayLabel) {
-      overlayLabel.textContent = 'Workspace closed';
+      overlayLabel.textContent = closing ? 'Workspace closing' : closeFailed ? 'Close needs attention' : 'Workspace closed';
     }
-    overlayTitle.textContent = 'Workspace closed';
-    overlayDetail.textContent = 'This workspace was shut down. Return to Workspaces to create new work.';
+    overlayTitle.textContent = closing ? 'Workspace closing' : closeFailed ? 'Close needs attention' : 'Workspace closed';
+    overlayDetail.textContent = closing
+      ? 'GlassHive is safely stopping this workspace.'
+      : closeFailed
+      ? 'GlassHive could not confirm compute shutdown. Retry Close workspace; new work remains blocked.'
+      : 'This workspace was shut down. Return to Workspaces to create new work.';
     return;
   }
 
@@ -764,6 +773,7 @@ async function refresh() {
     const worker = data.worker;
     const runtime = data.runtime_details || {};
     const displayState = displayStateForLive(data);
+    currentDisplayState = displayState;
     currentProjectTitle = String(data.project_title || worker.project_id || projectId || 'Project');
     currentDeliverable = data.deliverable || null;
 
@@ -835,7 +845,7 @@ frame.addEventListener('load', () => {
   if (!frame.src || frame.src === 'about:blank') return;
   frameReady = true;
   attachStartedAt = 0;
-  if (!['paused', 'idle', 'idle stopped'].includes(String(statePill.textContent || '').trim().toLowerCase())) {
+  if (!['paused', 'idle', 'idle_terminated', 'stopped', 'terminating', 'termination_failed', 'terminated'].includes(currentDisplayState)) {
     overlay.hidden = true;
     if (stage) {
       stage.dataset.overlayActive = 'false';

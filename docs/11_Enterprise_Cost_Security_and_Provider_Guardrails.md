@@ -358,7 +358,13 @@ The Standard GlassHive QA cases must include:
 - lifecycle reaper checks for idle, paused, max-duration, and terminal-worker orphan compute,
   including failed records and non-running containers with timeout thresholds otherwise disabled
 - active-run termination race checks proving a background processor cannot resurrect a terminated
-  worker or leak a pause, interrupt, or termination reason into a later run
+  worker or leak a pause, interrupt, or termination reason into a later run; browser, API, and MCP
+  writes against a closed workspace must return the same actionable conflict and persist no run or
+  schedule, including when permanent closure wins a concurrent reservation race; teardown failure
+  remains a durable closed state that startup may retry, cached desktop/terminal access is rejected,
+  active desktop/terminal streams are revoked, recurring definitions cannot be re-enabled or remain
+  active in a delegated owner, the external runtime start is fenced with durable runtime identity,
+  truncated provider streams fail, and stale runtime writers cannot reopen the workspace
 - active telemetry checks proving run identity cannot drift to a newer queued run, counters remain
   monotonic across partial JSONL writes, oversized unterminated records remain memory-bounded, and
   large unchanged logs are not reparsed

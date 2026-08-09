@@ -11,9 +11,10 @@ import sqlite3
 import time
 import uuid
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from urllib.parse import urlencode, urlsplit
 
 import httpx
@@ -22,10 +23,12 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import workers_projects_runtime.api as api_module
+import workers_projects_runtime.openclaw_runtime as openclaw_runtime_module
 import workers_projects_runtime.service as service_module
 import workers_projects_runtime.signed_links as signed_links_module
 from workers_projects_runtime.api import create_app
 from workers_projects_runtime.auth import AuthContext, owner_matches_auth_context
+from workers_projects_runtime.control_plane import ControlPlaneConflict
 from workers_projects_runtime.deliverables import (
     deliverable_payload,
     is_deliverable_url,
@@ -34,10 +37,13 @@ from workers_projects_runtime.deliverables import (
 from workers_projects_runtime.openclaw_runtime import (
     RuntimeErrorBase,
     RuntimeInfo,
+    OpenClawRuntime,
     StubRuntime,
     WorkerInterruptedError,
     WorkerPausedError,
     WorkerTerminatedError,
+    notify_runtime_started,
+    runtime_start_boundary,
 )
 from workers_projects_runtime.service import (
     GlassHiveQuotaExceededError,
@@ -58,7 +64,8 @@ from workers_projects_runtime.signed_links import (
     verify_signed_link,
     verify_signed_link_token,
 )
-from workers_projects_runtime.store import Store
+from workers_projects_runtime.store import Store, WorkerClosedStoreError
+from workers_projects_runtime.terminal_takeover import TerminalTarget
 
 
 def test_runtime_signed_link_sqlite_state_is_private(tmp_path, monkeypatch):
@@ -5600,6 +5607,70 @@ def test_worker_find_or_resume_preserves_bundle_when_no_new_bundle_is_provided(t
         service.shutdown()
 
 
+def test_alias_reuse_losing_race_to_close_creates_a_new_workspace(tmp_path):
+    class BlockingAliasLookupStore(Store):
+        def __init__(self, db_path: str):
+            super().__init__(db_path)
+            self.block_lookup = False
+            self.entered = Event()
+            self.release = Event()
+
+        def find_worker_by_alias(self, *args, **kwargs):
+            worker = super().find_worker_by_alias(*args, **kwargs)
+            if self.block_lookup:
+                self.entered.set()
+                assert self.release.wait(timeout=3), "alias reuse test did not release lookup"
+            return worker
+
+    store = BlockingAliasLookupStore(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), reconcile_on_startup=False)
+    project = service.create_project("owner", "Alias race", "Create after Close wins.", "codex-cli")
+    original = service.find_or_create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Original",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        alias="primary",
+        start_synchronously=False,
+    )
+    store.block_lookup = True
+    results: list[dict] = []
+
+    thread = Thread(
+        target=lambda: results.append(
+            service.find_or_create_worker(
+                project_id=project["project_id"],
+                owner_id="owner",
+                name="Replacement",
+                role="operator",
+                profile="codex-cli",
+                backend="openclaw",
+                alias="primary",
+                start_synchronously=False,
+            )
+        )
+    )
+    thread.start()
+    try:
+        assert store.entered.wait(timeout=2), "alias reuse never reached the stale lookup"
+        assert service.terminate_worker(original["worker_id"])["state"] == "terminated"
+    finally:
+        store.release.set()
+        thread.join(timeout=3)
+        service.shutdown()
+
+    assert not thread.is_alive()
+    assert len(results) == 1
+    assert results[0]["worker_id"] != original["worker_id"]
+    assert results[0]["state"] == "paused"
+    assert store.get_worker(original["worker_id"])["state"] == "terminated"
+    assert "worker.resumed_by_alias" not in {
+        event["event_type"] for event in store.list_events(original["worker_id"])
+    }
+
+
 def test_host_worker_disabled_blocks_host_creation_and_run(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "false")
     db_path = tmp_path / "runtime.db"
@@ -6775,7 +6846,9 @@ class ControllableRuntime:
         return self._info(worker, pid=None if self.paused.is_set() else 1234)
 
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None) -> str:
-        self.running.set()
+        with runtime_start_boundary(worker):
+            notify_runtime_started(worker)
+            self.running.set()
         deadline = time.time() + 5
         while time.time() < deadline:
             if self.interrupted.is_set():
@@ -6970,7 +7043,9 @@ class RaisingPauseRuntime:
         return self._info(worker, pid=None if self.paused.is_set() else 2222)
 
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None) -> str:
-        self.running.set()
+        with runtime_start_boundary(worker):
+            notify_runtime_started(worker)
+            self.running.set()
         deadline = time.time() + 5
         while time.time() < deadline:
             if self.paused.is_set():
@@ -7079,6 +7154,1390 @@ def test_terminate_active_run_cannot_resurrect_worker(tmp_path):
     assert client.get(f"/v1/workers/{worker['worker_id']}").json()["state"] == "terminated"
 
 
+def test_terminated_worker_rejects_new_work_without_stranding_runs(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
+
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Closed", "goal": "Reject work after closure."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Closed Worker", "role": "operator"},
+    ).json()
+
+    terminated = client.post(f"/v1/workers/{worker['worker_id']}/terminate")
+    assert terminated.status_code == 202
+    assert terminated.json()["state"] == "terminated"
+
+    attempts = [
+        client.post(
+            f"/v1/workers/{worker['worker_id']}/assign",
+            json={"instruction": "Do not queue this assignment."},
+        ),
+        client.post(
+            f"/v1/workers/{worker['worker_id']}/message",
+            json={"message": "Do not queue this message."},
+        ),
+        client.post(
+            f"/v1/workers/{worker['worker_id']}/steer",
+            json={"message": "Do not queue this steer."},
+        ),
+        client.post(
+            f"/v1/workers/{worker['worker_id']}/schedule",
+            json={"instruction": "Do not schedule this run.", "delay_seconds": 60},
+        ),
+        client.post(
+            f"/v1/workers/{worker['worker_id']}/launch-failed",
+            json={"reason": "Do not overwrite closed state."},
+        ),
+        client.post(f"/v1/workers/{worker['worker_id']}/resume"),
+        client.post(f"/v1/workers/{worker['worker_id']}/pause"),
+        client.post(f"/v1/workers/{worker['worker_id']}/interrupt"),
+    ]
+
+    for response in attempts:
+        assert response.status_code == 409, response.text
+        assert "closed" in response.json()["detail"].lower()
+
+    assert client.app.state.store.list_runs_for_worker(worker["worker_id"]) == []
+    assert client.app.state.store.list_schedules_for_worker(worker["worker_id"]) == []
+    with pytest.raises(WorkerClosedStoreError, match="closed"):
+        client.app.state.store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "Simulate an assignment that raced with closure.",
+        )
+    assert client.get(f"/v1/workers/{worker['worker_id']}").json()["state"] == "terminated"
+
+
+def test_one_shot_schedule_losing_race_to_workspace_close_is_rejected(tmp_path, monkeypatch):
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Schedule race", "goal": "Reject late work."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Schedule race", "role": "operator"},
+    ).json()
+    store = client.app.state.store
+    original_create = store.create_scheduled_run
+
+    def close_then_create(**kwargs):
+        store.update_worker_state(worker["worker_id"], "terminated")
+        return original_create(**kwargs)
+
+    monkeypatch.setattr(store, "create_scheduled_run", close_then_create)
+    response = client.post(
+        f"/v1/workers/{worker['worker_id']}/schedule",
+        json={"instruction": "Do not persist after closure wins.", "delay_seconds": 60},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "closed" in response.json()["detail"].lower()
+    assert store.list_schedules_for_worker(worker["worker_id"]) == []
+
+
+def test_slow_termination_publishes_close_before_runtime_teardown(tmp_path):
+    class BlockingTerminationRuntime(StubRuntime):
+        def __init__(self):
+            self.entered = Event()
+            self.release = Event()
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.entered.set()
+            assert self.release.wait(timeout=3), "termination test did not release runtime teardown"
+            return super().terminate_worker(worker)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = BlockingTerminationRuntime()
+    service = WorkersProjectsService(store, runtime)
+    project = service.create_project("demo-owner", "Closing", "Reject late work.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Closing workspace",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        start_synchronously=False,
+    )
+    errors: list[BaseException] = []
+
+    def terminate():
+        try:
+            service.terminate_worker(worker["worker_id"])
+        except BaseException as exc:  # pragma: no cover - assertion reports worker thread errors
+            errors.append(exc)
+
+    thread = Thread(target=terminate)
+    thread.start()
+    try:
+        assert runtime.entered.wait(timeout=2), "termination never reached runtime teardown"
+        assert store.get_worker(worker["worker_id"])["state"] == "terminating"
+        with pytest.raises(ControlPlaneConflict, match="closed"):
+            service.assign_run(worker["worker_id"], "Do not queue during teardown.")
+        assert store.list_runs_for_worker(worker["worker_id"]) == []
+    finally:
+        runtime.release.set()
+        thread.join(timeout=3)
+        service.shutdown()
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert store.get_worker(worker["worker_id"])["state"] == "terminated"
+
+
+def test_resume_losing_race_to_termination_cannot_resurrect_workspace(tmp_path):
+    class BlockingResumeRuntime(StubRuntime):
+        def __init__(self):
+            self.entered = Event()
+            self.release = Event()
+            self.compute_active = False
+            self.terminate_calls = 0
+
+        def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+            self.entered.set()
+            assert self.release.wait(timeout=3), "resume test did not release runtime startup"
+            self.compute_active = True
+            return super().ensure_worker_ready(worker)
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminate_calls += 1
+            self.compute_active = False
+            return super().terminate_worker(worker)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = BlockingResumeRuntime()
+    service = WorkersProjectsService(store, runtime)
+    project = service.create_project("demo-owner", "Resume race", "Do not resurrect.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Resume race",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        start_synchronously=False,
+    )
+    store.update_worker_state(worker["worker_id"], "paused")
+    errors: list[BaseException] = []
+
+    def resume():
+        try:
+            service.resume_worker(worker["worker_id"])
+        except BaseException as exc:  # pragma: no cover - assertion reports worker thread errors
+            errors.append(exc)
+
+    thread = Thread(target=resume)
+    thread.start()
+    try:
+        assert runtime.entered.wait(timeout=2), "resume never reached runtime startup"
+        terminated = service.terminate_worker(worker["worker_id"])
+        assert terminated["state"] == "terminated"
+    finally:
+        runtime.release.set()
+        thread.join(timeout=3)
+        service.shutdown()
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ControlPlaneConflict)
+    assert store.get_worker(worker["worker_id"])["state"] == "terminated"
+    assert runtime.compute_active is False
+    assert runtime.terminate_calls == 2
+
+
+def test_desktop_action_losing_race_to_termination_cleans_recreated_compute(tmp_path):
+    class BlockingDesktopRuntime(StubRuntime):
+        def __init__(self):
+            self.entered = Event()
+            self.release = Event()
+            self.compute_active = False
+            self.terminate_calls = 0
+
+        def desktop_action(
+            self,
+            worker: dict,
+            action: str,
+            *,
+            url: str | None = None,
+            run_id: str | None = None,
+        ) -> dict[str, object]:
+            self.entered.set()
+            assert self.release.wait(timeout=3), "desktop test did not release runtime action"
+            self.compute_active = True
+            return {"status": "ready", "notes": action}
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminate_calls += 1
+            self.compute_active = False
+            return super().terminate_worker(worker)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = BlockingDesktopRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    project = service.create_project("demo-owner", "Desktop race", "Close wins.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Desktop race",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        start_synchronously=False,
+    )
+    errors: list[BaseException] = []
+
+    def act() -> None:
+        try:
+            service.desktop_action(worker["worker_id"], "desktop")
+        except BaseException as exc:  # pragma: no cover - assertion reports worker thread errors
+            errors.append(exc)
+
+    thread = Thread(target=act)
+    thread.start()
+    try:
+        assert runtime.entered.wait(timeout=2), "desktop action never reached runtime"
+        assert service.terminate_worker(worker["worker_id"])["state"] == "terminated"
+    finally:
+        runtime.release.set()
+        thread.join(timeout=3)
+        service.shutdown()
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ControlPlaneConflict)
+    assert runtime.compute_active is False
+    assert runtime.terminate_calls == 2
+    assert store.get_worker(worker["worker_id"])["state"] == "terminated"
+    assert "worker.desktop_action" not in {
+        event["event_type"] for event in store.list_events(worker["worker_id"])
+    }
+
+
+def test_queued_run_losing_last_start_boundary_to_close_never_executes(tmp_path):
+    class BlockingStartRuntime(StubRuntime):
+        def __init__(self):
+            self.entered = Event()
+            self.release = Event()
+            self.ran = False
+
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            self.entered.set()
+            assert self.release.wait(timeout=3), "run start test did not release runtime"
+            with runtime_start_boundary(worker):
+                self.ran = True
+                notify_runtime_started(worker)
+            return "should not run"
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = BlockingStartRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    project = service.create_project("demo-owner", "Start fence", "Close wins.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Start fence",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        start_synchronously=False,
+    )
+    run = service.assign_run(worker["worker_id"], "Do not execute after Close.")
+    try:
+        assert runtime.entered.wait(timeout=2), "processor never reached the final start boundary"
+        assert service.terminate_worker(worker["worker_id"])["state"] == "terminated"
+    finally:
+        runtime.release.set()
+        deadline = time.time() + 2
+        while time.time() < deadline and store.get_run(run["run_id"])["state"] == "running":
+            time.sleep(0.01)
+        service.shutdown()
+
+    assert runtime.ran is False
+    assert store.get_run(run["run_id"])["state"] == "cancelled"
+    assert "run.started" not in {
+        event["event_type"] for event in store.list_events(worker["worker_id"])
+    }
+
+
+def test_close_remains_prompt_after_runtime_start_boundary_is_released(tmp_path):
+    class LongRunningRuntime(StubRuntime):
+        def __init__(self):
+            self.started = Event()
+            self.stopped = Event()
+
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            with runtime_start_boundary(worker):
+                notify_runtime_started(worker)
+                self.started.set()
+            assert self.stopped.wait(timeout=3), "close did not interrupt the active runtime"
+            raise WorkerTerminatedError("closed")
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.stopped.set()
+            return super().terminate_worker(worker)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = LongRunningRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    project = service.create_project("demo-owner", "Prompt close", "Close promptly.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Prompt close",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        start_synchronously=False,
+    )
+    service.assign_run(worker["worker_id"], "Run until closed.")
+    try:
+        assert runtime.started.wait(timeout=2)
+        started_at = time.monotonic()
+        closed = service.terminate_worker(worker["worker_id"])
+        elapsed = time.monotonic() - started_at
+    finally:
+        service.shutdown()
+
+    assert closed["state"] == "terminated"
+    assert elapsed < 0.5
+
+
+def test_openclaw_request_is_accepted_inside_runtime_start_boundary(tmp_path, monkeypatch):
+    runtime = OpenClawRuntime(base_dir=str(tmp_path / "runtime"))
+    worker = {
+        "worker_id": "wrk_boundary",
+        "profile": "openclaw-general",
+        "model": "openclaw",
+    }
+    in_boundary = {"value": False}
+    accepted: list[bool] = []
+    started: list[bool] = []
+    persisted: list[RuntimeInfo] = []
+
+    @contextmanager
+    def guard():
+        assert in_boundary["value"] is False
+        in_boundary["value"] = True
+        try:
+            yield
+        finally:
+            in_boundary["value"] = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        accepted.append(in_boundary["value"])
+        assert [info.pid for info in persisted] == [123]
+        assert json.loads(request.content)["stream"] is True
+        assert request.headers["accept"] == "text/event-stream"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b'event: response.output_text.delta\n'
+                b'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
+                b'event: response.completed\n'
+                b'data: {"type":"response.completed","response":{"output":[]}}\n\n'
+                b'data: [DONE]\n\n'
+            ),
+            request=request,
+        )
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            _ = args, kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def build_request(self, method: str, url: str, **kwargs):
+            return httpx.Request(method, url, **kwargs)
+
+        def send(self, request: httpx.Request, *, stream: bool = False):
+            _ = stream
+            return handler(request)
+
+    monkeypatch.setattr(runtime, "_prepare_worker_runtime", lambda: None)
+    monkeypatch.setattr(
+        runtime,
+        "_start_worker_runtime",
+        lambda _worker: RuntimeInfo(
+            runtime="openclaw",
+            model="openclaw",
+            gateway_url="http://openclaw.invalid",
+            gateway_port=1,
+            gateway_token="synthetic-token",
+            session_key="synthetic-session",
+            state_dir=str(tmp_path / "state"),
+            workspace_dir=str(tmp_path / "workspace"),
+            pid=123,
+        ),
+    )
+    monkeypatch.setattr(runtime, "_wait_for_ready", lambda _port, _token: None)
+    monkeypatch.setattr(
+        openclaw_runtime_module.httpx,
+        "Client",
+        FakeClient,
+    )
+    worker["_runtime_start_guard"] = guard
+    worker["_runtime_started_callback"] = lambda: started.append(True)
+    worker["_runtime_info_callback"] = persisted.append
+
+    assert runtime.run_task(worker, "Return ok.") == "ok"
+    assert accepted == [True]
+    assert started == [True]
+    assert [info.pid for info in persisted] == [123]
+    assert in_boundary["value"] is False
+
+
+def test_openclaw_stream_releases_start_boundary_before_long_response_body(tmp_path, monkeypatch):
+    runtime = OpenClawRuntime(base_dir=str(tmp_path / "runtime"))
+    boundary_lock = Lock()
+    body_read_started = Event()
+    release_body = Event()
+    started = Event()
+    result: list[str] = []
+    errors: list[BaseException] = []
+
+    @contextmanager
+    def guard():
+        with boundary_lock:
+            yield
+
+    class BlockingStream(httpx.SyncByteStream):
+        def __iter__(self):
+            body_read_started.set()
+            assert release_body.wait(timeout=3)
+            yield (
+                b'event: response.output_text.delta\n'
+                b'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
+                b'event: response.completed\n'
+                b'data: {"type":"response.completed","response":{"output":[]}}\n\n'
+                b'data: [DONE]\n\n'
+            )
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            _ = args, kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def build_request(self, method: str, url: str, **kwargs):
+            return httpx.Request(method, url, **kwargs)
+
+        def send(self, request: httpx.Request, *, stream: bool = False):
+            assert stream is True
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=BlockingStream(),
+                request=request,
+            )
+
+    monkeypatch.setattr(runtime, "_prepare_worker_runtime", lambda: None)
+    monkeypatch.setattr(
+        runtime,
+        "_start_worker_runtime",
+        lambda _worker: RuntimeInfo(
+            runtime="openclaw",
+            model="openclaw",
+            gateway_url="http://openclaw.invalid",
+            gateway_port=1,
+            gateway_token="synthetic-token",
+            session_key="synthetic-session",
+            state_dir=str(tmp_path / "state"),
+            workspace_dir=str(tmp_path / "workspace"),
+            pid=123,
+        ),
+    )
+    monkeypatch.setattr(runtime, "_wait_for_ready", lambda _port, _token: None)
+    monkeypatch.setattr(openclaw_runtime_module.httpx, "Client", FakeClient)
+    worker = {
+        "worker_id": "wrk_stream_boundary",
+        "profile": "openclaw-general",
+        "model": "openclaw",
+        "_runtime_start_guard": guard,
+        "_runtime_started_callback": started.set,
+    }
+
+    def run() -> None:
+        try:
+            result.append(runtime.run_task(worker, "Return ok."))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    run_thread = Thread(target=run)
+    run_thread.start()
+    assert body_read_started.wait(timeout=2)
+    assert started.is_set()
+    assert boundary_lock.acquire(timeout=0.25)
+    boundary_lock.release()
+    release_body.set()
+    run_thread.join(timeout=3)
+
+    assert not run_thread.is_alive()
+    assert errors == []
+    assert result == ["ok"]
+
+
+def test_openclaw_stream_rejects_partial_output_without_completed_event(tmp_path, monkeypatch):
+    runtime = OpenClawRuntime(base_dir=str(tmp_path / "runtime"))
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            _ = args, kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def build_request(self, method: str, url: str, **kwargs):
+            return httpx.Request(method, url, **kwargs)
+
+        def send(self, request: httpx.Request, *, stream: bool = False):
+            _ = stream
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=(
+                    b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+                    b'data: [DONE]\n\n'
+                ),
+                request=request,
+            )
+
+    monkeypatch.setattr(runtime, "_prepare_worker_runtime", lambda: None)
+    monkeypatch.setattr(
+        runtime,
+        "_start_worker_runtime",
+        lambda _worker: RuntimeInfo(
+            runtime="openclaw",
+            model="openclaw",
+            gateway_url="http://openclaw.invalid",
+            gateway_port=1,
+            gateway_token="synthetic-token",
+            session_key="synthetic-session",
+            state_dir=str(tmp_path / "state"),
+            workspace_dir=str(tmp_path / "workspace"),
+            pid=123,
+        ),
+    )
+    monkeypatch.setattr(runtime, "_wait_for_ready", lambda _port, _token: None)
+    monkeypatch.setattr(openclaw_runtime_module.httpx, "Client", FakeClient)
+
+    with pytest.raises(RuntimeErrorBase, match="before response.completed"):
+        runtime.run_task(
+            {
+                "worker_id": "wrk_partial_stream",
+                "profile": "openclaw-general",
+                "model": "openclaw",
+            },
+            "Return a complete response.",
+        )
+
+
+def test_openclaw_cleans_new_gateway_when_runtime_info_cannot_be_persisted(tmp_path, monkeypatch):
+    runtime = OpenClawRuntime(base_dir=str(tmp_path / "runtime"))
+    terminated_pids: list[int | None] = []
+    send_calls: list[httpx.Request] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            _ = args, kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def build_request(self, method: str, url: str, **kwargs):
+            return httpx.Request(method, url, **kwargs)
+
+        def send(self, request: httpx.Request, *, stream: bool = False):
+            _ = stream
+            send_calls.append(request)
+            raise AssertionError("request must not be sent without durable runtime metadata")
+
+    info = RuntimeInfo(
+        runtime="openclaw",
+        model="openclaw",
+        gateway_url="http://openclaw.invalid",
+        gateway_port=1,
+        gateway_token="synthetic-token",
+        session_key="synthetic-session",
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        pid=43210,
+    )
+    monkeypatch.setattr(runtime, "_prepare_worker_runtime", lambda: None)
+    monkeypatch.setattr(runtime, "_start_worker_runtime", lambda _worker: info)
+    monkeypatch.setattr(runtime, "_wait_for_ready", lambda _port, _token: None)
+
+    def terminate(worker: dict) -> RuntimeInfo:
+        terminated_pids.append(worker.get("pid"))
+        return RuntimeInfo(**{**info.__dict__, "pid": None})
+
+    def reject_persistence(_info: RuntimeInfo) -> None:
+        raise OSError("synthetic state unavailable")
+
+    monkeypatch.setattr(runtime, "terminate_worker", terminate)
+    monkeypatch.setattr(openclaw_runtime_module.httpx, "Client", FakeClient)
+
+    with pytest.raises(OSError, match="synthetic state unavailable"):
+        runtime.run_task(
+            {
+                "worker_id": "wrk_persist_failure",
+                "profile": "openclaw-general",
+                "model": "openclaw",
+                "_runtime_info_callback": reject_persistence,
+            },
+            "Do not send without durable runtime identity.",
+        )
+
+    assert terminated_pids == [43210]
+    assert send_calls == []
+
+
+def test_openclaw_cold_readiness_wait_does_not_block_close(tmp_path, monkeypatch):
+    runtime = OpenClawRuntime(base_dir=str(tmp_path / "runtime"))
+    readiness_waiting = Event()
+    release_readiness = Event()
+    terminated_pids: list[int | None] = []
+    info = RuntimeInfo(
+        runtime="openclaw",
+        model="openclaw",
+        gateway_url="http://openclaw.invalid",
+        gateway_port=1,
+        gateway_token="synthetic-token",
+        session_key="synthetic-session",
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        pid=43210,
+    )
+
+    def wait_for_ready(_port: int, _token: str) -> None:
+        readiness_waiting.set()
+        assert release_readiness.wait(timeout=3)
+
+    def terminate(worker: dict) -> RuntimeInfo:
+        terminated_pids.append(worker.get("pid"))
+        release_readiness.set()
+        return RuntimeInfo(**{**info.__dict__, "pid": None})
+
+    monkeypatch.setattr(runtime, "_prepare_worker_runtime", lambda: None)
+    monkeypatch.setattr(runtime, "_start_worker_runtime", lambda _worker: info)
+    monkeypatch.setattr(runtime, "_wait_for_ready", wait_for_ready)
+    monkeypatch.setattr(runtime, "terminate_worker", terminate)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    project = service.create_project("demo-owner", "Cold readiness", "Close promptly.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Cold readiness",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        start_synchronously=False,
+    )
+    run = service.assign_run(worker["worker_id"], "Wait for readiness.")
+    try:
+        assert readiness_waiting.wait(timeout=2)
+        assert store.get_worker(worker["worker_id"])["pid"] == 43210
+        started_at = time.monotonic()
+        closed = service.terminate_worker(worker["worker_id"])
+        elapsed = time.monotonic() - started_at
+
+        assert closed["state"] == "terminated"
+        assert elapsed < 0.5
+        assert terminated_pids and terminated_pids[0] == 43210
+    finally:
+        release_readiness.set()
+        time.sleep(0.05)
+        service.shutdown()
+
+    assert store.get_worker(worker["worker_id"])["state"] == "terminated"
+    assert store.get_run(run["run_id"])["state"] == "cancelled"
+
+
+def test_openclaw_shared_preparation_does_not_hold_close_start_fence(tmp_path, monkeypatch):
+    runtime = OpenClawRuntime(base_dir=str(tmp_path / "runtime"))
+    preparation_started = Event()
+    release_preparation = Event()
+    start_calls: list[str] = []
+    info = RuntimeInfo(
+        runtime="openclaw",
+        model="openclaw",
+        gateway_url="",
+        gateway_port=None,
+        gateway_token="synthetic-token",
+        session_key="synthetic-session",
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        pid=None,
+    )
+
+    def prepare() -> None:
+        preparation_started.set()
+        assert release_preparation.wait(timeout=3)
+
+    def start(worker: dict) -> RuntimeInfo:
+        start_calls.append(str(worker["worker_id"]))
+        return info
+
+    def terminate(_worker: dict) -> RuntimeInfo:
+        release_preparation.set()
+        return info
+
+    monkeypatch.setattr(runtime, "_prepare_worker_runtime", prepare)
+    monkeypatch.setattr(runtime, "_start_worker_runtime", start)
+    monkeypatch.setattr(runtime, "terminate_worker", terminate)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    project = service.create_project("demo-owner", "Cold preparation", "Close promptly.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Cold preparation",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        start_synchronously=False,
+    )
+    run = service.assign_run(worker["worker_id"], "Prepare shared runtime assets.")
+    try:
+        assert preparation_started.wait(timeout=2)
+        started_at = time.monotonic()
+        closed = service.terminate_worker(worker["worker_id"])
+        elapsed = time.monotonic() - started_at
+
+        assert closed["state"] == "terminated"
+        assert elapsed < 0.5
+    finally:
+        release_preparation.set()
+        time.sleep(0.05)
+        service.shutdown()
+
+    assert start_calls == []
+    assert store.get_worker(worker["worker_id"])["state"] == "terminated"
+    assert store.get_run(run["run_id"])["state"] == "cancelled"
+
+
+@pytest.mark.parametrize("operation", ["resume", "synchronous_create"])
+def test_openclaw_non_run_readiness_persists_pid_before_close(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    runtime = OpenClawRuntime(base_dir=str(tmp_path / "runtime"))
+    readiness_waiting = Event()
+    release_readiness = Event()
+    worker_started = Event()
+    worker_ids: list[str] = []
+    live_pids: set[int] = set()
+    terminated_pids: list[int | None] = []
+    results: list[dict] = []
+    errors: list[BaseException] = []
+    info_template = {
+        "runtime": "openclaw",
+        "model": "openclaw",
+        "gateway_url": "http://openclaw.invalid",
+        "gateway_port": 1,
+        "gateway_token": "synthetic-token",
+        "session_key": "synthetic-session",
+        "state_dir": str(tmp_path / "state"),
+        "workspace_dir": str(tmp_path / "workspace"),
+    }
+
+    def start(worker: dict) -> RuntimeInfo:
+        worker_ids.append(str(worker["worker_id"]))
+        live_pids.add(43210)
+        worker_started.set()
+        return RuntimeInfo(**info_template, pid=43210)
+
+    def wait_for_ready(_port: int, _token: str) -> None:
+        readiness_waiting.set()
+        assert release_readiness.wait(timeout=3)
+
+    def terminate(worker: dict) -> RuntimeInfo:
+        pid = worker.get("pid")
+        terminated_pids.append(pid)
+        if isinstance(pid, int):
+            live_pids.discard(pid)
+        release_readiness.set()
+        return RuntimeInfo(**info_template, pid=None)
+
+    monkeypatch.setattr(runtime, "_prepare_worker_runtime", lambda: None)
+    monkeypatch.setattr(runtime, "_start_worker_runtime", start)
+    monkeypatch.setattr(runtime, "_wait_for_ready", wait_for_ready)
+    monkeypatch.setattr(runtime, "terminate_worker", terminate)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    project = service.create_project("demo-owner", "Non-run start", "Persist before Close.", "codex-cli")
+    prepared_worker = None
+    if operation == "resume":
+        prepared_worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="demo-owner",
+            name="Resume start",
+            role="operator",
+            profile="codex-cli",
+            backend="openclaw",
+            start_synchronously=False,
+        )
+
+    def start_operation() -> None:
+        try:
+            if operation == "resume":
+                results.append(service.resume_worker(prepared_worker["worker_id"]))
+            else:
+                results.append(
+                    service.create_worker(
+                        project_id=project["project_id"],
+                        owner_id="demo-owner",
+                        name="Synchronous start",
+                        role="operator",
+                        profile="codex-cli",
+                        backend="openclaw",
+                        start_synchronously=True,
+                    )
+                )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    operation_thread = Thread(target=start_operation)
+    operation_thread.start()
+    try:
+        assert worker_started.wait(timeout=2)
+        assert readiness_waiting.wait(timeout=2)
+        worker_id = worker_ids[0]
+        assert store.get_worker(worker_id)["pid"] == 43210
+        started_at = time.monotonic()
+        closed = service.terminate_worker(worker_id)
+        elapsed = time.monotonic() - started_at
+
+        assert closed["state"] == "terminated"
+        assert elapsed < 0.5
+        assert terminated_pids and terminated_pids[0] == 43210
+    finally:
+        release_readiness.set()
+        operation_thread.join(timeout=3)
+        service.shutdown()
+
+    assert not operation_thread.is_alive()
+    assert live_pids == set()
+    assert store.get_worker(worker_ids[0])["state"] == "terminated"
+    assert results == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], ControlPlaneConflict)
+
+
+@pytest.mark.parametrize("operation", ["resume", "synchronous_create"])
+def test_openclaw_non_run_readiness_failure_cleans_published_pid(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    runtime = OpenClawRuntime(base_dir=str(tmp_path / "runtime"))
+    live_pids = {43210}
+    terminated_pids: list[int | None] = []
+    info_template = {
+        "runtime": "openclaw",
+        "model": "openclaw",
+        "gateway_url": "http://openclaw.invalid",
+        "gateway_port": 1,
+        "gateway_token": "synthetic-token",
+        "session_key": "synthetic-session",
+        "state_dir": str(tmp_path / "state"),
+        "workspace_dir": str(tmp_path / "workspace"),
+    }
+
+    def terminate(worker: dict) -> RuntimeInfo:
+        pid = worker.get("pid")
+        terminated_pids.append(pid)
+        if isinstance(pid, int):
+            live_pids.discard(pid)
+        return RuntimeInfo(**info_template, pid=None)
+
+    def readiness_failure(_port: int, _token: str) -> None:
+        raise RuntimeErrorBase("synthetic gateway not ready")
+
+    monkeypatch.setattr(runtime, "_prepare_worker_runtime", lambda: None)
+    monkeypatch.setattr(
+        runtime,
+        "_start_worker_runtime",
+        lambda _worker: RuntimeInfo(**info_template, pid=43210),
+    )
+    monkeypatch.setattr(runtime, "_wait_for_ready", readiness_failure)
+    monkeypatch.setattr(runtime, "terminate_worker", terminate)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    project = service.create_project("demo-owner", "Readiness failure", "Clean compute.", "codex-cli")
+    try:
+        if operation == "resume":
+            worker = service.create_worker(
+                project_id=project["project_id"],
+                owner_id="demo-owner",
+                name="Resume readiness failure",
+                role="operator",
+                profile="codex-cli",
+                backend="openclaw",
+                start_synchronously=False,
+            )
+            result = service.resume_worker(worker["worker_id"])
+        else:
+            result = service.create_worker(
+                project_id=project["project_id"],
+                owner_id="demo-owner",
+                name="Create readiness failure",
+                role="operator",
+                profile="codex-cli",
+                backend="openclaw",
+                start_synchronously=True,
+            )
+
+        stored = store.get_worker(result["worker_id"])
+        assert result["state"] == "failed"
+        assert stored["state"] == "failed"
+        assert stored["pid"] is None
+        assert "synthetic gateway not ready" in str(stored["last_error"])
+        assert terminated_pids == [43210]
+        assert live_pids == set()
+    finally:
+        service.shutdown()
+
+
+@pytest.mark.parametrize("operation", ["resume", "synchronous_create"])
+def test_non_run_ready_finalization_is_ordered_before_concurrent_close(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), reconcile_on_startup=False)
+    project = service.create_project("demo-owner", "Ready ordering", "Order lifecycle events.", "codex-cli")
+    prepared_worker = None
+    if operation == "resume":
+        prepared_worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="demo-owner",
+            name="Resume ordering",
+            role="operator",
+            profile="codex-cli",
+            backend="openclaw",
+            start_synchronously=False,
+        )
+
+    original_update_worker = store.update_worker
+    ready_written = Event()
+    release_ready = Event()
+    worker_ids: list[str] = []
+
+    def block_after_ready(worker_id: str, **fields):
+        updated = original_update_worker(worker_id, **fields)
+        if fields.get("state") == "ready":
+            worker_ids.append(worker_id)
+            ready_written.set()
+            assert release_ready.wait(timeout=3)
+        return updated
+
+    monkeypatch.setattr(store, "update_worker", block_after_ready)
+    operation_results: list[dict] = []
+    operation_errors: list[BaseException] = []
+    close_results: list[dict] = []
+
+    def run_operation() -> None:
+        try:
+            if operation == "resume":
+                operation_results.append(service.resume_worker(prepared_worker["worker_id"]))
+            else:
+                operation_results.append(
+                    service.create_worker(
+                        project_id=project["project_id"],
+                        owner_id="demo-owner",
+                        name="Create ordering",
+                        role="operator",
+                        profile="codex-cli",
+                        backend="openclaw",
+                        start_synchronously=True,
+                    )
+                )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            operation_errors.append(exc)
+
+    operation_thread = Thread(target=run_operation)
+    operation_thread.start()
+    assert ready_written.wait(timeout=2)
+    worker_id = worker_ids[0]
+    close_thread = Thread(
+        target=lambda: close_results.append(service.terminate_worker(worker_id))
+    )
+    close_thread.start()
+    time.sleep(0.05)
+    assert close_results == []
+    release_ready.set()
+    operation_thread.join(timeout=3)
+    close_thread.join(timeout=3)
+    service.shutdown()
+
+    assert not operation_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert operation_errors == []
+    assert operation_results[0]["state"] == "ready"
+    assert close_results[0]["state"] == "terminated"
+    assert store.get_worker(worker_id)["state"] == "terminated"
+    event_types = [event["event_type"] for event in store.list_events(worker_id)]
+    ready_event = "worker.resumed" if operation == "resume" else "worker.ready"
+    assert event_types.index(ready_event) < event_types.index("worker.terminated")
+
+
+def test_runtime_info_is_persisted_before_close_can_follow_accepted_start(tmp_path):
+    class PublishingRuntime(StubRuntime):
+        def __init__(self):
+            self.body_active = Event()
+            self.release_body = Event()
+            self.terminated_pids: list[int | None] = []
+
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            _ = instruction, timeout_sec, run_id
+            with runtime_start_boundary(worker):
+                callback = worker.get("_runtime_info_callback")
+                assert callable(callback)
+                callback(self._runtime_info(worker, pid=43210))
+                notify_runtime_started(worker)
+            self.body_active.set()
+            assert self.release_body.wait(timeout=3)
+            return "late output"
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated_pids.append(worker.get("pid"))
+            return self._runtime_info(worker, pid=None)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = PublishingRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    project = service.create_project("demo-owner", "Persist runtime", "Close known compute.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Persist runtime",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        start_synchronously=False,
+    )
+    run = service.assign_run(worker["worker_id"], "Start and then close.")
+    try:
+        assert runtime.body_active.wait(timeout=2)
+        assert store.get_worker(worker["worker_id"])["pid"] == 43210
+        closed = service.terminate_worker(worker["worker_id"])
+        assert closed["state"] == "terminated"
+        assert runtime.terminated_pids == [43210]
+    finally:
+        runtime.release_body.set()
+        time.sleep(0.05)
+        service.shutdown()
+
+    assert store.get_worker(worker["worker_id"])["state"] == "terminated"
+    assert store.get_run(run["run_id"])["state"] == "cancelled"
+
+
+@pytest.mark.parametrize("operation", ["pause", "interrupt"])
+def test_control_before_final_start_boundary_prevents_execution_without_closing(tmp_path, operation):
+    class BlockingStartRuntime(StubRuntime):
+        def __init__(self):
+            self.entered = Event()
+            self.release = Event()
+            self.ran = False
+
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            self.entered.set()
+            assert self.release.wait(timeout=3), "control test did not release run start"
+            with runtime_start_boundary(worker):
+                self.ran = True
+                notify_runtime_started(worker)
+            return "should not run"
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = BlockingStartRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    project = service.create_project("demo-owner", "Control fence", "Control wins.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Control fence",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        start_synchronously=False,
+    )
+    run = service.assign_run(worker["worker_id"], "Do not start after control.")
+    try:
+        assert runtime.entered.wait(timeout=2)
+        if operation == "pause":
+            result = service.pause_worker(worker["worker_id"])
+            assert result["state"] == "paused"
+        else:
+            result = service.interrupt_worker(worker["worker_id"], run_id=run["run_id"])
+            assert result["state"] == "ready"
+    finally:
+        runtime.release.set()
+        time.sleep(0.05)
+        service.shutdown()
+
+    assert runtime.ran is False
+    assert store.get_worker(worker["worker_id"])["state"] == (
+        "paused" if operation == "pause" else "ready"
+    )
+    assert store.get_run(run["run_id"])["state"] == (
+        "paused" if operation == "pause" else "interrupted"
+    )
+    assert "run.started" not in {
+        event["event_type"] for event in store.list_events(worker["worker_id"])
+    }
+
+
+def test_pause_started_snapshot_is_serialized_with_runtime_start(tmp_path, monkeypatch):
+    class SnapshotRaceRuntime(StubRuntime):
+        def __init__(self):
+            self.before_boundary = Event()
+            self.try_boundary = Event()
+            self.ran = False
+
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            self.before_boundary.set()
+            assert self.try_boundary.wait(timeout=3)
+            with runtime_start_boundary(worker):
+                self.ran = True
+                notify_runtime_started(worker)
+            return "should not run"
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = SnapshotRaceRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    project = service.create_project("demo-owner", "Pause snapshot", "Pause wins.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Pause snapshot",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        start_synchronously=False,
+    )
+    run = service.assign_run(worker["worker_id"], "Do not cross the pause boundary.")
+    assert runtime.before_boundary.wait(timeout=2)
+
+    original_has_run_event = store.has_run_event
+    snapshot_read = Event()
+    release_snapshot = Event()
+
+    def block_false_started_snapshot(run_id: str, event_type: str) -> bool:
+        result = original_has_run_event(run_id, event_type)
+        if run_id == run["run_id"] and event_type == "run.started" and not result:
+            snapshot_read.set()
+            assert release_snapshot.wait(timeout=3)
+        return result
+
+    monkeypatch.setattr(store, "has_run_event", block_false_started_snapshot)
+    pause_result: dict[str, object] = {}
+    pause_errors: list[BaseException] = []
+
+    def pause() -> None:
+        try:
+            pause_result.update(service.pause_worker(worker["worker_id"]))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            pause_errors.append(exc)
+
+    pause_thread = Thread(target=pause)
+    pause_thread.start()
+    assert snapshot_read.wait(timeout=2)
+    runtime.try_boundary.set()
+    time.sleep(0.05)
+    assert runtime.ran is False
+    release_snapshot.set()
+    pause_thread.join(timeout=3)
+    time.sleep(0.05)
+    service.shutdown()
+
+    assert not pause_thread.is_alive()
+    assert pause_errors == []
+    assert pause_result["state"] == "paused"
+    assert runtime.ran is False
+    assert store.get_run(run["run_id"])["state"] == "paused"
+    assert not store.has_run_event(run["run_id"], "run.started")
+
+
+def test_concurrent_terminate_calls_have_one_runtime_owner(tmp_path):
+    class SingleOwnerTerminationRuntime(StubRuntime):
+        def __init__(self):
+            self.entered = Event()
+            self.release = Event()
+            self.calls = 0
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.calls += 1
+            self.entered.set()
+            assert self.release.wait(timeout=3), "termination test did not release runtime teardown"
+            return super().terminate_worker(worker)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = SingleOwnerTerminationRuntime()
+    service = WorkersProjectsService(store, runtime)
+    project = service.create_project("demo-owner", "Close once", "One teardown owner.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Close once",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        start_synchronously=False,
+    )
+    first_results: list[dict] = []
+
+    thread = Thread(target=lambda: first_results.append(service.terminate_worker(worker["worker_id"])))
+    thread.start()
+    try:
+        assert runtime.entered.wait(timeout=2), "first termination did not reach runtime teardown"
+        observer = service.terminate_worker(worker["worker_id"])
+        assert observer["state"] == "terminating"
+        assert runtime.calls == 1
+    finally:
+        runtime.release.set()
+        thread.join(timeout=3)
+        service.shutdown()
+
+    assert not thread.is_alive()
+    assert first_results[0]["state"] == "terminated"
+    assert runtime.calls == 1
+    assert store.get_worker(worker["worker_id"])["state"] == "terminated"
+
+
+def test_startup_reconcile_finishes_persisted_terminating_workspace(tmp_path):
+    class RecordingTerminationRuntime(StubRuntime):
+        def __init__(self):
+            self.calls = 0
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.calls += 1
+            return super().terminate_worker(worker)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = RecordingTerminationRuntime()
+    service = WorkersProjectsService(store, runtime)
+    project = service.create_project("demo-owner", "Recover close", "Finish durable closure.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Recover close",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        start_synchronously=False,
+    )
+    store.update_worker(worker["worker_id"], state="terminating", pid=12345)
+
+    try:
+        service._reconcile_worker_row(store.get_worker(worker["worker_id"]))
+    finally:
+        service.shutdown()
+
+    assert runtime.calls == 1
+    assert store.get_worker(worker["worker_id"])["state"] == "terminated"
+
+
+def test_termination_cancels_future_and_recurring_work_immediately(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "glasshive_native")
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime())
+    project = service.create_project("demo-owner", "Cancel future", "Close all future work.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="demo-owner",
+        name="Cancel future",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        start_synchronously=False,
+    )
+    one_shot = service.schedule_run(
+        worker["worker_id"],
+        "Never run this one-shot task.",
+        run_at="2027-01-02T03:04:05+00:00",
+    )
+    recurring = service.create_recurring_schedule(
+        worker["worker_id"],
+        "Never run this recurring task.",
+        recurrence_type="interval",
+        interval_seconds=3600,
+        first_run_at="2027-01-02T03:04:05+00:00",
+    )
+
+    try:
+        assert service.terminate_worker(worker["worker_id"])["state"] == "terminated"
+        schedule = store.get_schedule(one_shot["schedule_id"])
+        definition = store.get_recurring_schedule_definition(
+            recurring["definition_id"], tenant_id="local", owner_id="demo-owner"
+        )
+        assert schedule["state"] == "cancelled"
+        assert schedule["last_error"] == "workspace_closed"
+        assert definition["active"] is False
+        assert service.process_due_schedules_once(now_iso="2027-01-02T04:04:05+00:00") == []
+        assert store.get_schedule(one_shot["schedule_id"])["state"] == "cancelled"
+        assert store.list_runs_for_worker(worker["worker_id"]) == []
+    finally:
+        service.shutdown()
+
+
 def test_terminate_failure_is_not_reported_as_success(tmp_path):
     class FailingTerminateRuntime(StubRuntime):
         def terminate_worker(self, worker: dict) -> RuntimeInfo:
@@ -7102,11 +8561,224 @@ def test_terminate_failure_is_not_reported_as_success(tmp_path):
 
         refreshed = store.get_worker(worker["worker_id"])
         assert refreshed is not None
-        assert refreshed["state"] == "failed"
+        assert refreshed["state"] == "termination_failed"
         assert refreshed["last_error"] == "compute remained active"
         assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.termination_failed"
+        # Delayed runtime writers cannot reopen a workspace whose teardown needs attention.
+        assert store.update_worker(worker["worker_id"], state="ready")["state"] == "termination_failed"
+        assert store.update_worker_unless_gc_claimed(worker["worker_id"], state="paused") is None
+        assert store.get_worker(worker["worker_id"])["state"] == "termination_failed"
+        for rejected in (
+            lambda: service.assign_run(worker["worker_id"], "Do not queue after close failed."),
+            lambda: service.send_message(worker["worker_id"], "Do not queue this message."),
+            lambda: service.resume_worker(worker["worker_id"]),
+            lambda: service.schedule_run(worker["worker_id"], "Do not schedule this.", delay_seconds=60),
+            lambda: service.pause_worker(worker["worker_id"]),
+            lambda: service.interrupt_worker(worker["worker_id"]),
+        ):
+            with pytest.raises(ControlPlaneConflict, match="closed"):
+                rejected()
     finally:
         service.shutdown()
+
+
+@pytest.mark.parametrize("closed_state", ["terminating", "termination_failed", "terminated"])
+@pytest.mark.parametrize("operation", ["pause", "interrupt"])
+def test_closed_workspace_control_actions_do_not_call_runtime(tmp_path, closed_state, operation):
+    class RecordingControlRuntime(StubRuntime):
+        def __init__(self):
+            self.pause_calls = 0
+            self.interrupt_calls = 0
+
+        def pause_worker(self, worker: dict) -> RuntimeInfo:
+            self.pause_calls += 1
+            return super().pause_worker(worker)
+
+        def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
+            self.interrupt_calls += 1
+            return super().interrupt_worker(worker, run_id=run_id)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = RecordingControlRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = service.create_project("owner", "Closed controls", "Reject controls.", "codex-cli")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Closed controls",
+            role="operator",
+            profile="codex-cli",
+            backend="openclaw",
+            start_synchronously=False,
+        )
+        store.update_worker_state(worker["worker_id"], closed_state)
+
+        with pytest.raises(ControlPlaneConflict, match="closed"):
+            if operation == "pause":
+                service.pause_worker(worker["worker_id"])
+            else:
+                service.interrupt_worker(worker["worker_id"])
+
+        assert runtime.pause_calls == 0
+        assert runtime.interrupt_calls == 0
+        assert store.get_worker(worker["worker_id"])["state"] == closed_state
+    finally:
+        service.shutdown()
+
+
+@pytest.mark.parametrize("operation", ["pause", "interrupt"])
+def test_control_action_losing_race_to_close_has_no_stale_side_effects(tmp_path, operation):
+    class BlockingControlRuntime(StubRuntime):
+        def __init__(self):
+            self.entered = Event()
+            self.release = Event()
+
+        def pause_worker(self, worker: dict) -> RuntimeInfo:
+            self.entered.set()
+            assert self.release.wait(timeout=3), "pause test did not release runtime control"
+            return super().pause_worker(worker)
+
+        def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
+            self.entered.set()
+            assert self.release.wait(timeout=3), "interrupt test did not release runtime control"
+            return super().interrupt_worker(worker, run_id=run_id)
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = BlockingControlRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    project = service.create_project("owner", "Control race", "Close wins control race.", "codex-cli")
+    worker = service.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Control race",
+        role="operator",
+        profile="codex-cli",
+        backend="openclaw",
+        start_synchronously=False,
+    )
+    active_run = None
+    if operation == "interrupt":
+        active_run = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "Control race run",
+            state="running",
+        )
+    errors: list[BaseException] = []
+
+    def control() -> None:
+        try:
+            if operation == "pause":
+                service.pause_worker(worker["worker_id"])
+            else:
+                service.interrupt_worker(worker["worker_id"])
+        except BaseException as exc:  # pragma: no cover - assertion reports worker thread errors
+            errors.append(exc)
+
+    thread = Thread(target=control)
+    thread.start()
+    try:
+        assert runtime.entered.wait(timeout=2), "control action never reached runtime"
+        assert service.terminate_worker(worker["worker_id"])["state"] == "terminated"
+    finally:
+        runtime.release.set()
+        thread.join(timeout=3)
+        service.shutdown()
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ControlPlaneConflict)
+    assert store.get_worker(worker["worker_id"])["state"] == "terminated"
+    event_types = [event["event_type"] for event in store.list_events(worker["worker_id"])]
+    assert f"worker.{operation}d" not in event_types
+    if active_run is not None:
+        assert store.get_run(active_run["run_id"])["state"] == "cancelled"
+
+
+@pytest.mark.parametrize("closed_state", ["terminating", "termination_failed", "terminated"])
+def test_closed_workspace_rejects_terminal_websocket(tmp_path, closed_state):
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Closed terminal", "goal": "Reject terminal attach."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Closed terminal", "role": "operator"},
+    ).json()
+    client.app.state.store.update_worker_state(worker["worker_id"], closed_state)
+
+    with pytest.raises(WebSocketDisconnect) as disconnected:
+        with client.websocket_connect(f"/ws/workers/{worker['worker_id']}/terminal"):
+            pass
+    assert disconnected.value.code == 4404
+
+
+def test_open_terminal_websocket_is_revoked_when_workspace_closes(tmp_path):
+    pid_path = tmp_path / "terminal.pid"
+
+    class TerminalRuntime(StubRuntime):
+        def terminal_target(self, worker: dict) -> TerminalTarget:
+            return TerminalTarget(
+                command=[
+                    "/bin/sh",
+                    "-c",
+                    f"echo $$ > {pid_path}; echo terminal-ready; exec sleep 30",
+                ],
+                cwd=str(tmp_path),
+            )
+
+    client = TestClient(
+        create_app(
+            str(tmp_path / "runtime.db"),
+            runtime_backend="stub",
+            runtime=TerminalRuntime(),
+        )
+    )
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Close terminal", "goal": "Revoke live shell."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Close terminal", "role": "operator"},
+    ).json()
+    opened = Event()
+    disconnected_codes: list[int] = []
+
+    def use_terminal() -> None:
+        try:
+            with client.websocket_connect(f"/ws/workers/{worker['worker_id']}/terminal") as websocket:
+                assert "terminal-ready" in websocket.receive_text()
+                opened.set()
+                websocket.receive_text()
+        except WebSocketDisconnect as exc:
+            disconnected_codes.append(exc.code)
+
+    thread = Thread(target=use_terminal)
+    thread.start()
+    try:
+        assert opened.wait(timeout=2), "terminal did not open"
+        response = client.post(f"/v1/workers/{worker['worker_id']}/terminate")
+        assert response.status_code == 202
+        thread.join(timeout=3)
+    finally:
+        if thread.is_alive():
+            thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert disconnected_codes == [1008]
+    pid = int(pid_path.read_text().strip())
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("terminal process survived workspace closure")
 
 
 def test_terminate_rejects_runtime_that_still_reports_compute(tmp_path):
@@ -7140,7 +8812,7 @@ def test_terminate_rejects_runtime_that_still_reports_compute(tmp_path):
         with pytest.raises(RuntimeError, match="still active after termination"):
             service.terminate_worker(worker["worker_id"])
 
-        assert store.get_worker(worker["worker_id"])["state"] == "failed"
+        assert store.get_worker(worker["worker_id"])["state"] == "termination_failed"
     finally:
         service.shutdown()
 

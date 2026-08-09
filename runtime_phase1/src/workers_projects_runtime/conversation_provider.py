@@ -1400,7 +1400,8 @@ class ConversationProvider:
                 or Path(str(existing["workspace_dir"])).resolve() != workspace
                 or existing["access_mode"] != expected_access
                 or not existing_worker
-                or str(existing_worker.get("state") or "") in {"failed", "terminated"}
+                or str(existing_worker.get("state") or "")
+                in {"failed", "terminating", "termination_failed", "terminated"}
                 or policy_changed
                 or system_state_changed
             )

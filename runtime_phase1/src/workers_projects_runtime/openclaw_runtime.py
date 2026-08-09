@@ -8,6 +8,7 @@ import signal
 import socket
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -113,6 +114,103 @@ class WorkerInterruptedError(RuntimeErrorBase):
     pass
 
 
+@contextmanager
+def runtime_start_boundary(worker: dict):
+    """Enter the service-owned Close/start fence at the real external start boundary."""
+
+    guard_factory = worker.get("_runtime_start_guard")
+    if callable(guard_factory):
+        with guard_factory():
+            yield
+        return
+    yield
+
+
+def notify_runtime_started(worker: dict) -> None:
+    callback = worker.get("_runtime_started_callback")
+    if callable(callback):
+        callback()
+
+
+def notify_runtime_info(worker: dict, info: RuntimeInfo) -> None:
+    callback = worker.get("_runtime_info_callback")
+    if callable(callback):
+        callback(info)
+
+
+def _response_output_parts(data: dict) -> list[str]:
+    output_parts: list[str] = []
+    for item in data.get("output", []):
+        if item.get("type") == "message":
+            for content in item.get("content", []):
+                if content.get("type") == "output_text":
+                    text = content.get("text", "")
+                    if text:
+                        output_parts.append(text)
+        elif item.get("type") == "function_call":
+            output_parts.append(f"[Tool call: {item.get('name', 'function')}]")
+    return output_parts
+
+
+def _streamed_response_text(response: httpx.Response) -> str:
+    """Read an OpenAI Responses SSE stream after its request was accepted."""
+
+    output_parts: list[str] = []
+    completed_text = ""
+    completed_response: dict = {}
+    event_type = ""
+    saw_completed = False
+    for raw_line in response.iter_lines():
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        if line.startswith("event:"):
+            event_type = line.partition(":")[2].strip()
+            continue
+        if not line.startswith("data:"):
+            continue
+        raw_data = line.partition(":")[2].strip()
+        if raw_data == "[DONE]":
+            break
+        try:
+            payload = json.loads(raw_data)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        payload_type = str(payload.get("type") or event_type)
+        if payload_type == "response.output_text.delta":
+            delta = str(payload.get("delta") or "")
+            if delta:
+                output_parts.append(delta)
+        elif payload_type == "response.output_text.done":
+            completed_text = str(payload.get("text") or "")
+        elif payload_type == "response.output_item.added":
+            item = payload.get("item") or {}
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                output_parts.append(f"[Tool call: {item.get('name', 'function')}]")
+        elif payload_type == "response.completed":
+            saw_completed = True
+            candidate = payload.get("response") or {}
+            if isinstance(candidate, dict):
+                completed_response = candidate
+        elif payload_type == "response.failed":
+            failure = payload.get("response") or payload.get("error") or payload
+            raise RuntimeErrorBase(
+                f"OpenClaw response failed: {json.dumps(failure, default=str)[:500]}"
+            )
+    if not saw_completed:
+        raise RuntimeErrorBase("OpenClaw stream ended before response.completed")
+    if output_parts:
+        return "".join(output_parts).strip()
+    if completed_text:
+        return completed_text.strip()
+    completed_parts = _response_output_parts(completed_response)
+    if completed_parts:
+        return "\n".join(completed_parts).strip()
+    return str(completed_response or {"status": "completed"})
+
+
 class WorkerRuntime(Protocol):
     def resolve_model(self, profile: str) -> str: ...
 
@@ -184,10 +282,12 @@ class StubRuntime:
         return self._runtime_info(worker, pid=None)
 
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        with runtime_start_boundary(worker):
+            notify_runtime_started(worker)
         return f"STUB_OK: {instruction}"
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
-        if worker.get("state") in {"paused", "terminated"}:
+        if worker.get("state") in {"paused", "terminating", "termination_failed", "terminated"}:
             return self._runtime_info(worker, pid=None)
         return self.ensure_worker_ready(worker)
 
@@ -230,15 +330,21 @@ class OpenClawRuntime:
         }
         return defaults.get(profile, defaults["openclaw-general"])
 
-    def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+    def _prepare_worker_runtime(self) -> None:
+        """Complete shared, non-worker provisioning outside the Close/start fence."""
+
         verify_reviewed_openclaw_binary(self.openclaw_bin)
         self._ensure_sandbox_image()
+
+    def _start_worker_runtime(self, worker: dict) -> RuntimeInfo:
+        """Return a live process identity without waiting for gateway readiness."""
+
         meta = self._metadata_for_worker(worker)
         pid = self._safe_int(worker.get("pid"))
         gateway_port = self._safe_int(worker.get("gateway_port"))
         gateway_token = worker.get("gateway_token") or meta["gateway_token"]
 
-        if pid and gateway_port and gateway_token and self._process_alive(pid) and self._probe_gateway(gateway_port, gateway_token):
+        if pid and gateway_port and gateway_token and self._process_alive(pid):
             return RuntimeInfo(
                 runtime="openclaw",
                 model=worker.get("model") or self.resolve_model(worker.get("profile", "openclaw-general")),
@@ -266,7 +372,6 @@ class OpenClawRuntime:
             port=port,
             token=token,
         )
-        self._wait_for_ready(port, token)
         return RuntimeInfo(
             runtime="openclaw",
             model=worker.get("model") or self.resolve_model(worker.get("profile", "openclaw-general")),
@@ -278,6 +383,63 @@ class OpenClawRuntime:
             workspace_dir=meta["workspace_dir"],
             pid=process.pid,
         )
+
+    @staticmethod
+    def _runtime_worker_with_info(worker: dict, info: RuntimeInfo) -> dict:
+        return {
+            **worker,
+            "runtime": info.runtime,
+            "model": info.model,
+            "gateway_url": info.gateway_url,
+            "gateway_port": info.gateway_port,
+            "gateway_token": info.gateway_token,
+            "session_key": info.session_key,
+            "state_dir": info.state_dir,
+            "workspace_dir": info.workspace_dir,
+            "pid": info.pid,
+        }
+
+    def _start_and_publish_worker_runtime(self, worker: dict) -> RuntimeInfo:
+        with runtime_start_boundary(worker):
+            info = self._start_worker_runtime(worker)
+            try:
+                notify_runtime_info(worker, info)
+            except Exception as persistence_error:
+                try:
+                    self.terminate_worker(self._runtime_worker_with_info(worker, info))
+                except Exception as cleanup_error:
+                    raise RuntimeErrorBase(
+                        "OpenClaw runtime metadata could not be persisted and the new gateway could not be cleaned up"
+                    ) from cleanup_error
+                raise persistence_error
+        return info
+
+    def _wait_for_published_worker_ready(
+        self,
+        worker: dict,
+        info: RuntimeInfo,
+    ) -> RuntimeInfo:
+        if not info.gateway_port or not info.gateway_token:
+            raise RuntimeErrorBase("OpenClaw gateway runtime metadata is incomplete")
+        try:
+            self._wait_for_ready(info.gateway_port, info.gateway_token)
+        except Exception as readiness_error:
+            try:
+                cleaned = self.terminate_worker(
+                    self._runtime_worker_with_info(worker, info)
+                )
+            except Exception as cleanup_error:
+                raise RuntimeErrorBase(
+                    "OpenClaw gateway readiness failed and the new gateway could not be cleaned up"
+                ) from cleanup_error
+            notify_runtime_info(worker, cleaned)
+            raise readiness_error
+        return info
+
+    def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+        self._prepare_worker_runtime()
+        info = self._start_and_publish_worker_runtime(worker)
+        return self._wait_for_published_worker_ready(worker, info)
 
     def pause_worker(self, worker: dict) -> RuntimeInfo:
         pid = self._safe_int(worker.get("pid"))
@@ -303,29 +465,41 @@ class OpenClawRuntime:
         return self.pause_worker(worker)
 
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
-        info = self.ensure_worker_ready(worker)
-        headers = {
-            "Authorization": f"Bearer {info.gateway_token}",
-            "Content-Type": "application/json",
-            "x-openclaw-agent-id": "main",
-            "x-openclaw-session-key": info.session_key or f"agent:main:wpr:worker:{worker['worker_id']}",
-        }
-        payload = {
-            "model": "openclaw",
-            "input": instruction,
-            "stream": False,
-        }
-
+        response: httpx.Response | None = None
         try:
             with httpx.Client(timeout=_run_timeout_sec(timeout_sec)) as client:
-                response = client.post(f"{info.gateway_url}/v1/responses", json=payload, headers=headers)
+                self._prepare_worker_runtime()
+                info = self._start_and_publish_worker_runtime(worker)
+                info = self._wait_for_published_worker_ready(worker, info)
+                with runtime_start_boundary(worker):
+                    headers = {
+                        "Authorization": f"Bearer {info.gateway_token}",
+                        "Content-Type": "application/json",
+                        "x-openclaw-agent-id": "main",
+                        "x-openclaw-session-key": info.session_key
+                        or f"agent:main:wpr:worker:{worker['worker_id']}",
+                    }
+                    request = client.build_request(
+                        "POST",
+                        f"{info.gateway_url}/v1/responses",
+                        json={"model": "openclaw", "input": instruction, "stream": True},
+                        headers={**headers, "Accept": "text/event-stream"},
+                    )
+                    response = client.send(request, stream=True)
+                    if response.is_error:
+                        response.read()
+                    response.raise_for_status()
+                    notify_runtime_started(worker)
+                if "text/event-stream" in str(response.headers.get("content-type") or "").lower():
+                    return _streamed_response_text(response)
+                response.read()
                 response.raise_for_status()
                 data = response.json()
         except httpx.ConnectError as exc:
             state = str(worker.get("state") or "")
             if state == "paused":
                 raise WorkerPausedError("Worker was paused while a run was active") from exc
-            if state == "terminated":
+            if state in {"terminating", "termination_failed", "terminated"}:
                 raise WorkerTerminatedError("Worker was terminated while a run was active") from exc
             raise RuntimeErrorBase(f"Could not connect to OpenClaw gateway for worker {worker['worker_id']}: {exc}") from exc
         except httpx.HTTPStatusError as exc:
@@ -333,18 +507,13 @@ class OpenClawRuntime:
         except httpx.TimeoutException as exc:
             effective_timeout = _run_timeout_sec(timeout_sec)
             raise RuntimeErrorBase(f"OpenClaw timed out after {effective_timeout}s") from exc
+        except httpx.TransportError as exc:
+            raise RuntimeErrorBase("OpenClaw response stream ended unexpectedly") from exc
+        finally:
+            if response is not None:
+                response.close()
 
-        output_parts: list[str] = []
-        for item in data.get("output", []):
-            if item.get("type") == "message":
-                for content in item.get("content", []):
-                    if content.get("type") == "output_text":
-                        text = content.get("text", "")
-                        if text:
-                            output_parts.append(text)
-            elif item.get("type") == "function_call":
-                name = item.get("name", "function")
-                output_parts.append(f"[Tool call: {name}]")
+        output_parts = _response_output_parts(data)
 
         if output_parts:
             return "\n".join(output_parts).strip()

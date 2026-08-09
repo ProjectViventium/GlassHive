@@ -97,6 +97,7 @@ from .service import (
     WorkersProjectsService,
     allowed_worker_profiles,
     merge_bootstrap_bundle,
+    public_callback_message_text,
 )
 from .signed_links import (
     append_signed_query,
@@ -108,7 +109,7 @@ from .signed_links import (
     verify_signed_link,
     verify_signed_link_token,
 )
-from .store import SchedulePrincipalAuthorityStoreError, Store
+from .store import SchedulePrincipalAuthorityStoreError, Store, WorkerClosedStoreError
 from .terminal_takeover import TerminalTarget, bridge_terminal
 
 load_viventium_runtime_env()
@@ -2363,6 +2364,15 @@ def create_app(
             worker = require_worker(payload.target_id, request)
             if str(worker.get("owner_id") or "") != owner_id:
                 raise HTTPException(status_code=404, detail="Workspace not found")
+            if str(worker.get("state") or "") in {
+                "terminating",
+                "termination_failed",
+                "terminated",
+            }:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Workspace is closed; create a new workspace for new work",
+                )
         pending = control_plane.create_pending_change(
             tenant_id=tenant_id,
             owner_id=owner_id,
@@ -2950,13 +2960,23 @@ def create_app(
                     "detail": str(exc),
                 },
             )
+        except WorkerClosedStoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if str(schedule.get("state") or "") == "pending":
             schedule = store.claim_schedule(str(schedule["schedule_id"])) or store.get_schedule(
                 str(schedule["schedule_id"])
             )
         if not schedule:
             raise HTTPException(status_code=409, detail="Workspace occurrence could not be claimed")
-        run = service.assign_scheduled_run(schedule)
+        try:
+            run = service.assign_scheduled_run(schedule)
+        except ControlPlaneConflict as exc:
+            store.finalize_schedule(
+                str(schedule["schedule_id"]),
+                state="cancelled",
+                last_error=str(exc),
+            )
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return RunResponse(**run)
 
     @app.post("/v1/workers/{worker_id}/message", response_model=RunResponse, status_code=202)
@@ -3501,7 +3521,12 @@ def create_app(
         project_items = []
         for project in projects:
             workers = store.list_workers(project["project_id"], _tenant_filter(ctx), _owner_filter(ctx))
-            active_workers = [worker for worker in workers if worker["state"] != "terminated"]
+            active_workers = [
+                worker
+                for worker in workers
+                if str(worker.get("state") or "")
+                not in {"terminating", "termination_failed", "terminated"}
+            ]
             open_target = f"/ui/projects/{escape(project['project_id'])}"
             project_id_row = f"<p><strong>Project ID:</strong> {escape(project['project_id'])}</p>" if show_internal else ""
             project_items.append(
@@ -3563,7 +3588,15 @@ def create_app(
         if worker_id:
             selected_worker = next((worker for worker in workers if worker["worker_id"] == worker_id), None)
         if selected_worker is None:
-            selected_worker = next((worker for worker in workers if worker["state"] != "terminated"), None)
+            selected_worker = next(
+                (
+                    worker
+                    for worker in workers
+                    if str(worker.get("state") or "")
+                    not in {"terminating", "termination_failed", "terminated"}
+                ),
+                None,
+            )
 
         selected_runs = store.list_runs_for_worker(selected_worker["worker_id"], limit=10, tenant_id=_tenant_filter(ctx)) if selected_worker else []
         project_runs = store.list_runs_for_project(project_id, limit=12, tenant_id=_tenant_filter(ctx))
@@ -3606,7 +3639,8 @@ def create_app(
                 "</option>"
             )
             for worker in workers
-            if worker["state"] != "terminated"
+            if str(worker.get("state") or "")
+            not in {"terminating", "termination_failed", "terminated"}
         )
         worker_select = (
             f"{project_worker_options}<option value='__new__'>Create new worker...</option>"
@@ -4623,11 +4657,37 @@ def create_app(
         if not worker:
             await websocket.close(code=4404)
             return
-        if worker["state"] == "terminated":
+        if str(worker.get("state") or "") in {"terminating", "termination_failed", "terminated"}:
             await websocket.close(code=4404)
             return
         target = _terminal_target(worker)
-        await bridge_terminal(websocket, target)
+        current = store.get_worker(
+            worker_id,
+            tenant_id=ctx.tenant_id if ctx.enterprise else None,
+            owner_id=ctx.owner_id if ctx.enterprise else None,
+        )
+        if current and str(current.get("state") or "") in {
+            "terminating",
+            "termination_failed",
+            "terminated",
+        }:
+            try:
+                service._reject_closed_after_runtime_activity(
+                    worker_id,
+                    fallback_worker=current,
+                    context="terminal attachment",
+                )
+            except ControlPlaneConflict:
+                pass
+            await websocket.close(code=4404)
+            return
+        await bridge_terminal(
+            websocket,
+            target,
+            should_close=lambda: str(
+                (store.get_worker(worker_id) or {}).get("state") or ""
+            ) in {"terminating", "termination_failed", "terminated"},
+        )
 
     return app
 

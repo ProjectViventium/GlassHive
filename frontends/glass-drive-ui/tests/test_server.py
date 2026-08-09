@@ -408,7 +408,13 @@ class FakeRuntimeClient:
     def worker_live(self, worker_id: str):
         self.worker_live_requests.append(worker_id)
         return {
-            "worker": {"worker_id": worker_id, "name": "Main Worker", "project_id": "prj_1", "profile": "codex-cli", "state": "ready"},
+            "worker": {
+                "worker_id": worker_id,
+                "name": "Main Worker",
+                "project_id": "prj_1",
+                "profile": "codex-cli",
+                "state": getattr(self, "worker_state", "ready"),
+            },
             "runtime_details": {"view_url": "http://127.0.0.1:60812/?autoconnect=1&password=synthetic-vnc"},
             "latest_output": "OK",
             "deliverable": {
@@ -1650,6 +1656,52 @@ def test_active_novnc_websocket_closes_at_watch_session_cap(tmp_path, monkeypatc
     assert upstreams and upstreams[0].closed is True
 
 
+def test_active_novnc_websocket_is_revoked_when_workspace_closes(monkeypatch):
+    upstreams = []
+
+    class FakeUpstream:
+        def __init__(self):
+            self.closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.closed = True
+            return False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(30)
+            raise StopAsyncIteration
+
+        async def send(self, message):
+            _ = message
+
+        async def close(self):
+            self.closed = True
+
+    def fake_connect(*args, **kwargs):
+        _ = args, kwargs
+        upstream = FakeUpstream()
+        upstreams.append(upstream)
+        return upstream
+
+    monkeypatch.setattr(server_module.websockets, "connect", fake_connect)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    with client.websocket_connect("/novnc/wrk_1/websockify") as websocket:
+        runtime.worker_state = "termination_failed"
+        with pytest.raises(WebSocketDisconnect) as exc:
+            websocket.receive_text()
+
+    assert exc.value.code == 1008
+    assert upstreams and upstreams[0].closed is True
+
+
 def test_launcher_workspace_hive_static_controls():
     static_dir = Path(server_module.__file__).parent / "static"
     app_js = (static_dir / "app.js").read_text(encoding="utf-8")
@@ -1897,7 +1949,7 @@ def test_workspace_status_scripts_never_label_failed_terminal_runs_completed():
     watch_script = (static_dir / 'watch.js').read_text(encoding='utf-8')
     desktop_script = (static_dir / 'desktop.js').read_text(encoding='utf-8')
     watch_markup = (static_dir / 'watch.html').read_text(encoding='utf-8')
-    terminated_priority = "if (workerState === 'terminated') return 'terminated';"
+    terminated_priority = "if (['terminating', 'termination_failed', 'terminated'].includes(workerState)) return workerState;"
     for script in (app_script, watch_script):
         assert terminated_priority in script
         assert script.index(terminated_priority) < script.index(failed_branch)
@@ -1918,6 +1970,16 @@ def test_workspace_status_scripts_never_label_failed_terminal_runs_completed():
     assert "steerInput.disabled = closed" in watch_script
     assert "sendButton.disabled = closed" in watch_script
     assert "This workspace is closed" in watch_script
+    assert "if (normalized === 'terminating') return 'Closing';" in app_script
+    assert "if (normalized === 'terminating') return 'Closing';" in watch_script
+    assert "if (normalized === 'termination_failed') return 'Close needs attention';" in app_script
+    assert "if (normalized === 'termination_failed') return 'Close needs attention';" in watch_script
+    assert "data?.worker?.close_state || data?.worker?.state" in app_script
+    assert "if (['terminating', 'termination_failed', 'terminated'].includes(state))" in app_script
+    assert "Close needs attention" in app_script
+    assert "let currentDisplayState = 'starting';" in watch_script
+    assert "const state = currentDisplayState;" in watch_script
+    assert "'terminating', 'termination_failed', 'terminated'].includes(currentDisplayState)" in watch_script
     assert "GlassHive will resume when you send more work" not in desktop_script
     assert "This workspace was closed" in desktop_script
     assert ">Close workspace</button>" in watch_markup
@@ -1977,6 +2039,27 @@ def test_launch_failure_marks_new_worker_failed():
     })
     assert launch.status_code == 502
     assert runtime.launch_failures == [{'worker_id': 'wrk_new', 'reason': 'assign failed'}]
+
+
+def test_launch_preserves_closed_workspace_conflict_for_existing_workspace():
+    class ClosedWorkspaceRuntime(FakeRuntimeClient):
+        def assign_run(self, worker_id: str, instruction: str):
+            response = httpx.Response(
+                409,
+                json={"detail": "Workspace is closed; create a new workspace for new work"},
+                request=httpx.Request("POST", f"http://runtime.test/v1/workers/{worker_id}/assign"),
+            )
+            raise httpx.HTTPStatusError("closed", request=response.request, response=response)
+
+    runtime = ClosedWorkspaceRuntime()
+    response = TestClient(create_app(runtime_client=runtime)).post('/api/launch', json={
+        'description': 'Continue this workspace',
+        'workspace_option': 'open:wrk_1',
+    })
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Workspace is closed; create a new workspace for new work"
+    assert runtime.launch_failures == []
 
 
 def test_launch_duplicate_workspace_uses_runtime_duplicate_endpoint():
@@ -2179,8 +2262,31 @@ def test_novnc_proxy_caches_authorized_view_origin_and_static_assets(monkeypatch
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.text == second.text == 'export default "cached";'
-    assert runtime.worker_live_requests == ['wrk_1']
+    # Runtime authority is rechecked even when the static asset is cached so a close cannot
+    # reuse a stale desktop URL.
+    assert runtime.worker_live_requests == ['wrk_1', 'wrk_1']
     assert requested_urls == ['http://127.0.0.1:60812/core/rfb.js']
+
+
+@pytest.mark.parametrize("state", ["terminating", "termination_failed", "terminated"])
+def test_closed_workspace_rejects_cached_desktop_credentials_assets_and_websocket(state):
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    # Prime the origin cache while the workspace is usable, then close it.
+    assert client.get('/api/workspace/wrk_1/desktop-credentials').status_code == 200
+    runtime.worker_state = state
+
+    credentials = client.get('/api/workspace/wrk_1/desktop-credentials')
+    asset = client.get('/novnc/wrk_1/core/rfb.js')
+    assert credentials.status_code == 409
+    assert asset.status_code == 409
+    assert "closed" in credentials.json()["detail"].lower()
+    assert "closed" in asset.json()["detail"].lower()
+    with pytest.raises(WebSocketDisconnect) as disconnected:
+        with client.websocket_connect('/novnc/wrk_1/websockify'):
+            pass
+    assert disconnected.value.code == 1008
 
 
 def test_signed_watch_token_authenticates_runtime_calls(monkeypatch):
@@ -4837,6 +4943,86 @@ def test_worker_message_endpoint_uses_runtime_queue_message():
     response = client.post('/api/worker/wrk_1/message', json={'message': 'Queue this after the current run finishes.'})
     assert response.status_code == 200
     assert runtime.message_requests == [{'worker_id': 'wrk_1', 'message': 'Queue this after the current run finishes.'}]
+
+
+@pytest.mark.parametrize("route", [
+    "/api/worker/wrk_1/message",
+    "/api/workspace/wrk_1/message",
+    "/api/worker/wrk_1/steer",
+    "/api/workspace/wrk_1/steer",
+])
+def test_worker_message_and_steer_preserve_closed_workspace_conflict(route):
+    class ClosedWorkspaceRuntime(FakeRuntimeClient):
+        def message(self, worker_id: str, message: str):
+            return self._closed(worker_id, "message")
+
+        def steer(self, worker_id: str, message: str):
+            return self._closed(worker_id, "steer")
+
+        @staticmethod
+        def _closed(worker_id: str, action: str):
+            response = httpx.Response(
+                409,
+                json={"detail": "Workspace is closed; create a new workspace for new work"},
+                request=httpx.Request("POST", f"http://runtime.test/v1/workers/{worker_id}/{action}"),
+            )
+            raise httpx.HTTPStatusError("closed", request=response.request, response=response)
+
+    runtime = ClosedWorkspaceRuntime()
+    response = TestClient(create_app(runtime_client=runtime)).post(
+        route,
+        json={"message": "Do not strand this work."},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Workspace is closed; create a new workspace for new work"
+    assert runtime.message_requests == []
+    assert runtime.steer_requests == []
+
+
+@pytest.mark.parametrize("operation", ["prepare", "confirm"])
+def test_pending_workspace_change_preserves_closed_workspace_conflict(operation):
+    class ClosedWorkspaceRuntime(FakeRuntimeClient):
+        @staticmethod
+        def _closed(path: str):
+            response = httpx.Response(
+                409,
+                json={"detail": "Workspace is closed; create a new workspace for new work"},
+                request=httpx.Request("POST", f"http://runtime.test{path}"),
+            )
+            raise httpx.HTTPStatusError(
+                "closed",
+                request=response.request,
+                response=response,
+            )
+
+        def create_pending_change(self, payload: dict):
+            _ = payload
+            return self._closed("/v1/pending-changes")
+
+        def confirm_pending_change(self, change_id: str, confirmation_token: str):
+            _ = confirmation_token
+            return self._closed(f"/v1/pending-changes/{change_id}/confirm")
+
+    runtime = ClosedWorkspaceRuntime()
+    client = TestClient(create_app(runtime_client=runtime), raise_server_exceptions=False)
+    if operation == "prepare":
+        response = client.post(
+            "/api/pending-changes",
+            json={
+                "change_type": "workspace_provider_account",
+                "target_id": "wrk_1",
+                "payload": {"policy": "legacy"},
+            },
+        )
+    else:
+        response = client.post(
+            "/api/pending-changes/chg_1/confirm",
+            json={"confirmation_token": "synthetic-confirmation-token"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Workspace is closed; create a new workspace for new work"
 
 
 def test_launch_projects_uploaded_files_into_new_workspace_bootstrap():

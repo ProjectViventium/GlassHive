@@ -60,6 +60,8 @@ from .openclaw_runtime import (
     WorkerRuntime,
     WorkerTerminatedError,
     _PROVIDER_ENV_KEYS,
+    notify_runtime_started,
+    runtime_start_boundary,
 )
 from .openclaw_release import reviewed_openclaw_env
 from .runtime_requirements import host_runtime_requirement_issue
@@ -2491,24 +2493,26 @@ class BaseCliWorkerRuntime:
             worker=worker_for_run,
         )
 
-        self._stop_active_process(worker_for_run["worker_id"], worker=worker_for_run)
-        start_result = self.sandbox.start_screen_session(
-            worker_for_run["worker_id"],
-            self.runtime_name,
-            session_name,
-            ["bash", "--noprofile", "--norc", container_script],
-            env=env,
-            worker=worker_for_run,
-        )
-        if start_result.returncode != 0:
-            detail = (start_result.stderr or start_result.stdout or "").strip()[-1600:]
-            raise RuntimeErrorBase(f"Failed to start attached {self.runtime_name} session: {detail}")
-        process_pid = self.sandbox.screen_session_pid(
-            worker_for_run["worker_id"],
-            self.runtime_name,
-            session_name,
-            worker=worker_for_run,
-        )
+        with runtime_start_boundary(worker_for_run):
+            self._stop_active_process(worker_for_run["worker_id"], worker=worker_for_run)
+            start_result = self.sandbox.start_screen_session(
+                worker_for_run["worker_id"],
+                self.runtime_name,
+                session_name,
+                ["bash", "--noprofile", "--norc", container_script],
+                env=env,
+                worker=worker_for_run,
+            )
+            if start_result.returncode != 0:
+                detail = (start_result.stderr or start_result.stdout or "").strip()[-1600:]
+                raise RuntimeErrorBase(f"Failed to start attached {self.runtime_name} session: {detail}")
+            process_pid = self.sandbox.screen_session_pid(
+                worker_for_run["worker_id"],
+                self.runtime_name,
+                session_name,
+                worker=worker_for_run,
+            )
+            notify_runtime_started(worker_for_run)
 
         run_timeout_sec = self._run_timeout_sec(timeout_sec)
         transcript_paths = {
@@ -6342,7 +6346,9 @@ raise SystemExit(exit_code)
                     raise RuntimeErrorBase(
                         "Host-native process metadata was not durably recorded before launch"
                     )
-                self._release_durable_host_process(active_session)
+                with runtime_start_boundary(worker):
+                    self._release_durable_host_process(active_session)
+                    notify_runtime_started(worker)
                 try:
                     exit_code = process.wait()
                 except subprocess.TimeoutExpired as exc:
@@ -6519,7 +6525,9 @@ raise SystemExit(exit_code)
                 raise RuntimeErrorBase(
                     "Host-native process metadata was not durably recorded before launch"
                 )
-            self._release_durable_host_process(active_session)
+            with runtime_start_boundary(worker):
+                self._release_durable_host_process(active_session)
+                notify_runtime_started(worker)
             _write_active_run_status(
                 path=heartbeat_path,
                 worker=worker,

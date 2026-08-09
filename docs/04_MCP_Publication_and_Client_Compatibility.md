@@ -135,6 +135,17 @@ Fresh `workspace_launch` calls must not accidentally resume stale workspaces. A 
 fresh one-off project/worker for the new request. Use explicit reuse only when the user asked to
 resume or reuse that existing workspace. Deliberate operator-level reuse remains available through
 `worker_find_or_resume`, `workspace_continue`, and explicit lifecycle tools.
+An explicitly closed workspace is permanently closed from the moment teardown begins. That includes
+`terminating`, `termination_failed` (compute teardown needs retry/operator attention), and
+`terminated`: run, message, pause, interrupt, resume, desktop/terminal, account-switch, and schedule
+create/update/run-now tools must return the runtime's bounded recovery message (create a new
+workspace) rather than a generic transport error, and must not leave queued work behind. Startup
+reconciliation may retry teardown for `terminating` or `termination_failed`; it must never reopen the
+workspace. Close and the actual external start boundary are serialized: a cold runtime publishes
+its PID/connection metadata before a request is accepted, then releases the lifecycle fence while a
+long response streams. Already-open terminal and desktop streams are revoked on close, delegated
+recurring definitions are deactivated, and a failed late compensation keeps the workspace visibly
+`termination_failed` for retry.
 
 The same rule applies to lower-level `worker_delegate_once` calls. A supplied `alias` or existing
 `project_id` does not imply reuse for a fresh one-off task; GlassHive creates a fresh worker alias
