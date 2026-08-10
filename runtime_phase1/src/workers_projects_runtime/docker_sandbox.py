@@ -106,7 +106,10 @@ def _provider_account_seal_script(mount_target: str) -> str:
         "set -euo pipefail; "
         "command -v setfacl >/dev/null 2>&1; "
         f"test -d {quoted_mount}; "
-        f"test -z \"$(find {quoted_mount} -xdev -type l -print -quit)\"; "
+        # Provider CLIs may leave executable-wrapper symlinks in their private
+        # caches. Unlink the entries without following them before applying
+        # host ownership or ACL changes to real directories and files.
+        f"find {quoted_mount} -xdev -type l -delete; "
         f"test -z \"$(find {quoted_mount} -xdev -type f -links +1 -print -quit)\"; "
         f"test -z \"$(find {quoted_mount} -xdev ! -type d ! -type f -print -quit)\"; "
         f"find {quoted_mount} -xdev -type d -exec chown 0:0 -- {{}} +; "
