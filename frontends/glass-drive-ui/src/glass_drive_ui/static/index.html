@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>GlassHive</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260809b" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260810a" />
   </head>
   <body class="launch-body">
     <main class="launch-shell">
@@ -72,8 +72,8 @@
                 <label class="advanced-field">
                   <span>Credential policy</span>
                   <select id="provider-account-policy" name="provider_account_policy">
-                    <option value="personal_preferred" selected>Prefer my account; allow deployment fallback</option>
-                    <option value="personal_required">Only my account; never fall back</option>
+                    <option value="personal_required" selected>Only my account; never fall back</option>
+                    <option value="personal_preferred">Prefer my account; allow deployment fallback</option>
                     <option value="legacy">Use deployment-managed account</option>
                   </select>
                   <small>“Only my account” stops the launch instead of using global credentials.</small>
@@ -252,18 +252,11 @@
                 <form id="provider-account-form" class="account-form">
                   <label>
                     <span>AI</span>
-                    <select id="provider-account-provider" name="provider">
-                      <option value="codex">Codex</option>
-                      <option value="claude">Claude Code</option>
-                    </select>
+                    <select id="provider-account-provider" name="provider"></select>
                   </label>
                   <label>
                     <span>Sign in with</span>
-                    <select id="provider-account-method" name="auth_method">
-                      <option value="subscription">My subscription</option>
-                      <option value="api_key">Connected API key</option>
-                      <option value="enterprise_route">Enterprise route</option>
-                    </select>
+                    <select id="provider-account-method" name="auth_method"></select>
                   </label>
                   <label class="account-label-field">
                     <span>Name</span>
@@ -516,6 +509,6 @@
         </div>
       </form>
     </dialog>
-    <script src="/static/app.js?v=20260809b" type="module"></script>
+    <script src="/static/app.js?v=20260810a" type="module"></script>
   </body>
 </html>

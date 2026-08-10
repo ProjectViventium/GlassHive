@@ -1,4 +1,5 @@
-import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260809b';
+import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260810a';
+import { credentialPolicyTransition, preferredProviderAccountId } from './launch-policy.js?v=20260810a';
 
 const ACTIVE_STATES = new Set(['created', 'starting', 'queued', 'running', 'resuming']);
 const ACTIVE_RUN_STATES = new Set(['queued', 'running']);
@@ -9,7 +10,7 @@ const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'terminating', '
 const MAX_LIVE_TILE_IFRAMES = 4;
 const ACTIVE_TILE_REFRESH_MS = 7000;
 const RETAINED_TILE_REFRESH_MS = 60000;
-const GLASSHIVE_UI_REV = '20260809b';
+const GLASSHIVE_UI_REV = '20260810a';
 let workspaceRefreshInFlight = false;
 let csrfToken = '';
 let renameWorkspaceContext = null;
@@ -208,7 +209,6 @@ function renderLaunchProviderAccounts(accountSelect, policySelect, help, data, w
     'claude-code': new Set(['claude', 'anthropic']),
   }[profile];
   const currentAccount = accountSelect.value;
-  const currentPolicy = policySelect.value || 'personal_preferred';
 
   if (!isNewWorkspace) {
     const option = document.createElement('option');
@@ -220,20 +220,32 @@ function renderLaunchProviderAccounts(accountSelect, policySelect, help, data, w
     if (help) help.textContent = 'Existing workspaces keep their saved worker account and credential policy.';
     return;
   }
+  const policyTransition = credentialPolicyTransition({
+    currentPolicy: policySelect.value,
+    savedPersonalPolicy: policySelect.dataset.personalPolicy,
+    forcedLegacy: policySelect.dataset.forcedLegacy === 'true',
+    supportsPersonalAccounts: Boolean(supportedProviders),
+  });
+  policySelect.value = policyTransition.value;
+  if (policyTransition.forcedLegacy) {
+    policySelect.dataset.forcedLegacy = 'true';
+    policySelect.dataset.personalPolicy = policyTransition.savedPersonalPolicy;
+  } else {
+    delete policySelect.dataset.forcedLegacy;
+    delete policySelect.dataset.personalPolicy;
+  }
   if (!supportedProviders) {
     const option = document.createElement('option');
     option.value = '';
     option.textContent = 'Deployment-managed account';
     accountSelect.replaceChildren(option);
     accountSelect.disabled = true;
-    policySelect.value = 'legacy';
     policySelect.disabled = true;
     if (help) help.textContent = 'Personal subscriptions are available for Codex and Claude Code workers.';
     return;
   }
 
   policySelect.disabled = false;
-  policySelect.value = currentPolicy;
   const readyAccounts = (data?.provider_accounts || []).filter((account) => (
     supportedProviders.has(String(account.provider || '').toLowerCase())
     && String(account.status || '').toLowerCase() === 'ready'
@@ -251,7 +263,8 @@ function renderLaunchProviderAccounts(accountSelect, policySelect, help, data, w
     return option;
   })];
   accountSelect.replaceChildren(...options);
-  accountSelect.value = options.some((option) => option.value === currentAccount) ? currentAccount : '';
+  const preferredAccountId = preferredProviderAccountId(readyAccounts, currentAccount);
+  accountSelect.value = preferredAccountId;
 
   const policy = policySelect.value;
   accountSelect.disabled = policy === 'legacy' || readyAccounts.length === 0;

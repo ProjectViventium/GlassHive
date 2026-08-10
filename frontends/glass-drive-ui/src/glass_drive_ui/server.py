@@ -1260,6 +1260,19 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             return None
         return human_auth.resolve_session(str(request.cookies.get(AUTH_SESSION_COOKIE) or ""))
 
+    def _session_identity_for_request(request: Request | WebSocket) -> dict[str, str] | None:
+        session = _session_for_request(request)
+        if session is None:
+            return None
+        return {
+            "tenant_id": str(session.get("tenant_id") or "").strip(),
+            "user_id": str(session.get("user_id") or "").strip(),
+            "email": str(session.get("email") or "").strip(),
+            "display_name": str(session.get("display_name") or "").strip(),
+            "role": str(session.get("role") or "member").strip(),
+            "auth_source": "session",
+        }
+
     def _safe_login_return_to(request: Request) -> str:
         path = str(request.url.path or "/")
         if not path.startswith("/") or path.startswith("//") or "\\" in path:
@@ -1808,16 +1821,9 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 detail="This public GlassHive surface requires a signed workspace or artifact link",
             )
 
-        session = _session_for_request(request)
-        if session is not None:
-            return {
-                "tenant_id": str(session.get("tenant_id") or "").strip(),
-                "user_id": str(session.get("user_id") or "").strip(),
-                "email": str(session.get("email") or "").strip(),
-                "display_name": str(session.get("display_name") or "").strip(),
-                "role": str(session.get("role") or "member").strip(),
-                "auth_source": "session",
-            }
+        session_identity = _session_identity_for_request(request)
+        if session_identity is not None:
+            return session_identity
 
         enterprise = _enterprise_mode_enabled()
         trust_inbound_identity = _truthy_env("GLASSHIVE_TRUST_INBOUND_IDENTITY")
@@ -1992,8 +1998,14 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             "email": asserted_email,
         }
 
+    def _authenticated_identity_for_short_ref(request: Request) -> dict[str, str] | None:
+        session_identity = _session_identity_for_request(request)
+        if session_identity is not None:
+            return session_identity
+        return _trusted_proxy_identity_for_short_ref(request)
+
     def _require_short_ref_owner(payload: dict[str, object], request: Request) -> None:
-        identity = _trusted_proxy_identity_for_short_ref(request)
+        identity = _authenticated_identity_for_short_ref(request)
         if identity is None:
             return
         tenant_id = str(payload.get("tenant_id") or "").strip()
@@ -2387,6 +2399,9 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
 
     @app.get("/r/{ref_id}")
     def open_short_link(ref_id: str, request: Request) -> Response:
+        login_redirect = _login_redirect_if_needed(request)
+        if login_redirect is not None:
+            return login_redirect
         record = resolve_signed_link_ref(ref_id)
         if not record:
             raise HTTPException(status_code=401, detail="Invalid or expired GlassHive workspace link")
