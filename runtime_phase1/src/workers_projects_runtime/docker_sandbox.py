@@ -1490,7 +1490,10 @@ screen -ls | awk -v target="$target" '
                 "--cap-add", "CHOWN", "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
                 "--pids-limit", "64", "--memory", "128m", "--cpus", "0.25",
                 "--user", "0:0", "--mount",
-                f"type=bind,src={resolved},dst={mount_target},rw",
+                # A bind mount is writable by default. Docker's --mount parser
+                # accepts explicit key=value options, but a bare `rw` field is
+                # rejected before the repair container starts.
+                f"type=bind,src={resolved},dst={mount_target}",
                 "--entrypoint", "bash", self.image, "-c",
                 _provider_account_seal_script(mount_target),
             ],
