@@ -33,6 +33,7 @@ from .inference_broker import (
 SAFE_ACCOUNT_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 MAX_SETUP_OUTPUT_CHARS = 32_000
+PROVIDER_VERIFY_HEARTBEAT_INTERVAL_SECONDS = 10.0
 PROVIDER_SETUP_ENV_ALLOWLIST = {
     "ALL_PROXY",
     "COLORTERM",
@@ -713,6 +714,9 @@ class ProviderSetupManager:
                 **_provider_setup_guidance(provider, output),
             }
         verification_lease: dict[str, Any] | None = None
+        verification_lease_stop = threading.Event()
+        verification_lease_lost = threading.Event()
+        verification_lease_thread: threading.Thread | None = None
         if session is None:
             verification_lease = self.store.acquire_provider_lease(
                 account_id=account_id,
@@ -726,7 +730,48 @@ class ProviderSetupManager:
                 required_recovery_code=str(account.get("recovery_code") or ""),
             )
         try:
+            if verification_lease is not None:
+                lease_id = str(verification_lease.get("lease_id") or "")
+
+                def renew_verification_lease() -> None:
+                    while not verification_lease_stop.wait(
+                        PROVIDER_VERIFY_HEARTBEAT_INTERVAL_SECONDS
+                    ):
+                        try:
+                            self.store.heartbeat_provider_lease(
+                                lease_id=lease_id,
+                                tenant_id=tenant_id,
+                                owner_id=owner_id,
+                                ttl_seconds=120,
+                            )
+                        except (ControlPlaneError, OSError, sqlite3.OperationalError):
+                            verification_lease_lost.set()
+                            return
+
+                # Extend before any Docker/image work, then keep the exclusive
+                # lease alive across both seals and the provider CLI check.
+                self.store.heartbeat_provider_lease(
+                    lease_id=lease_id,
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                    ttl_seconds=120,
+                )
+                heartbeat_thread = threading.Thread(
+                    target=renew_verification_lease,
+                    name=f"glasshive-provider-verify-lease-{account_id[:24]}",
+                    daemon=True,
+                )
+                heartbeat_thread.start()
+                verification_lease_thread = heartbeat_thread
+
+            def require_verification_lease() -> None:
+                if verification_lease_lost.is_set():
+                    raise ControlPlaneError(
+                        "Provider verification lease was lost; check the connection again"
+                    )
+
             self._reconcile_if_isolated(account_home)
+            require_verification_lease()
             account_home = self.homes.ensure_home(
                 tenant_id=tenant_id,
                 owner_id=owner_id,
@@ -737,7 +782,14 @@ class ProviderSetupManager:
             authenticated = verify and self._verify(
                 provider=provider, environment=environment, account_home=account_home
             )
+            require_verification_lease()
             if authenticated:
+                # Provider status commands may recreate private cache wrappers
+                # after the pre-verification seal. Reconcile again while the
+                # exclusive verify lease is still held, then perform the final
+                # descriptor-based host validation.
+                self._reconcile_if_isolated(account_home)
+                require_verification_lease()
                 self.homes.tighten_permissions(account_home=account_home)
                 status = "ready"
                 reason = ""
@@ -747,6 +799,14 @@ class ProviderSetupManager:
             else:
                 status = "action_required"
                 reason = "Complete provider sign-in to use this account"
+            if verification_lease is not None:
+                self.store.heartbeat_provider_lease(
+                    lease_id=str(verification_lease.get("lease_id") or ""),
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                    ttl_seconds=120,
+                )
+                require_verification_lease()
             updated = self.store.update_provider_account_status(
                 account_id=account_id,
                 tenant_id=tenant_id,
@@ -772,6 +832,9 @@ class ProviderSetupManager:
                     self._sessions.pop(account_id, None)
                 self._release_session(session)
             elif verification_lease is not None:
+                verification_lease_stop.set()
+                if verification_lease_thread is not None:
+                    verification_lease_thread.join(timeout=2)
                 self.store.release_provider_lease(
                     lease_id=str(verification_lease.get("lease_id") or ""),
                     tenant_id=tenant_id,
