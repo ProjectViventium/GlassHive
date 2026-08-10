@@ -5,6 +5,7 @@ import os
 import json
 import sqlite3
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from workers_projects_runtime.control_plane import (
     ControlPlaneStore,
 )
 from library_test_support import library_manifest, register_manifest
+from workers_projects_runtime import provider_accounts as provider_accounts_module
 from workers_projects_runtime.provider_accounts import (
     ProviderAccountHomeManager,
     ProviderSetupManager,
@@ -943,10 +945,23 @@ def test_connection_check_repairs_under_verify_lease_without_new_sign_in(tmp_pat
         recovery_code="credential_cleanup_failed",
     )
     reconciled: list[Path] = []
+    heartbeat_calls: list[str] = []
+    original_heartbeat = store.heartbeat_provider_lease
+
+    def heartbeat(**kwargs):
+        heartbeat_calls.append(str(kwargs["lease_id"]))
+        return original_heartbeat(**kwargs)
+
+    monkeypatch.setattr(store, "heartbeat_provider_lease", heartbeat)
 
     def reconcile(account_home: Path) -> None:
-        assert not account_home.exists()
         assert store.active_provider_lease(account["account_id"], "provider-verify") is not None
+        if account_home.exists():
+            wrapper = account_home / "codex" / "tmp" / "provider-wrapper"
+            assert wrapper.is_symlink()
+            wrapper.unlink()
+        else:
+            assert not reconciled
         reconciled.append(account_home)
 
     setup = ProviderSetupManager(
@@ -954,19 +969,161 @@ def test_connection_check_repairs_under_verify_lease_without_new_sign_in(tmp_pat
         home_root=tmp_path / "provider-homes",
         reconcile_provider_account_binding=reconcile,
     )
-    monkeypatch.setattr(setup, "_verify", lambda **_kwargs: True)
+    def verify(**kwargs) -> bool:
+        account_home = Path(kwargs["account_home"])
+        wrapper = account_home / "codex" / "tmp" / "provider-wrapper"
+        wrapper.parent.mkdir(parents=True)
+        wrapper.symlink_to(tmp_path / "outside-wrapper")
+        return True
+
+    monkeypatch.setattr(setup, "_verify", verify)
 
     result = setup.status(
         account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
     )
 
     assert result["status"] == "ready"
-    assert reconciled
+    assert len(reconciled) == 2
+    assert len(heartbeat_calls) >= 2
     assert store.active_provider_lease(account["account_id"], "provider-verify") is None
     recovered = store.get_provider_account(
         account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
     )
     assert recovered["recovery_code"] == ""
+
+
+def test_connection_check_renews_lease_while_reconcile_is_in_flight(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS", "true")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setattr(
+        provider_accounts_module,
+        "PROVIDER_VERIFY_HEARTBEAT_INTERVAL_SECONDS",
+        0.01,
+    )
+    store = ControlPlaneStore(str(tmp_path / "runtime.db"))
+    account = store.create_provider_account(
+        tenant_id="tenant-a", owner_id="user-a", provider="codex", label="Personal Codex",
+        auth_method="subscription", platform_support="supported",
+        secret_locator="native-home://auto", status="action_required",
+    )
+    store.update_provider_account_status(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a",
+        status="action_required", reconnect_reason="Credentials need safe repair",
+        recovery_code="credential_cleanup_failed",
+    )
+    reconcile_started = threading.Event()
+    release_reconcile = threading.Event()
+    background_heartbeat = threading.Event()
+    heartbeat_calls = 0
+    original_heartbeat = store.heartbeat_provider_lease
+
+    def heartbeat(**kwargs):
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+        renewed = original_heartbeat(**kwargs)
+        if heartbeat_calls >= 2:
+            background_heartbeat.set()
+        return renewed
+
+    monkeypatch.setattr(store, "heartbeat_provider_lease", heartbeat)
+
+    def reconcile(_account_home: Path) -> None:
+        if not reconcile_started.is_set():
+            reconcile_started.set()
+            assert release_reconcile.wait(timeout=2)
+
+    setup = ProviderSetupManager(
+        store=store,
+        home_root=tmp_path / "provider-homes",
+        reconcile_provider_account_binding=reconcile,
+    )
+    monkeypatch.setattr(setup, "_verify", lambda **_kwargs: True)
+    result: dict[str, object] = {}
+    failure: list[BaseException] = []
+
+    def run_status() -> None:
+        try:
+            result.update(
+                setup.status(
+                    account_id=account["account_id"],
+                    tenant_id="tenant-a",
+                    owner_id="user-a",
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failure.append(exc)
+
+    status_thread = threading.Thread(target=run_status)
+    status_thread.start()
+    try:
+        assert reconcile_started.wait(timeout=2)
+        assert background_heartbeat.wait(timeout=2)
+        with pytest.raises(ControlPlaneConflict, match="already in use"):
+            store.acquire_provider_lease(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+                lane="mission",
+                worker_id="worker-competing",
+                run_id="run-competing",
+                ttl_seconds=60,
+                allowed_statuses=("action_required",),
+                required_recovery_code="credential_cleanup_failed",
+            )
+    finally:
+        release_reconcile.set()
+        status_thread.join(timeout=2)
+
+    assert not status_thread.is_alive()
+    assert failure == []
+    assert result["status"] == "ready"
+    assert heartbeat_calls >= 2
+    assert store.active_provider_lease(account["account_id"], "provider-verify") is None
+
+
+def test_connection_check_lease_loss_quarantines_and_releases(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS", "true")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    store = ControlPlaneStore(str(tmp_path / "runtime.db"))
+    account = store.create_provider_account(
+        tenant_id="tenant-a", owner_id="user-a", provider="codex", label="Personal Codex",
+        auth_method="subscription", platform_support="supported",
+        secret_locator="native-home://auto", status="action_required",
+    )
+    store.update_provider_account_status(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a",
+        status="action_required", reconnect_reason="Credentials need safe repair",
+        recovery_code="credential_cleanup_failed",
+    )
+    setup = ProviderSetupManager(
+        store=store,
+        home_root=tmp_path / "provider-homes",
+        reconcile_provider_account_binding=lambda _account_home: None,
+    )
+    monkeypatch.setattr(setup, "_verify", lambda **_kwargs: True)
+    original_heartbeat = store.heartbeat_provider_lease
+    heartbeat_calls = 0
+
+    def lose_final_heartbeat(**kwargs):
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+        if heartbeat_calls > 1:
+            raise ControlPlaneError("Synthetic lease loss")
+        return original_heartbeat(**kwargs)
+
+    monkeypatch.setattr(store, "heartbeat_provider_lease", lose_final_heartbeat)
+
+    with pytest.raises(ControlPlaneError, match="Synthetic lease loss"):
+        setup.status(
+            account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+        )
+
+    assert store.active_provider_lease(account["account_id"], "provider-verify") is None
+    quarantined = store.get_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )
+    assert quarantined["status"] == "action_required"
+    assert quarantined["recovery_code"] == "credential_cleanup_failed"
 
 
 def test_setup_repair_failure_quarantines_account_and_releases_lease(tmp_path, monkeypatch):
