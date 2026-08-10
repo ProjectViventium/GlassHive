@@ -36,6 +36,9 @@ Every enterprise deployment must configure and QA these controls before users ar
   participating process must belong to this group. GlassHive then requires a pre-created
   root/current-owner directory with no public access (`02770` on Linux) and group-only SQLite,
   WAL, and SHM files (`0660`) instead of attempting to chmod state owned by another service.
+- A hosted state adapter may likewise pre-create the runtime database parent as root-owned `0770`
+  and its database as `0660`. The runtime accepts those paths only when their group is one of its
+  process groups and the modes are exact; it never chmods a root-owned path and rejects drift.
 - `GLASSHIVE_MAX_WATCH_SESSION_DURATION_S`: caps signed View / Steer session-token lifetime and
   the active websocket session for already-open watch tabs. This is separate from durable short
   refs: a user can reopen a durable owner-scoped link later, but the forgotten active tab does not

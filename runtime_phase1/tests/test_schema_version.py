@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import stat
+from types import SimpleNamespace
 
 import pytest
 
 from workers_projects_runtime import store as store_module
+from workers_projects_runtime import state_permissions as state_permissions_module
 from workers_projects_runtime.control_plane import ControlPlaneStore
 from workers_projects_runtime.schema_version import (
     UnsupportedSchemaVersionError,
@@ -155,6 +158,160 @@ def test_split_service_state_permissions_are_group_accessible(tmp_path, monkeypa
 
     assert stat.S_IMODE(state_dir.stat().st_mode) == 0o770
     assert stat.S_IMODE(database.stat().st_mode) == 0o660
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX permission contract")
+def test_runtime_accepts_prepared_root_owned_group_state_directory_without_chmod(
+    tmp_path, monkeypatch
+) -> None:
+    state_dir = tmp_path / "prepared-state"
+    state_dir.mkdir()
+    descriptor = 91
+    opened: dict[str, object] = {}
+    chmod_calls: list[tuple[int, int]] = []
+
+    def fake_open(path, flags):
+        opened.update(path=path, flags=flags)
+        return descriptor
+
+    monkeypatch.setenv("GLASSHIVE_STATE_DIR_MODE", "0770")
+    monkeypatch.setattr(state_permissions_module.os, "open", fake_open)
+    monkeypatch.setattr(
+        state_permissions_module.os,
+        "fstat",
+        lambda value: SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o770,
+            st_uid=0,
+            st_gid=2200,
+        ),
+    )
+    monkeypatch.setattr(state_permissions_module.os, "geteuid", lambda: 1200)
+    monkeypatch.setattr(state_permissions_module.os, "getegid", lambda: 1200)
+    monkeypatch.setattr(state_permissions_module.os, "getgroups", lambda: [2200])
+    monkeypatch.setattr(
+        state_permissions_module.os,
+        "fchmod",
+        lambda value, mode: chmod_calls.append((value, mode)),
+    )
+    monkeypatch.setattr(state_permissions_module.os, "close", lambda value: None)
+
+    state_permissions_module.ensure_state_directory(state_dir)
+
+    assert opened["path"] == state_dir
+    assert int(opened["flags"]) & getattr(state_permissions_module.os, "O_DIRECTORY", 0)
+    assert int(opened["flags"]) & getattr(state_permissions_module.os, "O_NOFOLLOW", 0)
+    assert chmod_calls == []
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX permission contract")
+@pytest.mark.parametrize(
+    ("prepared_mode", "prepared_gid"),
+    [(0o700, 2200), (0o775, 2200), (0o770, 3300)],
+)
+def test_runtime_rejects_untrusted_root_owned_state_directory(
+    tmp_path,
+    monkeypatch,
+    prepared_mode,
+    prepared_gid,
+) -> None:
+    state_dir = tmp_path / "unsafe-state"
+    state_dir.mkdir()
+    monkeypatch.setenv("GLASSHIVE_STATE_DIR_MODE", "0770")
+    monkeypatch.setattr(state_permissions_module.os, "open", lambda path, flags: 92)
+    monkeypatch.setattr(
+        state_permissions_module.os,
+        "fstat",
+        lambda value: SimpleNamespace(
+            st_mode=stat.S_IFDIR | prepared_mode,
+            st_uid=0,
+            st_gid=prepared_gid,
+        ),
+    )
+    monkeypatch.setattr(state_permissions_module.os, "geteuid", lambda: 1200)
+    monkeypatch.setattr(state_permissions_module.os, "getegid", lambda: 1200)
+    monkeypatch.setattr(state_permissions_module.os, "getgroups", lambda: [2200])
+    monkeypatch.setattr(state_permissions_module.os, "close", lambda value: None)
+
+    with pytest.raises(PermissionError, match="prepared state directory"):
+        state_permissions_module.ensure_state_directory(state_dir)
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX permission contract")
+def test_runtime_accepts_prepared_root_owned_group_state_file_without_chmod(
+    tmp_path, monkeypatch
+) -> None:
+    state_file = tmp_path / "runtime.db"
+    state_file.touch()
+    chmod_calls: list[tuple[int, int]] = []
+    opened: dict[str, object] = {}
+
+    def fake_open(path, flags):
+        opened.update(path=path, flags=flags)
+        return 93
+
+    monkeypatch.setenv("GLASSHIVE_STATE_FILE_MODE", "0660")
+    monkeypatch.setattr(state_permissions_module.os, "open", fake_open)
+    monkeypatch.setattr(
+        state_permissions_module.os,
+        "fstat",
+        lambda value: SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o660,
+            st_uid=0,
+            st_gid=2200,
+        ),
+    )
+    monkeypatch.setattr(state_permissions_module.os, "geteuid", lambda: 1200)
+    monkeypatch.setattr(state_permissions_module.os, "getegid", lambda: 1200)
+    monkeypatch.setattr(state_permissions_module.os, "getgroups", lambda: [2200])
+    monkeypatch.setattr(
+        state_permissions_module.os,
+        "fchmod",
+        lambda value, mode: chmod_calls.append((value, mode)),
+    )
+    monkeypatch.setattr(state_permissions_module.os, "close", lambda value: None)
+
+    state_permissions_module.secure_state_file(state_file)
+
+    assert opened["path"] == state_file
+    assert int(opened["flags"]) & getattr(state_permissions_module.os, "O_NOFOLLOW", 0)
+    assert int(opened["flags"]) & getattr(state_permissions_module.os, "O_NONBLOCK", 0)
+    assert chmod_calls == []
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX permission contract")
+def test_runtime_rejects_root_owned_state_file_outside_process_group(
+    tmp_path, monkeypatch
+) -> None:
+    state_file = tmp_path / "runtime.db"
+    state_file.touch()
+    monkeypatch.setenv("GLASSHIVE_STATE_FILE_MODE", "0660")
+    monkeypatch.setattr(state_permissions_module.os, "open", lambda path, flags: 94)
+    monkeypatch.setattr(
+        state_permissions_module.os,
+        "fstat",
+        lambda value: SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o660,
+            st_uid=0,
+            st_gid=3300,
+        ),
+    )
+    monkeypatch.setattr(state_permissions_module.os, "geteuid", lambda: 1200)
+    monkeypatch.setattr(state_permissions_module.os, "getegid", lambda: 1200)
+    monkeypatch.setattr(state_permissions_module.os, "getgroups", lambda: [2200])
+    monkeypatch.setattr(state_permissions_module.os, "close", lambda value: None)
+
+    with pytest.raises(PermissionError, match="prepared state file"):
+        state_permissions_module.secure_state_file(state_file)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission contract")
+def test_runtime_rejects_fifo_state_file_without_blocking(tmp_path, monkeypatch) -> None:
+    state_file = tmp_path / "runtime.db"
+    os.mkfifo(state_file)
+    monkeypatch.setenv("GLASSHIVE_STATE_FILE_MODE", "0660")
+
+    with pytest.raises(PermissionError, match="not a file"):
+        state_permissions_module.secure_state_file(state_file)
 
 
 @pytest.mark.parametrize(
