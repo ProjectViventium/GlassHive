@@ -13,6 +13,11 @@ This service does not replace the existing GlassHive runtime UI. It sits beside 
 - full-screen sandbox watch surface
 - result-first delivery for webpage/app tasks
 - exact live session still available as a secondary takeover surface
+- account setup controls are generated from the server's supported provider methods; unavailable
+  providers are not presented as disabled actions
+- a sole ready personal account is selected with fail-closed personal-only launch policy by default
+- enterprise `/r/{ref}` handoffs reuse the authenticated browser session, recheck tenant and owner,
+  and return an expired session to sign-in instead of exposing a raw proxy-auth error
 
 ## Current Behavior
 

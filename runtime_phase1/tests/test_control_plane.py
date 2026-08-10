@@ -99,6 +99,32 @@ def test_provider_accounts_are_owner_scoped_defaulted_and_secret_free(tmp_path):
         )
 
 
+def test_first_provider_account_becomes_the_default_without_an_extra_checkbox(tmp_path):
+    store = ControlPlaneStore(str(tmp_path / "runtime.db"))
+
+    first = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="codex",
+        label="Personal Codex",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://auto",
+    )
+    second = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="codex",
+        label="Another Codex",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://auto",
+    )
+
+    assert first["is_default"] is True
+    assert second["is_default"] is False
+
+
 def test_provider_account_lease_is_durable_exclusive_and_recovers_after_expiry(tmp_path):
     store = ControlPlaneStore(str(tmp_path / "runtime.db"))
     account = store.create_provider_account(

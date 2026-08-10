@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
 import threading
 import time
 from hashlib import sha256
@@ -1804,9 +1805,11 @@ def test_launcher_workspace_hive_static_controls():
     assert "workspace.control_url || workspace.api_url" in app_js
     assert "loadWorkspaceChoices" in control_plane_js
     assert "loadAllWorkspacePages" not in control_plane_js
-    assert 'value="api_key"' in index_html
-    assert 'value="enterprise_route"' in index_html
-    assert "Add connected account" in control_plane_js
+    assert 'value="api_key"' not in index_html
+    assert "availableProviderOptions" in control_plane_js
+    assert 'value="enterprise_route"' not in index_html
+    assert "enterprise_route: 'Enterprise route'" in control_plane_js
+    assert "'Add account'" in control_plane_js
     assert "controlPlane?.manage_connections_url" in control_plane_js
     assert "linked · verifies on run" in control_plane_js
     assert "GlassHive will verify it when this workspace runs" in control_plane_js
@@ -2585,6 +2588,88 @@ def test_short_worker_view_ref_redirects_and_sets_worker_cookie(monkeypatch):
     assert "glasshive_gh_token_wrk_1=" not in set_cookie
     assert "HttpOnly" in set_cookie
     assert "SameSite=lax" in set_cookie
+
+
+def test_enterprise_short_worker_view_ref_accepts_the_authenticated_browser_session(
+    tmp_path,
+    monkeypatch,
+):
+    _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "300")
+
+    class SessionAuth:
+        mode = "oidc"
+        session_enabled = True
+
+        def resolve_session(self, token):
+            sessions = {
+                "owner-session": {
+                    "tenant_id": "tenant-alpha",
+                    "user_id": "user-a",
+                    "email": "owner@example.invalid",
+                    "role": "member",
+                },
+                "other-session": {
+                    "tenant_id": "tenant-alpha",
+                    "user_id": "user-b",
+                    "email": "other@example.invalid",
+                    "role": "member",
+                },
+            }
+            return sessions.get(token)
+
+    monkeypatch.setattr(server_module.HumanAuthGateway, "from_env", lambda: SessionAuth())
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    token = server_module.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        ttl_seconds=60,
+    )
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/watch/wrk_1?surface=desktop&gh_token={token}",
+    )
+
+    client.cookies.set("glasshive_session", "owner-session")
+    accepted = client.get(f"/r/{ref_id}", follow_redirects=False)
+
+    assert accepted.status_code == 307
+    assert accepted.headers["location"] == "http://testserver/watch/wrk_1?surface=desktop"
+    assert "gh_token=" not in accepted.headers["location"]
+    assert runtime.worker_view_open_requests == ["wrk_1"]
+
+    client.cookies.set("glasshive_session", "other-session")
+    denied = client.get(f"/r/{ref_id}", follow_redirects=False)
+
+    assert denied.status_code == 404
+    assert runtime.worker_view_open_requests == ["wrk_1"]
+
+
+def test_enterprise_short_worker_view_ref_recovers_an_expired_browser_session_via_login(
+    tmp_path,
+    monkeypatch,
+):
+    _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    token = server_module.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        ttl_seconds=60,
+    )
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/watch/wrk_1?surface=desktop&gh_token={token}",
+    )
+
+    response = client.get(f"/r/{ref_id}", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/login?return_to=%2Fr%2F{ref_id}"
 
 
 def test_short_worker_view_ref_rejects_unconfigured_absolute_redirect_target(monkeypatch):
@@ -4564,6 +4649,64 @@ def test_connections_ui_keeps_primary_account_setup_short_and_actionable():
     assert "addAccount.hidden = !payload.complete" in script
     assert "externalClients.hidden = !payload.complete" in script
     assert "copyResetTimers" in script
+    assert '<option value="claude">Claude Code</option>' not in page
+    assert '<option value="api_key">Connected API key</option>' not in page
+    assert "renderProviderOptionControls" in script
+    assert "availableProviderOptions" in script
+    assert "if (!addAccount?.open)" in script
+    assert "defaultToggle.checked = accounts.length === 0" in script
+
+
+def test_launch_ui_uses_the_sole_ready_personal_account_without_silent_fallback():
+    page = (Path(server_module.STATIC_DIR) / "index.html").read_text(encoding="utf-8")
+    script = (Path(server_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
+    policy_module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
+
+    assert '<option value="personal_required" selected>' in page
+    assert '<option value="personal_preferred"' in page
+    assert "preferredProviderAccountId(readyAccounts, currentAccount)" in script
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ credentialPolicyTransition, preferredProviderAccountId }} from {json.dumps(policy_module)};"
+                "const ready = [{account_id: 'acct-ready', is_default: false}];"
+                "const forced = credentialPolicyTransition({currentPolicy: 'personal_required', "
+                "savedPersonalPolicy: '', forcedLegacy: false, supportsPersonalAccounts: false});"
+                "const restored = credentialPolicyTransition({currentPolicy: forced.value, "
+                "savedPersonalPolicy: forced.savedPersonalPolicy, forcedLegacy: forced.forcedLegacy, "
+                "supportsPersonalAccounts: true});"
+                "process.stdout.write(JSON.stringify({account: preferredProviderAccountId(ready, ''), forced, restored}));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "account": "acct-ready",
+        "forced": {
+            "value": "legacy",
+            "savedPersonalPolicy": "personal_required",
+            "forcedLegacy": True,
+        },
+        "restored": {
+            "value": "personal_required",
+            "savedPersonalPolicy": "",
+            "forcedLegacy": False,
+        },
+    }
+
+
+def test_primary_navigation_remains_visible_at_tablet_and_narrow_desktop_widths():
+    styles = (Path(server_module.STATIC_DIR) / "styles.css").read_text(encoding="utf-8")
+
+    assert "@media (max-width: 1100px)" in styles
+    assert ".view-tabs {\n    order: 3;\n    width: 100%;\n    flex-wrap: wrap;" in styles
+    assert ".current-user-control { width: 100%; flex-wrap: wrap; }" in styles
+    assert ".current-user-label { flex: 1 1 100%; max-width: 100%; }" in styles
 
 
 def test_main_ui_exposes_current_user_and_explicit_account_logout_actions():

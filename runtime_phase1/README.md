@@ -31,6 +31,10 @@ Docker-managed ephemeral workspaces are garbage-collected after seven days by de
 active account leases, pending confirmations, idempotency records, host/user workspace roots, or
 unrecognized storage layouts; it never deletes named or legacy state.
 
+The first provider account for an owner and provider becomes that provider's default automatically.
+Explicitly selecting a later default retains the existing one-default-per-provider contract, and
+disconnecting a default clears it so a newly connected replacement can become the default.
+
 ## Recurring Schedule Ownership
 
 Legacy one-shot schedules remain GlassHive-native and retain their existing API and database

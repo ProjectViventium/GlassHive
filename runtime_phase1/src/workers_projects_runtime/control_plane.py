@@ -541,6 +541,15 @@ class ControlPlaneStore:
             ).fetchone()[0]
             if int(account_count) >= account_limit:
                 raise ControlPlaneConflict("Provider account limit reached for this user")
+            has_default = conn.execute(
+                """
+                SELECT 1 FROM provider_accounts
+                WHERE tenant_id = ? AND owner_id = ? AND provider = ? AND is_default = 1
+                LIMIT 1
+                """,
+                (tenant_id, owner_id, provider),
+            ).fetchone()
+            make_default = bool(make_default or has_default is None)
             if make_default:
                 conn.execute(
                     "UPDATE provider_accounts SET is_default = 0, updated_at = ? WHERE tenant_id = ? AND owner_id = ? AND provider = ?",

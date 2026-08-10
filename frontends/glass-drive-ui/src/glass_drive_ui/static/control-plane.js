@@ -8,6 +8,16 @@ const SUPPORT_COPY = {
   managed_connection_required: 'Connect this account through the deployment\'s managed connected-accounts page.',
 };
 
+const PROVIDER_LABELS = {
+  codex: 'Codex',
+  claude: 'Claude Code',
+};
+const PROVIDER_METHOD_LABELS = {
+  subscription: 'My subscription',
+  api_key: 'Connected API key',
+  enterprise_route: 'Enterprise route',
+};
+
 let api = null;
 let controlPlane = null;
 let connectAi = null;
@@ -1034,33 +1044,75 @@ async function submitRecurringSchedule(event) {
 }
 
 function renderSupportHint() {
+  const addAccount = document.getElementById('add-provider-account');
+  if (!addAccount?.open) {
+    setProviderStatus('');
+    return;
+  }
   const provider = document.getElementById('provider-account-provider')?.value || 'codex';
   const method = document.getElementById('provider-account-method')?.value || 'subscription';
   const submit = document.querySelector('#provider-account-form button[type="submit"]');
-  if (!controlPlane || method !== 'subscription') {
-    const option = (controlPlane?.provider_options || []).find((item) => item.provider === provider);
-    const supported = provider === 'codex' && option?.inference_broker_support === 'supported';
-    setProviderStatus(!supported
-      ? (provider === 'claude'
-        ? 'Claude API and enterprise routes are not exposed by the reviewed OpenAI inference broker.'
-        : 'Use Manage connected accounts first; this deployment has not enabled the user-scoped inference broker.')
-      : (method === 'api_key'
-        ? 'Connect your OpenAI key in Manage connected accounts, then add its private GlassHive reference here. The key never enters GlassHive.'
-        : 'Add the approved enterprise OpenAI route as a private GlassHive reference for this account.'));
-    if (submit) {
-      submit.textContent = supported ? 'Add connected account' : 'Connection unavailable';
-      submit.disabled = !supported;
-    }
+  const option = availableProviderOptions().find((item) => item.provider === provider);
+  const supported = Boolean(option?.methods.includes(method));
+  setProviderStatus(supported ? '' : 'This option is no longer available. Refresh and try again.');
+  if (submit) {
+    submit.textContent = method === 'subscription' ? `Connect ${PROVIDER_LABELS[provider] || 'account'}` : 'Add account';
+    submit.disabled = !supported;
+  }
+}
+
+function availableProviderOptions() {
+  return (controlPlane?.provider_options || [])
+    .map((option) => ({
+      ...option,
+      provider: String(option.provider || '').trim().toLowerCase(),
+      methods: Array.isArray(option.methods)
+        ? option.methods.map((method) => String(method || '').trim()).filter(Boolean)
+        : [],
+    }))
+    .filter((option) => option.provider && option.methods.length > 0);
+}
+
+function renderProviderOptionControls() {
+  const addAccount = document.getElementById('add-provider-account');
+  const providerSelect = document.getElementById('provider-account-provider');
+  const methodSelect = document.getElementById('provider-account-method');
+  const defaultToggle = document.getElementById('provider-account-default');
+  if (!addAccount || !providerSelect || !methodSelect) return;
+
+  const providers = availableProviderOptions();
+  const currentProvider = providerSelect.value;
+  const currentMethod = methodSelect.value;
+  providerSelect.replaceChildren(...providers.map((option) => {
+    const element = document.createElement('option');
+    element.value = option.provider;
+    element.textContent = PROVIDER_LABELS[option.provider] || option.provider;
+    return element;
+  }));
+  if (!providers.length) {
+    methodSelect.replaceChildren();
+    addAccount.hidden = true;
+    setProviderStatus('');
     return;
   }
-  const option = (controlPlane.provider_options || []).find((item) => item.provider === provider);
-  setProviderStatus(option?.subscription_support === 'supported'
-    ? ''
-    : (SUPPORT_COPY[option?.subscription_support] || 'This connection is not available.'));
-  if (submit) {
-    submit.textContent = provider === 'claude' ? 'Connect Claude' : 'Connect Codex';
-    submit.disabled = option?.subscription_support !== 'supported';
+
+  providerSelect.value = providers.some((option) => option.provider === currentProvider)
+    ? currentProvider
+    : providers[0].provider;
+  const selectedProvider = providers.find((option) => option.provider === providerSelect.value) || providers[0];
+  methodSelect.replaceChildren(...selectedProvider.methods.map((method) => {
+    const element = document.createElement('option');
+    element.value = method;
+    element.textContent = PROVIDER_METHOD_LABELS[method] || method.replaceAll('_', ' ');
+    return element;
+  }));
+  methodSelect.value = selectedProvider.methods.includes(currentMethod) ? currentMethod : selectedProvider.methods[0];
+  addAccount.hidden = Boolean(activeSetupAccount);
+  if (defaultToggle) {
+    const accounts = controlPlane?.provider_accounts || [];
+    defaultToggle.checked = accounts.length === 0;
   }
+  renderSupportHint();
 }
 
 function showSetup(payload) {
@@ -1125,7 +1177,7 @@ function showSetup(payload) {
   if (!payload.complete && accountAction) accountAction.hidden = true;
   if (accountMore) accountMore.hidden = !payload.complete;
   if (accountRecovery) accountRecovery.hidden = !payload.complete;
-  if (addAccount) addAccount.hidden = !payload.complete;
+  if (addAccount) addAccount.hidden = !payload.complete || availableProviderOptions().length === 0;
   if (externalClients) externalClients.hidden = !payload.complete;
   if (restart) restart.hidden = !activeSetupAccount || Boolean(payload.complete);
   setProviderStatus(payload.status === 'ready'
@@ -1217,13 +1269,13 @@ async function loadControlPlane() {
     recurringSchedules = { items: [] };
     scheduleLoadError = await api.responseMessage(scheduleResponse, 'Could not load recurring schedules');
   }
+  renderProviderOptionControls();
   renderProviderAccounts();
   renderConnections();
   renderConnectAi();
   renderLibrary();
   renderLibraryRequestWorkspaceOptions();
   renderSchedules();
-  renderSupportHint();
   window.dispatchEvent(new CustomEvent('glasshive:control-plane-updated'));
 }
 
@@ -1320,7 +1372,7 @@ export function initializeControlPlane(dependencies) {
   api = dependencies;
   document.getElementById('library-request-form')?.addEventListener('submit', submitLibraryRequest);
   document.getElementById('provider-account-form')?.addEventListener('submit', submitProviderAccount);
-  document.getElementById('provider-account-provider')?.addEventListener('change', renderSupportHint);
+  document.getElementById('provider-account-provider')?.addEventListener('change', renderProviderOptionControls);
   document.getElementById('provider-account-method')?.addEventListener('change', renderSupportHint);
   document.getElementById('add-provider-account')?.addEventListener('toggle', (event) => {
     if (event.currentTarget.open) renderSupportHint();

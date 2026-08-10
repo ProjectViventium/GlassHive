@@ -1926,6 +1926,8 @@ textarea { resize: vertical; min-height: 78px; }
 
 @media (max-width: 560px) {
   .brand-row { align-items: flex-start; flex-direction: column; }
+  .current-user-control { width: 100%; flex-wrap: wrap; }
+  .current-user-label { flex: 1 1 100%; max-width: 100%; }
   .view-tabs {
     width: 100%;
     flex-wrap: wrap;
@@ -2012,4 +2014,15 @@ textarea { resize: vertical; min-height: 78px; }
   }
   .stage-overlay h2 { font-size: 2.1rem; }
   .stage-overlay p:last-child { font-size: 0.96rem; }
+}
+
+@media (max-width: 1100px) {
+  .view-tabs {
+    order: 3;
+    width: 100%;
+    flex-wrap: wrap;
+    overflow-x: visible;
+    border-radius: 18px;
+  }
+  .view-tab { flex: 1 1 auto; }
 }
