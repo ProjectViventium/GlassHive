@@ -356,7 +356,9 @@ def test_provider_account_repair_is_bounded_and_uses_rootless_namespace(tmp_path
         "CHOWN", "DAC_OVERRIDE", "FOWNER"
     ]
     assert "no-new-privileges" in command
-    assert f"type=bind,src={account_home.resolve()},dst=/workspace/.provider-account,rw" in command
+    repair_mount = f"type=bind,src={account_home.resolve()},dst=/workspace/.provider-account"
+    assert repair_mount in command
+    assert not any(value.endswith(",rw") for value in command)
     script = command[-1]
     assert "-xdev -type l -delete" in script
     assert "-type f -links +1" in script
