@@ -358,7 +358,7 @@ def test_provider_account_repair_is_bounded_and_uses_rootless_namespace(tmp_path
     assert "no-new-privileges" in command
     assert f"type=bind,src={account_home.resolve()},dst=/workspace/.provider-account,rw" in command
     script = command[-1]
-    assert "-xdev -type l" in script
+    assert "-xdev -type l -delete" in script
     assert "-type f -links +1" in script
     assert "! -type d ! -type f" in script
     assert "chown 0:0" in script
@@ -366,12 +366,39 @@ def test_provider_account_repair_is_bounded_and_uses_rootless_namespace(tmp_path
     assert "setfacl -b" in script and "setfacl -k" in script
 
 
-def test_provider_account_seal_checks_all_unsafe_types_before_mutation():
+def test_provider_account_seal_unlinks_entries_before_validating_unsafe_file_types():
     script = _provider_account_seal_script("/workspace/.provider-account")
     first_mutation = min(script.index("chown 0:0"), script.index("chmod 0700"))
-    assert script.index("-type l") < first_mutation
+    assert script.index("-type l -delete") < script.index("-links +1")
     assert script.index("-links +1") < first_mutation
     assert script.index("! -type d ! -type f") < first_mutation
+
+
+def test_provider_account_seal_unlinks_symlink_without_following_target(tmp_path):
+    account_home = tmp_path / "account"
+    account_home.mkdir()
+    external = tmp_path / "external.txt"
+    external.write_text("preserve", encoding="utf-8")
+    wrapper = account_home / "wrapper"
+    wrapper.symlink_to(external)
+    command_bin = tmp_path / "bin"
+    command_bin.mkdir()
+    for command in ("setfacl", "chown", "chmod"):
+        shim = command_bin / command
+        shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        shim.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", "-c", _provider_account_seal_script(str(account_home))],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{command_bin}:{os.environ.get('PATH', '')}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not wrapper.exists() and not wrapper.is_symlink()
+    assert external.read_text(encoding="utf-8") == "preserve"
 
 
 def test_describe_self_heals_novnc_when_service_port_resets(tmp_path):
