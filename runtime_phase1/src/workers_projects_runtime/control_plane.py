@@ -31,12 +31,16 @@ from .schema_version import (
 from .state_permissions import ensure_state_directory, secure_state_file
 
 
-CONTROL_PLANE_SCHEMA_VERSION = 3
+CONTROL_PLANE_SCHEMA_VERSION = 4
 
 
 PROVIDERS = {"codex", "claude", "openai", "anthropic", "custom"}
 AUTH_METHODS = {"subscription", "api_key", "enterprise_route"}
 ACCOUNT_STATUSES = {"disconnected", "connecting", "ready", "action_required", "unavailable", "error"}
+PROVIDER_ACCOUNT_RECOVERY_CODES = {"", "credential_cleanup_failed"}
+LEGACY_CREDENTIAL_CLEANUP_REASON = (
+    "Provider credential cleanup failed; operator cleanup is required"
+)
 LOCATOR_PREFIXES = ("native-home://", "keychain://", "broker://", "secret-store://")
 PROFILE_ACCOUNT_PROVIDERS = {
     "codex-cli": {"codex", "openai"},
@@ -234,6 +238,7 @@ class ControlPlaneStore:
                     last_verified_at REAL,
                     last_used_at REAL,
                     reconnect_reason TEXT NOT NULL DEFAULT '',
+                    recovery_code TEXT NOT NULL DEFAULT '',
                     secret_locator TEXT NOT NULL,
                     observed_runs INTEGER NOT NULL DEFAULT 0,
                     observed_failures INTEGER NOT NULL DEFAULT 0,
@@ -418,6 +423,22 @@ class ControlPlaneStore:
                 conn.execute(
                     "ALTER TABLE provider_accounts "
                     "ADD COLUMN observed_duration_seconds REAL NOT NULL DEFAULT 0"
+                )
+            if "recovery_code" not in provider_account_columns:
+                conn.execute(
+                    "ALTER TABLE provider_accounts "
+                    "ADD COLUMN recovery_code TEXT NOT NULL DEFAULT ''"
+                )
+                conn.execute(
+                    """
+                    UPDATE provider_accounts
+                    SET recovery_code = 'credential_cleanup_failed'
+                    WHERE auth_method = 'subscription'
+                      AND status = 'action_required'
+                      AND recovery_code = ''
+                      AND reconnect_reason = ?
+                    """,
+                    (LEGACY_CREDENTIAL_CLEANUP_REASON,),
                 )
             grant_columns = {
                 str(row["name"])
@@ -615,22 +636,28 @@ class ControlPlaneStore:
         status: str,
         reconnect_reason: str = "",
         verified: bool = False,
+        recovery_code: str | None = None,
     ) -> dict[str, Any]:
         normalized = str(status or "").strip().lower()
         if normalized not in ACCOUNT_STATUSES:
             raise ControlPlaneError("Unsupported provider account status")
+        normalized_recovery = None if recovery_code is None else str(recovery_code or "").strip()
+        if normalized_recovery is not None and normalized_recovery not in PROVIDER_ACCOUNT_RECOVERY_CODES:
+            raise ControlPlaneError("Unsupported provider account recovery code")
         now = time.time()
         with self._connect() as conn:
             cursor = conn.execute(
                 """
                 UPDATE provider_accounts
-                SET status = ?, reconnect_reason = ?, last_verified_at = CASE WHEN ? THEN ? ELSE last_verified_at END,
+                SET status = ?, reconnect_reason = ?, recovery_code = COALESCE(?, recovery_code),
+                    last_verified_at = CASE WHEN ? THEN ? ELSE last_verified_at END,
                     updated_at = ?
                 WHERE account_id = ? AND tenant_id = ? AND owner_id = ?
                 """,
                 (
                     normalized,
                     str(reconnect_reason or "")[:500],
+                    normalized_recovery,
                     1 if verified else 0,
                     now,
                     now,
@@ -671,7 +698,8 @@ class ControlPlaneStore:
             conn.execute(
                 """
                 UPDATE provider_accounts
-                SET status = 'disconnected', reconnect_reason = ?, is_default = 0, updated_at = ?
+                SET status = 'disconnected', reconnect_reason = ?, recovery_code = '',
+                    is_default = 0, updated_at = ?
                 WHERE account_id = ? AND tenant_id = ? AND owner_id = ?
                 """,
                 (str(reconnect_reason or "")[:500], now, account_id, tenant_id, owner_id),
@@ -735,6 +763,7 @@ class ControlPlaneStore:
         ttl_seconds: int,
         now: float | None = None,
         allowed_statuses: tuple[str, ...] = ("ready",),
+        required_recovery_code: str | None = None,
     ) -> dict[str, Any]:
         timestamp = float(now if now is not None else time.time())
         ttl = max(15, min(int(ttl_seconds), 24 * 60 * 60))
@@ -743,11 +772,16 @@ class ControlPlaneStore:
         }
         if not normalized_statuses or not normalized_statuses.issubset(ACCOUNT_STATUSES):
             raise ControlPlaneError("Provider lease allowed statuses are invalid")
+        normalized_recovery = (
+            None if required_recovery_code is None else str(required_recovery_code or "").strip()
+        )
+        if normalized_recovery is not None and normalized_recovery not in PROVIDER_ACCOUNT_RECOVERY_CODES:
+            raise ControlPlaneError("Provider lease recovery code is invalid")
         lease_id = _id("lease")
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             account = conn.execute(
-                "SELECT account_id, status FROM provider_accounts WHERE account_id = ? AND tenant_id = ? AND owner_id = ?",
+                "SELECT account_id, status, recovery_code FROM provider_accounts WHERE account_id = ? AND tenant_id = ? AND owner_id = ?",
                 (account_id, tenant_id, owner_id),
             ).fetchone()
             if account is None:
@@ -764,6 +798,8 @@ class ControlPlaneStore:
                 raise ControlPlaneConflict("Provider account is already in use")
             if str(account["status"] or "").strip().lower() not in normalized_statuses:
                 raise ControlPlaneConflict("Provider account is not ready for mission use")
+            if normalized_recovery is not None and str(account["recovery_code"] or "") != normalized_recovery:
+                raise ControlPlaneConflict("Provider account recovery state changed; refresh and try again")
             conn.execute(
                 """
                 INSERT INTO provider_account_leases

@@ -439,6 +439,37 @@ class MissionProviderAccountBinder:
                 ).strip().lower()
                 in {"1", "true", "yes", "on"},
             )
+            account_home = homes.account_home_path(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                account_id=selection.account_id,
+            )
+            lease_ttl_seconds = self._lease_ttl_seconds(timeout_sec)
+            lease = self.store.acquire_provider_lease(
+                account_id=selection.account_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                lane=f"{runtime_name}:mission",
+                worker_id=worker_id,
+                run_id=run_id,
+                ttl_seconds=lease_ttl_seconds,
+                required_recovery_code="",
+            )
+        except ControlPlaneConflict as exc:
+            if preferred:
+                yield self._preferred_fallback(worker)
+                return
+            raise RuntimeErrorBase("Selected provider account is already in use") from exc
+        except ControlPlaneError as exc:
+            if preferred:
+                yield self._preferred_fallback(worker)
+                return
+            raise RuntimeErrorBase(str(exc)) from exc
+
+        try:
+            if execution_mode == "docker":
+                assert reconcile_binding is not None
+                reconcile_binding(account_home)
             account_home = homes.ensure_home(
                 tenant_id=tenant_id,
                 owner_id=owner_id,
@@ -454,49 +485,27 @@ class MissionProviderAccountBinder:
                     key: f"{_CONTAINER_ACCOUNT_MOUNT}/{Path(value).name}"
                     for key, value in environment.items()
                 }
-            lease_ttl_seconds = self._lease_ttl_seconds(timeout_sec)
-            lease = self.store.acquire_provider_lease(
-                account_id=selection.account_id,
-                tenant_id=tenant_id,
-                owner_id=owner_id,
-                lane=f"{runtime_name}:mission",
-                worker_id=worker_id,
-                run_id=run_id,
-                ttl_seconds=lease_ttl_seconds,
-            )
-        except ControlPlaneConflict as exc:
-            if preferred:
-                yield self._preferred_fallback(worker)
-                return
-            raise RuntimeErrorBase("Selected provider account is already in use") from exc
-        except ControlPlaneError as exc:
-            if preferred:
-                yield self._preferred_fallback(worker)
-                return
-            raise RuntimeErrorBase(str(exc)) from exc
-
-        if execution_mode == "docker":
-            try:
-                assert reconcile_binding is not None
-                reconcile_binding(account_home)
-            except BaseException as exc:
+        except BaseException as exc:
+            if execution_mode == "docker":
                 try:
                     self.store.update_provider_account_status(
                         account_id=selection.account_id,
                         tenant_id=tenant_id,
                         owner_id=owner_id,
                         status="action_required",
-                        reconnect_reason="A stale provider credential mount could not be removed",
+                        reconnect_reason="Provider credentials need a safe connection check",
+                        recovery_code="credential_cleanup_failed",
                     )
-                finally:
-                    self.store.release_provider_lease(
-                        lease_id=str(lease.get("lease_id") or ""),
-                        tenant_id=tenant_id,
-                        owner_id=owner_id,
-                    )
-                raise RuntimeErrorBase(
-                    "GlassHive could not prove stale provider credentials were unmounted"
-                ) from exc
+                except (ControlPlaneError, OSError):
+                    logger.exception("Failed to quarantine unsafe provider credentials")
+            self.store.release_provider_lease(
+                lease_id=str(lease.get("lease_id") or ""),
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            raise RuntimeErrorBase(
+                "GlassHive could not safely reconcile stale provider credentials; check the connection"
+            ) from exc
 
         bound_worker = {
             **worker,
@@ -536,6 +545,7 @@ class MissionProviderAccountBinder:
                             owner_id=owner_id,
                             status="action_required",
                             reconnect_reason="Provider credential cleanup failed; operator cleanup is required",
+                            recovery_code="credential_cleanup_failed",
                         )
                     except (ControlPlaneError, OSError):
                         logger.exception(
@@ -577,22 +587,21 @@ class MissionProviderAccountBinder:
                     )
             lease_stop.set()
             lease_thread.join(timeout=2)
-            if not binding_release_errors:
-                try:
-                    self.store.release_provider_lease(
-                        lease_id=str(lease.get("lease_id") or ""),
-                        tenant_id=tenant_id,
-                        owner_id=owner_id,
-                    )
-                except ControlPlaneError as exc:
-                    if body_error is None:
-                        raise RuntimeErrorBase(
-                            "GlassHive could not release the provider account mission lease"
-                        ) from exc
-                    logger.exception(
-                        "Failed to release provider account lease after mission failure",
-                        extra={"worker_id": worker_id, "runtime": runtime_name},
-                    )
+            try:
+                self.store.release_provider_lease(
+                    lease_id=str(lease.get("lease_id") or ""),
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                )
+            except ControlPlaneError as exc:
+                if body_error is None:
+                    raise RuntimeErrorBase(
+                        "GlassHive could not release the provider account mission lease"
+                    ) from exc
+                logger.exception(
+                    "Failed to release provider account lease after mission failure",
+                    extra={"worker_id": worker_id, "runtime": runtime_name},
+                )
             if binding_release_errors and body_error is not None:
                 raise body_error
             if lease_lost.is_set() and body_error is None:

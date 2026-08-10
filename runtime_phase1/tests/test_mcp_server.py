@@ -5808,6 +5808,24 @@ def test_runtime_env_loads_host_cli_binary_paths(monkeypatch, tmp_path):
     assert os.environ["WPR_OPENCLAW_BIN"] == str(tmp_path / "openclaw")
 
 
+def test_runtime_env_loads_provider_account_home_and_isolation(monkeypatch, tmp_path):
+    runtime_file = tmp_path / "runtime.env"
+    account_root = tmp_path / "provider-accounts"
+    runtime_file.write_text(
+        f"GLASSHIVE_PROVIDER_ACCOUNT_HOME_ROOT={account_root}\n"
+        "GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION=per_worker_container\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VIVENTIUM_ENV_FILE", str(runtime_file))
+    monkeypatch.delenv("GLASSHIVE_PROVIDER_ACCOUNT_HOME_ROOT", raising=False)
+    monkeypatch.delenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", raising=False)
+
+    loaded = runtime_env.load_viventium_runtime_env()
+
+    assert loaded["GLASSHIVE_PROVIDER_ACCOUNT_HOME_ROOT"] == str(account_root)
+    assert loaded["GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION"] == "per_worker_container"
+
+
 def test_runtime_env_loads_host_worker_native_capability_knobs(monkeypatch, tmp_path):
     runtime_file = tmp_path / "runtime.env"
     runtime_file.write_text(

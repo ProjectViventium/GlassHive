@@ -197,8 +197,37 @@ def test_stale_provider_mount_reconciliation_fails_closed_before_second_binding(
     )
     assert quarantined is not None
     assert quarantined["status"] == "action_required"
+    assert quarantined["recovery_code"] == "credential_cleanup_failed"
     assert store.active_provider_lease(account["account_id"], "codex-cli:mission") is None
     assert recorder.worker is None
+
+
+def test_cleanup_failure_quarantines_account_but_releases_exclusive_lease(tmp_path, monkeypatch):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path), provider_account_db_path=str(database)
+    )
+    recorder = RecordingRuntime()
+    recorder.release_callback = lambda _worker: (_ for _ in ()).throw(
+        PermissionError("synthetic mapped uid")
+    )
+    runtime.codex = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = _worker(account["account_id"])
+    worker["execution_mode"] = "docker"
+
+    with pytest.raises(RuntimeErrorBase, match="account was quarantined"):
+        runtime.run_task(worker, "complete before cleanup", run_id="run_cleanup_failure")
+
+    updated = store.get_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )
+    assert updated["status"] == "action_required"
+    assert updated["recovery_code"] == "credential_cleanup_failed"
+    assert store.active_provider_lease(account["account_id"], "codex-cli:mission") is None
 
 
 def test_lease_heartbeat_loss_stops_docker_binding_and_fails_mission(tmp_path, monkeypatch):

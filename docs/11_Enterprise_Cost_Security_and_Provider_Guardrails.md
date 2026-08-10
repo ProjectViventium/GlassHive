@@ -207,6 +207,14 @@ support; startup grants and then verifies access for only the container worker u
 world-writable fallback. GlassHive removes the credential-bearing container and tightens the
 credential tree again before releasing the short, heartbeated exclusive mission lease.
 
+Provider-account setup, verification, and missions acquire the same owner-scoped exclusive lease
+before touching the account home. In `per_worker_container` mode they first remove stale mounts and
+run a bounded, network-disabled rootless repair container. That container rejects links, hard links,
+and special files, then normalizes safe entries to container `root:root`, private modes, and no
+residual access/default ACLs. A cleanup failure records the structured
+`credential_cleanup_failed` recovery state and releases the mission lease; Connections offers
+**Check connection** as the primary repair action without forcing a new provider sign-in.
+
 If the ACL grant/access check, stale-mount reconciliation, container removal, permission tightening,
 or lease heartbeat fails, the mission stops and the account becomes action-required. Deployments
 without this exact substrate keep reporting `isolated_substrate_required` instead of falling back to

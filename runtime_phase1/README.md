@@ -32,6 +32,10 @@ active account leases, pending confirmations, idempotency records, host/user wor
 unrecognized storage layouts; it never deletes named or legacy state.
 
 The first provider account for an owner and provider becomes that provider's default automatically.
+Native provider-account setup, verification, and mission use are serialized by an owner-scoped
+lease. Rootless container deployments reconcile stale mounts and normalize the private credential
+tree inside the rootless user namespace before host-side access. Cleanup failures remain recoverable
+through **Check connection**; a fresh provider sign-in is a secondary choice, not the default.
 Explicitly selecting a later default retains the existing one-default-per-provider contract, and
 disconnecting a default clears it so a newly connected replacement can become the default.
 

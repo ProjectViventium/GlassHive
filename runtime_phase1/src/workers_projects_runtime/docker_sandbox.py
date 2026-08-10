@@ -97,6 +97,26 @@ SAFE_DOCKER_EXEC_ENV_KEYS = {
 }
 VNC_PASSWORD_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~!@#$%^&*+=?"
 
+
+def _provider_account_seal_script(mount_target: str) -> str:
+    """Return the fail-closed rootless-namespace credential normalization script."""
+
+    quoted_mount = shlex.quote(str(mount_target))
+    return (
+        "set -euo pipefail; "
+        "command -v setfacl >/dev/null 2>&1; "
+        f"test -d {quoted_mount}; "
+        f"test -z \"$(find {quoted_mount} -xdev -type l -print -quit)\"; "
+        f"test -z \"$(find {quoted_mount} -xdev -type f -links +1 -print -quit)\"; "
+        f"test -z \"$(find {quoted_mount} -xdev ! -type d ! -type f -print -quit)\"; "
+        f"find {quoted_mount} -xdev -type d -exec chown 0:0 -- {{}} +; "
+        f"find {quoted_mount} -xdev -type f -exec chown 0:0 -- {{}} +; "
+        f"find {quoted_mount} -xdev -type d -exec chmod 0700 -- {{}} +; "
+        f"find {quoted_mount} -xdev -type f -exec chmod 0600 -- {{}} +; "
+        f"find {quoted_mount} -xdev -exec setfacl -b -- {{}} +; "
+        f"find {quoted_mount} -xdev -type d -exec setfacl -k -- {{}} +"
+    )
+
 AI_WORKER_BROWSER_EXTENSION_UPDATE_URL = "https://clients2.google.com/service/update2/crx"
 AI_WORKER_BROWSER_EXTENSION_IDS = {
     "claude": "fcoeoabgfenejglbffodgkkbkcdhcgfn",
@@ -1392,7 +1412,12 @@ screen -ls | awk -v target="$target" '
         bind mount.  Reuse is allowed only after every matching mount is gone.
         """
 
-        resolved_home = str(Path(account_home).resolve(strict=True))
+        candidate = Path(account_home)
+        if not candidate.exists() and not candidate.is_symlink():
+            return []
+        if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_dir():
+            raise RuntimeError("Provider account home is not a safe managed directory")
+        resolved_home = str(candidate.resolve(strict=True))
         listed = self._docker(
             ["ps", "-aq", "--filter", "name=^/wpr-"],
             check=False,
@@ -1441,6 +1466,37 @@ screen -ls | awk -v target="$target" '
             self._remove_isolated_network(container_name)
             removed.append(container_name)
         return removed
+
+    def repair_provider_account_access(self, account_home: Path) -> None:
+        """Normalize a private account tree through the rootless Docker user namespace."""
+
+        candidate = Path(account_home)
+        if not candidate.exists() and not candidate.is_symlink():
+            return
+        if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_dir():
+            raise RuntimeError("Provider account home is not a safe managed directory")
+        resolved = candidate.resolve(strict=True)
+        if resolved == Path(resolved.anchor):
+            raise RuntimeError("Provider account home is too broad")
+        self._ensure_image()
+        mount_target = self._provider_account_mount_target
+        result = self._docker(
+            [
+                "run", "--rm", "--network", "none", "--read-only",
+                "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
+                "--cap-add", "CHOWN", "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
+                "--pids-limit", "64", "--memory", "128m", "--cpus", "0.25",
+                "--user", "0:0", "--mount",
+                f"type=bind,src={resolved},dst={mount_target},rw",
+                "--entrypoint", "bash", self.image, "-c",
+                _provider_account_seal_script(mount_target),
+            ],
+            check=False,
+            capture_output=True,
+            timeout_sec=max(self.inspect_timeout_sec, 30),
+        )
+        if result.returncode != 0:
+            raise RuntimeError("GlassHive could not safely normalize provider-account credentials")
 
     def _sandbox_needs_provider_mount_recreate(
         self, worker: dict | None, sandbox: SandboxInfo

@@ -1042,6 +1042,11 @@ class ProfiledWorkerRuntime:
         if hasattr(runtime, "preflight_worker_profile"):
             runtime.preflight_worker_profile(profile, execution_mode)
 
+    def reconcile_provider_account_binding(self, account_home: Path) -> None:
+        """Use the shared Docker substrate to repair an account before setup or verification."""
+
+        self.codex.reconcile_provider_account_binding(account_home)
+
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).ensure_worker_ready(worker)
 
@@ -2080,9 +2085,14 @@ class BaseCliWorkerRuntime:
             raise RuntimeErrorBase("Provider credential cleanup requires a worker id")
         self._stop_active_process(worker_id, worker=worker, run_id=str(worker.get("_active_run_id") or "") or None)
         self.sandbox.terminate(worker_id)
+        raw_account_home = str(worker.get("_glasshive_provider_account_mount_host") or "").strip()
+        if not raw_account_home:
+            raise RuntimeErrorBase("Provider credential cleanup requires its private account home")
+        self.sandbox.repair_provider_account_access(Path(raw_account_home))
 
     def reconcile_provider_account_binding(self, account_home: Path) -> None:
         self.sandbox.terminate_containers_mounting_provider_account(account_home)
+        self.sandbox.repair_provider_account_access(account_home)
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         sandbox = self.sandbox.inspect(worker["worker_id"])
