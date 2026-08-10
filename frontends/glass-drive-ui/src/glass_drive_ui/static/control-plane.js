@@ -186,7 +186,7 @@ function renderProviderAccounts() {
       node('strong', '', String(account.label || account.provider || 'Worker account')),
       node('span', '', providerAccountDetails(account)),
     );
-    if (account.reconnect_reason && account.status !== 'ready') {
+    if (account.reconnect_reason && !['ready', 'connecting'].includes(String(account.status || ''))) {
       copy.append(node('span', 'connection-recovery', String(account.reconnect_reason)));
     }
     const actions = node('div', 'connection-actions connection-actions-primary');
@@ -1088,6 +1088,9 @@ function showSetup(payload) {
   const accountChip = accountRow?.querySelector('.status-chip');
   const accountAction = accountRow?.querySelector('.connection-actions-primary > button');
   const accountMore = accountRow?.querySelector('.connection-more');
+  const accountRecovery = accountRow?.querySelector('.connection-recovery');
+  const addAccount = document.getElementById('add-provider-account');
+  const externalClients = document.getElementById('connect-ai-advanced');
   if (instructions) instructions.textContent = rawInstructions || 'Preparing sign-in…';
   if (panel) panel.hidden = Boolean(payload.complete);
   if (setupLink) {
@@ -1121,6 +1124,9 @@ function showSetup(payload) {
   }
   if (!payload.complete && accountAction) accountAction.hidden = true;
   if (accountMore) accountMore.hidden = !payload.complete;
+  if (accountRecovery) accountRecovery.hidden = !payload.complete;
+  if (addAccount) addAccount.hidden = !payload.complete;
+  if (externalClients) externalClients.hidden = !payload.complete;
   if (restart) restart.hidden = !activeSetupAccount || Boolean(payload.complete);
   setProviderStatus(payload.status === 'ready'
     ? 'Connected.'
