@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import grp
 import hmac
 import importlib.util
 import json
@@ -7,6 +8,7 @@ import logging
 import os
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from hashlib import sha256
@@ -77,6 +79,135 @@ def test_ui_credential_bearing_sqlite_state_is_private(tmp_path, monkeypatch):
         watch_connection.close()
 
 
+def test_runtime_and_ui_share_only_the_explicit_group_link_ref_store(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared-link-refs"
+    shared_dir.mkdir(mode=0o770)
+    os.chown(shared_dir, -1, os.getegid())
+    shared_dir.chmod(0o2770 if sys.platform.startswith("linux") else 0o770)
+    shared_path = shared_dir / "link_refs.sqlite3"
+    shared_path.touch(mode=0o660)
+    os.chown(shared_path, -1, os.getegid())
+    shared_path.chmod(0o660)
+    shared_group = grp.getgrgid(os.getegid()).gr_name
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(shared_path))
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_SHARED_GROUP", shared_group)
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "shared-ref-secret")
+
+    runtime_signed_links = load_runtime_signed_links_module()
+    token = runtime_signed_links.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_shared",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    ref_id = runtime_signed_links.create_signed_link_ref(
+        token=token,
+        target_url="/watch/wrk_shared",
+    )
+    record = resolve_signed_link_ref(ref_id)
+    ui_token = signed_links_module.sign_link_token(
+        kind="artifact_open",
+        worker_id="wrk_shared",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="workspace/index.html",
+    )
+    ui_ref_id = create_signed_link_ref(token=ui_token)
+    runtime_record = runtime_signed_links.resolve_signed_link_ref(ui_ref_id)
+
+    assert record is not None
+    assert record["token"] == token
+    assert runtime_record is not None
+    assert runtime_record["token"] == ui_token
+    expected_directory_mode = 0o2770 if sys.platform.startswith("linux") else 0o770
+    assert os.stat(shared_dir).st_mode & 0o7777 == expected_directory_mode
+    for candidate in (shared_path, Path(f"{shared_path}-wal"), Path(f"{shared_path}-shm")):
+        if candidate.exists():
+            candidate_stat = os.stat(candidate)
+            assert candidate_stat.st_gid == os.getegid()
+            assert candidate_stat.st_mode & 0o777 == 0o660
+
+
+def test_explicit_group_link_ref_store_fails_closed_when_world_accessible(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared-link-refs"
+    shared_dir.mkdir(mode=0o777)
+    os.chown(shared_dir, -1, os.getegid())
+    shared_dir.chmod(0o2777 if sys.platform.startswith("linux") else 0o777)
+    shared_path = shared_dir / "link_refs.sqlite3"
+    shared_group = grp.getgrgid(os.getegid()).gr_name
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(shared_path))
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_SHARED_GROUP", shared_group)
+
+    with pytest.raises(PermissionError, match="shared link reference directory"):
+        signed_links_module._link_ref_conn()
+
+
+@pytest.mark.parametrize("unsafe_kind", ["missing", "world_mode", "symlink", "wal_mode"])
+def test_explicit_group_link_ref_store_rejects_unsafe_database_state(
+    tmp_path, monkeypatch, unsafe_kind
+):
+    shared_dir = tmp_path / "shared-link-refs"
+    shared_dir.mkdir(mode=0o770)
+    os.chown(shared_dir, -1, os.getegid())
+    shared_dir.chmod(0o2770 if sys.platform.startswith("linux") else 0o770)
+    shared_path = shared_dir / "link_refs.sqlite3"
+    if unsafe_kind == "symlink":
+        target = tmp_path / "outside.sqlite3"
+        target.touch(mode=0o660)
+        shared_path.symlink_to(target)
+    elif unsafe_kind != "missing":
+        shared_path.touch(mode=0o660)
+        os.chown(shared_path, -1, os.getegid())
+        shared_path.chmod(0o666 if unsafe_kind == "world_mode" else 0o660)
+        if unsafe_kind == "wal_mode":
+            wal_path = Path(f"{shared_path}-wal")
+            wal_path.touch(mode=0o644)
+            os.chown(wal_path, -1, os.getegid())
+            wal_path.chmod(0o644)
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(shared_path))
+    monkeypatch.setenv(
+        "GLASSHIVE_LINK_REF_SHARED_GROUP",
+        grp.getgrgid(os.getegid()).gr_name,
+    )
+
+    with pytest.raises(PermissionError, match="shared link reference"):
+        signed_links_module._link_ref_conn()
+
+
+def test_explicit_group_link_ref_store_requires_process_group_membership(monkeypatch):
+    class GroupRecord:
+        gr_gid = 4567
+
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_SHARED_GROUP", "synthetic-shared")
+    monkeypatch.setattr(signed_links_module.grp, "getgrnam", lambda _name: GroupRecord())
+    monkeypatch.setattr(signed_links_module.os, "geteuid", lambda: 501)
+    monkeypatch.setattr(signed_links_module.os, "getegid", lambda: 1234)
+    monkeypatch.setattr(signed_links_module.os, "getgroups", lambda: [1234])
+
+    with pytest.raises(PermissionError, match="not a member"):
+        signed_links_module._shared_link_ref_group_gid()
+
+
+def test_linux_shared_link_ref_directory_requires_setgid(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared-link-refs"
+    shared_dir.mkdir(mode=0o770)
+    os.chown(shared_dir, -1, os.getegid())
+    shared_dir.chmod(0o770)
+    shared_path = shared_dir / "link_refs.sqlite3"
+    shared_path.touch(mode=0o660)
+    os.chown(shared_path, -1, os.getegid())
+    shared_path.chmod(0o660)
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(shared_path))
+    monkeypatch.setenv(
+        "GLASSHIVE_LINK_REF_SHARED_GROUP",
+        grp.getgrgid(os.getegid()).gr_name,
+    )
+    monkeypatch.setattr(signed_links_module.sys, "platform", "linux")
+
+    with pytest.raises(PermissionError, match="shared link reference directory"):
+        signed_links_module._link_ref_conn()
+
+
 @pytest.fixture(autouse=True)
 def clear_glasshive_ui_env(monkeypatch, tmp_path):
     for name in (
@@ -98,6 +229,7 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "GLASSHIVE_SIGNED_LINK_SECRET",
         "GLASSHIVE_SIGNED_LINK_TTL_S",
         "GLASSHIVE_LINK_REF_STATE_PATH",
+        "GLASSHIVE_LINK_REF_SHARED_GROUP",
         "GLASSHIVE_LINK_REF_TTL_SECONDS",
         "GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME",
         "GLASSHIVE_HOST_WORKERS_ENABLED",
@@ -2670,6 +2802,122 @@ def test_enterprise_short_worker_view_ref_recovers_an_expired_browser_session_vi
 
     assert response.status_code == 303
     assert response.headers["location"] == f"/login?return_to=%2Fr%2F{ref_id}"
+
+
+def test_runtime_artifact_ref_recovers_login_then_preserves_owner_scope(
+    tmp_path,
+    monkeypatch,
+):
+    _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch)
+    shared_dir = tmp_path / "shared-link-refs"
+    shared_dir.mkdir(mode=0o770)
+    os.chown(shared_dir, -1, os.getegid())
+    shared_dir.chmod(0o2770 if sys.platform.startswith("linux") else 0o770)
+    shared_path = shared_dir / "link_refs.sqlite3"
+    shared_path.touch(mode=0o660)
+    os.chown(shared_path, -1, os.getegid())
+    shared_path.chmod(0o660)
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(shared_path))
+    monkeypatch.setenv(
+        "GLASSHIVE_LINK_REF_SHARED_GROUP",
+        grp.getgrgid(os.getegid()).gr_name,
+    )
+
+    class SessionAuth:
+        mode = "oidc"
+        session_enabled = True
+
+        def resolve_session(self, token):
+            identities = {
+                "owner-session": {
+                    "tenant_id": "tenant-alpha",
+                    "user_id": "user-a",
+                    "email": "owner@example.invalid",
+                    "role": "member",
+                },
+                "other-session": {
+                    "tenant_id": "tenant-alpha",
+                    "user_id": "user-b",
+                    "email": "other@example.invalid",
+                    "role": "member",
+                },
+            }
+            return identities.get(token)
+
+    monkeypatch.setattr(server_module.HumanAuthGateway, "from_env", lambda: SessionAuth())
+    runtime_signed_links = load_runtime_signed_links_module()
+    artifact_token = runtime_signed_links.sign_link_token(
+        kind="artifact_open",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="workspace/index.html",
+    )
+    ref_id = runtime_signed_links.create_signed_link_ref(token=artifact_token)
+
+    class FakeUpstreamResponse:
+        def __init__(self, status_code, content):
+            self.status_code = status_code
+            self.content = content
+            self.headers = {"content-type": "text/html; charset=utf-8"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            assertion = str((headers or {}).get("X-GlassHive-User-Assertion") or "")
+            claims = jwt.decode(
+                assertion,
+                options={"verify_signature": False},
+            )
+            if claims.get("sub") == "user-a":
+                return FakeUpstreamResponse(200, b"<h1>Hello World</h1>")
+            return FakeUpstreamResponse(404, b'{"detail":"GlassHive link not found"}')
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    signed_out = client.get(f"/v1/link-refs/{ref_id}", follow_redirects=False)
+    assert signed_out.status_code == 303
+    assert signed_out.headers["location"] == f"/login?return_to=%2Fv1%2Flink-refs%2F{ref_id}"
+
+    worker_cookie_name = f"glasshive_gh_token_{sha256(b'wrk_1').hexdigest()[:24]}"
+    worker_cookie_token = signed_links_module.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    client.cookies.set(worker_cookie_name, worker_cookie_token)
+    cookie_opened = client.get(f"/v1/link-refs/{ref_id}")
+    assert cookie_opened.status_code == 200
+    assert cookie_opened.content == b"<h1>Hello World</h1>"
+    client.cookies.delete(worker_cookie_name)
+
+    client.cookies.set(worker_cookie_name, "stale-or-corrupt-worker-cookie")
+    stale_cookie = client.get(f"/v1/link-refs/{ref_id}", follow_redirects=False)
+    assert stale_cookie.status_code == 303
+    assert stale_cookie.headers["location"] == (
+        f"/login?return_to=%2Fv1%2Flink-refs%2F{ref_id}"
+    )
+    client.cookies.delete(worker_cookie_name)
+
+    client.cookies.set("glasshive_session", "owner-session")
+    opened = client.get(f"/v1/link-refs/{ref_id}")
+    assert opened.status_code == 200
+    assert opened.content == b"<h1>Hello World</h1>"
+
+    client.cookies.set("glasshive_session", "other-session")
+    denied = client.get(f"/v1/link-refs/{ref_id}")
+    assert denied.status_code == 404
+    assert b"Hello World" not in denied.content
 
 
 def test_short_worker_view_ref_rejects_unconfigured_absolute_redirect_target(monkeypatch):

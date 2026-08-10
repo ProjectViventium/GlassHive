@@ -7,11 +7,18 @@ import logging
 import os
 import re
 import sqlite3
+import stat
+import sys
 import time
 import uuid
 from hashlib import sha256
 from pathlib import Path
 from urllib.parse import quote
+
+try:
+    import grp
+except ImportError:  # pragma: no cover - POSIX-only shared hosted mode
+    grp = None
 
 DEFAULT_TTL_SECONDS = 15 * 60
 DEFAULT_LINK_REF_TTL_SECONDS = 0
@@ -252,15 +259,71 @@ def link_ref_state_path() -> Path:
 def _harden_sqlite_state_path(db_path: Path) -> None:
     if os.name == "nt":
         return
+    shared_gid = _shared_link_ref_group_gid()
+    if shared_gid is not None:
+        _validate_shared_link_ref_state(db_path, shared_gid)
+        return
     db_path.parent.chmod(0o700)
     for candidate in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
         if candidate.exists() and not candidate.is_symlink():
             candidate.chmod(0o600)
 
 
+def _shared_link_ref_group_gid() -> int | None:
+    group_name = str(os.environ.get("GLASSHIVE_LINK_REF_SHARED_GROUP") or "").strip()
+    if not group_name:
+        return None
+    if grp is None:
+        raise PermissionError("shared link reference groups require a POSIX host")
+    try:
+        group_gid = int(grp.getgrnam(group_name).gr_gid)
+    except KeyError as exc:
+        raise PermissionError("configured shared link reference group does not exist") from exc
+    process_groups = {int(os.getegid()), *(int(value) for value in os.getgroups())}
+    if os.geteuid() != 0 and group_gid not in process_groups:
+        raise PermissionError("process is not a member of the shared link reference group")
+    return group_gid
+
+
+def _validate_shared_link_ref_state(db_path: Path, shared_gid: int) -> None:
+    parent = db_path.parent
+    try:
+        parent_stat = parent.lstat()
+    except OSError as exc:
+        raise PermissionError("shared link reference directory is unavailable") from exc
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent.is_symlink()
+        or parent.resolve(strict=True) != parent.absolute()
+        or int(parent_stat.st_uid) not in {0, os.geteuid()}
+        or int(parent_stat.st_gid) != shared_gid
+        or stat.S_IMODE(parent_stat.st_mode) != (0o2770 if sys.platform.startswith("linux") else 0o770)
+    ):
+        raise PermissionError("shared link reference directory has unsafe ownership or permissions")
+    for candidate in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        try:
+            candidate_stat = candidate.lstat()
+        except FileNotFoundError:
+            if candidate == db_path:
+                raise PermissionError("shared link reference database must be pre-created")
+            continue
+        except OSError as exc:
+            raise PermissionError("shared link reference database is unavailable") from exc
+        if (
+            not stat.S_ISREG(candidate_stat.st_mode)
+            or candidate.is_symlink()
+            or int(candidate_stat.st_gid) != shared_gid
+            or stat.S_IMODE(candidate_stat.st_mode) != 0o660
+        ):
+            raise PermissionError("shared link reference database has unsafe ownership or permissions")
+
+
 def _link_ref_conn(*, timeout_seconds: float = 30.0) -> sqlite3.Connection:
     db_path = link_ref_state_path()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if _shared_link_ref_group_gid() is None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        _harden_sqlite_state_path(db_path)
     conn = sqlite3.connect(db_path, timeout=max(0.0, float(timeout_seconds)))
     try:
         _harden_sqlite_state_path(db_path)

@@ -3514,6 +3514,7 @@ def test_enterprise_mode_loads_direct_runtime_env_file(tmp_path, monkeypatch):
                 "WPR_OPENCLAW_WIRE_API=openai-completions",
                 "GLASSHIVE_MAX_WORKSPACES_PER_USER=4",
                 f"GLASSHIVE_LINK_REF_STATE_PATH={link_ref_state}",
+                "GLASSHIVE_LINK_REF_SHARED_GROUP=glasshive-state",
                 "GLASSHIVE_LINK_REF_TTL_SECONDS=0",
             ]
         )
@@ -3533,6 +3534,7 @@ def test_enterprise_mode_loads_direct_runtime_env_file(tmp_path, monkeypatch):
         "WPR_OPENCLAW_WIRE_API",
         "GLASSHIVE_MAX_WORKSPACES_PER_USER",
         "GLASSHIVE_LINK_REF_STATE_PATH",
+        "GLASSHIVE_LINK_REF_SHARED_GROUP",
         "GLASSHIVE_LINK_REF_TTL_SECONDS",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -3548,6 +3550,7 @@ def test_enterprise_mode_loads_direct_runtime_env_file(tmp_path, monkeypatch):
     assert os.environ["WPR_OPENCLAW_WIRE_API"] == "openai-completions"
     assert os.environ["GLASSHIVE_MAX_WORKSPACES_PER_USER"] == "4"
     assert os.environ["GLASSHIVE_LINK_REF_STATE_PATH"] == str(link_ref_state)
+    assert os.environ["GLASSHIVE_LINK_REF_SHARED_GROUP"] == "glasshive-state"
     assert os.environ["GLASSHIVE_LINK_REF_TTL_SECONDS"] == "0"
 
 

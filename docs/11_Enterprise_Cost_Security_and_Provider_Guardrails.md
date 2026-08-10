@@ -32,6 +32,10 @@ Every enterprise deployment must configure and QA these controls before users ar
   View / Steer refs that redirect to a separate GlassHive UI service, both processes must point at
   the same state file on the same host or supported shared storage. Do not put SQLite WAL state on
   unsafe network filesystems.
+- `GLASSHIVE_LINK_REF_SHARED_GROUP`: explicit opt-in for a multi-process local ref store. Every
+  participating process must belong to this group. GlassHive then requires a pre-created
+  root/current-owner directory with no public access (`02770` on Linux) and group-only SQLite,
+  WAL, and SHM files (`0660`) instead of attempting to chmod state owned by another service.
 - `GLASSHIVE_MAX_WATCH_SESSION_DURATION_S`: caps signed View / Steer session-token lifetime and
   the active websocket session for already-open watch tabs. This is separate from durable short
   refs: a user can reopen a durable owner-scoped link later, but the forgotten active tab does not

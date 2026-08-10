@@ -129,6 +129,7 @@ RUNTIME_ENV_KEYS = {
     "GLASSHIVE_RUNTIME_BASE_URL",
     "GLASSHIVE_SIGNED_LINK_SECRET",
     "GLASSHIVE_LINK_REF_STATE_PATH",
+    "GLASSHIVE_LINK_REF_SHARED_GROUP",
     "GLASSHIVE_LINK_REF_TTL_SECONDS",
     "GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME",
     "WPR_LINK_REF_TTL_SECONDS",
@@ -1295,8 +1296,32 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     ) -> RedirectResponse | None:
         if not human_auth.session_enabled or _session_for_request(request) is not None:
             return None
-        if _signed_token_from_request(request, worker_id):
-            return None
+        signed_token = _signed_token_from_request(request, worker_id)
+        if signed_token:
+            payload = verify_signed_link_token(signed_token)
+            token_worker_id = str((payload or {}).get("worker_id") or "").strip()
+            token_tenant_id = str((payload or {}).get("tenant_id") or "").strip()
+            deployment_tenant_id = _enterprise_tenant_id()
+            if (
+                payload
+                and str(payload.get("kind") or "") in _allowed_signed_link_kinds(request)
+                and (not worker_id or token_worker_id == worker_id)
+                and (
+                    not _enterprise_mode_enabled()
+                    or not deployment_tenant_id
+                    or token_tenant_id == deployment_tenant_id
+                )
+            ):
+                return None
+            signed_attempt_in_url = bool(
+                str(request.query_params.get("gh_token") or "").strip()
+                or str(request.url.path or "").startswith("/v1/signed-links/")
+            )
+            if signed_attempt_in_url:
+                # Keep an invalid bearer-link attempt on its bounded error path. Redirecting it
+                # would either copy a secret into the login URL or silently discard the user's
+                # requested capability. Invalid cookies carry no URL secret and may recover via login.
+                return None
         target = _safe_login_return_to(request)
         return RedirectResponse(
             f"/login?{urlencode({'return_to': target})}",
@@ -3640,6 +3665,17 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
 
     @app.api_route("/v1/{runtime_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
     async def runtime_v1_proxy(runtime_path: str, request: Request) -> Response:
+        normalized_runtime_path = str(runtime_path or "").strip("/")
+        if request.method.upper() in {"GET", "HEAD"} and re.fullmatch(
+            r"link-refs/[A-Za-z0-9._-]{1,256}",
+            normalized_runtime_path,
+        ):
+            redirect = _login_redirect_if_needed(
+                request,
+                worker_id=_worker_id_from_runtime_proxy_path(normalized_runtime_path, request),
+            )
+            if redirect is not None:
+                return redirect
         return await _runtime_proxy("v1", runtime_path, request)
 
     @app.get("/")
