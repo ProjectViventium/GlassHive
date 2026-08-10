@@ -1846,7 +1846,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "Use Resume to continue from the same state" in watch_js
     assert "IDLE_REFRESH_MS" in watch_js
     assert "refreshInFlight" in watch_js
-    assert "const GLASSHIVE_UI_REV = '20260809a'" in watch_js
+    assert "const GLASSHIVE_UI_REV = '20260809b'" in watch_js
     assert "const workspaceApiBase = `/api/workspace/${workerId}`" in watch_js
     assert "/api/worker/${workerId}/live" not in watch_js
     assert '@app.get("/api/workspace/{worker_id}/live")' in (Path(server_module.__file__).read_text(encoding="utf-8"))
@@ -1866,7 +1866,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "gh_token|gh_sig|token|signature|sig" in watch_js
     assert "data.artifacts?.items || []" in watch_js
     assert "Workspace files" in watch_js
-    assert "watch.js?v=20260809a" in watch_html
+    assert "watch.js?v=20260809b" in watch_html
     assert ".artifact-row" in styles_css
     assert "artifact-list-more" in watch_js
     assert ".artifact-list-more" in styles_css
@@ -4560,6 +4560,9 @@ def test_connections_ui_keeps_primary_account_setup_short_and_actionable():
     assert "technical.dataset.autoOpened = 'true'" in script
     assert "technical.open = false" in script
     assert "accountMore.hidden = !payload.complete" in script
+    assert "accountRecovery.hidden = !payload.complete" in script
+    assert "addAccount.hidden = !payload.complete" in script
+    assert "externalClients.hidden = !payload.complete" in script
     assert "copyResetTimers" in script
 
 
