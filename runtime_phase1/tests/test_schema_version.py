@@ -92,7 +92,7 @@ def test_schema_migration_lock_serializes_competing_versions(tmp_path) -> None:
     ("component", "factory", "unexpected_table", "newer_version"),
     [
         ("runtime_store", Store, "projects", 5),
-        ("control_plane", ControlPlaneStore, "provider_accounts", 4),
+        ("control_plane", ControlPlaneStore, "provider_accounts", 5),
     ],
 )
 def test_stores_refuse_newer_schema_before_table_mutation(

@@ -21,6 +21,7 @@ const PROVIDER_METHOD_LABELS = {
 let api = null;
 let controlPlane = null;
 let connectAi = null;
+let connectAiLoadError = '';
 let workspaceCatalog = { items: [] };
 let recurringSchedules = { items: [] };
 let scheduleLoadError = '';
@@ -90,6 +91,16 @@ function providerAccountUsage(account) {
     details.push(`Tokens reported by worker: ${inputTokens.toLocaleString()} input · ${outputTokens.toLocaleString()} output`);
   }
   return details.filter(Boolean).join(' · ');
+}
+
+function subscriptionRouteAvailable(account) {
+  const provider = String(account?.provider || '').toLowerCase();
+  const aliases = provider === 'openai' ? ['openai', 'codex']
+    : provider === 'anthropic' ? ['anthropic', 'claude']
+      : [provider];
+  const option = (controlPlane?.provider_options || []).find((item) => aliases.includes(String(item.provider || '').toLowerCase()));
+  return String(account?.platform_support || '') === 'supported'
+    && String(option?.subscription_support || '') === 'supported';
 }
 
 async function copyText(value, button, fallbackNode = null) {
@@ -164,6 +175,7 @@ async function reconnectProviderAccount(account, button) {
 }
 
 async function verifyProviderAccount(account, button) {
+  const idleLabel = button.textContent || 'Test connection';
   button.disabled = true;
   button.textContent = 'Testing…';
   try {
@@ -174,7 +186,7 @@ async function verifyProviderAccount(account, button) {
   } catch (error) {
     setProviderStatus(error.message);
     button.disabled = false;
-    button.textContent = 'Test connection';
+    button.textContent = idleLabel;
   }
 }
 
@@ -215,7 +227,20 @@ function renderProviderAccounts() {
         pollSetup();
       });
       actions.append(continueSetup);
-    } else if (['disconnected', 'action_required', 'error', 'unavailable'].includes(String(account.status || ''))) {
+    } else if (
+      String(account.auth_method || '') === 'subscription'
+      && subscriptionRouteAvailable(account)
+      && String(account.status || '') === 'action_required'
+      && String(account.recovery_code || '') === 'credential_cleanup_failed'
+    ) {
+      const check = node('button', 'quiet-button', 'Check connection');
+      check.type = 'button';
+      check.addEventListener('click', () => verifyProviderAccount(account, check));
+      actions.append(check);
+    } else if (
+      ['disconnected', 'action_required', 'error', 'unavailable'].includes(String(account.status || ''))
+      && (String(account.auth_method || '') !== 'subscription' || subscriptionRouteAvailable(account))
+    ) {
       const reconnectLabel = String(account.auth_method || '') === 'subscription' ? 'Reconnect' : 'Reconnect & test';
       const reconnect = node('button', 'quiet-button', reconnectLabel);
       reconnect.type = 'button';
@@ -238,6 +263,17 @@ function renderProviderAccounts() {
       test.type = 'button';
       test.addEventListener('click', () => verifyProviderAccount(account, test));
       moreActions.append(test);
+    }
+    if (
+      String(account.auth_method || '') === 'subscription'
+      && subscriptionRouteAvailable(account)
+      && String(account.status || '') === 'action_required'
+      && String(account.recovery_code || '') === 'credential_cleanup_failed'
+    ) {
+      const signInAgain = node('button', 'text-button', 'Sign in again');
+      signInAgain.type = 'button';
+      signInAgain.addEventListener('click', () => reconnectProviderAccount(account, signInAgain));
+      moreActions.append(signInAgain);
     }
     if (account.status !== 'disconnected') {
       const disconnect = node('button', 'text-button', 'Disconnect');
@@ -340,6 +376,11 @@ function renderConnectAi() {
   const list = document.getElementById('connect-ai-commands');
   const source = document.getElementById('connect-ai-source');
   if (!list || !connectAi) return;
+  if (connectAiLoadError) {
+    list.replaceChildren(node('p', 'connect-login-note', connectAiLoadError));
+    if (source) source.replaceChildren();
+    return;
+  }
   const clients = connectAi.clients || {};
   const rows = [
     referenceRow('Codex · Registered callback', String(clients.codex?.callback_uri || '')),
@@ -1253,14 +1294,19 @@ async function loadWorkspaceChoices() {
 async function loadControlPlane() {
   const [controlResponse, connectResponse, workspacePayload, scheduleResponse] = await Promise.all([
     fetch(api.withAuth('/api/control-plane')),
-    fetch(api.withAuth('/api/connect-ai')),
+    fetch(api.withAuth('/api/connect-ai')).catch(() => null),
     loadWorkspaceChoices(),
     fetch(api.withAuth('/api/recurring-schedules?include_inactive=true')),
   ]);
   if (!controlResponse.ok) throw new Error(await api.responseMessage(controlResponse, 'Could not load connections'));
-  if (!connectResponse.ok) throw new Error(await api.responseMessage(connectResponse, 'Could not load AI connection instructions'));
   controlPlane = await controlResponse.json();
-  connectAi = await connectResponse.json();
+  if (connectResponse?.ok) {
+    connectAi = await connectResponse.json();
+    connectAiLoadError = '';
+  } else {
+    connectAi = { clients: {} };
+    connectAiLoadError = 'External AI client setup is temporarily unavailable.';
+  }
   workspaceCatalog = workspacePayload;
   if (scheduleResponse.ok) {
     recurringSchedules = await scheduleResponse.json();

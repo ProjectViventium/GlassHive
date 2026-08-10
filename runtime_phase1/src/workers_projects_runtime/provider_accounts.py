@@ -7,18 +7,23 @@ import re
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import fcntl
 
-from .control_plane import ControlPlaneConflict, ControlPlaneError
+from .control_plane import (
+    LEGACY_CREDENTIAL_CLEANUP_REASON,
+    ControlPlaneConflict,
+    ControlPlaneError,
+)
 from .inference_broker import (
     InferenceBrokerError,
     inference_broker_config_from_environment,
@@ -237,30 +242,66 @@ class ProviderAccountHomeManager:
         raise ControlPlaneError("Unsupported provider account home")
 
     def tighten_permissions(self, *, account_home: Path) -> None:
-        """Make provider-created credential state private without following symlinks."""
+        """Validate and privatize credential state through no-follow directory descriptors."""
 
+        if os.name == "nt":
+            return
         resolved_root = self.root.resolve(strict=True)
-        resolved_home = Path(account_home).resolve(strict=True)
-        if resolved_root not in resolved_home.parents:
-            raise ControlPlaneError("Provider account home is outside the managed credential root")
-        for current_root, directory_names, file_names in os.walk(resolved_home, followlinks=False):
-            current = Path(current_root)
-            if current.is_symlink():
-                raise ControlPlaneError("Provider account home contains an unsafe directory link")
-            if os.name != "nt":
-                current.chmod(0o700)
-            for directory_name in list(directory_names):
-                directory = current / directory_name
-                if directory.is_symlink():
-                    directory_names.remove(directory_name)
-                    continue
-                if os.name != "nt":
-                    directory.chmod(0o700)
-            if os.name != "nt":
-                for file_name in file_names:
-                    credential_file = current / file_name
-                    if not credential_file.is_symlink():
-                        credential_file.chmod(0o600)
+        lexical_home = Path(os.path.abspath(account_home))
+        try:
+            relative_home = lexical_home.relative_to(resolved_root)
+        except ValueError as exc:
+            raise ControlPlaneError(
+                "Provider account home is outside the managed credential root"
+            ) from exc
+        if not relative_home.parts:
+            raise ControlPlaneError("Provider account home is too broad")
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        directory_fd = os.open(resolved_root, directory_flags)
+        try:
+            for part in relative_home.parts:
+                child_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+                os.close(directory_fd)
+                directory_fd = child_fd
+            self._tighten_directory_fd(directory_fd)
+        except (OSError, ValueError) as exc:
+            raise ControlPlaneError(
+                "Provider account home contains unsafe credential state"
+            ) from exc
+        finally:
+            os.close(directory_fd)
+
+    def _tighten_directory_fd(self, directory_fd: int) -> None:
+        directory_stat = os.fstat(directory_fd)
+        if not stat.S_ISDIR(directory_stat.st_mode) or directory_stat.st_uid != os.geteuid():
+            raise ControlPlaneError("Provider account directory ownership is unsafe")
+        os.fchmod(directory_fd, 0o700)
+        for name in os.listdir(directory_fd):
+            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISLNK(entry.st_mode):
+                raise ControlPlaneError("Provider account home contains an unsafe link")
+            if entry.st_uid != os.geteuid():
+                raise ControlPlaneError("Provider account entry ownership is unsafe")
+            if stat.S_ISDIR(entry.st_mode):
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino):
+                        raise ControlPlaneError("Provider account directory changed during validation")
+                    self._tighten_directory_fd(child_fd)
+                finally:
+                    os.close(child_fd)
+                continue
+            if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+                raise ControlPlaneError("Provider account home contains an unsafe file")
+            os.chmod(name, 0o600, dir_fd=directory_fd, follow_symlinks=False)
+            secured = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (secured.st_dev, secured.st_ino) != (entry.st_dev, entry.st_ino):
+                raise ControlPlaneError("Provider account file changed during validation")
 
     def require_supported_route(
         self,
@@ -307,11 +348,30 @@ class ProviderSetupManager:
     provider's own native home, outside workspace storage and the control-plane database.
     """
 
-    def __init__(self, *, store: Any, home_root: Path) -> None:
+    def __init__(
+        self,
+        *,
+        store: Any,
+        home_root: Path,
+        reconcile_provider_account_binding: Callable[[Path], None] | None = None,
+    ) -> None:
         self.store = store
         self.homes = ProviderAccountHomeManager(home_root)
+        self.reconcile_provider_account_binding = reconcile_provider_account_binding
         self._sessions: dict[str, _SetupSession] = {}
         self._lock = threading.RLock()
+
+    def _reconcile_if_isolated(self, account_home: Path) -> None:
+        isolation = str(
+            os.environ.get("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION") or ""
+        ).strip().lower()
+        if isolation != "per_worker_container":
+            return
+        if self.reconcile_provider_account_binding is None:
+            raise ControlPlaneError(
+                "The reviewed provider-account container substrate is unavailable"
+            )
+        self.reconcile_provider_account_binding(account_home)
 
     def _binary(self, provider: str) -> str:
         env_name = "WPR_CODEX_CLI_PATH" if provider in {"codex", "openai"} else "WPR_CLAUDE_CODE_PATH"
@@ -383,14 +443,12 @@ class ProviderSetupManager:
     def start(self, *, account_id: str, tenant_id: str, owner_id: str) -> dict[str, object]:
         account = self._account(account_id=account_id, tenant_id=tenant_id, owner_id=owner_id)
         provider = str(account.get("provider") or "").strip().lower()
-        account_home = self.homes.ensure_home(
+        account_home = self.homes.account_home_path(
             tenant_id=tenant_id,
             owner_id=owner_id,
             account_id=account_id,
-            provider=provider,
         )
         setup_command, _ = self._commands(provider)
-        environment = self._environment(provider=provider, account_home=account_home)
         with self._lock:
             current = self._sessions.get(account_id)
             if current is not None and current.process.poll() is None:
@@ -405,15 +463,6 @@ class ProviderSetupManager:
                 for session in active_sessions
             ) >= 2:
                 raise ControlPlaneConflict("This user already has the maximum active account setups")
-            lock_path = account_home / ".setup.lock"
-            lock_file = lock_path.open("a+b")
-            if os.name != "nt":
-                lock_path.chmod(0o600)
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                lock_file.close()
-                raise ControlPlaneConflict("Provider account setup is already running") from exc
             try:
                 lease = self.store.acquire_provider_lease(
                     account_id=account_id,
@@ -431,10 +480,42 @@ class ProviderSetupManager:
                         "unavailable",
                         "error",
                     ),
+                    required_recovery_code=str(account.get("recovery_code") or ""),
                 )
+                self._reconcile_if_isolated(account_home)
+                account_home = self.homes.ensure_home(
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                    account_id=account_id,
+                    provider=provider,
+                )
+                environment = self._environment(provider=provider, account_home=account_home)
+                lock_path = account_home / ".setup.lock"
+                lock_file = lock_path.open("a+b")
+                if os.name != "nt":
+                    lock_path.chmod(0o600)
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    lock_file.close()
+                    raise ControlPlaneConflict("Provider account setup is already running") from exc
             except Exception:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-                lock_file.close()
+                if "lease" in locals():
+                    try:
+                        self.store.update_provider_account_status(
+                            account_id=account_id,
+                            tenant_id=tenant_id,
+                            owner_id=owner_id,
+                            status="action_required",
+                            reconnect_reason=LEGACY_CREDENTIAL_CLEANUP_REASON,
+                            recovery_code="credential_cleanup_failed",
+                        )
+                    finally:
+                        self.store.release_provider_lease(
+                            lease_id=str(lease.get("lease_id") or ""),
+                            tenant_id=tenant_id,
+                            owner_id=owner_id,
+                        )
                 raise
             master_fd, slave_fd = pty.openpty()
             try:
@@ -612,13 +693,11 @@ class ProviderSetupManager:
     ) -> dict[str, object]:
         account = self._account(account_id=account_id, tenant_id=tenant_id, owner_id=owner_id)
         provider = str(account.get("provider") or "").strip().lower()
-        account_home = self.homes.ensure_home(
+        account_home = self.homes.account_home_path(
             tenant_id=tenant_id,
             owner_id=owner_id,
             account_id=account_id,
-            provider=provider,
         )
-        environment = self._environment(provider=provider, account_home=account_home)
         with self._lock:
             session = self._sessions.get(account_id)
             if session is not None and (session.tenant_id != tenant_id or session.owner_id != owner_id):
@@ -633,29 +712,71 @@ class ProviderSetupManager:
                 "complete": False,
                 **_provider_setup_guidance(provider, output),
             }
-        authenticated = verify and self._verify(provider=provider, environment=environment, account_home=account_home)
-        if authenticated:
-            self.homes.tighten_permissions(account_home=account_home)
-            status = "ready"
-            reason = ""
-        elif session is not None and return_code not in {None, 0}:
-            status = "error"
-            reason = "Provider sign-in did not complete"
-        else:
-            status = "action_required"
-            reason = "Complete provider sign-in to use this account"
-        updated = self.store.update_provider_account_status(
-            account_id=account_id,
-            tenant_id=tenant_id,
-            owner_id=owner_id,
-            status=status,
-            reconnect_reason=reason,
-            verified=authenticated,
-        )
-        if session is not None:
-            with self._lock:
-                self._sessions.pop(account_id, None)
-            self._release_session(session)
+        verification_lease: dict[str, Any] | None = None
+        if session is None:
+            verification_lease = self.store.acquire_provider_lease(
+                account_id=account_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                lane="provider-verify",
+                worker_id="provider-verify",
+                run_id=f"verify:{account_id}",
+                ttl_seconds=60,
+                allowed_statuses=(str(account.get("status") or "action_required"),),
+                required_recovery_code=str(account.get("recovery_code") or ""),
+            )
+        try:
+            self._reconcile_if_isolated(account_home)
+            account_home = self.homes.ensure_home(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                account_id=account_id,
+                provider=provider,
+            )
+            environment = self._environment(provider=provider, account_home=account_home)
+            authenticated = verify and self._verify(
+                provider=provider, environment=environment, account_home=account_home
+            )
+            if authenticated:
+                self.homes.tighten_permissions(account_home=account_home)
+                status = "ready"
+                reason = ""
+            elif session is not None and return_code not in {None, 0}:
+                status = "error"
+                reason = "Provider sign-in did not complete"
+            else:
+                status = "action_required"
+                reason = "Complete provider sign-in to use this account"
+            updated = self.store.update_provider_account_status(
+                account_id=account_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                status=status,
+                reconnect_reason=reason,
+                verified=authenticated,
+                recovery_code="" if authenticated else None,
+            )
+        except Exception:
+            self.store.update_provider_account_status(
+                account_id=account_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                status="action_required",
+                reconnect_reason="Provider credentials need a safe connection check",
+                recovery_code="credential_cleanup_failed",
+            )
+            raise
+        finally:
+            if session is not None:
+                with self._lock:
+                    self._sessions.pop(account_id, None)
+                self._release_session(session)
+            elif verification_lease is not None:
+                self.store.release_provider_lease(
+                    lease_id=str(verification_lease.get("lease_id") or ""),
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                )
         return {
             "account_id": account_id,
             "status": updated.get("status", status),

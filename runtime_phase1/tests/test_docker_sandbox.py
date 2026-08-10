@@ -19,6 +19,7 @@ from workers_projects_runtime.docker_sandbox import (
     VNC_PASSWORD_ALPHABET,
     _ai_worker_browser_extension_check_script,
     _ai_worker_browser_native_host_bootstrap_script,
+    _provider_account_seal_script,
     _safe_docker_exec_env,
 )
 from workers_projects_runtime.bootstrap import (
@@ -320,6 +321,57 @@ def test_stale_provider_account_mount_is_removed_before_reuse(tmp_path):
     assert removed == ["wpr-stale-worker"]
     assert ["rm", "-f", "cid-stale"] in commands
     assert any(command[:2] == ["network", "rm"] for command in commands)
+
+
+def test_absent_provider_account_home_never_invokes_docker(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    manager._docker = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("Docker must not be called for an absent account home")
+    )
+
+    assert manager.terminate_containers_mounting_provider_account(
+        tmp_path / "provider-accounts" / "absent"
+    ) == []
+    manager.repair_provider_account_access(tmp_path / "provider-accounts" / "absent")
+
+
+def test_provider_account_repair_is_bounded_and_uses_rootless_namespace(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    account_home = tmp_path / "provider-accounts" / "acct-safe"
+    account_home.mkdir(parents=True)
+    commands: list[list[str]] = []
+    manager._ensure_image = lambda: None  # type: ignore[method-assign]
+    manager._docker = lambda args, **_kwargs: (  # type: ignore[method-assign]
+        commands.append(list(args))
+        or subprocess.CompletedProcess(["docker", *args], 0, stdout="", stderr="")
+    )
+
+    manager.repair_provider_account_access(tmp_path / "provider-accounts" / "absent")
+    manager.repair_provider_account_access(account_home)
+
+    assert len(commands) == 1
+    command = commands[0]
+    assert command[:3] == ["run", "--rm", "--network"]
+    assert [command[index + 1] for index, value in enumerate(command) if value == "--cap-add"] == [
+        "CHOWN", "DAC_OVERRIDE", "FOWNER"
+    ]
+    assert "no-new-privileges" in command
+    assert f"type=bind,src={account_home.resolve()},dst=/workspace/.provider-account,rw" in command
+    script = command[-1]
+    assert "-xdev -type l" in script
+    assert "-type f -links +1" in script
+    assert "! -type d ! -type f" in script
+    assert "chown 0:0" in script
+    assert "chmod 0700" in script and "chmod 0600" in script
+    assert "setfacl -b" in script and "setfacl -k" in script
+
+
+def test_provider_account_seal_checks_all_unsafe_types_before_mutation():
+    script = _provider_account_seal_script("/workspace/.provider-account")
+    first_mutation = min(script.index("chown 0:0"), script.index("chmod 0700"))
+    assert script.index("-type l") < first_mutation
+    assert script.index("-links +1") < first_mutation
+    assert script.index("! -type d ! -type f") < first_mutation
 
 
 def test_describe_self_heals_novnc_when_service_port_resets(tmp_path):

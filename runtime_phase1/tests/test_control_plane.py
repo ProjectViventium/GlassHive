@@ -504,6 +504,7 @@ raise SystemExit(2)
     monkeypatch.setenv("GLASSHIVE_INFERENCE_BROKER_SECRET", "must-not-reach-personal-login")
     monkeypatch.setenv("VIVENTIUM_CALL_SESSION_SECRET", "must-not-reach-personal-login")
     monkeypatch.setenv("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS", "true")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
     store = ControlPlaneStore(str(tmp_path / "runtime.db"))
     account = store.create_provider_account(
         tenant_id="tenant-a",
@@ -514,7 +515,17 @@ raise SystemExit(2)
         platform_support="supported",
         secret_locator="native-home://auto",
     )
-    setup = ProviderSetupManager(store=store, home_root=tmp_path / "provider-homes")
+    reconciled: list[Path] = []
+
+    def reconcile_under_lease(account_home: Path) -> None:
+        assert store.active_provider_lease(account["account_id"], "provider-setup") is not None
+        reconciled.append(account_home)
+
+    setup = ProviderSetupManager(
+        store=store,
+        home_root=tmp_path / "provider-homes",
+        reconcile_provider_account_binding=reconcile_under_lease,
+    )
 
     started = setup.start(account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a")
     assert started["status"] == "connecting"
@@ -540,6 +551,7 @@ raise SystemExit(2)
     assert captured["HOME"].startswith(str(tmp_path / "provider-homes"))
     assert os.stat(captured["CODEX_HOME"]).st_mode & 0o077 == 0
     assert os.stat(Path(captured["CODEX_HOME"]) / "auth.json").st_mode & 0o077 == 0
+    assert len(reconciled) >= 2
     lease = store.acquire_provider_lease(
         account_id=account["account_id"],
         tenant_id="tenant-a",
@@ -841,8 +853,178 @@ def test_control_plane_v2_migrates_provider_account_outcome_and_duration_counter
         columns = {row[1] for row in conn.execute("PRAGMA table_info(provider_accounts)")}
         assert {"observed_failures", "observed_duration_seconds"}.issubset(columns)
         assert require_compatible_schema(
-            conn, component="control_plane", target_version=3
-        ) == 3
+            conn, component="control_plane", target_version=4
+        ) == 4
+
+
+def test_legacy_credential_cleanup_failure_migrates_to_structured_recovery(tmp_path):
+    database = tmp_path / "runtime.db"
+    with sqlite3.connect(database) as conn:
+        conn.execute(
+            """
+            CREATE TABLE provider_accounts (
+                account_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, owner_id TEXT NOT NULL,
+                provider TEXT NOT NULL, label TEXT NOT NULL, auth_method TEXT NOT NULL,
+                platform_support TEXT NOT NULL, is_default INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL, last_verified_at REAL, last_used_at REAL,
+                reconnect_reason TEXT NOT NULL DEFAULT '', secret_locator TEXT NOT NULL,
+                observed_runs INTEGER NOT NULL DEFAULT 0, observed_failures INTEGER NOT NULL DEFAULT 0,
+                observed_duration_seconds REAL NOT NULL DEFAULT 0, observed_input_tokens INTEGER,
+                observed_output_tokens INTEGER, created_at REAL NOT NULL, updated_at REAL NOT NULL
+            )
+            """
+        )
+        values = (
+            "acct_cleanup", "tenant-a", "user-a", "codex", "Personal Codex", "subscription",
+            "supported", 0, "action_required", None, None,
+            "Provider credential cleanup failed; operator cleanup is required",
+            "native-home://acct_cleanup", 1, 0, 1.0, None, None, 1.0, 1.0,
+        )
+        conn.execute("INSERT INTO provider_accounts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
+        conn.execute(
+            "INSERT INTO provider_accounts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "acct_other", "tenant-a", "user-b", "codex", "Other", "subscription",
+                "supported", 0, "action_required", None, None, "Different reason",
+                "native-home://acct_other", 0, 0, 0.0, None, None, 1.0, 1.0,
+            ),
+        )
+
+    store = ControlPlaneStore(str(database))
+
+    migrated = store.get_provider_account(
+        account_id="acct_cleanup", tenant_id="tenant-a", owner_id="user-a"
+    )
+    untouched = store.get_provider_account(
+        account_id="acct_other", tenant_id="tenant-a", owner_id="user-b"
+    )
+    assert migrated["recovery_code"] == "credential_cleanup_failed"
+    assert untouched["recovery_code"] == ""
+
+
+def test_transient_provider_status_preserves_recovery_until_verified(tmp_path):
+    store = ControlPlaneStore(str(tmp_path / "runtime.db"))
+    account = store.create_provider_account(
+        tenant_id="tenant-a", owner_id="user-a", provider="codex", label="Personal Codex",
+        auth_method="subscription", platform_support="supported",
+        secret_locator="native-home://auto", status="action_required",
+    )
+    store.update_provider_account_status(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a",
+        status="action_required", reconnect_reason="Credentials need safe repair",
+        recovery_code="credential_cleanup_failed",
+    )
+
+    connecting = store.update_provider_account_status(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a",
+        status="connecting",
+    )
+    assert connecting["recovery_code"] == "credential_cleanup_failed"
+
+    ready = store.update_provider_account_status(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a",
+        status="ready", verified=True, recovery_code="",
+    )
+    assert ready["recovery_code"] == ""
+
+
+def test_connection_check_repairs_under_verify_lease_without_new_sign_in(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS", "true")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    store = ControlPlaneStore(str(tmp_path / "runtime.db"))
+    account = store.create_provider_account(
+        tenant_id="tenant-a", owner_id="user-a", provider="codex", label="Personal Codex",
+        auth_method="subscription", platform_support="supported",
+        secret_locator="native-home://auto", status="action_required",
+    )
+    store.update_provider_account_status(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a",
+        status="action_required", reconnect_reason="Credentials need safe repair",
+        recovery_code="credential_cleanup_failed",
+    )
+    reconciled: list[Path] = []
+
+    def reconcile(account_home: Path) -> None:
+        assert not account_home.exists()
+        assert store.active_provider_lease(account["account_id"], "provider-verify") is not None
+        reconciled.append(account_home)
+
+    setup = ProviderSetupManager(
+        store=store,
+        home_root=tmp_path / "provider-homes",
+        reconcile_provider_account_binding=reconcile,
+    )
+    monkeypatch.setattr(setup, "_verify", lambda **_kwargs: True)
+
+    result = setup.status(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )
+
+    assert result["status"] == "ready"
+    assert reconciled
+    assert store.active_provider_lease(account["account_id"], "provider-verify") is None
+    recovered = store.get_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )
+    assert recovered["recovery_code"] == ""
+
+
+def test_setup_repair_failure_quarantines_account_and_releases_lease(tmp_path, monkeypatch):
+    cli = tmp_path / "synthetic-codex"
+    cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli.chmod(0o700)
+    monkeypatch.setenv("WPR_CODEX_CLI_PATH", str(cli))
+    monkeypatch.setenv("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS", "true")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    store = ControlPlaneStore(str(tmp_path / "runtime.db"))
+    account = store.create_provider_account(
+        tenant_id="tenant-a", owner_id="user-a", provider="codex", label="Personal Codex",
+        auth_method="subscription", platform_support="supported",
+        secret_locator="native-home://auto", status="ready",
+    )
+
+    def reject_repair(account_home: Path) -> None:
+        assert not account_home.exists()
+        assert store.active_provider_lease(account["account_id"], "provider-setup") is not None
+        raise ControlPlaneError("Synthetic safe repair failure")
+
+    setup = ProviderSetupManager(
+        store=store,
+        home_root=tmp_path / "provider-homes",
+        reconcile_provider_account_binding=reject_repair,
+    )
+
+    with pytest.raises(ControlPlaneError, match="safe repair failure"):
+        setup.start(account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a")
+
+    assert store.active_provider_lease(account["account_id"], "provider-setup") is None
+    quarantined = store.get_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )
+    assert quarantined["status"] == "action_required"
+    assert quarantined["recovery_code"] == "credential_cleanup_failed"
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "hardlink", "fifo"])
+def test_provider_home_tightening_rejects_unsafe_entries(tmp_path, unsafe_kind):
+    manager = ProviderAccountHomeManager(tmp_path / "provider-homes")
+    account_home = manager.ensure_home(
+        tenant_id="tenant-a", owner_id="user-a", account_id="acct_safe", provider="codex"
+    )
+    unsafe = account_home / "codex" / "unsafe"
+    target = tmp_path / "outside"
+    target.write_text("synthetic", encoding="utf-8")
+    if unsafe_kind == "symlink":
+        unsafe.symlink_to(target)
+    elif unsafe_kind == "hardlink":
+        os.link(target, unsafe)
+    else:
+        os.mkfifo(unsafe)
+
+    with pytest.raises(ControlPlaneError, match="unsafe"):
+        manager.tighten_permissions(account_home=account_home)
+
+    assert target.read_text(encoding="utf-8") == "synthetic"
 
 
 def test_provider_setup_fails_closed_when_deployment_has_not_proven_support(tmp_path):

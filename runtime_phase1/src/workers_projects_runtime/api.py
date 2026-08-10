@@ -191,14 +191,17 @@ def create_app(
     data_root = Path(resolved_db_path).resolve().parent
     store = Store(resolved_db_path)
     control_plane = ControlPlaneStore(resolved_db_path)
+    runtime_impl = _build_runtime(resolved_runtime_backend, resolved_db_path, runtime)
     provider_setup = ProviderSetupManager(
         store=control_plane,
         home_root=Path(
             os.environ.get("GLASSHIVE_PROVIDER_ACCOUNT_HOME_ROOT")
             or (data_root / "provider_accounts")
         ).expanduser(),
+        reconcile_provider_account_binding=getattr(
+            runtime_impl, "reconcile_provider_account_binding", None
+        ),
     )
-    runtime_impl = _build_runtime(resolved_runtime_backend, resolved_db_path, runtime)
     capability_broker = getattr(runtime_impl, "capability_broker", None)
     if capability_broker is None:
         capability_broker = GlassHiveCapabilityBroker.from_environment()

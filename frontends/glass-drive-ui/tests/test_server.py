@@ -1960,7 +1960,11 @@ def test_launcher_workspace_hive_static_controls():
     assert "Workspace complete" in desktop_js
     assert "The latest output and workspace files are available from the status panel" in desktop_js
     assert "Clipboard sync: inactive until workspace resumes" in desktop_js
-    assert "desktop.js?v=20260625a" in desktop_html
+    assert "desktop.js?v=20260810b" in desktop_html
+    assert 'id="workspace-status-link"' in desktop_html
+    assert "showWorkspaceLink: true" in desktop_js
+    assert "Open workspace status and files" in desktop_html
+    assert "styles.css?v=20260810a" in watch_html
     assert "}, 5000);" not in desktop_js
     assert 'id="project-files"' in index_html
     assert 'id="schedule-text"' in index_html
@@ -4837,6 +4841,10 @@ def test_control_plane_ui_exposes_safe_disconnect_and_capability_remove_paths():
     assert "Disconnecting…" in script
     assert "Reconnect" in script
     assert "Test connection" in script
+    assert "Check connection" in script
+    assert "Sign in again" in script
+    assert "credential_cleanup_failed" in script
+    assert "subscriptionRouteAvailable(account)" in script
     assert "Forget" in script
     assert "last_verified_at" in script
     assert "last_used_at" in script
@@ -4862,6 +4870,23 @@ def test_control_plane_ui_exposes_safe_disconnect_and_capability_remove_paths():
     assert 'id="confirm-dependencies"' in confirm_page
     assert "library_plan_snapshot" in confirm_script
     assert "librarySnapshot.content_hash" in confirm_script
+
+
+def test_connections_recovery_is_verify_first_and_external_client_failure_is_optional():
+    script = (Path(server_module.STATIC_DIR) / "control-plane.js").read_text(encoding="utf-8")
+
+    recovery = script.index("String(account.recovery_code || '') === 'credential_cleanup_failed'")
+    check = script.index("'Check connection'", recovery)
+    verify = script.index("verifyProviderAccount(account, check)", check)
+    sign_in = script.index("'Sign in again'", verify)
+    reconnect = script.index("reconnectProviderAccount(account, signInAgain)", sign_in)
+    assert recovery < check < verify < sign_in < reconnect
+    assert "const idleLabel = button.textContent || 'Test connection';" in script
+    assert "button.textContent = idleLabel;" in script
+    assert "fetch(api.withAuth('/api/connect-ai')).catch(() => null)" in script
+    assert "if (connectResponse?.ok)" in script
+    assert "External AI client setup is temporarily unavailable." in script
+    assert "if (!connectResponse.ok) throw" not in script
 
 
 def test_connections_ui_keeps_primary_account_setup_short_and_actionable():

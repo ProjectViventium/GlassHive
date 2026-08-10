@@ -6,6 +6,7 @@ const stage = document.getElementById('desktop-stage');
 const overlay = document.getElementById('desktop-overlay');
 const statusEl = document.getElementById('desktop-status');
 const detailEl = document.getElementById('desktop-detail');
+const workspaceStatusLink = document.getElementById('workspace-status-link');
 const clipboardStatus = document.getElementById('clipboard-status');
 
 let rfb = null;
@@ -35,9 +36,10 @@ function withAuth(url) {
   return `${url}${url.includes('?') ? '&' : '?'}gh_token=${encodeURIComponent(signedToken)}`;
 }
 
-function setStatus(title, detail, { hideOverlay = false } = {}) {
+function setStatus(title, detail, { hideOverlay = false, showWorkspaceLink = false } = {}) {
   statusEl.textContent = title;
   detailEl.textContent = detail;
+  if (workspaceStatusLink) workspaceStatusLink.hidden = !showWorkspaceLink;
   overlay.hidden = hideOverlay;
 }
 
@@ -127,7 +129,11 @@ function showSettledWorkspaceStatus(data) {
   const status = settledWorkspaceStatus(data);
   stopClipboardSync();
   setClipboardStatus('Clipboard sync: inactive until workspace resumes');
-  setStatus(status.title, status.detail);
+  setStatus(status.title, status.detail, { showWorkspaceLink: true });
+}
+
+if (workspaceStatusLink) {
+  workspaceStatusLink.href = withAuth(`/watch/${encodeURIComponent(workerId)}?surface=desktop`);
 }
 
 function scheduleDesktopRefresh(delayMs = desktopRefreshDelayMs) {
