@@ -34,8 +34,12 @@ unrecognized storage layouts; it never deletes named or legacy state.
 The first provider account for an owner and provider becomes that provider's default automatically.
 Native provider-account setup, verification, and mission use are serialized by an owner-scoped
 lease. Rootless container deployments reconcile stale mounts and normalize the private credential
-tree inside the rootless user namespace before host-side access. Cleanup failures remain recoverable
-through **Check connection**; a fresh provider sign-in is a secondary choice, not the default.
+tree inside the rootless user namespace before host-side access. While an isolated Codex mission
+holds that lease, GlassHive gives the worker ownership only of Codex's non-secret installation ID
+and recreatable argument-alias directory so the reviewed CLI can initialize; cleanup removes the
+container and reseals those paths with the rest of the private tree. Cleanup failures remain
+recoverable through **Check connection**; a fresh provider sign-in is a secondary choice, not the
+default.
 Explicitly selecting a later default retains the existing one-default-per-provider contract, and
 disconnecting a default clears it so a newly connected replacement can become the default.
 

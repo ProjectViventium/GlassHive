@@ -120,6 +120,105 @@ def _provider_account_seal_script(mount_target: str) -> str:
         f"find {quoted_mount} -xdev -type d -exec setfacl -k -- {{}} +"
     )
 
+
+_CODEX_PROVIDER_RUNTIME_METADATA_SCRIPT = r"""
+import grp
+import os
+import pwd
+import stat
+import sys
+
+mount_path, home_name, identity = sys.argv[1:4]
+user_value, separator, group_value = identity.partition(":")
+
+
+def numeric_user(value: str) -> int:
+    return int(value) if value.isdigit() else pwd.getpwnam(value).pw_uid
+
+
+def numeric_group(value: str, user_id: int) -> int:
+    if not value:
+        return pwd.getpwuid(user_id).pw_gid
+    return int(value) if value.isdigit() else grp.getgrnam(value).gr_gid
+
+
+worker_uid = numeric_user(user_value)
+worker_gid = numeric_group(group_value if separator else "", worker_uid)
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+file_flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def open_optional(parent_fd: int, name: str, flags: int) -> int | None:
+    try:
+        return os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+
+
+mount_fd = os.open(mount_path, directory_flags)
+try:
+    home_fd = os.open(home_name, directory_flags, dir_fd=mount_fd)
+    try:
+        installation_fd = open_optional(home_fd, "installation_id", file_flags)
+        if installation_fd is not None:
+            try:
+                metadata = os.fstat(installation_fd)
+                mode = stat.S_IMODE(metadata.st_mode)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise RuntimeError("Codex installation metadata is not a safe regular file")
+                if metadata.st_size > 4096:
+                    raise RuntimeError("Codex installation metadata is unexpectedly large")
+                if metadata.st_uid not in {0, worker_uid}:
+                    raise RuntimeError("Codex installation metadata has an unexpected owner")
+                if metadata.st_gid not in {0, worker_gid}:
+                    raise RuntimeError("Codex installation metadata has an unexpected group")
+                if metadata.st_uid == 0 and mode & 0o007:
+                    raise RuntimeError("Sealed Codex installation metadata is publicly accessible")
+                if metadata.st_uid == worker_uid and mode not in {
+                    0o600,
+                    0o640,
+                    0o644,
+                    0o660,
+                    # A repeated recursive worker ACL grant widens the ACL
+                    # mask/group bits before this helper restores exact 0644.
+                    0o664,
+                }:
+                    raise RuntimeError("Codex installation metadata has an unexpected mode")
+                os.fchown(installation_fd, worker_uid, worker_gid)
+                os.fchmod(installation_fd, 0o644)
+                os.fsync(installation_fd)
+            finally:
+                os.close(installation_fd)
+
+        tmp_fd = open_optional(home_fd, "tmp", directory_flags)
+        if tmp_fd is not None:
+            try:
+                arg0_fd = open_optional(tmp_fd, "arg0", directory_flags)
+                if arg0_fd is not None:
+                    try:
+                        metadata = os.fstat(arg0_fd)
+                        mode = stat.S_IMODE(metadata.st_mode)
+                        if not stat.S_ISDIR(metadata.st_mode):
+                            raise RuntimeError("Codex argument metadata is not a safe directory")
+                        if metadata.st_uid not in {0, worker_uid}:
+                            raise RuntimeError("Codex argument metadata has an unexpected owner")
+                        if metadata.st_gid not in {0, worker_gid}:
+                            raise RuntimeError("Codex argument metadata has an unexpected group")
+                        if mode & 0o007:
+                            raise RuntimeError("Codex argument metadata is publicly accessible")
+                        os.fchown(arg0_fd, worker_uid, worker_gid)
+                        os.fchmod(arg0_fd, 0o700)
+                        os.fsync(arg0_fd)
+                    finally:
+                        os.close(arg0_fd)
+            finally:
+                os.close(tmp_fd)
+    finally:
+        os.close(home_fd)
+finally:
+    os.close(mount_fd)
+""".strip()
+
 AI_WORKER_BROWSER_EXTENSION_UPDATE_URL = "https://clients2.google.com/service/update2/crx"
 AI_WORKER_BROWSER_EXTENSION_IDS = {
     "claude": "fcoeoabgfenejglbffodgkkbkcdhcgfn",
@@ -1529,7 +1628,8 @@ screen -ls | awk -v target="$target" '
         raw_environment = worker.get("_glasshive_provider_account_env")
         if not isinstance(raw_environment, dict) or len(raw_environment) != 1:
             raise RuntimeError("Provider account mount is missing its private runtime home")
-        runtime_home = Path(str(next(iter(raw_environment.values())) or "").strip())
+        runtime_env_name, runtime_home_value = next(iter(raw_environment.items()))
+        runtime_home = Path(str(runtime_home_value or "").strip())
         try:
             runtime_home.relative_to(mount_target)
         except ValueError as exc:
@@ -1539,7 +1639,11 @@ screen -ls | awk -v target="$target" '
 
         quoted_mount = shlex.quote(str(mount_target))
         quoted_home = shlex.quote(str(runtime_home))
-        container_user = shlex.quote(self.user.split(":", 1)[0] or self.user)
+        container_user_name = self.user.split(":", 1)[0] or self.user
+        container_user = shlex.quote(container_user_name)
+        is_codex_home = str(runtime_env_name) == "CODEX_HOME"
+        if is_codex_home and runtime_home != mount_target / "codex":
+            raise RuntimeError("Codex provider runtime home must use its exact private directory")
         grant_script = (
             "set -e; "
             "command -v setfacl >/dev/null 2>&1; "
@@ -1558,9 +1662,45 @@ screen -ls | awk -v target="$target" '
                 "Provider account isolation requires POSIX ACL support in the reviewed worker image"
             )
 
+        if is_codex_home:
+            # Codex 0.146+ requires an existing installation_id to be owned by
+            # the invoking user with exact mode 0644, and unconditionally chmods
+            # its tmp/arg0 directory. ACLs cannot supply fchmod ownership. Use
+            # descriptor-relative, no-follow validation to transfer only those
+            # non-secret runtime metadata paths for this exclusive worker lease;
+            # post-run sealing restores service ownership and private modes.
+            prepared = self._docker_exec(
+                container_name,
+                [
+                    "python3",
+                    "-c",
+                    _CODEX_PROVIDER_RUNTIME_METADATA_SCRIPT,
+                    str(mount_target),
+                    "codex",
+                    self.user,
+                ],
+                cwd=self.workspace_mount,
+                user="root",
+            )
+            if prepared.returncode != 0:
+                raise RuntimeError(
+                    "The selected Codex account contains unsafe runtime metadata"
+                )
+
         verify_script = (
             f"set -e; test -r {quoted_home}; test -w {quoted_home}; test -x {quoted_home}"
         )
+        if is_codex_home:
+            quoted_installation_id = shlex.quote(str(runtime_home / "installation_id"))
+            quoted_arg0_root = shlex.quote(str(runtime_home / "tmp" / "arg0"))
+            verify_script += (
+                f"; if [ -e {quoted_installation_id} ]; then "
+                f"test -O {quoted_installation_id}; "
+                f"test \"$(stat -c %a {quoted_installation_id})\" = 644; fi"
+                f"; if [ -e {quoted_arg0_root} ]; then "
+                f"test -O {quoted_arg0_root}; "
+                f"test \"$(stat -c %a {quoted_arg0_root})\" = 700; fi"
+            )
         verified = self._docker_exec(
             container_name,
             ["bash", "-c", verify_script],

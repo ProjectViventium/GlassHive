@@ -204,8 +204,11 @@ and removes conflicting deployment gateway/key environment variables. Rootless D
 container's non-root worker to a subordinate host uid, so a correct bind mount of the host-owned
 `0700`/`0600` tree is not sufficient by itself. The reviewed workstation image includes POSIX ACL
 support; startup grants and then verifies access for only the container worker user. There is no
-world-writable fallback. GlassHive removes the credential-bearing container and tightens the
-credential tree again before releasing the short, heartbeated exclusive mission lease.
+world-writable fallback. Current Codex also requires its non-secret `installation_id` metadata to be
+worker-owned at mode `0644` and its recreatable `tmp/arg0` directory to be worker-mutable. GlassHive
+prepares only those structured `CODEX_HOME` paths inside the selected container while the exclusive
+mission lease is held. It removes the credential-bearing container and tightens the entire credential
+tree back to service ownership and private modes before releasing the lease.
 
 Provider-account setup, verification, and missions acquire the same owner-scoped exclusive lease
 before touching the account home. In `per_worker_container` mode they first remove stale mounts and
