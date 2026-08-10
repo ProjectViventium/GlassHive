@@ -109,7 +109,13 @@ authenticated routes, not bearer links.
 
 When MCP/runtime payloads emit `/r/{ref}` URLs whose host is the separate GlassHive UI service, the
 runtime and UI must share `GLASSHIVE_LINK_REF_STATE_PATH` or otherwise route the ref to the process
-that created it. This is a deployment contract, not a LibreChat behavior.
+that created it. A hosted deployment that shares the local SQLite store must also set
+`GLASSHIVE_LINK_REF_SHARED_GROUP` for every process that mints or resolves refs. The administrator
+must pre-create one root-owned, group-owned directory (`02770` on Linux) and database (`0660`),
+keep WAL/SHM files `0660`, and use local storage. In this explicit shared mode GlassHive validates
+the boundary and never widens permissions itself. Without the shared-group setting, the existing
+single-process private `0700` directory and `0600` file behavior remains unchanged. This is a
+deployment contract, not a LibreChat behavior.
 
 The MCP descriptions must make this non-callback path obvious to connected LLMs. A model should
 launch work with `workspace_launch`, include `uploaded_files` when the user attached files, return
