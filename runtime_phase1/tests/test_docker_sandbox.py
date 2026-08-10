@@ -6,6 +6,7 @@ import os
 import shlex
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from workers_projects_runtime.docker_sandbox import (
     DockerSandboxManager,
     SandboxInfo,
     VNC_PASSWORD_ALPHABET,
+    _CODEX_PROVIDER_RUNTIME_METADATA_SCRIPT,
     _ai_worker_browser_extension_check_script,
     _ai_worker_browser_native_host_bootstrap_script,
     _provider_account_seal_script,
@@ -231,16 +233,217 @@ def test_bound_provider_account_mount_grants_and_verifies_only_worker_user_acces
 
     manager._grant_provider_account_access("wpr-test", worker)  # type: ignore[attr-defined]
 
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert calls[0][0] == "root"
     grant_script = calls[0][1][-1]
     assert "command -v setfacl" in grant_script
     assert "setfacl -R -m u:seluser:rwX" in grant_script
-    assert "chmod" not in grant_script
-    assert calls[1][0] == "seluser"
-    verify_script = calls[1][1][-1]
+    assert "installation_id" not in grant_script
+    assert calls[1][0] == "root"
+    assert calls[1][1][:2] == ["python3", "-c"]
+    assert calls[1][1][2] == _CODEX_PROVIDER_RUNTIME_METADATA_SCRIPT
+    assert calls[1][1][3:] == [
+        "/workspace/.provider-account",
+        "codex",
+        "seluser",
+    ]
+    assert "os.O_NOFOLLOW" in calls[1][1][2]
+    assert "metadata.st_nlink != 1" in calls[1][1][2]
+    assert "os.fchown(installation_fd" in calls[1][1][2]
+    assert "os.fchmod(installation_fd, 0o644)" in calls[1][1][2]
+    assert "os.fchown(arg0_fd" in calls[1][1][2]
+    assert "os.fchmod(arg0_fd, 0o700)" in calls[1][1][2]
+    assert "delete" not in calls[1][1][2]
+    assert calls[2][0] == "seluser"
+    verify_script = calls[2][1][-1]
     assert "test -r /workspace/.provider-account/codex" in verify_script
     assert "test -w /workspace/.provider-account/codex" in verify_script
+    assert "test -O /workspace/.provider-account/codex/installation_id" in verify_script
+    assert "stat -c %a /workspace/.provider-account/codex/installation_id" in verify_script
+
+
+def test_bound_claude_account_does_not_apply_codex_runtime_metadata_contract(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    account_home = tmp_path / "provider-accounts" / "acct-safe"
+    (account_home / "claude").mkdir(parents=True)
+    calls: list[tuple[str | None, list[str]]] = []
+
+    def fake_docker_exec(
+        container_name,
+        command,
+        *,
+        env=None,
+        cwd=None,
+        detach=False,
+        fire_and_forget=False,
+        user=None,
+    ):
+        calls.append((user, command))
+        return subprocess.CompletedProcess(["docker"], 0, "", "")
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+    manager._grant_provider_account_access(  # type: ignore[attr-defined]
+        "wpr-test",
+        {
+            "_glasshive_provider_account_bound": True,
+            "_glasshive_provider_account_mount_host": str(account_home),
+            "_glasshive_provider_account_mount_target": "/workspace/.provider-account",
+            "_glasshive_provider_account_env": {
+                "CLAUDE_CONFIG_DIR": "/workspace/.provider-account/claude"
+            },
+        },
+    )
+
+    grant_script = calls[0][1][-1]
+    assert "installation_id" not in grant_script
+    assert "/tmp/arg0" not in grant_script
+    assert len(calls) == 2
+
+
+def _run_codex_runtime_metadata_prep(root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _CODEX_PROVIDER_RUNTIME_METADATA_SCRIPT,
+            str(root),
+            "codex",
+            f"{os.getuid()}:{os.getgid()}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def test_codex_runtime_metadata_prep_is_repeatable_and_preserves_arg0_helpers(tmp_path):
+    codex_home = tmp_path / "codex"
+    arg0_root = codex_home / "tmp" / "arg0"
+    arg0_root.mkdir(parents=True)
+    helper = arg0_root / "active-helper"
+    helper.write_text("still active")
+    installation_id = codex_home / "installation_id"
+    installation_id.write_text("00000000-0000-4000-8000-000000000001")
+    installation_id.chmod(0o600)
+    arg0_root.chmod(0o700)
+
+    first = _run_codex_runtime_metadata_prep(tmp_path)
+    # The next readiness pass applies the recursive named rw ACL first. Its
+    # mask appears in the group mode bits until the metadata helper restores
+    # Codex's required exact 0644 mode.
+    installation_id.chmod(0o664)
+    second = _run_codex_runtime_metadata_prep(tmp_path)
+
+    assert first.returncode == second.returncode == 0
+    assert stat.S_IMODE(installation_id.stat().st_mode) == 0o644
+    assert installation_id.stat().st_uid == os.getuid()
+    assert stat.S_IMODE(arg0_root.stat().st_mode) == 0o700
+    assert arg0_root.stat().st_uid == os.getuid()
+    assert helper.read_text() == "still active"
+
+
+def test_codex_runtime_metadata_prep_allows_missing_optional_metadata(tmp_path):
+    (tmp_path / "codex").mkdir()
+
+    result = _run_codex_runtime_metadata_prep(tmp_path)
+
+    assert result.returncode == 0
+
+
+def test_bound_codex_account_requires_the_exact_private_codex_home(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    account_home = tmp_path / "provider-accounts" / "acct-safe"
+    (account_home / "other").mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="exact private directory"):
+        manager._grant_provider_account_access(  # type: ignore[attr-defined]
+            "wpr-test",
+            {
+                "_glasshive_provider_account_bound": True,
+                "_glasshive_provider_account_mount_host": str(account_home),
+                "_glasshive_provider_account_mount_target": "/workspace/.provider-account",
+                "_glasshive_provider_account_env": {
+                    "CODEX_HOME": "/workspace/.provider-account/other"
+                },
+            },
+        )
+
+
+def test_bound_codex_account_fails_closed_when_runtime_metadata_cannot_be_prepared(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    account_home = tmp_path / "provider-accounts" / "acct-safe"
+    (account_home / "codex").mkdir(parents=True)
+    calls: list[tuple[str | None, list[str]]] = []
+
+    def fake_docker_exec(
+        container_name,
+        command,
+        *,
+        env=None,
+        cwd=None,
+        detach=False,
+        fire_and_forget=False,
+        user=None,
+    ):
+        calls.append((user, command))
+        return subprocess.CompletedProcess(
+            ["docker"], 1 if command[:2] == ["python3", "-c"] else 0, "", ""
+        )
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="unsafe runtime metadata"):
+        manager._grant_provider_account_access(  # type: ignore[attr-defined]
+            "wpr-test",
+            {
+                "_glasshive_provider_account_bound": True,
+                "_glasshive_provider_account_mount_host": str(account_home),
+                "_glasshive_provider_account_mount_target": "/workspace/.provider-account",
+                "_glasshive_provider_account_env": {
+                    "CODEX_HOME": "/workspace/.provider-account/codex"
+                },
+            },
+        )
+
+    assert len(calls) == 2
+    assert calls[0][0] == "root"
+    assert calls[1][0] == "root"
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "hardlink", "fifo"])
+def test_codex_runtime_metadata_prep_rejects_unsafe_installation_id(tmp_path, unsafe_kind):
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    installation_id = codex_home / "installation_id"
+    external = tmp_path / "external"
+    external.write_text("unchanged")
+    if unsafe_kind == "symlink":
+        installation_id.symlink_to(external)
+    elif unsafe_kind == "hardlink":
+        os.link(external, installation_id)
+    else:
+        os.mkfifo(installation_id)
+
+    result = _run_codex_runtime_metadata_prep(tmp_path)
+
+    assert result.returncode != 0
+    assert external.read_text() == "unchanged"
+
+
+def test_codex_runtime_metadata_prep_rejects_arg0_symlink_without_touching_target(tmp_path):
+    tmp_root = tmp_path / "codex" / "tmp"
+    tmp_root.mkdir(parents=True)
+    external = tmp_path / "external-arg0"
+    external.mkdir()
+    marker = external / "marker"
+    marker.write_text("unchanged")
+    (tmp_root / "arg0").symlink_to(external, target_is_directory=True)
+
+    result = _run_codex_runtime_metadata_prep(tmp_path)
+
+    assert result.returncode != 0
+    assert marker.read_text() == "unchanged"
 
 
 def test_provider_account_mount_requires_private_binder_marker(tmp_path):
