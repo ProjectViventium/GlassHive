@@ -5960,6 +5960,154 @@ def test_host_conversation_broker_config_stays_in_private_worker_state(tmp_path,
     assert not (life / ".claude").exists()
 
 
+def test_host_conversation_projects_agent_builder_control_schema_to_both_native_clis(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    life = tmp_path / "Life"
+    life.mkdir()
+    control = {
+        "version": 1,
+        "tools": [
+            {
+                "name": "lc_transfer_to_specialist",
+                "description": "Consult the specialist using shared graph state.",
+            }
+        ],
+    }
+    codex_runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "codex-private-state"))
+    codex_worker = {
+        "worker_id": "wrk_codex_graph_control",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(life),
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "run_mode": "conversation",
+                "provider_model": "gpt-5.6-sol",
+                "access_mode": "full",
+                "agent_builder_control": control,
+            }
+        ),
+    }
+
+    codex_command, _ = codex_runtime._build_command(
+        codex_worker,
+        "Choose the next graph action.",
+        codex_runtime._host_runtime_info(codex_worker),
+    )
+
+    assert "--output-schema" in codex_command
+    codex_schema_path = Path(codex_command[codex_command.index("--output-schema") + 1])
+    assert codex_schema_path.is_file()
+    codex_schema = json.loads(codex_schema_path.read_text())
+    assert codex_schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+    assert codex_schema["additionalProperties"] is False
+    assert codex_schema["required"] == ["type", "content", "tool_name"]
+    assert codex_schema["properties"]["tool_name"]["enum"] == [
+        None,
+        "lc_transfer_to_specialist",
+    ]
+    assert not (life / codex_schema_path.name).exists()
+    codex_runtime._write_session_key(
+        codex_worker["worker_id"],
+        "synthetic-codex-session",
+    )
+    codex_resume_command, _ = codex_runtime._build_command(
+        codex_worker,
+        "Return to the graph.",
+        codex_runtime._host_runtime_info(codex_worker),
+    )
+    assert codex_resume_command[1:3] == ["exec", "resume"]
+    assert codex_resume_command.index("--output-schema") < codex_resume_command.index(
+        "synthetic-codex-session"
+    )
+
+    claude_runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "claude-private-state"))
+    claude_worker = {
+        **codex_worker,
+        "worker_id": "wrk_claude_graph_control",
+        "profile": "claude-code",
+        "model": "opus",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "run_mode": "conversation",
+                "provider_model": "opus",
+                "access_mode": "full",
+                "agent_builder_control": control,
+            }
+        ),
+    }
+
+    claude_command, _ = claude_runtime._build_command(
+        claude_worker,
+        "Choose the next graph action.",
+        claude_runtime._host_runtime_info(claude_worker),
+    )
+
+    assert "--json-schema" in claude_command
+    claude_schema = json.loads(
+        claude_command[claude_command.index("--json-schema") + 1]
+    )
+    assert "$schema" not in claude_schema
+    assert claude_schema == {
+        key: value for key, value in codex_schema.items() if key != "$schema"
+    }
+    assert claude_schema["additionalProperties"] is False
+    assert claude_schema["required"] == ["type", "content", "tool_name"]
+    assert claude_schema["properties"]["tool_name"]["enum"] == [
+        None,
+        "lc_transfer_to_specialist",
+    ]
+    claude_runtime._write_session_key(
+        claude_worker["worker_id"],
+        "synthetic-claude-session",
+    )
+    claude_resume_command, _ = claude_runtime._build_command(
+        claude_worker,
+        "Return to the graph.",
+        claude_runtime._host_runtime_info(claude_worker),
+    )
+    assert claude_resume_command.index("--json-schema") < claude_resume_command.index(
+        "--resume"
+    )
+    assert claude_resume_command[claude_resume_command.index("--resume") + 1] == (
+        "synthetic-claude-session"
+    )
+    assert json.loads(
+        claude_resume_command[claude_resume_command.index("--json-schema") + 1]
+    ) == claude_schema
+
+
+def test_host_mission_and_plain_conversation_commands_do_not_gain_graph_control_schema(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    life = tmp_path / "Life"
+    life.mkdir()
+    runtimes_and_flags = [
+        (HostCodexCliRuntime(base_dir=str(tmp_path / "codex-state")), "--output-schema"),
+        (HostClaudeCodeRuntime(base_dir=str(tmp_path / "claude-state")), "--json-schema"),
+    ]
+    for index, (runtime, flag) in enumerate(runtimes_and_flags):
+        profile = "codex-cli" if isinstance(runtime, HostCodexCliRuntime) else "claude-code"
+        for run_mode in ("mission", "conversation"):
+            worker = {
+                "worker_id": f"wrk_no_graph_control_{index}_{run_mode}",
+                "profile": profile,
+                "execution_mode": "host",
+                "workspace_root": str(life),
+                "model": "gpt-5.6-sol" if profile == "codex-cli" else "opus",
+                "bootstrap_bundle_json": json.dumps({"run_mode": run_mode}),
+            }
+            command, _ = runtime._build_command(
+                worker,
+                "Continue normally.",
+                runtime._host_runtime_info(worker),
+            )
+            assert flag not in command
+
+
 def test_host_capability_projection_adds_missing_entries_to_existing_worker_catalogs(
     tmp_path,
     monkeypatch,

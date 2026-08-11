@@ -43,6 +43,10 @@ from .release_provenance import release_provenance
 from .runtime_requirements import host_runtime_requirement_issue
 from .runtime_env import load_viventium_runtime_env
 from .runtime_identity import derive_legacy_backend_label
+from .workspace_continuation import (
+    CONNECTED_ACCOUNT_NO_BROKER_NOTE,
+    continuation_instruction,
+)
 from .signed_links import (
     append_signed_query,
     create_signed_link_ref,
@@ -68,6 +72,58 @@ DEFAULT_OWNER_ID = os.environ.get("WPR_DEFAULT_OWNER_ID", "").strip()
 DEFAULT_API_TOKEN = os.environ.get("WPR_API_TOKEN", "").strip()
 DEFAULT_MCP_API_TOKEN = os.environ.get("GLASSHIVE_MCP_API_KEY", "").strip()
 
+
+def _callback_delivery_deadline_seconds() -> int:
+    """Return the owner-declared upper bound for callback delivery.
+
+    The runtime service dead-letters after a finite total-attempt budget and retries pending
+    callbacks on a fixed interval.  Carry that structural horizon to the host so a durable voice
+    continuation can fail truthfully when delivery is no longer possible.
+    """
+
+    try:
+        max_attempts = int(os.environ.get("GLASSHIVE_CALLBACK_MAX_TOTAL_ATTEMPTS", "25"))
+    except (TypeError, ValueError):
+        max_attempts = 25
+    try:
+        retry_interval = int(os.environ.get("GLASSHIVE_CALLBACK_RETRY_INTERVAL_S", "30"))
+    except (TypeError, ValueError):
+        retry_interval = 30
+    try:
+        retry_attempts = int(os.environ.get("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", "3"))
+    except (TypeError, ValueError):
+        retry_attempts = 3
+    try:
+        retry_base_delay = float(
+            os.environ.get("GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S", "0.5")
+        )
+    except (TypeError, ValueError):
+        retry_base_delay = 0.5
+    try:
+        stale_after = int(
+            os.environ.get("GLASSHIVE_CALLBACK_DELIVERING_STALE_AFTER_S", "300")
+        )
+    except (TypeError, ValueError):
+        stale_after = 300
+    max_attempts = min(1000, max(1, max_attempts))
+    retry_interval = min(3600, max(1, retry_interval))
+    retry_attempts = min(25, max(1, retry_attempts))
+    retry_base_delay = min(60.0, max(0.0, retry_base_delay))
+    stale_after = min(24 * 60 * 60, max(1, stale_after))
+    batches = math.ceil(max_attempts / retry_attempts)
+    bounded_delivery_work = (
+        max_attempts * 5.0
+        + batches * retry_base_delay * sum(range(1, retry_attempts))
+        + max(0, batches - 1) * retry_interval
+        + stale_after
+        + 120
+    )
+    conservative_interval_horizon = max_attempts * retry_interval + 120
+    return min(
+        45 * 24 * 60 * 60,
+        max(60, math.ceil(bounded_delivery_work), conservative_interval_horizon),
+    )
+
 READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
@@ -92,13 +148,6 @@ WORKER_HOST_SIDE_ORCHESTRATION_RULE = (
     "worker workspace."
 )
 
-CONNECTED_ACCOUNT_NO_BROKER_NOTE = (
-    "Connected-account content intent was requested, but this workspace did not receive a complete "
-    "host-signed `glasshive-user-capabilities` broker grant/config in its bootstrap bundle. Do not "
-    "claim brokered MCP access, brokered provider reachability, or brokered results. Use only tools "
-    "that are actually available inside this worker session and label them accurately; if the needed "
-    "provider, content, or auth scope is unavailable, report the blocker instead of filling gaps."
-)
 CAPABILITY_BROKER_NAME = "glasshive-user-capabilities"
 CAPABILITY_BROKER_CONTENT_READ_SCOPE = "content_read"
 HIGH_EFFORT_SELECTION_GUIDANCE = (
@@ -3761,6 +3810,11 @@ def create_mcp_server(
             "status": "dispatched",
             "callback_ready": callback_ready,
             "callback_delivery": "optional" if callback_ready else "not_configured_standalone_polling_available",
+            **(
+                {"callback_delivery_deadline_seconds": _callback_delivery_deadline_seconds()}
+                if callback_ready
+                else {}
+            ),
             "missing_callback_fields": missing_callback_fields,
             **dispatch_context,
         }
@@ -5527,58 +5581,6 @@ def create_mcp_server(
             )
             await asyncio.sleep(min(sleep_interval, max(0.0, deadline - time.monotonic())))
 
-    def _continuation_instruction(
-        *,
-        previous_run: dict[str, Any],
-        continuation_goal: str | None,
-    ) -> str:
-        def base_instruction(value: str) -> str:
-            text = str(value or "").strip()
-            for _ in range(8):
-                if not text.startswith("Continue this GlassHive workspace"):
-                    break
-                marker = "Original task:\n"
-                if marker not in text:
-                    break
-                text = text.split(marker, 1)[1].strip()
-                for stop_marker in (
-                    "\n\nPrevious failure classification:",
-                    "\n\nContinuation request:",
-                    "\n\nGlassHive completion contract:",
-                ):
-                    index = text.find(stop_marker)
-                    if index >= 0:
-                        text = text[:index].strip()
-                        break
-            return _strip_worker_instruction_note(text, CONNECTED_ACCOUNT_NO_BROKER_NOTE)
-
-        original_instruction = base_instruction(str(previous_run.get("instruction") or ""))
-        failure_payload = _run_failure_payload(previous_run)
-        chunks = [
-            "Continue this GlassHive workspace from its current files, browser state, notes, and partial outputs.",
-            "Preserve the original user request, success criteria, response format, and any files already available in the workspace.",
-            "Do not replace binary source files with text extracts unless the user explicitly asked for text extraction only.",
-        ]
-        if original_instruction:
-            chunks.append(f"Original task:\n{original_instruction}")
-        if failure_payload.get("failure_class"):
-            chunks.append(
-                "Previous failure classification:\n"
-                f"- class: {failure_payload.get('failure_class')}\n"
-                f"- retryable: {bool(failure_payload.get('failure_retryable'))}\n"
-                f"- recovery guidance: {failure_payload.get('failure_recommended_recovery') or 'Continue carefully.'}"
-            )
-        clean_goal = str(continuation_goal or "").strip()
-        if clean_goal:
-            chunks.append(f"Continuation request:\n{clean_goal}")
-        else:
-            chunks.append(
-                "Continuation request:\nResume the original task from the current workspace state. "
-                "Use available partial work, avoid repeating failed provider-heavy loops when possible, "
-                "and produce the final requested deliverables."
-            )
-        return "\n\n".join(chunks)
-
     @server.tool(
         name="workspace_continue",
         title="Continue GlassHive Workspace",
@@ -5658,7 +5660,10 @@ def create_mcp_server(
             preferences = {}
         worker_profile = str(worker.get("profile") or "").strip()
         resolved_effort = _resolve_effort_for_profile(worker_profile, effort, preferences)
-        instruction = _continuation_instruction(previous_run=previous_run, continuation_goal=continuation_goal)
+        instruction = continuation_instruction(
+            previous_run=previous_run,
+            continuation_goal=continuation_goal,
+        )
         parsed_bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json)
         parsed_bundle = _merge_request_context(parsed_bundle)
         prior_connected_account_guard = CONNECTED_ACCOUNT_NO_BROKER_NOTE in str(previous_run.get("instruction") or "")

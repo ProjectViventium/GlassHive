@@ -62,6 +62,8 @@ from .models import (
     ProjectResponse,
     RecurringScheduleDefinitionResponse,
     RecurringScheduleOccurrenceResponse,
+    RunActionRequest,
+    RunActionResponse,
     RunResponse,
     RunRecurringScheduleNowRequest,
     SchedulePrincipalAuthorityRequest,
@@ -83,6 +85,7 @@ from .recurrence import DELEGATED_RECURRENCE_OWNER
 from .release_provenance import release_provenance
 from .runtime_env import load_viventium_runtime_env
 from .runtime_identity import derive_legacy_backend_label
+from .run_actions import ACTION_CAPABILITY_HEADER, ACTION_ENDPOINT, RunActionError
 from .scheduling_owner import (
     SCHEDULING_CORTEX_ASSERTION_HEADER,
     SchedulingOwnerError,
@@ -481,6 +484,43 @@ def create_app(
     @app.middleware("http")
     async def optional_bearer_auth(request: Request, call_next):
         request.state.auth_context = AuthContext()
+        if request.method.upper() == "POST" and request.url.path == ACTION_ENDPOINT:
+            capability = str(request.headers.get(ACTION_CAPABILITY_HEADER) or "").strip()
+            if not capability:
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "detail": {
+                            "code": "capability_required",
+                            "message": "A scoped action capability is required.",
+                        }
+                    },
+                )
+            try:
+                claims = service.verify_action_capability(capability)
+            except RunActionError as exc:
+                return JSONResponse(
+                    status_code=exc.status_code,
+                    content={"detail": {"code": exc.code, "message": str(exc)}},
+                )
+            if auth_settings.enterprise and str(claims["tenantId"]) != auth_settings.tenant_id:
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "detail": {
+                            "code": "capability_scope_mismatch",
+                            "message": "The action capability does not match this deployment tenant.",
+                        }
+                    },
+                )
+            request.state.run_action_claims = claims
+            request.state.auth_context = AuthContext(
+                tenant_id=str(claims["tenantId"]),
+                user_id=str(claims["ownerId"]),
+                auth_mode="action_capability",
+                enterprise=auth_settings.enterprise,
+            )
+            return await call_next(request)
         auth_header = request.headers.get("authorization", "")
         bearer = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
         provider_path = (
@@ -3001,6 +3041,47 @@ def create_app(
             )
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return RunResponse(**run)
+
+    @app.post(ACTION_ENDPOINT, response_model=RunActionResponse, status_code=202)
+    def execute_run_action(
+        payload: RunActionRequest,
+        request: Request,
+    ) -> RunActionResponse:
+        claims = getattr(request.state, "run_action_claims", None)
+        if not isinstance(claims, dict):
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "capability_required", "message": "A scoped action capability is required."},
+            )
+        try:
+            result = service.execute_run_action(
+                claims,
+                capability_id=payload.capabilityId,
+                action=payload.action,
+                project_id=payload.projectId,
+                worker_id=payload.workerId,
+                run_id=payload.runId,
+                idempotency_key=payload.idempotencyKey,
+            )
+        except RunActionError as exc:
+            if exc.code == "run_already_completed" and payload.action == "cancel":
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "version": 1,
+                        "status": "already_completed",
+                        "action": "cancel",
+                        "projectId": payload.projectId,
+                        "workerId": payload.workerId,
+                        "sourceRunId": payload.runId,
+                        "state": "completed",
+                    },
+                )
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
+        return RunActionResponse(**result)
 
     @app.post("/v1/workers/{worker_id}/message", response_model=RunResponse, status_code=202)
     def send_message(worker_id: str, payload: SendMessageRequest, request: Request) -> RunResponse:

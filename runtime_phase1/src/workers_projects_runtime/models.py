@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal, cast
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .recurrence import canonical_recurrence_owner
 from .runtime_identity import derive_legacy_backend_label
@@ -198,6 +198,40 @@ class AssignRunRequest(BaseModel):
 
 class SendMessageRequest(BaseModel):
     message: str = Field(min_length=1)
+
+
+class RunActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1]
+    capabilityId: str = Field(min_length=5, max_length=192, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]+$")
+    action: Literal["retry", "cancel"]
+    projectId: str = Field(min_length=1, max_length=192, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]*$")
+    workerId: str = Field(min_length=1, max_length=192, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]*$")
+    runId: str = Field(min_length=1, max_length=192, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]*$")
+    idempotencyKey: str = Field(min_length=8, max_length=192, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]+$")
+
+
+class RunActionCorrelation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    projectId: str
+    workerId: str
+    runId: str
+
+
+class RunActionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1]
+    status: Literal["queued", "pending", "accepted"]
+    action: Literal["retry", "cancel"]
+    projectId: str
+    workerId: str
+    sourceRunId: str
+    newRun: RunActionCorrelation | None
+    confirmationPending: bool
+    idempotentReplay: bool
 
 
 class ScheduleRunRequest(BaseModel):

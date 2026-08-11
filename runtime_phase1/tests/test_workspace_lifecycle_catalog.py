@@ -12,6 +12,7 @@ import pytest
 from workers_projects_runtime.control_plane import ControlPlaneStore
 from workers_projects_runtime.openclaw_runtime import RuntimeErrorBase, RuntimeInfo, StubRuntime
 from workers_projects_runtime.service import WorkersProjectsService
+from workers_projects_runtime.run_actions import RunActionError
 from workers_projects_runtime.signed_links import (
     create_signed_link_ref,
     resolve_signed_link_ref,
@@ -118,6 +119,85 @@ def test_ephemeral_reaper_removes_only_expired_managed_one_off_state(tmp_path, m
     assert store.get_worker(named["worker_id"]) is not None
     assert store.get_project(named_project["project_id"]) is not None
     assert named_file.read_text(encoding="utf-8") == "persistent"
+
+
+def test_ephemeral_gc_removes_run_action_uses_before_runs_and_workers(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_EPHEMERAL_GC_ENABLED", "true")
+    monkeypatch.setenv("GLASSHIVE_EPHEMERAL_RETENTION_S", "60")
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(
+        store,
+        PersistentFixtureRuntime(tmp_path / "managed-runtime"),
+        reconcile_on_startup=False,
+    )
+    try:
+        project = _project(store, title="Action cleanup")
+        worker = _worker(service, project, name="Action cleanup", workspace_kind="ephemeral")
+        source = store.create_run(
+            worker["worker_id"], project["project_id"], "Retryable action", state="failed"
+        )
+        store.update_run(source["run_id"], failure_retryable=1)
+        retry = store.create_retry_run_action(
+            capability_id="cap-cleanup",
+            idempotency_key="idem-cleanup",
+            project_id=project["project_id"],
+            worker_id=worker["worker_id"],
+            source_run_id=source["run_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            instruction="Retry safely",
+        )
+        store.finalize_run(retry["run"]["run_id"], state="completed", output_text="Done")
+        _expire_worker(store, worker["worker_id"])
+
+        reaped = service.reap_ephemeral_workspaces_once(now=datetime.now(timezone.utc))
+    finally:
+        service.shutdown()
+
+    assert [item["worker_id"] for item in reaped] == [worker["worker_id"]]
+    assert store.get_run_action("cap-cleanup") is None
+    assert store.get_worker(worker["worker_id"]) is None
+
+
+def test_retry_action_fails_closed_once_ephemeral_gc_is_claimed(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(
+        store,
+        PersistentFixtureRuntime(tmp_path / "managed-runtime"),
+        reconcile_on_startup=False,
+    )
+    try:
+        project = _project(store, title="GC retry fence")
+        worker = _worker(service, project, name="GC retry fence", workspace_kind="ephemeral")
+        source = store.create_run(
+            worker["worker_id"], project["project_id"], "Retryable action", state="failed"
+        )
+        store.update_run(source["run_id"], failure_retryable=1)
+        updated_before = datetime.now(timezone.utc).isoformat()
+        _expire_worker(store, worker["worker_id"])
+        claimed = store.claim_ephemeral_workspace_gc(
+            worker["worker_id"],
+            updated_before=updated_before,
+            now_epoch=time.time(),
+            claim_token="gc-test-claim",
+            claim_ttl_s=60,
+        )
+        assert claimed is not None
+
+        with pytest.raises(RunActionError) as raised:
+            store.create_retry_run_action(
+                capability_id="cap-after-gc",
+                idempotency_key="idem-after-gc",
+                project_id=project["project_id"],
+                worker_id=worker["worker_id"],
+                source_run_id=source["run_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+                instruction="Must not restart",
+            )
+        assert raised.value.code == "worker_ended"
+    finally:
+        service.shutdown()
 
 
 def test_ephemeral_reaper_fails_closed_for_active_or_scheduled_work(tmp_path, monkeypatch):

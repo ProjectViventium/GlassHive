@@ -22,6 +22,7 @@ from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Callable
 
+from .agent_builder_control import graph_transfer_output_schema
 from .bootstrap import (
     GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
     GLASSHIVE_NATIVE_CAPABILITY_INVENTORY,
@@ -4023,6 +4024,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             session_key = info.session_key
             assistant_parts: list[str] = []
             result_parts: list[str] = []
+            structured_parts: list[str] = []
             for line in raw.splitlines():
                 try:
                     event = json.loads(line)
@@ -4034,6 +4036,17 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                 if maybe_session:
                     session_key = maybe_session
                 if str(event.get("type") or "") == "result":
+                    structured = event.get(
+                        "structured_output", event.get("structuredOutput")
+                    )
+                    if isinstance(structured, dict):
+                        structured_parts.append(
+                            json.dumps(
+                                structured,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                        )
                     result = str(event.get("result") or "").strip()
                     if result:
                         result_parts.append(result)
@@ -4048,7 +4061,9 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                 ).strip()
                 if text:
                     assistant_parts.append(text)
-            selected = _select_user_facing_agent_output(result_parts or assistant_parts)
+            selected = _select_user_facing_agent_output(
+                structured_parts or result_parts or assistant_parts
+            )
             return session_key, selected or "The harness completed without a user-facing response."
         try:
             payload = json.loads(raw.splitlines()[-1])
@@ -5360,6 +5375,25 @@ raise SystemExit(exit_code)
                 return {}
         raw_bundle = worker.get("bootstrap_bundle")
         return raw_bundle if isinstance(raw_bundle, dict) else {}
+
+    def _agent_builder_output_schema(self, worker: dict) -> dict[str, object] | None:
+        if not self._conversation_mode_from_worker(worker):
+            return None
+        bundle = self._bootstrap_bundle_for_worker(worker)
+        schema = graph_transfer_output_schema(bundle.get("agent_builder_control"))
+        return schema if isinstance(schema, dict) else None
+
+    def _agent_builder_output_schema_path(
+        self,
+        worker: dict,
+    ) -> Path | None:
+        schema = self._agent_builder_output_schema(worker)
+        if not schema:
+            return None
+        path = self._state_dir(str(worker["worker_id"])) / "agent-builder-output-schema.json"
+        if not _write_private_json(path, schema):
+            raise RuntimeErrorBase("Agent Builder control schema is unavailable")
+        return path
 
     def _write_workspace_file(self, workspace: Path, relative_path: str, content: str, *, overwrite: bool = True) -> None:
         relative = Path(relative_path)
@@ -7173,6 +7207,9 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
             )
         else:
             command.append("--full-auto")
+        output_schema_path = self._agent_builder_output_schema_path(worker)
+        if output_schema_path:
+            command.extend(["--output-schema", str(output_schema_path)])
         if is_resume:
             command.append(existing_session)
         command.append("-")
@@ -7196,6 +7233,16 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
 class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
     worker_root_name = "host_claude_code_runtime"
     binary_env_var = "WPR_CLAUDE_CODE_BIN"
+
+    def _agent_builder_output_schema(self, worker: dict) -> dict[str, object] | None:
+        schema = super()._agent_builder_output_schema(worker)
+        if not schema:
+            return None
+        # Claude Code rejects the canonical 2020-12 declaration while accepting
+        # the same constraints in an unqualified schema.
+        projected_schema = dict(schema)
+        projected_schema.pop("$schema", None)
+        return projected_schema
 
     def _conversation_workspace_side_effect_state(self, workspace: Path) -> dict[str, bool]:
         claude_dir = workspace / ".claude"
@@ -7489,6 +7536,14 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
                     str(worker.get("profile") or "claude-code"), "host", effort
                 )
             command.extend(["--effort", effort])
+        output_schema = self._agent_builder_output_schema(worker)
+        if output_schema:
+            command.extend(
+                [
+                    "--json-schema",
+                    json.dumps(output_schema, separators=(",", ":"), sort_keys=True),
+                ]
+            )
         if session_key and not session_key.startswith("claude-worker:"):
             command.extend(["--resume", session_key])
         env = self._host_env(worker)
