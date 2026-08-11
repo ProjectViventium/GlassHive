@@ -141,11 +141,13 @@ async function deleteJson(url) {
 function renderCurrentUser(identity = {}) {
   const control = document.getElementById('current-user-control');
   const label = document.getElementById('current-user-label');
+  const switchAccount = document.getElementById('switch-account');
   if (!control || !label || !csrfToken) return;
   const name = String(identity.display_name || '').trim();
   const email = String(identity.email || '').trim();
   label.textContent = name && email ? `${name} · ${email}` : name || email || 'Signed in';
   label.title = label.textContent;
+  if (switchAccount) switchAccount.hidden = identity.provider_switch_visible !== true;
   control.hidden = false;
 }
 

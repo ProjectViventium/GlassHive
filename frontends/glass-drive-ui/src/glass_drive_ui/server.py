@@ -79,6 +79,7 @@ RUNTIME_ENV_KEYS = {
     "GLASSHIVE_PROVIDER_EMAIL_LOGIN",
     "GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT",
     "GLASSHIVE_LOCAL_PASSWORD_LOGIN",
+    "GLASSHIVE_OIDC_LOGIN_VISIBLE",
     "GLASSHIVE_LOCAL_AUTH_ALLOWED_EMAIL_DOMAINS",
     "GLASSHIVE_LOCAL_AUTH_THROTTLE_KEY",
     "GLASSHIVE_ALLOWED_EMAIL_DOMAINS",
@@ -1282,6 +1283,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             "email": str(session.get("email") or "").strip(),
             "display_name": str(session.get("display_name") or "").strip(),
             "role": str(session.get("role") or "member").strip(),
+            "auth_method": str(session.get("auth_method") or "oidc").strip(),
             "auth_source": "session",
         }
 
@@ -1445,6 +1447,17 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         local_password_login = human_auth.mode == "oidc" and bool(
             getattr(human_auth, "local_password_login", False)
         )
+        oidc_login_visible = human_auth.mode == "oidc" and bool(
+            getattr(human_auth, "oidc_login_visible", True)
+        )
+        login_methods = [
+            method
+            for method, enabled in (
+                ("oidc", oidc_login_visible),
+                ("local_password", local_password_login),
+            )
+            if enabled
+        ]
         return {
             "mode": human_auth.mode,
             # Keep the two legacy keys for older login assets, but do not claim
@@ -1457,6 +1470,8 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             "principal_enrollment": human_auth.mode == "oidc" and human_auth.allow_registration,
             "identity_owner": "external_provider",
             "oidc": human_auth.mode == "oidc",
+            "oidc_login_visible": oidc_login_visible,
+            "login_methods": login_methods,
         }
 
     @app.get("/auth/session")
@@ -2529,6 +2544,11 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 "email": identity.get("email", ""),
                 "display_name": identity.get("display_name", ""),
                 "role": identity.get("role", ""),
+                "auth_method": identity.get("auth_method", ""),
+                "provider_switch_visible": bool(
+                    identity.get("auth_method") == "oidc"
+                    and getattr(human_auth, "oidc_login_visible", True)
+                ),
             },
             "csrf_token": (
                 str(request.cookies.get(AUTH_CSRF_COOKIE) or "")

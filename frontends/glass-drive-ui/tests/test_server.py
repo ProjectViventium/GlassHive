@@ -251,6 +251,7 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "GLASSHIVE_PROVIDER_EMAIL_LOGIN",
         "GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT",
         "GLASSHIVE_LOCAL_PASSWORD_LOGIN",
+        "GLASSHIVE_OIDC_LOGIN_VISIBLE",
         "GLASSHIVE_LOCAL_AUTH_ALLOWED_EMAIL_DOMAINS",
         "GLASSHIVE_LOCAL_AUTH_THROTTLE_KEY",
         "GLASSHIVE_ALLOW_EMAIL_LOGIN",
@@ -5155,6 +5156,8 @@ def test_oidc_identity_owner_advertises_provider_email_login_with_closed_enrollm
         "principal_enrollment": False,
         "identity_owner": "external_provider",
         "oidc": True,
+        "oidc_login_visible": True,
+        "login_methods": ["oidc"],
     }
     assert "Continue with email or organization" in auth_script
     assert "create an account if needed" not in auth_script
@@ -5176,6 +5179,7 @@ def test_local_password_login_is_explicit_same_origin_and_has_no_signup_surface(
         "https://glasshive.example.test/auth/oidc/callback",
     )
     monkeypatch.setenv("GLASSHIVE_LOCAL_PASSWORD_LOGIN", "true")
+    monkeypatch.setenv("GLASSHIVE_OIDC_LOGIN_VISIBLE", "false")
     monkeypatch.setenv(
         "GLASSHIVE_LOCAL_AUTH_THROTTLE_KEY",
         "synthetic-throttle-key-for-server-tests",
@@ -5195,8 +5199,11 @@ def test_local_password_login_is_explicit_same_origin_and_has_no_signup_surface(
 
     assert config.json()["local_password_login"] is True
     assert config.json()["local_password_signup"] is False
+    assert config.json()["oidc"] is True
+    assert config.json()["oidc_login_visible"] is False
+    assert config.json()["login_methods"] == ["local_password"]
     assert 'id="local-login"' in page.text
-    assert '/static/auth.js?v=20260809c' in page.text
+    assert '/static/auth.js?v=20260811b' in page.text
     assert page.headers["cache-control"] == "no-store, no-cache, private, max-age=0"
     assert login_csrf
     assert client.get("/auth/email/register").status_code == 404
@@ -5307,6 +5314,23 @@ def test_local_password_login_is_explicit_same_origin_and_has_no_signup_surface(
     assert session["authenticated"] is True
     assert session["user_id"] == principal["user_id"]
     assert session["auth_method"] == "local_password"
+    bootstrap = client.get("/api/bootstrap").json()
+    assert bootstrap["identity"]["auth_method"] == "local_password"
+    assert bootstrap["identity"]["provider_switch_visible"] is False
+
+
+def test_login_dom_uses_visible_methods_without_stale_provider_copy():
+    page = (Path(server_module.STATIC_DIR) / "login.html").read_text(encoding="utf-8")
+    script = (Path(server_module.STATIC_DIR) / "auth.js").read_text(encoding="utf-8")
+    app_script = (Path(server_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="auth-footnote"' in page
+    assert "config.login_methods" in script
+    assert "loginMethods.has('oidc')" in script
+    assert "loginMethods.has('local_password')" in script
+    assert "authDivider.hidden = !(oidcVisible && localVisible)" in script
+    assert "identity.provider_switch_visible" in app_script
+    assert "switchAccount.hidden" in app_script
 
 
 class _FakeOidcHumanAuth:
