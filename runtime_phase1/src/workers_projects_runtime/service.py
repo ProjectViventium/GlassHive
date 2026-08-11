@@ -4298,10 +4298,16 @@ class WorkersProjectsService:
         if not hasattr(self.runtime, "desktop_action"):
             raise RuntimeErrorBase("Desktop actions are not supported by the configured runtime")
         active_run = self.store.get_active_run(worker_id)
+        effective_run_id = str(run_id or (active_run or {}).get("run_id") or "").strip() or None
         if worker.get("state") != "running":
             self.store.update_worker_state(worker_id, "starting", last_error="")
         try:
-            launched = self.runtime.desktop_action(worker, action, url=url, run_id=run_id)
+            launched = self.runtime.desktop_action(
+                worker,
+                action,
+                url=url,
+                run_id=effective_run_id,
+            )
         except TypeError as exc:
             if "run_id" not in str(exc):
                 raise
