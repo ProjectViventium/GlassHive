@@ -388,6 +388,7 @@ class LaunchRequest(BaseModel):
     effort: str | None = None
     provider_account_policy: Literal["legacy", "personal_preferred", "personal_required"] | None = None
     provider_account_id: str | None = Field(default=None, max_length=128)
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
     files: list[UploadedFileRequest] = Field(default_factory=list)
 
 
@@ -685,6 +686,7 @@ def flatten_workspaces(
         watch_url = f"/watch/{worker_id}?project_id={project_id}&surface=desktop"
         project_url = f"/ui/projects/{project_id}?worker_id={worker_id}"
         desktop_url = f"/desktop/{worker_id}"
+        desktop_preview_url = f"/desktop/{worker_id}?preview=1"
         api_url = f"/api/worker/{worker_id}"
         signed_watch_url = _append_signed_worker_token(watch_url, worker_id, identity)
         items.append(
@@ -705,6 +707,11 @@ def flatten_workspaces(
                 "workspace_url": signed_watch_url,
                 "project_url": _append_signed_worker_token(project_url, worker_id, identity),
                 "desktop_url": _append_signed_worker_token(desktop_url, worker_id, identity),
+                "desktop_preview_url": _append_signed_worker_token(
+                    desktop_preview_url,
+                    worker_id,
+                    identity,
+                ),
                 "api_url": _append_signed_worker_token(api_url, worker_id, identity),
                 # Browser controls run inside the authenticated GlassHive shell. Keep the
                 # navigation URLs opaque while child control paths remain same-origin.
@@ -2230,9 +2237,14 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         safe["runtime_details"]["view_available"] = view_available
         return safe
 
-    def _worker_live_or_http(active_client: RuntimeClient, worker_id: str) -> dict[str, Any]:
+    def _worker_live_or_http(
+        active_client: RuntimeClient,
+        worker_id: str,
+        *,
+        compact: bool = False,
+    ) -> dict[str, Any]:
         try:
-            return active_client.worker_live(worker_id)
+            return active_client.worker_live(worker_id, compact=compact)
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code if exc.response is not None else 502
             raise HTTPException(status_code=status_code, detail="GlassHive worker is not available") from exc
@@ -2802,10 +2814,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 "callback_uri": (
                     f"http://localhost:{claude_callback_port_number}/callback"
                 ),
-                "login_note": (
-                    "Run /mcp in Claude Code and complete sign-in. The deployment administrator "
-                    "must pre-register this fixed callback port for the configured public client."
-                ),
+                "login_note": "Run /mcp in Claude Code and complete sign-in.",
             }
         codex_callback_port_number = (
             int(codex_callback_port) if codex_callback_port.isdigit() else 0
@@ -2855,17 +2864,35 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         documentation_url = str(
             os.environ.get("GLASSHIVE_MCP_DOCUMENTATION_URL") or ""
         ).strip()
+        guided_steps: list[str] = []
+        codex_client = clients.get("codex")
+        if isinstance(codex_client, dict):
+            guided_steps.extend(
+                [
+                    "For Codex, run these exact commands:",
+                    str(codex_client["add_command"]),
+                    str(codex_client["login_command"]),
+                ]
+            )
+        claude_client = clients.get("claude")
+        if isinstance(claude_client, dict):
+            guided_steps.extend(
+                [
+                    "For Claude Code, run this exact command:",
+                    str(claude_client["add_command"]),
+                    str(claude_client.get("login_note") or "Open /mcp and finish sign-in."),
+                ]
+            )
+        guided_steps.append(
+            "Complete the sign-in I approve, then list the GlassHive tools and confirm my workspace list is available."
+        )
         return {
             "mcp_url": mcp_url,
             "server_name": server_name,
+            "supported_clients": sorted(clients),
             "guided_prompt": (
-                "Connect this AI app to my self-hosted GlassHive using Streamable HTTP. "
-                f"Use server name {server_name} and server URL {mcp_url}. "
-                "If you can safely update this app's local MCP settings, add the server, start "
-                "its OAuth sign-in, keep the local callback listener running, and open the sign-in "
-                "page for me. Otherwise, show me the exact in-app setting where I should paste the "
-                "server URL. Never open a loopback callback address by itself. After sign-in, list "
-                "the GlassHive tools and confirm that my workspace list is available."
+                "Connect this AI app to my self-hosted GlassHive using the exact deployment setup below.\n\n"
+                + "\n".join(guided_steps)
             ),
             "clients": clients,
             "configuration_status": "ready" if clients else "action_required",
@@ -2903,6 +2930,27 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             cursor=cursor,
             limit=limit,
         )
+
+    @app.get("/api/workspaces/{worker_id}")
+    def get_saved_workspace(request: Request, worker_id: str) -> dict[str, Any]:
+        try:
+            worker = _client_for_request(request, worker_id).get_worker(worker_id)
+            return {
+                "worker_id": str(worker.get("worker_id") or worker_id),
+                "duplication_report": (
+                    worker.get("duplication_report")
+                    if isinstance(worker.get("duplication_report"), dict)
+                    else {}
+                ),
+            }
+        except httpx.HTTPStatusError as exc:
+            status_code = 404 if exc.response is not None and exc.response.status_code == 404 else 502
+            raise HTTPException(
+                status_code=status_code,
+                detail=("Workspace not found" if status_code == 404 else "GlassHive could not load this workspace"),
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="GlassHive could not load this workspace") from exc
 
     @app.post("/api/workspaces/{worker_id}/duplicate", status_code=201)
     def duplicate_saved_workspace(
@@ -3253,6 +3301,9 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                     or "Selected personal worker account"
                 )
             effective_scopes = []
+        elif str(pending.get("change_type") or "") == "workspace_duplication_reapproval_waiver":
+            capability_label = str(payload.get("label") or "Copied capability")
+            effective_scopes = []
         elif payload.get("library_id"):
             snapshot = dict(payload.get("library_snapshot") or {})
             capability_label = str(snapshot.get("display_label") or snapshot.get("stable_id") or capability_label)
@@ -3354,6 +3405,8 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         worker_id: str | None = None
         profile: str
         created_new_worker = False
+        duplication_reapproval_count = 0
+        duplication_reapproval_items: list[dict[str, Any]] = []
         new_workspace = not workspace_option.startswith(("open:", "existing:", "duplicate:"))
         requested_account_selection = bool(
             payload.provider_account_policy or str(payload.provider_account_id or "").strip()
@@ -3384,6 +3437,12 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 requested_account_id=payload.provider_account_id,
             )
 
+        if workspace_option.startswith("duplicate:") and not payload.idempotency_key:
+            raise HTTPException(
+                status_code=422,
+                detail="A reusable idempotency key is required to copy a workspace",
+            )
+
         try:
             if workspace_option.startswith("open:") or workspace_option.startswith("existing:"):
                 worker_id = workspace_option.split(":", 1)[1]
@@ -3394,10 +3453,31 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 source_worker_id = workspace_option.split(":", 1)[1]
                 source_worker = active_client.get_worker(source_worker_id)
                 profile = str(source_worker.get("profile") or "codex-cli")
-                project = active_client.create_project(owner_id, build_project_title(payload.description), payload.description.strip(), profile)
-                project_id = str(project["project_id"])
-                worker = active_client.duplicate_worker(project_id, source_worker_id, owner_id)
-                worker_id = str(worker["worker_id"])
+                duplicated = active_client.duplicate_workspace(
+                    source_worker_id,
+                    idempotency_key=payload.idempotency_key,
+                )
+                project = duplicated.get("project") or {}
+                worker = duplicated.get("workspace") or {}
+                project_id = str(project.get("project_id") or worker.get("project_id") or "")
+                worker_id = str(worker.get("worker_id") or "")
+                if not project_id or not worker_id:
+                    raise RuntimeError("GlassHive returned an incomplete workspace copy")
+                duplication_report = worker.get("duplication_report") or {}
+                duplication_reapproval_count = int(
+                    duplication_report.get(
+                        "capabilities_requiring_reapproval",
+                        0,
+                    )
+                    or 0
+                )
+                raw_reapproval_items = duplication_report.get("reapproval_items") or []
+                if isinstance(raw_reapproval_items, list):
+                    duplication_reapproval_items = [
+                        dict(item)
+                        for item in raw_reapproval_items
+                        if isinstance(item, dict)
+                    ]
                 created_new_worker = True
             else:
                 profile = workspace_option.split(":", 1)[1] if ":" in workspace_option else _default_worker_profile()
@@ -3429,7 +3509,11 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 created_new_worker = True
             scheduled = None
             run = None
-            if schedule_text:
+            if duplication_reapproval_count:
+                # Capability grants belong to one immutable workspace. The canonical
+                # duplicate stays paused until the user reviews equivalent grants.
+                pass
+            elif schedule_text:
                 scheduled = active_client.schedule_run(str(worker_id), brief, schedule_text=schedule_text)
             else:
                 run = active_client.assign_run(str(worker_id), brief)
@@ -3478,15 +3562,23 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             "run_id": (run or {}).get("run_id"),
             "schedule_id": (scheduled or {}).get("schedule_id"),
             "scheduled_for": (scheduled or {}).get("run_at"),
-            "status": "scheduled" if scheduled else "dispatched",
+            "status": (
+                "action_required"
+                if duplication_reapproval_count
+                else "scheduled"
+                if scheduled
+                else "dispatched"
+            ),
+            "capabilities_requiring_reapproval": duplication_reapproval_count,
+            "reapproval_items": duplication_reapproval_items,
             "watch_url": launch_watch_url,
         }
 
     @app.get("/api/workspace/{worker_id}/live")
     @app.get("/api/worker/{worker_id}/live")
-    def worker_live(request: Request, worker_id: str) -> JSONResponse:
+    def worker_live(request: Request, worker_id: str, compact: bool = False) -> JSONResponse:
         active_client = _client_for_request(request, worker_id, internal_details=True)
-        payload = _worker_live_or_http(active_client, worker_id)
+        payload = _worker_live_or_http(active_client, worker_id, compact=compact)
         worker = payload.get("worker") or {}
         project_id = str(worker.get("project_id") or "")
         payload["project_title"] = _project_title_for_worker(active_client, project_id) if project_id else ""

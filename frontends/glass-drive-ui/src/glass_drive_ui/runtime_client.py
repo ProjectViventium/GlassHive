@@ -229,8 +229,9 @@ class RuntimeClient:
     def get_worker(self, worker_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/workers/{worker_id}")
 
-    def worker_live(self, worker_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/v1/workers/{worker_id}/live")
+    def worker_live(self, worker_id: str, *, compact: bool = False) -> dict[str, Any]:
+        suffix = "?compact=1" if compact else ""
+        return self._request("GET", f"/v1/workers/{worker_id}/live{suffix}")
 
     def record_worker_view_open(self, worker_id: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/workers/{worker_id}/view-opened")

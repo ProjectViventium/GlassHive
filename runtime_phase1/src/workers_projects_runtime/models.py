@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal, cast
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .recurrence import canonical_recurrence_owner
 from .runtime_identity import derive_legacy_backend_label
@@ -67,7 +67,9 @@ def normalize_workspace_tags(values: list[str] | tuple[str, ...] | None) -> list
 
 
 class WorkspaceDuplicateReport(BaseModel):
-    source_state: Literal["copied", "empty", "filtered", "missing"]
+    model_config = ConfigDict(extra="allow")
+
+    source_state: Literal["pending", "copied", "empty", "filtered", "missing", "template"]
     copied_files: int = Field(ge=0)
     skipped_items: int = Field(ge=0)
 

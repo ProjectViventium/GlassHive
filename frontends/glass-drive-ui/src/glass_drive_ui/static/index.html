@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>GlassHive</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260811b" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260811h" />
   </head>
   <body class="launch-body">
     <main class="launch-shell">
@@ -28,6 +28,7 @@
             <button id="local-sign-out" class="account-action" type="button">Sign out here</button>
           </div>
         </div>
+        <aside id="capability-review-banner" class="capability-review-banner" aria-live="polite" hidden></aside>
         <section id="project-view" class="project-view" role="tabpanel" aria-labelledby="project-tab">
           <div class="composer-copy">
             <h1>Define the project once. Watch the worker deliver.</h1>
@@ -215,7 +216,7 @@
             <section class="control-card connections-primary-card">
               <div class="control-card-head">
                 <div>
-                  <h2>AI accounts</h2>
+                  <h2>Worker accounts</h2>
                 </div>
               </div>
               <div id="provider-account-list" class="connection-list" aria-live="polite"></div>
@@ -278,7 +279,7 @@
             <details id="connect-ai-advanced" class="connection-disclosure connect-ai-card">
               <summary>Use GlassHive from another AI app</summary>
               <div class="advanced-connection-content">
-                <p>Control your workers from Codex, ChatGPT, or Claude Code.</p>
+                <p id="connect-ai-supported-summary">Control your workspaces from a supported AI app.</p>
                 <div class="connect-ai-modes" role="tablist" aria-label="Connection setup method">
                   <button id="connect-ai-auto-tab" class="connect-ai-mode" type="button" role="tab" aria-selected="true" aria-controls="connect-ai-auto-panel">Automatic</button>
                   <button id="connect-ai-manual-tab" class="connect-ai-mode" type="button" role="tab" aria-selected="false" aria-controls="connect-ai-manual-panel">Manual</button>
@@ -286,7 +287,7 @@
                 <section id="connect-ai-auto-panel" class="connect-ai-panel" role="tabpanel" aria-labelledby="connect-ai-auto-tab">
                   <span class="section-kicker">Recommended</span>
                   <h3>Ask your AI to connect</h3>
-                  <p>Copy this once and paste it into the Codex or Claude conversation you already use.</p>
+                  <p id="connect-ai-auto-copy">Copy this once and paste it into a supported AI app.</p>
                   <div class="command-row connect-ai-prompt-row">
                     <div class="command-copy"><code id="connect-ai-auto-prompt"></code></div>
                     <button id="copy-connect-ai-prompt" class="quiet-button" type="button">Copy setup prompt</button>
@@ -336,8 +337,9 @@
                 What should GlassHive add?
                 <textarea id="library-request-text" rows="3" maxlength="10000" placeholder="Add the skill from https://… and verify it works in this workspace." required></textarea>
               </label>
+              <p class="card-note">This sends a workspace-only request to the worker you chose. It does not install anything globally or approve new access.</p>
               <div class="library-request-actions">
-                <button class="primary-button compact-button" type="submit">Ask workspace to set it up</button>
+                <button class="primary-button compact-button" type="submit">Ask this workspace</button>
                 <span id="library-request-status" class="inline-status" aria-live="polite"></span>
               </div>
             </form>
@@ -365,13 +367,13 @@
               <form id="recurring-schedule-form" class="schedule-form">
                 <label>
                   <span>Workspace</span>
-                  <select id="recurring-schedule-workspace" required>
+                  <select id="recurring-schedule-workspace">
                     <option value="">Choose a saved workspace</option>
                   </select>
                 </label>
                 <label>
                   <span>What should this workspace do?</span>
-                  <textarea id="recurring-schedule-instruction" rows="4" maxlength="10000" placeholder="Create the weekly project update and save it in the workspace." required></textarea>
+                  <textarea id="recurring-schedule-instruction" rows="4" maxlength="10000" placeholder="Create the weekly project update and save it in the workspace."></textarea>
                 </label>
                 <div class="schedule-field-grid">
                   <label>
@@ -379,13 +381,16 @@
                     <select id="recurring-schedule-type">
                       <option value="once">One time</option>
                       <option value="daily">Every day</option>
-                      <option value="interval">Every few hours or days</option>
-                      <option value="cron">Cron expression</option>
-                      <option value="rfc5545">RFC 5545 rule</option>
+                      <option value="weekly">Every week</option>
+                      <optgroup label="Advanced">
+                        <option value="interval">Custom interval</option>
+                        <option value="cron">Custom · cron</option>
+                        <option value="rfc5545">Custom · calendar rule</option>
+                      </optgroup>
                     </select>
                   </label>
                   <label id="recurring-schedule-once-field">
-                    <span>Starts at (required for one time)</span>
+                    <span id="recurring-schedule-start-label">Starts at</span>
                     <input id="recurring-schedule-starts-at" type="datetime-local" />
                   </label>
                   <label id="recurring-schedule-daily-field">
@@ -399,6 +404,7 @@
                       <select id="recurring-schedule-interval-unit" aria-label="Repeat interval unit">
                         <option value="hours">hours</option>
                         <option value="days">days</option>
+                        <option value="weeks">weeks</option>
                       </select>
                     </span>
                   </label>
@@ -407,11 +413,11 @@
                     <input id="recurring-schedule-timezone" type="text" value="UTC" autocomplete="off" placeholder="America/Toronto" />
                   </label>
                   <label id="recurring-schedule-cron-field" hidden>
-                    <span>Cron</span>
+                    <span>Custom cron schedule</span>
                     <input id="recurring-schedule-cron" type="text" autocomplete="off" placeholder="0 9 * * 1-5" />
                   </label>
                   <label id="recurring-schedule-rrule-field" hidden>
-                    <span>RFC 5545 RRULE</span>
+                    <span>Custom calendar rule</span>
                     <input id="recurring-schedule-rrule" type="text" autocomplete="off" placeholder="FREQ=WEEKLY;BYDAY=MO;BYHOUR=9" />
                   </label>
                 </div>
@@ -539,6 +545,6 @@
         </div>
       </form>
     </dialog>
-    <script src="/static/app.js?v=20260811b" type="module"></script>
+    <script src="/static/app.js?v=20260811h" type="module"></script>
   </body>
 </html>

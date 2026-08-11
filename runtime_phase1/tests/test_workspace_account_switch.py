@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 
 from fastapi.testclient import TestClient
@@ -92,6 +93,243 @@ def test_workspace_account_switch_is_confirmed_owner_scoped_and_future_only(tmp_
         "account_id": account["account_id"],
     }
     assert "bootstrap_bundle_json" not in selected
+
+
+def test_workspace_duplicate_reports_personal_account_reapproval_without_copying_selection(tmp_path):
+    database = tmp_path / "runtime.db"
+    client = TestClient(create_app(db_path=str(database), runtime_backend="stub"))
+    workspace = _workspace(client)
+    store = ControlPlaneStore(str(database))
+    account = _ready_account(store)
+    pending = client.post(
+        "/v1/pending-changes",
+        json={
+            "change_type": "workspace_provider_account",
+            "target_id": workspace["worker_id"],
+            "payload": {
+                "policy": "personal_required",
+                "account_id": account["account_id"],
+            },
+        },
+    ).json()
+    assert client.post(
+        f"/v1/pending-changes/{pending['change_id']}/confirm",
+        json={"confirmation_token": pending["confirmation_token"]},
+    ).status_code == 200
+
+    copied = client.post(
+        f"/v1/workspaces/{workspace['worker_id']}/duplicate",
+        json={"idempotency_key": "duplicate-personal-account-1"},
+    )
+
+    assert copied.status_code == 201
+    report = copied.json()["workspace"]["duplication_report"]
+    assert report["capabilities_requiring_reapproval"] == 1
+    assert report["reapproval_items"] == [{
+        "action_id": "rea_" + hashlib.sha256(
+            f"provider_selection\0{account['account_id']}".encode()
+        ).hexdigest()[:24],
+        "kind": "provider_account",
+        "resolution": "provider_selection",
+        "reference": account["account_id"],
+        "label": "Synthetic private account",
+        "route": "connections",
+        "policy": "personal_required",
+        "scopes": [],
+    }]
+    assert "provider_account" not in copied.json()["workspace"]
+    copied_worker_id = copied.json()["workspace"]["worker_id"]
+    assert client.post(
+        f"/v1/workers/{copied_worker_id}/message",
+        json={"message": "Run before account review"},
+    ).status_code == 409
+    bypass = client.post(
+        "/v1/pending-changes",
+        json={
+            "change_type": "workspace_duplication_reapproval_waiver",
+            "target_id": copied_worker_id,
+            "payload": {"action_id": report["reapproval_items"][0]["action_id"]},
+        },
+    )
+    assert bypass.status_code == 409
+    assert "choose" in bypass.json()["detail"].lower()
+    copied_pending = client.post(
+        "/v1/pending-changes",
+        json={
+            "change_type": "workspace_provider_account",
+            "target_id": copied_worker_id,
+            "payload": {
+                "policy": "personal_required",
+                "account_id": account["account_id"],
+            },
+        },
+    ).json()
+    assert client.post(
+        f"/v1/pending-changes/{copied_pending['change_id']}/confirm",
+        json={"confirmation_token": copied_pending["confirmation_token"]},
+    ).status_code == 200
+    assert client.post(
+        f"/v1/workers/{copied_worker_id}/message",
+        json={"message": "Run after account review"},
+    ).status_code == 202
+
+
+def test_duplicate_handles_a_forgotten_selected_account_without_an_impossible_review(tmp_path):
+    database = tmp_path / "runtime.db"
+    client = TestClient(create_app(db_path=str(database), runtime_backend="stub"))
+    store = ControlPlaneStore(str(database))
+
+    def selected_workspace(policy: str, *, forget: bool) -> dict:
+        workspace = _workspace(client)
+        account = _ready_account(store)
+        pending = client.post(
+            "/v1/pending-changes",
+            json={
+                "change_type": "workspace_provider_account",
+                "target_id": workspace["worker_id"],
+                "payload": {"policy": policy, "account_id": account["account_id"]},
+            },
+        ).json()
+        assert client.post(
+            f"/v1/pending-changes/{pending['change_id']}/confirm",
+            json={"confirmation_token": pending["confirmation_token"]},
+        ).status_code == 200
+        store.update_provider_account_status(
+            account_id=account["account_id"],
+            tenant_id="local",
+            owner_id="demo-owner",
+            status="disconnected",
+        )
+        if forget:
+            store.forget_provider_account(
+                account_id=account["account_id"], tenant_id="local", owner_id="demo-owner"
+            )
+        return workspace
+
+    disconnected_preferred = selected_workspace("personal_preferred", forget=False)
+    disconnected_preferred_copy = client.post(
+        f"/v1/workspaces/{disconnected_preferred['worker_id']}/duplicate",
+        json={"idempotency_key": "disconnected-preferred-account"},
+    )
+    assert disconnected_preferred_copy.status_code == 201
+    assert disconnected_preferred_copy.json()["workspace"]["duplication_report"][
+        "capabilities_requiring_reapproval"
+    ] == 0
+
+    disconnected_required = selected_workspace("personal_required", forget=False)
+    disconnected_required_copy = client.post(
+        f"/v1/workspaces/{disconnected_required['worker_id']}/duplicate",
+        json={"idempotency_key": "disconnected-required-account"},
+    )
+    assert disconnected_required_copy.status_code == 409
+
+    preferred = selected_workspace("personal_preferred", forget=True)
+    preferred_copy = client.post(
+        f"/v1/workspaces/{preferred['worker_id']}/duplicate",
+        json={"idempotency_key": "forgotten-preferred-account"},
+    )
+    assert preferred_copy.status_code == 201
+    copied = preferred_copy.json()["workspace"]
+    assert copied["duplication_report"]["capabilities_requiring_reapproval"] == 0
+    assert client.post(
+        f"/v1/workers/{copied['worker_id']}/message",
+        json={"message": "Use the valid deployment fallback"},
+    ).status_code == 202
+
+    required = selected_workspace("personal_required", forget=True)
+    required_copy = client.post(
+        f"/v1/workspaces/{required['worker_id']}/duplicate",
+        json={"idempotency_key": "forgotten-required-account"},
+    )
+    assert required_copy.status_code == 409
+    assert required_copy.json()["detail"] == (
+        "This workspace requires a personal AI account that is not ready. "
+        "Reconnect it or choose a current account before duplicating it."
+    )
+
+
+def test_duplicate_keeps_provider_grant_and_provider_selection_as_distinct_review_actions(tmp_path):
+    database = tmp_path / "runtime.db"
+    client = TestClient(create_app(db_path=str(database), runtime_backend="stub"))
+    workspace = _workspace(client)
+    store = ControlPlaneStore(str(database))
+    account = _ready_account(store)
+    selection = client.post(
+        "/v1/pending-changes",
+        json={
+            "change_type": "workspace_provider_account",
+            "target_id": workspace["worker_id"],
+            "payload": {
+                "policy": "personal_required",
+                "account_id": account["account_id"],
+            },
+        },
+    ).json()
+    assert client.post(
+        f"/v1/pending-changes/{selection['change_id']}/confirm",
+        json={"confirmation_token": selection["confirmation_token"]},
+    ).status_code == 200
+    with sqlite3.connect(database) as conn:
+        conn.execute(
+            """
+            INSERT INTO workspace_capability_grants
+                (grant_id, tenant_id, owner_id, worker_id, library_id, connection_id,
+                 account_id, scopes_json, prior_bootstrap_bundle_json,
+                 applied_bootstrap_bundle_json, installation_plan_json, probe_json,
+                 created_at, revoked_at)
+            VALUES ('grant_provider_reference', 'local', 'demo-owner', ?, NULL, NULL, ?,
+                    '[]', '{}', '{}', '[]', '{}', 1, NULL)
+            """,
+            (workspace["worker_id"], account["account_id"]),
+        )
+
+    copied = client.post(
+        f"/v1/workspaces/{workspace['worker_id']}/duplicate",
+        json={"idempotency_key": "duplicate-provider-actions-1"},
+    )
+
+    assert copied.status_code == 201
+    copied_worker_id = copied.json()["workspace"]["worker_id"]
+    items = copied.json()["workspace"]["duplication_report"]["reapproval_items"]
+    assert {item["resolution"] for item in items} == {"provider_grant", "provider_selection"}
+    assert len({item["action_id"] for item in items}) == 2
+    assert {item["reference"] for item in items} == {account["account_id"]}
+    copied_selection = client.post(
+        "/v1/pending-changes",
+        json={
+            "change_type": "workspace_provider_account",
+            "target_id": copied_worker_id,
+            "payload": {
+                "policy": "personal_required",
+                "account_id": account["account_id"],
+            },
+        },
+    ).json()
+    assert client.post(
+        f"/v1/pending-changes/{copied_selection['change_id']}/confirm",
+        json={"confirmation_token": copied_selection["confirmation_token"]},
+    ).status_code == 200
+    assert client.post(
+        f"/v1/workers/{copied_worker_id}/message",
+        json={"message": "The distinct provider grant still needs a decision"},
+    ).status_code == 409
+    provider_grant = next(item for item in items if item["resolution"] == "provider_grant")
+    skip = client.post(
+        "/v1/pending-changes",
+        json={
+            "change_type": "workspace_duplication_reapproval_waiver",
+            "target_id": copied_worker_id,
+            "payload": {"action_id": provider_grant["action_id"]},
+        },
+    ).json()
+    assert client.post(
+        f"/v1/pending-changes/{skip['change_id']}/confirm",
+        json={"confirmation_token": skip["confirmation_token"]},
+    ).status_code == 200
+    assert client.post(
+        f"/v1/workers/{copied_worker_id}/message",
+        json={"message": "Both exact review actions were resolved"},
+    ).status_code == 202
 
 
 def test_workspace_account_switch_revalidates_profile_status_and_active_lease(tmp_path):

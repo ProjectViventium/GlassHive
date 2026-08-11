@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 
 import pytest
@@ -166,9 +167,57 @@ def test_template_snapshot_is_immutable_sanitized_and_source_independent(tmp_pat
         library["stable_id"],
         dependency["stable_id"],
     }
+    worker_id = instantiated.json()["workspace"]["worker_id"]
+    report = instantiated.json()["workspace"]["duplication_report"]
+    assert report["source_state"] == "template"
+    reloaded = client.get(f"/v1/workers/{worker_id}")
+    assert reloaded.status_code == 200, reloaded.text
+    assert reloaded.json()["duplication_report"]["source_state"] == "template"
+    live = client.get(f"/v1/workers/{worker_id}/live")
+    assert live.status_code == 200, live.text
+    assert live.json()["worker"]["duplication_report"]["source_state"] == "template"
+    assert report["reapproval_items"] == [{
+        "action_id": "rea_" + hashlib.sha256(
+            f"library_grant\0{library['library_id']}".encode()
+        ).hexdigest()[:24],
+        "kind": "library",
+        "resolution": "library_grant",
+        "reference": library["library_id"],
+        "label": library["stable_id"],
+        "route": "library",
+        "scopes": ["documents:read"],
+    }]
+    assert report["outstanding_reapproval_items"] == report["reapproval_items"]
     assert client.get(
-        f"/v1/workspaces/{instantiated.json()['workspace']['worker_id']}/capability-grants"
+        f"/v1/workspaces/{worker_id}/capability-grants"
     ).json()["items"] == []
+    assert client.post(
+        f"/v1/workers/{worker_id}/message",
+        json={"message": "Do not run before template capability review"},
+    ).status_code == 409
+    prepared = client.post(
+        "/v1/pending-changes",
+        json={
+            "change_type": "library_enable",
+            "target_id": worker_id,
+            "payload": {"library_id": library["library_id"], "scopes": ["documents:read"]},
+        },
+    ).json()
+    assert client.post(
+        f"/v1/pending-changes/{prepared['change_id']}/confirm",
+        json={"confirmation_token": prepared["confirmation_token"]},
+    ).status_code == 200
+    after_review = client.post(
+        f"/v1/workspace-templates/{template['template_id']}/instantiate",
+        json={"idempotency_key": "template-public-safe-1", "name": "Fresh briefing desk"},
+    )
+    assert after_review.status_code == 201
+    assert after_review.json()["idempotent_replay"] is True
+    assert after_review.json()["workspace"]["duplication_report"]["outstanding_reapproval_items"] == []
+    assert client.post(
+        f"/v1/workers/{worker_id}/message",
+        json={"message": "Run after template capability review"},
+    ).status_code == 202
     conflict = client.post(
         f"/v1/workspace-templates/{template['template_id']}/instantiate",
         json={"idempotency_key": "template-public-safe-1", "name": "Different request"},

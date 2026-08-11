@@ -1,7 +1,7 @@
-import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260811b';
-import { credentialPolicyTransition, preferredProviderAccountId } from './launch-policy.js?v=20260811b';
-import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811b';
-import { compareWorkspacePriority, previewWorkerIds } from './workspace-overview.js?v=20260811b';
+import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260811h';
+import { credentialPolicyTransition, preferredProviderAccountId } from './launch-policy.js?v=20260811h';
+import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811h';
+import { compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery } from './workspace-overview.js?v=20260811h';
 
 const ACTIVE_STATES = new Set(['created', 'starting', 'queued', 'running', 'resuming']);
 const ACTIVE_RUN_STATES = new Set(['queued', 'running']);
@@ -12,7 +12,8 @@ const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'terminating', '
 const MAX_VIEW_ONLY_PREVIEWS = 3;
 const ACTIVE_TILE_REFRESH_MS = 7000;
 const RETAINED_TILE_REFRESH_MS = 60000;
-const GLASSHIVE_UI_REV = '20260811b';
+const GLASSHIVE_UI_REV = '20260811h';
+const CAPABILITY_REVIEW_KEY = 'glasshive.capability-review';
 let workspaceRefreshInFlight = false;
 let csrfToken = '';
 let renameWorkspaceContext = null;
@@ -20,6 +21,23 @@ let saveTemplateContext = null;
 let workspaceVisibilityObserver = null;
 const pageParams = new URLSearchParams(window.location.search);
 const signedToken = pageParams.get('gh_token') || '';
+
+function rememberCapabilityReview(workerId, count, items = []) {
+  const normalizedItems = Array.isArray(items)
+    ? items.filter((item) => (
+      item
+      && typeof item === 'object'
+      && String(item.action_id || '')
+      && String(item.resolution || '')
+    )).map((item) => ({ ...item }))
+    : [];
+  sessionStorage.setItem(CAPABILITY_REVIEW_KEY, JSON.stringify({
+    worker_id: String(workerId || ''),
+    count: Math.max(Number(count || 0), normalizedItems.length),
+    items: normalizedItems,
+  }));
+  return normalizedItems.some((item) => item.route === 'connections') ? 'connections' : 'library';
+}
 
 const defaultHivePrefs = {
   showInactive: true,
@@ -71,6 +89,19 @@ async function responseMessage(response, fallback) {
   }
 }
 
+async function responseError(response, fallback) {
+  let code = '';
+  try {
+    const body = await response.clone().json();
+    code = String(body?.detail?.code || '');
+  } catch (_error) {
+    code = '';
+  }
+  const error = new Error(await responseMessage(response, fallback));
+  error.code = code;
+  return error;
+}
+
 async function getJson(url, fallback = 'Request failed') {
   const response = await fetch(withAuth(url), { cache: 'no-store' });
   if (!response.ok) throw new Error(await responseMessage(response, fallback));
@@ -112,7 +143,7 @@ async function postJson(url, payload) {
     },
     body: payload ? JSON.stringify(payload) : undefined,
   });
-  if (!response.ok) throw new Error(await responseMessage(response, 'Request failed'));
+  if (!response.ok) throw await responseError(response, 'Request failed');
   return response.json();
 }
 
@@ -153,6 +184,7 @@ function renderCurrentUser(identity = {}) {
 
 async function signOut(scope) {
   const response = await postJson('/auth/logout', { scope });
+  sessionStorage.removeItem(CAPABILITY_REVIEW_KEY);
   window.location.assign(String(response.redirect_url || '/login'));
 }
 
@@ -444,8 +476,9 @@ function workerDesktopUrl(workerId, signedUrl = '') {
   return withUiRev(signedUrl || withAuth(`/desktop/${encodeURIComponent(String(workerId || ''))}`));
 }
 
-function workerPreviewUrl(workerId, signedUrl = '') {
-  const url = workerDesktopUrl(workerId, signedUrl);
+function workerPreviewUrl(workerId, signedPreviewUrl = '', signedDesktopUrl = '') {
+  if (signedPreviewUrl) return workerDesktopUrl(workerId, signedPreviewUrl);
+  const url = workerDesktopUrl(workerId, signedDesktopUrl);
   return `${url}${url.includes('?') ? '&' : '?'}preview=1`;
 }
 
@@ -510,8 +543,13 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
   const pane = glass.querySelector('[data-worker-glass]');
   if (!pane) return;
   const tile = glass.closest('.workspace-tile');
+  const previewLink = glass.querySelector('.workspace-glass-open');
+  const allowPreviewOpen = (allowed) => {
+    if (previewLink) previewLink.hidden = !allowed;
+  };
   const watchVisible = tile?.dataset.watchVisible !== 'false';
   if (!watchVisible) {
+    allowPreviewOpen(false);
     pane.replaceChildren();
     return;
   }
@@ -535,9 +573,14 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
       frame.title = 'View-only live workspace preview';
       frame.tabIndex = -1;
       frame.setAttribute('aria-hidden', 'true');
-      frame.src = workerPreviewUrl(workerId, tile?.dataset.desktopUrl || '');
+      frame.src = workerPreviewUrl(
+        workerId,
+        tile?.dataset.desktopPreviewUrl || '',
+        tile?.dataset.desktopUrl || '',
+      );
       pane.replaceChildren(frame);
     }
+    allowPreviewOpen(true);
     return;
   }
   if (ACTIVE_STATES.has(normalized) || normalized === 'running' || normalized === 'queued') {
@@ -549,6 +592,7 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
       ? 'Workspace ready'
       : 'Live surface warming up';
     pane.replaceChildren(note);
+    allowPreviewOpen(true);
     return;
   }
 
@@ -557,6 +601,7 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
     note.className = 'workspace-glass-note';
     note.textContent = 'Needs attention · Send a corrected follow-up below';
     pane.replaceChildren(note);
+    allowPreviewOpen(true);
     return;
   }
 
@@ -565,6 +610,7 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
     note.className = 'workspace-glass-note';
     note.textContent = normalized === 'terminating' ? 'Workspace closing' : normalized === 'termination_failed' ? 'Close needs attention' : 'Workspace closed';
     pane.replaceChildren(note);
+    allowPreviewOpen(true);
     return;
   }
 
@@ -573,6 +619,7 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
     note.className = 'workspace-glass-note workspace-glass-complete';
     note.textContent = 'Delivery ready';
     pane.replaceChildren(note);
+    allowPreviewOpen(true);
     return;
   }
   const wakeButton = createButton('Resume workspace', 'workspace-glass-action');
@@ -580,6 +627,7 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
     await runWorkerAction(workerId, 'resume', wakeButton, refreshBootstrap);
   });
   pane.replaceChildren(wakeButton);
+  allowPreviewOpen(false);
 }
 
 function deliveryLink(label, url, { download = false } = {}) {
@@ -603,7 +651,11 @@ function renderWorkspaceDelivery(tile, data) {
   if (!panel || !action) return;
   panel.replaceChildren();
   panel.dataset.available = String(model.available);
-  action.textContent = model.available ? 'View delivery' : model.state === 'completed' ? 'View result' : 'View status';
+  const closedLabel = model.available ? 'View delivery' : model.state === 'completed' ? 'View result' : 'View status';
+  action.dataset.closedLabel = closedLabel;
+  action.textContent = panel.hidden
+    ? closedLabel
+    : closedLabel.replace(/^View\s+/, 'Hide ');
 
   const summary = document.createElement('p');
   summary.className = 'workspace-delivery-summary';
@@ -617,16 +669,6 @@ function renderWorkspaceDelivery(tile, data) {
     if (model.primary.openUrl) primaryActions.appendChild(deliveryLink('Open output', model.primary.openUrl));
     if (model.primary.downloadUrl) primaryActions.appendChild(deliveryLink('Download', model.primary.downloadUrl, { download: true }));
     panel.appendChild(primaryActions);
-  }
-
-  const image = model.artifacts.find((item) => item.contentType.startsWith('image/') && item.openUrl);
-  if (image) {
-    const preview = document.createElement('img');
-    preview.className = 'workspace-delivery-thumbnail';
-    preview.src = withAuth(image.openUrl);
-    preview.alt = `Latest image delivery: ${image.label}`;
-    preview.loading = 'lazy';
-    panel.appendChild(preview);
   }
 
   if (model.artifacts.length) {
@@ -687,11 +729,25 @@ async function refreshWorkspaceTile(workerId, refreshBootstrap) {
     let data = await response.json();
     const rawState = String(data?.worker?.state || '').trim().toLowerCase() || 'unknown';
     const runState = String(data?.latest_run?.state || '').trim().toLowerCase();
-    if (runState === 'completed' && tile.dataset.deliveryLoaded !== 'true') {
+    const runId = String(data?.latest_run?.run_id || data?.latest_run?.ended_at || '').trim();
+    if (runState && runState !== 'completed') {
+      delete tile.dataset.deliveryRunId;
+      tile.dataset.deliveryLoaded = 'false';
+    }
+    if (shouldHydrateWorkspaceDelivery({
+      runState,
+      runId,
+      hydratedRunId: tile.dataset.deliveryRunId || '',
+      legacyLoaded: tile.dataset.deliveryLoaded === 'true',
+    })) {
       const deliveryResponse = await fetch(withAuth(workerApiUrl(workerId, '/live')), { cache: 'no-store' });
       if (deliveryResponse.ok) {
         data = await deliveryResponse.json();
         tile.dataset.deliveryLoaded = 'true';
+        const hydratedRunId = String(
+          data?.latest_run?.run_id || data?.latest_run?.ended_at || runId || '',
+        ).trim();
+        if (hydratedRunId) tile.dataset.deliveryRunId = hydratedRunId;
       }
     }
     const state = displayStateForLive(data);
@@ -778,6 +834,7 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   tile.dataset.state = isActive ? 'active' : isResumable ? 'resumable' : 'inactive';
   tile.dataset.workerId = workerId;
   tile.dataset.desktopUrl = String(workspace.desktop_url || '');
+  tile.dataset.desktopPreviewUrl = String(workspace.desktop_preview_url || '');
   tile.dataset.apiUrl = String(workspace.control_url || workspace.api_url || '');
   tile.dataset.watchVisible = String(Boolean(viewPrefs.showWatch));
   tile.dataset.statusVisible = String(Boolean(viewPrefs.showStatus));
@@ -823,6 +880,17 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
     }
   }
   glass.appendChild(glassPane);
+  const workspaceUrl = String(workspace.workspace_url || workspace.watch_url || '');
+  if (workspaceUrl && !glassPane.querySelector('.workspace-glass-action')) {
+    const previewLink = document.createElement('a');
+    previewLink.className = 'workspace-glass-open';
+    previewLink.href = withAuth(workspaceUrl);
+    previewLink.tabIndex = -1;
+    previewLink.setAttribute('aria-hidden', 'true');
+    previewLink.setAttribute('aria-label', `Open ${workspaceTileTitle(workspace)} workspace`);
+    previewLink.title = 'Open workspace';
+    glass.appendChild(previewLink);
+  }
 
   const body = document.createElement('div');
   body.className = 'workspace-tile-body';
@@ -878,11 +946,20 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   report.className = 'workspace-status-report workspace-status-button';
   report.setAttribute('aria-expanded', 'false');
   report.setAttribute('aria-label', `Open latest workspace output for ${workspaceTileTitle(workspace)}`);
+  const deliveryPanelId = `workspace-delivery-${workerId.replace(/[^A-Za-z0-9_-]/g, '_')}`;
+  report.setAttribute('aria-controls', deliveryPanelId);
   report.addEventListener('click', () => {
     const panel = tile.querySelector('[data-worker-delivery]');
     if (!panel) return;
     panel.hidden = !panel.hidden;
     report.setAttribute('aria-expanded', String(!panel.hidden));
+    const action = report.querySelector('[data-worker-delivery-action]');
+    if (action) {
+      const closedLabel = action.dataset.closedLabel || 'View delivery';
+      action.textContent = panel.hidden
+        ? closedLabel
+        : closedLabel.replace(/^View\s+/, 'Hide ');
+    }
   });
   const reportHead = document.createElement('span');
   reportHead.className = 'workspace-report-head';
@@ -903,6 +980,7 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
 
   const deliveryPanel = document.createElement('section');
   deliveryPanel.className = 'workspace-delivery-panel';
+  deliveryPanel.id = deliveryPanelId;
   deliveryPanel.dataset.workerDelivery = 'true';
   deliveryPanel.hidden = true;
   const deliveryPlaceholder = document.createElement('p');
@@ -913,6 +991,14 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
 
   const actions = document.createElement('div');
   actions.className = 'workspace-tile-actions';
+
+  const more = document.createElement('details');
+  more.className = 'workspace-tile-more';
+  const moreSummary = document.createElement('summary');
+  moreSummary.textContent = 'More';
+  const moreActions = document.createElement('div');
+  moreActions.className = 'workspace-tile-more-actions';
+  more.append(moreSummary, moreActions);
 
   const favorite = createButton(workspace.favorite ? '★' : '☆', 'workspace-icon-button');
   favorite.dataset.workerFavorite = 'true';
@@ -935,11 +1021,11 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
 
   const duplicate = createButton('Duplicate');
   duplicate.addEventListener('click', () => duplicateSavedWorkspace(workspace, duplicate, refreshBootstrap));
-  actions.appendChild(duplicate);
+  moreActions.appendChild(duplicate);
 
   const saveTemplate = createButton('Save as template');
   saveTemplate.addEventListener('click', () => openSaveTemplate(workspace, refreshBootstrap));
-  actions.appendChild(saveTemplate);
+  moreActions.appendChild(saveTemplate);
 
   const accountSelect = document.createElement('select');
   accountSelect.className = 'workspace-account-select';
@@ -1000,19 +1086,19 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
       liveOutput.textContent = error.message;
     }
   });
-  actions.appendChild(accountSelect);
+  moreActions.appendChild(accountSelect);
 
   if (workspace.workspace_kind === 'ephemeral' || workspace.workspace_kind === 'legacy') {
     const keep = createButton('Keep as workspace');
     keep.addEventListener('click', async () => {
       await runWorkerMetadata(workerId, { workspace_kind: 'named' }, keep, refreshBootstrap);
     });
-    actions.appendChild(keep);
+    moreActions.appendChild(keep);
   }
 
   const rename = createButton('Rename');
   rename.addEventListener('click', () => openRenameWorkspace(workspace, refreshBootstrap));
-  actions.appendChild(rename);
+  moreActions.appendChild(rename);
 
   const toggle = createButton(state === 'completed' ? 'Continue' : workerActionForState(state) === 'resume' ? 'Resume' : 'Pause', 'workspace-run-toggle');
   toggle.dataset.workerActionToggle = 'true';
@@ -1031,7 +1117,8 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   interrupt.addEventListener('click', async () => {
     await runWorkerAction(workerId, 'interrupt', interrupt, refreshBootstrap);
   });
-  actions.appendChild(interrupt);
+  moreActions.appendChild(interrupt);
+  actions.appendChild(more);
 
   const steerForm = document.createElement('form');
   steerForm.className = 'workspace-steer';
@@ -1139,26 +1226,48 @@ async function duplicateSavedWorkspace(workspace, button, refreshBootstrap) {
   const workerId = String(workspace.worker_id || '');
   if (!workerId) return;
   const originalText = button.textContent;
+  let resetText = originalText;
   button.disabled = true;
   button.textContent = 'Duplicating…';
   button.dataset.idempotencyKey ||= globalThis.crypto?.randomUUID?.()
     || `duplicate-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   try {
-    await postJson(
+    const payload = await postJson(
       `/api/workspaces/${encodeURIComponent(workerId)}/duplicate`,
       { idempotency_key: button.dataset.idempotencyKey },
     );
     delete button.dataset.idempotencyKey;
-    button.textContent = 'Duplicated';
+    const copiedWorker = payload.worker || {};
+    const approvals = Number(copiedWorker.duplication_report?.capabilities_requiring_reapproval || 0);
+    button.textContent = 'Copied';
     await refreshBootstrap();
+    if (approvals > 0) {
+      const route = rememberCapabilityReview(
+        copiedWorker.worker_id,
+        approvals,
+        copiedWorker.duplication_report?.outstanding_reapproval_items
+          || copiedWorker.duplication_report?.reapproval_items
+          || [],
+      );
+      const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);
+      const output = tile?.querySelector('[data-worker-output]');
+      if (output) output.textContent = `Workspace copied. Review ${approvals} capabilit${approvals === 1 ? 'y' : 'ies'} before running it.`;
+      window.location.hash = route;
+    }
   } catch (error) {
     const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);
     const output = tile?.querySelector('[data-worker-output]');
-    if (output) output.textContent = `${error.message} Retry will use the same request key.`;
+    if (error.code === 'workspace_duplication_failed') {
+      delete button.dataset.idempotencyKey;
+      resetText = 'Start fresh copy';
+      if (output) output.textContent = error.message;
+    } else if (output) {
+      output.textContent = `${error.message} Retry will use the same request key.`;
+    }
   } finally {
     window.setTimeout(() => {
       button.disabled = false;
-      button.textContent = originalText;
+      button.textContent = resetText;
     }, 900);
   }
 }
@@ -1779,9 +1888,19 @@ async function main() {
       delete templateStartButton.dataset.idempotencyKey;
       if (templateInstanceName) templateInstanceName.value = '';
       await refreshBootstrap();
-      const approvals = Array.isArray(payload.approvals_required) ? payload.approvals_required.length : 0;
+      const reviewItems = payload.workspace?.duplication_report?.outstanding_reapproval_items
+        || payload.workspace?.duplication_report?.reapproval_items
+        || [];
+      const approvals = Array.isArray(reviewItems) ? reviewItems.length : 0;
+      if (approvals > 0) {
+        window.location.hash = rememberCapabilityReview(
+          payload.workspace?.worker_id,
+          approvals,
+          reviewItems,
+        );
+      }
       if (templateStartStatus) templateStartStatus.textContent = approvals
-        ? `Workspace created and paused. ${approvals} Library approval${approvals === 1 ? '' : 's'} must be reviewed before use. Turn on Inactive Workspaces to find it.`
+        ? `Workspace copied. Review ${approvals} capabilit${approvals === 1 ? 'y' : 'ies'} before running it.`
         : 'Workspace created and paused. Turn on Inactive Workspaces to find it.';
     } catch (error) {
       if (templateStartStatus) templateStartStatus.textContent = `${error.message} Retry will use the same request key.`;
@@ -1867,6 +1986,8 @@ async function main() {
       provider_account_id: select.value.startsWith('new:') && providerAccountPolicy?.value !== 'legacy'
         ? providerAccount?.value || null
         : null,
+      idempotency_key: button.dataset.launchIdempotencyKey ||= globalThis.crypto?.randomUUID?.()
+        || `launch-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       files,
     };
     try {
@@ -1879,9 +2000,20 @@ async function main() {
         body: JSON.stringify(payload),
       });
       if (!response.ok) {
-        throw new Error(await responseMessage(response, 'Launch failed'));
+        throw await responseError(response, 'Launch failed');
       }
       const data = await response.json();
+      delete button.dataset.launchIdempotencyKey;
+      if (data.status === 'action_required') {
+        const approvals = Number(data.capabilities_requiring_reapproval || 0);
+        const route = rememberCapabilityReview(data.worker_id, approvals, data.reapproval_items || []);
+        status.textContent = `Workspace copied. Review ${approvals} capabilit${approvals === 1 ? 'y' : 'ies'} before running it.`;
+        await refreshBootstrap();
+        window.location.hash = route;
+        button.disabled = false;
+        if (scheduleButton) scheduleButton.disabled = false;
+        return;
+      }
       if (data.status === 'scheduled') {
         status.textContent = `Scheduled for ${data.scheduled_for || scheduleValue}.`;
         await refreshBootstrap();
@@ -1894,6 +2026,10 @@ async function main() {
     } catch (error) {
       button.disabled = false;
       if (scheduleButton) scheduleButton.disabled = false;
+      if (error.code === 'workspace_duplication_failed' && select.value.startsWith('duplicate:')) {
+        delete button.dataset.launchIdempotencyKey;
+        button.textContent = 'Start fresh copy';
+      }
       status.textContent = error.message;
     }
   });

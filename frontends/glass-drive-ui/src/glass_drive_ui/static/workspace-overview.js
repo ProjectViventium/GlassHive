@@ -29,3 +29,15 @@ export function previewWorkerIds(items, limit = 3) {
     .map((item) => String(item.worker_id || ''))
     .filter(Boolean);
 }
+
+export function shouldHydrateWorkspaceDelivery({
+  runState = '',
+  runId = '',
+  hydratedRunId = '',
+  legacyLoaded = false,
+} = {}) {
+  if (String(runState).trim().toLowerCase() !== 'completed') return false;
+  const current = String(runId || '').trim();
+  if (current) return current !== String(hydratedRunId || '').trim();
+  return !legacyLoaded;
+}
