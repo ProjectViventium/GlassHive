@@ -8,7 +8,7 @@ import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Condition, Event, Lock, Thread
 from typing import Callable, Iterator
 
 from .control_plane import ControlPlaneConflict, ControlPlaneError, ControlPlaneStore
@@ -191,6 +191,8 @@ class MissionProviderAccountBinder:
     ) -> None:
         self.store = ControlPlaneStore(db_path) if db_path else None
         self.home_root = Path(home_root)
+        self._active_binding_condition = Condition()
+        self._active_bindings: dict[str, dict[str, object]] = {}
 
     def selected_account_record(
         self,
@@ -235,6 +237,243 @@ class MissionProviderAccountBinder:
             status=status,
             reconnect_reason=reconnect_reason,
         )
+
+    def _reserve_active_route(
+        self,
+        worker: dict,
+        *,
+        runtime_name: str,
+        run_id: str,
+        account_id: str,
+        route_kind: str,
+    ) -> object:
+        worker_id = str(worker.get("worker_id") or "").strip()
+        if not worker_id:
+            raise RuntimeErrorBase("Provider account routes require an exact worker")
+        token = object()
+        with self._active_binding_condition:
+            if worker_id in self._active_bindings:
+                raise RuntimeErrorBase(
+                    "This worker already has an active provider account route"
+                )
+            self._active_bindings[worker_id] = {
+                "token": token,
+                "worker": dict(worker),
+                "run_id": str(run_id),
+                "runtime_name": str(runtime_name),
+                "account_id": str(account_id),
+                "tenant_id": str(worker.get("tenant_id") or "local").strip()
+                or "local",
+                "owner_id": str(worker.get("owner_id") or "").strip(),
+                "route_kind": str(route_kind),
+                "lease_id": "",
+                "readers": 0,
+                "ready": False,
+                "closing": False,
+            }
+        return token
+
+    def _update_active_route(
+        self,
+        worker_id: str,
+        token: object,
+        *,
+        worker: dict | None = None,
+        lease_id: str | None = None,
+    ) -> None:
+        with self._active_binding_condition:
+            active = self._active_bindings.get(worker_id)
+            if active is None or active.get("token") is not token:
+                raise RuntimeErrorBase("The provider account route is no longer active")
+            if worker is not None:
+                active["worker"] = dict(worker)
+            if lease_id is not None:
+                active["lease_id"] = str(lease_id)
+
+    def mark_active_route_ready(
+        self,
+        worker: dict,
+        *,
+        runtime_name: str,
+        run_id: str,
+    ) -> None:
+        """Publish a route only after the mission owns its initial ready substrate."""
+
+        selection = mission_provider_account_selection(worker)
+        worker_id = str(worker.get("worker_id") or "").strip()
+        with self._active_binding_condition:
+            active = self._active_bindings.get(worker_id)
+            if (
+                active is None
+                or bool(active.get("closing"))
+                or str(active.get("run_id") or "") != str(run_id)
+                or str(active.get("runtime_name") or "") != str(runtime_name)
+                or str(active.get("account_id") or "")
+                != str(selection.account_id if selection is not None else "")
+                or str(active.get("tenant_id") or "")
+                != (str(worker.get("tenant_id") or "local").strip() or "local")
+                or str(active.get("owner_id") or "")
+                != str(worker.get("owner_id") or "").strip()
+            ):
+                raise RuntimeErrorBase(
+                    "The provider account route is no longer available for this worker run"
+                )
+            active["worker"] = dict(worker)
+            active["ready"] = True
+            self._active_binding_condition.notify_all()
+
+    def _begin_close_active_route(self, worker_id: str, token: object) -> None:
+        with self._active_binding_condition:
+            active = self._active_bindings.get(worker_id)
+            if active is None or active.get("token") is not token:
+                return
+            active["closing"] = True
+            while int(active.get("readers") or 0) > 0:
+                self._active_binding_condition.wait()
+
+    def _finalize_close_active_route(self, worker_id: str, token: object) -> None:
+        with self._active_binding_condition:
+            active = self._active_bindings.get(worker_id)
+            if active is None or active.get("token") is not token:
+                return
+            if self._active_bindings.get(worker_id) is active:
+                self._active_bindings.pop(worker_id, None)
+            self._active_binding_condition.notify_all()
+
+    def _close_active_route(self, worker_id: str, token: object) -> None:
+        self._begin_close_active_route(worker_id, token)
+        self._finalize_close_active_route(worker_id, token)
+
+    @contextmanager
+    def bind_unbound_route(
+        self,
+        worker: dict,
+        *,
+        runtime_name: str,
+        run_id: str,
+        account_id: str,
+    ) -> Iterator[dict]:
+        """Register the exact selected-account run that uses no native home mount."""
+
+        worker_id = str(worker.get("worker_id") or "").strip()
+        token = self._reserve_active_route(
+            worker,
+            runtime_name=runtime_name,
+            run_id=run_id,
+            account_id=account_id,
+            route_kind="unbound",
+        )
+        try:
+            yield worker
+        finally:
+            self._close_active_route(worker_id, token)
+
+    @contextmanager
+    def project_active_route(
+        self,
+        worker: dict,
+        *,
+        runtime_name: str,
+        run_id: str,
+    ) -> Iterator[dict]:
+        """Borrow the exact active provider route for an active worker action.
+
+        Mission binding is deliberately ephemeral and never persisted on the worker row. Desktop
+        actions arrive through a separate request while the mission is running, so they must prove
+        the exact owner/account/worker/run lease before comparing the live container mount. This
+        method never acquires a second lease or reconstructs a home from email or mutable UI
+        metadata. The mission cleanup waits for every borrowed action to release its projection.
+        """
+
+        selection = mission_provider_account_selection(worker)
+        if selection is None:
+            yield worker
+            return
+        clean_runtime = str(runtime_name or "").strip()
+        clean_run_id = str(run_id or "").strip()
+        if clean_runtime not in _PROFILE_PROVIDERS or not clean_run_id:
+            raise RuntimeErrorBase(
+                "Desktop actions require the exact active provider account lease"
+            )
+        tenant_id = str(worker.get("tenant_id") or "local").strip() or "local"
+        owner_id = str(worker.get("owner_id") or "").strip()
+        worker_id = str(worker.get("worker_id") or "").strip()
+        if not owner_id or not worker_id:
+            raise RuntimeErrorBase(
+                "Desktop actions require an authenticated provider account owner"
+            )
+        with self._active_binding_condition:
+            current = self._active_bindings.get(worker_id)
+            route_kind = str((current or {}).get("route_kind") or "")
+            expected_token = (current or {}).get("token")
+            expected_lease_id = str((current or {}).get("lease_id") or "")
+        lease: dict | None = None
+        if route_kind == "native":
+            if self.store is None:
+                raise RuntimeErrorBase(
+                    "Desktop actions cannot verify the active provider account lease"
+                )
+            lease = self.store.active_provider_lease(
+                selection.account_id,
+                f"{clean_runtime}:mission",
+            )
+            if lease is None:
+                raise RuntimeErrorBase(
+                    "Desktop actions require the exact active provider account lease"
+                )
+            if any(
+                str(lease.get(key) or "").strip() != expected
+                for key, expected in (
+                    ("tenant_id", tenant_id),
+                    ("owner_id", owner_id),
+                    ("worker_id", worker_id),
+                    ("run_id", clean_run_id),
+                )
+            ):
+                raise RuntimeErrorBase(
+                    "The active provider account lease does not own this worker run"
+                )
+            if (
+                not expected_lease_id
+                or str(lease.get("lease_id") or "") != expected_lease_id
+            ):
+                raise RuntimeErrorBase(
+                    "Desktop actions require the exact active provider account lease"
+                )
+        with self._active_binding_condition:
+            active = self._active_bindings.get(worker_id)
+            if (
+                active is None
+                or active.get("token") is not expected_token
+                or bool(active.get("closing"))
+                or not bool(active.get("ready"))
+                or str(active.get("run_id") or "") != clean_run_id
+                or str(active.get("runtime_name") or "") != clean_runtime
+                or str(active.get("account_id") or "") != selection.account_id
+                or str(active.get("tenant_id") or "") != tenant_id
+                or str(active.get("owner_id") or "") != owner_id
+                or str(active.get("route_kind") or "") not in {"native", "unbound"}
+                or (
+                    str(active.get("route_kind") or "") == "native"
+                    and str(active.get("lease_id") or "") != expected_lease_id
+                )
+            ):
+                raise RuntimeErrorBase(
+                    "Desktop actions require the ready provider route for this worker run"
+                )
+            active["readers"] = int(active.get("readers") or 0) + 1
+            bound_worker = dict(active["worker"])  # type: ignore[arg-type]
+        try:
+            yield bound_worker
+        finally:
+            with self._active_binding_condition:
+                active = self._active_bindings.get(worker_id)
+                if active is not None and active.get("token") is expected_token:
+                    active["readers"] = max(0, int(active.get("readers") or 0) - 1)
+                    self._active_binding_condition.notify_all()
+
+    # Backward-compatible internal name for callers/tests that specifically exercise native binds.
+    project_active_binding = project_active_route
 
     @staticmethod
     def _lease_ttl_seconds(timeout_sec: float | None) -> int:
@@ -427,6 +666,13 @@ class MissionProviderAccountBinder:
             raise RuntimeErrorBase(
                 "Selected provider account is not ready; reconnect or verify it before running"
             )
+        route_token = self._reserve_active_route(
+            worker,
+            runtime_name=runtime_name,
+            run_id=run_id,
+            account_id=selection.account_id,
+            route_kind="native",
+        )
         try:
             homes = ProviderAccountHomeManager(self.home_root)
             homes.require_supported_route(
@@ -456,15 +702,23 @@ class MissionProviderAccountBinder:
                 required_recovery_code="",
             )
         except ControlPlaneConflict as exc:
+            self._close_active_route(worker_id, route_token)
             if preferred:
                 yield self._preferred_fallback(worker)
                 return
             raise RuntimeErrorBase("Selected provider account is already in use") from exc
         except ControlPlaneError as exc:
+            self._close_active_route(worker_id, route_token)
             if preferred:
                 yield self._preferred_fallback(worker)
                 return
             raise RuntimeErrorBase(str(exc)) from exc
+        except BaseException:
+            self._close_active_route(worker_id, route_token)
+            raise
+
+        lease_id = str(lease.get("lease_id") or "")
+        self._update_active_route(worker_id, route_token, lease_id=lease_id)
 
         try:
             if execution_mode == "docker":
@@ -498,11 +752,14 @@ class MissionProviderAccountBinder:
                     )
                 except (ControlPlaneError, OSError):
                     logger.exception("Failed to quarantine unsafe provider credentials")
-            self.store.release_provider_lease(
-                lease_id=str(lease.get("lease_id") or ""),
-                tenant_id=tenant_id,
-                owner_id=owner_id,
-            )
+            try:
+                self.store.release_provider_lease(
+                    lease_id=lease_id,
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                )
+            finally:
+                self._close_active_route(worker_id, route_token)
             raise RuntimeErrorBase(
                 "GlassHive could not safely reconcile stale provider credentials; check the connection"
             ) from exc
@@ -521,6 +778,12 @@ class MissionProviderAccountBinder:
                     "_glasshive_provider_account_mount_target": _CONTAINER_ACCOUNT_MOUNT,
                 }
             )
+        self._update_active_route(
+            worker_id,
+            route_token,
+            worker=bound_worker,
+            lease_id=lease_id,
+        )
         binding_release_lock = Lock()
         binding_released = Event()
         binding_release_errors: list[BaseException] = []
@@ -555,22 +818,47 @@ class MissionProviderAccountBinder:
                     raise
                 binding_released.set()
 
-        def abort_bound_credentials() -> None:
-            if execution_mode == "docker":
-                release_bound_credentials()
-            elif abort_binding is not None:
-                abort_binding(bound_worker)
+        def begin_close_active_binding() -> None:
+            self._begin_close_active_route(worker_id, route_token)
 
-        lease_stop, lease_thread, lease_lost = self._start_lease_heartbeat(
-            lease_id=str(lease.get("lease_id") or ""),
-            tenant_id=tenant_id,
-            owner_id=owner_id,
-            ttl_seconds=lease_ttl_seconds,
-            worker_id=worker_id,
-            runtime_name=runtime_name,
-            account_id=selection.account_id,
-            on_lease_lost=abort_bound_credentials,
-        )
+        def finalize_close_active_binding() -> None:
+            self._finalize_close_active_route(worker_id, route_token)
+
+        def abort_bound_credentials() -> None:
+            begin_close_active_binding()
+            try:
+                if execution_mode == "docker":
+                    release_bound_credentials()
+                elif abort_binding is not None:
+                    abort_binding(bound_worker)
+            finally:
+                finalize_close_active_binding()
+
+        try:
+            lease_stop, lease_thread, lease_lost = self._start_lease_heartbeat(
+                lease_id=lease_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                ttl_seconds=lease_ttl_seconds,
+                worker_id=worker_id,
+                runtime_name=runtime_name,
+                account_id=selection.account_id,
+                on_lease_lost=abort_bound_credentials,
+            )
+        except BaseException:
+            begin_close_active_binding()
+            try:
+                release_bound_credentials()
+            finally:
+                try:
+                    self.store.release_provider_lease(
+                        lease_id=lease_id,
+                        tenant_id=tenant_id,
+                        owner_id=owner_id,
+                    )
+                finally:
+                    finalize_close_active_binding()
+            raise
         body_error: BaseException | None = None
         try:
             yield bound_worker
@@ -578,6 +866,7 @@ class MissionProviderAccountBinder:
             body_error = exc
             raise
         finally:
+            begin_close_active_binding()
             try:
                 release_bound_credentials()
             except BaseException:
@@ -585,23 +874,26 @@ class MissionProviderAccountBinder:
                     body_error = RuntimeErrorBase(
                         "GlassHive could not remove the provider credential mount; the account was quarantined"
                     )
-            lease_stop.set()
-            lease_thread.join(timeout=2)
             try:
-                self.store.release_provider_lease(
-                    lease_id=str(lease.get("lease_id") or ""),
-                    tenant_id=tenant_id,
-                    owner_id=owner_id,
-                )
-            except ControlPlaneError as exc:
-                if body_error is None:
-                    raise RuntimeErrorBase(
-                        "GlassHive could not release the provider account mission lease"
-                    ) from exc
-                logger.exception(
-                    "Failed to release provider account lease after mission failure",
-                    extra={"worker_id": worker_id, "runtime": runtime_name},
-                )
+                lease_stop.set()
+                lease_thread.join(timeout=2)
+                try:
+                    self.store.release_provider_lease(
+                        lease_id=lease_id,
+                        tenant_id=tenant_id,
+                        owner_id=owner_id,
+                    )
+                except ControlPlaneError as exc:
+                    if body_error is None:
+                        raise RuntimeErrorBase(
+                            "GlassHive could not release the provider account mission lease"
+                        ) from exc
+                    logger.exception(
+                        "Failed to release provider account lease after mission failure",
+                        extra={"worker_id": worker_id, "runtime": runtime_name},
+                    )
+            finally:
+                finalize_close_active_binding()
             if binding_release_errors and body_error is not None:
                 raise body_error
             if lease_lost.is_set() and body_error is None:

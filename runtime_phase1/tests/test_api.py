@@ -9702,6 +9702,38 @@ def test_desktop_action_refreshes_activity_before_idle_reaper(tmp_path, monkeypa
         service.shutdown()
 
 
+def test_desktop_action_uses_the_active_run_id_when_the_browser_omits_it(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = DesktopStubRuntime(tmp_path / "desktop")
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = service.create_project("owner", "Desktop", "Promote result", "codex-cli")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Desktop Worker",
+            role="operator",
+            profile="codex-cli",
+            backend="openclaw",
+            start_synchronously=False,
+        )
+        run = store.create_run(
+            worker["worker_id"], project["project_id"], "Create a page", state="running"
+        )
+        store.update_worker(worker["worker_id"], state="running", last_run_id=run["run_id"])
+
+        service.desktop_action(worker["worker_id"], "browser", url="about:blank")
+
+        assert runtime.last_desktop_action == {
+            "worker_id": worker["worker_id"],
+            "action": "browser",
+            "url": "about:blank",
+            "run_id": run["run_id"],
+        }
+    finally:
+        service.shutdown()
+
+
 class DeliverableDesktopRuntime(DesktopStubRuntime):
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None) -> str:
         workspace_dir = Path(str(worker["workspace_dir"]))

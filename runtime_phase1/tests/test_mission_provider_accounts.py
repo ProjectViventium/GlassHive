@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
@@ -26,6 +28,21 @@ class RecordingRuntime:
         self.released_workers: list[str] = []
         self.reconciled_homes: list[Path] = []
         self.release_callback = None
+        self.ensure_calls = 0
+
+    def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+        self.ensure_calls += 1
+        return RuntimeInfo(
+            runtime=str(worker.get("profile") or "synthetic"),
+            model="synthetic",
+            gateway_url="",
+            gateway_port=None,
+            gateway_token=None,
+            session_key=None,
+            state_dir="",
+            workspace_dir="",
+            pid=1,
+        )
 
     def run_task(
         self,
@@ -43,6 +60,22 @@ class RecordingRuntime:
         self.released_workers.append(str(worker.get("worker_id") or ""))
         if self.release_callback is not None:
             self.release_callback(worker)
+
+    def desktop_action(
+        self,
+        worker: dict,
+        action: str,
+        *,
+        url: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, object]:
+        self.worker = dict(worker)
+        return {
+            "status": "launched",
+            "action": action,
+            "url": url,
+            "run_id": run_id,
+        }
 
     def reconcile_provider_account_binding(self, account_home: Path) -> None:
         self.reconciled_homes.append(Path(account_home))
@@ -329,6 +362,660 @@ def test_profiled_runtime_binds_private_home_and_holds_exclusive_lease_for_entir
     assert private_home.parent.parent.parent.parent == tmp_path / "provider_accounts"
     assert private_home != Path.home() / ".codex"
     assert store.active_provider_lease(account["account_id"], "codex-cli:mission") is None
+
+
+def test_desktop_action_projects_the_exact_active_mission_provider_binding(tmp_path, monkeypatch):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = _worker(account["account_id"])
+    worker["execution_mode"] = "docker"
+    recorder = RecordingRuntime()
+    runtime.codex = recorder  # type: ignore[assignment]
+    with runtime.provider_account_binder.bind(
+        worker,
+        runtime_name="codex-cli",
+        run_id="run_personal",
+        timeout_sec=60,
+        release_binding=lambda _worker: None,
+        reconcile_binding=lambda _home: None,
+    ) as bound:
+        runtime.provider_account_binder.mark_active_route_ready(
+            bound,
+            runtime_name="codex-cli",
+            run_id="run_personal",
+        )
+        account_home = Path(bound["_glasshive_provider_account_mount_host"])
+        launched = runtime.desktop_action(
+            worker,
+            "browser",
+            url="file:///workspace/project/index.html",
+            run_id="run_personal",
+        )
+        assert launched["status"] == "launched"
+        assert recorder.worker is not None
+        assert recorder.worker["_glasshive_provider_account_bound"] is True
+        assert recorder.worker["_glasshive_provider_account_env"] == {
+            "CODEX_HOME": "/workspace/.provider-account/codex"
+        }
+        assert recorder.worker["_glasshive_provider_account_mount_host"] == str(
+            account_home.resolve(strict=True)
+        )
+        assert recorder.worker["_glasshive_provider_account_mount_target"] == (
+            "/workspace/.provider-account"
+        )
+    assert store.active_provider_lease(
+        account["account_id"], "codex-cli:mission"
+    ) is None
+
+
+def test_mission_cleanup_waits_for_a_borrowed_desktop_action_projection(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = _worker(account["account_id"])
+    worker["execution_mode"] = "docker"
+    mission_bound = Event()
+    finish_mission = Event()
+    mission_finished = Event()
+    action_borrowed = Event()
+    release_action = Event()
+    binding_released = Event()
+    thread_errors: list[BaseException] = []
+
+    def run_mission() -> None:
+        try:
+            with runtime.provider_account_binder.bind(
+                worker,
+                runtime_name="codex-cli",
+                run_id="run_personal",
+                timeout_sec=60,
+                release_binding=lambda _worker: binding_released.set(),
+                reconcile_binding=lambda _home: None,
+            ) as bound:
+                runtime.provider_account_binder.mark_active_route_ready(
+                    bound,
+                    runtime_name="codex-cli",
+                    run_id="run_personal",
+                )
+                mission_bound.set()
+                finish_mission.wait()
+        except BaseException as exc:  # pragma: no cover - asserted in the parent thread
+            thread_errors.append(exc)
+        finally:
+            mission_finished.set()
+
+    def borrow_action() -> None:
+        try:
+            mission_bound.wait()
+            with runtime.provider_account_binder.project_active_binding(
+                worker,
+                runtime_name="codex-cli",
+                run_id="run_personal",
+            ):
+                action_borrowed.set()
+                release_action.wait()
+        except BaseException as exc:  # pragma: no cover - asserted in the parent thread
+            thread_errors.append(exc)
+
+    mission_thread = Thread(target=run_mission, daemon=True)
+    action_thread = Thread(target=borrow_action, daemon=True)
+    mission_thread.start()
+    action_thread.start()
+    assert action_borrowed.wait(10)
+
+    finish_mission.set()
+    with runtime.provider_account_binder._active_binding_condition:
+        assert runtime.provider_account_binder._active_binding_condition.wait_for(
+            lambda: bool(
+                runtime.provider_account_binder._active_bindings.get("wrk_personal", {}).get(
+                    "closing"
+                )
+            ),
+            timeout=10,
+        )
+    assert not binding_released.is_set()
+    assert not mission_finished.is_set()
+
+    release_action.set()
+    action_thread.join(timeout=10)
+    mission_thread.join(timeout=10)
+    assert not action_thread.is_alive()
+    assert not mission_thread.is_alive()
+    assert binding_released.is_set()
+    assert mission_finished.is_set()
+    assert thread_errors == []
+    assert store.active_provider_lease(
+        account["account_id"], "codex-cli:mission"
+    ) is None
+
+
+def test_desktop_action_rejects_stale_or_cross_worker_provider_binding(tmp_path):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    worker = _worker(account["account_id"])
+    worker["execution_mode"] = "docker"
+    ProviderAccountHomeManager(tmp_path / "provider_accounts").ensure_home(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        account_id=account["account_id"],
+        provider="codex",
+    )
+
+    with pytest.raises(RuntimeErrorBase, match="ready provider route"):
+        with runtime.provider_account_binder.project_active_binding(
+            worker,
+            runtime_name="codex-cli",
+            run_id="run_personal",
+        ):
+            pass
+
+    lease = store.acquire_provider_lease(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        lane="codex-cli:mission",
+        worker_id="wrk_other",
+        run_id="run_personal",
+        ttl_seconds=60,
+    )
+    try:
+        with pytest.raises(RuntimeErrorBase, match="ready provider route"):
+            with runtime.provider_account_binder.project_active_binding(
+                worker,
+                runtime_name="codex-cli",
+                run_id="run_personal",
+            ):
+                pass
+    finally:
+        store.release_provider_lease(
+            lease_id=lease["lease_id"], tenant_id="tenant-a", owner_id="user-a"
+        )
+
+
+def test_second_account_for_same_worker_is_rejected_before_first_container_cleanup(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    first_account = _account(store)
+    second_account = _account(store)
+    binder = MissionProviderAccountBinder(
+        db_path=str(database),
+        home_root=tmp_path / "provider_accounts",
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    first_active = Event()
+    release_first = Event()
+    first_finished = Event()
+    first_releases: list[str] = []
+    second_releases: list[str] = []
+    second_reconciles: list[Path] = []
+    errors: list[BaseException] = []
+
+    def hold_first_account() -> None:
+        try:
+            with binder.bind(
+                {**_worker(first_account["account_id"]), "execution_mode": "docker"},
+                runtime_name="codex-cli",
+                run_id="run_first",
+                timeout_sec=60,
+                release_binding=lambda worker: first_releases.append(worker["worker_id"]),
+                reconcile_binding=lambda _home: None,
+            ):
+                first_active.set()
+                assert release_first.wait(5)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            first_finished.set()
+
+    first_thread = Thread(target=hold_first_account)
+    first_thread.start()
+    assert first_active.wait(5)
+
+    with pytest.raises(RuntimeErrorBase, match="already has an active provider account route"):
+        with binder.bind(
+            {**_worker(second_account["account_id"]), "execution_mode": "docker"},
+            runtime_name="codex-cli",
+            run_id="run_second",
+            timeout_sec=60,
+            release_binding=lambda worker: second_releases.append(worker["worker_id"]),
+            reconcile_binding=second_reconciles.append,
+        ):
+            pass
+
+    assert not first_finished.is_set()
+    assert first_releases == []
+    assert second_releases == []
+    assert second_reconciles == []
+    assert store.active_provider_lease(
+        first_account["account_id"], "codex-cli:mission"
+    ) is not None
+    assert store.active_provider_lease(
+        second_account["account_id"], "codex-cli:mission"
+    ) is None
+
+    release_first.set()
+    first_thread.join(timeout=5)
+    assert not first_thread.is_alive()
+    assert errors == []
+    assert first_releases == ["wrk_personal"]
+
+
+def test_worker_route_stays_reserved_until_native_container_cleanup_finishes(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    first_account = _account(store)
+    second_account = _account(store)
+    binder = MissionProviderAccountBinder(
+        db_path=str(database),
+        home_root=tmp_path / "provider_accounts",
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    mission_entered = Event()
+    finish_mission = Event()
+    cleanup_started = Event()
+    finish_cleanup = Event()
+    mission_finished = Event()
+    errors: list[BaseException] = []
+
+    def block_cleanup(_worker: dict) -> None:
+        cleanup_started.set()
+        assert finish_cleanup.wait(5)
+
+    def run_first() -> None:
+        try:
+            with binder.bind(
+                {**_worker(first_account["account_id"]), "execution_mode": "docker"},
+                runtime_name="codex-cli",
+                run_id="run_first",
+                timeout_sec=60,
+                release_binding=block_cleanup,
+                reconcile_binding=lambda _home: None,
+            ):
+                mission_entered.set()
+                assert finish_mission.wait(5)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            mission_finished.set()
+
+    thread = Thread(target=run_first)
+    thread.start()
+    assert mission_entered.wait(5)
+    finish_mission.set()
+    assert cleanup_started.wait(5)
+    assert not mission_finished.is_set()
+
+    with pytest.raises(RuntimeErrorBase, match="already has an active provider account route"):
+        with binder.bind(
+            {**_worker(second_account["account_id"]), "execution_mode": "docker"},
+            runtime_name="codex-cli",
+            run_id="run_second",
+            timeout_sec=60,
+            release_binding=lambda _worker: None,
+            reconcile_binding=lambda _home: None,
+        ):
+            pass
+    with pytest.raises(RuntimeErrorBase, match="already has an active provider account route"):
+        with binder.bind_unbound_route(
+            _worker(second_account["account_id"]),
+            runtime_name="codex-cli",
+            run_id="run_fallback",
+            account_id=second_account["account_id"],
+        ):
+            pass
+
+    finish_cleanup.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert errors == []
+    with binder.bind_unbound_route(
+        _worker(second_account["account_id"]),
+        runtime_name="codex-cli",
+        run_id="run_after_cleanup",
+        account_id=second_account["account_id"],
+    ):
+        pass
+
+
+def test_broker_grant_is_not_issued_while_native_worker_cleanup_holds_the_route(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    native_account = _account(store)
+    broker_account = _account(store, auth_method="api_key")
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    runtime.codex = RecordingRuntime()  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    mission_entered = Event()
+    finish_mission = Event()
+    cleanup_started = Event()
+    finish_cleanup = Event()
+    errors: list[BaseException] = []
+
+    class CountingBroker:
+        def __init__(self) -> None:
+            self.binds = 0
+
+        @contextmanager
+        def bind_run(self, **_kwargs):
+            self.binds += 1
+            yield {"adapter": "synthetic-broker"}
+
+    broker = CountingBroker()
+    runtime.inference_broker = broker  # type: ignore[assignment]
+
+    def release_native(_worker: dict) -> None:
+        cleanup_started.set()
+        assert finish_cleanup.wait(10)
+
+    def run_native() -> None:
+        try:
+            with runtime.provider_account_binder.bind(
+                {**_worker(native_account["account_id"]), "execution_mode": "docker"},
+                runtime_name="codex-cli",
+                run_id="run_native",
+                timeout_sec=60,
+                release_binding=release_native,
+                reconcile_binding=lambda _home: None,
+            ):
+                mission_entered.set()
+                assert finish_mission.wait(10)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = Thread(target=run_native)
+    thread.start()
+    assert mission_entered.wait(10)
+    finish_mission.set()
+    assert cleanup_started.wait(10)
+
+    broker_worker = {
+        **_worker(broker_account["account_id"]),
+        "execution_mode": "docker",
+        "model": "gpt-synthetic",
+    }
+    with pytest.raises(RuntimeErrorBase, match="already has an active provider account route"):
+        runtime._run_task_with_provider_account(
+            broker_worker,
+            "must not issue",
+            timeout_sec=60,
+            run_id="run_broker",
+        )
+    assert broker.binds == 0
+
+    finish_cleanup.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert errors == []
+
+
+def test_desktop_action_rejects_reacquired_lease_with_identical_run_metadata(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = {**_worker(account["account_id"]), "execution_mode": "docker"}
+    replacement: dict | None = None
+    with pytest.raises(RuntimeErrorBase, match="release the provider account mission lease"):
+        with runtime.provider_account_binder.bind(
+            worker,
+            runtime_name="codex-cli",
+            run_id="run_personal",
+            timeout_sec=60,
+            release_binding=lambda _worker: None,
+            reconcile_binding=lambda _home: None,
+        ) as bound:
+            runtime.provider_account_binder.mark_active_route_ready(
+                bound,
+                runtime_name="codex-cli",
+                run_id="run_personal",
+            )
+            original = store.active_provider_lease(
+                account["account_id"], "codex-cli:mission"
+            )
+            assert original is not None
+            store.release_provider_lease(
+                lease_id=original["lease_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+            )
+            replacement = store.acquire_provider_lease(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+                lane="codex-cli:mission",
+                worker_id="wrk_personal",
+                run_id="run_personal",
+                ttl_seconds=60,
+            )
+            with pytest.raises(RuntimeErrorBase, match="exact active provider account lease"):
+                with runtime.provider_account_binder.project_active_route(
+                    worker,
+                    runtime_name="codex-cli",
+                    run_id="run_personal",
+                ):
+                    pass
+    assert replacement is not None
+    store.release_provider_lease(
+        lease_id=replacement["lease_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+
+
+def test_personal_preferred_fallback_desktop_action_uses_its_active_unbound_route(
+    tmp_path,
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    disconnected = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="codex",
+        label="Disconnected",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://disconnected-desktop",
+        status="disconnected",
+    )
+    mission_running = Event()
+    finish_mission = Event()
+
+    def hold_mission(_worker, _instruction, _timeout_sec, _run_id):
+        mission_running.set()
+        assert finish_mission.wait(5)
+
+    recorder = RecordingRuntime(hold_mission)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    runtime.host_codex = recorder  # type: ignore[assignment]
+    worker = _worker(disconnected["account_id"], policy="personal_preferred")
+    errors: list[BaseException] = []
+
+    def run_mission() -> None:
+        try:
+            runtime.run_task(worker, "fallback mission", run_id="run_fallback")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = Thread(target=run_mission)
+    thread.start()
+    assert mission_running.wait(5)
+    result = runtime.desktop_action(
+        worker,
+        "browser",
+        url="file:///workspace/project/index.html",
+        run_id="run_fallback",
+    )
+    assert result["status"] == "launched"
+    assert recorder.worker is not None
+    assert recorder.worker["_glasshive_provider_account_preferred_fallback"] is True
+    assert "_glasshive_provider_account_bound" not in recorder.worker
+    finish_mission.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert errors == []
+
+
+def test_broker_mission_desktop_action_uses_its_active_unbound_route(tmp_path):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, auth_method="api_key")
+    mission_running = Event()
+    finish_mission = Event()
+
+    class FakeInferenceBroker:
+        @contextmanager
+        def bind_run(self, **_kwargs):
+            yield {"adapter": "synthetic-broker"}
+
+    def hold_mission(_worker, _instruction, _timeout_sec, _run_id):
+        mission_running.set()
+        assert finish_mission.wait(5)
+
+    recorder = RecordingRuntime(hold_mission)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    runtime.host_codex = recorder  # type: ignore[assignment]
+    runtime.inference_broker = FakeInferenceBroker()  # type: ignore[assignment]
+    worker = {**_worker(account["account_id"]), "model": "gpt-synthetic"}
+    errors: list[BaseException] = []
+
+    def run_mission() -> None:
+        try:
+            runtime.run_task(worker, "broker mission", run_id="run_broker")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = Thread(target=run_mission)
+    thread.start()
+    assert mission_running.wait(5)
+    result = runtime.desktop_action(
+        worker,
+        "browser",
+        url="file:///workspace/project/index.html",
+        run_id="run_broker",
+    )
+    assert result["status"] == "launched"
+    assert recorder.worker is not None
+    assert recorder.worker["_glasshive_inference_broker_bound"] is True
+    assert "_glasshive_provider_account_bound" not in recorder.worker
+    finish_mission.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert errors == []
+
+
+def test_desktop_action_waits_until_the_mission_container_is_initially_ready(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    first_ensure = Event()
+    allow_ready = Event()
+    mission_running = Event()
+    finish_mission = Event()
+
+    class ReadinessRuntime(RecordingRuntime):
+        def __init__(self) -> None:
+            super().__init__(self._hold_mission)
+            self.ready = False
+            self.create_count = 0
+
+        def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+            self.ensure_calls += 1
+            if not self.ready:
+                self.create_count += 1
+                first_ensure.set()
+                assert allow_ready.wait(5)
+                self.ready = True
+            return super().ensure_worker_ready(worker)
+
+        def _hold_mission(self, _worker, _instruction, _timeout_sec, _run_id):
+            mission_running.set()
+            assert finish_mission.wait(5)
+
+        def desktop_action(self, worker: dict, action: str, **kwargs):
+            self.ensure_worker_ready(worker)
+            return super().desktop_action(worker, action, **kwargs)
+
+    recorder = ReadinessRuntime()
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    runtime.codex = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = {**_worker(account["account_id"]), "execution_mode": "docker"}
+    errors: list[BaseException] = []
+
+    def run_mission() -> None:
+        try:
+            runtime.run_task(worker, "ready mission", run_id="run_ready")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = Thread(target=run_mission)
+    thread.start()
+    assert first_ensure.wait(5)
+    with pytest.raises(RuntimeErrorBase, match="ready provider route"):
+        runtime.desktop_action(worker, "browser", run_id="run_ready")
+    assert recorder.create_count == 1
+    assert recorder.ensure_calls == 1
+
+    allow_ready.set()
+    assert mission_running.wait(5)
+    result = runtime.desktop_action(worker, "browser", run_id="run_ready")
+    assert result["status"] == "launched"
+    assert recorder.create_count == 1
+    finish_mission.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert errors == []
 
 
 def test_runtime_factory_wires_the_exact_control_plane_database_into_mission_binding(tmp_path):

@@ -20,6 +20,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 compatibility
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
+from typing import Callable
 
 from .bootstrap import (
     GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
@@ -1183,6 +1184,34 @@ class ProfiledWorkerRuntime:
                         extra={"worker_id": worker.get("worker_id"), "run_id": run_id},
                     )
 
+    def _run_unbound_selected_account_route(
+        self,
+        *,
+        runtime: WorkerRuntime,
+        worker: dict,
+        run_id: str,
+        account_id: str,
+        execute: Callable[[dict], str],
+    ) -> str:
+        """Expose a broker/fallback route only after its initial substrate is ready."""
+
+        runtime_name = str(
+            getattr(runtime, "runtime_name", "") or worker.get("profile") or ""
+        ).strip()
+        with self.provider_account_binder.bind_unbound_route(
+            worker,
+            runtime_name=runtime_name,
+            run_id=run_id,
+            account_id=account_id,
+        ) as routed_worker:
+            runtime.ensure_worker_ready(routed_worker)
+            self.provider_account_binder.mark_active_route_ready(
+                routed_worker,
+                runtime_name=runtime_name,
+                run_id=run_id,
+            )
+            return execute(routed_worker)
+
     def _run_with_inference_broker(
         self,
         *,
@@ -1206,14 +1235,21 @@ class ProfiledWorkerRuntime:
             )
         if status not in {"ready", "action_required", "unavailable", "error"}:
             if preferred:
-                return runtime.run_task(
-                    {
-                        **worker,
-                        "_glasshive_provider_account_preferred_fallback": True,
-                    },
-                    instruction,
-                    timeout_sec=timeout_sec,
+                fallback_worker = {
+                    **worker,
+                    "_glasshive_provider_account_preferred_fallback": True,
+                }
+                return self._run_unbound_selected_account_route(
+                    runtime=runtime,
+                    worker=fallback_worker,
                     run_id=run_id,
+                    account_id=selection.account_id,
+                    execute=lambda routed_worker: runtime.run_task(
+                        routed_worker,
+                        instruction,
+                        timeout_sec=timeout_sec,
+                        run_id=run_id,
+                    ),
                 )
             raise RuntimeErrorBase(
                 "Selected OpenAI connection is not ready; reconnect or verify it before running"
@@ -1223,58 +1259,90 @@ class ProfiledWorkerRuntime:
             or runtime.resolve_model(str(worker.get("profile") or "codex-cli"))
             or ""
         ).strip()
-        try:
-            with self.inference_broker.bind_run(
-                tenant_id=str(worker.get("tenant_id") or "local").strip() or "local",
-                owner_id=str(worker.get("owner_id") or "").strip(),
-                worker_id=str(worker.get("worker_id") or "").strip(),
-                run_id=run_id,
-                auth_method=str(account.get("auth_method") or "").strip(),
-                models=[model],
-            ) as projection:
-                if status != "ready":
-                    self.provider_account_binder.update_selected_account_status(
-                        worker,
-                        selection,
-                        status="ready",
+
+        def execute_reserved_route(routed_worker: dict) -> str:
+            mission_dispatched = False
+            try:
+                with self.inference_broker.bind_run(
+                    tenant_id=str(worker.get("tenant_id") or "local").strip()
+                    or "local",
+                    owner_id=str(worker.get("owner_id") or "").strip(),
+                    worker_id=str(worker.get("worker_id") or "").strip(),
+                    run_id=run_id,
+                    auth_method=str(account.get("auth_method") or "").strip(),
+                    models=[model],
+                ) as projection:
+                    if status != "ready":
+                        self.provider_account_binder.update_selected_account_status(
+                            worker,
+                            selection,
+                            status="ready",
+                        )
+                    bound_worker = {
+                        **routed_worker,
+                        "model": model,
+                        "_glasshive_inference_broker_bound": True,
+                        "_glasshive_inference_broker": projection,
+                    }
+                    self.provider_account_binder.mark_active_route_ready(
+                        bound_worker,
+                        runtime_name=runtime_name,
+                        run_id=run_id,
                     )
-                bound_worker = {
-                    **worker,
-                    "model": model,
-                    "_glasshive_inference_broker_bound": True,
-                    "_glasshive_inference_broker": projection,
+                    mission_dispatched = True
+                    return self._run_observed_provider_account_task(
+                        runtime=runtime,
+                        worker=bound_worker,
+                        instruction=instruction,
+                        timeout_sec=timeout_sec,
+                        run_id=run_id,
+                        account_id=str(
+                            account.get("account_id") or selection.account_id
+                        ),
+                    )
+            except InferenceBrokerError as exc:
+                unavailable_codes = {
+                    "broker_unavailable",
+                    "enterprise_route_unavailable",
+                    "proxy_route_unavailable",
                 }
-                return self._run_observed_provider_account_task(
-                    runtime=runtime,
-                    worker=bound_worker,
-                    instruction=instruction,
+                self.provider_account_binder.update_selected_account_status(
+                    worker,
+                    selection,
+                    status=(
+                        "unavailable"
+                        if exc.code in unavailable_codes
+                        else "action_required"
+                    ),
+                    reconnect_reason=str(exc),
+                )
+                # A broker cleanup failure can be raised while leaving the context after the
+                # worker already completed. Never run the user's mission twice as a fallback.
+                if mission_dispatched or not preferred:
+                    raise
+                fallback_worker = {
+                    **routed_worker,
+                    "_glasshive_provider_account_preferred_fallback": True,
+                }
+                self.provider_account_binder.mark_active_route_ready(
+                    fallback_worker,
+                    runtime_name=runtime_name,
+                    run_id=run_id,
+                )
+                return runtime.run_task(
+                    fallback_worker,
+                    instruction,
                     timeout_sec=timeout_sec,
                     run_id=run_id,
-                    account_id=str(account.get("account_id") or selection.account_id),
                 )
-        except InferenceBrokerError as exc:
-            unavailable_codes = {
-                "broker_unavailable",
-                "enterprise_route_unavailable",
-                "proxy_route_unavailable",
-            }
-            self.provider_account_binder.update_selected_account_status(
-                worker,
-                selection,
-                status="unavailable" if exc.code in unavailable_codes else "action_required",
-                reconnect_reason=str(exc),
-            )
-            if not preferred:
-                raise
-            return runtime.run_task(
-                {
-                    **worker,
-                    "_glasshive_provider_account_preferred_fallback": True,
-                },
-                instruction,
-                timeout_sec=timeout_sec,
-                run_id=run_id,
-            )
+
+        return self._run_unbound_selected_account_route(
+            runtime=runtime,
+            worker=worker,
+            run_id=run_id,
+            account_id=selection.account_id,
+            execute=execute_reserved_route,
+        )
 
     def _run_task_with_provider_account(
         self,
@@ -1332,6 +1400,12 @@ class ProfiledWorkerRuntime:
             ),
         ) as bound_worker:
             if bound_worker.get("_glasshive_provider_account_bound"):
+                runtime.ensure_worker_ready(bound_worker)
+                self.provider_account_binder.mark_active_route_ready(
+                    bound_worker,
+                    runtime_name=runtime_name,
+                    run_id=effective_run_id,
+                )
                 return self._run_observed_provider_account_task(
                     runtime=runtime,
                     worker=bound_worker,
@@ -1340,11 +1414,17 @@ class ProfiledWorkerRuntime:
                     run_id=effective_run_id,
                     account_id=selection.account_id,
                 )
-            return runtime.run_task(
-                bound_worker,
-                instruction,
-                timeout_sec=timeout_sec,
+            return self._run_unbound_selected_account_route(
+                runtime=runtime,
+                worker=bound_worker,
                 run_id=effective_run_id,
+                account_id=selection.account_id,
+                execute=lambda routed_worker: runtime.run_task(
+                    routed_worker,
+                    instruction,
+                    timeout_sec=timeout_sec,
+                    run_id=effective_run_id,
+                ),
             )
 
     def _run_mode_from_worker(self, worker: dict) -> str:
@@ -1603,8 +1683,33 @@ class ProfiledWorkerRuntime:
         run_id: str | None = None,
     ) -> dict[str, object]:
         runtime = self._runtime_for_worker(worker)
+        if mission_provider_account_selection(worker) is not None:
+            with self.provider_account_binder.project_active_route(
+                worker,
+                runtime_name=str(
+                    getattr(runtime, "runtime_name", "")
+                    or worker.get("profile")
+                    or ""
+                ).strip(),
+                run_id=str(run_id or "").strip(),
+            ) as projected_worker:
+                if hasattr(runtime, "desktop_action"):
+                    return runtime.desktop_action(
+                        projected_worker,
+                        action,
+                        url=url,
+                        run_id=run_id,
+                    )
+                raise RuntimeErrorBase(
+                    f"Desktop actions are not supported for profile {worker.get('profile') or 'unknown'}"
+                )
         if hasattr(runtime, "desktop_action"):
-            return runtime.desktop_action(worker, action, url=url, run_id=run_id)
+            return runtime.desktop_action(
+                worker,
+                action,
+                url=url,
+                run_id=run_id,
+            )
         raise RuntimeErrorBase(f"Desktop actions are not supported for profile {worker.get('profile') or 'unknown'}")
 
 

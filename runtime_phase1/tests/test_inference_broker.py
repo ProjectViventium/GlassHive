@@ -364,6 +364,19 @@ class RecordingRuntime:
     def resolve_model(self, _profile):
         return "gpt-5.4"
 
+    def ensure_worker_ready(self, worker):
+        return RuntimeInfo(
+            runtime=str(worker.get("profile") or "synthetic"),
+            model="gpt-5.4",
+            gateway_url="",
+            gateway_port=None,
+            gateway_token=None,
+            session_key=None,
+            state_dir="",
+            workspace_dir="",
+            pid=1,
+        )
+
     def run_task(self, worker, instruction, timeout_sec=None, run_id=None):
         self.calls.append((worker, instruction, timeout_sec, run_id))
         if self.failure is not None:
@@ -398,6 +411,17 @@ class RecordingBroker:
 
     def revoke_active(self, **kwargs):
         self.revokes.append(kwargs)
+
+
+class RevokeFailureAfterDispatchBroker(RecordingBroker):
+    @contextmanager
+    def bind_run(self, **kwargs):
+        with super().bind_run(**kwargs) as projection:
+            yield projection
+        raise InferenceBrokerError(
+            "synthetic broker revocation failure",
+            code="revoke_failed",
+        )
 
 
 def test_scheduled_run_issues_at_execution_and_never_persists_grant(tmp_path, monkeypatch):
@@ -509,6 +533,56 @@ def test_brokered_provider_account_records_failed_run_without_inventing_tokens(
     assert observed["observed_output_tokens"] is None
 
 
+def test_preferred_broker_cleanup_failure_never_dispatches_the_mission_twice(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("GLASSHIVE_INFERENCE_BROKER_URL", raising=False)
+    db_path = tmp_path / "control-plane.db"
+    store = ControlPlaneStore(str(db_path))
+    account = store.create_provider_account(
+        tenant_id="glass-tenant",
+        owner_id="owner-a",
+        provider="openai",
+        label="Personal OpenAI",
+        auth_method="api_key",
+        platform_support="supported",
+        secret_locator="broker://librechat",
+        status="ready",
+    )
+    profiled = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path / "runtime"),
+        provider_account_db_path=str(db_path),
+    )
+    runtime = RecordingRuntime()
+    monkeypatch.setattr(profiled, "_runtime_for_worker", lambda _worker: runtime)
+    profiled.inference_broker = RevokeFailureAfterDispatchBroker()
+    worker = {
+        "worker_id": "worker-a",
+        "owner_id": "owner-a",
+        "tenant_id": "glass-tenant",
+        "profile": "codex-cli",
+        "execution_mode": "docker",
+        "bootstrap_bundle_json": {
+            "provider_account": {
+                "policy": "personal_preferred",
+                "account_id": account["account_id"],
+            }
+        },
+    }
+
+    with pytest.raises(InferenceBrokerError, match="revocation failure"):
+        profiled.run_task(worker, "Run exactly once", run_id="run-revoke-failed")
+
+    assert len(runtime.calls) == 1
+    observed = store.get_provider_account(
+        account_id=account["account_id"],
+        tenant_id="glass-tenant",
+        owner_id="owner-a",
+    )
+    assert observed["status"] == "action_required"
+    assert observed["observed_runs"] == 1
+
+
 def test_native_provider_account_records_usage_only_after_bound_worker_dispatch(
     tmp_path, monkeypatch
 ):
@@ -536,6 +610,11 @@ def test_native_provider_account_records_usage_only_after_bound_worker_dispatch(
         yield {**worker, "_glasshive_provider_account_bound": True}
 
     monkeypatch.setattr(profiled.provider_account_binder, "bind", bound_account)
+    monkeypatch.setattr(
+        profiled.provider_account_binder,
+        "mark_active_route_ready",
+        lambda *_args, **_kwargs: None,
+    )
     worker = {
         "worker_id": "worker-a",
         "owner_id": "owner-a",
