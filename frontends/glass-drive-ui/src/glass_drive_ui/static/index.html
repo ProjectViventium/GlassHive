@@ -276,10 +276,40 @@
               <a id="manage-connections-link" class="card-action" href="#" hidden>Manage tools</a>
             </section>
             <details id="connect-ai-advanced" class="connection-disclosure connect-ai-card">
-              <summary>External AI clients</summary>
+              <summary>Use GlassHive from another AI app</summary>
               <div class="advanced-connection-content">
-                <p>Use these commands only when connecting the Codex or Claude desktop client to GlassHive.</p>
-                <div id="connect-ai-commands" class="command-list" aria-live="polite"></div>
+                <p>Control your workers from Codex, ChatGPT, or Claude Code.</p>
+                <div class="connect-ai-modes" role="tablist" aria-label="Connection setup method">
+                  <button id="connect-ai-auto-tab" class="connect-ai-mode" type="button" role="tab" aria-selected="true" aria-controls="connect-ai-auto-panel">Automatic</button>
+                  <button id="connect-ai-manual-tab" class="connect-ai-mode" type="button" role="tab" aria-selected="false" aria-controls="connect-ai-manual-panel">Manual</button>
+                </div>
+                <section id="connect-ai-auto-panel" class="connect-ai-panel" role="tabpanel" aria-labelledby="connect-ai-auto-tab">
+                  <span class="section-kicker">Recommended</span>
+                  <h3>Ask your AI to connect</h3>
+                  <p>Copy this once and paste it into the Codex or Claude conversation you already use.</p>
+                  <div class="command-row connect-ai-prompt-row">
+                    <div class="command-copy"><code id="connect-ai-auto-prompt"></code></div>
+                    <button id="copy-connect-ai-prompt" class="quiet-button" type="button">Copy setup prompt</button>
+                  </div>
+                </section>
+                <section id="connect-ai-manual-panel" class="connect-ai-panel" role="tabpanel" aria-labelledby="connect-ai-manual-tab" hidden>
+                  <h3>Add the server yourself</h3>
+                  <p>Paste this address into your AI app’s Streamable HTTP or MCP server setting.</p>
+                  <div class="command-row">
+                    <div class="command-copy"><strong>GlassHive server</strong><code id="connect-ai-server-url"></code></div>
+                    <button id="copy-connect-ai-url" class="quiet-button" type="button">Copy server address</button>
+                  </div>
+                  <div id="connect-ai-clients" class="command-list" aria-live="polite"></div>
+                  <details id="connect-ai-terminal-setup" class="connection-disclosure nested-disclosure">
+                    <summary>Terminal setup</summary>
+                    <div id="connect-ai-commands" class="command-list" aria-live="polite"></div>
+                  </details>
+                  <details id="connect-ai-registration-details" class="connection-disclosure nested-disclosure">
+                    <summary>Administrator registration details</summary>
+                    <p>These loopback addresses are registration references. Do not open this address by itself.</p>
+                    <div id="connect-ai-callbacks" class="command-list"></div>
+                  </details>
+                </section>
                 <p id="connect-ai-source" class="card-note"></p>
               </div>
             </details>

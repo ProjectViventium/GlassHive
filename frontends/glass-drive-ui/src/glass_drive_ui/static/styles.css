@@ -1086,6 +1086,42 @@ button, input, textarea, select { font: inherit; }
   font-size: 0.8rem;
   line-height: 1.45;
 }
+.connect-ai-modes {
+  display: inline-flex;
+  gap: 4px;
+  margin: 14px 0;
+  padding: 4px;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 999px;
+  background: rgba(3,5,8,0.44);
+}
+.connect-ai-mode {
+  min-height: 34px;
+  padding: 7px 14px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-weight: 800;
+}
+.connect-ai-mode[aria-selected="true"] { background: rgba(91,238,190,0.13); color: var(--text); }
+.connect-ai-panel { display: grid; gap: 10px; }
+.connect-ai-panel[hidden] { display: none; }
+.connect-ai-panel h3,
+.connect-ai-panel p { margin: 0; }
+.connect-ai-prompt-row { align-items: flex-start; }
+.connect-ai-prompt-row code { max-height: 11rem; white-space: pre-wrap; }
+.connect-ai-client-card {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: 14px;
+  background: rgba(3,5,8,0.35);
+}
+.connect-ai-client-card p { margin: 0; }
+.nested-disclosure { margin-top: 6px; }
 .compact-connections-card { padding: 16px; }
 .compact-connections-card h2 { margin-top: 0; }
 .card-action { margin-top: 14px; }

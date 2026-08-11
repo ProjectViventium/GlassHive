@@ -372,27 +372,80 @@ function referenceRow(label, value) {
   return row;
 }
 
+function connectAiClientCard(title, steps) {
+  const card = node('article', 'connect-ai-client-card');
+  card.append(node('strong', '', title), node('p', 'card-note', steps));
+  return card;
+}
+
+function setConnectAiMode(mode) {
+  const manual = mode === 'manual';
+  const autoTab = document.getElementById('connect-ai-auto-tab');
+  const manualTab = document.getElementById('connect-ai-manual-tab');
+  const autoPanel = document.getElementById('connect-ai-auto-panel');
+  const manualPanel = document.getElementById('connect-ai-manual-panel');
+  if (autoTab) autoTab.setAttribute('aria-selected', String(!manual));
+  if (manualTab) manualTab.setAttribute('aria-selected', String(manual));
+  if (autoPanel) autoPanel.hidden = manual;
+  if (manualPanel) manualPanel.hidden = !manual;
+}
+
 function renderConnectAi() {
   const list = document.getElementById('connect-ai-commands');
+  const callbacks = document.getElementById('connect-ai-callbacks');
+  const clientsList = document.getElementById('connect-ai-clients');
+  const serverUrl = document.getElementById('connect-ai-server-url');
+  const copyUrl = document.getElementById('copy-connect-ai-url');
+  const prompt = document.getElementById('connect-ai-auto-prompt');
+  const copyPrompt = document.getElementById('copy-connect-ai-prompt');
   const source = document.getElementById('connect-ai-source');
   if (!list || !connectAi) return;
   if (connectAiLoadError) {
     list.replaceChildren(node('p', 'connect-login-note', connectAiLoadError));
+    callbacks?.replaceChildren();
+    clientsList?.replaceChildren(node('p', 'connect-login-note', connectAiLoadError));
+    if (serverUrl) serverUrl.textContent = '';
+    if (prompt) prompt.textContent = connectAiLoadError;
+    if (copyUrl) copyUrl.disabled = true;
+    if (copyPrompt) copyPrompt.disabled = true;
     if (source) source.replaceChildren();
     return;
   }
   const clients = connectAi.clients || {};
-  const rows = [
-    referenceRow('Codex · Registered callback', String(clients.codex?.callback_uri || '')),
+  const canSetup = String(connectAi.configuration_status || '') === 'ready';
+  const mcpUrl = String(connectAi.mcp_url || '');
+  const guidedPrompt = String(connectAi.guided_prompt || '');
+  if (serverUrl) serverUrl.textContent = mcpUrl;
+  if (prompt) prompt.textContent = canSetup ? guidedPrompt : String(connectAi.configuration_note || 'Setup is not available.');
+  if (copyUrl) {
+    copyUrl.disabled = !canSetup || !mcpUrl;
+    copyUrl.onclick = () => copyText(mcpUrl, copyUrl, serverUrl);
+  }
+  if (copyPrompt) {
+    copyPrompt.disabled = !canSetup || !guidedPrompt;
+    copyPrompt.onclick = () => copyText(guidedPrompt, copyPrompt, prompt);
+  }
+
+  clientsList?.replaceChildren(
+    ...(canSetup ? [
+      connectAiClientCard('ChatGPT or Codex', 'Open Settings → MCP servers → Add server. Paste the GlassHive address, restart if prompted, then Authenticate.'),
+      connectAiClientCard('Claude Code', 'Use Terminal setup below, then run /mcp in Claude Code to finish sign-in.'),
+    ] : [node('p', 'connect-login-note', String(connectAi.configuration_note || 'Setup is not available.'))]),
+  );
+
+  const rows = canSetup ? [
     commandRow('Codex · 1. Add server', String(clients.codex?.add_command || '')),
     commandRow('Codex · 2. Sign in', String(clients.codex?.login_command || '')),
-    referenceRow('Claude Code · Registered callback', String(clients.claude?.callback_uri || '')),
     commandRow('Claude Code · Add server', String(clients.claude?.add_command || '')),
-  ].filter((row) => row.querySelector('code')?.textContent);
-  rows.push(node('p', 'connect-login-note', String(connectAi.configuration_note || '')));
+  ].filter((row) => row.querySelector('code')?.textContent) : [];
   if (clients.claude?.login_note) {
     rows.push(node('p', 'connect-login-note', String(clients.claude.login_note)));
   }
+  rows.push(node('p', 'connect-login-note', `Saved as ${String(connectAi.server_name || 'this GlassHive server')}.`));
+  const callbackRows = canSetup ? [
+    referenceRow('Codex callback · Do not open this address', String(clients.codex?.callback_uri || '')),
+    referenceRow('Claude Code callback · Do not open this address', String(clients.claude?.callback_uri || '')),
+  ].filter((row) => row.querySelector('code')?.textContent) : [];
   if (connectAi.documentation_url) {
     const docs = node('a', 'connect-login-note', 'Client registration instructions');
     docs.href = String(connectAi.documentation_url);
@@ -401,6 +454,7 @@ function renderConnectAi() {
     rows.push(docs);
   }
   list.replaceChildren(...rows);
+  callbacks?.replaceChildren(...callbackRows);
   if (source) {
     const sourceLink = node('a', '', `${connectAi.source?.label || 'Source available'} · ${connectAi.source?.license || ''}`);
     sourceLink.href = String(connectAi.source?.repository_url || '#');
@@ -1416,6 +1470,8 @@ export async function refreshControlPlane() {
 
 export function initializeControlPlane(dependencies) {
   api = dependencies;
+  document.getElementById('connect-ai-auto-tab')?.addEventListener('click', () => setConnectAiMode('auto'));
+  document.getElementById('connect-ai-manual-tab')?.addEventListener('click', () => setConnectAiMode('manual'));
   document.getElementById('library-request-form')?.addEventListener('submit', submitLibraryRequest);
   document.getElementById('provider-account-form')?.addEventListener('submit', submitProviderAccount);
   document.getElementById('provider-account-provider')?.addEventListener('change', renderProviderOptionControls);

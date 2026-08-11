@@ -551,6 +551,12 @@ def _codex_oauth_callback_uri(mcp_url: str, callback_port: int) -> str:
     return f"http://127.0.0.1:{callback_port}/callback/{callback_hash}"
 
 
+def _mcp_client_server_name(mcp_url: str) -> str:
+    """Return a stable shell-safe name without leaking a deployment label."""
+    canonical = _canonical_codex_server_url(mcp_url)
+    return f"glasshive-{sha256(canonical.encode('utf-8')).hexdigest()[:12]}"
+
+
 def _strip_signed_query_params(url: str) -> str:
     parsed = urlparse(str(url or ""))
     query = urlencode(
@@ -2696,6 +2702,13 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             base = str(os.environ.get("GLASSHIVE_OPERATOR_BASE_URL") or request.base_url).rstrip("/")
             mcp_url = f"{base}/mcp"
         parsed = urlparse(mcp_url)
+        try:
+            server_name = _mcp_client_server_name(mcp_url)
+        except (UnicodeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="GlassHive MCP requires a valid public URL",
+            ) from exc
         multi_user = _multi_user_security_enabled()
         if multi_user and (
             parsed.scheme != "https"
@@ -2763,7 +2776,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                     "claude mcp add --transport http --scope user "
                     f"--client-id {shlex.quote(claude_client_id)} "
                     f"--callback-port {shlex.quote(claude_callback_port)} "
-                    f"glasshive {shlex.quote(mcp_url)}"
+                    f"{server_name} {shlex.quote(mcp_url)}"
                 ),
                 "callback_port": claude_callback_port_number,
                 "callback_uri": (
@@ -2807,14 +2820,14 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                     "codex mcp add "
                     f"-c mcp_oauth_callback_port={codex_callback_port_number} "
                     f"-c {codex_callback_url_override} "
-                    f"glasshive --url {shlex.quote(mcp_url)} "
+                    f"{server_name} --url {shlex.quote(mcp_url)} "
                     f"--oauth-client-id {shlex.quote(codex_client_id)} "
                     f"--oauth-resource {shlex.quote(codex_resource)}"
                 ),
                 "login_command": (
                     "codex mcp login "
                     f"-c mcp_oauth_callback_port={codex_callback_port_number} "
-                    f"-c {codex_callback_url_override} glasshive"
+                    f"-c {codex_callback_url_override} {server_name}"
                 ),
                 "callback_port": codex_callback_port_number,
                 "callback_uri": codex_callback_uri,
@@ -2824,6 +2837,16 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         ).strip()
         return {
             "mcp_url": mcp_url,
+            "server_name": server_name,
+            "guided_prompt": (
+                "Connect this AI app to my self-hosted GlassHive using Streamable HTTP. "
+                f"Use server name {server_name} and server URL {mcp_url}. "
+                "If you can safely update this app's local MCP settings, add the server, start "
+                "its OAuth sign-in, keep the local callback listener running, and open the sign-in "
+                "page for me. Otherwise, show me the exact in-app setting where I should paste the "
+                "server URL. Never open a loopback callback address by itself. After sign-in, list "
+                "the GlassHive tools and confirm that my workspace list is available."
+            ),
             "clients": clients,
             "configuration_status": "ready" if clients else "action_required",
             "configuration_note": (

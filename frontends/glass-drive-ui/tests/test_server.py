@@ -1939,12 +1939,12 @@ def test_launcher_workspace_hive_static_controls():
     assert "schedule.last_outcome || schedule.last_error" in control_plane_js
     assert "Latest result:" in control_plane_js
     assert "clients.codex?.login_command" in control_plane_js
-    assert "External AI clients" in index_html
+    assert "Use GlassHive from another AI app" in index_html
     assert "Copy one command" not in index_html
     assert "function referenceRow" in control_plane_js
     assert "Registration reference" in control_plane_js
-    assert "referenceRow('Codex · Registered callback'" in control_plane_js
-    assert "referenceRow('Claude Code · Registered callback'" in control_plane_js
+    assert "Codex callback · Do not open this address" in control_plane_js
+    assert "Claude Code callback · Do not open this address" in control_plane_js
     assert "/api/control-plane" in control_plane_js
     assert "/api/connect-ai" in control_plane_js
     assert "provider-account-form" in control_plane_js
@@ -4535,16 +4535,17 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
 
     assert response.status_code == 200
     payload = response.json()
+    assert payload["server_name"] == "glasshive-d0c2dae3d5cd"
     assert payload["clients"]["codex"]["add_command"] == (
         "codex mcp add -c mcp_oauth_callback_port=49153 "
-        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive "
+        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive-d0c2dae3d5cd "
         "--url https://glasshive.example.test/mcp "
         "--oauth-client-id registered-codex-client "
         "--oauth-resource https://glasshive.example.test/mcp"
     )
     assert payload["clients"]["codex"]["login_command"] == (
         "codex mcp login -c mcp_oauth_callback_port=49153 "
-        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive"
+        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive-d0c2dae3d5cd"
     )
     assert payload["clients"]["codex"]["callback_uri"] == (
         "http://127.0.0.1:49153/callback/0MLa49XNV_Yw"
@@ -4552,7 +4553,7 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert payload["clients"]["claude"]["add_command"] == (
         "claude mcp add --transport http --scope user "
         "--client-id registered-claude-client --callback-port 49152 "
-        "glasshive https://glasshive.example.test/mcp"
+        "glasshive-d0c2dae3d5cd https://glasshive.example.test/mcp"
     )
     assert payload["clients"]["claude"]["callback_port"] == 49152
     assert payload["clients"]["claude"]["callback_uri"] == (
@@ -4566,6 +4567,39 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     ).read_text(encoding="utf-8")
     assert "clients.codex?.callback_uri" in control_plane_script
     assert "clients.claude?.callback_uri" in control_plane_script
+
+
+def test_mcp_client_server_name_is_canonical_stable_and_deployment_specific():
+    upper = server_module._mcp_client_server_name(
+        "https://GLASSHIVE.EXAMPLE.TEST:443/mcp"
+    )
+    canonical = server_module._mcp_client_server_name(
+        "https://glasshive.example.test/mcp"
+    )
+    path_scoped = server_module._mcp_client_server_name(
+        "https://glasshive.example.test/team-a/mcp"
+    )
+
+    assert upper == canonical == "glasshive-d0c2dae3d5cd"
+    assert path_scoped == "glasshive-76d186f127b6"
+    assert server_module.re.fullmatch(r"glasshive-[0-9a-f]{12}", canonical)
+
+
+def test_external_ai_primary_ui_is_url_first_and_callbacks_are_admin_details():
+    page = (Path(server_module.STATIC_DIR) / "index.html").read_text(encoding="utf-8")
+    script = (Path(server_module.STATIC_DIR) / "control-plane.js").read_text(encoding="utf-8")
+
+    assert "Use GlassHive from another AI app" in page
+    assert 'id="connect-ai-server-url"' in page
+    assert 'id="copy-connect-ai-url"' in page
+    assert 'id="connect-ai-terminal-setup"' in page
+    assert 'id="connect-ai-registration-details"' in page
+    assert "Copy server address" in page
+    assert "Recommended" in page
+    assert "Do not open this address" in script
+    assert "connectAi.mcp_url" in script
+    assert "connectAi.server_name" in script
+    assert "referenceRow('Codex · Registered callback'" not in script
 
 
 def test_connect_ai_hides_false_commands_without_pre_registered_client(tmp_path, monkeypatch):
@@ -4920,7 +4954,7 @@ def test_connections_ui_keeps_primary_account_setup_short_and_actionable():
 
     assert 'id="add-provider-account"' in page
     assert 'id="connect-ai-advanced"' in page
-    assert '<summary>External AI clients</summary>' in page
+    assert '<summary>Use GlassHive from another AI app</summary>' in page
     assert "Your AI accounts and tools." not in page
     assert "Connect the subscription your workers should use." not in page
     assert 'id="provider-setup-link"' in page
