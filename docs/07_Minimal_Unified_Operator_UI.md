@@ -47,6 +47,14 @@ Calm dark glass over a bright signal core, like a modern appliance or Tesla cont
 11. For webpage, app, and browser-visible deliverables, the watch screen must end on the delivered result itself rather than a raw terminal transcript.
 11a. Chat/tool takeover links must target the configured GlassHive operator `/watch/{worker}` URL
     as the primary user-facing surface. Raw noVNC URLs are diagnostic-only.
+11b. The secondary `Open` action for a self-contained `.html` or `.htm` artifact must render the
+    page inside the existing GlassHive file landing page, not show raw markup. That preview runs in
+    a credentialless, no-referrer, unique-origin iframe sandbox with no scripts, authenticated
+    same-origin access, forms, popups, top-level navigation, connection APIs, or external
+    subresources. Ordinary link or frame navigation remains confined to that sandbox. Other text
+    formats remain escaped source previews; interactive or multi-file web apps stay on the isolated
+    workspace desktop. `Download` remains a distinct attachment action and must not navigate the
+    user into an error page.
 12. The raw live terminal session must still exist and stay available as a secondary surface for takeover and debugging.
 13. When desktop-first watch is enabled, the active worker terminal must also be visible inside the desktop itself by default so the operator can watch the real live session without leaving desktop view.
 14. The watch screen must expose a direct, obvious path to the full runtime project workspace for operators who want the richer dashboard and control plane.

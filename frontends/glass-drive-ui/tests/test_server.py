@@ -1985,7 +1985,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "Use Resume to continue from the same state" in watch_js
     assert "IDLE_REFRESH_MS" in watch_js
     assert "refreshInFlight" in watch_js
-    assert "const GLASSHIVE_UI_REV = '20260809b'" in watch_js
+    assert "const GLASSHIVE_UI_REV = '20260811a'" in watch_js
     assert "const workspaceApiBase = `/api/workspace/${workerId}`" in watch_js
     assert "/api/worker/${workerId}/live" not in watch_js
     assert '@app.get("/api/workspace/{worker_id}/live")' in (Path(server_module.__file__).read_text(encoding="utf-8"))
@@ -1997,6 +1997,8 @@ def test_launcher_workspace_hive_static_controls():
     assert "if (!isFilePreviewUrl(url))" in watch_js
     assert "currentDeliverable?.kind === 'file'" in watch_js
     assert "syncResultActions(currentDeliverable)" in watch_js
+    assert "link.download = '';" in watch_js
+    assert "download.download = '';" in watch_js
     assert 'id="artifact-list"' in watch_html
     assert "function syncArtifactList(items)" in watch_js
     assert "function liveProgressText(data)" in watch_js
@@ -2005,7 +2007,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "gh_token|gh_sig|token|signature|sig" in watch_js
     assert "data.artifacts?.items || []" in watch_js
     assert "Workspace files" in watch_js
-    assert "watch.js?v=20260809b" in watch_html
+    assert "watch.js?v=20260811a" in watch_html
     assert ".artifact-row" in styles_css
     assert "artifact-list-more" in watch_js
     assert ".artifact-list-more" in styles_css

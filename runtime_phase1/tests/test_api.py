@@ -10069,11 +10069,17 @@ def test_artifact_open_page_previews_text_without_forcing_download(tmp_path, mon
         assert opened.headers["x-content-type-options"] == "nosniff"
         assert opened.headers["x-frame-options"] == "SAMEORIGIN"
         assert "default-src 'none'" in opened.headers["content-security-policy"]
+        assert "script-src 'none'" in opened.headers["content-security-policy"]
+        assert "connect-src 'none'" in opened.headers["content-security-policy"]
+        assert "object-src 'none'" in opened.headers["content-security-policy"]
+        assert "form-action 'none'" in opened.headers["content-security-policy"]
+        assert "frame-src 'self'" in opened.headers["content-security-policy"]
         assert "frame-ancestors 'self'" in opened.headers["content-security-policy"]
         assert "GlassHive preview works." in opened.text
         assert "Download file" in opened.text
         assert "/v1/signed-links/" not in opened.text
         assert 'href="/v1/link-refs/' in opened.text
+        assert " download" in anchor_for_link_text(opened.text, "Download file")
         assert 'target="_top"' in anchor_for_link_text(opened.text, "View workspace")
         assert "gh_token=" not in opened.text
         opened_download_href = href_for_link_text(opened.text, "Download file")
@@ -10138,11 +10144,32 @@ def test_artifact_open_page_previews_text_without_forcing_download(tmp_path, mon
         assert "<script>" not in opened_svg.text
 
         html_artifact = workspace / "unsafe.html"
-        html_artifact.write_text("</pre><script>alert('x')</script>", encoding="utf-8")
+        html_artifact.write_text(
+            "<!doctype html><h1>Hello world</h1><script>parent.document.body.textContent='unsafe'</script>",
+            encoding="utf-8",
+        )
         opened_html = client.get(f"/v1/workers/{worker['worker_id']}/artifacts/open?path=unsafe.html")
         assert opened_html.status_code == 200
-        assert "</pre><script>" not in opened_html.text
-        assert "&lt;/pre&gt;&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;" in opened_html.text
+        assert '<iframe class="html-preview" sandbox credentialless referrerpolicy="no-referrer" ' in opened_html.text
+        assert "allow-scripts" not in opened_html.text
+        assert "allow-same-origin" not in opened_html.text
+        assert "&lt;h1&gt;Hello world&lt;/h1&gt;" in opened_html.text
+        assert "<script>parent.document" not in opened_html.text
+
+        source_artifact = workspace / "source.txt"
+        source_artifact.write_text("<h1>Source only</h1>", encoding="utf-8")
+        opened_source = client.get(f"/v1/workers/{worker['worker_id']}/artifacts/open?path=source.txt")
+        assert opened_source.status_code == 200
+        assert '<iframe class="html-preview"' not in opened_source.text
+        assert '<pre class="artifact-preview">&lt;h1&gt;Source only&lt;/h1&gt;</pre>' in opened_source.text
+
+        monkeypatch.setenv("GLASSHIVE_ARTIFACT_PREVIEW_MAX_BYTES", "4096")
+        large_html = workspace / "large.html"
+        large_html.write_text("<h1>Large page</h1>" + ("x" * 5000), encoding="utf-8")
+        opened_large_html = client.get(f"/v1/workers/{worker['worker_id']}/artifacts/open?path=large.html")
+        assert opened_large_html.status_code == 200
+        assert '<iframe class="html-preview"' not in opened_large_html.text
+        assert "This page is too large for a safe preview" in opened_large_html.text
 
         open_token = sign_link_token(
             kind="artifact_open",
