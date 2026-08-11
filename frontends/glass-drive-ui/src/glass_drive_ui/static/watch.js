@@ -13,7 +13,7 @@ const LONG_PRESS_MS = 550;
 const ACTIVE_REFRESH_MS = 2000;
 const IDLE_REFRESH_MS = 10000;
 const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);
-const GLASSHIVE_UI_REV = '20260811a';
+const GLASSHIVE_UI_REV = '20260811b';
 const workspaceApiBase = `/api/workspace/${workerId}`;
 
 const frame = document.getElementById('desktop-frame');
@@ -232,8 +232,7 @@ function clearAttachedView() {
 }
 
 function projectWorkspaceUrl() {
-  if (!projectId) return '';
-  return withAuth(`${runtimeBase}/ui/projects/${projectId}?worker_id=${workerId}`);
+  return '/#workspaces';
 }
 
 function syncProjectWorkspaceLinks() {
@@ -935,10 +934,8 @@ openExternal.addEventListener('click', () => {
 
 for (const button of [openProjectWorkspace, openProjectWorkspaceMenu]) {
   button.addEventListener('click', () => {
-    const url = projectWorkspaceUrl();
     closeMenu();
-    if (!url) return;
-    window.open(url, '_blank', 'noopener,noreferrer');
+    window.location.assign('/#workspaces');
   });
 }
 

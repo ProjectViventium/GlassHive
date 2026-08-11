@@ -679,6 +679,7 @@ def flatten_workspaces(
         project_url = f"/ui/projects/{project_id}?worker_id={worker_id}"
         desktop_url = f"/desktop/{worker_id}"
         api_url = f"/api/worker/{worker_id}"
+        signed_watch_url = _append_signed_worker_token(watch_url, worker_id, identity)
         items.append(
             {
                 **worker,
@@ -690,7 +691,11 @@ def flatten_workspaces(
                 "is_active": worker_state in active_states,
                 "is_resumable": worker_state in resumable_states,
                 "state_label": "retained" if worker_state == "ready" else (worker.get("state") or ""),
-                "watch_url": _append_signed_worker_token(watch_url, worker_id, identity),
+                "watch_url": signed_watch_url,
+                # Primary user navigation stays on the modern GlassHive surface.
+                # Keep project_url below as an additive compatibility contract for
+                # direct operators and older API consumers.
+                "workspace_url": signed_watch_url,
                 "project_url": _append_signed_worker_token(project_url, worker_id, identity),
                 "desktop_url": _append_signed_worker_token(desktop_url, worker_id, identity),
                 "api_url": _append_signed_worker_token(api_url, worker_id, identity),

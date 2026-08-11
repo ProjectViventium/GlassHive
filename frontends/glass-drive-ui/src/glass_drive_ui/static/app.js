@@ -1,5 +1,7 @@
-import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260810a';
-import { credentialPolicyTransition, preferredProviderAccountId } from './launch-policy.js?v=20260810a';
+import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260811b';
+import { credentialPolicyTransition, preferredProviderAccountId } from './launch-policy.js?v=20260811b';
+import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811b';
+import { compareWorkspacePriority, previewWorkerIds } from './workspace-overview.js?v=20260811b';
 
 const ACTIVE_STATES = new Set(['created', 'starting', 'queued', 'running', 'resuming']);
 const ACTIVE_RUN_STATES = new Set(['queued', 'running']);
@@ -7,14 +9,15 @@ const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']
 const INTERRUPTIBLE_STATES = new Set(['queued', 'running', 'resuming']);
 const RESUME_STATES = new Set(['ready', 'paused', 'idle', 'idle_terminated', 'stopped', 'completed', 'retained']);
 const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'terminating', 'termination_failed', 'terminated']);
-const MAX_LIVE_TILE_IFRAMES = 4;
+const MAX_VIEW_ONLY_PREVIEWS = 3;
 const ACTIVE_TILE_REFRESH_MS = 7000;
 const RETAINED_TILE_REFRESH_MS = 60000;
-const GLASSHIVE_UI_REV = '20260810a';
+const GLASSHIVE_UI_REV = '20260811b';
 let workspaceRefreshInFlight = false;
 let csrfToken = '';
 let renameWorkspaceContext = null;
 let saveTemplateContext = null;
+let workspaceVisibilityObserver = null;
 const pageParams = new URLSearchParams(window.location.search);
 const signedToken = pageParams.get('gh_token') || '';
 
@@ -86,7 +89,7 @@ function decorateCatalogWorkspace(workspace) {
     is_active: ACTIVE_STATES.has(state),
     is_resumable: RESUME_STATES.has(state),
     watch_url: `/watch/${encodeURIComponent(workerId)}?project_id=${encodeURIComponent(projectId)}&surface=desktop`,
-    project_url: `/ui/projects/${encodeURIComponent(projectId)}?worker_id=${encodeURIComponent(workerId)}`,
+    workspace_url: `/watch/${encodeURIComponent(workerId)}?project_id=${encodeURIComponent(projectId)}&surface=desktop`,
     desktop_url: `/desktop/${encodeURIComponent(workerId)}`,
     api_url: `/api/worker/${encodeURIComponent(workerId)}`,
     control_url: `/api/worker/${encodeURIComponent(workerId)}`,
@@ -439,6 +442,11 @@ function workerDesktopUrl(workerId, signedUrl = '') {
   return withUiRev(signedUrl || withAuth(`/desktop/${encodeURIComponent(String(workerId || ''))}`));
 }
 
+function workerPreviewUrl(workerId, signedUrl = '') {
+  const url = workerDesktopUrl(workerId, signedUrl);
+  return `${url}${url.includes('?') ? '&' : '?'}preview=1`;
+}
+
 function appendUrlPath(url, path) {
   const value = String(url || '');
   if (!value) return '';
@@ -506,16 +514,26 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
     return;
   }
   const normalized = String(state || '').trim().toLowerCase();
-  const alreadyHasFrame = Boolean(pane.querySelector('.workspace-live-frame'));
-  const canMountLiveFrame = alreadyHasFrame || document.querySelectorAll('.workspace-live-frame').length < MAX_LIVE_TILE_IFRAMES;
+  const alreadyHasFrame = Boolean(pane.querySelector('.workspace-live-preview'));
+  const previewIds = previewWorkerIds(
+    Array.from(document.querySelectorAll('.workspace-tile')).map((candidate) => ({
+      worker_id: candidate.dataset.workerId,
+      visible: candidate.dataset.viewportVisible === 'true',
+      active: candidate.dataset.state === 'active',
+    })),
+    MAX_VIEW_ONLY_PREVIEWS,
+  );
+  const canMountLiveFrame = alreadyHasFrame || previewIds.includes(String(workerId || ''));
   if ((ACTIVE_STATES.has(normalized) || normalized === 'running' || normalized === 'queued') && hasLiveDesktop && canMountLiveFrame) {
-    let frame = pane.querySelector('.workspace-live-frame');
+    let frame = pane.querySelector('.workspace-live-preview');
     if (!frame) {
       frame = document.createElement('iframe');
-      frame.className = 'workspace-live-frame';
+      frame.className = 'workspace-live-preview';
       frame.loading = 'lazy';
-      frame.title = 'Live workspace desktop';
-      frame.src = workerDesktopUrl(workerId, tile?.dataset.desktopUrl || '');
+      frame.title = 'View-only live workspace preview';
+      frame.tabIndex = -1;
+      frame.setAttribute('aria-hidden', 'true');
+      frame.src = workerPreviewUrl(workerId, tile?.dataset.desktopUrl || '');
       pane.replaceChildren(frame);
     }
     return;
@@ -548,15 +566,81 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
     return;
   }
 
-  const wakeButton = createButton(normalized === 'completed' ? 'Completed' : 'Resume workspace', 'workspace-glass-action');
   if (normalized === 'completed') {
-    wakeButton.dataset.intent = 'completed';
-    wakeButton.title = 'The last run completed. Click to continue this workspace with follow-up work.';
+    const note = document.createElement('div');
+    note.className = 'workspace-glass-note workspace-glass-complete';
+    note.textContent = 'Delivery ready';
+    pane.replaceChildren(note);
+    return;
   }
+  const wakeButton = createButton('Resume workspace', 'workspace-glass-action');
   wakeButton.addEventListener('click', async () => {
     await runWorkerAction(workerId, 'resume', wakeButton, refreshBootstrap);
   });
   pane.replaceChildren(wakeButton);
+}
+
+function deliveryLink(label, url, { download = false } = {}) {
+  const link = document.createElement('a');
+  link.className = 'workspace-delivery-link';
+  link.href = withAuth(String(url || ''));
+  link.textContent = label;
+  if (download) {
+    link.download = '';
+  } else {
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+  }
+  return link;
+}
+
+function renderWorkspaceDelivery(tile, data) {
+  const model = workspaceDeliveryModel(data);
+  const panel = tile.querySelector('[data-worker-delivery]');
+  const action = tile.querySelector('[data-worker-delivery-action]');
+  if (!panel || !action) return;
+  panel.replaceChildren();
+  panel.dataset.available = String(model.available);
+  action.textContent = model.available ? 'View delivery' : model.state === 'completed' ? 'View result' : 'View status';
+
+  const summary = document.createElement('p');
+  summary.className = 'workspace-delivery-summary';
+  summary.textContent = model.summary || 'No run output yet.';
+  panel.appendChild(summary);
+  if (!model.available) return;
+
+  if (model.primary) {
+    const primaryActions = document.createElement('div');
+    primaryActions.className = 'workspace-delivery-actions';
+    if (model.primary.openUrl) primaryActions.appendChild(deliveryLink('Open output', model.primary.openUrl));
+    if (model.primary.downloadUrl) primaryActions.appendChild(deliveryLink('Download', model.primary.downloadUrl, { download: true }));
+    panel.appendChild(primaryActions);
+  }
+
+  const image = model.artifacts.find((item) => item.contentType.startsWith('image/') && item.openUrl);
+  if (image) {
+    const preview = document.createElement('img');
+    preview.className = 'workspace-delivery-thumbnail';
+    preview.src = withAuth(image.openUrl);
+    preview.alt = `Latest image delivery: ${image.label}`;
+    preview.loading = 'lazy';
+    panel.appendChild(preview);
+  }
+
+  if (model.artifacts.length) {
+    const list = document.createElement('ul');
+    list.className = 'workspace-delivery-files';
+    for (const artifact of model.artifacts.slice(0, 4)) {
+      const row = document.createElement('li');
+      const label = document.createElement('span');
+      label.textContent = artifact.label;
+      row.appendChild(label);
+      if (artifact.openUrl) row.appendChild(deliveryLink('Open', artifact.openUrl));
+      if (artifact.downloadUrl) row.appendChild(deliveryLink('Download', artifact.downloadUrl, { download: true }));
+      list.appendChild(row);
+    }
+    panel.appendChild(list);
+  }
 }
 
 function displayStateForLive(data) {
@@ -588,18 +672,26 @@ function updateWorkspaceMeta(meta, profile, state, catalogDetails = null) {
 
 async function refreshWorkspaceTile(workerId, refreshBootstrap) {
   const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);
-  if (!tile) return;
+  if (!tile || tile.dataset.refreshing === 'true') return;
   const output = tile.querySelector('[data-worker-output]');
   const markNextRefresh = (delayMs) => {
     tile.dataset.liveLoaded = 'true';
     tile.dataset.nextLiveRefreshAt = String(Date.now() + delayMs);
   };
+  tile.dataset.refreshing = 'true';
   try {
-    const response = await fetch(withAuth(workerApiUrl(workerId, '/live')));
+    const response = await fetch(withAuth(workerApiUrl(workerId, '/live?compact=1')), { cache: 'no-store' });
     if (!response.ok) throw new Error(await responseMessage(response, 'Live status unavailable'));
-    const data = await response.json();
+    let data = await response.json();
     const rawState = String(data?.worker?.state || '').trim().toLowerCase() || 'unknown';
     const runState = String(data?.latest_run?.state || '').trim().toLowerCase();
+    if (runState === 'completed' && tile.dataset.deliveryLoaded !== 'true') {
+      const deliveryResponse = await fetch(withAuth(workerApiUrl(workerId, '/live')), { cache: 'no-store' });
+      if (deliveryResponse.ok) {
+        data = await deliveryResponse.json();
+        tile.dataset.deliveryLoaded = 'true';
+      }
+    }
     const state = displayStateForLive(data);
     tile.dataset.state = ACTIVE_RUN_STATES.has(runState) || ACTIVE_STATES.has(rawState)
       ? 'active'
@@ -610,6 +702,7 @@ async function refreshWorkspaceTile(workerId, refreshBootstrap) {
     updateTileControlLabels(tile, state);
     const glass = tile.querySelector('.workspace-tile-glass');
     if (glass) setGlassPane(glass, workerId, state, Boolean(data?.runtime_details?.view_available || data?.runtime_details?.view_url), refreshBootstrap);
+    renderWorkspaceDelivery(tile, data);
     const meta = tile.querySelector('[data-worker-meta]');
     updateWorkspaceMeta(meta, data?.worker?.profile, state);
     const favorite = tile.querySelector('[data-worker-favorite]');
@@ -624,6 +717,8 @@ async function refreshWorkspaceTile(workerId, refreshBootstrap) {
   } catch (error) {
     markNextRefresh(ACTIVE_TILE_REFRESH_MS);
     if (output) output.textContent = error.message;
+  } finally {
+    tile.dataset.refreshing = 'false';
   }
 }
 
@@ -631,6 +726,7 @@ async function refreshVisibleWorkspaceTiles(refreshBootstrap, { force = false } 
   if (document.hidden || workspaceRefreshInFlight) return;
   const now = Date.now();
   const workerIds = Array.from(document.querySelectorAll('.workspace-tile'))
+    .filter((tile) => tile.dataset.viewportVisible === 'true')
     .filter((tile) => tile.dataset.watchVisible === 'true' || tile.dataset.statusVisible === 'true')
     .filter((tile) => {
       if (force) return true;
@@ -685,6 +781,8 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   tile.dataset.statusVisible = String(Boolean(viewPrefs.showStatus));
   tile.dataset.liveLoaded = 'false';
   tile.dataset.nextLiveRefreshAt = '0';
+  tile.dataset.viewportVisible = 'false';
+  tile.dataset.refreshing = 'false';
 
   const glass = document.createElement('div');
   glass.className = 'workspace-tile-glass';
@@ -709,15 +807,18 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
     note.textContent = 'Checking live surface...';
     glassPane.appendChild(note);
   } else {
-    const wakeButton = createButton(state === 'completed' || state === 'ready' || state === 'retained' ? 'Completed' : 'Resume workspace', 'workspace-glass-action');
-    if (wakeButton.textContent === 'Completed') {
-      wakeButton.dataset.intent = 'completed';
-      wakeButton.title = 'The last run completed. Use Send below to continue this workspace.';
+    if (state === 'completed' || state === 'ready' || state === 'retained') {
+      const note = document.createElement('div');
+      note.className = 'workspace-glass-note workspace-glass-complete';
+      note.textContent = 'Delivery ready';
+      glassPane.appendChild(note);
+    } else {
+      const wakeButton = createButton('Resume workspace', 'workspace-glass-action');
+      wakeButton.addEventListener('click', async () => {
+        await runWorkerAction(workerId, 'resume', wakeButton, refreshBootstrap);
+      });
+      glassPane.appendChild(wakeButton);
     }
-    wakeButton.addEventListener('click', async () => {
-      await runWorkerAction(workerId, 'resume', wakeButton, refreshBootstrap);
-    });
-    glassPane.appendChild(wakeButton);
   }
   glass.appendChild(glassPane);
 
@@ -773,9 +874,13 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   const report = document.createElement('button');
   report.type = 'button';
   report.className = 'workspace-status-report workspace-status-button';
+  report.setAttribute('aria-expanded', 'false');
   report.setAttribute('aria-label', `Open latest workspace output for ${workspaceTileTitle(workspace)}`);
   report.addEventListener('click', () => {
-    window.location.href = String(workspace.watch_url || '#');
+    const panel = tile.querySelector('[data-worker-delivery]');
+    if (!panel) return;
+    panel.hidden = !panel.hidden;
+    report.setAttribute('aria-expanded', String(!panel.hidden));
   });
   const reportHead = document.createElement('span');
   reportHead.className = 'workspace-report-head';
@@ -784,7 +889,8 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   reportLabel.textContent = 'Latest workspace output';
   const reportAction = document.createElement('span');
   reportAction.className = 'workspace-report-action';
-  reportAction.textContent = 'Open status';
+  reportAction.dataset.workerDeliveryAction = 'true';
+  reportAction.textContent = 'View delivery';
   reportHead.append(reportLabel, reportAction);
   const liveOutput = document.createElement('span');
   liveOutput.className = 'workspace-live-output';
@@ -792,6 +898,16 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   liveOutput.textContent = 'Loading workspace status...';
   report.append(reportHead, liveOutput);
   body.appendChild(report);
+
+  const deliveryPanel = document.createElement('section');
+  deliveryPanel.className = 'workspace-delivery-panel';
+  deliveryPanel.dataset.workerDelivery = 'true';
+  deliveryPanel.hidden = true;
+  const deliveryPlaceholder = document.createElement('p');
+  deliveryPlaceholder.className = 'workspace-delivery-summary';
+  deliveryPlaceholder.textContent = 'Loading workspace status...';
+  deliveryPanel.appendChild(deliveryPlaceholder);
+  body.appendChild(deliveryPanel);
 
   const actions = document.createElement('div');
   actions.className = 'workspace-tile-actions';
@@ -809,17 +925,11 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   });
   actions.appendChild(favorite);
 
-  const watch = createButton('Full watch');
+  const watch = createButton('Open workspace');
   watch.addEventListener('click', async () => {
     await openWorkspaceSurface(workspace, watch);
   });
   actions.appendChild(watch);
-
-  const project = createButton('Project');
-  project.addEventListener('click', () => {
-    window.location.href = String(workspace.project_url || '#');
-  });
-  actions.appendChild(project);
 
   const duplicate = createButton('Duplicate');
   duplicate.addEventListener('click', () => duplicateSavedWorkspace(workspace, duplicate, refreshBootstrap));
@@ -979,7 +1089,7 @@ async function openWorkspaceSurface(workspace, button) {
       if (button) button.textContent = 'Resuming…';
       await postJson(workerApiUrl(workerId, '/action/resume'));
     }
-    window.location.href = String(workspace?.watch_url || '#');
+    window.location.href = String(workspace?.workspace_url || workspace?.watch_url || '#');
   } catch (error) {
     const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);
     const output = tile?.querySelector('[data-worker-output]');
@@ -1087,6 +1197,34 @@ function openRenameWorkspace(workspace, refreshBootstrap) {
   input.select();
 }
 
+function observeWorkspaceTiles(grid, refreshBootstrap) {
+  workspaceVisibilityObserver?.disconnect();
+  workspaceVisibilityObserver = null;
+  const tiles = Array.from(grid.querySelectorAll('.workspace-tile'));
+  if (!('IntersectionObserver' in window)) {
+    for (const tile of tiles) tile.dataset.viewportVisible = 'true';
+    return;
+  }
+  workspaceVisibilityObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      const tile = entry.target;
+      tile.dataset.viewportVisible = String(entry.isIntersecting);
+      if (!entry.isIntersecting) {
+        const frame = tile.querySelector('.workspace-live-preview');
+        if (frame) {
+          const note = document.createElement('div');
+          note.className = 'workspace-glass-note';
+          note.textContent = 'Live preview paused offscreen';
+          frame.closest('[data-worker-glass]')?.replaceChildren(note);
+        }
+        continue;
+      }
+      refreshWorkspaceTile(String(tile.dataset.workerId || ''), refreshBootstrap).catch(() => {});
+    }
+  }, { rootMargin: '240px 0px', threshold: 0.01 });
+  for (const tile of tiles) workspaceVisibilityObserver.observe(tile);
+}
+
 function renderWorkspaceHive(data, refreshBootstrap, viewPrefs = defaultHivePrefs) {
   const grid = document.getElementById('workspace-hive-grid');
   const empty = document.getElementById('workspace-hive-empty');
@@ -1102,8 +1240,9 @@ function renderWorkspaceHive(data, refreshBootstrap, viewPrefs = defaultHivePref
   const active = workspaces.filter((workspace) => isWorkspaceActive(workspace));
   const resumable = workspaces.filter((workspace) => !isWorkspaceActive(workspace) && isWorkspaceResumable(workspace));
   const inactive = workspaces.filter((workspace) => !isWorkspaceActive(workspace) && !isWorkspaceResumable(workspace));
-  const sortFavorites = (items) => [...items].sort((left, right) => Number(Boolean(right.favorite)) - Number(Boolean(left.favorite)));
-  const visible = prefs.showInactive ? sortFavorites([...active, ...resumable, ...inactive]) : sortFavorites(active);
+  const visible = prefs.showInactive
+    ? [...active, ...resumable, ...inactive].sort(compareWorkspacePriority)
+    : [...active].sort(compareWorkspacePriority);
 
   summary.textContent = prefs.showInactive
     ? `${active.length} active · ${resumable.length} retained · ${inactive.length} inactive · ${workspaces.length} loaded`
@@ -1134,6 +1273,7 @@ function renderWorkspaceHive(data, refreshBootstrap, viewPrefs = defaultHivePref
     return renderWorkspaceTile(workspace, refreshBootstrap, drafts.get(workerId) || '', prefs, data || {});
   });
   grid.replaceChildren(...tiles);
+  observeWorkspaceTiles(grid, refreshBootstrap);
   refreshVisibleWorkspaceTiles(refreshBootstrap, { force: true }).catch(() => {});
 }
 

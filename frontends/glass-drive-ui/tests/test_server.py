@@ -896,6 +896,7 @@ def test_bootstrap_and_launch_flow():
     assert boot.json()['existing_workspaces'][0]['is_resumable'] is True
     assert boot.json()['existing_workspaces'][0]['state_label'] == 'retained'
     assert boot.json()['existing_workspaces'][0]['watch_url'] == '/watch/wrk_1?project_id=prj_1&surface=desktop'
+    assert boot.json()['existing_workspaces'][0]['workspace_url'] == '/watch/wrk_1?project_id=prj_1&surface=desktop'
     assert boot.json()['existing_workspaces'][0]['project_url'] == '/ui/projects/prj_1?worker_id=wrk_1'
     assert boot.json()['existing_workspaces'][0]['desktop_url'] == '/desktop/wrk_1'
     assert boot.json()['existing_workspaces'][0]['api_url'] == '/api/worker/wrk_1'
@@ -1593,6 +1594,7 @@ def test_bootstrap_exposes_paused_workers_as_resumable_workspaces():
             "is_resumable": True,
             "state_label": "paused",
             "watch_url": "/watch/wrk_idle?project_id=prj_1&surface=desktop",
+            "workspace_url": "/watch/wrk_idle?project_id=prj_1&surface=desktop",
             "project_url": "/ui/projects/prj_1?worker_id=wrk_idle",
                 "desktop_url": "/desktop/wrk_idle",
                 "api_url": "/api/worker/wrk_idle",
@@ -1616,15 +1618,17 @@ def test_watch_assets_render():
     assert 'Inactive Workspaces' in home.text
     assert 'Status Report' in home.text
     assert 'Glass Drive' not in home.text
+    assert '<a class="brand-mark" href="/" aria-label="GlassHive home">GlassHive</a>' in home.text
     watch = client.get('/watch/wrk_1')
     assert watch.status_code == 200
     assert 'GlassHive' in watch.text
     assert 'Workspace live view' in watch.text
-    assert 'Open project workspace' in watch.text
+    assert 'Back to workspaces' in watch.text
     assert 'Open worker details' in watch.text
     assert 'Send redirects now' in watch.text
     assert 'Hold Send or Cmd/Ctrl+Enter to queue instead' in watch.text
     assert 'Glass Drive' not in watch.text
+    assert '<a class="brand-mark" href="/#workspaces" aria-label="Back to GlassHive workspaces">GlassHive</a>' in watch.text
     desktop = client.get('/desktop/wrk_1')
     assert desktop.status_code == 200
     assert 'GlassHive Desktop' in desktop.text
@@ -1849,8 +1853,9 @@ def test_launcher_workspace_hive_static_controls():
     watch_html = (static_dir / "watch.html").read_text(encoding="utf-8")
     watch_js = (static_dir / "watch.js").read_text(encoding="utf-8")
     desktop_html = (static_dir / "desktop.html").read_text(encoding="utf-8")
-    assert "workspace-live-frame" in app_js
-    assert "MAX_LIVE_TILE_IFRAMES" in app_js
+    assert "workspace-live-preview" in app_js
+    assert "workspace-live-frame" not in app_js
+    assert "MAX_VIEW_ONLY_PREVIEWS = 3" in app_js
     assert "RETAINED_TILE_REFRESH_MS" in app_js
     assert "dataset.nextLiveRefreshAt" in app_js
     assert "document.hidden" in app_js
@@ -1864,11 +1869,26 @@ def test_launcher_workspace_hive_static_controls():
     assert "appendUrlPath" in app_js
     assert "deployment_default_workspace_option" in app_js
     assert "dataset.watchVisible !== 'false'" in app_js
-    assert "dataset.watchVisible === 'true' || tile.dataset.statusVisible === 'true'" in app_js
-    assert "Full watch" in app_js
+    assert "dataset.viewportVisible === 'true'" in app_js
+    assert "new IntersectionObserver" in app_js
+    assert "workerApiUrl(workerId, '/live?compact=1')" in app_js
+    assert "tile.dataset.refreshing" in app_js
+    assert "preview=1" in app_js
+    assert "frame.tabIndex = -1" in app_js
+    assert "rfb.viewOnly = viewOnly" in desktop_js
+    assert "rfb.focusOnClick = !viewOnly" in desktop_js
+    assert "Open workspace" in app_js
     assert "workspace-status-button" in app_js
     assert "Open latest workspace output" in app_js
-    assert "Open status" in app_js
+    assert "View delivery" in app_js
+    assert "renderWorkspaceDelivery" in app_js
+    assert "workspace-delivery-panel" in app_js
+    assert "Delivery ready" in app_js
+    assert "normalized === 'completed' ? 'Completed'" not in app_js
+    assert "workspace?.workspace_url || workspace?.watch_url" in app_js
+    assert "workspace.project_url" not in app_js
+    assert "runtimeBase}/ui/projects" not in watch_js
+    assert "window.location.assign('/#workspaces')" in watch_js
     assert "Status Report" in index_html
     assert "Inactive Workspaces" in index_html
     assert "/api/workspaces/${encodeURIComponent(workerId)}/duplicate" in app_js
@@ -1960,11 +1980,11 @@ def test_launcher_workspace_hive_static_controls():
     assert "Workspace complete" in desktop_js
     assert "The latest output and workspace files are available from the status panel" in desktop_js
     assert "Clipboard sync: inactive until workspace resumes" in desktop_js
-    assert "desktop.js?v=20260810b" in desktop_html
+    assert "desktop.js?v=20260811b" in desktop_html
     assert 'id="workspace-status-link"' in desktop_html
     assert "showWorkspaceLink: true" in desktop_js
     assert "Open workspace status and files" in desktop_html
-    assert "styles.css?v=20260810a" in watch_html
+    assert "styles.css?v=20260811b" in watch_html
     assert "}, 5000);" not in desktop_js
     assert 'id="project-files"' in index_html
     assert 'id="schedule-text"' in index_html
@@ -1985,7 +2005,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "Use Resume to continue from the same state" in watch_js
     assert "IDLE_REFRESH_MS" in watch_js
     assert "refreshInFlight" in watch_js
-    assert "const GLASSHIVE_UI_REV = '20260811a'" in watch_js
+    assert "const GLASSHIVE_UI_REV = '20260811b'" in watch_js
     assert "const workspaceApiBase = `/api/workspace/${workerId}`" in watch_js
     assert "/api/worker/${workerId}/live" not in watch_js
     assert '@app.get("/api/workspace/{worker_id}/live")' in (Path(server_module.__file__).read_text(encoding="utf-8"))
@@ -2007,7 +2027,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "gh_token|gh_sig|token|signature|sig" in watch_js
     assert "data.artifacts?.items || []" in watch_js
     assert "Workspace files" in watch_js
-    assert "watch.js?v=20260811a" in watch_html
+    assert "watch.js?v=20260811b" in watch_html
     assert ".artifact-row" in styles_css
     assert "artifact-list-more" in watch_js
     assert ".artifact-list-more" in styles_css
@@ -2536,10 +2556,13 @@ def test_bootstrap_signs_workspace_links_in_enterprise_mode(monkeypatch):
     assert response.status_code == 200
     workspace = response.json()["existing_workspaces"][0]
     watch_ref = worker_ref_record(workspace["watch_url"])
+    workspace_ref = worker_ref_record(workspace["workspace_url"])
     project_ref = worker_ref_record(workspace["project_url"])
     desktop_ref = worker_ref_record(workspace["desktop_url"])
     api_ref = worker_ref_record(workspace["api_url"])
     assert str(watch_ref["target_url"]).startswith("/watch/wrk_1?")
+    assert workspace["workspace_url"] == workspace["watch_url"]
+    assert str(workspace_ref["target_url"]).startswith("/watch/wrk_1?")
     assert str(project_ref["target_url"]).startswith("/ui/projects/prj_1?")
     assert str(desktop_ref["target_url"]) == "/desktop/wrk_1"
     assert str(api_ref["target_url"]) == "/api/worker/wrk_1"
@@ -4972,6 +4995,75 @@ def test_launch_ui_uses_the_sole_ready_personal_account_without_silent_fallback(
             "savedPersonalPolicy": "",
             "forcedLegacy": False,
         },
+    }
+
+
+def test_workspace_delivery_model_exposes_completed_output_without_stale_failure_actions():
+    module = (Path(server_module.STATIC_DIR) / "delivery-presenter.js").as_uri()
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ workspaceDeliveryModel }} from {json.dumps(module)};"
+                "const completed = workspaceDeliveryModel({latest_run:{state:'completed'},latest_output:'Finished the page',"
+                "deliverable:{kind:'file',label:'index.html',open_url:'/v1/link-refs/open',download_url:'/v1/link-refs/down'},"
+                "artifacts:{items:[{path:'workspace/index.html',content_type:'text/html',open_url:'/v1/link-refs/open',download_url:'/v1/link-refs/down'},"
+                "{path:'workspace/preview.png',content_type:'image/png',open_url:'/v1/link-refs/image'}]}});"
+                "const failed = workspaceDeliveryModel({latest_run:{state:'failed'},latest_output:'Build failed',"
+                "deliverable:{kind:'file',open_url:'/stale'},artifacts:{items:[{path:'stale.txt',open_url:'/stale'}]}});"
+                "process.stdout.write(JSON.stringify({completed,failed}));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["completed"]["available"] is True
+    assert payload["completed"]["summary"] == "Finished the page"
+    assert payload["completed"]["primary"]["openUrl"] == "/v1/link-refs/open"
+    assert payload["completed"]["primary"]["downloadUrl"] == "/v1/link-refs/down"
+    assert [item["label"] for item in payload["completed"]["artifacts"]] == [
+        "workspace/index.html",
+        "workspace/preview.png",
+    ]
+    assert payload["failed"] == {
+        "available": False,
+        "state": "failed",
+        "summary": "Build failed",
+        "primary": None,
+        "artifacts": [],
+    }
+
+
+def test_workspace_overview_orders_attention_then_favorites_and_bounds_preview_budget():
+    module = (Path(server_module.STATIC_DIR) / "workspace-overview.js").as_uri()
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ compareWorkspacePriority, previewWorkerIds }} from {json.dumps(module)};"
+                "const items=["
+                "{worker_id:'normal',state:'running',favorite:false},"
+                "{worker_id:'favorite',state:'ready',favorite:true},"
+                "{worker_id:'failed',state:'failed',favorite:false},"
+                "{worker_id:'blocked',state:'action_required',favorite:false}];"
+                "items.sort(compareWorkspacePriority);"
+                "const previews=previewWorkerIds(Array.from({length:7},(_,i)=>({worker_id:`w${i}`,visible:i!==1,active:true})),3);"
+                "process.stdout.write(JSON.stringify({order:items.map(x=>x.worker_id),previews}));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "order": ["blocked", "failed", "favorite", "normal"],
+        "previews": ["w0", "w2", "w3"],
     }
 
 
