@@ -146,7 +146,11 @@ def _env_enabled(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 ARTIFACT_OPEN_SECURITY_HEADERS = {
     "Cache-Control": "no-store, no-cache, private, max-age=0",
-    "Content-Security-Policy": "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'self'",
+    "Content-Security-Policy": (
+        "default-src 'none'; script-src 'none'; connect-src 'none'; object-src 'none'; "
+        "form-action 'none'; img-src data:; style-src 'unsafe-inline'; frame-src 'self'; "
+        "base-uri 'none'; frame-ancestors 'self'"
+    ),
     "Pragma": "no-cache",
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
@@ -1226,7 +1230,22 @@ def create_app(
         media_type = _artifact_mime_type(target)
         size = len(content)
         preview = ""
-        if _is_text_preview_artifact(target, media_type):
+        if target.suffix.lower() in {".htm", ".html"} and media_type == "text/html":
+            text, truncated = _read_artifact_text_preview(content)
+            if truncated:
+                preview = (
+                    "<div class=\"no-preview\">"
+                    "<h2>Page is ready</h2>"
+                    "<p>This page is too large for a safe preview. Download it to open the complete artifact.</p>"
+                    "</div>"
+                )
+            else:
+                preview = (
+                    '<iframe class="html-preview" sandbox credentialless referrerpolicy="no-referrer" '
+                    f'title="Rendered preview of {escape(target.name, quote=True)}" '
+                    f'srcdoc="{escape(text, quote=True)}"></iframe>'
+                )
+        elif _is_text_preview_artifact(target, media_type):
             text, truncated = _read_artifact_text_preview(content)
             truncated_note = (
                 "<p class=\"notice\">Preview is truncated. Use Download file for the complete artifact.</p>"
@@ -1265,6 +1284,7 @@ def create_app(
     h1 {{ margin: 0 0 8px; font-size: clamp(28px, 5vw, 56px); line-height: 1; overflow-wrap: anywhere; }}
     .meta {{ color: #a9b2c0; margin-bottom: 24px; }}
     .artifact-preview {{ margin: 0; padding: 24px; border: 1px solid rgba(255,255,255,0.14); border-radius: 14px; background: #10141b; color: #eef2f7; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; font-size: 14px; }}
+    .html-preview {{ display: block; width: 100%; min-height: min(72vh, 760px); border: 1px solid rgba(255,255,255,0.14); border-radius: 14px; background: #fff; }}
     .notice, .no-preview {{ border: 1px solid rgba(255,255,255,0.14); border-radius: 14px; background: #10141b; padding: 18px; color: #cbd3df; }}
     .image-preview {{ max-width: 100%; border-radius: 14px; border: 1px solid rgba(255,255,255,0.14); background: #10141b; }}
   </style>
@@ -1274,7 +1294,7 @@ def create_app(
     <div class="topbar">
       <div class="brand">GlassHive</div>
       <div class="actions">
-        <a class="button" href="{escape(download_url, quote=True)}">Download file</a>
+        <a class="button" download href="{escape(download_url, quote=True)}">Download file</a>
         <a class="button secondary" href="{escape(workspace_url, quote=True)}" target="_top" rel="noopener noreferrer">View workspace</a>
       </div>
     </div>

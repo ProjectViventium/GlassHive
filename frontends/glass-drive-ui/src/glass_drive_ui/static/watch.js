@@ -13,7 +13,7 @@ const LONG_PRESS_MS = 550;
 const ACTIVE_REFRESH_MS = 2000;
 const IDLE_REFRESH_MS = 10000;
 const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);
-const GLASSHIVE_UI_REV = '20260809b';
+const GLASSHIVE_UI_REV = '20260811a';
 const workspaceApiBase = `/api/workspace/${workerId}`;
 
 const frame = document.getElementById('desktop-frame');
@@ -506,7 +506,7 @@ function syncResultActions(deliverable) {
     const openUrl = String(deliverable.open_url || deliverable.browser_url || '');
     const downloadUrl = String(deliverable.download_url || '');
     if (openUrl) actions.push({ label: 'Open file', url: openUrl, primary: true });
-    if (downloadUrl) actions.push({ label: 'Download file', url: downloadUrl, primary: false });
+    if (downloadUrl) actions.push({ label: 'Download file', url: downloadUrl, primary: false, download: true });
   }
   resultActions.hidden = actions.length === 0;
   for (const action of actions) {
@@ -514,8 +514,12 @@ function syncResultActions(deliverable) {
     link.className = `result-action${action.primary ? ' primary' : ''}`;
     link.href = action.url;
     link.textContent = action.label;
-    link.target = '_blank';
-    link.rel = 'noopener noreferrer';
+    if (action.download) {
+      link.download = '';
+    } else {
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+    }
     resultActions.appendChild(link);
   }
 }
@@ -571,8 +575,7 @@ function syncArtifactList(items) {
       const download = document.createElement('a');
       download.className = 'artifact-link';
       download.href = String(file.download_url);
-      download.target = '_blank';
-      download.rel = 'noopener noreferrer';
+      download.download = '';
       download.textContent = 'Download';
       row.appendChild(download);
     }
