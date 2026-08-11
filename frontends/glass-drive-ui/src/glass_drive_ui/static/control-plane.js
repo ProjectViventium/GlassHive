@@ -2,8 +2,8 @@ import {
   recurrenceSubmissionPolicy,
   scheduleEditorType,
   zonedDateTimeLocalValue,
-} from './schedule-policy.js?v=20260811h';
-import { equivalentReapprovalScopes } from './capability-review.js?v=20260811h';
+} from './schedule-policy.js?v=20260811i';
+import { equivalentReapprovalScopes } from './capability-review.js?v=20260811i';
 
 const SUPPORT_COPY = {
   supported: 'Ready to connect',

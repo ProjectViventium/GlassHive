@@ -2850,8 +2850,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                     f"-c mcp_oauth_callback_port={codex_callback_port_number} "
                     f"-c {codex_callback_url_override} "
                     f"{server_name} --url {shlex.quote(mcp_url)} "
-                    f"--oauth-client-id {shlex.quote(codex_client_id)} "
-                    f"--oauth-resource {shlex.quote(codex_resource)}"
+                    f"--oauth-client-id {shlex.quote(codex_client_id)}"
                 ),
                 "login_command": (
                     "codex mcp login "

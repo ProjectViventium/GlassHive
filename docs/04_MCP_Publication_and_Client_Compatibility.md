@@ -210,8 +210,12 @@ completes sign-in in the browser profile opened by the
 client, or copies the client-provided authorization URL into the browser profile they intend to use.
 The browser does not claim it can edit local client configuration itself.
 
-The generated command may carry a public client id, canonical resource, and fixed callback flags as
-opaque setup arguments. Human-facing callback addresses and registration explanations remain only in
+The generated command may carry a public client id and fixed callback flags as opaque setup
+arguments. GlassHive still validates that the configured Codex resource exactly equals the canonical
+MCP URL, but current Codex discovers that resource from the protected-resource metadata. The setup
+command must not also pass `--oauth-resource`, because doing both produces two OAuth `resource`
+parameters and standards-compliant identity providers reject the malformed request. Human-facing
+callback addresses and registration explanations remain only in
 the administrator disclosure; they are never presented as links or user steps.
 
 `Manual` exposes the exact server address and official client commands rather than asking users to
@@ -219,7 +223,7 @@ edit hidden configuration. `<SERVER_NAME>` is the stable `glasshive-<12 hex>` na
 canonical deployment URL, so multiple independent self-hosted origins do not collide:
 
 ```text
-codex mcp add -c mcp_oauth_callback_port=<REGISTERED_PORT> -c 'mcp_oauth_callback_url="http://127.0.0.1:<REGISTERED_PORT>/callback"' <SERVER_NAME> --url <MCP_URL> --oauth-client-id <REGISTERED_CLIENT_ID> --oauth-resource <MCP_URL>
+codex mcp add -c mcp_oauth_callback_port=<REGISTERED_PORT> -c 'mcp_oauth_callback_url="http://127.0.0.1:<REGISTERED_PORT>/callback"' <SERVER_NAME> --url <MCP_URL> --oauth-client-id <REGISTERED_CLIENT_ID>
 codex mcp login -c mcp_oauth_callback_port=<REGISTERED_PORT> -c 'mcp_oauth_callback_url="http://127.0.0.1:<REGISTERED_PORT>/callback"' <SERVER_NAME>
 claude mcp add --transport http --scope user --client-id <REGISTERED_CLIENT_ID> --callback-port <REGISTERED_PORT> <SERVER_NAME> <MCP_URL>
 ```

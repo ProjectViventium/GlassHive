@@ -2070,14 +2070,14 @@ def test_launcher_workspace_hive_static_controls():
     assert "Workspace complete" in desktop_js
     assert "The latest output and workspace files are available from the status panel" in desktop_js
     assert "Clipboard sync: inactive until workspace resumes" in desktop_js
-    assert "desktop.js?v=20260811h" in desktop_html
-    assert "desktop.css?v=20260811h" in desktop_html
+    assert "desktop.js?v=20260811i" in desktop_html
+    assert "desktop.css?v=20260811i" in desktop_html
     assert "<style" not in desktop_html
     assert "#desktop-overlay" in desktop_css
     assert 'id="workspace-status-link"' in desktop_html
     assert "showWorkspaceLink: true" in desktop_js
     assert "Open workspace status and files" in desktop_html
-    assert "styles.css?v=20260811h" in watch_html
+    assert "styles.css?v=20260811i" in watch_html
     assert "}, 5000);" not in desktop_js
     assert 'id="project-files"' in index_html
     assert 'id="schedule-text"' in index_html
@@ -2098,7 +2098,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "Use Resume to continue from the same state" in watch_js
     assert "IDLE_REFRESH_MS" in watch_js
     assert "refreshInFlight" in watch_js
-    assert "const GLASSHIVE_UI_REV = '20260811h'" in watch_js
+    assert "const GLASSHIVE_UI_REV = '20260811i'" in watch_js
     assert "const workspaceApiBase = `/api/workspace/${workerId}`" in watch_js
     assert "/api/worker/${workerId}/live" not in watch_js
     assert '@app.get("/api/workspace/{worker_id}/live")' in (Path(server_module.__file__).read_text(encoding="utf-8"))
@@ -2120,7 +2120,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "gh_token|gh_sig|token|signature|sig" in watch_js
     assert "data.artifacts?.items || []" in watch_js
     assert "Workspace files" in watch_js
-    assert "watch.js?v=20260811h" in watch_html
+    assert "watch.js?v=20260811i" in watch_html
     assert ".artifact-row" in styles_css
     assert "artifact-list-more" in watch_js
     assert ".artifact-list-more" in styles_css
@@ -4853,9 +4853,9 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
         "codex mcp add -c mcp_oauth_callback_port=49153 "
         "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive-d0c2dae3d5cd "
         "--url https://glasshive.example.test/mcp "
-        "--oauth-client-id registered-codex-client "
-        "--oauth-resource https://glasshive.example.test/mcp"
+        "--oauth-client-id registered-codex-client"
     )
+    assert "--oauth-resource" not in payload["clients"]["codex"]["add_command"]
     assert payload["clients"]["codex"]["login_command"] == (
         "codex mcp login -c mcp_oauth_callback_port=49153 "
         "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive-d0c2dae3d5cd"
@@ -5451,7 +5451,19 @@ def test_workspace_delivery_model_exposes_completed_output_without_stale_failure
                 "{path:'workspace/preview.png',content_type:'image/png',open_url:'/v1/link-refs/image'}]}});"
                 "const failed = workspaceDeliveryModel({latest_run:{state:'failed'},latest_output:'Build failed',"
                 "deliverable:{kind:'file',open_url:'/stale'},artifacts:{items:[{path:'stale.txt',open_url:'/stale'}]}});"
-                "process.stdout.write(JSON.stringify({completed,failed}));"
+                "const hosted = workspaceDeliveryModel({latest_run:{state:'completed'},latest_output:'Hosted page ready',"
+                "deliverable:{kind:'webpage',label:'index.html',browser_url:'file:///workspace/project/index.html'},"
+                "artifacts:{items:[{path:'workspace/preview.png',open_url:'/v1/link-refs/image'},"
+                "{path:'workspace/index.html',content_type:'text/html',open_url:'/v1/link-refs/hosted-open',download_url:'/v1/link-refs/hosted-down'}]}});"
+                "const duplicateBasename = workspaceDeliveryModel({latest_run:{state:'completed'},latest_output:'Exact page ready',"
+                "deliverable:{kind:'webpage',label:'index.html',workspace_path:'dist/index.html',browser_url:'file:///workspace/project/dist/index.html'},"
+                "artifacts:{items:[{path:'docs/index.html',open_url:'/v1/link-refs/wrong'},"
+                "{path:'dist/index.html',open_url:'/v1/link-refs/exact',download_url:'/v1/link-refs/exact-down'}]}});"
+                "const rootDuplicate = workspaceDeliveryModel({latest_run:{state:'completed'},latest_output:'Root page ready',"
+                "deliverable:{kind:'webpage',label:'index.html',workspace_path:'index.html',browser_url:'file:///workspace/project/index.html'},"
+                "artifacts:{items:[{path:'docs/index.html',open_url:'/v1/link-refs/root-wrong'},"
+                "{path:'index.html',open_url:'/v1/link-refs/root-exact'}]}});"
+                "process.stdout.write(JSON.stringify({completed,failed,hosted,duplicateBasename,rootDuplicate}));"
             ),
         ],
         check=True,
@@ -5474,6 +5486,17 @@ def test_workspace_delivery_model_exposes_completed_output_without_stale_failure
         "primary": None,
         "artifacts": [],
     }
+    assert payload["hosted"]["primary"] == {
+        "label": "workspace/index.html",
+        "contentType": "text/html",
+        "openUrl": "/v1/link-refs/hosted-open",
+        "downloadUrl": "/v1/link-refs/hosted-down",
+    }
+    assert not payload["hosted"]["primary"]["openUrl"].startswith("file:")
+    assert payload["duplicateBasename"]["primary"]["label"] == "dist/index.html"
+    assert payload["duplicateBasename"]["primary"]["openUrl"] == "/v1/link-refs/exact"
+    assert payload["rootDuplicate"]["primary"]["label"] == "index.html"
+    assert payload["rootDuplicate"]["primary"]["openUrl"] == "/v1/link-refs/root-exact"
 
 
 def test_workspace_overview_orders_attention_bounds_previews_and_rehydrates_each_completed_run():
@@ -5613,7 +5636,7 @@ def test_local_password_login_is_explicit_same_origin_and_has_no_signup_surface(
     assert config.json()["oidc_login_visible"] is False
     assert config.json()["login_methods"] == ["local_password"]
     assert 'id="local-login"' in page.text
-    assert '/static/auth.js?v=20260811h' in page.text
+    assert '/static/auth.js?v=20260811i' in page.text
     assert page.headers["cache-control"] == "no-store, no-cache, private, max-age=0"
     assert login_csrf
     assert client.get("/auth/email/register").status_code == 404

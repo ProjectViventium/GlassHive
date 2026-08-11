@@ -1,7 +1,7 @@
-import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260811h';
-import { credentialPolicyTransition, preferredProviderAccountId } from './launch-policy.js?v=20260811h';
-import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811h';
-import { compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery } from './workspace-overview.js?v=20260811h';
+import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260811i';
+import { credentialPolicyTransition, preferredProviderAccountId } from './launch-policy.js?v=20260811i';
+import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811i';
+import { compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery } from './workspace-overview.js?v=20260811i';
 
 const ACTIVE_STATES = new Set(['created', 'starting', 'queued', 'running', 'resuming']);
 const ACTIVE_RUN_STATES = new Set(['queued', 'running']);
@@ -12,7 +12,7 @@ const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'terminating', '
 const MAX_VIEW_ONLY_PREVIEWS = 3;
 const ACTIVE_TILE_REFRESH_MS = 7000;
 const RETAINED_TILE_REFRESH_MS = 60000;
-const GLASSHIVE_UI_REV = '20260811h';
+const GLASSHIVE_UI_REV = '20260811i';
 const CAPABILITY_REVIEW_KEY = 'glasshive.capability-review';
 let workspaceRefreshInFlight = false;
 let csrfToken = '';

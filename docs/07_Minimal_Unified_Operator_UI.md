@@ -131,6 +131,9 @@ need to choose between `open` and `resume`.
 
 Opening or downloading an existing delivery is always read-only. A completed workspace restarts
 only through an explicit `Continue` or new-message action; output inspection never calls resume.
+Worker-local targets such as `file:///workspace/...` are never browser delivery links. If an older
+deliverable record has only that internal target, Workspaces promotes the matching owner-scoped
+artifact Open/Download refs instead.
 
 ### V1 Action Set
 
