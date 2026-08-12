@@ -2070,14 +2070,14 @@ def test_launcher_workspace_hive_static_controls():
     assert "Workspace complete" in desktop_js
     assert "The latest output and workspace files are available from the status panel" in desktop_js
     assert "Clipboard sync: inactive until workspace resumes" in desktop_js
-    assert "desktop.js?v=20260811i" in desktop_html
-    assert "desktop.css?v=20260811i" in desktop_html
+    assert "desktop.js?v=20260811j" in desktop_html
+    assert "desktop.css?v=20260811j" in desktop_html
     assert "<style" not in desktop_html
     assert "#desktop-overlay" in desktop_css
     assert 'id="workspace-status-link"' in desktop_html
     assert "showWorkspaceLink: true" in desktop_js
     assert "Open workspace status and files" in desktop_html
-    assert "styles.css?v=20260811i" in watch_html
+    assert "styles.css?v=20260811j" in watch_html
     assert "}, 5000);" not in desktop_js
     assert 'id="project-files"' in index_html
     assert 'id="schedule-text"' in index_html
@@ -2098,7 +2098,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "Use Resume to continue from the same state" in watch_js
     assert "IDLE_REFRESH_MS" in watch_js
     assert "refreshInFlight" in watch_js
-    assert "const GLASSHIVE_UI_REV = '20260811i'" in watch_js
+    assert "const GLASSHIVE_UI_REV = '20260811j'" in watch_js
     assert "const workspaceApiBase = `/api/workspace/${workerId}`" in watch_js
     assert "/api/worker/${workerId}/live" not in watch_js
     assert '@app.get("/api/workspace/{worker_id}/live")' in (Path(server_module.__file__).read_text(encoding="utf-8"))
@@ -2120,7 +2120,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "gh_token|gh_sig|token|signature|sig" in watch_js
     assert "data.artifacts?.items || []" in watch_js
     assert "Workspace files" in watch_js
-    assert "watch.js?v=20260811i" in watch_html
+    assert "watch.js?v=20260811j" in watch_html
     assert ".artifact-row" in styles_css
     assert "artifact-list-more" in watch_js
     assert ".artifact-list-more" in styles_css
@@ -2137,6 +2137,18 @@ def test_launcher_workspace_hive_static_controls():
     assert '"brand controls"' in styles_css
     assert '.watch-meta-line p' in styles_css
     assert 'white-space: normal' in styles_css
+
+
+def test_open_completed_workspace_never_resumes_compute_implicitly():
+    app_js = (Path(server_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
+    start = app_js.index("async function openWorkspaceSurface")
+    end = app_js.index("async function runWorkerAction", start)
+    open_workspace = app_js[start:end]
+
+    assert "workspace?.workspace_url || workspace?.watch_url" in open_workspace
+    assert "['paused', 'idle', 'idle_terminated', 'stopped'].includes(rawWorkspaceState(workspace))" in open_workspace
+    assert "Boolean(workspace?.compute_released_at)" not in open_workspace
+    assert "'/action/resume'" in open_workspace
 
 
 def test_watch_authenticated_actions_forward_current_csrf_cookie():
@@ -5636,7 +5648,7 @@ def test_local_password_login_is_explicit_same_origin_and_has_no_signup_surface(
     assert config.json()["oidc_login_visible"] is False
     assert config.json()["login_methods"] == ["local_password"]
     assert 'id="local-login"' in page.text
-    assert '/static/auth.js?v=20260811i' in page.text
+    assert '/static/auth.js?v=20260811j' in page.text
     assert page.headers["cache-control"] == "no-store, no-cache, private, max-age=0"
     assert login_csrf
     assert client.get("/auth/email/register").status_code == 404
