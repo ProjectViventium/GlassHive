@@ -239,9 +239,12 @@ and base callback URL so an ambient user-level `mcp_oauth_callback_url` cannot r
 registration to a different host or path.
 
 The public HTTPS MCP URL is the RFC 8707 resource sent by Codex and returned in protected-resource
-metadata. It is not implicitly the JWT `aud`. Entra v2 access tokens normally use the API app's
-client-id GUID as `aud`, while delegated scopes use the authorization server's full recognized value
-such as `api://<api-app-client-id>/user_impersonation`. Multi-user MCP therefore requires explicit
+metadata. For Entra, register that exact canonical URL as an additional Application ID URI on the
+resource application and request its delegated scope as
+`<canonical-mcp-url>/access_as_user`. Keep the existing `api://<api-app-client-id>` identifier
+when another consumer still uses it. The public URL is not implicitly the JWT `aud`: Entra v2 access
+tokens normally use the API app's client-id GUID as `aud`, and the `scp` claim contains only the
+short delegated permission value. Multi-user MCP therefore requires explicit
 `GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES` independently of `GLASSHIVE_MCP_PUBLIC_URL` and validates
 issuer, one of those exact token audiences, non-conflicting tenant claims, stable subject, required
 scopes, and one explicitly
@@ -251,7 +254,9 @@ client claim names with `GLASSHIVE_MCP_OAUTH_CLIENT_ID_CLAIMS`; rotate registrat
 old and new IDs only for the bounded rollout window. Entra does not provide MCP dynamic client
 registration, so Connect AI emits no client command until the deployment config also supplies the
 same pre-registered Codex/Claude client ID, each fixed callback port, explicit token audiences and
-scopes, and the canonical Codex public resource. Resource drift, missing verifier policy, or a client
+scopes, and the canonical Codex public resource. An Entra request scope whose resource prefix differs
+from that canonical URL is invalid deployment configuration: the authorization server can reject it
+before issuing a token even when the client and callback are correct. Resource drift, missing verifier policy, or a client
 ID outside the allowlist remains `action_required` and produces no copyable command. When enrollment
 is enabled, a first fully verified MCP login enrolls the same hashed
 issuer/subject principal used by Glass Drive, while a locally disabled principal is rejected on the

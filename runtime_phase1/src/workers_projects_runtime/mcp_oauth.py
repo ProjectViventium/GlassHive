@@ -193,6 +193,7 @@ class OidcJwtTokenVerifier:
         audience: str | tuple[str, ...],
         resource: str = "",
         token_scopes: tuple[str, ...],
+        authorization_scopes: tuple[str, ...] = (),
         deployment_tenant_id: str = "",
         token_tenant_id: str = "",
         subject_claim: str = "sub",
@@ -223,6 +224,37 @@ class OidcJwtTokenVerifier:
         if not self.token_scopes:
             raise McpOAuthConfigurationError(
                 "MCP OAuth requires at least one access-token scope"
+            )
+        self.authorization_scopes = tuple(
+            dict.fromkeys(
+                value.strip() for value in authorization_scopes if value.strip()
+            )
+        )
+        exact_authorization_scopes = tuple(
+            scope for scope in self.authorization_scopes if scope in self.token_scopes
+        )
+        canonical_alias_candidates = tuple(
+            scope
+            for scope in self.authorization_scopes
+            if scope not in exact_authorization_scopes
+            and scope.startswith(f"{self.resource.rstrip('/')}/")
+        )
+        exact_aliases = {
+            f"{self.resource.rstrip('/')}/{token_scope}": token_scope
+            for token_scope in self.token_scopes
+        }
+        self.authorization_scope_aliases = {
+            scope: exact_aliases[scope]
+            for scope in canonical_alias_candidates
+            if scope in exact_aliases
+        }
+        if canonical_alias_candidates and len(
+            self.authorization_scope_aliases
+        ) != len(
+            canonical_alias_candidates
+        ):
+            raise McpOAuthConfigurationError(
+                "Every MCP authorization scope must map to a validated access-token scope"
             )
         self.deployment_tenant_id = str(deployment_tenant_id or "").strip()
         self.token_tenant_id = str(token_tenant_id or "").strip()
@@ -404,10 +436,17 @@ class OidcJwtTokenVerifier:
             "role": role,
             "upstream_subject": upstream_subject,
         }
+        projected_scopes = list(scopes)
+        projected_scopes.extend(
+            authorization_scope
+            for authorization_scope, token_scope in self.authorization_scope_aliases.items()
+            if token_scope in scopes
+        )
+        projected_scopes = list(dict.fromkeys(projected_scopes))
         return AccessToken(
             token=token,
             client_id=client_id,
-            scopes=scopes,
+            scopes=projected_scopes,
             expires_at=int(claims["exp"]),
             resource=self.resource,
             subject=canonical_principal,
@@ -547,6 +586,7 @@ def oauth_from_env() -> tuple[OidcJwtTokenVerifier, AuthSettings] | None:
         audience=token_audiences,
         resource=resource_url,
         token_scopes=token_scopes,
+        authorization_scopes=authorization_scopes,
         deployment_tenant_id=deployment_tenant_id,
         token_tenant_id=token_tenant_id,
         subject_claim=canonical_subject_claim or "sub",

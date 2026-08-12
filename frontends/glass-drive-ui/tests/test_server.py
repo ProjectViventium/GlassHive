@@ -4956,7 +4956,9 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert "--oauth-resource" not in payload["clients"]["codex"]["add_command"]
     assert payload["clients"]["codex"]["login_command"] == (
         "codex mcp login -c mcp_oauth_callback_port=49153 "
-        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive-d0c2dae3d5cd"
+        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' "
+        "--scopes api://00000000-0000-4000-8000-000000000123/user_impersonation "
+        "glasshive-d0c2dae3d5cd"
     )
     assert payload["clients"]["codex"]["callback_uri"] == (
         "http://127.0.0.1:49153/callback/0MLa49XNV_Yw"

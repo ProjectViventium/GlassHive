@@ -2778,6 +2778,9 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         required_scopes = str(
             os.environ.get("GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES") or ""
         ).strip()
+        required_scope_values = [
+            value for value in re.split(r"[,\s]+", required_scopes) if value
+        ]
         raw_allowed_client_ids = str(
             os.environ.get("GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS") or ""
         ).strip()
@@ -2785,7 +2788,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             value for value in re.split(r"[,\s]+", raw_allowed_client_ids) if value
         }
         registration_policy_ready = not multi_user or bool(
-            token_audiences and token_scopes and required_scopes and allowed_client_ids
+            token_audiences
+            and token_scopes
+            and required_scope_values
+            and allowed_client_ids
         )
 
         def client_is_allowed(client_id: str) -> bool:
@@ -2844,6 +2850,11 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 'mcp_oauth_callback_url='
                 f'"http://127.0.0.1:{codex_callback_port_number}/callback"'
             )
+            codex_scope_option = (
+                f"--scopes {shlex.quote(','.join(required_scope_values))} "
+                if required_scope_values
+                else ""
+            )
             clients["codex"] = {
                 "add_command": (
                     "codex mcp add "
@@ -2855,7 +2866,9 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 "login_command": (
                     "codex mcp login "
                     f"-c mcp_oauth_callback_port={codex_callback_port_number} "
-                    f"-c {codex_callback_url_override} {server_name}"
+                    f"-c {codex_callback_url_override} "
+                    f"{codex_scope_option}"
+                    f"{server_name}"
                 ),
                 "callback_port": codex_callback_port_number,
                 "callback_uri": codex_callback_uri,
