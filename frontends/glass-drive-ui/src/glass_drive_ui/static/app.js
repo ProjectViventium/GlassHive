@@ -1,7 +1,7 @@
-import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260811l';
-import { credentialPolicyTransition, preferredProviderAccountId, shouldResumeOnWorkspaceOpen } from './launch-policy.js?v=20260811l';
-import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811l';
-import { compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery } from './workspace-overview.js?v=20260811l';
+import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260811m';
+import { credentialPolicyTransition, preferredProviderAccountId, shouldResumeOnWorkspaceOpen, workspaceLifecycleControl } from './launch-policy.js?v=20260811m';
+import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811m';
+import { compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery } from './workspace-overview.js?v=20260811m';
 
 const ACTIVE_STATES = new Set(['created', 'starting', 'queued', 'running', 'resuming']);
 const ACTIVE_RUN_STATES = new Set(['queued', 'running']);
@@ -12,7 +12,7 @@ const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'terminating', '
 const MAX_VIEW_ONLY_PREVIEWS = 3;
 const ACTIVE_TILE_REFRESH_MS = 7000;
 const RETAINED_TILE_REFRESH_MS = 60000;
-const GLASSHIVE_UI_REV = '20260811l';
+const GLASSHIVE_UI_REV = '20260811m';
 const CAPABILITY_REVIEW_KEY = 'glasshive.capability-review';
 let workspaceRefreshInFlight = false;
 let csrfToken = '';
@@ -454,11 +454,6 @@ function workspaceOptionLabel(workspace) {
   return `${workspaceTileTitle(workspace)} · ${workspaceProfileLabel(workspace.profile)} · ${workspaceStateLabel(workspace)}`;
 }
 
-function workerActionForState(state) {
-  const normalized = String(state || '').trim().toLowerCase();
-  return RESUME_STATES.has(normalized) ? 'resume' : 'pause';
-}
-
 function syncTileSteerAvailability(tile, state) {
   const normalized = String(state || '').trim().toLowerCase();
   tile.dataset.displayState = normalized;
@@ -521,13 +516,13 @@ function summarizeLive(data) {
 
 function updateTileControlLabels(tile, state) {
   const normalized = String(state || '').trim().toLowerCase();
-  const action = workerActionForState(state);
+  const control = workspaceLifecycleControl(normalized);
   const toggle = tile.querySelector('[data-worker-action-toggle]');
   if (toggle) {
-    toggle.hidden = TERMINAL_ATTENTION_STATES.has(normalized) || ['terminating', 'termination_failed', 'terminated'].includes(normalized);
-    toggle.dataset.action = action;
-    toggle.textContent = normalized === 'completed' ? 'Continue' : action === 'resume' ? 'Resume' : 'Pause';
-    toggle.disabled = DISABLED_CONTROL_STATES.has(normalized);
+    toggle.hidden = control.hidden;
+    toggle.dataset.action = control.action;
+    toggle.textContent = control.label;
+    toggle.disabled = control.disabled;
   }
   const interrupt = tile.querySelector('[data-worker-interrupt]');
   if (interrupt) {
@@ -1100,11 +1095,12 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   rename.addEventListener('click', () => openRenameWorkspace(workspace, refreshBootstrap));
   moreActions.appendChild(rename);
 
-  const toggle = createButton(state === 'completed' ? 'Continue' : workerActionForState(state) === 'resume' ? 'Resume' : 'Pause', 'workspace-run-toggle');
+  const lifecycleControl = workspaceLifecycleControl(state);
+  const toggle = createButton(lifecycleControl.label, 'workspace-run-toggle');
   toggle.dataset.workerActionToggle = 'true';
-  toggle.dataset.action = workerActionForState(state);
-  toggle.hidden = TERMINAL_ATTENTION_STATES.has(state) || ['terminating', 'termination_failed', 'terminated'].includes(state);
-  toggle.disabled = DISABLED_CONTROL_STATES.has(state);
+  toggle.dataset.action = lifecycleControl.action;
+  toggle.hidden = lifecycleControl.hidden;
+  toggle.disabled = lifecycleControl.disabled;
   toggle.addEventListener('click', async () => {
     await runWorkerAction(workerId, toggle.dataset.action, toggle, refreshBootstrap);
   });

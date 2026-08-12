@@ -150,6 +150,11 @@ Secondary:
 3. `Interrupt`
 4. `Delete`
 
+Failed, cancelled, and interrupted workspaces must keep an explicit `Pause` recovery action when
+their workspace substrate can still be running. Error guidance must never recommend pausing while
+the normal Workspaces and Watch surfaces hide or disable that action. `Resume` remains inappropriate
+for these terminal run states because it can restart compute without creating a corrected follow-up.
+
 ### Duplicate Semantics
 
 `Duplicate workspace` is approved for the default v1 flow, but only with safe semantics.

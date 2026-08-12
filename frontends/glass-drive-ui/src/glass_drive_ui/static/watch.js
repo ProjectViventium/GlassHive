@@ -1,3 +1,5 @@
+import { workspaceLifecycleControl } from './launch-policy.js?v=20260811m';
+
 const params = new URLSearchParams(window.location.search);
 const workerId = window.location.pathname.split('/').filter(Boolean).at(-1);
 const projectId = params.get('project_id');
@@ -13,7 +15,7 @@ const LONG_PRESS_MS = 550;
 const ACTIVE_REFRESH_MS = 2000;
 const IDLE_REFRESH_MS = 10000;
 const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);
-const GLASSHIVE_UI_REV = '20260811l';
+const GLASSHIVE_UI_REV = '20260811m';
 const workspaceApiBase = `/api/workspace/${workerId}`;
 
 const frame = document.getElementById('desktop-frame');
@@ -262,19 +264,18 @@ function syncSendAffordance() {
 function syncRunToggle(state) {
   if (!runToggleButton) return;
   const normalized = String(state || '').trim().toLowerCase();
-  runToggleButton.hidden = TERMINAL_ATTENTION_STATES.has(normalized) || ['terminating', 'termination_failed', 'terminated'].includes(normalized);
-  const shouldResume = normalized === 'paused' || normalized === 'idle' || normalized === 'idle_terminated' || normalized === 'stopped' || normalized === 'completed';
-  const disabled = ['created', 'starting', 'terminating', 'termination_failed', 'terminated'].includes(normalized);
-  runToggleButton.dataset.action = shouldResume ? 'resume' : 'pause';
-  runToggleButton.textContent = normalized === 'completed' ? 'Continue' : shouldResume ? 'Resume' : 'Pause';
-  runToggleButton.setAttribute('aria-label', normalized === 'completed' ? 'Continue workspace' : shouldResume ? 'Resume workspace' : 'Pause workspace');
-  runToggleButton.setAttribute('aria-pressed', String(!shouldResume && !disabled));
+  const control = workspaceLifecycleControl(normalized);
+  runToggleButton.hidden = control.hidden;
+  runToggleButton.dataset.action = control.action;
+  runToggleButton.textContent = control.label;
+  runToggleButton.setAttribute('aria-label', `${control.label} workspace`);
+  runToggleButton.setAttribute('aria-pressed', String(control.action === 'pause' && !control.disabled));
   runToggleButton.title = normalized === 'completed'
     ? 'Continue this completed workspace'
-    : shouldResume
+    : control.action === 'resume'
     ? 'Resume this workspace'
     : 'Pause this workspace';
-  runToggleButton.disabled = disabled;
+  runToggleButton.disabled = control.disabled;
 }
 
 function syncSteerAvailability(state) {

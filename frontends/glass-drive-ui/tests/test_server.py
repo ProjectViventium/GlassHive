@@ -2070,14 +2070,14 @@ def test_launcher_workspace_hive_static_controls():
     assert "Workspace complete" in desktop_js
     assert "The latest output and workspace files are available from the status panel" in desktop_js
     assert "Clipboard sync: inactive until workspace resumes" in desktop_js
-    assert "desktop.js?v=20260811l" in desktop_html
-    assert "desktop.css?v=20260811l" in desktop_html
+    assert "desktop.js?v=20260811m" in desktop_html
+    assert "desktop.css?v=20260811m" in desktop_html
     assert "<style" not in desktop_html
     assert "#desktop-overlay" in desktop_css
     assert 'id="workspace-status-link"' in desktop_html
     assert "showWorkspaceLink: true" in desktop_js
     assert "Open workspace status and files" in desktop_html
-    assert "styles.css?v=20260811l" in watch_html
+    assert "styles.css?v=20260811m" in watch_html
     assert "}, 5000);" not in desktop_js
     assert 'id="project-files"' in index_html
     assert 'id="schedule-text"' in index_html
@@ -2098,7 +2098,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "Use Resume to continue from the same state" in watch_js
     assert "IDLE_REFRESH_MS" in watch_js
     assert "refreshInFlight" in watch_js
-    assert "const GLASSHIVE_UI_REV = '20260811l'" in watch_js
+    assert "const GLASSHIVE_UI_REV = '20260811m'" in watch_js
     assert "const workspaceApiBase = `/api/workspace/${workerId}`" in watch_js
     assert "/api/worker/${workerId}/live" not in watch_js
     assert '@app.get("/api/workspace/{worker_id}/live")' in (Path(server_module.__file__).read_text(encoding="utf-8"))
@@ -2120,7 +2120,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "gh_token|gh_sig|token|signature|sig" in watch_js
     assert "data.artifacts?.items || []" in watch_js
     assert "Workspace files" in watch_js
-    assert "watch.js?v=20260811l" in watch_html
+    assert "watch.js?v=20260811m" in watch_html
     assert ".artifact-row" in styles_css
     assert "artifact-list-more" in watch_js
     assert ".artifact-list-more" in styles_css
@@ -2186,6 +2186,52 @@ def test_workspace_open_resume_policy_uses_the_user_visible_state():
         "stopped": True,
         "fallbackPaused": True,
         "oneOffPaused": False,
+    }
+
+
+def test_failed_workspace_keeps_the_recommended_pause_recovery_visible():
+    policy_module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ workspaceLifecycleControl }} from {json.dumps(policy_module)};"
+                "const states = ['failed','cancelled','interrupted','completed','paused','terminated'];"
+                "process.stdout.write(JSON.stringify(Object.fromEntries(states.map(state => "
+                "[state, workspaceLifecycleControl(state)]))));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    controls = json.loads(result.stdout)
+    for state in ("failed", "cancelled", "interrupted"):
+        assert controls[state] == {
+            "action": "pause",
+            "label": "Pause",
+            "hidden": False,
+            "disabled": False,
+        }
+    assert controls["completed"] == {
+        "action": "resume",
+        "label": "Continue",
+        "hidden": False,
+        "disabled": False,
+    }
+    assert controls["paused"] == {
+        "action": "resume",
+        "label": "Resume",
+        "hidden": False,
+        "disabled": False,
+    }
+    assert controls["terminated"] == {
+        "action": "pause",
+        "label": "Pause",
+        "hidden": True,
+        "disabled": True,
     }
 
 
@@ -2273,14 +2319,16 @@ def test_workspace_status_scripts_never_label_failed_terminal_runs_completed():
         assert script.index(terminated_priority) < script.index(failed_branch)
     assert "const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);" in app_script
     assert "RESUME_STATES.has(normalized) || TERMINAL_ATTENTION_STATES.has(normalized)" not in app_script
-    assert "toggle.hidden = TERMINAL_ATTENTION_STATES.has(normalized)" in app_script
+    assert "const control = workspaceLifecycleControl(normalized);" in app_script
+    assert "toggle.hidden = control.hidden;" in app_script
     assert "function syncTileSteerAvailability(tile, state)" in app_script
     assert app_script.count("syncTileSteerAvailability(tile, state);") >= 2
     assert "tile.dataset.displayState = normalized" in app_script
     assert "syncTileSteerAvailability(tile, tile.dataset.displayState || state);" in app_script
     assert "Send a corrected follow-up below" in app_script
     assert "const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);" in watch_script
-    assert "runToggleButton.hidden = TERMINAL_ATTENTION_STATES.has(normalized)" in watch_script
+    assert "const control = workspaceLifecycleControl(normalized);" in watch_script
+    assert "runToggleButton.hidden = control.hidden;" in watch_script
     assert "TERMINAL_ATTENTION_STATES.has(state)" in watch_script
     assert "Workspace needs attention" in watch_script
     assert "then use Resume or send a corrected follow-up" not in watch_script
@@ -5686,7 +5734,7 @@ def test_local_password_login_is_explicit_same_origin_and_has_no_signup_surface(
     assert config.json()["oidc_login_visible"] is False
     assert config.json()["login_methods"] == ["local_password"]
     assert 'id="local-login"' in page.text
-    assert '/static/auth.js?v=20260811l' in page.text
+    assert '/static/auth.js?v=20260811m' in page.text
     assert page.headers["cache-control"] == "no-store, no-cache, private, max-age=0"
     assert login_csrf
     assert client.get("/auth/email/register").status_code == 404
