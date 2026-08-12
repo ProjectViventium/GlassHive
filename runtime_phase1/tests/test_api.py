@@ -3537,7 +3537,10 @@ def test_enterprise_mode_loads_direct_runtime_env_file(tmp_path, monkeypatch):
         "GLASSHIVE_LINK_REF_SHARED_GROUP",
         "GLASSHIVE_LINK_REF_TTL_SECONDS",
     ):
-        monkeypatch.delenv(key, raising=False)
+        # The runtime loader writes directly to os.environ. Register an empty
+        # value with monkeypatch first so its teardown removes the value that
+        # the loader installs instead of leaking it into later tests.
+        monkeypatch.setenv(key, "")
 
     client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
 

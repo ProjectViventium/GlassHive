@@ -27,6 +27,7 @@ def _workspace_record(database, *, bootstrap: dict | None = None) -> None:
                 owner_id TEXT NOT NULL,
                 profile TEXT NOT NULL,
                 bootstrap_bundle_json TEXT,
+                duplication_report_json TEXT NOT NULL DEFAULT '{}',
                 updated_at REAL NOT NULL
             )
             """

@@ -37,12 +37,17 @@ def _create_workspace_record(database, *, worker_id="wrk_public_safe", owner_id=
                 owner_id TEXT NOT NULL,
                 profile TEXT NOT NULL,
                 bootstrap_bundle_json TEXT,
+                duplication_report_json TEXT NOT NULL DEFAULT '{}',
                 updated_at REAL NOT NULL
             )
             """
         )
         conn.execute(
-            "INSERT INTO workers VALUES (?, 'tenant-a', ?, 'codex-cli', '{}', ?)",
+            """
+            INSERT INTO workers
+                (worker_id, tenant_id, owner_id, profile, bootstrap_bundle_json, updated_at)
+            VALUES (?, 'tenant-a', ?, 'codex-cli', '{}', ?)
+            """,
             (worker_id, owner_id, time.time()),
         )
 
