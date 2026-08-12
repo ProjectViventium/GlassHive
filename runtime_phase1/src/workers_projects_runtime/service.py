@@ -1051,7 +1051,25 @@ class WorkersProjectsService:
             tenant_id=str(worker.get("tenant_id") or "local"),
             owner_id=str(worker.get("owner_id") or ""),
         )
-        return account is None or str(account.get("status") or "").strip().lower() != "ready"
+        if account is None or str(account.get("status") or "").strip().lower() != "ready":
+            return True
+        lease = self.control_plane_store.active_provider_account_lease(account_id)
+        if lease is None:
+            return False
+        worker_id = str(worker.get("worker_id") or "")
+        active_run = self.store.get_active_run(worker_id) if worker_id else None
+        owns_active_mission_lease = bool(
+            active_run
+            and str(lease.get("worker_id") or "") == worker_id
+            and str(lease.get("run_id") or "") == str(active_run.get("run_id") or "")
+            and str(lease.get("lane") or "")
+            == f"{str(worker.get('profile') or '').strip()}:mission"
+        )
+        # A steer replaces the current worker's own active mission, whose binder
+        # releases this exact run lease during interruption. Every other lease makes
+        # personal_preferred fall back to the deployment route, so prove that route
+        # before creating or interrupting any run.
+        return not owns_active_mission_lease
 
     def _unresolved_duplication_reapprovals(self, worker: dict) -> list[dict]:
         report = worker.get("duplication_report")
