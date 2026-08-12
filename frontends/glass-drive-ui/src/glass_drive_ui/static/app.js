@@ -1,7 +1,7 @@
-import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260811j';
-import { credentialPolicyTransition, preferredProviderAccountId } from './launch-policy.js?v=20260811j';
-import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811j';
-import { compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery } from './workspace-overview.js?v=20260811j';
+import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260811k';
+import { credentialPolicyTransition, preferredProviderAccountId, shouldResumeOnWorkspaceOpen } from './launch-policy.js?v=20260811k';
+import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811k';
+import { compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery } from './workspace-overview.js?v=20260811k';
 
 const ACTIVE_STATES = new Set(['created', 'starting', 'queued', 'running', 'resuming']);
 const ACTIVE_RUN_STATES = new Set(['queued', 'running']);
@@ -12,7 +12,7 @@ const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'terminating', '
 const MAX_VIEW_ONLY_PREVIEWS = 3;
 const ACTIVE_TILE_REFRESH_MS = 7000;
 const RETAINED_TILE_REFRESH_MS = 60000;
-const GLASSHIVE_UI_REV = '20260811j';
+const GLASSHIVE_UI_REV = '20260811k';
 const CAPABILITY_REVIEW_KEY = 'glasshive.capability-review';
 let workspaceRefreshInFlight = false;
 let csrfToken = '';
@@ -1169,8 +1169,10 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
 
 async function openWorkspaceSurface(workspace, button) {
   const workerId = String(workspace?.worker_id || '');
-  const shouldResume = workspace?.workspace_kind === 'named'
-    && ['paused', 'idle', 'idle_terminated', 'stopped'].includes(rawWorkspaceState(workspace));
+  const shouldResume = shouldResumeOnWorkspaceOpen({
+    workspaceKind: workspace?.workspace_kind,
+    displayedState: workspaceStateLabel(workspace),
+  });
   const originalText = button?.textContent || '';
   if (button) button.disabled = true;
   try {

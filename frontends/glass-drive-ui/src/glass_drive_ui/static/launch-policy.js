@@ -22,3 +22,10 @@ export function credentialPolicyTransition({
   }
   return { value: personalPolicy, savedPersonalPolicy: '', forcedLegacy: false };
 }
+
+const WORKSPACE_OPEN_RESUME_STATES = new Set(['paused', 'idle', 'idle_terminated', 'stopped']);
+
+export function shouldResumeOnWorkspaceOpen({ workspaceKind, displayedState }) {
+  return String(workspaceKind || '') === 'named'
+    && WORKSPACE_OPEN_RESUME_STATES.has(String(displayedState || '').trim().toLowerCase());
+}
