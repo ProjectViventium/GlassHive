@@ -13,7 +13,7 @@ const LONG_PRESS_MS = 550;
 const ACTIVE_REFRESH_MS = 2000;
 const IDLE_REFRESH_MS = 10000;
 const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);
-const GLASSHIVE_UI_REV = '20260811k';
+const GLASSHIVE_UI_REV = '20260811l';
 const workspaceApiBase = `/api/workspace/${workerId}`;
 
 const frame = document.getElementById('desktop-frame');

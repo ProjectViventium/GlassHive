@@ -25,7 +25,8 @@ export function credentialPolicyTransition({
 
 const WORKSPACE_OPEN_RESUME_STATES = new Set(['paused', 'idle', 'idle_terminated', 'stopped']);
 
-export function shouldResumeOnWorkspaceOpen({ workspaceKind, displayedState }) {
+export function shouldResumeOnWorkspaceOpen({ workspaceKind, renderedState, fallbackState }) {
+  const displayedState = String(renderedState || fallbackState || '').trim().toLowerCase();
   return String(workspaceKind || '') === 'named'
-    && WORKSPACE_OPEN_RESUME_STATES.has(String(displayedState || '').trim().toLowerCase());
+    && WORKSPACE_OPEN_RESUME_STATES.has(displayedState);
 }
