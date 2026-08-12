@@ -201,6 +201,73 @@ def test_host_runtime_rejects_recycled_pid_identity_without_stopping_the_process
             unrelated_process.wait(timeout=3)
 
 
+def test_host_runtime_stop_failure_preserves_process_and_active_session(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path))
+    worker_id = "wrk_host_stop_failure"
+
+    class StubbornProcess:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(["synthetic-stubborn-process"], timeout)
+
+    process = StubbornProcess()
+    runtime._register_process(worker_id, process)  # type: ignore[arg-type]
+    runtime._write_active_session(
+        worker_id,
+        {
+            "session_name": "conversation-run_stop_failure",
+            "run_id": "run_stop_failure",
+            "stdout_path": str(tmp_path / "stdout.log"),
+            "stderr_path": str(tmp_path / "stderr.log"),
+            "exit_path": str(tmp_path / "exit_code"),
+            "model": "gpt-5.6-sol",
+            "process_pid": process.pid,
+            "started_at": datetime.now().astimezone().isoformat(),
+        },
+    )
+    runtime._host_active_slots()["mission"] = worker_id
+    runtime._host_worker_lanes()[worker_id] = "mission"
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.killpg", lambda _pgid, _signal: None)
+    runtime._wait_for_host_process_group_exit = lambda _pgid, _timeout: False  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError, match="remained alive"):
+        runtime._stop_active_process(
+            worker_id,
+            worker={"worker_id": worker_id, "execution_mode": "host"},
+            run_id="run_stop_failure",
+        )
+
+    assert runtime._read_active_session(worker_id) is not None
+    assert runtime._active_processes[worker_id] is process
+    assert runtime._host_active_slots()["mission"] == worker_id
+    assert runtime._host_worker_lanes()[worker_id] == "mission"
+
+
+def test_host_runtime_process_group_permission_probe_fails_closed(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path))
+
+    def deny_probe(_pgid, _signal):
+        raise PermissionError
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.killpg", deny_probe)
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], returncode=1, stdout="", stderr="ps failed"),
+    )
+
+    assert runtime._host_process_group_alive(12345) is True
+
+
 @pytest.mark.parametrize(
     ("runtime_class", "profile", "model", "stdout_payload", "expected_output", "expected_session"),
     [
@@ -2247,6 +2314,7 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
     runtime._record_run_metrics = record_metrics  # type: ignore[method-assign]
     _patch_host_codex_requirement_probe(monkeypatch)
     workspace = tmp_path / "workspace"
+    processes: list[object] = []
 
     class TimeoutProcess:
         pid = 12345
@@ -2254,6 +2322,7 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
         def __init__(self, command, **kwargs):
             _mark_fake_host_supervisor_ready(list(command), self.pid)
             self.terminated = False
+            processes.append(self)
             stdout = kwargs["stdout"]
             stdout.write("working before timeout\n")
             stdout.flush()
@@ -2276,6 +2345,14 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
         def kill(self):
             self.terminated = True
 
+    def fake_killpg(_pgid, signal_number):
+        if signal_number == 0:
+            if any(not process.terminated for process in processes):
+                return
+            raise ProcessLookupError
+        for process in processes:
+            process.terminate()
+
     monkeypatch.setattr(
         "workers_projects_runtime.profile_runtime.subprocess.run",
         lambda args, **kwargs: subprocess.CompletedProcess(
@@ -2286,6 +2363,8 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
         ),
     )
     monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.Popen", TimeoutProcess)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.killpg", fake_killpg)
     worker = {
         "worker_id": "wrk_timeout_evidence",
         "name": "Timeout Evidence Worker",
@@ -2324,6 +2403,7 @@ def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monke
     runtime.binary = "/bin/echo"
     _patch_host_codex_requirement_probe(monkeypatch)
     workspace = tmp_path / "workspace"
+    processes: list[object] = []
 
     class ForegroundServerProcess:
         pid = 12345
@@ -2331,6 +2411,7 @@ def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monke
         def __init__(self, command, **kwargs):
             _mark_fake_host_supervisor_ready(list(command), self.pid)
             self.terminated = False
+            processes.append(self)
             stdout = kwargs["stdout"]
             stderr = kwargs["stderr"]
             stdout.write("Serving HTTP on 127.0.0.1 port 8000 ...\n")
@@ -2356,6 +2437,14 @@ def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monke
         def kill(self):
             self.terminated = True
 
+    def fake_killpg(_pgid, signal_number):
+        if signal_number == 0:
+            if any(not process.terminated for process in processes):
+                return
+            raise ProcessLookupError
+        for process in processes:
+            process.terminate()
+
     monkeypatch.setattr(
         "workers_projects_runtime.profile_runtime.subprocess.run",
         lambda args, **kwargs: subprocess.CompletedProcess(
@@ -2366,6 +2455,8 @@ def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monke
         ),
     )
     monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.Popen", ForegroundServerProcess)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.killpg", fake_killpg)
     worker = {
         "worker_id": "wrk_foreground_server_evidence",
         "name": "Foreground Server Evidence Worker",
@@ -2517,6 +2608,10 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
             self.terminated = True
 
     def fake_killpg(_pgid, _signal):
+        if _signal == 0:
+            if any(not process.terminated for process in processes):
+                return
+            raise ProcessLookupError
         for process in processes:
             process.terminate()
 
@@ -4244,8 +4339,39 @@ def test_docker_cli_runtime_clears_active_session_after_stop(tmp_path):
 
     runtime._stop_active_process(worker_id, worker={"worker_id": worker_id})
 
-    assert calls == [("screen", "job-run_stop_meta"), ("terminate", "run_stop_meta")]
+    assert calls == [("terminate", "run_stop_meta"), ("screen", "job-run_stop_meta")]
     assert not runtime._active_session_meta_path(worker_id).exists()
+
+
+def test_docker_cli_runtime_propagates_stop_failure_and_keeps_active_session(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker_id = "wrk_stop_failure"
+    runtime._ensure_dirs(worker_id)
+    runtime._write_active_session(
+        worker_id,
+        {
+            "session_name": "job-run_stop_failure",
+            "run_id": "run_stop_failure",
+            "stdout_path": str(tmp_path / "stdout.log"),
+            "stderr_path": str(tmp_path / "stderr.log"),
+            "exit_path": str(tmp_path / "exit_code"),
+        },
+    )
+    terminate_calls: list[str] = []
+
+    def fail_screen(*args, **kwargs):
+        raise RuntimeError("screen session remained alive")
+
+    runtime.sandbox.stop_screen_session = fail_screen  # type: ignore[method-assign]
+    runtime.sandbox.terminate_run_processes = (  # type: ignore[method-assign]
+        lambda worker_id, runtime_name, run_id, **kwargs: terminate_calls.append(run_id)
+    )
+
+    with pytest.raises(RuntimeError, match="screen session remained alive"):
+        runtime._stop_active_process(worker_id, worker={"worker_id": worker_id})
+
+    assert terminate_calls == ["run_stop_failure"]
+    assert runtime._active_session_meta_path(worker_id).exists()
 
 
 def test_docker_cli_runtime_uses_configured_run_timeout(tmp_path, monkeypatch):

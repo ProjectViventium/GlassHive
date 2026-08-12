@@ -1990,14 +1990,17 @@ def test_stop_screen_session_targets_all_exact_duplicate_sockets(tmp_path):
 
     script = calls[0][2]
     assert calls[0][-1] == "openclaw-gateway"
-    assert "sockets=$(screen -ls | awk" in script
+    assert "matching_sockets()" in script
     assert "if (name == target) print socket" in script
     assert 'screen -S "$socket" -X quit' in script
+    assert "sockets=$(matching_sockets)" in script
+    assert "Screen session remains after quit" in script
+    assert "exit 43" in script
 
 
 def test_terminate_run_processes_targets_run_env_and_descendants(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
-    calls: list[list[str]] = []
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
 
     class FakeSandbox:
         container_name = "wpr-test"
@@ -2005,7 +2008,7 @@ def test_terminate_run_processes_targets_run_env_and_descendants(tmp_path):
     manager.ensure_ready = lambda *args, **kwargs: FakeSandbox()  # type: ignore[method-assign]
 
     def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
-        calls.append(command)
+        calls.append((command, env))
         return subprocess.CompletedProcess(["docker"], returncode=0, stdout="", stderr="")
 
     manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
@@ -2017,10 +2020,55 @@ def test_terminate_run_processes_targets_run_env_and_descendants(tmp_path):
         worker={"worker_id": "wrk_test", "state": "running", "state_dir": str(tmp_path / "state")},
     )
 
-    script = calls[0][-1]
+    command, env = calls[0]
+    script = command[-1]
     assert "GLASSHIVE_ACTIVE_RUN_ID=$run_id" in script
     assert "descendants()" in script
-    assert "/workspace/.wpr-home/.glasshive-runs/run_123" in script
+    assert "/workspace/.wpr-home/.glasshive-runs/run_123" not in script
+    assert env is not None
+    assert env["GLASSHIVE_STOP_RUN_ROOT"] == "/workspace/.wpr-home/.glasshive-runs/run_123"
+    assert env["GLASSHIVE_STOP_RUN_ID"] == "run_123"
+    assert "self_pid=$$" in script
+    assert '$1 != self_pid' in script
+    assert "process_spec()" in script
+    assert "capture_specs()" in script
+    assert "capture_pgids()" in script
+    assert "alive_pids()" in script
+    assert "alive_pgids()" in script
+    assert "signal_groups()" in script
+    assert "self_pgid=" in script
+    assert "expected_start=${spec#*:}" in script
+    assert "specs=$(merge_specs" in script
+    assert "pgids=$(merge_specs" in script
+    assert script.count("discovered=$(matching_pids)") == 2
+    assert script.count('kill -KILL "$pid"') == 2
+    assert "signal_groups KILL $surviving_groups" in script
+    assert "survivors=" in script
+    assert "exit 43" in script
+
+
+@pytest.mark.parametrize(
+    ("returncode", "detail"),
+    [
+        (43, "Run processes remain after TERM/KILL: 4242"),
+        (125, "docker exec failed"),
+    ],
+)
+def test_terminate_run_processes_propagates_nonzero_and_survivor_results(tmp_path, returncode, detail):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+
+    def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
+        return subprocess.CompletedProcess(["docker"], returncode=returncode, stdout="", stderr=detail)
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match=detail):
+        manager.terminate_run_processes(
+            "wrk_test",
+            "claude-code",
+            "run_123",
+            worker={"worker_id": "wrk_test", "state": "running", "state_dir": str(tmp_path / "state")},
+        )
 
 
 def test_ensure_ready_repairs_bind_mount_ownership_before_prime(tmp_path):
