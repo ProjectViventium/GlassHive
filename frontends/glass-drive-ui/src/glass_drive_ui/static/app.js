@@ -1,5 +1,7 @@
-import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260810a';
-import { credentialPolicyTransition, preferredProviderAccountId } from './launch-policy.js?v=20260810a';
+import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260811m';
+import { credentialPolicyTransition, preferredProviderAccountId, shouldResumeOnWorkspaceOpen, workspaceLifecycleControl } from './launch-policy.js?v=20260811m';
+import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811m';
+import { compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery } from './workspace-overview.js?v=20260811m';
 
 const ACTIVE_STATES = new Set(['created', 'starting', 'queued', 'running', 'resuming']);
 const ACTIVE_RUN_STATES = new Set(['queued', 'running']);
@@ -7,16 +9,35 @@ const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']
 const INTERRUPTIBLE_STATES = new Set(['queued', 'running', 'resuming']);
 const RESUME_STATES = new Set(['ready', 'paused', 'idle', 'idle_terminated', 'stopped', 'completed', 'retained']);
 const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'terminating', 'termination_failed', 'terminated']);
-const MAX_LIVE_TILE_IFRAMES = 4;
+const MAX_VIEW_ONLY_PREVIEWS = 3;
 const ACTIVE_TILE_REFRESH_MS = 7000;
 const RETAINED_TILE_REFRESH_MS = 60000;
-const GLASSHIVE_UI_REV = '20260810a';
+const GLASSHIVE_UI_REV = '20260811m';
+const CAPABILITY_REVIEW_KEY = 'glasshive.capability-review';
 let workspaceRefreshInFlight = false;
 let csrfToken = '';
 let renameWorkspaceContext = null;
 let saveTemplateContext = null;
+let workspaceVisibilityObserver = null;
 const pageParams = new URLSearchParams(window.location.search);
 const signedToken = pageParams.get('gh_token') || '';
+
+function rememberCapabilityReview(workerId, count, items = []) {
+  const normalizedItems = Array.isArray(items)
+    ? items.filter((item) => (
+      item
+      && typeof item === 'object'
+      && String(item.action_id || '')
+      && String(item.resolution || '')
+    )).map((item) => ({ ...item }))
+    : [];
+  sessionStorage.setItem(CAPABILITY_REVIEW_KEY, JSON.stringify({
+    worker_id: String(workerId || ''),
+    count: Math.max(Number(count || 0), normalizedItems.length),
+    items: normalizedItems,
+  }));
+  return normalizedItems.some((item) => item.route === 'connections') ? 'connections' : 'library';
+}
 
 const defaultHivePrefs = {
   showInactive: true,
@@ -68,6 +89,19 @@ async function responseMessage(response, fallback) {
   }
 }
 
+async function responseError(response, fallback) {
+  let code = '';
+  try {
+    const body = await response.clone().json();
+    code = String(body?.detail?.code || '');
+  } catch (_error) {
+    code = '';
+  }
+  const error = new Error(await responseMessage(response, fallback));
+  error.code = code;
+  return error;
+}
+
 async function getJson(url, fallback = 'Request failed') {
   const response = await fetch(withAuth(url), { cache: 'no-store' });
   if (!response.ok) throw new Error(await responseMessage(response, fallback));
@@ -86,7 +120,7 @@ function decorateCatalogWorkspace(workspace) {
     is_active: ACTIVE_STATES.has(state),
     is_resumable: RESUME_STATES.has(state),
     watch_url: `/watch/${encodeURIComponent(workerId)}?project_id=${encodeURIComponent(projectId)}&surface=desktop`,
-    project_url: `/ui/projects/${encodeURIComponent(projectId)}?worker_id=${encodeURIComponent(workerId)}`,
+    workspace_url: `/watch/${encodeURIComponent(workerId)}?project_id=${encodeURIComponent(projectId)}&surface=desktop`,
     desktop_url: `/desktop/${encodeURIComponent(workerId)}`,
     api_url: `/api/worker/${encodeURIComponent(workerId)}`,
     control_url: `/api/worker/${encodeURIComponent(workerId)}`,
@@ -109,7 +143,7 @@ async function postJson(url, payload) {
     },
     body: payload ? JSON.stringify(payload) : undefined,
   });
-  if (!response.ok) throw new Error(await responseMessage(response, 'Request failed'));
+  if (!response.ok) throw await responseError(response, 'Request failed');
   return response.json();
 }
 
@@ -138,16 +172,19 @@ async function deleteJson(url) {
 function renderCurrentUser(identity = {}) {
   const control = document.getElementById('current-user-control');
   const label = document.getElementById('current-user-label');
+  const switchAccount = document.getElementById('switch-account');
   if (!control || !label || !csrfToken) return;
   const name = String(identity.display_name || '').trim();
   const email = String(identity.email || '').trim();
   label.textContent = name && email ? `${name} · ${email}` : name || email || 'Signed in';
   label.title = label.textContent;
+  if (switchAccount) switchAccount.hidden = identity.provider_switch_visible !== true;
   control.hidden = false;
 }
 
 async function signOut(scope) {
   const response = await postJson('/auth/logout', { scope });
+  sessionStorage.removeItem(CAPABILITY_REVIEW_KEY);
   window.location.assign(String(response.redirect_url || '/login'));
 }
 
@@ -417,11 +454,6 @@ function workspaceOptionLabel(workspace) {
   return `${workspaceTileTitle(workspace)} · ${workspaceProfileLabel(workspace.profile)} · ${workspaceStateLabel(workspace)}`;
 }
 
-function workerActionForState(state) {
-  const normalized = String(state || '').trim().toLowerCase();
-  return RESUME_STATES.has(normalized) ? 'resume' : 'pause';
-}
-
 function syncTileSteerAvailability(tile, state) {
   const normalized = String(state || '').trim().toLowerCase();
   tile.dataset.displayState = normalized;
@@ -437,6 +469,12 @@ function syncTileSteerAvailability(tile, state) {
 
 function workerDesktopUrl(workerId, signedUrl = '') {
   return withUiRev(signedUrl || withAuth(`/desktop/${encodeURIComponent(String(workerId || ''))}`));
+}
+
+function workerPreviewUrl(workerId, signedPreviewUrl = '', signedDesktopUrl = '') {
+  if (signedPreviewUrl) return workerDesktopUrl(workerId, signedPreviewUrl);
+  const url = workerDesktopUrl(workerId, signedDesktopUrl);
+  return `${url}${url.includes('?') ? '&' : '?'}preview=1`;
 }
 
 function appendUrlPath(url, path) {
@@ -478,13 +516,13 @@ function summarizeLive(data) {
 
 function updateTileControlLabels(tile, state) {
   const normalized = String(state || '').trim().toLowerCase();
-  const action = workerActionForState(state);
+  const control = workspaceLifecycleControl(normalized);
   const toggle = tile.querySelector('[data-worker-action-toggle]');
   if (toggle) {
-    toggle.hidden = TERMINAL_ATTENTION_STATES.has(normalized) || ['terminating', 'termination_failed', 'terminated'].includes(normalized);
-    toggle.dataset.action = action;
-    toggle.textContent = normalized === 'completed' ? 'Continue' : action === 'resume' ? 'Resume' : 'Pause';
-    toggle.disabled = DISABLED_CONTROL_STATES.has(normalized);
+    toggle.hidden = control.hidden;
+    toggle.dataset.action = control.action;
+    toggle.textContent = control.label;
+    toggle.disabled = control.disabled;
   }
   const interrupt = tile.querySelector('[data-worker-interrupt]');
   if (interrupt) {
@@ -500,24 +538,44 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
   const pane = glass.querySelector('[data-worker-glass]');
   if (!pane) return;
   const tile = glass.closest('.workspace-tile');
+  const previewLink = glass.querySelector('.workspace-glass-open');
+  const allowPreviewOpen = (allowed) => {
+    if (previewLink) previewLink.hidden = !allowed;
+  };
   const watchVisible = tile?.dataset.watchVisible !== 'false';
   if (!watchVisible) {
+    allowPreviewOpen(false);
     pane.replaceChildren();
     return;
   }
   const normalized = String(state || '').trim().toLowerCase();
-  const alreadyHasFrame = Boolean(pane.querySelector('.workspace-live-frame'));
-  const canMountLiveFrame = alreadyHasFrame || document.querySelectorAll('.workspace-live-frame').length < MAX_LIVE_TILE_IFRAMES;
+  const alreadyHasFrame = Boolean(pane.querySelector('.workspace-live-preview'));
+  const previewIds = previewWorkerIds(
+    Array.from(document.querySelectorAll('.workspace-tile')).map((candidate) => ({
+      worker_id: candidate.dataset.workerId,
+      visible: candidate.dataset.viewportVisible === 'true',
+      active: candidate.dataset.state === 'active',
+    })),
+    MAX_VIEW_ONLY_PREVIEWS,
+  );
+  const canMountLiveFrame = alreadyHasFrame || previewIds.includes(String(workerId || ''));
   if ((ACTIVE_STATES.has(normalized) || normalized === 'running' || normalized === 'queued') && hasLiveDesktop && canMountLiveFrame) {
-    let frame = pane.querySelector('.workspace-live-frame');
+    let frame = pane.querySelector('.workspace-live-preview');
     if (!frame) {
       frame = document.createElement('iframe');
-      frame.className = 'workspace-live-frame';
+      frame.className = 'workspace-live-preview';
       frame.loading = 'lazy';
-      frame.title = 'Live workspace desktop';
-      frame.src = workerDesktopUrl(workerId, tile?.dataset.desktopUrl || '');
+      frame.title = 'View-only live workspace preview';
+      frame.tabIndex = -1;
+      frame.setAttribute('aria-hidden', 'true');
+      frame.src = workerPreviewUrl(
+        workerId,
+        tile?.dataset.desktopPreviewUrl || '',
+        tile?.dataset.desktopUrl || '',
+      );
       pane.replaceChildren(frame);
     }
+    allowPreviewOpen(true);
     return;
   }
   if (ACTIVE_STATES.has(normalized) || normalized === 'running' || normalized === 'queued') {
@@ -529,6 +587,7 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
       ? 'Workspace ready'
       : 'Live surface warming up';
     pane.replaceChildren(note);
+    allowPreviewOpen(true);
     return;
   }
 
@@ -537,6 +596,7 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
     note.className = 'workspace-glass-note';
     note.textContent = 'Needs attention · Send a corrected follow-up below';
     pane.replaceChildren(note);
+    allowPreviewOpen(true);
     return;
   }
 
@@ -545,18 +605,81 @@ function setGlassPane(glass, workerId, state, hasLiveDesktop, refreshBootstrap) 
     note.className = 'workspace-glass-note';
     note.textContent = normalized === 'terminating' ? 'Workspace closing' : normalized === 'termination_failed' ? 'Close needs attention' : 'Workspace closed';
     pane.replaceChildren(note);
+    allowPreviewOpen(true);
     return;
   }
 
-  const wakeButton = createButton(normalized === 'completed' ? 'Completed' : 'Resume workspace', 'workspace-glass-action');
   if (normalized === 'completed') {
-    wakeButton.dataset.intent = 'completed';
-    wakeButton.title = 'The last run completed. Click to continue this workspace with follow-up work.';
+    const note = document.createElement('div');
+    note.className = 'workspace-glass-note workspace-glass-complete';
+    note.textContent = 'Delivery ready';
+    pane.replaceChildren(note);
+    allowPreviewOpen(true);
+    return;
   }
+  const wakeButton = createButton('Resume workspace', 'workspace-glass-action');
   wakeButton.addEventListener('click', async () => {
     await runWorkerAction(workerId, 'resume', wakeButton, refreshBootstrap);
   });
   pane.replaceChildren(wakeButton);
+  allowPreviewOpen(false);
+}
+
+function deliveryLink(label, url, { download = false } = {}) {
+  const link = document.createElement('a');
+  link.className = 'workspace-delivery-link';
+  link.href = withAuth(String(url || ''));
+  link.textContent = label;
+  if (download) {
+    link.download = '';
+  } else {
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+  }
+  return link;
+}
+
+function renderWorkspaceDelivery(tile, data) {
+  const model = workspaceDeliveryModel(data);
+  const panel = tile.querySelector('[data-worker-delivery]');
+  const action = tile.querySelector('[data-worker-delivery-action]');
+  if (!panel || !action) return;
+  panel.replaceChildren();
+  panel.dataset.available = String(model.available);
+  const closedLabel = model.available ? 'View delivery' : model.state === 'completed' ? 'View result' : 'View status';
+  action.dataset.closedLabel = closedLabel;
+  action.textContent = panel.hidden
+    ? closedLabel
+    : closedLabel.replace(/^View\s+/, 'Hide ');
+
+  const summary = document.createElement('p');
+  summary.className = 'workspace-delivery-summary';
+  summary.textContent = model.summary || 'No run output yet.';
+  panel.appendChild(summary);
+  if (!model.available) return;
+
+  if (model.primary) {
+    const primaryActions = document.createElement('div');
+    primaryActions.className = 'workspace-delivery-actions';
+    if (model.primary.openUrl) primaryActions.appendChild(deliveryLink('Open output', model.primary.openUrl));
+    if (model.primary.downloadUrl) primaryActions.appendChild(deliveryLink('Download', model.primary.downloadUrl, { download: true }));
+    panel.appendChild(primaryActions);
+  }
+
+  if (model.artifacts.length) {
+    const list = document.createElement('ul');
+    list.className = 'workspace-delivery-files';
+    for (const artifact of model.artifacts.slice(0, 4)) {
+      const row = document.createElement('li');
+      const label = document.createElement('span');
+      label.textContent = artifact.label;
+      row.appendChild(label);
+      if (artifact.openUrl) row.appendChild(deliveryLink('Open', artifact.openUrl));
+      if (artifact.downloadUrl) row.appendChild(deliveryLink('Download', artifact.downloadUrl, { download: true }));
+      list.appendChild(row);
+    }
+    panel.appendChild(list);
+  }
 }
 
 function displayStateForLive(data) {
@@ -588,18 +711,40 @@ function updateWorkspaceMeta(meta, profile, state, catalogDetails = null) {
 
 async function refreshWorkspaceTile(workerId, refreshBootstrap) {
   const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);
-  if (!tile) return;
+  if (!tile || tile.dataset.refreshing === 'true') return;
   const output = tile.querySelector('[data-worker-output]');
   const markNextRefresh = (delayMs) => {
     tile.dataset.liveLoaded = 'true';
     tile.dataset.nextLiveRefreshAt = String(Date.now() + delayMs);
   };
+  tile.dataset.refreshing = 'true';
   try {
-    const response = await fetch(withAuth(workerApiUrl(workerId, '/live')));
+    const response = await fetch(withAuth(workerApiUrl(workerId, '/live?compact=1')), { cache: 'no-store' });
     if (!response.ok) throw new Error(await responseMessage(response, 'Live status unavailable'));
-    const data = await response.json();
+    let data = await response.json();
     const rawState = String(data?.worker?.state || '').trim().toLowerCase() || 'unknown';
     const runState = String(data?.latest_run?.state || '').trim().toLowerCase();
+    const runId = String(data?.latest_run?.run_id || data?.latest_run?.ended_at || '').trim();
+    if (runState && runState !== 'completed') {
+      delete tile.dataset.deliveryRunId;
+      tile.dataset.deliveryLoaded = 'false';
+    }
+    if (shouldHydrateWorkspaceDelivery({
+      runState,
+      runId,
+      hydratedRunId: tile.dataset.deliveryRunId || '',
+      legacyLoaded: tile.dataset.deliveryLoaded === 'true',
+    })) {
+      const deliveryResponse = await fetch(withAuth(workerApiUrl(workerId, '/live')), { cache: 'no-store' });
+      if (deliveryResponse.ok) {
+        data = await deliveryResponse.json();
+        tile.dataset.deliveryLoaded = 'true';
+        const hydratedRunId = String(
+          data?.latest_run?.run_id || data?.latest_run?.ended_at || runId || '',
+        ).trim();
+        if (hydratedRunId) tile.dataset.deliveryRunId = hydratedRunId;
+      }
+    }
     const state = displayStateForLive(data);
     tile.dataset.state = ACTIVE_RUN_STATES.has(runState) || ACTIVE_STATES.has(rawState)
       ? 'active'
@@ -610,6 +755,7 @@ async function refreshWorkspaceTile(workerId, refreshBootstrap) {
     updateTileControlLabels(tile, state);
     const glass = tile.querySelector('.workspace-tile-glass');
     if (glass) setGlassPane(glass, workerId, state, Boolean(data?.runtime_details?.view_available || data?.runtime_details?.view_url), refreshBootstrap);
+    renderWorkspaceDelivery(tile, data);
     const meta = tile.querySelector('[data-worker-meta]');
     updateWorkspaceMeta(meta, data?.worker?.profile, state);
     const favorite = tile.querySelector('[data-worker-favorite]');
@@ -624,6 +770,8 @@ async function refreshWorkspaceTile(workerId, refreshBootstrap) {
   } catch (error) {
     markNextRefresh(ACTIVE_TILE_REFRESH_MS);
     if (output) output.textContent = error.message;
+  } finally {
+    tile.dataset.refreshing = 'false';
   }
 }
 
@@ -631,6 +779,7 @@ async function refreshVisibleWorkspaceTiles(refreshBootstrap, { force = false } 
   if (document.hidden || workspaceRefreshInFlight) return;
   const now = Date.now();
   const workerIds = Array.from(document.querySelectorAll('.workspace-tile'))
+    .filter((tile) => tile.dataset.viewportVisible === 'true')
     .filter((tile) => tile.dataset.watchVisible === 'true' || tile.dataset.statusVisible === 'true')
     .filter((tile) => {
       if (force) return true;
@@ -680,11 +829,14 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   tile.dataset.state = isActive ? 'active' : isResumable ? 'resumable' : 'inactive';
   tile.dataset.workerId = workerId;
   tile.dataset.desktopUrl = String(workspace.desktop_url || '');
+  tile.dataset.desktopPreviewUrl = String(workspace.desktop_preview_url || '');
   tile.dataset.apiUrl = String(workspace.control_url || workspace.api_url || '');
   tile.dataset.watchVisible = String(Boolean(viewPrefs.showWatch));
   tile.dataset.statusVisible = String(Boolean(viewPrefs.showStatus));
   tile.dataset.liveLoaded = 'false';
   tile.dataset.nextLiveRefreshAt = '0';
+  tile.dataset.viewportVisible = 'false';
+  tile.dataset.refreshing = 'false';
 
   const glass = document.createElement('div');
   glass.className = 'workspace-tile-glass';
@@ -709,17 +861,31 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
     note.textContent = 'Checking live surface...';
     glassPane.appendChild(note);
   } else {
-    const wakeButton = createButton(state === 'completed' || state === 'ready' || state === 'retained' ? 'Completed' : 'Resume workspace', 'workspace-glass-action');
-    if (wakeButton.textContent === 'Completed') {
-      wakeButton.dataset.intent = 'completed';
-      wakeButton.title = 'The last run completed. Use Send below to continue this workspace.';
+    if (state === 'completed' || state === 'ready' || state === 'retained') {
+      const note = document.createElement('div');
+      note.className = 'workspace-glass-note workspace-glass-complete';
+      note.textContent = 'Delivery ready';
+      glassPane.appendChild(note);
+    } else {
+      const wakeButton = createButton('Resume workspace', 'workspace-glass-action');
+      wakeButton.addEventListener('click', async () => {
+        await runWorkerAction(workerId, 'resume', wakeButton, refreshBootstrap);
+      });
+      glassPane.appendChild(wakeButton);
     }
-    wakeButton.addEventListener('click', async () => {
-      await runWorkerAction(workerId, 'resume', wakeButton, refreshBootstrap);
-    });
-    glassPane.appendChild(wakeButton);
   }
   glass.appendChild(glassPane);
+  const workspaceUrl = String(workspace.workspace_url || workspace.watch_url || '');
+  if (workspaceUrl && !glassPane.querySelector('.workspace-glass-action')) {
+    const previewLink = document.createElement('a');
+    previewLink.className = 'workspace-glass-open';
+    previewLink.href = withAuth(workspaceUrl);
+    previewLink.tabIndex = -1;
+    previewLink.setAttribute('aria-hidden', 'true');
+    previewLink.setAttribute('aria-label', `Open ${workspaceTileTitle(workspace)} workspace`);
+    previewLink.title = 'Open workspace';
+    glass.appendChild(previewLink);
+  }
 
   const body = document.createElement('div');
   body.className = 'workspace-tile-body';
@@ -773,9 +939,22 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   const report = document.createElement('button');
   report.type = 'button';
   report.className = 'workspace-status-report workspace-status-button';
+  report.setAttribute('aria-expanded', 'false');
   report.setAttribute('aria-label', `Open latest workspace output for ${workspaceTileTitle(workspace)}`);
+  const deliveryPanelId = `workspace-delivery-${workerId.replace(/[^A-Za-z0-9_-]/g, '_')}`;
+  report.setAttribute('aria-controls', deliveryPanelId);
   report.addEventListener('click', () => {
-    window.location.href = String(workspace.watch_url || '#');
+    const panel = tile.querySelector('[data-worker-delivery]');
+    if (!panel) return;
+    panel.hidden = !panel.hidden;
+    report.setAttribute('aria-expanded', String(!panel.hidden));
+    const action = report.querySelector('[data-worker-delivery-action]');
+    if (action) {
+      const closedLabel = action.dataset.closedLabel || 'View delivery';
+      action.textContent = panel.hidden
+        ? closedLabel
+        : closedLabel.replace(/^View\s+/, 'Hide ');
+    }
   });
   const reportHead = document.createElement('span');
   reportHead.className = 'workspace-report-head';
@@ -784,7 +963,8 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   reportLabel.textContent = 'Latest workspace output';
   const reportAction = document.createElement('span');
   reportAction.className = 'workspace-report-action';
-  reportAction.textContent = 'Open status';
+  reportAction.dataset.workerDeliveryAction = 'true';
+  reportAction.textContent = 'View delivery';
   reportHead.append(reportLabel, reportAction);
   const liveOutput = document.createElement('span');
   liveOutput.className = 'workspace-live-output';
@@ -793,8 +973,27 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   report.append(reportHead, liveOutput);
   body.appendChild(report);
 
+  const deliveryPanel = document.createElement('section');
+  deliveryPanel.className = 'workspace-delivery-panel';
+  deliveryPanel.id = deliveryPanelId;
+  deliveryPanel.dataset.workerDelivery = 'true';
+  deliveryPanel.hidden = true;
+  const deliveryPlaceholder = document.createElement('p');
+  deliveryPlaceholder.className = 'workspace-delivery-summary';
+  deliveryPlaceholder.textContent = 'Loading workspace status...';
+  deliveryPanel.appendChild(deliveryPlaceholder);
+  body.appendChild(deliveryPanel);
+
   const actions = document.createElement('div');
   actions.className = 'workspace-tile-actions';
+
+  const more = document.createElement('details');
+  more.className = 'workspace-tile-more';
+  const moreSummary = document.createElement('summary');
+  moreSummary.textContent = 'More';
+  const moreActions = document.createElement('div');
+  moreActions.className = 'workspace-tile-more-actions';
+  more.append(moreSummary, moreActions);
 
   const favorite = createButton(workspace.favorite ? '★' : '☆', 'workspace-icon-button');
   favorite.dataset.workerFavorite = 'true';
@@ -809,25 +1008,19 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   });
   actions.appendChild(favorite);
 
-  const watch = createButton('Full watch');
+  const watch = createButton('Open workspace');
   watch.addEventListener('click', async () => {
     await openWorkspaceSurface(workspace, watch);
   });
   actions.appendChild(watch);
 
-  const project = createButton('Project');
-  project.addEventListener('click', () => {
-    window.location.href = String(workspace.project_url || '#');
-  });
-  actions.appendChild(project);
-
   const duplicate = createButton('Duplicate');
   duplicate.addEventListener('click', () => duplicateSavedWorkspace(workspace, duplicate, refreshBootstrap));
-  actions.appendChild(duplicate);
+  moreActions.appendChild(duplicate);
 
   const saveTemplate = createButton('Save as template');
   saveTemplate.addEventListener('click', () => openSaveTemplate(workspace, refreshBootstrap));
-  actions.appendChild(saveTemplate);
+  moreActions.appendChild(saveTemplate);
 
   const accountSelect = document.createElement('select');
   accountSelect.className = 'workspace-account-select';
@@ -888,25 +1081,26 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
       liveOutput.textContent = error.message;
     }
   });
-  actions.appendChild(accountSelect);
+  moreActions.appendChild(accountSelect);
 
   if (workspace.workspace_kind === 'ephemeral' || workspace.workspace_kind === 'legacy') {
     const keep = createButton('Keep as workspace');
     keep.addEventListener('click', async () => {
       await runWorkerMetadata(workerId, { workspace_kind: 'named' }, keep, refreshBootstrap);
     });
-    actions.appendChild(keep);
+    moreActions.appendChild(keep);
   }
 
   const rename = createButton('Rename');
   rename.addEventListener('click', () => openRenameWorkspace(workspace, refreshBootstrap));
-  actions.appendChild(rename);
+  moreActions.appendChild(rename);
 
-  const toggle = createButton(state === 'completed' ? 'Continue' : workerActionForState(state) === 'resume' ? 'Resume' : 'Pause', 'workspace-run-toggle');
+  const lifecycleControl = workspaceLifecycleControl(state);
+  const toggle = createButton(lifecycleControl.label, 'workspace-run-toggle');
   toggle.dataset.workerActionToggle = 'true';
-  toggle.dataset.action = workerActionForState(state);
-  toggle.hidden = TERMINAL_ATTENTION_STATES.has(state) || ['terminating', 'termination_failed', 'terminated'].includes(state);
-  toggle.disabled = DISABLED_CONTROL_STATES.has(state);
+  toggle.dataset.action = lifecycleControl.action;
+  toggle.hidden = lifecycleControl.hidden;
+  toggle.disabled = lifecycleControl.disabled;
   toggle.addEventListener('click', async () => {
     await runWorkerAction(workerId, toggle.dataset.action, toggle, refreshBootstrap);
   });
@@ -919,7 +1113,8 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   interrupt.addEventListener('click', async () => {
     await runWorkerAction(workerId, 'interrupt', interrupt, refreshBootstrap);
   });
-  actions.appendChild(interrupt);
+  moreActions.appendChild(interrupt);
+  actions.appendChild(more);
 
   const steerForm = document.createElement('form');
   steerForm.className = 'workspace-steer';
@@ -970,8 +1165,11 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
 
 async function openWorkspaceSurface(workspace, button) {
   const workerId = String(workspace?.worker_id || '');
-  const shouldResume = workspace?.workspace_kind === 'named'
-    && (Boolean(workspace?.compute_released_at) || ['paused', 'idle', 'idle_terminated', 'stopped'].includes(rawWorkspaceState(workspace)));
+  const shouldResume = shouldResumeOnWorkspaceOpen({
+    workspaceKind: workspace?.workspace_kind,
+    renderedState: button?.closest('.workspace-tile')?.dataset.displayState,
+    fallbackState: workspaceStateLabel(workspace),
+  });
   const originalText = button?.textContent || '';
   if (button) button.disabled = true;
   try {
@@ -979,7 +1177,7 @@ async function openWorkspaceSurface(workspace, button) {
       if (button) button.textContent = 'Resuming…';
       await postJson(workerApiUrl(workerId, '/action/resume'));
     }
-    window.location.href = String(workspace?.watch_url || '#');
+    window.location.href = String(workspace?.workspace_url || workspace?.watch_url || '#');
   } catch (error) {
     const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);
     const output = tile?.querySelector('[data-worker-output]');
@@ -1027,26 +1225,48 @@ async function duplicateSavedWorkspace(workspace, button, refreshBootstrap) {
   const workerId = String(workspace.worker_id || '');
   if (!workerId) return;
   const originalText = button.textContent;
+  let resetText = originalText;
   button.disabled = true;
   button.textContent = 'Duplicating…';
   button.dataset.idempotencyKey ||= globalThis.crypto?.randomUUID?.()
     || `duplicate-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   try {
-    await postJson(
+    const payload = await postJson(
       `/api/workspaces/${encodeURIComponent(workerId)}/duplicate`,
       { idempotency_key: button.dataset.idempotencyKey },
     );
     delete button.dataset.idempotencyKey;
-    button.textContent = 'Duplicated';
+    const copiedWorker = payload.worker || {};
+    const approvals = Number(copiedWorker.duplication_report?.capabilities_requiring_reapproval || 0);
+    button.textContent = 'Copied';
     await refreshBootstrap();
+    if (approvals > 0) {
+      const route = rememberCapabilityReview(
+        copiedWorker.worker_id,
+        approvals,
+        copiedWorker.duplication_report?.outstanding_reapproval_items
+          || copiedWorker.duplication_report?.reapproval_items
+          || [],
+      );
+      const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);
+      const output = tile?.querySelector('[data-worker-output]');
+      if (output) output.textContent = `Workspace copied. Review ${approvals} capabilit${approvals === 1 ? 'y' : 'ies'} before running it.`;
+      window.location.hash = route;
+    }
   } catch (error) {
     const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);
     const output = tile?.querySelector('[data-worker-output]');
-    if (output) output.textContent = `${error.message} Retry will use the same request key.`;
+    if (error.code === 'workspace_duplication_failed') {
+      delete button.dataset.idempotencyKey;
+      resetText = 'Start fresh copy';
+      if (output) output.textContent = error.message;
+    } else if (output) {
+      output.textContent = `${error.message} Retry will use the same request key.`;
+    }
   } finally {
     window.setTimeout(() => {
       button.disabled = false;
-      button.textContent = originalText;
+      button.textContent = resetText;
     }, 900);
   }
 }
@@ -1087,6 +1307,34 @@ function openRenameWorkspace(workspace, refreshBootstrap) {
   input.select();
 }
 
+function observeWorkspaceTiles(grid, refreshBootstrap) {
+  workspaceVisibilityObserver?.disconnect();
+  workspaceVisibilityObserver = null;
+  const tiles = Array.from(grid.querySelectorAll('.workspace-tile'));
+  if (!('IntersectionObserver' in window)) {
+    for (const tile of tiles) tile.dataset.viewportVisible = 'true';
+    return;
+  }
+  workspaceVisibilityObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      const tile = entry.target;
+      tile.dataset.viewportVisible = String(entry.isIntersecting);
+      if (!entry.isIntersecting) {
+        const frame = tile.querySelector('.workspace-live-preview');
+        if (frame) {
+          const note = document.createElement('div');
+          note.className = 'workspace-glass-note';
+          note.textContent = 'Live preview paused offscreen';
+          frame.closest('[data-worker-glass]')?.replaceChildren(note);
+        }
+        continue;
+      }
+      refreshWorkspaceTile(String(tile.dataset.workerId || ''), refreshBootstrap).catch(() => {});
+    }
+  }, { rootMargin: '240px 0px', threshold: 0.01 });
+  for (const tile of tiles) workspaceVisibilityObserver.observe(tile);
+}
+
 function renderWorkspaceHive(data, refreshBootstrap, viewPrefs = defaultHivePrefs) {
   const grid = document.getElementById('workspace-hive-grid');
   const empty = document.getElementById('workspace-hive-empty');
@@ -1102,8 +1350,9 @@ function renderWorkspaceHive(data, refreshBootstrap, viewPrefs = defaultHivePref
   const active = workspaces.filter((workspace) => isWorkspaceActive(workspace));
   const resumable = workspaces.filter((workspace) => !isWorkspaceActive(workspace) && isWorkspaceResumable(workspace));
   const inactive = workspaces.filter((workspace) => !isWorkspaceActive(workspace) && !isWorkspaceResumable(workspace));
-  const sortFavorites = (items) => [...items].sort((left, right) => Number(Boolean(right.favorite)) - Number(Boolean(left.favorite)));
-  const visible = prefs.showInactive ? sortFavorites([...active, ...resumable, ...inactive]) : sortFavorites(active);
+  const visible = prefs.showInactive
+    ? [...active, ...resumable, ...inactive].sort(compareWorkspacePriority)
+    : [...active].sort(compareWorkspacePriority);
 
   summary.textContent = prefs.showInactive
     ? `${active.length} active · ${resumable.length} retained · ${inactive.length} inactive · ${workspaces.length} loaded`
@@ -1134,6 +1383,7 @@ function renderWorkspaceHive(data, refreshBootstrap, viewPrefs = defaultHivePref
     return renderWorkspaceTile(workspace, refreshBootstrap, drafts.get(workerId) || '', prefs, data || {});
   });
   grid.replaceChildren(...tiles);
+  observeWorkspaceTiles(grid, refreshBootstrap);
   refreshVisibleWorkspaceTiles(refreshBootstrap, { force: true }).catch(() => {});
 }
 
@@ -1637,9 +1887,19 @@ async function main() {
       delete templateStartButton.dataset.idempotencyKey;
       if (templateInstanceName) templateInstanceName.value = '';
       await refreshBootstrap();
-      const approvals = Array.isArray(payload.approvals_required) ? payload.approvals_required.length : 0;
+      const reviewItems = payload.workspace?.duplication_report?.outstanding_reapproval_items
+        || payload.workspace?.duplication_report?.reapproval_items
+        || [];
+      const approvals = Array.isArray(reviewItems) ? reviewItems.length : 0;
+      if (approvals > 0) {
+        window.location.hash = rememberCapabilityReview(
+          payload.workspace?.worker_id,
+          approvals,
+          reviewItems,
+        );
+      }
       if (templateStartStatus) templateStartStatus.textContent = approvals
-        ? `Workspace created and paused. ${approvals} Library approval${approvals === 1 ? '' : 's'} must be reviewed before use. Turn on Inactive Workspaces to find it.`
+        ? `Workspace copied. Review ${approvals} capabilit${approvals === 1 ? 'y' : 'ies'} before running it.`
         : 'Workspace created and paused. Turn on Inactive Workspaces to find it.';
     } catch (error) {
       if (templateStartStatus) templateStartStatus.textContent = `${error.message} Retry will use the same request key.`;
@@ -1725,6 +1985,8 @@ async function main() {
       provider_account_id: select.value.startsWith('new:') && providerAccountPolicy?.value !== 'legacy'
         ? providerAccount?.value || null
         : null,
+      idempotency_key: button.dataset.launchIdempotencyKey ||= globalThis.crypto?.randomUUID?.()
+        || `launch-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       files,
     };
     try {
@@ -1737,9 +1999,20 @@ async function main() {
         body: JSON.stringify(payload),
       });
       if (!response.ok) {
-        throw new Error(await responseMessage(response, 'Launch failed'));
+        throw await responseError(response, 'Launch failed');
       }
       const data = await response.json();
+      delete button.dataset.launchIdempotencyKey;
+      if (data.status === 'action_required') {
+        const approvals = Number(data.capabilities_requiring_reapproval || 0);
+        const route = rememberCapabilityReview(data.worker_id, approvals, data.reapproval_items || []);
+        status.textContent = `Workspace copied. Review ${approvals} capabilit${approvals === 1 ? 'y' : 'ies'} before running it.`;
+        await refreshBootstrap();
+        window.location.hash = route;
+        button.disabled = false;
+        if (scheduleButton) scheduleButton.disabled = false;
+        return;
+      }
       if (data.status === 'scheduled') {
         status.textContent = `Scheduled for ${data.scheduled_for || scheduleValue}.`;
         await refreshBootstrap();
@@ -1752,6 +2025,10 @@ async function main() {
     } catch (error) {
       button.disabled = false;
       if (scheduleButton) scheduleButton.disabled = false;
+      if (error.code === 'workspace_duplication_failed' && select.value.startsWith('duplicate:')) {
+        delete button.dataset.launchIdempotencyKey;
+        button.textContent = 'Start fresh copy';
+      }
       status.textContent = error.message;
     }
   });

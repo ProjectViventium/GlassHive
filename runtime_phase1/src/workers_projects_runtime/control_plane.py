@@ -2103,7 +2103,7 @@ class ControlPlaneStore:
                 if library_id:
                     worker = conn.execute(
                         """
-                        SELECT profile FROM workers
+                        SELECT profile, duplication_report_json FROM workers
                         WHERE worker_id = ? AND tenant_id = ? AND owner_id = ?
                         """,
                         (str(target_id), tenant_id, owner_id),
@@ -2145,6 +2145,38 @@ class ControlPlaneStore:
                         if str(value).strip()
                     }
                     allowed_scopes = set(snapshot["allowed_scopes"])
+                    report = _parse_json(worker["duplication_report_json"], {})
+                    waived = {
+                        str(value).strip()
+                        for value in ((report or {}).get("waived_reapprovals") or [])
+                        if str(value).strip()
+                    } if isinstance(report, dict) else set()
+                    copied_review = next(
+                        (
+                            entry
+                            for entry in ((report or {}).get("reapproval_items") or [])
+                            if isinstance(entry, dict)
+                            and str(entry.get("resolution") or "") == "library_grant"
+                            and str(entry.get("reference") or "") == library_id
+                            and str(entry.get("action_id") or "") not in waived
+                        ),
+                        None,
+                    ) if isinstance(report, dict) else None
+                    if copied_review is not None:
+                        copied_scopes = {
+                            str(value).strip()
+                            for value in (copied_review.get("scopes") or [])
+                            if str(value).strip()
+                        }
+                        if not copied_scopes.issubset(allowed_scopes):
+                            raise ControlPlaneConflict(
+                                "The copied capability changed; review its current permissions"
+                            )
+                        if requested_scopes and requested_scopes != copied_scopes:
+                            raise ControlPlaneConflict(
+                                "Copied capability review must keep its exact permissions"
+                            )
+                        requested_scopes = copied_scopes
                     if requested_scopes and not requested_scopes.issubset(allowed_scopes):
                         raise ControlPlaneError("Requested workspace scopes exceed the approved capability scopes")
                     pending_payload["scopes"] = sorted(requested_scopes or allowed_scopes)
@@ -2257,6 +2289,55 @@ class ControlPlaneStore:
                             "updated_at": float(account["updated_at"] or 0),
                         },
                     }
+            elif str(change_type).strip() == "workspace_duplication_reapproval_waiver":
+                worker = conn.execute(
+                    """
+                    SELECT worker_id, state, duplication_report_json FROM workers
+                    WHERE worker_id = ? AND tenant_id = ? AND owner_id = ?
+                    """,
+                    (str(target_id), tenant_id, owner_id),
+                ).fetchone()
+                if worker is None:
+                    raise ControlPlaneError("Target workspace is no longer available for this user")
+                if str(worker["state"] or "") in {
+                    "terminating",
+                    "termination_failed",
+                    "terminated",
+                }:
+                    raise ControlPlaneConflict(
+                        "Workspace is closed; create a new workspace for new work"
+                    )
+                report = _parse_json(worker["duplication_report_json"], {})
+                if not isinstance(report, dict):
+                    raise ControlPlaneError("Workspace capability review is invalid")
+                action_id = str(pending_payload.get("action_id") or "").strip()
+                item = next(
+                    (
+                        entry
+                        for entry in (report.get("reapproval_items") or [])
+                        if isinstance(entry, dict)
+                        and str(entry.get("action_id") or "") == action_id
+                    ),
+                    None,
+                )
+                if item is None:
+                    raise ControlPlaneError("Workspace capability review item is unavailable")
+                if str(item.get("resolution") or "") == "provider_selection":
+                    raise ControlPlaneConflict(
+                        "Choose a reviewed worker account instead of bypassing its selection"
+                    )
+                waived = {
+                    str(value)
+                    for value in (report.get("waived_reapprovals") or [])
+                    if str(value)
+                }
+                if action_id in waived:
+                    raise ControlPlaneConflict("Workspace capability review item was already skipped")
+                pending_payload = {
+                    "action_id": action_id,
+                    "review_snapshot": item,
+                    "label": str(item.get("label") or "Copied capability")[:160],
+                }
             conn.execute(
                 """
                 INSERT INTO control_plane_pending_changes
@@ -2675,6 +2756,60 @@ class ControlPlaneStore:
                     "worker_id": str(row["target_id"]),
                     "provider_account": selection,
                     "account": applied_account,
+                    "applies_to": "future_runs",
+                }
+            elif change_type == "workspace_duplication_reapproval_waiver":
+                worker = conn.execute(
+                    """
+                    SELECT worker_id, duplication_report_json FROM workers
+                    WHERE worker_id = ? AND tenant_id = ? AND owner_id = ?
+                    """,
+                    (str(row["target_id"]), tenant_id, owner_id),
+                ).fetchone()
+                if worker is None:
+                    raise ControlPlaneError("Target workspace is no longer available for this user")
+                report = _parse_json(worker["duplication_report_json"], {})
+                if not isinstance(report, dict):
+                    raise ControlPlaneError("Workspace capability review is invalid")
+                action_id = str(payload.get("action_id") or "").strip()
+                item = next(
+                    (
+                        entry
+                        for entry in (report.get("reapproval_items") or [])
+                        if isinstance(entry, dict)
+                        and str(entry.get("action_id") or "") == action_id
+                    ),
+                    None,
+                )
+                reviewed = payload.get("review_snapshot")
+                if item is None or not isinstance(reviewed, dict) or not hmac.compare_digest(
+                    _json(item), _json(reviewed)
+                ):
+                    raise ControlPlaneConflict(
+                        "Workspace capability review changed; prepare the decision again"
+                    )
+                if str(item.get("resolution") or "") == "provider_selection":
+                    raise ControlPlaneConflict(
+                        "Choose a reviewed worker account instead of bypassing its selection"
+                    )
+                waived = {
+                    str(value)
+                    for value in (report.get("waived_reapprovals") or [])
+                    if str(value)
+                }
+                if action_id in waived:
+                    raise ControlPlaneConflict(
+                        "Workspace capability review item was already resolved"
+                    )
+                waived.add(action_id)
+                report["waived_reapprovals"] = sorted(waived)
+                conn.execute(
+                    "UPDATE workers SET duplication_report_json = ?, updated_at = ? WHERE worker_id = ?",
+                    (_json(report), _worker_updated_at(), str(row["target_id"])),
+                )
+                applied = {
+                    "worker_id": str(row["target_id"]),
+                    "action_id": action_id,
                     "applies_to": "future_runs",
                 }
             else:

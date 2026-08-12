@@ -34,6 +34,15 @@ def test_local_password_login_requires_a_private_throttle_key(tmp_path, monkeypa
         HumanAuthGateway.from_env()
 
 
+def test_browser_login_presentation_rejects_hiding_every_method(tmp_path, monkeypatch):
+    configure_oidc(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_LOCAL_PASSWORD_LOGIN", "false")
+    monkeypatch.setenv("GLASSHIVE_OIDC_LOGIN_VISIBLE", "false")
+
+    with pytest.raises(RuntimeError, match="at least one browser login method"):
+        HumanAuthGateway.from_env()
+
+
 def test_local_password_provisioning_requires_admin_generated_entropy(
     tmp_path,
     monkeypatch,

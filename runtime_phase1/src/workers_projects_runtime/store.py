@@ -1249,6 +1249,7 @@ class Store:
         tenant_id: str = "local",
         workspace_kind: WorkspaceKind | str = "legacy",
         tags: list[str] | None = None,
+        duplication_report: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         worker_id = f"wrk_{uuid.uuid4().hex[:10]}"
         now = utc_now()
@@ -1280,7 +1281,11 @@ class Store:
             "favorite": 0,
             "workspace_kind": normalize_workspace_kind(workspace_kind),
             "workspace_tags_json": _workspace_tags_json(tags),
-            "duplication_report_json": "{}",
+            "duplication_report_json": json.dumps(
+                duplication_report or {},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
             "compute_released_at": None,
             "pid": None,
             "last_run_id": None,

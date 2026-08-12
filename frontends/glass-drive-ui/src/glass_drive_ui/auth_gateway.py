@@ -278,6 +278,9 @@ class HumanAuthGateway:
             "GLASSHIVE_ALLOW_EMAIL_LOGIN",
         )
         self.local_password_login = _env_bool("GLASSHIVE_LOCAL_PASSWORD_LOGIN")
+        self.oidc_login_visible = _env_bool("GLASSHIVE_OIDC_LOGIN_VISIBLE", True)
+        if self.mode == "oidc" and not self.oidc_login_visible and not self.local_password_login:
+            raise RuntimeError("GlassHive requires at least one browser login method")
         self.local_allowed_email_domains = _configured_domains(
             "GLASSHIVE_LOCAL_AUTH_ALLOWED_EMAIL_DOMAINS"
         )

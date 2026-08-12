@@ -57,7 +57,9 @@ Calm dark glass over a bright signal core, like a modern appliance or Tesla cont
     user into an error page.
 12. The raw live terminal session must still exist and stay available as a secondary surface for takeover and debugging.
 13. When desktop-first watch is enabled, the active worker terminal must also be visible inside the desktop itself by default so the operator can watch the real live session without leaving desktop view.
-14. The watch screen must expose a direct, obvious path to the full runtime project workspace for operators who want the richer dashboard and control plane.
+14. The watch screen must expose a direct, obvious path back to the modern GlassHive Workspaces
+    control room. Ordinary product navigation must not send users to the legacy runtime `/ui`
+    pages. Those routes remain available only as compatible operator diagnostics.
 15. The launch composer may expose the initial watch surface only as an advanced control. The primary project box must remain the same three-field experience.
 16. If project launch fails after a worker was created, the UI/runtime must record that launch as an explicit failure instead of leaving a healthy-looking but runless worker behind.
 17. The main controls must be simple and obvious:
@@ -69,8 +71,13 @@ Calm dark glass over a bright signal core, like a modern appliance or Tesla cont
 18. The latest result must be visible in the top ribbon and expandable without leaving the live view.
 18a. The latest workspace output affordance must look and read like an explicit action wherever it
    appears. The watch ribbon and workspace overview tiles should show `Latest workspace output`,
-   the current status/summary, and a clear `Open status` / `Close status` control state so users do
-   not have to guess which text is clickable.
+   the current status/summary, and a clear output/status action so users do not have to guess which
+   text is clickable. Inspecting output must never resume or restart compute.
+18b. Workspaces is the executive control room. It must show direct safe delivery actions and a
+   bounded, view-only overview of active workers without mounting an unbounded wall of interactive
+   desktops. Overview polling is compact, non-overlapping, and limited to visible tiles; at most a
+   small fixed number of live previews may be connected at once. A full interactive desktop remains
+   one click away in Watch / Steer.
 19. The steering box must remain visible across normal desktop widths and mobile-safe layouts.
 20. A non-technical user should be able to understand the flow with near-zero explanation.
 21. `Steer + send` must behave like a real redirect, not a passive note:
@@ -116,9 +123,17 @@ The easiest non-technical user flow should be:
    task or service
 6. land directly in the desktop-first watch view after open, duplicate, or create
 7. keep advanced lifecycle or debugging controls behind the existing ribbon / more menu
+8. expose the latest delivery directly on each workspace card, with `Open output` and `Download`
+   distinct from `Open workspace`
 
 `Open workspace` should automatically resume a paused workspace. Non-technical users should not
 need to choose between `open` and `resume`.
+
+Opening or downloading an existing delivery is always read-only. A completed workspace restarts
+only through an explicit `Continue` or new-message action; output inspection never calls resume.
+Worker-local targets such as `file:///workspace/...` are never browser delivery links. If an older
+deliverable record has only that internal target, Workspaces promotes the matching owner-scoped
+artifact Open/Download refs instead.
 
 ### V1 Action Set
 
@@ -134,6 +149,11 @@ Secondary:
 2. `Resume`
 3. `Interrupt`
 4. `Delete`
+
+Failed, cancelled, and interrupted workspaces must keep an explicit `Pause` recovery action when
+their workspace substrate can still be running. Error guidance must never recommend pausing while
+the normal Workspaces and Watch surfaces hide or disable that action. `Resume` remains inappropriate
+for these terminal run states because it can restart compute without creating a corrected follow-up.
 
 ### Duplicate Semantics
 
@@ -152,8 +172,27 @@ V1 duplicate should:
 The durable reservation is fail-closed. A fresh pending request cannot start a second project. A
 stale reservation is recovered only when one exact owner-scoped worker has both its persisted copy
 report and completed duplication event; ambiguous state is preserved for diagnosis or cleaned when
-it has no workspace, never silently duplicated. The legacy project-worker duplicate route remains
-unchanged for compatibility.
+it has no workspace, never silently duplicated. The legacy project-worker duplicate route keeps its
+request/response compatibility but uses the same fail-closed destination review gate.
+
+Capabilities that cannot be copied safely are returned as exact, owner-scoped review items. Duplicate
+and template destinations are created with that deterministic action-id report in the same durable
+write as the new worker, before file copy or HTTP success. The destination remains unable to run until
+every Library item is restored through its real approval, a concrete personal provider selection is
+reviewed again, or the user explicitly confirms `Continue without this capability`. Legacy brokered
+connection and provider-grant references are deliberately non-transferable: the UI says they were
+not copied and never claims a setup message restored them. Provider selection cannot be waived.
+Reapproval preserves the source grant's exact scope subset rather than requesting every current
+manifest scope; API and MCP omission cannot widen it. Account-less `personal_preferred` fallback has
+no private capability and therefore creates no impossible review item. A preferred account that is
+disconnected, otherwise not ready, or later forgotten degrades to that same explicit fallback; an
+unready `personal_required` account blocks duplication with a concise reconnect-or-choose recovery
+instead of creating a permanent review item. Review state survives
+refresh/restart in the destination record, including when the copied workspace falls outside the
+first catalog page; an exact owner-scoped lookup clears it on account change without exposing another
+user's labels. A terminal duplicate failure discards only
+its failed idempotency attempt so the UI can offer `Start fresh copy`; transient retries retain the
+same key.
 
 This gives users a real branch/fork action without silently carrying over sensitive browser state.
 
@@ -205,13 +244,17 @@ Use a separate frontend service that:
 7. A hello-world landing page task ends on the rendered page in the sandbox browser.
 8. The active worker terminal is visible inside the desktop-first watch flow by default.
 9. The exact live terminal session remains available from the same watch screen.
-10. The watch screen provides a first-class link to the runtime project workspace without forcing the operator to discover it inside an embedded iframe.
+10. The watch screen provides a first-class link to the modern Workspaces control room, while direct
+    legacy runtime project URLs remain compatible diagnostics and never become primary navigation.
 11. Launches that fail after worker creation leave an explicit failure trail instead of a silent orphan worker.
 12. The UI feels simple enough for a non-technical user.
 13. A non-technical user can understand that reopening a named workspace returns them to the same files, browser setup, and login state.
 14. The primary action set is open-duplicate-new and each action is understandable to a non-technical user.
 15. `Open workspace` is the single reuse verb and automatically resumes paused workspaces.
 16. `Duplicate workspace` creates a new workspace with copied files/context but a clean browser-session state.
+17. Workspaces exposes a delivery without opening Watch / Steer or changing lifecycle state.
+18. The overview bounds live previews and compact polling as the catalog grows; no offscreen tile
+    captures keyboard/mouse input or creates an unbounded desktop connection.
 
 ## Current Phase-1 Clipboard Note
 

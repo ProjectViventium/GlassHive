@@ -1413,6 +1413,17 @@ def create_app(
             "schedule_readiness",
         }
         item = {key: worker.get(key) for key in allowed if key in worker}
+        duplication_report = item.get("duplication_report")
+        if isinstance(duplication_report, dict):
+            current_report = dict(duplication_report)
+            outstanding = [
+                dict(entry)
+                for entry in service._unresolved_duplication_reapprovals(worker)
+                if str(entry.get("action_id") or "") != "duplication_pending"
+            ]
+            current_report["outstanding_reapproval_items"] = outstanding
+            current_report["capabilities_requiring_reapproval"] = len(outstanding)
+            item["duplication_report"] = current_report
         raw_bundle = worker.get("bootstrap_bundle_json")
         if isinstance(raw_bundle, str) and raw_bundle.strip():
             try:
@@ -1431,6 +1442,150 @@ def create_app(
                     **({"account_id": account_id} if account_id else {}),
                 }
         return item
+
+    def _workspace_duplication_reapproval_items(
+        source: dict[str, object],
+        source_grants: list[dict[str, Any]],
+        *,
+        tenant_id: str,
+        owner_id: str,
+    ) -> list[dict[str, object]]:
+        """Describe intentionally un-copied user capabilities without exposing secrets."""
+
+        library = {
+            str(item.get("library_id") or ""): item
+            for item in control_plane.list_library()
+        }
+        connections = {
+            str(item.get("connection_id") or ""): item
+            for item in control_plane.list_connections(tenant_id=tenant_id, owner_id=owner_id)
+        }
+        accounts = {
+            str(item.get("account_id") or ""): item
+            for item in control_plane.list_provider_accounts(tenant_id=tenant_id, owner_id=owner_id)
+        }
+        items: list[dict[str, object]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add_item(
+            *,
+            kind: str,
+            reference: str,
+            label: str,
+            route: str,
+            resolution: str,
+            scopes: list[object] | None = None,
+            policy: str = "",
+        ) -> None:
+            normalized_reference = str(reference or "").strip()
+            key = (resolution, normalized_reference)
+            if not normalized_reference or key in seen:
+                return
+            seen.add(key)
+            action_id = "rea_" + sha256(
+                f"{resolution}\0{normalized_reference}".encode("utf-8")
+            ).hexdigest()[:24]
+            items.append(
+                {
+                    "action_id": action_id,
+                    "kind": kind,
+                    "resolution": resolution,
+                    "reference": normalized_reference,
+                    "label": str(label or "Capability").strip()[:160] or "Capability",
+                    "route": route,
+                    "scopes": sorted(
+                        {
+                            str(scope).strip()
+                            for scope in (scopes or [])
+                            if str(scope).strip()
+                        }
+                    ),
+                    **({"policy": policy} if policy else {}),
+                }
+            )
+
+        for grant in source_grants:
+            grant_scopes = grant.get("scopes") if isinstance(grant.get("scopes"), list) else []
+            library_id = str(grant.get("library_id") or "").strip()
+            connection_id = str(grant.get("connection_id") or "").strip()
+            account_id = str(grant.get("account_id") or "").strip()
+            if library_id:
+                entry = library.get(library_id, {})
+                manifest = entry.get("manifest") if isinstance(entry.get("manifest"), dict) else {}
+                add_item(
+                    kind="library",
+                    reference=library_id,
+                    label=str(
+                        manifest.get("label")
+                        or manifest.get("name")
+                        or entry.get("stable_id")
+                        or "Library capability"
+                    ),
+                    route="library",
+                    scopes=grant_scopes,
+                    resolution="library_grant",
+                )
+            elif connection_id:
+                entry = connections.get(connection_id, {})
+                add_item(
+                    kind="connection",
+                    reference=connection_id,
+                    label=str(entry.get("label") or entry.get("kind") or "Connected service"),
+                    route="connections",
+                    scopes=grant_scopes,
+                    resolution="connection_grant",
+                )
+            elif account_id:
+                entry = accounts.get(account_id, {})
+                add_item(
+                    kind="provider_account",
+                    reference=account_id,
+                    label=str(entry.get("label") or entry.get("provider") or "Personal AI account"),
+                    route="connections",
+                    scopes=grant_scopes,
+                    resolution="provider_grant",
+                )
+
+        provider_selection = _workspace_catalog_item(source).get("provider_account")
+        if isinstance(provider_selection, dict):
+            policy = str(provider_selection.get("policy") or "").strip()
+            account_id = str(provider_selection.get("account_id") or "").strip()
+            if policy in {"personal_preferred", "personal_required"} and account_id:
+                entry = accounts.get(account_id)
+                account_ready = bool(
+                    entry is not None
+                    and str(entry.get("status") or "").strip().lower() == "ready"
+                )
+                if not account_ready:
+                    if policy == "personal_required":
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "This workspace requires a personal AI account that is not ready. "
+                                "Reconnect it or choose a current account before duplicating it."
+                            ),
+                        )
+                    return sorted(
+                        items,
+                        key=lambda item: (
+                            str(item["route"]),
+                            str(item["kind"]),
+                            str(item["reference"]),
+                        ),
+                    )
+                add_item(
+                    kind="provider_account",
+                    reference=account_id,
+                    label=str(entry.get("label") or entry.get("provider") or "Personal AI account"),
+                    route="connections",
+                    policy=policy,
+                    resolution="provider_selection",
+                )
+
+        return sorted(
+            items,
+            key=lambda item: (str(item["route"]), str(item["kind"]), str(item["reference"])),
+        )
 
     def _redact_runtime_details(details: dict[str, object]) -> dict[str, object]:
         allowed = {"mode", "runtime", "sandbox_state"}
@@ -1866,14 +2021,24 @@ def create_app(
             requested_name=requested_name,
         )
         if reservation.get("idempotent_replay") and reservation.get("response"):
-            return {**dict(reservation["response"]), "idempotent_replay": True}
+            response = dict(reservation["response"])
+            response_workspace = response.get("workspace")
+            current_worker_id = str(reservation.get("worker_id") or "").strip()
+            if not current_worker_id and isinstance(response_workspace, dict):
+                current_worker_id = str(response_workspace.get("worker_id") or "").strip()
+            current_worker = store.get_worker(current_worker_id) if current_worker_id else None
+            if current_worker is not None:
+                response["workspace"] = _workspace_catalog_item(current_worker)
+            return {**response, "idempotent_replay": True}
         if reservation.get("failed_replay"):
             failed_worker_id = str(reservation.get("worker_id") or "").strip()
-            failure = _redact_text(str(reservation.get("error_text") or "Workspace duplication failed"))
-            suffix = f" Failed workspace: {failed_worker_id}." if failed_worker_id else ""
-            raise ControlPlaneConflict(
-                f"Workspace duplication with this idempotency key previously failed: {failure}.{suffix} "
-                "No second workspace was created."
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "workspace_duplication_failed",
+                    "message": "This copy attempt could not be completed.",
+                    "recovery": "Start a fresh copy; no second workspace was created.",
+                },
             )
         if reservation.get("in_progress"):
             try:
@@ -1910,15 +2075,7 @@ def create_app(
                     for event in recovered_events
                 )
                 if isinstance(recovered_report, dict) and recovered_report and has_completed_event:
-                    source_grants = control_plane.list_workspace_grants(
-                        tenant_id=tenant_id,
-                        owner_id=owner_id,
-                        worker_id=worker_id,
-                    )
                     recovered_workspace = _workspace_catalog_item(recovered_worker)
-                    report = dict(recovered_report)
-                    report["capabilities_requiring_reapproval"] = len(source_grants)
-                    recovered_workspace["duplication_report"] = report
                     recovered_response: dict[str, object] = {
                         "project": reserved_project,
                         "workspace": recovered_workspace,
@@ -1974,6 +2131,12 @@ def create_app(
                 owner_id=owner_id,
                 worker_id=worker_id,
             )
+            reapproval_items = _workspace_duplication_reapproval_items(
+                source,
+                source_grants,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
             source_project = require_project(str(source.get("project_id") or ""), request)
             source_name = str(source.get("name") or "Workspace").strip() or "Workspace"
             duplicate_name = requested_name or f"{source_name} copy"
@@ -1997,11 +2160,9 @@ def create_app(
                 _request_owner(ctx, owner_id),
                 duplicate_name,
                 str(source.get("role") or "main"),
+                reapproval_items=reapproval_items,
             )
             workspace = _workspace_catalog_item(worker)
-            report = dict(workspace.get("duplication_report") or {})
-            report["capabilities_requiring_reapproval"] = len(source_grants)
-            workspace["duplication_report"] = report
             response: dict[str, object] = {"project": project, "workspace": workspace}
             control_plane.complete_workspace_duplication(
                 tenant_id=tenant_id,
@@ -2046,10 +2207,16 @@ def create_app(
                 project_id=project_id,
                 worker_id=failed_worker_id,
             )
+            if isinstance(exc, HTTPException) and not project_id and not failed_worker_id:
+                raise exc
             if failed_worker_id:
-                raise ControlPlaneConflict(
-                    "Workspace duplication failed; its failed workspace state was preserved and retrying "
-                    "this idempotency key will return the original failure without creating another workspace"
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "workspace_duplication_failed",
+                        "message": "This copy attempt could not be completed.",
+                        "recovery": "Start a fresh copy; its failed state was preserved for diagnosis.",
+                    },
                 ) from exc
             if not project_id:
                 raise ControlPlaneConflict(
@@ -2436,6 +2603,10 @@ def create_app(
                     status_code=409,
                     detail="Workspace is closed; create a new workspace for new work",
                 )
+        elif payload.change_type == "workspace_duplication_reapproval_waiver":
+            worker = require_worker(payload.target_id, request)
+            if str(worker.get("owner_id") or "") != owner_id:
+                raise HTTPException(status_code=404, detail="Workspace not found")
         pending = control_plane.create_pending_change(
             tenant_id=tenant_id,
             owner_id=owner_id,
@@ -2493,6 +2664,9 @@ def create_app(
             if pending_type == "workspace_provider_account":
                 event_type = "workspace.provider_account_changed"
                 event_summary = "Workspace account selection changed for future runs"
+            elif pending_type == "workspace_duplication_reapproval_waiver":
+                event_type = "workspace.capability_reapproval_skipped"
+                event_summary = "Copied workspace capability was explicitly left disconnected"
             elif pending_type == "library_upgrade":
                 event_type = "workspace.capability_upgraded"
                 event_summary = "Approved capability upgraded for workspace"
@@ -2615,12 +2789,26 @@ def create_app(
         ctx = _auth_context(request)
         require_project(project_id, request)
         source_worker = require_worker(payload.source_worker_id, request)
+        tenant_id = str(source_worker.get("tenant_id") or "local")
+        owner_id = _request_owner(ctx, payload.owner_id or str(source_worker.get("owner_id") or ""))
+        source_grants = control_plane.list_workspace_grants(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            worker_id=payload.source_worker_id,
+        )
+        reapproval_items = _workspace_duplication_reapproval_items(
+            source_worker,
+            source_grants,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
         worker = service.duplicate_worker(
             payload.source_worker_id,
             project_id,
-            _request_owner(ctx, payload.owner_id or str(source_worker.get("owner_id") or "")),
+            owner_id,
             payload.name,
             payload.role,
+            reapproval_items=reapproval_items,
         )
         return WorkerResponse(**worker)
 
@@ -2633,6 +2821,9 @@ def create_app(
     @app.get("/v1/workers/{worker_id}", response_model=WorkerResponse)
     def get_worker(worker_id: str, request: Request) -> WorkerResponse:
         worker = require_worker(worker_id, request)
+        catalog_projection = _workspace_catalog_item(worker)
+        if "duplication_report" in catalog_projection:
+            worker = {**worker, "duplication_report": catalog_projection["duplication_report"]}
         return WorkerResponse(**worker)
 
     @app.patch("/v1/workers/{worker_id}", response_model=WorkerResponse)

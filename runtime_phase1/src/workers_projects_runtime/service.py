@@ -1057,6 +1057,12 @@ class WorkersProjectsService:
             raise ControlPlaneConflict(
                 "Workspace is closed; create a new workspace for new work"
             )
+        if isinstance(worker_or_mode, dict):
+            unresolved = self._unresolved_duplication_reapprovals(worker_or_mode)
+            if unresolved:
+                raise ControlPlaneConflict(
+                    "Copied workspace needs capability review before it can run"
+                )
         execution_mode = (
             str(worker_or_mode.get("execution_mode") or "docker")
             if isinstance(worker_or_mode, dict)
@@ -1066,6 +1072,73 @@ class WorkersProjectsService:
             raise HostWorkersDisabledError(
                 "GlassHive host-native workers are disabled by Viventium config"
             )
+
+    def _unresolved_duplication_reapprovals(self, worker: dict) -> list[dict]:
+        report = worker.get("duplication_report")
+        if not isinstance(report, dict):
+            return []
+        if str(report.get("duplication_state") or "").strip() == "pending":
+            return [{"action_id": "duplication_pending", "kind": "duplication"}]
+        items = [
+            item
+            for item in (report.get("reapproval_items") or [])
+            if isinstance(item, dict)
+            and str(item.get("action_id") or "").strip()
+            and str(item.get("reference") or "").strip()
+        ]
+        if not items:
+            return []
+        waived = {
+            str(item).strip()
+            for item in (report.get("waived_reapprovals") or [])
+            if str(item).strip()
+        }
+        if self.control_plane_store is None:
+            return [item for item in items if str(item.get("action_id") or "") not in waived]
+        tenant_id = str(worker.get("tenant_id") or "local")
+        owner_id = str(worker.get("owner_id") or "")
+        worker_id = str(worker.get("worker_id") or "")
+        grants = self.control_plane_store.list_workspace_grants(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+        )
+        selection = mission_provider_account_selection(worker)
+
+        def resolved(item: dict) -> bool:
+            reference = str(item.get("reference") or "")
+            action_id = str(item.get("action_id") or "")
+            if action_id in waived:
+                return True
+            resolution = str(item.get("resolution") or "")
+            policy = str(item.get("policy") or "")
+            if resolution == "provider_selection" and policy:
+                return bool(
+                    selection is not None
+                    and selection.policy == policy
+                    and selection.account_id == reference
+                )
+            grant_key = {
+                "library_grant": "library_id",
+                "connection_grant": "connection_id",
+                "provider_grant": "account_id",
+            }.get(resolution)
+            expected_scopes = {
+                str(scope).strip()
+                for scope in (item.get("scopes") or [])
+                if str(scope).strip()
+            }
+            return bool(grant_key and any(
+                str(grant.get(grant_key) or "") == reference
+                and {
+                    str(scope).strip()
+                    for scope in (grant.get("scopes") or [])
+                    if str(scope).strip()
+                } == expected_scopes
+                for grant in grants
+            ))
+
+        return [item for item in items if not resolved(item)]
 
     def _runtime_start_lock(self, worker_id: str) -> Lock:
         with self._processors_lock:
@@ -2409,6 +2482,7 @@ class WorkersProjectsService:
         start_synchronously: bool = True,
         workspace_kind: WorkspaceKind | str = "legacy",
         tags: list[str] | None = None,
+        duplication_report: dict[str, object] | None = None,
     ) -> dict:
         self._ensure_execution_allowed(execution_mode)
         self._ensure_profile_allowed(profile)
@@ -2433,6 +2507,7 @@ class WorkersProjectsService:
                 bootstrap_bundle=bootstrap_bundle,
                 workspace_kind=normalize_workspace_kind(workspace_kind),
                 tags=normalize_workspace_tags(tags),
+                duplication_report=duplication_report,
             )
         if not start_synchronously:
             prepare_workspace = getattr(self.runtime, "prepare_worker_workspace", None)
@@ -3869,8 +3944,18 @@ class WorkersProjectsService:
         owner_id: str,
         name: str,
         role: str,
+        reapproval_items: list[dict[str, object]] | None = None,
     ) -> dict:
         source_worker = self.require_worker(source_worker_id)
+        required_items = [dict(item) for item in (reapproval_items or []) if isinstance(item, dict)]
+        initial_report: dict[str, object] = {
+            "duplication_state": "pending",
+            "source_state": "pending",
+            "copied_files": 0,
+            "skipped_items": 0,
+            "capabilities_requiring_reapproval": len(required_items),
+            "reapproval_items": required_items,
+        }
         bootstrap_bundle = _duplicate_bootstrap_bundle(self._bootstrap_bundle_for(source_worker))
         profile = str(source_worker.get("profile") or "codex-cli")
         execution_mode = str(source_worker.get("execution_mode") or "docker")
@@ -3889,10 +3974,11 @@ class WorkersProjectsService:
             bootstrap_bundle=bootstrap_bundle,
             workspace_kind="named",
             tags=normalize_workspace_tags(source_worker.get("tags") if isinstance(source_worker.get("tags"), list) else []),
+            duplication_report=initial_report,
             start_synchronously=False,
         )
         try:
-            duplication_report = self._copy_workspace_contents(source_worker, duplicated)
+            copy_report = self._copy_workspace_contents(source_worker, duplicated)
         except Exception as exc:
             current_duplicate = self.store.get_worker(str(duplicated["worker_id"])) or duplicated
             cleanup_ready = False
@@ -3930,6 +4016,15 @@ class WorkersProjectsService:
                     owner_id=owner_id,
                 )
             raise
+        duplication_report = dict(copy_report)
+        if required_items:
+            duplication_report.update(
+                {
+                    "duplication_state": "complete",
+                    "capabilities_requiring_reapproval": len(required_items),
+                    "reapproval_items": required_items,
+                }
+            )
         self.store.update_worker(
             duplicated["worker_id"],
             duplication_report_json=json.dumps(duplication_report, sort_keys=True, separators=(",", ":")),
@@ -4065,6 +4160,33 @@ class WorkersProjectsService:
             library_refs=[dict(item) for item in library_refs if isinstance(item, dict)],
             profile=profile,
         )
+        validated_library_refs = {
+            str(item.get("library_id") or ""): item
+            for item in approvals_required
+            if isinstance(item, dict) and str(item.get("library_id") or "")
+        }
+        reapproval_items = [
+            {
+                "action_id": "rea_" + hashlib.sha256(
+                    f"library_grant\0{str(reference.get('library_id') or '')}".encode("utf-8")
+                ).hexdigest()[:24],
+                "kind": "library",
+                "resolution": "library_grant",
+                "reference": str(reference.get("library_id") or ""),
+                "label": str(
+                    validated_library_refs.get(str(reference.get("library_id") or ""), {}).get("stable_id")
+                    or reference.get("stable_id")
+                    or "Library capability"
+                )[:160],
+                "route": "library",
+                "scopes": sorted(
+                    {str(scope) for scope in (reference.get("scopes") or []) if str(scope)}
+                ),
+            }
+            for reference in library_refs
+            if isinstance(reference, dict)
+            and str(reference.get("library_id") or "") in validated_library_refs
+        ]
         provider_account_ref = worker_spec.get("provider_account_ref")
         provider_account_selection: dict[str, str] | None = None
         if provider_account_ref is not None:
@@ -4153,6 +4275,14 @@ class WorkersProjectsService:
                 tags=normalize_workspace_tags(
                     worker_spec.get("tags") if isinstance(worker_spec.get("tags"), list) else []
                 ),
+                duplication_report={
+                    "duplication_state": "complete",
+                    "source_state": "template",
+                    "copied_files": 0,
+                    "skipped_items": 0,
+                    "capabilities_requiring_reapproval": len(reapproval_items),
+                    "reapproval_items": reapproval_items,
+                },
                 start_synchronously=False,
             )
             self.control_plane_store.complete_workspace_template_instantiation(

@@ -10,21 +10,26 @@ guess a deployment URL.
 
 ## Connect
 
-1. Ask the user to sign in to their GlassHive site and open **Connect AI**.
-2. If **Connect AI** says `action_required`, stop and report that the deployment has no complete
+1. Ask the user to sign in to their GlassHive site and open **Connections**, then expand **Use
+   GlassHive from another AI app**.
+2. If that panel says `action_required`, stop and report that the deployment has no complete
    pre-registered client. Ask its administrator to register and allowlist the client, delegated
    scopes, token audience, and exact callback URI shown by the deployment. Do not invent a command.
-3. Use only the exact deployment-generated add and login commands shown for the selected client.
+3. Prefer the panel's **Automatic** copy: it is a self-contained instruction carrying the exact
+   deployment-generated add and login commands for every client this deployment supports. If the
+   user selects Manual instead, use only those same exact commands shown for the selected client.
    They carry the registered client id, canonical public MCP resource, and fixed callback settings
    required by that deployment. Do not reconstruct a command from only the MCP URL or substitute a
    generic example from this skill.
-4. Run the displayed commands in their displayed order. For Claude Code, follow the accompanying
+4. Run the embedded/displayed commands in their displayed order. For Claude Code, follow the accompanying
    `/mcp` sign-in note when shown. Hosted multi-user MCP URLs must be HTTPS.
 5. Let the client open its OAuth login/consent flow. Never ask the user to paste an access token into
    chat, a workspace, this skill, or a client command.
-6. Verify the configured `glasshive` server and list its tools. If OAuth, URL, or discovery fails,
-   report the exact failing state and return to **Connect AI**; do not fall back to a static bearer
-   token or a guessed localhost address.
+6. Verify the deployment-generated server name shown by GlassHive and list its tools. Never assume
+   the server is named `glasshive`; the live name is derived from the deployment URL so multiple
+   GlassHive installations do not collide. If OAuth, URL, or discovery fails, report the exact
+   failing state and return to the same Connections panel; do not fall back to a static bearer token
+   or a guessed localhost address.
 
 ## Use
 
