@@ -131,6 +131,74 @@ def test_legacy_one_shot_schedule_contract_is_unchanged(tmp_path, monkeypatch):
         service.shutdown()
 
 
+def test_missing_work_ai_fails_claimed_one_shot_and_recurring_schedules_without_runs(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "native")
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    for name in (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "OPENAI_REVERSE_PROXY",
+        "PORTKEY_API_KEY",
+        "PORTKEY_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(
+        store,
+        StubRuntime(),
+        control_plane_store=ControlPlaneStore(str(tmp_path / "runtime.db")),
+        reconcile_on_startup=False,
+    )
+    service._ensure_worker_processor = lambda _worker_id: None  # type: ignore[method-assign]
+    try:
+        worker = _worker(store)
+        one_shot = service.schedule_run(
+            worker["worker_id"],
+            "Run once after setup.",
+            run_at="2026-03-09T14:00:00+00:00",
+        )
+        first = service.process_due_schedules_once(now_iso="2026-03-09T14:30:00+00:00")
+        assert first[0]["schedule_id"] == one_shot["schedule_id"]
+        assert first[0]["state"] == "failed"
+        assert "Work AI is not set up" in first[0]["last_error"]
+        assert store.list_runs_for_worker(worker["worker_id"]) == []
+        assert service.process_due_schedules_once(
+            now_iso="2026-03-09T14:31:00+00:00"
+        ) == []
+
+        definition = service.create_recurring_schedule(
+            worker["worker_id"],
+            "Run the recurring report after setup.",
+            recurrence_type="daily",
+            local_time="09:00",
+            timezone_name="America/New_York",
+            first_run_at="2026-03-10T13:00:00+00:00",
+            schedule_text="daily at 9 AM",
+        )
+        recurring = service.process_due_schedules_once(
+            now_iso="2026-03-10T13:30:00+00:00"
+        )
+        failed = next(item for item in recurring if item["worker_id"] == worker["worker_id"])
+        assert failed["state"] == "failed"
+        assert "Work AI is not set up" in failed["last_error"]
+        occurrence = store.recurring_occurrence_for_schedule(failed["schedule_id"])
+        assert occurrence is not None
+        assert occurrence["state"] == "failed"
+        assert occurrence["outcome"] == "failed"
+        assert store.list_runs_for_worker(worker["worker_id"]) == []
+        assert store.get_recurring_schedule_definition(
+            definition["definition_id"],
+            tenant_id="tenant-one",
+            owner_id="owner-one",
+        )["active"] is True
+    finally:
+        service.shutdown()
+
+
 def test_native_daily_recurrence_materializes_latest_occurrence_once_and_persists(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "native")
     monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
@@ -1381,6 +1449,7 @@ def test_one_shot_disable_after_service_revalidation_cannot_reserve_run(tmp_path
     monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
     monkeypatch.setenv("GLASSHIVE_RECURRING_SCHEDULE_OWNER", "glasshive_native")
     monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-standard-openai-key")
     db_path = str(tmp_path / "runtime.db")
     store = Store(db_path)
     service = WorkersProjectsService(

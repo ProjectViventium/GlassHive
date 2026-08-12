@@ -3502,6 +3502,25 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                     bootstrap_bundle,
                     provider_account_selection,
                 )
+                selected_policy = str(
+                    (provider_account_selection or {}).get("policy") or "legacy"
+                ).strip().lower()
+                selected_account_id = str(
+                    (provider_account_selection or {}).get("account_id") or ""
+                ).strip()
+                uses_deployment_provider = selected_policy == "legacy" or (
+                    selected_policy == "personal_preferred" and not selected_account_id
+                )
+                if uses_deployment_provider:
+                    readiness = active_client.provider_readiness(profile)
+                    if str(readiness.get("readiness") or "") != "deployment_managed":
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Work AI is not set up. Ask an administrator to finish provider "
+                                "setup or connect a personal account in Connections."
+                            ),
+                        )
                 project = active_client.create_project(owner_id, build_project_title(payload.description), payload.description.strip(), profile)
                 project_id = str(project["project_id"])
                 worker = active_client.create_worker(
@@ -3529,6 +3548,8 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 scheduled = active_client.schedule_run(str(worker_id), brief, schedule_text=schedule_text)
             else:
                 run = active_client.assign_run(str(worker_id), brief)
+        except HTTPException:
+            raise
         except httpx.HTTPStatusError as exc:
             reason = _runtime_status_detail(exc, _format_launch_error(exc))
             if created_new_worker and worker_id:

@@ -332,9 +332,16 @@ class FakeRuntimeClient:
         self.activity_requests = []
         self.schedule_authority_requests = []
         self.schedule_authority_error = None
+        self.provider_readiness_response = {
+            "readiness": "deployment_managed",
+            "status": "Work AI is ready.",
+        }
 
     def health(self):
         return {"status": "ok"}
+
+    def provider_readiness(self, profile: str):
+        return {**self.provider_readiness_response, "profile": profile}
 
     def with_headers(self, headers: dict[str, str]):
         self.header_contexts.append(headers)
@@ -940,6 +947,32 @@ def test_bootstrap_and_launch_flow():
     assert launch.json()['watch_url'].startswith('/watch/wrk_new')
     assert 'surface=desktop' in launch.json()['watch_url']
     assert fake.create_worker_requests[-1]['start_synchronously'] is False
+
+
+def test_new_workspace_launch_blocks_missing_work_ai_before_any_workspace_mutation():
+    fake = FakeRuntimeClient()
+    fake.provider_readiness_response = {
+        "readiness": "action_required",
+        "status": "Work AI is not set up.",
+    }
+    client = TestClient(create_app(runtime_client=fake))
+
+    response = client.post('/api/launch', json={
+        'description': 'Create a synthetic provider readiness report',
+        'success_criteria': 'Return the report',
+        'context': '',
+        'workspace_option': 'new:codex-cli',
+    })
+
+    assert response.status_code == 409
+    assert response.json()['detail'] == (
+        'Work AI is not set up. Ask an administrator to finish provider setup '
+        'or connect a personal account in Connections.'
+    )
+    assert fake.create_project_requests == []
+    assert fake.create_worker_requests == []
+    assert fake.assign_requests == []
+    assert fake.launch_failures == []
 
 
 def test_bootstrap_labels_degraded_personal_sections_instead_of_claiming_empty_state():
@@ -1992,7 +2025,8 @@ def test_launcher_workspace_hive_static_controls():
     assert "if (workspaceCatalogStatus) workspaceCatalogStatus.textContent = '';" in app_js
     assert "cursor: append ? String(catalogState.nextCursor || '') : ''" in app_js
     assert "workspace.provider_readiness" in app_js
-    assert "deployment account fallback" in app_js
+    assert "Work AI is not set up. Ask an administrator." in app_js
+    assert "Work AI: organization fallback" in app_js
     assert "function updateWorkspaceMeta" in app_js
     assert "meta.dataset.catalogDetails" in app_js
     assert "updateWorkspaceMeta(meta, data?.worker?.profile, state);" in app_js

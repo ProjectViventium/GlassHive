@@ -22,6 +22,7 @@ from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Callable
 
+from .auth import multi_user_security_enabled
 from .bootstrap import (
     GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
     GLASSHIVE_NATIVE_CAPABILITY_INVENTORY,
@@ -50,6 +51,7 @@ from .inference_broker import (
 from .mission_provider_accounts import (
     MissionProviderAccountBinder,
     apply_bound_provider_account_environment,
+    deployment_provider_readiness,
     mission_provider_account_selection,
 )
 from .openclaw_runtime import (
@@ -1235,6 +1237,12 @@ class ProfiledWorkerRuntime:
             )
         if status not in {"ready", "action_required", "unavailable", "error"}:
             if preferred:
+                readiness, _status = deployment_provider_readiness(runtime_name)
+                if readiness != "deployment_managed":
+                    raise RuntimeErrorBase(
+                        "Work AI is not set up for this workspace. Reconnect the personal account "
+                        "or ask an administrator to finish provider setup."
+                    )
                 fallback_worker = {
                     **worker,
                     "_glasshive_provider_account_preferred_fallback": True,
@@ -1320,6 +1328,12 @@ class ProfiledWorkerRuntime:
                 # worker already completed. Never run the user's mission twice as a fallback.
                 if mission_dispatched or not preferred:
                     raise
+                readiness, _status = deployment_provider_readiness(runtime_name)
+                if readiness != "deployment_managed":
+                    raise RuntimeErrorBase(
+                        "Work AI is not set up for this workspace. Reconnect the personal account "
+                        "or ask an administrator to finish provider setup."
+                    ) from exc
                 fallback_worker = {
                     **routed_worker,
                     "_glasshive_provider_account_preferred_fallback": True,
@@ -2536,7 +2550,11 @@ class BaseCliWorkerRuntime:
             "_glasshive_task_run": True,
         }
         info = self.ensure_worker_ready(worker_for_run)
-        refresh_runtime_env_for_worker(self._home_dir(worker_for_run["worker_id"]), worker_for_run)
+        refresh_runtime_env_for_worker(
+            self._home_dir(worker_for_run["worker_id"]),
+            worker_for_run,
+            self.runtime_name,
+        )
         workspace = Path(str(info.workspace_dir or self._workspace_dir(worker_for_run["worker_id"])))
         refresh_project_runtime_files_for_worker(
             self._home_dir(worker_for_run["worker_id"]),
@@ -3244,7 +3262,16 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
             logger.warning("OpenClaw gateway did not become ready for %s: %s", worker.get("worker_id"), detail)
 
     def _sandbox_env(self) -> dict[str, str]:
-        env = reviewed_openclaw_env(self._container_env(*_PROVIDER_ENV_KEYS))
+        provider_keys = list(_PROVIDER_ENV_KEYS)
+        if multi_user_security_enabled():
+            selected_key = self._compatible_provider_env_key()
+            if selected_key == "PORTKEY_API_KEY":
+                provider_keys = [key for key in provider_keys if key.startswith("PORTKEY_")]
+            elif selected_key == "OPENAI_API_KEY":
+                provider_keys = [key for key in provider_keys if key.startswith("OPENAI_")]
+            else:
+                provider_keys = []
+        env = reviewed_openclaw_env(self._container_env(*provider_keys))
         env["HOME"] = self.sandbox.home_mount
         env["TERM"] = self.sandbox.term_value
         env["DISPLAY"] = self.sandbox.display_value
@@ -3548,7 +3575,15 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         configured = os.environ.get("WPR_CODEX_CLI_ENV_KEY", "").strip()
         if configured:
             return configured
-        if os.environ.get("PORTKEY_BASE_URL", "").strip() and not os.environ.get("OPENAI_BASE_URL", "").strip():
+        if os.environ.get("PORTKEY_BASE_URL", "").strip() and not any(
+            os.environ.get(name, "").strip()
+            for name in (
+                "WPR_CODEX_CLI_BASE_URL",
+                "OPENAI_BASE_URL",
+                "OPENAI_API_BASE",
+                "OPENAI_REVERSE_PROXY",
+            )
+        ):
             return "PORTKEY_API_KEY"
         return "OPENAI_API_KEY"
 
@@ -3738,7 +3773,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         if is_resume:
             command.append(existing_session)
         command.append("-")
-        env = self._container_env(
+        provider_keys = [
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "OPENAI_API_BASE",
@@ -3747,6 +3782,17 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             "PORTKEY_BASE_URL",
             "PORTKEY_VIRTUAL_KEY",
             "PORTKEY_CONFIG",
+        ]
+        if multi_user_security_enabled():
+            selected_key = self._compatible_provider_env_key(worker)
+            if selected_key == "PORTKEY_API_KEY":
+                provider_keys = [key for key in provider_keys if key.startswith("PORTKEY_")]
+            elif selected_key == "OPENAI_API_KEY":
+                provider_keys = [key for key in provider_keys if key.startswith("OPENAI_")]
+            else:
+                provider_keys = []
+        env = self._container_env(
+            *provider_keys,
             "HTTPS_PROXY",
             "HTTP_PROXY",
             "NO_PROXY",

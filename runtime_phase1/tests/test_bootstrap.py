@@ -66,9 +66,10 @@ def test_enterprise_bootstrap_filters_worker_env_and_projects_provider_env(monke
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("GLASSHIVE_PROJECT_PROVIDER_ENV", "true")
     monkeypatch.setenv("OPENAI_API_KEY", "process-openai")
-    monkeypatch.setenv("PORTKEY_BASE_URL", "https://portkey.example.com")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openai.example.com")
 
     worker = {
+        "profile": "codex-cli",
         "bootstrap_bundle_json": json.dumps(
             {
                 "env": {
@@ -84,10 +85,57 @@ def test_enterprise_bootstrap_filters_worker_env_and_projects_provider_env(monke
     env = bootstrap_env_for(worker)
 
     assert env["OPENAI_API_KEY"] == "bundle-openai"
-    assert env["ANTHROPIC_BASE_URL"] == "https://anthropic.enterprise.example.com"
+    assert "ANTHROPIC_BASE_URL" not in env
     assert env["GLASSHIVE_CAPABILITY_BROKER_TOKEN"] == "public-safe-broker-grant"
-    assert env["PORTKEY_BASE_URL"] == "https://portkey.example.com"
+    assert env["OPENAI_BASE_URL"] == "https://openai.example.com"
     assert "PRIVATE_INTERNAL_TOKEN" not in env
+
+
+@pytest.mark.parametrize(
+    ("profile", "present", "absent"),
+    [
+        ("codex-cli", {"OPENAI_API_KEY"}, {"ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID"}),
+        ("claude-code", {"ANTHROPIC_API_KEY"}, {"OPENAI_API_KEY", "PORTKEY_API_KEY"}),
+        ("openclaw-general", {"OPENAI_API_KEY"}, {"ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID"}),
+    ],
+)
+def test_enterprise_deployment_provider_projection_is_profile_scoped(
+    monkeypatch, profile, present, absent
+):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_PROJECT_PROVIDER_ENV", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai")
+    monkeypatch.setenv("PORTKEY_API_KEY", "synthetic-portkey")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-anthropic")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "synthetic-aws")
+    env = bootstrap_env_for({"profile": profile})
+    assert present.issubset(env)
+    assert absent.isdisjoint(env)
+
+
+def test_enterprise_compatible_provider_projection_follows_each_runtime_selector(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("GLASSHIVE_PROJECT_PROVIDER_ENV", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://openai.example.test/v1")
+    monkeypatch.setenv("PORTKEY_API_KEY", "synthetic-portkey")
+    monkeypatch.setenv("PORTKEY_BASE_URL", "https://portkey.example.test/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://selected.example.test/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_ENV_KEY", "PORTKEY_API_KEY")
+
+    codex = bootstrap_env_for({"profile": "codex-cli"})
+    openclaw = bootstrap_env_for({"profile": "openclaw-general"})
+
+    assert codex["PORTKEY_API_KEY"] == "synthetic-portkey"
+    assert "OPENAI_API_KEY" not in codex
+    assert openclaw["OPENAI_API_KEY"] == "synthetic-openai"
+    assert "PORTKEY_API_KEY" not in openclaw
+
+    monkeypatch.setenv("WPR_OPENCLAW_BASE_URL", "https://selected.example.test/v1")
+    monkeypatch.setenv("WPR_OPENCLAW_ENV_KEY", "PORTKEY_API_KEY")
+    selected_openclaw = bootstrap_env_for({"profile": "openclaw-general"})
+    assert selected_openclaw["PORTKEY_API_KEY"] == "synthetic-portkey"
+    assert "OPENAI_API_KEY" not in selected_openclaw
 
 
 def test_enterprise_worker_env_allowlist_rejects_user_provider_tokens(monkeypatch):
@@ -190,9 +238,9 @@ def test_enterprise_bootstrap_keeps_provider_secrets_out_of_interactive_runtime_
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in runtime_env
     assert "PORTKEY_VIRTUAL_KEY" not in runtime_env
     assert "OPENAI_API_KEY" in secret_env
-    assert "CLAUDE_CODE_OAUTH_TOKEN" in secret_env
-    assert "PORTKEY_VIRTUAL_KEY" in secret_env
-    assert set(secret_keys) == {"CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "PORTKEY_VIRTUAL_KEY"}
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in secret_env
+    assert "PORTKEY_VIRTUAL_KEY" not in secret_env
+    assert set(secret_keys) == {"OPENAI_API_KEY"}
     assert oct((tmp_path / "home" / ".glasshive" / "secret-runtime.env").stat().st_mode & 0o777) == "0o600"
     assert oct((tmp_path / "home" / ".glasshive" / "secret-runtime.keys").stat().st_mode & 0o777) == "0o600"
 
@@ -307,7 +355,7 @@ def test_enterprise_run_only_secrets_are_refreshed_for_each_run(tmp_path, monkey
     assert "OPENAI_API_KEY" not in runtime_env.read_text()
 
     secret_env.unlink()
-    refresh_runtime_env_for_worker(home_dir, worker)
+    refresh_runtime_env_for_worker(home_dir, worker, "codex-cli")
 
     assert "OPENAI_API_KEY" in secret_env.read_text()
     assert "OPENAI_API_KEY" not in runtime_env.read_text()

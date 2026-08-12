@@ -11,7 +11,10 @@ import pytest
 
 from workers_projects_runtime.control_plane import ControlPlaneError, ControlPlaneStore
 from workers_projects_runtime.api import _build_runtime
-from workers_projects_runtime.mission_provider_accounts import MissionProviderAccountBinder
+from workers_projects_runtime.mission_provider_accounts import (
+    MissionProviderAccountBinder,
+    deployment_provider_readiness,
+)
 from workers_projects_runtime.openclaw_runtime import RuntimeErrorBase, RuntimeInfo
 from workers_projects_runtime.provider_accounts import ProviderAccountHomeManager
 from workers_projects_runtime.profile_runtime import (
@@ -1334,6 +1337,89 @@ def test_host_command_builders_apply_only_the_bound_native_provider_home(tmp_pat
     assert claude_env["CLAUDE_CONFIG_DIR"] != str(tmp_path / "global-claude")
     assert "ANTHROPIC_API_KEY" not in claude_env
     assert "ANTHROPIC_BASE_URL" not in claude_env
+
+
+def test_deployment_provider_readiness_is_profile_aware_and_route_complete(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    provider_names = {
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "OPENAI_REVERSE_PROXY",
+        "PORTKEY_API_KEY",
+        "PORTKEY_BASE_URL",
+        "WPR_CODEX_CLI_BASE_URL",
+        "WPR_CODEX_CLI_ENV_KEY",
+        "WPR_OPENCLAW_BASE_URL",
+        "WPR_OPENCLAW_ENV_KEY",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "WPR_CLAUDE_CODE_USE_API_KEY",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "AWS_REGION",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+    }
+    for name in provider_names:
+        monkeypatch.delenv(name, raising=False)
+
+    for profile in ("codex-cli", "openclaw-general", "claude-code", "unknown"):
+        assert deployment_provider_readiness(profile)[0] == "action_required"
+
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-standard-openai-key")
+    assert deployment_provider_readiness("codex-cli")[0] == "deployment_managed"
+    assert deployment_provider_readiness("openclaw-general")[0] == "deployment_managed"
+    assert deployment_provider_readiness("claude-code")[0] == "action_required"
+    monkeypatch.delenv("OPENAI_API_KEY")
+
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://selected.example.test/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_ENV_KEY", "PORTKEY_API_KEY")
+    monkeypatch.setenv("PORTKEY_API_KEY", "synthetic-portkey")
+    assert deployment_provider_readiness("codex-cli")[0] == "deployment_managed"
+    assert deployment_provider_readiness("openclaw-general")[0] == "action_required"
+    monkeypatch.setenv("WPR_OPENCLAW_BASE_URL", "https://selected.example.test/v1")
+    monkeypatch.setenv("WPR_OPENCLAW_ENV_KEY", "PORTKEY_API_KEY")
+    assert deployment_provider_readiness("openclaw-general")[0] == "deployment_managed"
+    monkeypatch.setenv("WPR_OPENCLAW_ENV_KEY", "PATH")
+    assert deployment_provider_readiness("openclaw-general")[0] == "action_required"
+    monkeypatch.delenv("WPR_CODEX_CLI_BASE_URL")
+    monkeypatch.delenv("WPR_CODEX_CLI_ENV_KEY")
+    monkeypatch.delenv("WPR_OPENCLAW_BASE_URL")
+    monkeypatch.delenv("WPR_OPENCLAW_ENV_KEY")
+    monkeypatch.delenv("PORTKEY_API_KEY")
+
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-claude-oauth")
+    assert deployment_provider_readiness("claude-code")[0] == "deployment_managed"
+    assert deployment_provider_readiness("codex-cli")[0] == "action_required"
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "true")
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "synthetic-bedrock-bearer")
+    assert deployment_provider_readiness("claude-code")[0] == "action_required"
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    assert deployment_provider_readiness("claude-code")[0] == "deployment_managed"
+
+
+def test_legacy_enterprise_flag_uses_the_same_fail_closed_provider_readiness(monkeypatch):
+    monkeypatch.delenv("GLASSHIVE_SECURITY_MODE", raising=False)
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    for name in (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "OPENAI_REVERSE_PROXY",
+        "PORTKEY_API_KEY",
+        "PORTKEY_BASE_URL",
+        "WPR_CODEX_CLI_BASE_URL",
+        "WPR_CODEX_CLI_ENV_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert deployment_provider_readiness("codex-cli")[0] == "action_required"
+
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-standard-openai-key")
+    assert deployment_provider_readiness("codex-cli")[0] == "deployment_managed"
 
 
 def test_bound_codex_mission_never_copies_process_global_auth_into_worker_state(tmp_path, monkeypatch):
