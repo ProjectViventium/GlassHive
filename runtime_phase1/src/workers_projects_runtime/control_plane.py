@@ -920,6 +920,23 @@ class ControlPlaneStore:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def active_provider_account_lease(
+        self, account_id: str, *, now: float | None = None
+    ) -> dict[str, Any] | None:
+        """Return the current lease that would block any new use of this account."""
+
+        timestamp = float(now if now is not None else time.time())
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM provider_account_leases
+                WHERE account_id = ? AND released_at IS NULL AND expires_at > ?
+                ORDER BY acquired_at DESC LIMIT 1
+                """,
+                (account_id, timestamp),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def heartbeat_provider_lease(
         self,
         *,

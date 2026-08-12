@@ -164,6 +164,13 @@ def test_provider_account_lease_is_durable_exclusive_and_recovers_after_expiry(t
             now=now + 1,
         )
 
+    active = restarted_store.active_provider_account_lease(
+        account["account_id"], now=now + 1
+    )
+    assert active is not None
+    assert active["lease_id"] == first["lease_id"]
+    assert active["worker_id"] == "wrk_a"
+
     with pytest.raises(ControlPlaneConflict, match="already in use"):
         restarted_store.acquire_provider_lease(
             account_id=account["account_id"],
@@ -195,6 +202,9 @@ def test_provider_account_lease_is_durable_exclusive_and_recovers_after_expiry(t
         now=now + 62,
     )
     assert restarted_store.active_provider_lease(account["account_id"], "default", now=now + 63) is None
+    assert restarted_store.active_provider_account_lease(
+        account["account_id"], now=now + 63
+    ) is None
 
 
 def test_provider_account_lease_heartbeat_extends_only_an_active_owner_scoped_lease(tmp_path):
