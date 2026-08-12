@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+import tomllib
 
 import pytest
 from fastapi.testclient import TestClient
@@ -103,6 +104,88 @@ def test_live_codex_worker_can_run_and_resume(tmp_path):
     codex_resume_done = wait_for_run(client, codex_resume_run["run_id"])
     assert codex_resume_done["state"] == "completed", codex_resume_done
     assert "CODEX_RESUME_OK" in codex_resume_done["output_text"], codex_resume_done["output_text"]
+
+
+def test_live_host_codex_plugin_denylist_worker_can_run(tmp_path, monkeypatch):
+    denied_plugin = "viventium-feelings@project-viventium"
+    monkeypatch.setenv("GLASSHIVE_HOST_PLUGIN_DENYLIST", denied_plugin)
+    db_path = tmp_path / "runtime-host-plugin-live.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="openclaw"))
+    project = _create_project(client, "codex-cli")
+
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Codex Plugin Isolation Worker",
+            "role": "coder",
+            "profile": "codex-cli",
+            "backend": "openclaw",
+            "execution_mode": "host",
+        },
+    ).json()
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={
+            "instruction": (
+                "Reply with a final section exactly named FINAL REPORT: followed by "
+                "CODEX_PLUGIN_DENYLIST_OK."
+            )
+        },
+    ).json()
+    done = wait_for_run(client, run["run_id"])
+
+    assert done["state"] == "completed", done
+    assert "CODEX_PLUGIN_DENYLIST_OK" in done["output_text"]
+    worker_root = tmp_path / "host_codex_cli_runtime" / "workers" / worker["worker_id"]
+    config = tomllib.loads((worker_root / "home" / ".codex" / "config.toml").read_text())
+    assert config["plugins"][denied_plugin]["enabled"] is False
+    instruction = next((worker_root / "home" / ".glasshive-runs").glob("*/instruction.stdin"))
+    assert denied_plugin not in instruction.read_text()
+
+
+def test_live_host_claude_plugin_denylist_worker_can_run(tmp_path, monkeypatch):
+    if os.environ.get("WPR_RUN_CLAUDE_CODE_LIVE_TESTS", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        pytest.skip("Set WPR_RUN_CLAUDE_CODE_LIVE_TESTS=1 to run live Claude Code worker tests")
+    denied_plugin = "viventium-feelings@project-viventium"
+    monkeypatch.setenv("GLASSHIVE_HOST_PLUGIN_DENYLIST", denied_plugin)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    db_path = tmp_path / "runtime-host-claude-plugin-live.db"
+    client = TestClient(create_app(str(db_path), runtime_backend="openclaw"))
+    project = _create_project(client, "claude-code")
+
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Claude Plugin Isolation Worker",
+            "role": "coder",
+            "profile": "claude-code",
+            "backend": "openclaw",
+            "execution_mode": "host",
+        },
+    ).json()
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={
+            "instruction": (
+                "Reply with a final section exactly named FINAL REPORT: followed by "
+                "CLAUDE_PLUGIN_DENYLIST_OK."
+            )
+        },
+    ).json()
+    done = wait_for_run(client, run["run_id"])
+
+    assert done["state"] == "completed", done
+    assert "CLAUDE_PLUGIN_DENYLIST_OK" in done["output_text"]
+    worker_root = tmp_path / "host_claude_code_runtime" / "workers" / worker["worker_id"]
+    instruction = next((worker_root / "home" / ".glasshive-runs").glob("*/instruction.stdin"))
+    assert denied_plugin not in instruction.read_text()
 
 
 def test_live_claude_worker_can_run_and_resume(tmp_path):

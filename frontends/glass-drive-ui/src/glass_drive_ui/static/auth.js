@@ -5,6 +5,7 @@ const localPassword = document.querySelector('#local-password');
 const localSubmit = document.querySelector('#local-submit');
 const authDivider = document.querySelector('#auth-divider');
 const status = document.querySelector('#auth-status');
+const footnote = document.querySelector('#auth-footnote');
 const pageParams = new URLSearchParams(window.location.search);
 const requestedReturnTo = String(pageParams.get('return_to') || '/');
 const returnTo = requestedReturnTo.startsWith('/')
@@ -76,19 +77,37 @@ async function initialize() {
     window.location.replace(returnTo);
     return;
   }
-  if (config.oidc) {
+  const loginMethods = new Set(Array.isArray(config.login_methods)
+    ? config.login_methods
+    : [
+      ...(config.oidc ? ['oidc'] : []),
+      ...(config.local_password_login ? ['local_password'] : []),
+    ]);
+  const oidcVisible = loginMethods.has('oidc');
+  const localVisible = loginMethods.has('local_password');
+  if (oidcVisible) {
     if (config.provider_email_login) {
       oidcButton.textContent = 'Continue with email or organization';
     }
     oidcButton.href = `/auth/oidc/start?return_to=${encodeURIComponent(returnTo)}`;
     oidcButton.hidden = false;
   }
-  if (config.local_password_login) {
+  if (localVisible) {
     localForm.hidden = false;
-    authDivider.hidden = !config.oidc;
+    authDivider.hidden = !(oidcVisible && localVisible);
   }
-  if (!config.oidc && !config.local_password_login) {
+  if (!oidcVisible && !localVisible) {
     throw new Error('Sign-in is unavailable.');
+  }
+
+  if (footnote) {
+    if (oidcVisible && localVisible) {
+      footnote.textContent = 'Use your preapproved email sign-in or your organization account. There is no public sign-up or self-service password reset.';
+    } else if (localVisible) {
+      footnote.textContent = 'Use the email sign-in your administrator provisioned. There is no public sign-up or self-service password reset.';
+    } else {
+      footnote.textContent = 'Use your approved organization account. GlassHive does not create a separate public account.';
+    }
   }
 
   if (config.principal_enrollment === false) {
@@ -98,7 +117,9 @@ async function initialize() {
   const authError = String(pageParams.get('auth_error') || '');
   if (errorMessages[authError]) status.textContent = errorMessages[authError];
   else if (pageParams.get('provider_logout') === 'unavailable') {
-    status.textContent = 'You are signed out of GlassHive. Your organization did not expose account switching here; choose Continue to sign in again.';
+    status.textContent = oidcVisible
+      ? 'You are signed out of GlassHive. Your organization did not expose account switching here; choose Continue to sign in again.'
+      : 'You are signed out of GlassHive. Sign in again when you are ready.';
   } else if (pageParams.has('logged_out')) {
     status.textContent = 'You are signed out of GlassHive.';
   }

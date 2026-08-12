@@ -201,6 +201,73 @@ def test_host_runtime_rejects_recycled_pid_identity_without_stopping_the_process
             unrelated_process.wait(timeout=3)
 
 
+def test_host_runtime_stop_failure_preserves_process_and_active_session(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path))
+    worker_id = "wrk_host_stop_failure"
+
+    class StubbornProcess:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(["synthetic-stubborn-process"], timeout)
+
+    process = StubbornProcess()
+    runtime._register_process(worker_id, process)  # type: ignore[arg-type]
+    runtime._write_active_session(
+        worker_id,
+        {
+            "session_name": "conversation-run_stop_failure",
+            "run_id": "run_stop_failure",
+            "stdout_path": str(tmp_path / "stdout.log"),
+            "stderr_path": str(tmp_path / "stderr.log"),
+            "exit_path": str(tmp_path / "exit_code"),
+            "model": "gpt-5.6-sol",
+            "process_pid": process.pid,
+            "started_at": datetime.now().astimezone().isoformat(),
+        },
+    )
+    runtime._host_active_slots()["mission"] = worker_id
+    runtime._host_worker_lanes()[worker_id] = "mission"
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.killpg", lambda _pgid, _signal: None)
+    runtime._wait_for_host_process_group_exit = lambda _pgid, _timeout: False  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError, match="remained alive"):
+        runtime._stop_active_process(
+            worker_id,
+            worker={"worker_id": worker_id, "execution_mode": "host"},
+            run_id="run_stop_failure",
+        )
+
+    assert runtime._read_active_session(worker_id) is not None
+    assert runtime._active_processes[worker_id] is process
+    assert runtime._host_active_slots()["mission"] == worker_id
+    assert runtime._host_worker_lanes()[worker_id] == "mission"
+
+
+def test_host_runtime_process_group_permission_probe_fails_closed(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path))
+
+    def deny_probe(_pgid, _signal):
+        raise PermissionError
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.killpg", deny_probe)
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], returncode=1, stdout="", stderr="ps failed"),
+    )
+
+    assert runtime._host_process_group_alive(12345) is True
+
+
 @pytest.mark.parametrize(
     ("runtime_class", "profile", "model", "stdout_payload", "expected_output", "expected_session"),
     [
@@ -2247,6 +2314,7 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
     runtime._record_run_metrics = record_metrics  # type: ignore[method-assign]
     _patch_host_codex_requirement_probe(monkeypatch)
     workspace = tmp_path / "workspace"
+    processes: list[object] = []
 
     class TimeoutProcess:
         pid = 12345
@@ -2254,6 +2322,7 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
         def __init__(self, command, **kwargs):
             _mark_fake_host_supervisor_ready(list(command), self.pid)
             self.terminated = False
+            processes.append(self)
             stdout = kwargs["stdout"]
             stdout.write("working before timeout\n")
             stdout.flush()
@@ -2276,6 +2345,14 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
         def kill(self):
             self.terminated = True
 
+    def fake_killpg(_pgid, signal_number):
+        if signal_number == 0:
+            if any(not process.terminated for process in processes):
+                return
+            raise ProcessLookupError
+        for process in processes:
+            process.terminate()
+
     monkeypatch.setattr(
         "workers_projects_runtime.profile_runtime.subprocess.run",
         lambda args, **kwargs: subprocess.CompletedProcess(
@@ -2286,6 +2363,8 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
         ),
     )
     monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.Popen", TimeoutProcess)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.killpg", fake_killpg)
     worker = {
         "worker_id": "wrk_timeout_evidence",
         "name": "Timeout Evidence Worker",
@@ -2324,6 +2403,7 @@ def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monke
     runtime.binary = "/bin/echo"
     _patch_host_codex_requirement_probe(monkeypatch)
     workspace = tmp_path / "workspace"
+    processes: list[object] = []
 
     class ForegroundServerProcess:
         pid = 12345
@@ -2331,6 +2411,7 @@ def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monke
         def __init__(self, command, **kwargs):
             _mark_fake_host_supervisor_ready(list(command), self.pid)
             self.terminated = False
+            processes.append(self)
             stdout = kwargs["stdout"]
             stderr = kwargs["stderr"]
             stdout.write("Serving HTTP on 127.0.0.1 port 8000 ...\n")
@@ -2356,6 +2437,14 @@ def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monke
         def kill(self):
             self.terminated = True
 
+    def fake_killpg(_pgid, signal_number):
+        if signal_number == 0:
+            if any(not process.terminated for process in processes):
+                return
+            raise ProcessLookupError
+        for process in processes:
+            process.terminate()
+
     monkeypatch.setattr(
         "workers_projects_runtime.profile_runtime.subprocess.run",
         lambda args, **kwargs: subprocess.CompletedProcess(
@@ -2366,6 +2455,8 @@ def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monke
         ),
     )
     monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.Popen", ForegroundServerProcess)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.killpg", fake_killpg)
     worker = {
         "worker_id": "wrk_foreground_server_evidence",
         "name": "Foreground Server Evidence Worker",
@@ -2517,6 +2608,10 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
             self.terminated = True
 
     def fake_killpg(_pgid, _signal):
+        if _signal == 0:
+            if any(not process.terminated for process in processes):
+                return
+            raise ProcessLookupError
         for process in processes:
             process.terminate()
 
@@ -3439,6 +3534,7 @@ def test_claude_stream_telemetry_is_compact_and_content_free(tmp_path):
         "time_to_request_ms": 24,
         "num_turns": 8,
         "api_retry_count": 1,
+        "last_api_retry_event_sequence": 4,
         "api_retry_delay_ms": 1500,
         "api_retry_statuses": ["529"],
         "tool_call_count": 1,
@@ -3554,6 +3650,37 @@ def test_claude_live_telemetry_reads_the_complete_active_run(tmp_path):
     assert telemetry["tool_call_counts"] == {"Bash": 1, "Read": 1}
     assert telemetry["last_stream_activity_at"] == telemetry["last_progress_at"]
     assert telemetry["seconds_since_stream_activity"] == telemetry["seconds_since_progress"]
+
+
+def test_claude_live_telemetry_locates_the_last_retry_in_the_event_stream(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_retry_sequence",
+        "name": "Invoice Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_retry_sequence"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "system", "subtype": "init"}),
+                json.dumps({"type": "api_retry", "error_status": 500}),
+                json.dumps({"type": "assistant", "message": {"content": []}}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    telemetry = runtime.live_telemetry(worker, "", run_id=run_id)
+
+    assert telemetry["api_retry_count"] == 1
+    assert telemetry["last_api_retry_event_sequence"] == 2
+    assert telemetry["event_count"] == 3
 
 
 def test_claude_live_telemetry_consumes_only_complete_appended_lines(tmp_path):
@@ -3864,7 +3991,7 @@ def test_workspace_claude_command_honors_per_run_xhigh_effort(tmp_path):
         "name": "Workspace Claude Worker",
         "profile": "claude-code",
         "execution_mode": "docker",
-        "model": "claude-opus-4-8",
+        "model": "claude-opus-5",
         "bootstrap_bundle_json": json.dumps({"env": {"WPR_CLAUDE_CODE_EFFORT": "xhigh"}}),
     }
 
@@ -3963,7 +4090,7 @@ def test_host_claude_command_enables_chrome_by_default(tmp_path, monkeypatch):
         "name": "Main Host Claude Worker",
         "profile": "claude-code",
         "execution_mode": "host",
-        "model": "claude-opus-4-8",
+        "model": "claude-opus-5",
         "workspace_root": str(tmp_path / "workspaces"),
     }
     info = runtime._host_runtime_info(worker)
@@ -3995,7 +4122,7 @@ def test_host_claude_command_honors_xhigh_effort(tmp_path, monkeypatch):
         "name": "Host Claude Worker",
         "profile": "claude-code",
         "execution_mode": "host",
-        "model": "claude-opus-4-8",
+        "model": "claude-opus-5",
         "workspace_root": str(tmp_path / "workspaces"),
     }
 
@@ -4021,7 +4148,7 @@ def test_host_claude_xhigh_effort_rejects_older_effort_contract(tmp_path, monkey
         "name": "Host Claude Worker",
         "profile": "claude-code",
         "execution_mode": "host",
-        "model": "claude-opus-4-8",
+        "model": "claude-opus-5",
         "workspace_root": str(tmp_path / "workspaces"),
     }
 
@@ -4244,8 +4371,39 @@ def test_docker_cli_runtime_clears_active_session_after_stop(tmp_path):
 
     runtime._stop_active_process(worker_id, worker={"worker_id": worker_id})
 
-    assert calls == [("screen", "job-run_stop_meta"), ("terminate", "run_stop_meta")]
+    assert calls == [("terminate", "run_stop_meta"), ("screen", "job-run_stop_meta")]
     assert not runtime._active_session_meta_path(worker_id).exists()
+
+
+def test_docker_cli_runtime_propagates_stop_failure_and_keeps_active_session(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker_id = "wrk_stop_failure"
+    runtime._ensure_dirs(worker_id)
+    runtime._write_active_session(
+        worker_id,
+        {
+            "session_name": "job-run_stop_failure",
+            "run_id": "run_stop_failure",
+            "stdout_path": str(tmp_path / "stdout.log"),
+            "stderr_path": str(tmp_path / "stderr.log"),
+            "exit_path": str(tmp_path / "exit_code"),
+        },
+    )
+    terminate_calls: list[str] = []
+
+    def fail_screen(*args, **kwargs):
+        raise RuntimeError("screen session remained alive")
+
+    runtime.sandbox.stop_screen_session = fail_screen  # type: ignore[method-assign]
+    runtime.sandbox.terminate_run_processes = (  # type: ignore[method-assign]
+        lambda worker_id, runtime_name, run_id, **kwargs: terminate_calls.append(run_id)
+    )
+
+    with pytest.raises(RuntimeError, match="screen session remained alive"):
+        runtime._stop_active_process(worker_id, worker={"worker_id": worker_id})
+
+    assert terminate_calls == ["run_stop_failure"]
+    assert runtime._active_session_meta_path(worker_id).exists()
 
 
 def test_docker_cli_runtime_uses_configured_run_timeout(tmp_path, monkeypatch):
@@ -4772,7 +4930,7 @@ def test_claude_code_runtime_uses_bedrock_provider_model_without_oauth(tmp_path,
         "worker_id": "wrk_claude_bedrock",
         "name": "Claude Bedrock Worker",
         "profile": "claude-code",
-        "model": "claude-opus-4-8",
+        "model": "claude-opus-5",
     }
     runtime._ensure_dirs(worker["worker_id"])
     provider_model = (
@@ -5958,6 +6116,154 @@ def test_host_conversation_broker_config_stays_in_private_worker_state(tmp_path,
     assert not (claude_home / "plugins" / "data").exists()
     assert not (life / ".mcp.json").exists()
     assert not (life / ".claude").exists()
+
+
+def test_host_conversation_projects_agent_builder_control_schema_to_both_native_clis(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    life = tmp_path / "Life"
+    life.mkdir()
+    control = {
+        "version": 1,
+        "tools": [
+            {
+                "name": "lc_transfer_to_specialist",
+                "description": "Consult the specialist using shared graph state.",
+            }
+        ],
+    }
+    codex_runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "codex-private-state"))
+    codex_worker = {
+        "worker_id": "wrk_codex_graph_control",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(life),
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "run_mode": "conversation",
+                "provider_model": "gpt-5.6-sol",
+                "access_mode": "full",
+                "agent_builder_control": control,
+            }
+        ),
+    }
+
+    codex_command, _ = codex_runtime._build_command(
+        codex_worker,
+        "Choose the next graph action.",
+        codex_runtime._host_runtime_info(codex_worker),
+    )
+
+    assert "--output-schema" in codex_command
+    codex_schema_path = Path(codex_command[codex_command.index("--output-schema") + 1])
+    assert codex_schema_path.is_file()
+    codex_schema = json.loads(codex_schema_path.read_text())
+    assert codex_schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+    assert codex_schema["additionalProperties"] is False
+    assert codex_schema["required"] == ["type", "content", "tool_name"]
+    assert codex_schema["properties"]["tool_name"]["enum"] == [
+        None,
+        "lc_transfer_to_specialist",
+    ]
+    assert not (life / codex_schema_path.name).exists()
+    codex_runtime._write_session_key(
+        codex_worker["worker_id"],
+        "synthetic-codex-session",
+    )
+    codex_resume_command, _ = codex_runtime._build_command(
+        codex_worker,
+        "Return to the graph.",
+        codex_runtime._host_runtime_info(codex_worker),
+    )
+    assert codex_resume_command[1:3] == ["exec", "resume"]
+    assert codex_resume_command.index("--output-schema") < codex_resume_command.index(
+        "synthetic-codex-session"
+    )
+
+    claude_runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "claude-private-state"))
+    claude_worker = {
+        **codex_worker,
+        "worker_id": "wrk_claude_graph_control",
+        "profile": "claude-code",
+        "model": "opus",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "run_mode": "conversation",
+                "provider_model": "opus",
+                "access_mode": "full",
+                "agent_builder_control": control,
+            }
+        ),
+    }
+
+    claude_command, _ = claude_runtime._build_command(
+        claude_worker,
+        "Choose the next graph action.",
+        claude_runtime._host_runtime_info(claude_worker),
+    )
+
+    assert "--json-schema" in claude_command
+    claude_schema = json.loads(
+        claude_command[claude_command.index("--json-schema") + 1]
+    )
+    assert "$schema" not in claude_schema
+    assert claude_schema == {
+        key: value for key, value in codex_schema.items() if key != "$schema"
+    }
+    assert claude_schema["additionalProperties"] is False
+    assert claude_schema["required"] == ["type", "content", "tool_name"]
+    assert claude_schema["properties"]["tool_name"]["enum"] == [
+        None,
+        "lc_transfer_to_specialist",
+    ]
+    claude_runtime._write_session_key(
+        claude_worker["worker_id"],
+        "synthetic-claude-session",
+    )
+    claude_resume_command, _ = claude_runtime._build_command(
+        claude_worker,
+        "Return to the graph.",
+        claude_runtime._host_runtime_info(claude_worker),
+    )
+    assert claude_resume_command.index("--json-schema") < claude_resume_command.index(
+        "--resume"
+    )
+    assert claude_resume_command[claude_resume_command.index("--resume") + 1] == (
+        "synthetic-claude-session"
+    )
+    assert json.loads(
+        claude_resume_command[claude_resume_command.index("--json-schema") + 1]
+    ) == claude_schema
+
+
+def test_host_mission_and_plain_conversation_commands_do_not_gain_graph_control_schema(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    life = tmp_path / "Life"
+    life.mkdir()
+    runtimes_and_flags = [
+        (HostCodexCliRuntime(base_dir=str(tmp_path / "codex-state")), "--output-schema"),
+        (HostClaudeCodeRuntime(base_dir=str(tmp_path / "claude-state")), "--json-schema"),
+    ]
+    for index, (runtime, flag) in enumerate(runtimes_and_flags):
+        profile = "codex-cli" if isinstance(runtime, HostCodexCliRuntime) else "claude-code"
+        for run_mode in ("mission", "conversation"):
+            worker = {
+                "worker_id": f"wrk_no_graph_control_{index}_{run_mode}",
+                "profile": profile,
+                "execution_mode": "host",
+                "workspace_root": str(life),
+                "model": "gpt-5.6-sol" if profile == "codex-cli" else "opus",
+                "bootstrap_bundle_json": json.dumps({"run_mode": run_mode}),
+            }
+            command, _ = runtime._build_command(
+                worker,
+                "Continue normally.",
+                runtime._host_runtime_info(worker),
+            )
+            assert flag not in command
 
 
 def test_host_capability_projection_adds_missing_entries_to_existing_worker_catalogs(

@@ -251,6 +251,7 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "GLASSHIVE_PROVIDER_EMAIL_LOGIN",
         "GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT",
         "GLASSHIVE_LOCAL_PASSWORD_LOGIN",
+        "GLASSHIVE_OIDC_LOGIN_VISIBLE",
         "GLASSHIVE_LOCAL_AUTH_ALLOWED_EMAIL_DOMAINS",
         "GLASSHIVE_LOCAL_AUTH_THROTTLE_KEY",
         "GLASSHIVE_ALLOW_EMAIL_LOGIN",
@@ -313,6 +314,7 @@ class FakeRuntimeClient:
         self.steer_requests = []
         self.lifecycle_requests = []
         self.worker_live_requests = []
+        self.worker_live_compact_requests = []
         self.worker_view_open_requests = []
         self.provider_account_requests = []
         self.provider_setup_requests = []
@@ -320,6 +322,7 @@ class FakeRuntimeClient:
         self.provider_verify_requests = []
         self.provider_forget_requests = []
         self.workspace_grant_requests = []
+        self.duplication_reapproval_requests = []
         self.pending_change_requests = []
         self.pending_change_reads = []
         self.pending_confirm_requests = []
@@ -442,7 +445,11 @@ class FakeRuntimeClient:
         )
         return {
             "project": {"project_id": "prj_duplicate"},
-            "workspace": {"worker_id": "wrk_dup", "name": name or "Main Worker copy"},
+            "workspace": {
+                "worker_id": "wrk_dup",
+                "name": name or "Main Worker copy",
+                "duplication_report": {"capabilities_requiring_reapproval": 0},
+            },
         }
 
     def list_workspace_templates(self):
@@ -473,12 +480,25 @@ class FakeRuntimeClient:
         self.workspace_template_requests.append(
             {"action": "instantiate", "template_id": template_id, "payload": payload}
         )
+        reapproval_items = [{
+            **self.list_workspace_templates()[0]["library_refs"][0],
+            "kind": "library",
+            "reference": "skill.synthetic.summary@1.0.0",
+            "route": "library",
+            "resolution": "library_grant",
+            "action_id": "rea_synthetic",
+        }]
         return {
             "project": {"project_id": "prj_template"},
             "workspace": {
                 "worker_id": "wrk_template",
                 "name": payload.get("name") or "Synthetic research desk",
                 "state": "paused",
+                "duplication_report": {
+                    "reapproval_items": reapproval_items,
+                    "outstanding_reapproval_items": reapproval_items,
+                    "capabilities_requiring_reapproval": 1,
+                },
             },
             "approvals_required": self.list_workspace_templates()[0]["library_refs"],
             "idempotent_replay": False,
@@ -497,6 +517,12 @@ class FakeRuntimeClient:
             {"action": "revoke", "worker_id": worker_id, "grant_id": grant_id}
         )
         return {"grant_id": grant_id, "worker_id": worker_id, "revoked_at": 1}
+
+    def waive_workspace_duplication_reapproval(self, worker_id: str, reference: str):
+        self.duplication_reapproval_requests.append(
+            {"worker_id": worker_id, "reference": reference}
+        )
+        return {"worker_id": worker_id, "remaining": 0}
 
     def get_pending_change(self, change_id: str):
         self.pending_change_reads.append(change_id)
@@ -543,8 +569,9 @@ class FakeRuntimeClient:
             "updated_at": "2026-05-24T00:00:00+00:00",
         }
 
-    def worker_live(self, worker_id: str):
+    def worker_live(self, worker_id: str, *, compact: bool = False):
         self.worker_live_requests.append(worker_id)
+        self.worker_live_compact_requests.append({"worker_id": worker_id, "compact": compact})
         return {
             "worker": {
                 "worker_id": worker_id,
@@ -896,8 +923,10 @@ def test_bootstrap_and_launch_flow():
     assert boot.json()['existing_workspaces'][0]['is_resumable'] is True
     assert boot.json()['existing_workspaces'][0]['state_label'] == 'retained'
     assert boot.json()['existing_workspaces'][0]['watch_url'] == '/watch/wrk_1?project_id=prj_1&surface=desktop'
+    assert boot.json()['existing_workspaces'][0]['workspace_url'] == '/watch/wrk_1?project_id=prj_1&surface=desktop'
     assert boot.json()['existing_workspaces'][0]['project_url'] == '/ui/projects/prj_1?worker_id=wrk_1'
     assert boot.json()['existing_workspaces'][0]['desktop_url'] == '/desktop/wrk_1'
+    assert boot.json()['existing_workspaces'][0]['desktop_preview_url'] == '/desktop/wrk_1?preview=1'
     assert boot.json()['existing_workspaces'][0]['api_url'] == '/api/worker/wrk_1'
     assert boot.json()['existing_workspaces'][0]['control_url'] == '/api/worker/wrk_1'
 
@@ -1587,22 +1616,25 @@ def test_bootstrap_exposes_paused_workers_as_resumable_workspaces():
             "profile": "codex-cli",
             "state": "paused",
             "favorite": False,
-                "workspace_kind": "named",
+            "workspace_kind": "named",
             "tags": [],
             "is_active": False,
             "is_resumable": True,
             "state_label": "paused",
             "watch_url": "/watch/wrk_idle?project_id=prj_1&surface=desktop",
+            "workspace_url": "/watch/wrk_idle?project_id=prj_1&surface=desktop",
             "project_url": "/ui/projects/prj_1?worker_id=wrk_idle",
-                "desktop_url": "/desktop/wrk_idle",
-                "api_url": "/api/worker/wrk_idle",
-                "control_url": "/api/worker/wrk_idle",
-            }
+            "desktop_url": "/desktop/wrk_idle",
+            "desktop_preview_url": "/desktop/wrk_idle?preview=1",
+            "api_url": "/api/worker/wrk_idle",
+            "control_url": "/api/worker/wrk_idle",
+        }
     ]
 
 
 def test_watch_assets_render():
-    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
     home = client.get('/')
     assert home.status_code == 200
     assert 'GlassHive' in home.text
@@ -1616,15 +1648,17 @@ def test_watch_assets_render():
     assert 'Inactive Workspaces' in home.text
     assert 'Status Report' in home.text
     assert 'Glass Drive' not in home.text
+    assert '<a class="brand-mark" href="/" aria-label="GlassHive home">GlassHive</a>' in home.text
     watch = client.get('/watch/wrk_1')
     assert watch.status_code == 200
     assert 'GlassHive' in watch.text
     assert 'Workspace live view' in watch.text
-    assert 'Open project workspace' in watch.text
+    assert 'Back to workspaces' in watch.text
     assert 'Open worker details' in watch.text
     assert 'Send redirects now' in watch.text
     assert 'Hold Send or Cmd/Ctrl+Enter to queue instead' in watch.text
     assert 'Glass Drive' not in watch.text
+    assert '<a class="brand-mark" href="/#workspaces" aria-label="Back to GlassHive workspaces">GlassHive</a>' in watch.text
     desktop = client.get('/desktop/wrk_1')
     assert desktop.status_code == 200
     assert 'GlassHive Desktop' in desktop.text
@@ -1633,6 +1667,12 @@ def test_watch_assets_render():
     assert live.json()['runtime_details']['view_available'] is True
     assert 'view_url' not in live.json()['runtime_details']
     assert live.json()['project_title'] == 'Alpha'
+    compact_live = client.get('/api/workspace/wrk_1/live?compact=1')
+    assert compact_live.status_code == 200
+    assert runtime.worker_live_compact_requests[-2:] == [
+        {'worker_id': 'wrk_1', 'compact': False},
+        {'worker_id': 'wrk_1', 'compact': True},
+    ]
     credentials = client.get('/api/workspace/wrk_1/desktop-credentials')
     assert credentials.status_code == 200
     assert credentials.json() == {'password': 'synthetic-vnc'}
@@ -1849,8 +1889,13 @@ def test_launcher_workspace_hive_static_controls():
     watch_html = (static_dir / "watch.html").read_text(encoding="utf-8")
     watch_js = (static_dir / "watch.js").read_text(encoding="utf-8")
     desktop_html = (static_dir / "desktop.html").read_text(encoding="utf-8")
-    assert "workspace-live-frame" in app_js
-    assert "MAX_LIVE_TILE_IFRAMES" in app_js
+    desktop_css = (static_dir / "desktop.css").read_text(encoding="utf-8")
+    assert "workspace-live-preview" in app_js
+    assert "workspace-live-frame" not in app_js
+    assert "MAX_VIEW_ONLY_PREVIEWS = 3" in app_js
+    assert "minmax(min(440px, 100%), 1fr)" in styles_css
+    assert "aspect-ratio: 16 / 9" in styles_css
+    assert "aspect-ratio: auto" in styles_css
     assert "RETAINED_TILE_REFRESH_MS" in app_js
     assert "dataset.nextLiveRefreshAt" in app_js
     assert "document.hidden" in app_js
@@ -1864,18 +1909,59 @@ def test_launcher_workspace_hive_static_controls():
     assert "appendUrlPath" in app_js
     assert "deployment_default_workspace_option" in app_js
     assert "dataset.watchVisible !== 'false'" in app_js
-    assert "dataset.watchVisible === 'true' || tile.dataset.statusVisible === 'true'" in app_js
-    assert "Full watch" in app_js
+    assert "dataset.viewportVisible === 'true'" in app_js
+    assert "new IntersectionObserver" in app_js
+    assert "workerApiUrl(workerId, '/live?compact=1')" in app_js
+    assert "tile.dataset.refreshing" in app_js
+    assert "preview=1" in app_js
+    assert "frame.tabIndex = -1" in app_js
+    assert "rfb.viewOnly = viewOnly" in desktop_js
+    assert "rfb.focusOnClick = !viewOnly" in desktop_js
+    assert "Open workspace" in app_js
+    assert "workspace-tile-more" in app_js
+    assert "workspace-tile-more-actions" in app_js
+    assert "dataset.desktopPreviewUrl" in app_js
+    assert "shouldHydrateWorkspaceDelivery" in app_js
+    assert "dataset.deliveryRunId" in app_js
+    assert "report.setAttribute('aria-controls', deliveryPanelId)" in app_js
+    assert "Hide delivery" not in app_js
+    assert "closedLabel.replace(/^View\\s+/, 'Hide ')" in app_js
+    assert "workspace-delivery-thumbnail" not in app_js
+    assert "moreSummary.textContent = 'More'" in app_js
+    assert "moreActions.appendChild(duplicate)" in app_js
+    assert "moreActions.appendChild(saveTemplate)" in app_js
+    assert "moreActions.appendChild(accountSelect)" in app_js
+    assert "moreActions.appendChild(rename)" in app_js
+    assert "actions.appendChild(toggle)" in app_js
+    assert "moreActions.appendChild(interrupt)" in app_js
     assert "workspace-status-button" in app_js
     assert "Open latest workspace output" in app_js
-    assert "Open status" in app_js
+    assert "workspace-glass-open" in app_js
+    assert "Open ${workspaceTileTitle(workspace)} workspace" in app_js
+    assert "previewLink.tabIndex = -1" in app_js
+    assert "allowPreviewOpen(false)" in app_js
+    assert "View delivery" in app_js
+    assert "renderWorkspaceDelivery" in app_js
+    assert "workspace-delivery-panel" in app_js
+    assert "Delivery ready" in app_js
+    assert "normalized === 'completed' ? 'Completed'" not in app_js
+    assert "workspace?.workspace_url || workspace?.watch_url" in app_js
+    assert "workspace.project_url" not in app_js
+    assert "runtimeBase}/ui/projects" not in watch_js
+    assert "window.location.assign('/#workspaces')" in watch_js
     assert "Status Report" in index_html
     assert "Inactive Workspaces" in index_html
     assert "/api/workspaces/${encodeURIComponent(workerId)}/duplicate" in app_js
     assert "button.dataset.idempotencyKey ||= globalThis.crypto?.randomUUID?.()" in app_js
     assert "idempotency_key: button.dataset.idempotencyKey" in app_js
     assert "delete button.dataset.idempotencyKey" in app_js
+    assert "error.code === 'workspace_duplication_failed'" in app_js
+    assert "resetText = 'Start fresh copy'" in app_js
+    assert "delete button.dataset.launchIdempotencyKey" in app_js
+    assert "throw await responseError(response, 'Launch failed')" in app_js
     assert 'id="workspace-template-panel"' in index_html
+    assert 'id="recurring-schedule-workspace" required' not in index_html
+    assert 'id="recurring-schedule-instruction" rows="4" maxlength="10000" placeholder="Create the weekly project update and save it in the workspace." required' not in index_html
     assert 'id="workspace-template-start-form"' in index_html
     assert 'id="save-template-dialog"' in index_html
     assert "/api/workspaces/${encodeURIComponent(context.workerId)}/templates" in app_js
@@ -1886,6 +1972,12 @@ def test_launcher_workspace_hive_static_controls():
     assert "rename-workspace-dialog" in index_html
     assert "window.prompt" not in app_js
     assert "Duplicate selected workspace" in app_js
+    assert "Workspace copied. Review" in app_js
+    assert "glasshive.capability-review" in app_js
+    assert "copiedWorker.duplication_report?.reapproval_items" in app_js
+    assert "data.reapproval_items || []" in app_js
+    assert "sessionStorage.removeItem(CAPABILITY_REVIEW_KEY)" in app_js
+    assert "window.location.hash = route" in app_js
     assert 'data-view-tab="connections"' in index_html
     assert 'data-view-tab="library"' in index_html
     assert 'data-view-tab="schedules"' in index_html
@@ -1916,21 +2008,39 @@ def test_launcher_workspace_hive_static_controls():
     control_plane_js = (static_dir / "control-plane.js").read_text(encoding="utf-8")
     assert "window.dispatchEvent(new CustomEvent('glasshive:control-plane-updated'))" in control_plane_js
     assert "No duplicate occurrence was created; retry is safe" in control_plane_js
+    assert "if (!workspace)" in control_plane_js
+    assert "persistCapabilityReview(null)" in control_plane_js
+    assert "prepareBrokeredCapabilityReapproval" not in control_plane_js
+    assert "workspace_duplication_reapproval_waiver" in control_plane_js
+    assert "outstanding_reapproval_items" in control_plane_js
+    assert "copied workspace capabilit" in control_plane_js
+    assert "copied workspace connection" not in control_plane_js
+    assert "equivalentReapprovalScopes(item.scopes || [], exactReviewItem)" in control_plane_js
     assert "schedule.last_outcome || schedule.last_error" in control_plane_js
+    assert "startsAt.required = false" in control_plane_js
+    assert "Choose when this schedule should start." in control_plane_js
     assert "Latest result:" in control_plane_js
-    assert "clients.codex?.login_command" in control_plane_js
-    assert "External AI clients" in index_html
+    assert "String(clients.codex.login_command || '')" in control_plane_js
+    assert "Use GlassHive from another AI app" in index_html
     assert "Copy one command" not in index_html
     assert "function referenceRow" in control_plane_js
     assert "Registration reference" in control_plane_js
-    assert "referenceRow('Codex · Registered callback'" in control_plane_js
-    assert "referenceRow('Claude Code · Registered callback'" in control_plane_js
+    assert "Codex callback · Do not open this address" in control_plane_js
+    assert "Claude Code callback · Do not open this address" in control_plane_js
     assert "/api/control-plane" in control_plane_js
     assert "/api/connect-ai" in control_plane_js
     assert "provider-account-form" in control_plane_js
     assert "pollSetup" in control_plane_js
     assert 'id="library-request-form"' in index_html
     assert "submitLibraryRequest" in control_plane_js
+    assert "Ask this workspace" in index_html
+    assert "This sends a workspace-only request" in index_html
+    assert "The connection review stays open until access is verified" in control_plane_js
+    assert "Continue without" in control_plane_js
+    assert "waiveCapabilityReapproval" in control_plane_js
+    assert "pendingBrokeredReviewReference" not in control_plane_js
+    assert "dispatch owner" not in control_plane_js
+    assert "pendingCapabilityReview" in control_plane_js
     assert "/api/workspace/${encodeURIComponent(workspaceId)}/message" in control_plane_js
     assert "message: requestText" in control_plane_js
     assert "api.withAuth(`/watch/${encodeURIComponent(workspaceId)}?surface=desktop`)" in control_plane_js
@@ -1960,11 +2070,14 @@ def test_launcher_workspace_hive_static_controls():
     assert "Workspace complete" in desktop_js
     assert "The latest output and workspace files are available from the status panel" in desktop_js
     assert "Clipboard sync: inactive until workspace resumes" in desktop_js
-    assert "desktop.js?v=20260810b" in desktop_html
+    assert "desktop.js?v=20260811m" in desktop_html
+    assert "desktop.css?v=20260811m" in desktop_html
+    assert "<style" not in desktop_html
+    assert "#desktop-overlay" in desktop_css
     assert 'id="workspace-status-link"' in desktop_html
     assert "showWorkspaceLink: true" in desktop_js
     assert "Open workspace status and files" in desktop_html
-    assert "styles.css?v=20260810a" in watch_html
+    assert "styles.css?v=20260811m" in watch_html
     assert "}, 5000);" not in desktop_js
     assert 'id="project-files"' in index_html
     assert 'id="schedule-text"' in index_html
@@ -1985,7 +2098,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "Use Resume to continue from the same state" in watch_js
     assert "IDLE_REFRESH_MS" in watch_js
     assert "refreshInFlight" in watch_js
-    assert "const GLASSHIVE_UI_REV = '20260811a'" in watch_js
+    assert "const GLASSHIVE_UI_REV = '20260811m'" in watch_js
     assert "const workspaceApiBase = `/api/workspace/${workerId}`" in watch_js
     assert "/api/worker/${workerId}/live" not in watch_js
     assert '@app.get("/api/workspace/{worker_id}/live")' in (Path(server_module.__file__).read_text(encoding="utf-8"))
@@ -2007,7 +2120,7 @@ def test_launcher_workspace_hive_static_controls():
     assert "gh_token|gh_sig|token|signature|sig" in watch_js
     assert "data.artifacts?.items || []" in watch_js
     assert "Workspace files" in watch_js
-    assert "watch.js?v=20260811a" in watch_html
+    assert "watch.js?v=20260811m" in watch_html
     assert ".artifact-row" in styles_css
     assert "artifact-list-more" in watch_js
     assert ".artifact-list-more" in styles_css
@@ -2024,6 +2137,102 @@ def test_launcher_workspace_hive_static_controls():
     assert '"brand controls"' in styles_css
     assert '.watch-meta-line p' in styles_css
     assert 'white-space: normal' in styles_css
+
+
+def test_open_completed_workspace_never_resumes_compute_implicitly():
+    app_js = (Path(server_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
+    start = app_js.index("async function openWorkspaceSurface")
+    end = app_js.index("async function runWorkerAction", start)
+    open_workspace = app_js[start:end]
+
+    assert "workspace?.workspace_url || workspace?.watch_url" in open_workspace
+    assert "shouldResumeOnWorkspaceOpen" in open_workspace
+    assert "renderedState: button?.closest('.workspace-tile')?.dataset.displayState" in open_workspace
+    assert "fallbackState: workspaceStateLabel(workspace)" in open_workspace
+    assert "rawWorkspaceState(workspace)" not in open_workspace
+    assert "Boolean(workspace?.compute_released_at)" not in open_workspace
+    assert "'/action/resume'" in open_workspace
+
+
+def test_workspace_open_resume_policy_uses_the_user_visible_state():
+    policy_module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ shouldResumeOnWorkspaceOpen }} from {json.dumps(policy_module)};"
+                "const states = ['completed','failed','cancelled','running','paused','idle','idle_terminated','stopped'];"
+                "const outcomes = Object.fromEntries(states.map(renderedState => [renderedState, "
+                "shouldResumeOnWorkspaceOpen({workspaceKind:'named', renderedState, fallbackState:'paused'})]));"
+                "outcomes.fallbackPaused = shouldResumeOnWorkspaceOpen({workspaceKind:'named', renderedState:'', fallbackState:'paused'});"
+                "outcomes.oneOffPaused = shouldResumeOnWorkspaceOpen({workspaceKind:'run', renderedState:'paused', fallbackState:'paused'});"
+                "process.stdout.write(JSON.stringify(outcomes));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "completed": False,
+        "failed": False,
+        "cancelled": False,
+        "running": False,
+        "paused": True,
+        "idle": True,
+        "idle_terminated": True,
+        "stopped": True,
+        "fallbackPaused": True,
+        "oneOffPaused": False,
+    }
+
+
+def test_failed_workspace_keeps_the_recommended_pause_recovery_visible():
+    policy_module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ workspaceLifecycleControl }} from {json.dumps(policy_module)};"
+                "const states = ['failed','cancelled','interrupted','completed','paused','terminated'];"
+                "process.stdout.write(JSON.stringify(Object.fromEntries(states.map(state => "
+                "[state, workspaceLifecycleControl(state)]))));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    controls = json.loads(result.stdout)
+    for state in ("failed", "cancelled", "interrupted"):
+        assert controls[state] == {
+            "action": "pause",
+            "label": "Pause",
+            "hidden": False,
+            "disabled": False,
+        }
+    assert controls["completed"] == {
+        "action": "resume",
+        "label": "Continue",
+        "hidden": False,
+        "disabled": False,
+    }
+    assert controls["paused"] == {
+        "action": "resume",
+        "label": "Resume",
+        "hidden": False,
+        "disabled": False,
+    }
+    assert controls["terminated"] == {
+        "action": "pause",
+        "label": "Pause",
+        "hidden": True,
+        "disabled": True,
+    }
 
 
 def test_watch_authenticated_actions_forward_current_csrf_cookie():
@@ -2110,14 +2319,16 @@ def test_workspace_status_scripts_never_label_failed_terminal_runs_completed():
         assert script.index(terminated_priority) < script.index(failed_branch)
     assert "const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);" in app_script
     assert "RESUME_STATES.has(normalized) || TERMINAL_ATTENTION_STATES.has(normalized)" not in app_script
-    assert "toggle.hidden = TERMINAL_ATTENTION_STATES.has(normalized)" in app_script
+    assert "const control = workspaceLifecycleControl(normalized);" in app_script
+    assert "toggle.hidden = control.hidden;" in app_script
     assert "function syncTileSteerAvailability(tile, state)" in app_script
     assert app_script.count("syncTileSteerAvailability(tile, state);") >= 2
     assert "tile.dataset.displayState = normalized" in app_script
     assert "syncTileSteerAvailability(tile, tile.dataset.displayState || state);" in app_script
     assert "Send a corrected follow-up below" in app_script
     assert "const TERMINAL_ATTENTION_STATES = new Set(['failed', 'cancelled', 'interrupted']);" in watch_script
-    assert "runToggleButton.hidden = TERMINAL_ATTENTION_STATES.has(normalized)" in watch_script
+    assert "const control = workspaceLifecycleControl(normalized);" in watch_script
+    assert "runToggleButton.hidden = control.hidden;" in watch_script
     assert "TERMINAL_ATTENTION_STATES.has(state)" in watch_script
     assert "Workspace needs attention" in watch_script
     assert "then use Resume or send a corrected follow-up" not in watch_script
@@ -2217,7 +2428,7 @@ def test_launch_preserves_closed_workspace_conflict_for_existing_workspace():
     assert runtime.launch_failures == []
 
 
-def test_launch_duplicate_workspace_uses_runtime_duplicate_endpoint():
+def test_launch_duplicate_workspace_uses_capability_aware_runtime_duplicate_endpoint():
     runtime = FakeRuntimeClient()
     client = TestClient(create_app(runtime_client=runtime))
     launch = client.post('/api/launch', json={
@@ -2225,17 +2436,107 @@ def test_launch_duplicate_workspace_uses_runtime_duplicate_endpoint():
         'success_criteria': 'The experiment starts in a duplicated workspace',
         'context': '',
         'workspace_option': 'duplicate:wrk_1',
+        'idempotency_key': 'launch-duplicate-workspace-1',
     })
     assert launch.status_code == 200
     assert launch.json()['watch_url'].startswith('/watch/wrk_dup')
-    assert runtime.duplicate_requests == [
+    assert runtime.workspace_duplicate_requests == [
         {
-            'project_id': 'prj_new',
-            'source_worker_id': 'wrk_1',
-            'owner_id': 'demo-owner',
-            'name': 'Main Workspace',
+            'worker_id': 'wrk_1',
+            'idempotency_key': 'launch-duplicate-workspace-1',
+            'name': '',
         },
     ]
+    assert runtime.duplicate_requests == []
+
+
+def test_launch_duplicate_with_capabilities_pauses_for_reapproval_without_dispatch():
+    class CapabilityDuplicateRuntime(FakeRuntimeClient):
+        def duplicate_workspace(self, worker_id: str, *, idempotency_key: str, name: str = ""):
+            result = super().duplicate_workspace(
+                worker_id,
+                idempotency_key=idempotency_key,
+                name=name,
+            )
+            result["workspace"]["duplication_report"]["capabilities_requiring_reapproval"] = 2
+            return result
+
+    runtime = CapabilityDuplicateRuntime()
+    response = TestClient(create_app(runtime_client=runtime)).post('/api/launch', json={
+        'description': 'Branch the saved workspace without silently copying access',
+        'workspace_option': 'duplicate:wrk_1',
+        'idempotency_key': 'launch-capability-copy-1',
+    })
+
+    assert response.status_code == 200
+    assert response.json()['status'] == 'action_required'
+    assert response.json()['capabilities_requiring_reapproval'] == 2
+    assert response.json()['worker_id'] == 'wrk_dup'
+    assert runtime.assign_requests == []
+    assert runtime.schedule_requests == []
+    assert runtime.duplicate_requests == []
+
+
+def test_launch_duplicate_requires_a_reusable_idempotency_key_before_mutation():
+    runtime = FakeRuntimeClient()
+    response = TestClient(create_app(runtime_client=runtime)).post('/api/launch', json={
+        'description': 'Copy the saved workspace',
+        'workspace_option': 'duplicate:wrk_1',
+    })
+
+    assert response.status_code == 422
+    assert 'idempotency' in response.json()['detail'].lower()
+    assert runtime.workspace_duplicate_requests == []
+    assert runtime.assign_requests == []
+
+
+def test_launch_duplicate_with_personal_account_reapproval_never_falls_back_or_dispatches():
+    class PersonalAccountDuplicateRuntime(FakeRuntimeClient):
+        def duplicate_workspace(self, worker_id: str, *, idempotency_key: str, name: str = ""):
+            result = super().duplicate_workspace(worker_id, idempotency_key=idempotency_key, name=name)
+            result["workspace"]["duplication_report"] = {
+                "capabilities_requiring_reapproval": 1,
+                "reapproval_items": [{
+                    "kind": "provider_account",
+                    "reference": "acct_synthetic",
+                    "label": "Personal Codex",
+                    "route": "connections",
+                    "policy": "personal_required",
+                    "scopes": [],
+                }],
+            }
+            return result
+
+    runtime = PersonalAccountDuplicateRuntime()
+    response = TestClient(create_app(runtime_client=runtime)).post('/api/launch', json={
+        'description': 'Copy the personal workspace safely',
+        'workspace_option': 'duplicate:wrk_1',
+        'idempotency_key': 'launch-personal-copy-1',
+    })
+
+    assert response.status_code == 200
+    assert response.json()['status'] == 'action_required'
+    assert response.json()['reapproval_items'][0]['kind'] == 'provider_account'
+    assert runtime.assign_requests == []
+    assert runtime.schedule_requests == []
+
+
+def test_launch_duplicate_fails_closed_on_an_incomplete_runtime_copy():
+    class IncompleteDuplicateRuntime(FakeRuntimeClient):
+        def duplicate_workspace(self, worker_id: str, *, idempotency_key: str, name: str = ""):
+            return {"project": {}, "workspace": {}}
+
+    runtime = IncompleteDuplicateRuntime()
+    response = TestClient(create_app(runtime_client=runtime)).post('/api/launch', json={
+        'description': 'Copy the saved workspace',
+        'workspace_option': 'duplicate:wrk_1',
+        'idempotency_key': 'launch-incomplete-copy-1',
+    })
+
+    assert response.status_code == 502
+    assert response.json()['detail'] == 'GlassHive returned an incomplete workspace copy'
+    assert runtime.assign_requests == []
+    assert runtime.schedule_requests == []
 
 
 def test_saved_workspace_duplicate_is_one_click_and_uses_a_fresh_identity():
@@ -2253,11 +2554,36 @@ def test_saved_workspace_duplicate_is_one_click_and_uses_a_fresh_identity():
     assert short_key.status_code == 422
     assert response.status_code == 201
     assert response.json()['worker']['worker_id'] == 'wrk_dup'
+    assert response.json()['worker']['duplication_report'] == {
+        'capabilities_requiring_reapproval': 0,
+    }
     assert runtime.workspace_duplicate_requests == [
         {
             'worker_id': 'wrk_1',
             'idempotency_key': 'duplicate-browser-session-1',
             'name': '',
+        }
+    ]
+
+
+def test_copied_workspace_capability_skip_uses_the_human_confirmation_path_through_bff():
+    runtime = FakeRuntimeClient()
+    response = TestClient(create_app(runtime_client=runtime)).post(
+        "/api/pending-changes",
+        json={
+            "change_type": "workspace_duplication_reapproval_waiver",
+            "target_id": "wrk_dup",
+            "payload": {"action_id": "rea_synthetic"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "pending"
+    assert runtime.pending_change_requests == [
+        {
+            "change_type": "workspace_duplication_reapproval_waiver",
+            "target_id": "wrk_dup",
+            "payload": {"action_id": "rea_synthetic"},
         }
     ]
 
@@ -2281,12 +2607,26 @@ def test_workspace_templates_list_save_and_instantiate_through_the_bff():
     assert saved.status_code == 201
     assert saved.json()['name'] == 'My research desk'
     assert started.status_code == 201
-    assert started.json()['workspace'] == {
+    assert {
+        key: started.json()['workspace'][key]
+        for key in ('worker_id', 'name', 'state')
+    } == {
         'worker_id': 'wrk_template',
         'name': 'Fresh research desk',
         'state': 'paused',
     }
     assert started.json()['approvals_required'][0]['stable_id'] == 'skill.synthetic.summary'
+    assert started.json()['workspace']['duplication_report']['outstanding_reapproval_items'][0] == {
+        'stable_id': 'skill.synthetic.summary',
+        'version': '1.0.0',
+        'content_hash': 'sha256:library-synthetic',
+        'scopes': ['documents:read'],
+        'kind': 'library',
+        'reference': 'skill.synthetic.summary@1.0.0',
+        'route': 'library',
+        'resolution': 'library_grant',
+        'action_id': 'rea_synthetic',
+    }
     assert runtime.workspace_template_requests == [
         {
             'action': 'save',
@@ -2319,12 +2659,18 @@ def test_human_confirmation_page_loads_scoped_metadata_and_never_embeds_token():
 
 def test_confirmation_script_keeps_token_in_fragment_or_session_storage_only():
     script = (Path(server_module.STATIC_DIR) / 'confirm.js').read_text(encoding='utf-8')
+    page = (Path(server_module.STATIC_DIR) / 'confirm.html').read_text(encoding='utf-8')
 
     assert "window.location.hash" in script
     assert "history.replaceState(null, '', '/confirm-change')" in script
     assert "sessionStorage" in script
     assert "return_to=%2Fconfirm-change" in script
     assert "return_to=%2Fconfirm-change%23" not in script
+    assert 'id="confirm-technical"' in page
+    assert '>Technical details<' in page
+    assert 'id="confirm-back"' in page
+    assert "Back to workspace" in page
+    assert "back.href = `/watch/${encodeURIComponent(String(pending.target_id || ''))}?surface=desktop`" in script
 
 
 def test_launch_open_workspace_reuses_existing_worker():
@@ -2536,16 +2882,28 @@ def test_bootstrap_signs_workspace_links_in_enterprise_mode(monkeypatch):
     assert response.status_code == 200
     workspace = response.json()["existing_workspaces"][0]
     watch_ref = worker_ref_record(workspace["watch_url"])
+    workspace_ref = worker_ref_record(workspace["workspace_url"])
     project_ref = worker_ref_record(workspace["project_url"])
     desktop_ref = worker_ref_record(workspace["desktop_url"])
+    desktop_preview_ref = worker_ref_record(workspace["desktop_preview_url"])
     api_ref = worker_ref_record(workspace["api_url"])
     assert str(watch_ref["target_url"]).startswith("/watch/wrk_1?")
+    assert workspace["workspace_url"] == workspace["watch_url"]
+    assert str(workspace_ref["target_url"]).startswith("/watch/wrk_1?")
     assert str(project_ref["target_url"]).startswith("/ui/projects/prj_1?")
     assert str(desktop_ref["target_url"]) == "/desktop/wrk_1"
+    assert str(desktop_preview_ref["target_url"]) == "/desktop/wrk_1?preview=1"
     assert str(api_ref["target_url"]) == "/api/worker/wrk_1"
     assert workspace["control_url"] == "/api/worker/wrk_1"
     assert client.get(workspace["watch_url"], headers=headers).status_code == 200
     assert client.get(workspace["desktop_url"], headers=headers).status_code == 200
+    preview_redirect = client.get(
+        workspace["desktop_preview_url"],
+        headers=headers,
+        follow_redirects=False,
+    )
+    assert preview_redirect.status_code == 307
+    assert preview_redirect.headers["location"] == "/desktop/wrk_1?preview=1"
 
 
 def test_signed_watch_token_is_worker_scoped(monkeypatch):
@@ -4051,8 +4409,8 @@ def test_multi_user_desktop_credentials_fail_closed_without_vnc_password(monkeyp
     monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
 
     class PasswordlessRuntime(FakeRuntimeClient):
-        def worker_live(self, worker_id: str):
-            payload = super().worker_live(worker_id)
+        def worker_live(self, worker_id: str, *, compact: bool = False):
+            payload = super().worker_live(worker_id, compact=compact)
             payload["runtime_details"]["view_url"] = "http://127.0.0.1:60812/?autoconnect=1"
             return payload
 
@@ -4395,8 +4753,12 @@ def test_recurring_schedule_ui_has_structured_accessible_controls():
     assert 'id="recurring-schedule-type"' in page.text
     assert 'id="recurring-schedule-timezone"' in page.text
     assert 'value="once"' in page.text
+    assert 'value="weekly"' in page.text
+    assert 'value="weeks"' in page.text
     assert 'value="cron"' in page.text
     assert 'value="rfc5545"' in page.text
+    assert 'Custom · cron' in page.text
+    assert 'Custom · calendar rule' in page.text
     assert 'id="recurring-schedule-starts-at"' in page.text
     assert 'id="recurring-schedule-once-field"' in page.text
     assert 'id="recurring-schedule-ends-at"' in page.text
@@ -4410,13 +4772,84 @@ def test_recurring_schedule_ui_has_structured_accessible_controls():
     assert 'id="recurring-schedule-submit"' in page.text
     control_plane_script = (server_module.STATIC_DIR / "control-plane.js").read_text(encoding="utf-8")
     assert "renderSchedules" in control_plane_script
-    assert "dispatch_via_viventium_cortex" in control_plane_script
     assert "runScheduleNow" in control_plane_script
     assert "retireSchedule" in control_plane_script
     assert "editSchedule" in control_plane_script
-    assert "onceField.hidden = kind !== 'once'" in control_plane_script
+    assert "data-schedule-status" in control_plane_script
+    assert "actionStatus.setAttribute('aria-live', 'polite')" in control_plane_script
+    assert "intervalUnit === 'weeks' ? 604800" in control_plane_script
+    assert "recurrenceSubmissionPolicy(selectedRecurrenceType" in control_plane_script
+    assert "scheduleEditorType(schedule)" in control_plane_script
+    assert "selectedRecurrenceType === 'weekly' ? 'interval'" not in control_plane_script
+    assert "Viventium Cortex is the single dispatch owner" not in control_plane_script
+    assert "Dispatch owner:" not in control_plane_script
+    assert "onceField.hidden = !['once', 'weekly'].includes(kind)" in control_plane_script
     assert "{ enabled: false }" in control_plane_script
     assert "if (controlPlane?.recurrence_owner === 'viventium_cortex') return" not in control_plane_script
+
+
+def test_weekly_schedule_uses_calendar_recurrence_in_the_browser_timezone() -> None:
+    module = (Path(server_module.STATIC_DIR) / "schedule-policy.js").as_uri()
+    script = f"""
+      import {{
+        recurrenceSubmissionPolicy,
+        scheduleEditorType,
+        zonedDateTimeLocalValue,
+      }} from {json.dumps(module)};
+      const policy = recurrenceSubmissionPolicy('weekly', {{
+        intervalSeconds: 604800,
+        timezoneName: 'America/Toronto',
+        rrule: '',
+      }});
+      if (JSON.stringify(policy) !== JSON.stringify({{
+        recurrenceType: 'rfc5545',
+        intervalSeconds: null,
+        timezoneName: 'America/Toronto',
+        rrule: 'FREQ=WEEKLY',
+      }})) throw new Error(JSON.stringify(policy));
+      if (scheduleEditorType({{ recurrence_type: 'rfc5545', rrule: 'FREQ=WEEKLY' }}) !== 'weekly') {{
+        throw new Error('weekly editor mapping missing');
+      }}
+      if (scheduleEditorType({{ recurrence_type: 'interval', interval_seconds: 604800 }}) !== 'interval') {{
+        throw new Error('elapsed intervals must not be relabeled weekly');
+      }}
+      if (zonedDateTimeLocalValue('2026-01-15T14:00:00Z', 'America/Toronto') !== '2026-01-15T09:00') {{
+        throw new Error('winter wall time was not preserved');
+      }}
+      if (zonedDateTimeLocalValue('2026-07-15T14:00:00Z', 'America/Toronto') !== '2026-07-15T10:00') {{
+        throw new Error('summer wall time was not preserved');
+      }}
+      if (zonedDateTimeLocalValue('not-a-date', 'America/Toronto') !== '') {{
+        throw new Error('invalid instants must fail closed');
+      }}
+    """
+    result = subprocess.run(
+        ["node", "--input-type=module", "--eval", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_duplicate_reapproval_never_widens_the_prior_workspace_scopes() -> None:
+    module = (Path(server_module.STATIC_DIR) / "capability-review.js").as_uri()
+    script = f"""
+      import {{ equivalentReapprovalScopes }} from {json.dumps(module)};
+      const exact = equivalentReapprovalScopes(
+        ['documents:read', 'documents:write'],
+        {{ scopes: ['documents:read', 'unknown:scope'] }},
+      );
+      if (JSON.stringify(exact) !== JSON.stringify(['documents:read'])) throw new Error(JSON.stringify(exact));
+      if (equivalentReapprovalScopes(['documents:read'], null) !== null) throw new Error('ordinary grants changed');
+    """
+    result = subprocess.run(
+        ["node", "--input-type=module", "--eval", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def _configure_multi_user_connect_test(tmp_path, monkeypatch) -> None:
@@ -4512,16 +4945,18 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
 
     assert response.status_code == 200
     payload = response.json()
+    assert payload["server_name"] == "glasshive-d0c2dae3d5cd"
+    assert payload["supported_clients"] == ["claude", "codex"]
     assert payload["clients"]["codex"]["add_command"] == (
         "codex mcp add -c mcp_oauth_callback_port=49153 "
-        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive "
+        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive-d0c2dae3d5cd "
         "--url https://glasshive.example.test/mcp "
-        "--oauth-client-id registered-codex-client "
-        "--oauth-resource https://glasshive.example.test/mcp"
+        "--oauth-client-id registered-codex-client"
     )
+    assert "--oauth-resource" not in payload["clients"]["codex"]["add_command"]
     assert payload["clients"]["codex"]["login_command"] == (
         "codex mcp login -c mcp_oauth_callback_port=49153 "
-        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive"
+        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive-d0c2dae3d5cd"
     )
     assert payload["clients"]["codex"]["callback_uri"] == (
         "http://127.0.0.1:49153/callback/0MLa49XNV_Yw"
@@ -4529,7 +4964,7 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert payload["clients"]["claude"]["add_command"] == (
         "claude mcp add --transport http --scope user "
         "--client-id registered-claude-client --callback-port 49152 "
-        "glasshive https://glasshive.example.test/mcp"
+        "glasshive-d0c2dae3d5cd https://glasshive.example.test/mcp"
     )
     assert payload["clients"]["claude"]["callback_port"] == 49152
     assert payload["clients"]["claude"]["callback_uri"] == (
@@ -4538,11 +4973,85 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert payload["configuration_status"] == "ready"
     assert payload["documentation_url"].endswith("/glasshive-client-registration")
     assert payload["source"]["license"] == "FSL-1.1-ALv2"
+    assert payload["clients"]["codex"]["add_command"] in payload["guided_prompt"]
+    assert payload["clients"]["codex"]["login_command"] in payload["guided_prompt"]
+    assert payload["clients"]["claude"]["add_command"] in payload["guided_prompt"]
+    assert payload["clients"]["claude"]["login_note"] in payload["guided_prompt"]
+    assert "administrator" not in payload["guided_prompt"].lower()
     control_plane_script = (
         server_module.STATIC_DIR / "control-plane.js"
     ).read_text(encoding="utf-8")
-    assert "clients.codex?.callback_uri" in control_plane_script
-    assert "clients.claude?.callback_uri" in control_plane_script
+    assert "String(clients.codex.callback_uri || '')" in control_plane_script
+    assert "String(clients.claude.callback_uri || '')" in control_plane_script
+
+
+def test_mcp_client_server_name_is_canonical_stable_and_deployment_specific():
+    upper = server_module._mcp_client_server_name(
+        "https://GLASSHIVE.EXAMPLE.TEST:443/mcp"
+    )
+    canonical = server_module._mcp_client_server_name(
+        "https://glasshive.example.test/mcp"
+    )
+    path_scoped = server_module._mcp_client_server_name(
+        "https://glasshive.example.test/team-a/mcp"
+    )
+
+    assert upper == canonical == "glasshive-d0c2dae3d5cd"
+    assert path_scoped == "glasshive-76d186f127b6"
+    assert server_module.re.fullmatch(r"glasshive-[0-9a-f]{12}", canonical)
+
+
+def test_connect_ai_advertises_only_clients_with_a_complete_deployment_contract(tmp_path, monkeypatch):
+    _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ISSUER", "https://identity.example.test")
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES", "synthetic-audience")
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_SCOPES", "user_impersonation")
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES", "user_impersonation")
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS", "registered-codex-client")
+    monkeypatch.setenv("GLASSHIVE_MCP_CODEX_CLIENT_ID", "registered-codex-client")
+    monkeypatch.setenv("GLASSHIVE_MCP_CODEX_CALLBACK_PORT", "49153")
+    monkeypatch.setenv("GLASSHIVE_MCP_CODEX_RESOURCE", "https://glasshive.example.test/mcp")
+    monkeypatch.delenv("GLASSHIVE_MCP_CLAUDE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GLASSHIVE_MCP_CLAUDE_CALLBACK_PORT", raising=False)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    client.cookies.set("glasshive_session", "connect-session")
+
+    payload = client.get("/api/connect-ai").json()
+
+    assert payload["supported_clients"] == ["codex"]
+    assert set(payload["clients"]) == {"codex"}
+    assert payload["clients"]["codex"]["add_command"] in payload["guided_prompt"]
+    assert payload["clients"]["codex"]["login_command"] in payload["guided_prompt"]
+    assert "For Claude Code" not in payload["guided_prompt"]
+
+
+def test_external_ai_primary_ui_is_url_first_and_callbacks_are_admin_details():
+    page = (Path(server_module.STATIC_DIR) / "index.html").read_text(encoding="utf-8")
+    script = (Path(server_module.STATIC_DIR) / "control-plane.js").read_text(encoding="utf-8")
+
+    assert "Use GlassHive from another AI app" in page
+    assert "Control your workspaces" in page
+    assert 'id="connect-ai-server-url"' in page
+    assert 'id="copy-connect-ai-url"' in page
+    assert 'id="connect-ai-terminal-setup"' in page
+    assert 'id="connect-ai-registration-details"' in page
+    assert "Copy server address" in page
+    assert "Recommended" in page
+    assert "Do not open this address" in script
+    assert "connectAi.mcp_url" in script
+    assert "connectAi.server_name" in script
+    assert "referenceRow('Codex · Registered callback'" not in script
+    assert "['ArrowLeft', 'ArrowRight', 'Home', 'End']" in script
+    assert "manualTab.tabIndex = manual ? 0 : -1" in script
+    assert "if (canSetup && clients.codex)" in script
+    assert "if (canSetup && clients.claude)" in script
+    assert "ChatGPT or Codex" not in script
+    assert "connect-ai-supported-summary" in page
+    assert "connect-ai-auto-copy" in page
+    assert "supportedSummary.textContent" in script
+    assert "Worker accounts" in page
+    assert "AI accounts" not in page
+    assert "response.status === 404" in script
 
 
 def test_connect_ai_hides_false_commands_without_pre_registered_client(tmp_path, monkeypatch):
@@ -4822,6 +5331,56 @@ def test_provider_disconnect_and_workspace_capability_revoke_are_user_scoped():
     ]
 
 
+def test_workspace_detail_bff_maps_owner_miss_to_safe_404(monkeypatch):
+    runtime = FakeRuntimeClient()
+    response = httpx.Response(
+        404,
+        request=httpx.Request("GET", "http://runtime.test/v1/workers/wrk_missing"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "get_worker",
+        lambda _worker_id: (_ for _ in ()).throw(
+            httpx.HTTPStatusError("missing", request=response.request, response=response)
+        ),
+    )
+    client = TestClient(create_app(runtime_client=runtime))
+
+    missing = client.get("/api/workspaces/wrk_missing")
+
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "Workspace not found"
+
+
+def test_workspace_detail_bff_returns_only_review_state(monkeypatch):
+    runtime = FakeRuntimeClient()
+    monkeypatch.setattr(
+        runtime,
+        "get_worker",
+        lambda worker_id: {
+            "worker_id": worker_id,
+            "duplication_report": {"outstanding_reapproval_items": []},
+            "gateway_url": "http://private.invalid",
+            "takeover_url": "http://private.invalid/takeover",
+            "control_url": "http://private.invalid/control",
+            "gateway_port": 65535,
+            "session_key": "private-session",
+            "state_dir": "/private/state",
+            "workspace_dir": "/private/workspace",
+            "workspace_root": "/private/root",
+        },
+    )
+    client = TestClient(create_app(runtime_client=runtime))
+
+    detail = client.get("/api/workspaces/wrk_1")
+
+    assert detail.status_code == 200
+    assert detail.json() == {
+        "worker_id": "wrk_1",
+        "duplication_report": {"outstanding_reapproval_items": []},
+    }
+
+
 def test_provider_verify_and_forget_are_user_scoped_through_the_runtime_client():
     runtime = FakeRuntimeClient()
     client = TestClient(create_app(runtime_client=runtime))
@@ -4897,7 +5456,7 @@ def test_connections_ui_keeps_primary_account_setup_short_and_actionable():
 
     assert 'id="add-provider-account"' in page
     assert 'id="connect-ai-advanced"' in page
-    assert '<summary>External AI clients</summary>' in page
+    assert '<summary>Use GlassHive from another AI app</summary>' in page
     assert "Your AI accounts and tools." not in page
     assert "Connect the subscription your workers should use." not in page
     assert 'id="provider-setup-link"' in page
@@ -4975,6 +5534,105 @@ def test_launch_ui_uses_the_sole_ready_personal_account_without_silent_fallback(
     }
 
 
+def test_workspace_delivery_model_exposes_completed_output_without_stale_failure_actions():
+    module = (Path(server_module.STATIC_DIR) / "delivery-presenter.js").as_uri()
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ workspaceDeliveryModel }} from {json.dumps(module)};"
+                "const completed = workspaceDeliveryModel({latest_run:{state:'completed'},latest_output:'Finished the page',"
+                "deliverable:{kind:'file',label:'index.html',open_url:'/v1/link-refs/open',download_url:'/v1/link-refs/down'},"
+                "artifacts:{items:[{path:'workspace/index.html',content_type:'text/html',open_url:'/v1/link-refs/open',download_url:'/v1/link-refs/down'},"
+                "{path:'workspace/preview.png',content_type:'image/png',open_url:'/v1/link-refs/image'}]}});"
+                "const failed = workspaceDeliveryModel({latest_run:{state:'failed'},latest_output:'Build failed',"
+                "deliverable:{kind:'file',open_url:'/stale'},artifacts:{items:[{path:'stale.txt',open_url:'/stale'}]}});"
+                "const hosted = workspaceDeliveryModel({latest_run:{state:'completed'},latest_output:'Hosted page ready',"
+                "deliverable:{kind:'webpage',label:'index.html',browser_url:'file:///workspace/project/index.html'},"
+                "artifacts:{items:[{path:'workspace/preview.png',open_url:'/v1/link-refs/image'},"
+                "{path:'workspace/index.html',content_type:'text/html',open_url:'/v1/link-refs/hosted-open',download_url:'/v1/link-refs/hosted-down'}]}});"
+                "const duplicateBasename = workspaceDeliveryModel({latest_run:{state:'completed'},latest_output:'Exact page ready',"
+                "deliverable:{kind:'webpage',label:'index.html',workspace_path:'dist/index.html',browser_url:'file:///workspace/project/dist/index.html'},"
+                "artifacts:{items:[{path:'docs/index.html',open_url:'/v1/link-refs/wrong'},"
+                "{path:'dist/index.html',open_url:'/v1/link-refs/exact',download_url:'/v1/link-refs/exact-down'}]}});"
+                "const rootDuplicate = workspaceDeliveryModel({latest_run:{state:'completed'},latest_output:'Root page ready',"
+                "deliverable:{kind:'webpage',label:'index.html',workspace_path:'index.html',browser_url:'file:///workspace/project/index.html'},"
+                "artifacts:{items:[{path:'docs/index.html',open_url:'/v1/link-refs/root-wrong'},"
+                "{path:'index.html',open_url:'/v1/link-refs/root-exact'}]}});"
+                "process.stdout.write(JSON.stringify({completed,failed,hosted,duplicateBasename,rootDuplicate}));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["completed"]["available"] is True
+    assert payload["completed"]["summary"] == "Finished the page"
+    assert payload["completed"]["primary"]["openUrl"] == "/v1/link-refs/open"
+    assert payload["completed"]["primary"]["downloadUrl"] == "/v1/link-refs/down"
+    assert [item["label"] for item in payload["completed"]["artifacts"]] == [
+        "workspace/index.html",
+        "workspace/preview.png",
+    ]
+    assert payload["failed"] == {
+        "available": False,
+        "state": "failed",
+        "summary": "Build failed",
+        "primary": None,
+        "artifacts": [],
+    }
+    assert payload["hosted"]["primary"] == {
+        "label": "workspace/index.html",
+        "contentType": "text/html",
+        "openUrl": "/v1/link-refs/hosted-open",
+        "downloadUrl": "/v1/link-refs/hosted-down",
+    }
+    assert not payload["hosted"]["primary"]["openUrl"].startswith("file:")
+    assert payload["duplicateBasename"]["primary"]["label"] == "dist/index.html"
+    assert payload["duplicateBasename"]["primary"]["openUrl"] == "/v1/link-refs/exact"
+    assert payload["rootDuplicate"]["primary"]["label"] == "index.html"
+    assert payload["rootDuplicate"]["primary"]["openUrl"] == "/v1/link-refs/root-exact"
+
+
+def test_workspace_overview_orders_attention_bounds_previews_and_rehydrates_each_completed_run():
+    module = (Path(server_module.STATIC_DIR) / "workspace-overview.js").as_uri()
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery }} from {json.dumps(module)};"
+                "const items=["
+                "{worker_id:'normal',state:'running',favorite:false},"
+                "{worker_id:'favorite',state:'ready',favorite:true},"
+                "{worker_id:'failed',state:'failed',favorite:false},"
+                "{worker_id:'blocked',state:'action_required',favorite:false}];"
+                "items.sort(compareWorkspacePriority);"
+                "const previews=previewWorkerIds(Array.from({length:7},(_,i)=>({worker_id:`w${i}`,visible:i!==1,active:true})),3);"
+                "const hydration=["
+                "shouldHydrateWorkspaceDelivery({runState:'completed',runId:'run-a'}),"
+                "shouldHydrateWorkspaceDelivery({runState:'completed',runId:'run-a',hydratedRunId:'run-a'}),"
+                "shouldHydrateWorkspaceDelivery({runState:'running',runId:'run-b',hydratedRunId:'run-a'}),"
+                "shouldHydrateWorkspaceDelivery({runState:'completed',runId:'run-b',hydratedRunId:'run-a'}),"
+                "shouldHydrateWorkspaceDelivery({runState:'completed',legacyLoaded:true})];"
+                "process.stdout.write(JSON.stringify({order:items.map(x=>x.worker_id),previews,hydration}));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "order": ["blocked", "failed", "favorite", "normal"],
+        "previews": ["w0", "w2", "w3"],
+        "hydration": [True, False, False, True, False],
+    }
+
+
 def test_primary_navigation_remains_visible_at_tablet_and_narrow_desktop_widths():
     styles = (Path(server_module.STATIC_DIR) / "styles.css").read_text(encoding="utf-8")
 
@@ -5029,6 +5687,8 @@ def test_oidc_identity_owner_advertises_provider_email_login_with_closed_enrollm
         "principal_enrollment": False,
         "identity_owner": "external_provider",
         "oidc": True,
+        "oidc_login_visible": True,
+        "login_methods": ["oidc"],
     }
     assert "Continue with email or organization" in auth_script
     assert "create an account if needed" not in auth_script
@@ -5050,6 +5710,7 @@ def test_local_password_login_is_explicit_same_origin_and_has_no_signup_surface(
         "https://glasshive.example.test/auth/oidc/callback",
     )
     monkeypatch.setenv("GLASSHIVE_LOCAL_PASSWORD_LOGIN", "true")
+    monkeypatch.setenv("GLASSHIVE_OIDC_LOGIN_VISIBLE", "false")
     monkeypatch.setenv(
         "GLASSHIVE_LOCAL_AUTH_THROTTLE_KEY",
         "synthetic-throttle-key-for-server-tests",
@@ -5069,8 +5730,11 @@ def test_local_password_login_is_explicit_same_origin_and_has_no_signup_surface(
 
     assert config.json()["local_password_login"] is True
     assert config.json()["local_password_signup"] is False
+    assert config.json()["oidc"] is True
+    assert config.json()["oidc_login_visible"] is False
+    assert config.json()["login_methods"] == ["local_password"]
     assert 'id="local-login"' in page.text
-    assert '/static/auth.js?v=20260809c' in page.text
+    assert '/static/auth.js?v=20260811m' in page.text
     assert page.headers["cache-control"] == "no-store, no-cache, private, max-age=0"
     assert login_csrf
     assert client.get("/auth/email/register").status_code == 404
@@ -5181,6 +5845,23 @@ def test_local_password_login_is_explicit_same_origin_and_has_no_signup_surface(
     assert session["authenticated"] is True
     assert session["user_id"] == principal["user_id"]
     assert session["auth_method"] == "local_password"
+    bootstrap = client.get("/api/bootstrap").json()
+    assert bootstrap["identity"]["auth_method"] == "local_password"
+    assert bootstrap["identity"]["provider_switch_visible"] is False
+
+
+def test_login_dom_uses_visible_methods_without_stale_provider_copy():
+    page = (Path(server_module.STATIC_DIR) / "login.html").read_text(encoding="utf-8")
+    script = (Path(server_module.STATIC_DIR) / "auth.js").read_text(encoding="utf-8")
+    app_script = (Path(server_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="auth-footnote"' in page
+    assert "config.login_methods" in script
+    assert "loginMethods.has('oidc')" in script
+    assert "loginMethods.has('local_password')" in script
+    assert "authDivider.hidden = !(oidcVisible && localVisible)" in script
+    assert "identity.provider_switch_visible" in app_script
+    assert "switchAccount.hidden" in app_script
 
 
 class _FakeOidcHumanAuth:

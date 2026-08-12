@@ -21,6 +21,7 @@ class CreatePendingChangeRequest(BaseModel):
         "library_enable",
         "library_upgrade",
         "workspace_provider_account",
+        "workspace_duplication_reapproval_waiver",
     ]
     target_id: str = Field(min_length=1, max_length=200)
     payload: dict[str, Any] = Field(default_factory=dict)

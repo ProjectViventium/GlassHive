@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -11,6 +12,10 @@ from fastapi.testclient import TestClient
 from workers_projects_runtime.api import create_app
 from workers_projects_runtime.control_plane import ControlPlaneStore
 from library_test_support import library_manifest, register_manifest
+
+
+def _reapproval_action_id(resolution: str, reference: str) -> str:
+    return "rea_" + hashlib.sha256(f"{resolution}\0{reference}".encode()).hexdigest()[:24]
 
 
 def test_pending_change_metadata_and_activity_are_owner_scoped(tmp_path, monkeypatch):
@@ -206,6 +211,7 @@ def test_workspace_duplicate_idempotency_is_durable_request_scoped_and_owner_sco
     assert missing_key.status_code == 422
     assert short_key.status_code == 422
     assert first.status_code == 201
+
     assert first.json()["idempotent_replay"] is False
 
     with TestClient(create_app(db_path=str(database), runtime_backend="stub")) as restarted:
@@ -233,6 +239,53 @@ def test_workspace_duplicate_idempotency_is_durable_request_scoped_and_owner_sco
     assert "different workspace duplicate request" in conflict.json()["detail"].lower()
     assert other_owner.status_code == 201
     assert other_owner.json()["workspace"]["worker_id"] != first.json()["workspace"]["worker_id"]
+
+
+def test_terminal_workspace_duplicate_retry_returns_fresh_copy_recovery(tmp_path):
+    app = create_app(db_path=str(tmp_path / "runtime.db"), runtime_backend="stub")
+    with TestClient(app) as client:
+        project = client.post(
+            "/v1/projects",
+            json={"owner_id": "demo-owner", "title": "Source", "goal": "Synthetic QA"},
+        ).json()
+        source = client.post(
+            f"/v1/projects/{project['project_id']}/workers",
+            json={
+                "owner_id": "demo-owner",
+                "name": "Source",
+                "role": "main",
+                "profile": "codex-cli",
+                "workspace_kind": "named",
+                "start_synchronously": False,
+            },
+        ).json()
+        app.state.control_plane.reserve_workspace_duplication(
+            tenant_id="local",
+            owner_id="demo-owner",
+            idempotency_key="duplicate-terminal-attempt-1",
+            source_worker_id=source["worker_id"],
+            requested_name="",
+        )
+        app.state.control_plane.fail_workspace_duplication(
+            tenant_id="local",
+            owner_id="demo-owner",
+            idempotency_key="duplicate-terminal-attempt-1",
+            error_text="synthetic private failure",
+            project_id="prj_failed",
+            worker_id="wrk_failed",
+        )
+        retried = client.post(
+            f"/v1/workspaces/{source['worker_id']}/duplicate",
+            json={"idempotency_key": "duplicate-terminal-attempt-1"},
+        )
+
+    assert retried.status_code == 409
+    assert retried.json()["detail"] == {
+        "code": "workspace_duplication_failed",
+        "message": "This copy attempt could not be completed.",
+        "recovery": "Start a fresh copy; no second workspace was created.",
+    }
+    assert "synthetic private failure" not in retried.text
 
 
 def test_workspace_duplicate_in_progress_retry_does_not_create_a_second_project(tmp_path, monkeypatch):
@@ -287,7 +340,6 @@ def test_workspace_duplicate_in_progress_retry_does_not_create_a_second_project(
     assert "already in progress" in retry.json()["detail"].lower()
     assert len(projects_during_retry) == 2
     assert first.status_code == 201
-
 
 def test_workspace_duplicate_failure_without_a_workspace_can_retry_without_hidden_projects(tmp_path, monkeypatch):
     app = create_app(db_path=str(tmp_path / "runtime.db"), runtime_backend="stub")
@@ -522,6 +574,24 @@ def test_stale_workspace_duplicate_recovers_only_proven_completion_and_fails_clo
         )
     assert first.status_code == 201
 
+    library = register_manifest(
+        ControlPlaneStore(str(database)),
+        library_manifest(stable_id="skill.synthetic.after-copy", scopes=["documents:read"]),
+    )
+    with TestClient(create_app(db_path=str(database), runtime_backend="stub")) as grant_client:
+        later_pending = grant_client.post(
+            "/v1/pending-changes",
+            json={
+                "change_type": "library_enable",
+                "target_id": source["worker_id"],
+                "payload": {"library_id": library["library_id"], "scopes": ["documents:read"]},
+            },
+        ).json()
+        assert grant_client.post(
+            f"/v1/pending-changes/{later_pending['change_id']}/confirm",
+            json={"confirmation_token": later_pending["confirmation_token"]},
+        ).status_code == 200
+
     with sqlite3.connect(database) as conn:
         conn.execute(
             """
@@ -568,6 +638,7 @@ def test_stale_workspace_duplicate_recovers_only_proven_completion_and_fails_clo
     assert recovered.json()["idempotent_replay"] is True
     assert recovered.json()["project"]["project_id"] == first.json()["project"]["project_id"]
     assert recovered.json()["workspace"]["worker_id"] == first.json()["workspace"]["worker_id"]
+    assert recovered.json()["workspace"]["duplication_report"].get("reapproval_items", []) == []
     assert len(projects_after_recovery) == 2
     assert ambiguous.status_code == 409
     assert "stale workspace duplication" in ambiguous.json()["detail"].lower()
@@ -639,9 +710,41 @@ def test_capability_grants_and_provider_disconnect_have_complete_api_lifecycle(t
     ).json()
     copied_worker_id = copied["workspace"]["worker_id"]
     assert copied["workspace"]["duplication_report"]["capabilities_requiring_reapproval"] == 1
+    assert copied["workspace"]["duplication_report"]["reapproval_items"] == [
+        {
+            "action_id": _reapproval_action_id("library_grant", library["library_id"]),
+            "kind": "library",
+            "resolution": "library_grant",
+            "reference": library["library_id"],
+            "label": "Synthetic Library item",
+            "route": "library",
+            "scopes": ["documents:read"],
+        }
+    ]
     assert client.get(
         f"/v1/workspaces/{copied_worker_id}/capability-grants"
     ).json()["items"] == []
+    blocked_copy = client.post(
+        f"/v1/workers/{copied_worker_id}/message",
+        json={"message": "Run before capability review"},
+    )
+    assert blocked_copy.status_code == 409
+    copied_pending = client.post(
+        "/v1/pending-changes",
+        json={
+            "change_type": "library_enable",
+            "target_id": copied_worker_id,
+            "payload": {"library_id": library["library_id"], "scopes": ["documents:read"]},
+        },
+    ).json()
+    assert client.post(
+        f"/v1/pending-changes/{copied_pending['change_id']}/confirm",
+        json={"confirmation_token": copied_pending["confirmation_token"]},
+    ).status_code == 200
+    assert client.post(
+        f"/v1/workers/{copied_worker_id}/message",
+        json={"message": "Run after capability review"},
+    ).status_code == 202
 
     account = client.post(
         "/v1/provider-accounts",
@@ -665,6 +768,384 @@ def test_capability_grants_and_provider_disconnect_have_complete_api_lifecycle(t
     assert forgotten.status_code == 200
     assert forgotten.json()["status"] == "forgotten"
     assert client.get("/v1/provider-accounts").json()["items"] == []
+
+
+def test_copied_library_reapproval_keeps_exact_scopes_when_request_omits_or_widens_them(tmp_path):
+    database = tmp_path / "runtime.db"
+    client = TestClient(create_app(db_path=str(database), runtime_backend="stub"))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Scoped copy", "goal": "Synthetic QA"},
+    ).json()
+    source = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Scoped copy",
+            "role": "main",
+            "profile": "codex-cli",
+            "workspace_kind": "named",
+            "start_synchronously": False,
+        },
+    ).json()
+    library = register_manifest(
+        ControlPlaneStore(str(database)),
+        library_manifest(
+            stable_id="skill.synthetic.exact-copy-scopes",
+            scopes=["documents:read", "documents:write"],
+        ),
+    )
+    source_change = client.post(
+        "/v1/pending-changes",
+        json={
+            "change_type": "library_enable",
+            "target_id": source["worker_id"],
+            "payload": {"library_id": library["library_id"], "scopes": ["documents:read"]},
+        },
+    ).json()
+    assert client.post(
+        f"/v1/pending-changes/{source_change['change_id']}/confirm",
+        json={"confirmation_token": source_change["confirmation_token"]},
+    ).status_code == 200
+    copied = client.post(
+        f"/v1/workspaces/{source['worker_id']}/duplicate",
+        json={"idempotency_key": "exact-copy-scopes-1"},
+    ).json()["workspace"]
+    assert copied["duplication_report"]["reapproval_items"][0]["scopes"] == ["documents:read"]
+
+    widened = client.post(
+        "/v1/pending-changes",
+        json={
+            "change_type": "library_enable",
+            "target_id": copied["worker_id"],
+            "payload": {
+                "library_id": library["library_id"],
+                "scopes": ["documents:read", "documents:write"],
+            },
+        },
+    )
+    assert widened.status_code == 409
+    assert "exact permissions" in widened.json()["detail"].lower()
+
+    omitted = client.post(
+        "/v1/pending-changes",
+        json={
+            "change_type": "library_enable",
+            "target_id": copied["worker_id"],
+            "payload": {"library_id": library["library_id"]},
+        },
+    )
+    assert omitted.status_code == 201, omitted.text
+    assert omitted.json()["payload"]["scopes"] == ["documents:read"]
+    confirmed = client.post(
+        f"/v1/pending-changes/{omitted.json()['change_id']}/confirm",
+        json={"confirmation_token": omitted.json()["confirmation_token"]},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert client.post(
+        f"/v1/workers/{copied['worker_id']}/message",
+        json={"message": "Run after equivalent review"},
+    ).status_code == 202
+
+
+def test_accountless_personal_preferred_fallback_copies_without_impossible_reapproval(tmp_path):
+    database = tmp_path / "runtime.db"
+    client = TestClient(create_app(db_path=str(database), runtime_backend="stub"))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Fallback source", "goal": "Synthetic QA"},
+    ).json()
+    source = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Fallback source",
+            "role": "main",
+            "profile": "codex-cli",
+            "workspace_kind": "named",
+            "start_synchronously": False,
+            "bootstrap_bundle": {"provider_account": {"policy": "personal_preferred"}},
+        },
+    ).json()
+
+    canonical = client.post(
+        f"/v1/workspaces/{source['worker_id']}/duplicate",
+        json={"idempotency_key": "fallback-copy-canonical-1"},
+    )
+    assert canonical.status_code == 201, canonical.text
+    assert canonical.json()["workspace"]["duplication_report"].get("reapproval_items", []) == []
+    assert client.post(
+        f"/v1/workers/{canonical.json()['workspace']['worker_id']}/message",
+        json={"message": "Use the valid deployment fallback"},
+    ).status_code == 202
+
+    legacy = client.post(
+        f"/v1/projects/{project['project_id']}/workers/duplicate",
+        json={
+            "owner_id": "demo-owner",
+            "source_worker_id": source["worker_id"],
+            "name": "Fallback legacy copy",
+            "role": "main",
+        },
+    )
+    assert legacy.status_code == 201, legacy.text
+    assert legacy.json()["duplication_report"].get("reapproval_items", []) == []
+    assert client.post(
+        f"/v1/workers/{legacy.json()['worker_id']}/message",
+        json={"message": "Legacy route keeps the same fallback semantics"},
+    ).status_code == 202
+
+
+def test_workspace_duplicate_reports_legacy_brokered_connection_as_explicit_reapproval(tmp_path):
+    database = tmp_path / "runtime.db"
+    client = TestClient(create_app(db_path=str(database), runtime_backend="stub"))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Brokered source", "goal": "Synthetic QA"},
+    ).json()
+    workspace = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Brokered source",
+            "role": "main",
+            "profile": "codex-cli",
+            "workspace_kind": "named",
+            "start_synchronously": False,
+        },
+    ).json()
+    store = ControlPlaneStore(str(database))
+    connection = store.create_connection(
+        tenant_id="local",
+        owner_id="demo-owner",
+        kind="documents",
+        adapter="synthetic",
+        label="Team documents",
+        status="ready",
+        secret_locator="broker://synthetic",
+        scopes=["documents:read"],
+    )
+    with sqlite3.connect(database) as conn:
+        conn.execute(
+            """
+            INSERT INTO workspace_capability_grants
+                (grant_id, tenant_id, owner_id, worker_id, library_id, connection_id,
+                 account_id, scopes_json, prior_bootstrap_bundle_json,
+                 applied_bootstrap_bundle_json, installation_plan_json, probe_json,
+                 created_at, revoked_at)
+            VALUES (?, 'local', 'demo-owner', ?, NULL, ?, NULL, ?, '{}', '{}', '[]', '{}', 1, NULL)
+            """,
+            (
+                "grant_legacy_connection",
+                workspace["worker_id"],
+                connection["connection_id"],
+                json.dumps(["documents:read"]),
+            ),
+        )
+
+    copied = client.post(
+        f"/v1/workspaces/{workspace['worker_id']}/duplicate",
+        json={"idempotency_key": "duplicate-brokered-connection-1"},
+    )
+
+    assert copied.status_code == 201
+    assert copied.json()["workspace"]["duplication_report"]["reapproval_items"] == [{
+        "action_id": _reapproval_action_id("connection_grant", connection["connection_id"]),
+        "kind": "connection",
+        "resolution": "connection_grant",
+        "reference": connection["connection_id"],
+        "label": "Team documents",
+        "route": "connections",
+        "scopes": ["documents:read"],
+    }]
+    assert client.post(
+        f"/v1/workers/{copied.json()['workspace']['worker_id']}/message",
+        json={"message": "Run before connection review"},
+    ).status_code == 409
+    action_id = copied.json()["workspace"]["duplication_report"]["reapproval_items"][0]["action_id"]
+    prepared = client.post(
+        "/v1/pending-changes",
+        json={
+            "change_type": "workspace_duplication_reapproval_waiver",
+            "target_id": copied.json()["workspace"]["worker_id"],
+            "payload": {"action_id": action_id},
+        },
+    )
+    assert prepared.status_code == 201, prepared.text
+    competing = client.post(
+        "/v1/pending-changes",
+        json={
+            "change_type": "workspace_duplication_reapproval_waiver",
+            "target_id": copied.json()["workspace"]["worker_id"],
+            "payload": {"action_id": action_id},
+        },
+    )
+    assert competing.status_code == 201, competing.text
+    assert client.post(
+        f"/v1/workers/{copied.json()['workspace']['worker_id']}/message",
+        json={"message": "A prepared skip is not human confirmation"},
+    ).status_code == 409
+    waived = client.post(
+        f"/v1/pending-changes/{prepared.json()['change_id']}/confirm",
+        json={"confirmation_token": prepared.json()["confirmation_token"]},
+    )
+    assert waived.status_code == 200, waived.text
+    duplicate_confirmation = client.post(
+        f"/v1/pending-changes/{competing.json()['change_id']}/confirm",
+        json={"confirmation_token": competing.json()["confirmation_token"]},
+    )
+    assert duplicate_confirmation.status_code == 409
+    assert "already resolved" in duplicate_confirmation.json()["detail"].lower()
+    catalog = client.get("/v1/workspaces?kind=named").json()["items"]
+    copied_catalog = next(
+        item for item in catalog if item["worker_id"] == copied.json()["workspace"]["worker_id"]
+    )
+    assert copied_catalog["duplication_report"]["outstanding_reapproval_items"] == []
+    assert client.post(
+        f"/v1/workers/{copied.json()['workspace']['worker_id']}/message",
+        json={"message": "Continue explicitly without the old connection"},
+    ).status_code == 202
+
+
+def test_legacy_duplicate_route_persists_the_same_review_gate(tmp_path):
+    database = tmp_path / "runtime.db"
+    client = TestClient(create_app(db_path=str(database), runtime_backend="stub"))
+    source_project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Legacy source", "goal": "Synthetic QA"},
+    ).json()
+    source = client.post(
+        f"/v1/projects/{source_project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Legacy source",
+            "role": "main",
+            "profile": "codex-cli",
+            "workspace_kind": "named",
+            "start_synchronously": False,
+        },
+    ).json()
+    library = register_manifest(
+        ControlPlaneStore(str(database)),
+        library_manifest(stable_id="skill.synthetic.legacy-duplicate", scopes=["documents:read"]),
+    )
+    pending = client.post(
+        "/v1/pending-changes",
+        json={
+            "change_type": "library_enable",
+            "target_id": source["worker_id"],
+            "payload": {"library_id": library["library_id"], "scopes": ["documents:read"]},
+        },
+    ).json()
+    assert client.post(
+        f"/v1/pending-changes/{pending['change_id']}/confirm",
+        json={"confirmation_token": pending["confirmation_token"]},
+    ).status_code == 200
+    target_project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Legacy target", "goal": "Synthetic QA"},
+    ).json()
+
+    copied = client.post(
+        f"/v1/projects/{target_project['project_id']}/workers/duplicate",
+        json={
+            "owner_id": "demo-owner",
+            "source_worker_id": source["worker_id"],
+            "name": "Legacy copy",
+            "role": "main",
+        },
+    )
+
+    assert copied.status_code == 201, copied.text
+    report = copied.json()["duplication_report"]
+    assert report["reapproval_items"][0]["action_id"] == _reapproval_action_id(
+        "library_grant", library["library_id"]
+    )
+    assert client.post(
+        f"/v1/workers/{copied.json()['worker_id']}/message",
+        json={"message": "Legacy copies are review-gated too"},
+    ).status_code == 409
+
+
+def test_duplicate_is_review_gated_while_workspace_copy_is_still_in_flight(tmp_path, monkeypatch):
+    database = tmp_path / "runtime.db"
+    app = create_app(db_path=str(database), runtime_backend="stub")
+    service = app.state.service
+    entered = threading.Event()
+    release = threading.Event()
+    created_worker_ids: list[str] = []
+    original_copy = service._copy_workspace_contents
+
+    with TestClient(app) as client:
+        project = client.post(
+            "/v1/projects",
+            json={"owner_id": "demo-owner", "title": "Atomic source", "goal": "Synthetic QA"},
+        ).json()
+        source = client.post(
+            f"/v1/projects/{project['project_id']}/workers",
+            json={
+                "owner_id": "demo-owner",
+                "name": "Atomic source",
+                "role": "main",
+                "profile": "codex-cli",
+                "workspace_kind": "named",
+                "start_synchronously": False,
+            },
+        ).json()
+        library = register_manifest(
+            ControlPlaneStore(str(database)),
+            library_manifest(stable_id="skill.synthetic.atomic-copy", scopes=["documents:read"]),
+        )
+        pending = client.post(
+            "/v1/pending-changes",
+            json={
+                "change_type": "library_enable",
+                "target_id": source["worker_id"],
+                "payload": {"library_id": library["library_id"], "scopes": ["documents:read"]},
+            },
+        ).json()
+        assert client.post(
+            f"/v1/pending-changes/{pending['change_id']}/confirm",
+            json={"confirmation_token": pending["confirmation_token"]},
+        ).status_code == 200
+
+        def blocked_copy(source_worker, duplicated_worker):
+            created_worker_ids.append(str(duplicated_worker["worker_id"]))
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("synthetic copy barrier timed out")
+            return original_copy(source_worker, duplicated_worker)
+
+        monkeypatch.setattr(service, "_copy_workspace_contents", blocked_copy)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                client.post,
+                f"/v1/workspaces/{source['worker_id']}/duplicate",
+                json={"idempotency_key": "atomic-duplicate-review-1"},
+            )
+            try:
+                assert entered.wait(5)
+                copied_worker_id = created_worker_ids[0]
+                pending_copy = service.store.get_worker(copied_worker_id)
+                assert pending_copy is not None
+                assert pending_copy["duplication_report"]["duplication_state"] == "pending"
+                assert pending_copy["duplication_report"]["source_state"] == "pending"
+                assert pending_copy["duplication_report"]["reapproval_items"][0]["action_id"] == (
+                    _reapproval_action_id("library_grant", library["library_id"])
+                )
+                pending_response = client.get(f"/v1/workers/{copied_worker_id}")
+                assert pending_response.status_code == 200, pending_response.text
+                assert pending_response.json()["duplication_report"]["source_state"] == "pending"
+                assert client.post(
+                    f"/v1/workers/{copied_worker_id}/message",
+                    json={"message": "A process interruption cannot expose an executable copy"},
+                ).status_code == 409
+            finally:
+                release.set()
+            response = future.result(timeout=5)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["workspace"]["duplication_report"]["duplication_state"] == "complete"
 
 
 def test_subscription_provider_account_verify_rechecks_native_status(tmp_path, monkeypatch):

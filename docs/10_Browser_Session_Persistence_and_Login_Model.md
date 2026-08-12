@@ -268,6 +268,17 @@ Recommended safe default:
 1. copy project files and seeded context
 2. keep a new worker identity
 3. start with a clean browser profile unless the product intentionally approves session cloning
+4. copy only non-secret capability references and report each omitted grant/account/connection as an
+   exact review item
+5. prevent destination execution until the real approval exists or the owner explicitly continues
+   without that item; sending a setup message is not approval
+6. preserve the source grant's least-privilege scope subset during equivalent Library reapproval
+7. treat legacy connection/provider grant references as non-transferable until a real destination
+   capability exists; only explicit `Continue without` resolves that review item
+8. omit provider-selection review for an account-less `personal_preferred` deployment fallback
+
+The durable destination report owns this review state so refresh and restart cannot lose it. Browser
+session storage is only a convenience cache and is cleared when the authenticated owner changes.
 
 ## Website-Side Reality
 

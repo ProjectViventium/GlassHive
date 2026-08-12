@@ -1,6 +1,7 @@
 const workerId = window.location.pathname.split('/').filter(Boolean).at(-1);
 const params = new URLSearchParams(window.location.search);
 const signedToken = params.get('gh_token') || '';
+const viewOnly = params.get('preview') === '1';
 
 const stage = document.getElementById('desktop-stage');
 const overlay = document.getElementById('desktop-overlay');
@@ -258,7 +259,12 @@ async function connectDesktop() {
     currentWsUrl = wsUrl;
     currentPassword = password;
 
-    setStatus('Attaching live sandbox…', 'GlassHive is connecting directly to the worker desktop and enabling clipboard sync.');
+    setStatus(
+      viewOnly ? 'Attaching view-only preview…' : 'Attaching live sandbox…',
+      viewOnly
+        ? 'GlassHive is showing this workspace without keyboard, mouse, or clipboard control.'
+        : 'GlassHive is connecting directly to the worker desktop and enabling clipboard sync.',
+    );
 
     const modulePath = withAuth(`/novnc/${workerId}/core/rfb.js?attempt=${rfbImportAttempt}`);
     let RFB;
@@ -295,12 +301,20 @@ async function connectDesktop() {
     });
     rfb.scaleViewport = true;
     rfb.background = '#000';
-    rfb.focusOnClick = true;
-    rfb.showDotCursor = true;
+    rfb.viewOnly = viewOnly;
+    rfb.focusOnClick = !viewOnly;
+    rfb.showDotCursor = !viewOnly;
 
     rfb.addEventListener('connect', () => {
-      setStatus('Sandbox connected', 'Click anywhere inside the desktop to steer directly. Clipboard sync is active when the browser allows it.', { hideOverlay: true });
-      setClipboardStatus('Clipboard sync: bi-directional');
+      setStatus(
+        viewOnly ? 'Live preview' : 'Sandbox connected',
+        viewOnly
+          ? 'Open the workspace to steer this worker.'
+          : 'Click anywhere inside the desktop to steer directly. Clipboard sync is active when the browser allows it.',
+        { hideOverlay: true },
+      );
+      setClipboardStatus(viewOnly ? 'View only' : 'Clipboard sync: bi-directional');
+      if (viewOnly) return;
       try {
         rfb.focus();
       } catch (error) {
@@ -328,6 +342,7 @@ async function connectDesktop() {
     });
 
     rfb.addEventListener('clipboard', async (event) => {
+      if (viewOnly) return;
       const text = String(event.detail?.text || '');
       if (!text) return;
       lastRemoteClipboard = text;
@@ -341,7 +356,7 @@ async function connectDesktop() {
       }
     });
 
-    installClipboardSync();
+    if (!viewOnly) installClipboardSync();
   } finally {
     desktopRefreshInFlight = false;
     scheduleDesktopRefresh();

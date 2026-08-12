@@ -2282,6 +2282,7 @@ def test_worker_delegate_once_creates_resumes_and_runs_without_listing(monkeypat
             payload = _tool_json(delegated)
             assert payload["status"] == "dispatched"
             assert payload["callback_ready"] is True
+            assert payload["callback_delivery_deadline_seconds"] == 870
             record = _assert_link_ref_url(
                 payload["view_steer_url"],
                 prefix="http://127.0.0.1:8780/r/",

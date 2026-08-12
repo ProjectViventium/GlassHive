@@ -1,3 +1,10 @@
+import {
+  recurrenceSubmissionPolicy,
+  scheduleEditorType,
+  zonedDateTimeLocalValue,
+} from './schedule-policy.js?v=20260811m';
+import { equivalentReapprovalScopes } from './capability-review.js?v=20260811m';
+
 const SUPPORT_COPY = {
   supported: 'Ready to connect',
   proof_required: 'Available when this deployment enables isolated Codex subscription homes',
@@ -17,6 +24,7 @@ const PROVIDER_METHOD_LABELS = {
   api_key: 'Connected API key',
   enterprise_route: 'Enterprise route',
 };
+const CAPABILITY_REVIEW_KEY = 'glasshive.capability-review';
 
 let api = null;
 let controlPlane = null;
@@ -26,9 +34,11 @@ let workspaceCatalog = { items: [] };
 let recurringSchedules = { items: [] };
 let scheduleLoadError = '';
 const scheduleOccurrences = new Map();
+const scheduleActionMessages = new Map();
 let editingScheduleId = '';
 let activeSetupAccount = '';
 let setupPollTimer = 0;
+let pendingCapabilityReview = null;
 const copyResetTimers = new WeakMap();
 
 function node(tag, className = '', text = '') {
@@ -194,6 +204,11 @@ function renderProviderAccounts() {
   const list = document.getElementById('provider-account-list');
   if (!list || !controlPlane) return;
   const accounts = controlPlane.provider_accounts || [];
+  const reviewAccountIds = new Set(
+    (capabilityReviewRequest()?.items || [])
+      .filter((item) => item.kind === 'provider_account')
+      .map((item) => item.reference),
+  );
   const addAccount = document.querySelector('#add-provider-account > summary');
   if (addAccount) addAccount.textContent = accounts.length ? 'Connect another account' : 'Connect an AI account';
   if (!accounts.length) {
@@ -203,6 +218,7 @@ function renderProviderAccounts() {
   const rows = accounts.map((account) => {
     const row = node('article', 'connection-row');
     row.dataset.accountId = String(account.account_id || '');
+    row.classList.toggle('needs-review', reviewAccountIds.has(row.dataset.accountId));
     const copy = node('div', 'connection-copy');
     copy.append(
       node('strong', '', String(account.label || account.provider || 'Worker account')),
@@ -329,11 +345,20 @@ function renderConnections() {
   const card = document.getElementById('connected-services-card');
   if (!list || !controlPlane) return;
   const connections = controlPlane.connections || [];
+  const reviewConnectionIds = new Set(
+    (capabilityReviewRequest()?.items || [])
+      .filter((item) => item.kind === 'connection')
+      .map((item) => item.reference),
+  );
   if (!connections.length) {
     list.replaceChildren();
   } else {
     list.replaceChildren(...connections.map((connection) => {
       const row = node('article', 'connection-row');
+      row.classList.toggle(
+        'needs-review',
+        reviewConnectionIds.has(String(connection.connection_id || '')),
+      );
       const copy = node('div', 'connection-copy');
       copy.append(
         node('strong', '', String(connection.label || connection.kind || 'Connected service')),
@@ -372,27 +397,115 @@ function referenceRow(label, value) {
   return row;
 }
 
+function connectAiClientCard(title, steps) {
+  const card = node('article', 'connect-ai-client-card');
+  card.append(node('strong', '', title), node('p', 'card-note', steps));
+  return card;
+}
+
+function setConnectAiMode(mode) {
+  const manual = mode === 'manual';
+  const autoTab = document.getElementById('connect-ai-auto-tab');
+  const manualTab = document.getElementById('connect-ai-manual-tab');
+  const autoPanel = document.getElementById('connect-ai-auto-panel');
+  const manualPanel = document.getElementById('connect-ai-manual-panel');
+  if (autoTab) autoTab.setAttribute('aria-selected', String(!manual));
+  if (manualTab) manualTab.setAttribute('aria-selected', String(manual));
+  if (autoTab) autoTab.tabIndex = manual ? -1 : 0;
+  if (manualTab) manualTab.tabIndex = manual ? 0 : -1;
+  if (autoPanel) autoPanel.hidden = manual;
+  if (manualPanel) manualPanel.hidden = !manual;
+}
+
 function renderConnectAi() {
   const list = document.getElementById('connect-ai-commands');
+  const callbacks = document.getElementById('connect-ai-callbacks');
+  const clientsList = document.getElementById('connect-ai-clients');
+  const serverUrl = document.getElementById('connect-ai-server-url');
+  const copyUrl = document.getElementById('copy-connect-ai-url');
+  const prompt = document.getElementById('connect-ai-auto-prompt');
+  const copyPrompt = document.getElementById('copy-connect-ai-prompt');
   const source = document.getElementById('connect-ai-source');
+  const supportedSummary = document.getElementById('connect-ai-supported-summary');
+  const automaticCopy = document.getElementById('connect-ai-auto-copy');
   if (!list || !connectAi) return;
   if (connectAiLoadError) {
     list.replaceChildren(node('p', 'connect-login-note', connectAiLoadError));
+    callbacks?.replaceChildren();
+    clientsList?.replaceChildren(node('p', 'connect-login-note', connectAiLoadError));
+    if (serverUrl) serverUrl.textContent = '';
+    if (prompt) prompt.textContent = connectAiLoadError;
+    if (copyUrl) copyUrl.disabled = true;
+    if (copyPrompt) copyPrompt.disabled = true;
     if (source) source.replaceChildren();
     return;
   }
   const clients = connectAi.clients || {};
-  const rows = [
-    referenceRow('Codex · Registered callback', String(clients.codex?.callback_uri || '')),
-    commandRow('Codex · 1. Add server', String(clients.codex?.add_command || '')),
-    commandRow('Codex · 2. Sign in', String(clients.codex?.login_command || '')),
-    referenceRow('Claude Code · Registered callback', String(clients.claude?.callback_uri || '')),
-    commandRow('Claude Code · Add server', String(clients.claude?.add_command || '')),
-  ].filter((row) => row.querySelector('code')?.textContent);
-  rows.push(node('p', 'connect-login-note', String(connectAi.configuration_note || '')));
+  const canSetup = String(connectAi.configuration_status || '') === 'ready';
+  const supportedNames = [
+    ...(clients.codex ? ['Codex'] : []),
+    ...(clients.claude ? ['Claude Code'] : []),
+  ];
+  const supportedText = supportedNames.length === 2
+    ? `${supportedNames[0]} or ${supportedNames[1]}`
+    : supportedNames[0] || 'a supported AI app';
+  if (supportedSummary) supportedSummary.textContent = `Control your workspaces from ${supportedText}.`;
+  if (automaticCopy) automaticCopy.textContent = `Copy this once and paste it into ${supportedText}.`;
+  const mcpUrl = String(connectAi.mcp_url || '');
+  const guidedPrompt = String(connectAi.guided_prompt || '');
+  if (serverUrl) serverUrl.textContent = mcpUrl;
+  if (prompt) prompt.textContent = canSetup ? guidedPrompt : String(connectAi.configuration_note || 'Setup is not available.');
+  if (copyUrl) {
+    copyUrl.disabled = !canSetup || !mcpUrl;
+    copyUrl.onclick = () => copyText(mcpUrl, copyUrl, serverUrl);
+  }
+  if (copyPrompt) {
+    copyPrompt.disabled = !canSetup || !guidedPrompt;
+    copyPrompt.onclick = () => copyText(guidedPrompt, copyPrompt, prompt);
+  }
+
+  const clientCards = [];
+  if (canSetup && clients.codex) {
+    clientCards.push(connectAiClientCard(
+      'Codex',
+      'Open Settings → MCP servers → Add server. Paste the GlassHive address, restart if prompted, then Authenticate.',
+    ));
+  }
+  if (canSetup && clients.claude) {
+    clientCards.push(connectAiClientCard(
+      'Claude Code',
+      'Use Terminal setup below, then run /mcp in Claude Code to finish sign-in.',
+    ));
+  }
+  clientsList?.replaceChildren(
+    ...(clientCards.length
+      ? clientCards
+      : [node('p', 'connect-login-note', String(connectAi.configuration_note || 'Setup is not available.'))]),
+  );
+
+  const rows = canSetup ? [
+    ...(clients.codex ? [
+      commandRow('Codex · 1. Add server', String(clients.codex.add_command || '')),
+      commandRow('Codex · 2. Sign in', String(clients.codex.login_command || '')),
+    ] : []),
+    ...(clients.claude ? [
+      commandRow('Claude Code · Add server', String(clients.claude.add_command || '')),
+    ] : []),
+  ].filter((row) => row.querySelector('code')?.textContent) : [];
   if (clients.claude?.login_note) {
     rows.push(node('p', 'connect-login-note', String(clients.claude.login_note)));
   }
+  rows.push(node('p', 'connect-login-note', `Saved as ${String(connectAi.server_name || 'this GlassHive server')}.`));
+  const callbackRows = canSetup ? [
+    ...(clients.codex ? [referenceRow(
+      'Codex callback · Do not open this address',
+      String(clients.codex.callback_uri || ''),
+    )] : []),
+    ...(clients.claude ? [referenceRow(
+      'Claude Code callback · Do not open this address',
+      String(clients.claude.callback_uri || ''),
+    )] : []),
+  ].filter((row) => row.querySelector('code')?.textContent) : [];
   if (connectAi.documentation_url) {
     const docs = node('a', 'connect-login-note', 'Client registration instructions');
     docs.href = String(connectAi.documentation_url);
@@ -401,6 +514,7 @@ function renderConnectAi() {
     rows.push(docs);
   }
   list.replaceChildren(...rows);
+  callbacks?.replaceChildren(...callbackRows);
   if (source) {
     const sourceLink = node('a', '', `${connectAi.source?.label || 'Source available'} · ${connectAi.source?.license || ''}`);
     sourceLink.href = String(connectAi.source?.repository_url || '#');
@@ -426,18 +540,189 @@ function compareLibraryVersions(left, right) {
   return a.prerelease.localeCompare(b.prerelease);
 }
 
+function capabilityReviewRequest() {
+  if (pendingCapabilityReview) return pendingCapabilityReview;
+  try {
+    const raw = sessionStorage.getItem(CAPABILITY_REVIEW_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    const workerId = String(parsed.worker_id || '');
+    const count = Math.max(0, Number(parsed.count || 0));
+    if (!workerId || !count) return null;
+    const items = Array.isArray(parsed.items)
+      ? parsed.items.filter((item) => item && typeof item === 'object').map((item) => ({
+        action_id: String(item.action_id || ''),
+        kind: String(item.kind || ''),
+        reference: String(item.reference || ''),
+        resolution: String(item.resolution || ''),
+        label: String(item.label || 'Capability'),
+        route: item.route === 'connections' ? 'connections' : 'library',
+        scopes: Array.isArray(item.scopes) ? item.scopes.map(String) : [],
+        policy: String(item.policy || ''),
+      })).filter((item) => item.action_id && item.kind && item.reference && item.resolution)
+      : [];
+    pendingCapabilityReview = { workerId, count: Math.max(count, items.length), items };
+  } catch (_error) {
+    sessionStorage.removeItem(CAPABILITY_REVIEW_KEY);
+  }
+  return pendingCapabilityReview;
+}
+
+function persistCapabilityReview(review) {
+  pendingCapabilityReview = review;
+  if (!review?.workerId || !review?.items?.length) {
+    sessionStorage.removeItem(CAPABILITY_REVIEW_KEY);
+    pendingCapabilityReview = null;
+    return;
+  }
+  sessionStorage.setItem(CAPABILITY_REVIEW_KEY, JSON.stringify({
+    worker_id: review.workerId,
+    count: review.items.length,
+    items: review.items,
+  }));
+}
+
+function restoreCapabilityReviewFromCatalog() {
+  if (capabilityReviewRequest()?.items?.length) return;
+  const copiedWorkspace = (workspaceCatalog.items || []).find((workspace) => {
+    const report = workspace?.duplication_report || {};
+    return (report.outstanding_reapproval_items || []).some((item) => item?.action_id);
+  });
+  if (!copiedWorkspace) return;
+  const report = copiedWorkspace.duplication_report || {};
+  const items = report.outstanding_reapproval_items || [];
+  persistCapabilityReview({
+    workerId: String(copiedWorkspace.worker_id || ''),
+    count: items.length,
+    items,
+  });
+}
+
+async function reconcileCapabilityReview() {
+  const review = capabilityReviewRequest();
+  if (!review?.items?.length) return;
+  let workspace = (workspaceCatalog.items || []).find(
+    (item) => String(item.worker_id || '') === review.workerId,
+  );
+  if (!workspace) {
+    try {
+      const response = await fetch(api.withAuth(`/api/workspaces/${encodeURIComponent(review.workerId)}`));
+      if (response.status === 404) {
+        persistCapabilityReview(null);
+        return;
+      }
+      if (!response.ok) throw new Error(await api.responseMessage(response, 'Could not restore capability review'));
+      workspace = await response.json();
+    } catch (_error) {
+      // A transient runtime failure is not proof that this owner-scoped review disappeared.
+      return;
+    }
+  }
+  const remaining = workspace?.duplication_report?.outstanding_reapproval_items || [];
+  persistCapabilityReview({ ...review, count: remaining.length, items: remaining });
+}
+
+async function prepareProviderAccountReapproval(review, item, button) {
+  button.disabled = true;
+  button.textContent = 'Preparing review…';
+  try {
+    const pending = await api.postJson('/api/pending-changes', {
+      change_type: 'workspace_provider_account',
+      target_id: review.workerId,
+      payload: { policy: item.policy, account_id: item.reference },
+    });
+    const changeId = encodeURIComponent(String(pending.change_id || ''));
+    const token = encodeURIComponent(String(pending.confirmation_token || ''));
+    if (!changeId || !token) throw new Error('GlassHive could not prepare the account review.');
+    window.location.assign(`/confirm-change#change_id=${changeId}&token=${token}`);
+  } catch (error) {
+    button.textContent = error.message;
+    button.disabled = false;
+  }
+}
+
+function openCapabilitySetup(item) {
+  const route = item.route === 'connections' ? 'connections' : 'library';
+  window.location.hash = route;
+  document.getElementById(`${route}-view`)?.scrollIntoView({ block: 'start' });
+}
+
+async function waiveCapabilityReapproval(review, item, button) {
+  button.disabled = true;
+  button.textContent = 'Preparing review…';
+  try {
+    const pending = await api.postJson('/api/pending-changes', {
+      change_type: 'workspace_duplication_reapproval_waiver',
+      target_id: review.workerId,
+      payload: { action_id: item.action_id },
+    });
+    const changeId = encodeURIComponent(String(pending.change_id || ''));
+    const token = encodeURIComponent(String(pending.confirmation_token || ''));
+    if (!changeId || !token) throw new Error('GlassHive could not prepare the confirmation.');
+    window.location.assign(`/confirm-change#change_id=${changeId}&token=${token}`);
+  } catch (error) {
+    button.textContent = error.message;
+    button.disabled = false;
+  }
+}
+
+function renderCapabilityReviewBanner() {
+  const banner = document.getElementById('capability-review-banner');
+  if (!banner) return;
+  const review = capabilityReviewRequest();
+  if (!review?.items?.length) {
+    banner.hidden = true;
+    banner.replaceChildren();
+    return;
+  }
+  const title = node('strong', '', `Review ${review.items.length} copied workspace capabilit${review.items.length === 1 ? 'y' : 'ies'}`);
+  const summary = node('span', '', 'Nothing private was copied automatically. Choose each item below before running this workspace.');
+  const actions = node('div', 'capability-review-actions');
+  for (const item of review.items) {
+    const row = node('div', 'capability-review-action');
+    const button = node('button', 'quiet-button', `Review ${item.label}`);
+    button.type = 'button';
+    if (item.resolution === 'provider_selection' && item.policy && !item.reference.startsWith('policy:')) {
+      button.addEventListener('click', () => prepareProviderAccountReapproval(review, item, button));
+    } else if (item.resolution === 'connection_grant' || item.resolution === 'provider_grant') {
+      button.textContent = `${item.label} was not copied`;
+      button.disabled = true;
+    } else {
+      button.textContent = `Review ${item.label}`;
+      button.addEventListener('click', () => openCapabilitySetup(item));
+    }
+    row.append(button);
+    if (item.resolution !== 'provider_selection') {
+      const skip = node('button', 'text-button', 'Continue without');
+      skip.type = 'button';
+      skip.addEventListener('click', () => waiveCapabilityReapproval(review, item, skip));
+      row.append(skip);
+    }
+    actions.append(row);
+  }
+  banner.replaceChildren(title, summary, actions);
+  banner.hidden = false;
+}
+
 function renderLibrary() {
   const list = document.getElementById('library-list');
   const empty = document.getElementById('library-empty');
   if (!list || !controlPlane) return;
   const items = controlPlane.library || [];
   const libraryById = new Map(items.map((libraryItem) => [String(libraryItem.library_id || ''), libraryItem]));
+  const review = capabilityReviewRequest();
+  const requiredLibraryIds = new Set(
+    (review?.items || [])
+      .filter((item) => item.kind === 'library')
+      .map((item) => item.reference),
+  );
   if (empty) empty.hidden = items.length > 0;
   const cards = items.map((item) => {
     const manifest = item.manifest || {};
     const activatable = manifest.activatable === true && item.activation_status === 'ready';
     const capabilityName = String(manifest.label || manifest.name || item.stable_id || 'Approved capability');
     const card = node('article', 'library-card');
+    card.classList.toggle('needs-review', requiredLibraryIds.has(String(item.library_id || '')));
     const head = node('div', 'library-card-head');
     head.append(node('span', 'library-kind', String(manifest.kind || 'Capability')), statusChip(item.status || 'available'));
     card.append(
@@ -529,9 +814,15 @@ function renderLibrary() {
           await syncGrant();
           return;
         }
-        const requestedScopes = replacementGrant
+        const exactReviewItem = review?.workerId === select.value
+          ? (review.items || []).find(
+            (reviewItem) => reviewItem.kind === 'library' && reviewItem.reference === item.library_id,
+          )
+          : null;
+        const equivalentScopes = equivalentReapprovalScopes(item.scopes || [], exactReviewItem);
+        const requestedScopes = equivalentScopes ?? (replacementGrant
           ? (item.scopes || []).filter((scope) => (replacementGrant.scopes || []).includes(scope))
-          : (item.scopes || []);
+          : (item.scopes || []));
         const pending = await api.postJson('/api/pending-changes', {
           change_type: replacementGrant ? 'library_upgrade' : 'library_enable',
           target_id: select.value,
@@ -553,6 +844,14 @@ function renderLibrary() {
       }
     });
     grant.append(select, button);
+    if (
+      review
+      && requiredLibraryIds.has(String(item.library_id || ''))
+      && Array.from(select.options).some((option) => option.value === review.workerId)
+    ) {
+      select.value = review.workerId;
+      void syncGrant();
+    }
     card.append(grant);
     return card;
   });
@@ -562,7 +861,8 @@ function renderLibrary() {
 function renderLibraryRequestWorkspaceOptions() {
   const select = document.getElementById('library-request-workspace');
   if (!select) return;
-  const selected = select.value;
+  const review = capabilityReviewRequest();
+  const selected = review?.workerId || select.value;
   const workspaces = workspaceCatalog.items || [];
   const placeholder = node('option', '', workspaces.length
     ? (workspaceCatalog.next_cursor ? 'Choose recent workspace · search Workspaces for more' : 'Choose a saved workspace')
@@ -576,6 +876,10 @@ function renderLibraryRequestWorkspaceOptions() {
   select.replaceChildren(placeholder, ...options);
   if (options.some((option) => option.value === selected)) select.value = selected;
   select.disabled = !options.length;
+  const status = document.getElementById('library-request-status');
+  if (status && review) {
+    status.textContent = `Workspace copied. Review ${review.count} capabilit${review.count === 1 ? 'y' : 'ies'} before running it.`;
+  }
 }
 
 async function submitLibraryRequest(event) {
@@ -593,12 +897,12 @@ async function submitLibraryRequest(event) {
     document.getElementById('library-request-text')?.focus();
     return;
   }
-  if (status) status.textContent = 'Sending your request to the workspace…';
+  if (status) status.textContent = 'Sending a workspace-only request…';
   try {
     await api.postJson(`/api/workspace/${encodeURIComponent(workspaceId)}/message`, {
       message: requestText,
     });
-    if (status) status.textContent = 'Setup request started. Opening the workspace so you can review progress and finish any sign-in.';
+    if (status) status.textContent = 'Request sent. The connection review stays open until access is verified or you continue without it.';
     const workspace = (workspaceCatalog.items || []).find((item) => String(item.worker_id || '') === workspaceId);
     const watchUrl = String(workspace?.watch_url || api.withAuth(`/watch/${encodeURIComponent(workspaceId)}?surface=desktop`));
     window.location.assign(watchUrl);
@@ -624,6 +928,10 @@ function formatDateTime(value) {
 
 function intervalLabel(seconds) {
   const value = Number(seconds || 0);
+  if (value > 0 && value % 604800 === 0) {
+    const weeks = value / 604800;
+    return `Every ${weeks} week${weeks === 1 ? '' : 's'}`;
+  }
   if (value > 0 && value % 86400 === 0) {
     const days = value / 86400;
     return `Every ${days} day${days === 1 ? '' : 's'}`;
@@ -638,11 +946,15 @@ function intervalLabel(seconds) {
 function recurrenceLabel(schedule) {
   const kind = String(schedule.recurrence_type || 'interval');
   if (kind === 'once') return `Once · ${formatDateTime(schedule.next_occurrence_at || schedule.next_run_at)}`;
+  if (kind === 'weekly') return `Every week · first run ${formatDateTime(schedule.next_occurrence_at || schedule.next_run_at)}`;
+  if (kind === 'rfc5545' && String(schedule.rrule || '').trim().toUpperCase() === 'FREQ=WEEKLY') {
+    return `Every week · ${String(schedule.timezone_name || 'UTC')}`;
+  }
   if (kind === 'daily') {
     return `Daily at ${schedule.local_time || '—'} · ${schedule.timezone_name || 'UTC'}`;
   }
-  if (kind === 'cron') return `Cron ${schedule.cron_expression || '—'} · ${schedule.timezone_name || 'UTC'}`;
-  if (kind === 'rfc5545') return `RFC 5545 · ${schedule.timezone_name || 'UTC'}`;
+  if (kind === 'cron') return `Custom schedule · ${schedule.timezone_name || 'UTC'}`;
+  if (kind === 'rfc5545') return `Custom calendar schedule · ${schedule.timezone_name || 'UTC'}`;
   return intervalLabel(schedule.interval_seconds);
 }
 
@@ -714,15 +1026,36 @@ async function toggleOccurrenceHistory(definitionId, container, button) {
   }
 }
 
-async function deactivateSchedule(schedule, button) {
+function scheduleActionStatus(fallback) {
+  return fallback || document.getElementById('recurring-schedule-status');
+}
+
+function rememberScheduleAction(schedule, message, destination = '') {
+  scheduleActionMessages.set(String(schedule.definition_id || ''), { message, destination });
+}
+
+function renderScheduleActionStatus(status, remembered) {
+  status.replaceChildren();
+  if (!remembered?.message) return;
+  status.append(document.createTextNode(remembered.message));
+  if (remembered.destination) {
+    const link = node('a', 'inline-link', 'Open Connections');
+    link.href = remembered.destination;
+    status.append(document.createTextNode(' '), link);
+  }
+}
+
+async function deactivateSchedule(schedule, button, actionStatus) {
   const name = workspaceName(schedule.worker_id);
   if (!window.confirm(`Pause future occurrences for ${name}? You can resume it later and its history will be kept.`)) return;
   button.disabled = true;
   button.textContent = 'Pausing…';
-  const status = document.getElementById('recurring-schedule-status');
+  const status = scheduleActionStatus(actionStatus);
   try {
     await api.patchJson(`/api/recurring-schedules/${encodeURIComponent(schedule.definition_id)}`, { enabled: false });
-    if (status) status.textContent = 'Schedule paused. Its previous occurrences are still available.';
+    const message = 'Schedule paused. Its previous occurrences are still available.';
+    rememberScheduleAction(schedule, message);
+    if (status) status.textContent = message;
     await loadSchedules();
   } catch (error) {
     if (status) status.textContent = error.message;
@@ -731,24 +1064,21 @@ async function deactivateSchedule(schedule, button) {
   }
 }
 
-async function resumeSchedule(schedule, button) {
+async function resumeSchedule(schedule, button, actionStatus) {
   button.disabled = true;
   button.textContent = 'Resuming…';
-  const status = document.getElementById('recurring-schedule-status');
+  const status = scheduleActionStatus(actionStatus);
   try {
     await api.patchJson(`/api/recurring-schedules/${encodeURIComponent(schedule.definition_id)}`, { enabled: true });
-    if (status) status.textContent = 'Schedule resumed with the same owner and immutable history.';
+    const message = 'Schedule resumed with the same private workspace and history.';
+    rememberScheduleAction(schedule, message);
+    if (status) status.textContent = message;
     await loadSchedules();
   } catch (error) {
     if (status) status.textContent = error.message;
     button.disabled = false;
     button.textContent = 'Resume schedule';
   }
-}
-
-function datetimeLocalValue(value) {
-  const match = String(value || '').match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})/);
-  return match ? match[1] : '';
 }
 
 function resetScheduleEditor(message = '') {
@@ -779,18 +1109,28 @@ function editSchedule(schedule) {
   };
   setValue('recurring-schedule-workspace', schedule.worker_id);
   setValue('recurring-schedule-instruction', schedule.instruction);
-  setValue('recurring-schedule-type', schedule.recurrence_type || 'daily');
+  const intervalSeconds = Number(schedule.interval_seconds || 3600);
+  const editorRecurrenceType = scheduleEditorType(schedule);
+  setValue('recurring-schedule-type', editorRecurrenceType);
   setValue('recurring-schedule-local-time', schedule.local_time || '09:00');
   setValue('recurring-schedule-timezone', schedule.timezone_name || 'UTC');
   setValue('recurring-schedule-dst-policy', schedule.dst_policy || 'next_valid_earliest');
-  setValue('recurring-schedule-starts-at', datetimeLocalValue(schedule.starts_at));
-  setValue('recurring-schedule-ends-at', datetimeLocalValue(schedule.ends_at));
+  setValue(
+    'recurring-schedule-starts-at',
+    zonedDateTimeLocalValue(schedule.starts_at, schedule.timezone_name || 'UTC'),
+  );
+  setValue(
+    'recurring-schedule-ends-at',
+    zonedDateTimeLocalValue(schedule.ends_at, schedule.timezone_name || 'UTC'),
+  );
   setValue('recurring-schedule-cron', schedule.cron_expression || '');
   setValue('recurring-schedule-rrule', schedule.rrule || '');
-  const intervalSeconds = Number(schedule.interval_seconds || 3600);
-  const intervalUnit = intervalSeconds % 86400 === 0 ? 'days' : 'hours';
+  const intervalUnit = intervalSeconds % 604800 === 0
+    ? 'weeks'
+    : (intervalSeconds % 86400 === 0 ? 'days' : 'hours');
   setValue('recurring-schedule-interval-unit', intervalUnit);
-  setValue('recurring-schedule-interval-value', intervalUnit === 'days' ? intervalSeconds / 86400 : intervalSeconds / 3600);
+  const intervalFactor = intervalUnit === 'weeks' ? 604800 : (intervalUnit === 'days' ? 86400 : 3600);
+  setValue('recurring-schedule-interval-value', intervalSeconds / intervalFactor);
   setValue('recurring-schedule-overlap-policy', schedule.overlap_policy || 'skip');
   setValue('recurring-schedule-misfire-grace', Number(schedule.misfire_grace_seconds || 0) / 60);
   setValue('recurring-schedule-catch-up-policy', schedule.catch_up_policy || 'skip');
@@ -812,10 +1152,10 @@ function editSchedule(schedule) {
   document.getElementById('schedule-create-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
-async function runScheduleNow(schedule, button) {
+async function runScheduleNow(schedule, button, actionStatus) {
   button.disabled = true;
   button.textContent = 'Requesting…';
-  const status = document.getElementById('recurring-schedule-status');
+  const status = scheduleActionStatus(actionStatus);
   button.dataset.idempotencyKey ||= globalThis.crypto?.randomUUID?.()
     || `run-now-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   try {
@@ -823,9 +1163,13 @@ async function runScheduleNow(schedule, button) {
       `/api/recurring-schedules/${encodeURIComponent(schedule.definition_id)}/run-now`,
       { idempotency_key: button.dataset.idempotencyKey },
     );
-    if (status) status.textContent = result.status === 'owner_action_required'
-      ? String(result.message || 'The configured dispatch owner must run this schedule.')
+    const message = result.status === 'owner_action_required'
+      ? String(result.message || 'Reconnect the affected account, then try again.')
       : 'Run requested. It will use the same private workspace and connected capabilities.';
+    const recoveryDestination = String(result.action_url || '')
+      || (result.recovery_route === 'connections' ? '/#connections' : '');
+    rememberScheduleAction(schedule, message, recoveryDestination);
+    if (status) status.textContent = message;
     scheduleOccurrences.delete(String(schedule.definition_id || ''));
     await loadSchedules();
   } catch (error) {
@@ -835,17 +1179,18 @@ async function runScheduleNow(schedule, button) {
   }
 }
 
-async function retireSchedule(schedule, button) {
+async function retireSchedule(schedule, button, actionStatus) {
   const name = workspaceName(schedule.worker_id);
   if (!window.confirm(`Remove this schedule for ${name}? It cannot be resumed, but its occurrence history will be kept.`)) return;
   button.disabled = true;
   button.textContent = 'Removing…';
-  const status = document.getElementById('recurring-schedule-status');
+  const status = scheduleActionStatus(actionStatus);
   try {
     await api.deleteJson(`/api/recurring-schedules/${encodeURIComponent(schedule.definition_id)}`);
     if (editingScheduleId === schedule.definition_id) resetScheduleEditor();
-    if (status) status.textContent = 'Schedule removed. Its immutable occurrence history is still available.';
     await loadSchedules();
+    const pageStatus = document.getElementById('recurring-schedule-status');
+    if (pageStatus) pageStatus.textContent = 'Schedule removed. Its occurrence history is still available.';
   } catch (error) {
     if (status) status.textContent = error.message;
     button.disabled = false;
@@ -857,35 +1202,24 @@ function renderSchedules() {
   renderScheduleWorkspaceOptions();
   const list = document.getElementById('schedule-list');
   if (!list) return;
-  const delegated = controlPlane?.recurrence_owner === 'viventium_cortex';
   const createCard = document.getElementById('schedule-create-card');
   const newAction = document.getElementById('new-schedule-action');
   if (createCard) createCard.hidden = false;
   if (newAction) newAction.hidden = false;
-  let ownerNotice = null;
-  if (delegated) {
-    ownerNotice = node('article', 'schedule-card');
-    ownerNotice.append(
-      node('strong', '', 'Viventium Cortex is the single dispatch owner'),
-      node('span', 'schedule-card-meta', 'Create and inspect schedules here or through MCP. GlassHive saves the shared definition, while only Viventium dispatches occurrences and re-checks user access and connected capabilities at fire time.'),
-    );
-    const ownerUrl = String(controlPlane?.recurrence_owner_url || '');
-    if (ownerUrl) {
-      const link = node('a', 'card-action', 'Open Viventium');
-      link.href = ownerUrl;
-      ownerNotice.append(link);
-    }
-  }
   if (scheduleLoadError) {
-    list.replaceChildren(...[ownerNotice, emptyList(scheduleLoadError)].filter(Boolean));
+    list.replaceChildren(emptyList(scheduleLoadError));
     return;
   }
   const schedules = [...(recurringSchedules.items || [])].sort((left, right) => {
     if (Boolean(left.active) !== Boolean(right.active)) return left.active ? -1 : 1;
     return String(left.next_run_at || '').localeCompare(String(right.next_run_at || ''));
   });
+  const scheduleIds = new Set(schedules.map((schedule) => String(schedule.definition_id || '')));
+  for (const definitionId of scheduleActionMessages.keys()) {
+    if (!scheduleIds.has(definitionId)) scheduleActionMessages.delete(definitionId);
+  }
   if (!schedules.length) {
-    list.replaceChildren(...[ownerNotice, emptyList('No recurring work yet')].filter(Boolean));
+    list.replaceChildren(emptyList('No recurring work yet'));
     return;
   }
   const cards = schedules.map((schedule) => {
@@ -902,9 +1236,6 @@ function renderSchedules() {
     meta.append(
       node('span', '', recurrenceLabel(schedule)),
       node('span', '', schedule.active ? `Next: ${formatDateTime(schedule.next_run_at)}` : (retired ? 'Retired · history retained' : 'Paused · no future occurrences')),
-      node('span', '', schedule.owner_action === 'dispatch_via_viventium_cortex'
-        ? 'Dispatch owner: Viventium Cortex'
-        : 'Dispatch owner: GlassHive'),
     );
     if (schedule.last_occurrence_at) {
       meta.append(node('span', '', `Last occurrence: ${formatDateTime(schedule.last_occurrence_at)}`));
@@ -917,6 +1248,13 @@ function renderSchedules() {
       ));
     }
     const actions = node('div', 'schedule-card-actions');
+    const actionStatus = node('p', 'inline-status');
+    actionStatus.setAttribute('aria-live', 'polite');
+    actionStatus.setAttribute('data-schedule-status', String(schedule.definition_id || ''));
+    renderScheduleActionStatus(
+      actionStatus,
+      scheduleActionMessages.get(String(schedule.definition_id || '')),
+    );
     const historyButton = node('button', 'quiet-button', 'View history');
     historyButton.type = 'button';
     const history = node('div', 'schedule-history');
@@ -926,7 +1264,7 @@ function renderSchedules() {
     if (!retired) {
       const runNowButton = node('button', 'quiet-button', 'Run now');
       runNowButton.type = 'button';
-      runNowButton.addEventListener('click', () => runScheduleNow(schedule, runNowButton));
+      runNowButton.addEventListener('click', () => runScheduleNow(schedule, runNowButton, actionStatus));
       const editButton = node('button', 'quiet-button', 'Edit');
       editButton.type = 'button';
       editButton.addEventListener('click', () => editSchedule(schedule));
@@ -935,24 +1273,24 @@ function renderSchedules() {
     if (schedule.active && !retired) {
       const stopButton = node('button', 'quiet-button', 'Pause');
       stopButton.type = 'button';
-      stopButton.addEventListener('click', () => deactivateSchedule(schedule, stopButton));
+      stopButton.addEventListener('click', () => deactivateSchedule(schedule, stopButton, actionStatus));
       actions.append(stopButton);
     } else if (!retired) {
       const resumeButton = node('button', 'quiet-button', 'Resume schedule');
       resumeButton.type = 'button';
-      resumeButton.addEventListener('click', () => resumeSchedule(schedule, resumeButton));
+      resumeButton.addEventListener('click', () => resumeSchedule(schedule, resumeButton, actionStatus));
       actions.append(resumeButton);
     }
     if (!retired) {
       const retireButton = node('button', 'quiet-button', 'Remove');
       retireButton.type = 'button';
-      retireButton.addEventListener('click', () => retireSchedule(schedule, retireButton));
+      retireButton.addEventListener('click', () => retireSchedule(schedule, retireButton, actionStatus));
       actions.append(retireButton);
     }
-    card.append(head, meta, actions, history);
+    card.append(head, meta, actions, actionStatus, history);
     return card;
   });
-  list.replaceChildren(...[ownerNotice, ...cards].filter(Boolean));
+  list.replaceChildren(...cards);
 }
 
 async function loadSchedules() {
@@ -977,16 +1315,18 @@ function syncRecurringScheduleFields() {
   const cronField = document.getElementById('recurring-schedule-cron-field');
   const rruleField = document.getElementById('recurring-schedule-rrule-field');
   const startsAt = document.getElementById('recurring-schedule-starts-at');
+  const startsAtLabel = document.getElementById('recurring-schedule-start-label');
   const catchUpPolicy = document.getElementById('recurring-schedule-catch-up-policy')?.value || 'skip';
   const catchUpLimitField = document.getElementById('recurring-schedule-catch-up-limit-field');
   const advanced = document.querySelector('.schedule-advanced');
   if (intervalField) intervalField.hidden = kind !== 'interval';
   if (dailyField) dailyField.hidden = kind !== 'daily';
-  if (onceField) onceField.hidden = kind !== 'once';
+  if (onceField) onceField.hidden = !['once', 'weekly'].includes(kind);
   if (timezoneField) timezoneField.hidden = kind === 'interval';
   if (cronField) cronField.hidden = kind !== 'cron';
   if (rruleField) rruleField.hidden = kind !== 'rfc5545';
-  if (startsAt) startsAt.required = kind === 'once';
+  if (startsAt) startsAt.required = false;
+  if (startsAtLabel) startsAtLabel.textContent = kind === 'weekly' ? 'First run' : 'Starts at';
   if (catchUpLimitField) catchUpLimitField.hidden = catchUpPolicy !== 'bounded';
   if (advanced) advanced.hidden = false;
 }
@@ -998,7 +1338,7 @@ async function submitRecurringSchedule(event) {
   const status = document.getElementById('recurring-schedule-status');
   const workerId = document.getElementById('recurring-schedule-workspace')?.value || '';
   const instruction = document.getElementById('recurring-schedule-instruction')?.value.trim() || '';
-  const recurrenceType = document.getElementById('recurring-schedule-type')?.value || 'daily';
+  const selectedRecurrenceType = document.getElementById('recurring-schedule-type')?.value || 'daily';
   if (!workerId) {
     if (status) status.textContent = 'Choose a saved workspace first.';
     document.getElementById('recurring-schedule-workspace')?.focus();
@@ -1011,17 +1351,34 @@ async function submitRecurringSchedule(event) {
   }
   const intervalValue = Number(document.getElementById('recurring-schedule-interval-value')?.value || 1);
   const intervalUnit = document.getElementById('recurring-schedule-interval-unit')?.value || 'hours';
-  const intervalSeconds = Math.round(intervalValue * (intervalUnit === 'days' ? 86400 : 3600));
+  const rawIntervalSeconds = Math.round(intervalValue * (
+    intervalUnit === 'weeks' ? 604800 : (intervalUnit === 'days' ? 86400 : 3600)
+  ));
   const localTime = document.getElementById('recurring-schedule-local-time')?.value || '09:00';
-  const timezoneName = recurrenceType === 'interval'
-    ? 'UTC'
-    : (document.getElementById('recurring-schedule-timezone')?.value.trim() || 'UTC');
+  const selectedTimezone = document.getElementById('recurring-schedule-timezone')?.value.trim() || 'UTC';
   const startsAt = document.getElementById('recurring-schedule-starts-at')?.value || '';
   const endsAt = document.getElementById('recurring-schedule-ends-at')?.value || '';
   const cronExpression = document.getElementById('recurring-schedule-cron')?.value.trim() || '';
-  const rrule = document.getElementById('recurring-schedule-rrule')?.value.trim() || '';
-  if (recurrenceType === 'once' && !startsAt) {
-    if (status) status.textContent = 'Choose when this one-time occurrence should run.';
+  const selectedRrule = document.getElementById('recurring-schedule-rrule')?.value.trim() || '';
+  if (['once', 'weekly'].includes(selectedRecurrenceType) && !startsAt) {
+    if (status) status.textContent = 'Choose when this schedule should start.';
+    document.getElementById('recurring-schedule-starts-at')?.focus();
+    return;
+  }
+  const {
+    recurrenceType,
+    intervalSeconds,
+    timezoneName,
+    rrule,
+  } = recurrenceSubmissionPolicy(selectedRecurrenceType, {
+    intervalSeconds: rawIntervalSeconds,
+    timezoneName: selectedTimezone,
+    rrule: selectedRrule,
+  });
+  if (['once', 'weekly'].includes(selectedRecurrenceType) && !startsAt) {
+    if (status) status.textContent = selectedRecurrenceType === 'weekly'
+      ? 'Choose when the first weekly occurrence should run.'
+      : 'Choose when this one-time occurrence should run.';
     document.getElementById('recurring-schedule-starts-at')?.focus();
     return;
   }
@@ -1036,7 +1393,7 @@ async function submitRecurringSchedule(event) {
     return;
   }
   const scheduleText = recurrenceLabel({
-    recurrence_type: recurrenceType,
+    recurrence_type: selectedRecurrenceType,
     interval_seconds: intervalSeconds,
     local_time: localTime,
     timezone_name: timezoneName,
@@ -1050,7 +1407,7 @@ async function submitRecurringSchedule(event) {
     const payload = {
       instruction,
       recurrence_type: recurrenceType,
-      interval_seconds: recurrenceType === 'interval' ? intervalSeconds : null,
+      interval_seconds: intervalSeconds,
       local_time: recurrenceType === 'daily' ? localTime : '',
       timezone_name: timezoneName,
       dst_policy: document.getElementById('recurring-schedule-dst-policy')?.value || 'next_valid_earliest',
@@ -1072,9 +1429,7 @@ async function submitRecurringSchedule(event) {
       await api.postJson(`/api/workspace/${encodeURIComponent(workerId)}/recurring-schedules`, payload);
     }
     const completedEdit = Boolean(editingScheduleId);
-    resetScheduleEditor(controlPlane?.recurrence_owner === 'viventium_cortex'
-      ? 'Schedule saved. Viventium Cortex remains its only dispatch owner.'
-      : (completedEdit ? 'Schedule changes saved.' : 'Schedule created. GlassHive is its dispatch owner.'));
+    resetScheduleEditor(completedEdit ? 'Schedule changes saved.' : 'Schedule created.');
     scheduleOccurrences.clear();
     await loadSchedules();
   } catch (error) {
@@ -1308,6 +1663,7 @@ async function loadControlPlane() {
     connectAiLoadError = 'External AI client setup is temporarily unavailable.';
   }
   workspaceCatalog = workspacePayload;
+  restoreCapabilityReviewFromCatalog();
   if (scheduleResponse.ok) {
     recurringSchedules = await scheduleResponse.json();
     scheduleLoadError = '';
@@ -1315,6 +1671,7 @@ async function loadControlPlane() {
     recurringSchedules = { items: [] };
     scheduleLoadError = await api.responseMessage(scheduleResponse, 'Could not load recurring schedules');
   }
+  await reconcileCapabilityReview();
   renderProviderOptionControls();
   renderProviderAccounts();
   renderConnections();
@@ -1322,6 +1679,7 @@ async function loadControlPlane() {
   renderLibrary();
   renderLibraryRequestWorkspaceOptions();
   renderSchedules();
+  renderCapabilityReviewBanner();
   window.dispatchEvent(new CustomEvent('glasshive:control-plane-updated'));
 }
 
@@ -1416,6 +1774,24 @@ export async function refreshControlPlane() {
 
 export function initializeControlPlane(dependencies) {
   api = dependencies;
+  const connectAiTabs = [
+    document.getElementById('connect-ai-auto-tab'),
+    document.getElementById('connect-ai-manual-tab'),
+  ].filter(Boolean);
+  connectAiTabs[0]?.addEventListener('click', () => setConnectAiMode('auto'));
+  connectAiTabs[1]?.addEventListener('click', () => setConnectAiMode('manual'));
+  connectAiTabs.forEach((tab, index) => tab.addEventListener('keydown', (event) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const nextIndex = event.key === 'Home'
+      ? 0
+      : event.key === 'End'
+        ? connectAiTabs.length - 1
+        : (index + (event.key === 'ArrowRight' ? 1 : -1) + connectAiTabs.length) % connectAiTabs.length;
+    setConnectAiMode(nextIndex === 0 ? 'auto' : 'manual');
+    connectAiTabs[nextIndex].focus();
+  }));
+  setConnectAiMode('auto');
   document.getElementById('library-request-form')?.addEventListener('submit', submitLibraryRequest);
   document.getElementById('provider-account-form')?.addEventListener('submit', submitProviderAccount);
   document.getElementById('provider-account-provider')?.addEventListener('change', renderProviderOptionControls);

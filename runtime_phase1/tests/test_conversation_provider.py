@@ -439,6 +439,7 @@ def test_models_expose_exact_harness_registry(tmp_path, monkeypatch):
     assert models["codex-cli:gpt-5.6-sol"]["recommended_effort"] == "medium"
     assert models["codex-cli:gpt-5.6-sol"]["context_window"] == 272000
     assert models["claude-code:opus"]["display_name"] == "Claude / Opus"
+    assert models["claude-code:opus"]["recommended_effort"] == "max"
     assert models["claude-code:opus"]["effort_choices"] == [
         "low",
         "medium",

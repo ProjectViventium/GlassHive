@@ -11,6 +11,7 @@ from typing import Any
 
 from .models import WorkspaceKind, normalize_workspace_kind, normalize_workspace_tags, utc_now
 from .recurrence import canonical_recurrence_owner
+from .run_actions import RunActionError
 from .schema_version import (
     begin_schema_migration,
     execute_schema_script,
@@ -20,7 +21,7 @@ from .schema_version import (
 from .state_permissions import ensure_state_directory, secure_state_file
 
 
-RUNTIME_STORE_SCHEMA_VERSION = 4
+RUNTIME_STORE_SCHEMA_VERSION = 5
 
 
 class SchedulePrincipalAuthorityStoreError(ValueError):
@@ -249,6 +250,26 @@ class Store:
                     FOREIGN KEY(project_id) REFERENCES projects(project_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS run_action_uses (
+                    capability_id TEXT PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    source_run_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_code TEXT NOT NULL DEFAULT '',
+                    new_run_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(project_id) REFERENCES projects(project_id),
+                    FOREIGN KEY(worker_id) REFERENCES workers(worker_id),
+                    FOREIGN KEY(source_run_id) REFERENCES runs(run_id),
+                    FOREIGN KEY(new_run_id) REFERENCES runs(run_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS scheduled_runs (
                     schedule_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,
@@ -404,6 +425,7 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_runs_worker_state ON runs(worker_id, state, queued_at);
                 CREATE INDEX IF NOT EXISTS idx_events_worker_created ON events(worker_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_callback_outbox_status_updated ON callback_outbox(status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_run_action_uses_source ON run_action_uses(source_run_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_scheduled_runs_state_run_at ON scheduled_runs(state, run_at);
                 CREATE INDEX IF NOT EXISTS idx_recurring_definitions_due
                     ON recurring_schedule_definitions(scheduler_owner, active, next_run_at);
@@ -1227,6 +1249,7 @@ class Store:
         tenant_id: str = "local",
         workspace_kind: WorkspaceKind | str = "legacy",
         tags: list[str] | None = None,
+        duplication_report: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         worker_id = f"wrk_{uuid.uuid4().hex[:10]}"
         now = utc_now()
@@ -1258,7 +1281,11 @@ class Store:
             "favorite": 0,
             "workspace_kind": normalize_workspace_kind(workspace_kind),
             "workspace_tags_json": _workspace_tags_json(tags),
-            "duplication_report_json": "{}",
+            "duplication_report_json": json.dumps(
+                duplication_report or {},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
             "compute_released_at": None,
             "pid": None,
             "last_run_id": None,
@@ -1797,6 +1824,8 @@ class Store:
             conn.execute("DELETE FROM scheduled_runs WHERE worker_id = ?", (worker_id,))
             conn.execute("DELETE FROM callback_outbox WHERE worker_id = ?", (worker_id,))
             conn.execute("DELETE FROM events WHERE worker_id = ?", (worker_id,))
+            if "run_action_uses" in tables:
+                conn.execute("DELETE FROM run_action_uses WHERE worker_id = ?", (worker_id,))
             conn.execute("DELETE FROM runs WHERE worker_id = ?", (worker_id,))
             if "provider_account_leases" in tables:
                 conn.execute("DELETE FROM provider_account_leases WHERE worker_id = ?", (worker_id,))
@@ -2507,6 +2536,450 @@ class Store:
             row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             conn.execute("COMMIT")
         return self._row(row) or {}, created
+
+    @staticmethod
+    def _validate_existing_run_action(
+        row: sqlite3.Row,
+        *,
+        action: str,
+        idempotency_key: str,
+        project_id: str,
+        worker_id: str,
+        source_run_id: str,
+        tenant_id: str,
+        owner_id: str,
+    ) -> None:
+        expected = {
+            "action": action,
+            "idempotency_key": idempotency_key,
+            "project_id": project_id,
+            "worker_id": worker_id,
+            "source_run_id": source_run_id,
+            "tenant_id": tenant_id,
+            "owner_id": owner_id,
+        }
+        if any(str(row[key] or "") != str(value or "") for key, value in expected.items()):
+            raise RunActionError(
+                "capability_replayed",
+                "The action capability has already been consumed.",
+                status_code=409,
+            )
+
+    @staticmethod
+    def _require_run_action_scope(
+        conn: sqlite3.Connection,
+        *,
+        project_id: str,
+        worker_id: str,
+        source_run_id: str,
+        tenant_id: str,
+        owner_id: str,
+    ) -> tuple[sqlite3.Row, sqlite3.Row]:
+        worker = conn.execute("SELECT * FROM workers WHERE worker_id = ?", (worker_id,)).fetchone()
+        run = conn.execute("SELECT * FROM runs WHERE run_id = ?", (source_run_id,)).fetchone()
+        if (
+            worker is None
+            or run is None
+            or str(worker["project_id"] or "") != project_id
+            or str(run["project_id"] or "") != project_id
+            or str(run["worker_id"] or "") != worker_id
+            or str(worker["tenant_id"] or "") != tenant_id
+            or str(run["tenant_id"] or "") != tenant_id
+            or str(worker["owner_id"] or "") != owner_id
+        ):
+            raise RunActionError(
+                "capability_scope_mismatch",
+                "The action capability does not match this workspace run.",
+                status_code=403,
+            )
+        return worker, run
+
+    def create_retry_run_action(
+        self,
+        *,
+        capability_id: str,
+        idempotency_key: str,
+        project_id: str,
+        worker_id: str,
+        source_run_id: str,
+        tenant_id: str,
+        owner_id: str,
+        instruction: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM run_action_uses WHERE capability_id = ?", (capability_id,)
+            ).fetchone()
+            if existing is not None:
+                self._validate_existing_run_action(
+                    existing,
+                    action="retry",
+                    idempotency_key=idempotency_key,
+                    project_id=project_id,
+                    worker_id=worker_id,
+                    source_run_id=source_run_id,
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                )
+                new_run = conn.execute(
+                    "SELECT * FROM runs WHERE run_id = ?", (existing["new_run_id"],)
+                ).fetchone()
+                if new_run is None:
+                    raise RunActionError(
+                        "action_result_unavailable",
+                        "The prior action result is unavailable.",
+                        status_code=409,
+                    )
+                conn.execute("COMMIT")
+                return {
+                    "action": self._row(existing),
+                    "run": self._row(new_run),
+                    "idempotent_replay": True,
+                }
+
+            worker, source_run = self._require_run_action_scope(
+                conn,
+                project_id=project_id,
+                worker_id=worker_id,
+                source_run_id=source_run_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            prior_retry = conn.execute(
+                """
+                SELECT capability_id FROM run_action_uses
+                WHERE action = 'retry'
+                  AND source_run_id = ?
+                  AND project_id = ?
+                  AND worker_id = ?
+                  AND tenant_id = ?
+                  AND owner_id = ?
+                LIMIT 1
+                """,
+                (source_run_id, project_id, worker_id, tenant_id, owner_id),
+            ).fetchone()
+            if prior_retry is not None:
+                raise RunActionError(
+                    "run_already_retried",
+                    "This failed run has already been retried.",
+                    status_code=409,
+                )
+            if str(worker["state"] or "") == "terminated":
+                raise RunActionError("worker_ended", "The workspace has ended.", status_code=409)
+            if conn.execute(
+                """
+                SELECT 1 FROM workspace_gc_tombstones
+                WHERE worker_id = ? AND phase IN ('claimed', 'cleanup_pending') LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone() is not None:
+                raise RunActionError(
+                    "worker_ended",
+                    "The workspace has ended.",
+                    status_code=409,
+                )
+            if str(source_run["state"] or "") != "failed" or not bool(source_run["failure_retryable"]):
+                raise RunActionError(
+                    "run_not_retryable",
+                    "This run is not in a retryable failed state.",
+                    status_code=409,
+                )
+            active = conn.execute(
+                """
+                SELECT run_id FROM runs
+                WHERE worker_id = ? AND state IN ('queued', 'running')
+                ORDER BY queued_at ASC LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+            if active is not None:
+                raise RunActionError(
+                    "worker_has_active_run",
+                    "This workspace already has active work.",
+                    status_code=409,
+                )
+
+            new_run_id = f"run_{uuid.uuid4().hex[:10]}"
+            run_data = {
+                "run_id": new_run_id,
+                "worker_id": worker_id,
+                "project_id": project_id,
+                "tenant_id": tenant_id,
+                "instruction": instruction,
+                "state": "queued",
+                "queued_at": now,
+                "started_at": None,
+                "ended_at": None,
+                "output_text": "",
+                "error_text": "",
+                "failure_class": "",
+                "failure_retryable": 0,
+                "failure_user_message": "",
+                "failure_recommended_recovery": "",
+                "failure_diagnostic_summary": "",
+                "retry_after": None,
+                "retry_attempts": 0,
+                "last_retry_class": "",
+            }
+            conn.execute(
+                """
+                INSERT INTO runs (
+                    run_id, worker_id, project_id, tenant_id, instruction, state, queued_at,
+                    started_at, ended_at, output_text, error_text, failure_class,
+                    failure_retryable, failure_user_message,
+                    failure_recommended_recovery, failure_diagnostic_summary, retry_after,
+                    retry_attempts, last_retry_class
+                ) VALUES (
+                    :run_id, :worker_id, :project_id, :tenant_id, :instruction, :state,
+                    :queued_at, :started_at, :ended_at, :output_text, :error_text,
+                    :failure_class, :failure_retryable, :failure_user_message,
+                    :failure_recommended_recovery,
+                    :failure_diagnostic_summary, :retry_after, :retry_attempts,
+                    :last_retry_class
+                )
+                """,
+                run_data,
+            )
+            action_data = {
+                "capability_id": capability_id,
+                "action": "retry",
+                "idempotency_key": idempotency_key,
+                "project_id": project_id,
+                "worker_id": worker_id,
+                "source_run_id": source_run_id,
+                "tenant_id": tenant_id,
+                "owner_id": owner_id,
+                "status": "completed",
+                "result_code": "run_queued",
+                "new_run_id": new_run_id,
+                "created_at": now,
+                "updated_at": now,
+            }
+            conn.execute(
+                """
+                INSERT INTO run_action_uses (
+                    capability_id, action, idempotency_key, project_id, worker_id,
+                    source_run_id, tenant_id, owner_id, status, result_code,
+                    new_run_id, created_at, updated_at
+                ) VALUES (
+                    :capability_id, :action, :idempotency_key, :project_id, :worker_id,
+                    :source_run_id, :tenant_id, :owner_id, :status, :result_code,
+                    :new_run_id, :created_at, :updated_at
+                )
+                """,
+                action_data,
+            )
+            conn.execute(
+                "UPDATE workers SET last_run_id = ?, updated_at = ? WHERE worker_id = ?",
+                (new_run_id, now, worker_id),
+            )
+            conn.execute("COMMIT")
+        return {"action": action_data, "run": run_data, "idempotent_replay": False}
+
+    def reserve_cancel_run_action(
+        self,
+        *,
+        capability_id: str,
+        idempotency_key: str,
+        project_id: str,
+        worker_id: str,
+        source_run_id: str,
+        tenant_id: str,
+        owner_id: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        stale_before = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM run_action_uses WHERE capability_id = ?", (capability_id,)
+            ).fetchone()
+            worker, source_run = self._require_run_action_scope(
+                conn,
+                project_id=project_id,
+                worker_id=worker_id,
+                source_run_id=source_run_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+            if existing is not None:
+                self._validate_existing_run_action(
+                    existing,
+                    action="cancel",
+                    idempotency_key=idempotency_key,
+                    project_id=project_id,
+                    worker_id=worker_id,
+                    source_run_id=source_run_id,
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                )
+                action_status = str(existing["status"] or "")
+                source_state = str(source_run["state"] or "")
+                if action_status == "accepted":
+                    conn.execute("COMMIT")
+                    return {
+                        "action": self._row(existing),
+                        "idempotent_replay": True,
+                        "should_execute": False,
+                    }
+                if str(worker["state"] or "") == "terminated":
+                    raise RunActionError("worker_ended", "The workspace has ended.", status_code=409)
+                if action_status == "conflict":
+                    code = str(existing["result_code"] or "run_not_active")
+                    raise RunActionError(
+                        code,
+                        "The run completed before cancellation could be accepted."
+                        if code == "run_already_completed"
+                        else "This run is no longer active.",
+                        status_code=409,
+                        details={"state": source_state},
+                    )
+                if source_state == "completed":
+                    conn.execute(
+                        """
+                        UPDATE run_action_uses
+                        SET status = 'conflict', result_code = 'run_already_completed', updated_at = ?
+                        WHERE capability_id = ?
+                        """,
+                        (now, capability_id),
+                    )
+                    conn.execute("COMMIT")
+                    raise RunActionError(
+                        "run_already_completed",
+                        "The run completed before cancellation could be accepted.",
+                        status_code=409,
+                        details={"state": "completed"},
+                    )
+                if source_state not in {"running", "interrupted", "cancelled"}:
+                    raise RunActionError(
+                        "run_not_active",
+                        "This run is no longer active.",
+                        status_code=409,
+                        details={"state": source_state},
+                    )
+                if source_state in {"interrupted", "cancelled"}:
+                    conn.execute(
+                        """
+                        UPDATE run_action_uses
+                        SET status = 'accepted', result_code = 'cancellation_requested', updated_at = ?
+                        WHERE capability_id = ?
+                        """,
+                        (now, capability_id),
+                    )
+                    accepted = conn.execute(
+                        "SELECT * FROM run_action_uses WHERE capability_id = ?", (capability_id,)
+                    ).fetchone()
+                    conn.execute("COMMIT")
+                    return {
+                        "action": self._row(accepted),
+                        "idempotent_replay": True,
+                        "should_execute": False,
+                    }
+                should_execute = action_status in {"failed", "reserved"} or (
+                    action_status == "executing" and str(existing["updated_at"] or "") <= stale_before
+                )
+                if should_execute:
+                    conn.execute(
+                        """
+                        UPDATE run_action_uses
+                        SET status = 'executing', result_code = 'cancellation_requested', updated_at = ?
+                        WHERE capability_id = ?
+                        """,
+                        (now, capability_id),
+                    )
+                    claimed = conn.execute(
+                        "SELECT * FROM run_action_uses WHERE capability_id = ?", (capability_id,)
+                    ).fetchone()
+                    conn.execute("COMMIT")
+                    return {
+                        "action": self._row(claimed),
+                        "idempotent_replay": True,
+                        "should_execute": True,
+                    }
+                conn.execute("COMMIT")
+                return {
+                    "action": self._row(existing),
+                    "idempotent_replay": True,
+                    "should_execute": False,
+                }
+            if str(worker["state"] or "") == "terminated":
+                raise RunActionError("worker_ended", "The workspace has ended.", status_code=409)
+            source_state = str(source_run["state"] or "")
+            if source_state == "completed":
+                raise RunActionError(
+                    "run_already_completed",
+                    "The run completed before cancellation could be accepted.",
+                    status_code=409,
+                    details={"state": "completed"},
+                )
+            if source_state != "running":
+                raise RunActionError(
+                    "run_not_active",
+                    "This run is no longer active.",
+                    status_code=409,
+                    details={"state": source_state},
+                )
+            action_data = {
+                "capability_id": capability_id,
+                "action": "cancel",
+                "idempotency_key": idempotency_key,
+                "project_id": project_id,
+                "worker_id": worker_id,
+                "source_run_id": source_run_id,
+                "tenant_id": tenant_id,
+                "owner_id": owner_id,
+                "status": "executing",
+                "result_code": "cancellation_requested",
+                "new_run_id": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+            conn.execute(
+                """
+                INSERT INTO run_action_uses (
+                    capability_id, action, idempotency_key, project_id, worker_id,
+                    source_run_id, tenant_id, owner_id, status, result_code,
+                    new_run_id, created_at, updated_at
+                ) VALUES (
+                    :capability_id, :action, :idempotency_key, :project_id, :worker_id,
+                    :source_run_id, :tenant_id, :owner_id, :status, :result_code,
+                    :new_run_id, :created_at, :updated_at
+                )
+                """,
+                action_data,
+            )
+            conn.execute("COMMIT")
+        return {"action": action_data, "idempotent_replay": False, "should_execute": True}
+
+    def update_run_action_result(
+        self,
+        capability_id: str,
+        *,
+        status: str,
+        result_code: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE run_action_uses
+                SET status = ?, result_code = ?, updated_at = ?
+                WHERE capability_id = ?
+                """,
+                (status, result_code, utc_now(), capability_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM run_action_uses WHERE capability_id = ?", (capability_id,)
+            ).fetchone()
+        return self._row(row)
+
+    def get_run_action(self, capability_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM run_action_uses WHERE capability_id = ?", (capability_id,)
+            ).fetchone()
+        return self._row(row)
 
     def list_runs_for_worker(
         self,

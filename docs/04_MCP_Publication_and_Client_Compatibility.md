@@ -200,16 +200,38 @@ Prefer remote HTTP MCP with auth in front of the server when not loopback-only.
 
 ### Hosted user connection
 
-The designed Glass Drive **Connect AI** panel is the source of truth for a deployment's public HTTPS
-MCP URL. It emits the official client commands rather than asking users to edit hidden configuration:
+The designed Glass Drive **Use GlassHive from another AI app** panel is the source of truth for a
+deployment's public HTTPS MCP URL and the exact clients that deployment has completely registered.
+It must not advertise Codex, Claude Code, ChatGPT, or another client unless the live endpoint returns
+that client's complete allowlisted contract. The primary `Automatic` path copies one self-contained
+instruction containing the exact deployment-generated add/sign-in command for every returned client;
+the receiving AI does not have to guess configuration from a URL it cannot contextualize. The user
+completes sign-in in the browser profile opened by the
+client, or copies the client-provided authorization URL into the browser profile they intend to use.
+The browser does not claim it can edit local client configuration itself.
+
+The generated command may carry a public client id and fixed callback flags as opaque setup
+arguments. GlassHive still validates that the configured Codex resource exactly equals the canonical
+MCP URL, but current Codex discovers that resource from the protected-resource metadata. The setup
+command must not also pass `--oauth-resource`, because doing both produces two OAuth `resource`
+parameters and standards-compliant identity providers reject the malformed request. Human-facing
+callback addresses and registration explanations remain only in
+the administrator disclosure; they are never presented as links or user steps.
+
+`Manual` exposes the exact server address and official client commands rather than asking users to
+edit hidden configuration. `<SERVER_NAME>` is the stable `glasshive-<12 hex>` name derived from the
+canonical deployment URL, so multiple independent self-hosted origins do not collide:
 
 ```text
-codex mcp add -c mcp_oauth_callback_port=<REGISTERED_PORT> -c 'mcp_oauth_callback_url="http://127.0.0.1:<REGISTERED_PORT>/callback"' glasshive --url <MCP_URL> --oauth-client-id <REGISTERED_CLIENT_ID> --oauth-resource <MCP_URL>
-codex mcp login -c mcp_oauth_callback_port=<REGISTERED_PORT> -c 'mcp_oauth_callback_url="http://127.0.0.1:<REGISTERED_PORT>/callback"' glasshive
-claude mcp add --transport http --scope user --client-id <REGISTERED_CLIENT_ID> --callback-port <REGISTERED_PORT> glasshive <MCP_URL>
+codex mcp add -c mcp_oauth_callback_port=<REGISTERED_PORT> -c 'mcp_oauth_callback_url="http://127.0.0.1:<REGISTERED_PORT>/callback"' <SERVER_NAME> --url <MCP_URL> --oauth-client-id <REGISTERED_CLIENT_ID>
+codex mcp login -c mcp_oauth_callback_port=<REGISTERED_PORT> -c 'mcp_oauth_callback_url="http://127.0.0.1:<REGISTERED_PORT>/callback"' <SERVER_NAME>
+claude mcp add --transport http --scope user --client-id <REGISTERED_CLIENT_ID> --callback-port <REGISTERED_PORT> <SERVER_NAME> <MCP_URL>
 ```
 
-Connect AI also shows the exact redirect URI that the administrator must pre-register. Claude Code
+Administrator registration details separately show the exact redirect URI that must be
+pre-registered, with explicit `do not open this address` copy. These callback addresses are local
+client plumbing, not web destinations or user setup actions; opening one without the matching client
+listener produces an expected localhost connection failure. Claude Code
 uses `http://localhost:<port>/callback`. Current Codex derives
 `http://127.0.0.1:<port>/callback/<server-hash>` from the canonical MCP URL; copy the URI shown by
 the deployment rather than calculating or guessing it. Both Codex commands override the fixed port

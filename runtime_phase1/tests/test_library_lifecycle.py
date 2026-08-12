@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from library_test_support import library_manifest, register_manifest
 from workers_projects_runtime.api import create_app
 from workers_projects_runtime.control_plane import (
+    CONTROL_PLANE_SCHEMA_VERSION,
     ControlPlaneConflict,
     ControlPlaneError,
     ControlPlaneStore,
@@ -26,6 +27,7 @@ def _workspace_record(database, *, bootstrap: dict | None = None) -> None:
                 owner_id TEXT NOT NULL,
                 profile TEXT NOT NULL,
                 bootstrap_bundle_json TEXT,
+                duplication_report_json TEXT NOT NULL DEFAULT '{}',
                 updated_at REAL NOT NULL
             )
             """
@@ -200,7 +202,14 @@ def test_control_plane_v1_database_migrates_library_lifecycle_audit_columns(tmp_
     with sqlite3.connect(database) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(control_plane_library)")}
         assert {"status_reason", "published_by", "status_updated_at"}.issubset(columns)
-        assert require_compatible_schema(conn, component="control_plane", target_version=3) == 3
+        assert (
+            require_compatible_schema(
+                conn,
+                component="control_plane",
+                target_version=CONTROL_PLANE_SCHEMA_VERSION,
+            )
+            == CONTROL_PLANE_SCHEMA_VERSION
+        )
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'control_plane_library_events'"
         ).fetchone() == (1,)

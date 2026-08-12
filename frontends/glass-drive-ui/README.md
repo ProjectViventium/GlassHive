@@ -69,6 +69,9 @@ public sign-up, invitation, or self-service reset route.
   email or organization login. It does not enable a GlassHive password form.
 - `GLASSHIVE_ALLOW_PRINCIPAL_ENROLLMENT=false` keeps first-login principal creation closed.
 - `GLASSHIVE_LOCAL_PASSWORD_LOGIN=true` shows the local email/password form in addition to OIDC.
+- `GLASSHIVE_OIDC_LOGIN_VISIBLE=false` hides the ordinary OIDC button only when local-password login
+  is enabled. This is presentation-only: OIDC endpoints and the issuer + subject identity namespace
+  remain intact, and the gateway refuses a configuration with no visible browser login method.
 - `GLASSHIVE_LOCAL_AUTH_THROTTLE_KEY` is a gateway-only random secret of at least 32 bytes used to
   HMAC source-rate-limit keys; it is required when local password login is enabled and must remain
   stable across restarts. It does not bypass principal preapproval or add an MCP password grant.

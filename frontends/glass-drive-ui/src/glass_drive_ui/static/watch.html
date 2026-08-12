@@ -6,16 +6,16 @@
     <meta name="referrer" content="same-origin" />
     <title>GlassHive</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260810a" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260811m" />
   </head>
   <body class="watch-body">
     <div class="watch-app">
       <header class="watch-ribbon">
-        <span class="brand-mark">GlassHive</span>
+        <a class="brand-mark" href="/#workspaces" aria-label="Back to GlassHive workspaces">GlassHive</a>
         <div class="watch-main">
           <div class="watch-title-line">
             <h1 id="watch-title">Workspace live view</h1>
-            <button id="open-project-workspace" class="watch-link-chip" type="button" hidden>Project workspace</button>
+            <button id="open-project-workspace" class="watch-link-chip" type="button">Back to workspaces</button>
           </div>
           <div class="watch-meta-line">
             <p id="watch-subtitle">Connecting to workspace…</p>
@@ -54,7 +54,7 @@
         <pre id="latest-output-full">No run output yet.</pre>
       </section>
       <aside id="more-menu" class="more-menu" role="menu" hidden>
-        <button id="open-project-workspace-menu" role="menuitem" type="button">Open project workspace</button>
+        <button id="open-project-workspace-menu" role="menuitem" type="button">Back to workspaces</button>
         <button id="surface-terminal" role="menuitem" type="button">Watch exact live session</button>
         <button id="surface-desktop" role="menuitem" type="button">Watch live desktop</button>
         <button id="open-external" role="menuitem" type="button">Open current view in new tab</button>
@@ -107,6 +107,6 @@
         </div>
       </footer>
     </div>
-    <script src="/static/watch.js?v=20260811a" type="module"></script>
+    <script src="/static/watch.js?v=20260811m" type="module"></script>
   </body>
 </html>

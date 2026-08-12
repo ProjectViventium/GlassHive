@@ -29,6 +29,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .agent_builder_control import (
+    graph_transfer_control,
+    parse_graph_transfer_output,
+)
 from .profile_runtime import (
     _host_codex_conversation_project_instructions,
     _host_codex_personality_policy_state,
@@ -267,9 +271,14 @@ class ChatCompletionRequest(BaseModel):
     user: str | None = None
     metadata: CompletionMetadata | None = None
     reasoning_effort: str | None = None
+    # Agent Builder graph routing is supported only for structurally declared,
+    # zero-input transfer functions; ordinary arbitrary tool execution remains
+    # the host application's responsibility.
+    tools: list[dict[str, Any]] | None = Field(default=None, max_length=128)
+    tool_choice: Any = None
     # Standard Chat Completions tuning fields that harness-native models cannot honor are accepted
-    # and intentionally ignored for wire portability. Shape-changing orchestration fields such as
-    # tools/tool_choice/response_format remain forbidden and fail visibly.
+    # and intentionally ignored for wire portability. response_format remains forbidden; the
+    # tool fields above are narrowed by graph_transfer_control to safe Agent Builder transfers.
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
     max_tokens: int | None = Field(default=None, gt=0)
@@ -880,9 +889,62 @@ def _resolve_workspace(options: GlassHiveOptions) -> Path:
 
 def _idempotency_key(payload: ChatCompletionRequest) -> str:
     explicit = str(payload.metadata.idempotency_key or payload.metadata.message_id or "").strip()
-    if explicit:
-        return explicit
-    return f"request-{uuid.uuid4().hex}"
+    base_key = explicit or f"request-{uuid.uuid4().hex}"
+    try:
+        control = graph_transfer_control(payload.tools, payload.tool_choice)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    tools_disabled = (
+        isinstance(payload.tool_choice, str)
+        and payload.tool_choice.strip().lower() == "none"
+    )
+    if payload.tools and not control and not tools_disabled:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Unsupported parameter 'tools'",
+                "code": "unsupported_parameter",
+                "param": "tools",
+            },
+        )
+    if not control or not explicit:
+        return base_key
+    model = GLASSHIVE_MODELS.get(str(payload.model or "").strip())
+    reasoning_effort = str(
+        payload.reasoning_effort or (model.recommended_effort if model else "")
+    ).strip().lower()
+    raw_tool_choice = payload.tool_choice
+    if raw_tool_choice is None or (
+        isinstance(raw_tool_choice, str) and raw_tool_choice.strip().lower() == "auto"
+    ):
+        normalized_tool_choice: Any = "auto"
+    elif isinstance(raw_tool_choice, str):
+        normalized_tool_choice = raw_tool_choice.strip().lower()
+    elif isinstance(raw_tool_choice, dict):
+        function = raw_tool_choice.get("function")
+        normalized_tool_choice = {
+            "type": str(raw_tool_choice.get("type") or "").strip().lower(),
+            "function": {
+                "name": str(
+                    function.get("name") if isinstance(function, dict) else ""
+                ).strip()
+            },
+        }
+    else:
+        normalized_tool_choice = str(raw_tool_choice)
+    canonical = json.dumps(
+        {
+            "messages": [message.model_dump(mode="json") for message in payload.messages],
+            "model": str(payload.model or "").strip(),
+            "reasoning_effort": reasoning_effort,
+            "tool_choice": normalized_tool_choice,
+            "transfer_tools": [tool["name"] for tool in control["tools"]],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    execution_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+    return f"{base_key}:graph:{execution_digest}"
 
 
 def _usage(messages: list[ChatMessage], output: str) -> dict[str, int]:
@@ -1246,7 +1308,27 @@ class ConversationProvider:
             if application_instructions
             else ""
         )
-        return {
+        try:
+            agent_builder_control = graph_transfer_control(
+                payload.tools,
+                payload.tool_choice,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        provider_capabilities = {
+            "self_delegation": False,
+            "native_tools": True,
+        }
+        if agent_builder_control:
+            provider_capabilities.update(
+                {
+                    "graph_control_transport": "openai_tool_call",
+                    "graph_control_tools": [
+                        tool["name"] for tool in agent_builder_control.get("tools", [])
+                    ],
+                }
+            )
+        bundle = {
             **incoming,
             "run_mode": "conversation",
             "provider_model": model.native_model,
@@ -1259,11 +1341,13 @@ class ConversationProvider:
             ),
             "declared_developer_instruction_tail": declared_tail,
             "env": {**incoming_env, **effort_env},
-            "provider_capabilities": {
-                "self_delegation": False,
-                "native_tools": True,
-            },
+            "provider_capabilities": provider_capabilities,
         }
+        if agent_builder_control:
+            bundle["agent_builder_control"] = agent_builder_control
+        else:
+            bundle.pop("agent_builder_control", None)
+        return bundle
 
     @staticmethod
     def _session_manifest(session: dict[str, Any] | None) -> dict[str, Any]:
@@ -1851,7 +1935,40 @@ class ConversationProvider:
                 detail=_redact_text(detail),
             )
         output = self._conversation_output(request_record, run)
-        usage, usage_source = self._completion_usage(request_record, run, payload, output)
+        try:
+            control = graph_transfer_control(payload.tools, payload.tool_choice)
+            decision = parse_graph_transfer_output(output, control)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="GlassHive harness returned invalid Agent Builder graph control output",
+            ) from exc
+        visible_output = str(decision.get("content") or "")
+        usage, usage_source = self._completion_usage(
+            request_record, run, payload, visible_output
+        )
+        if decision["type"] == "tool_call":
+            tool_name = str(decision["tool_name"])
+            message = {
+                "role": "assistant",
+                "content": visible_output or None,
+                "reasoning_content": "",
+                "tool_calls": [
+                    {
+                        "id": self._graph_transfer_call_id(request_record, tool_name),
+                        "type": "function",
+                        "function": {"name": tool_name, "arguments": "{}"},
+                    }
+                ],
+            }
+            finish_reason = "tool_calls"
+        else:
+            message = {
+                "role": "assistant",
+                "content": visible_output,
+                "reasoning_content": "",
+            }
+            finish_reason = "stop"
         response = {
             "id": request_record["request_id"],
             "object": "chat.completion",
@@ -1860,8 +1977,8 @@ class ConversationProvider:
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": output, "reasoning_content": ""},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": finish_reason,
                 }
             ],
             "usage": usage,
@@ -1876,6 +1993,16 @@ class ConversationProvider:
             response_json=json.dumps(response, separators=(",", ":")),
         )
         return response
+
+    @staticmethod
+    def _graph_transfer_call_id(
+        request_record: dict[str, Any],
+        tool_name: str,
+    ) -> str:
+        digest = hashlib.sha256(
+            f"{request_record['request_id']}\n{tool_name}".encode("utf-8")
+        ).hexdigest()[:24]
+        return f"call_{digest}"
 
     async def stream(
         self,
@@ -1902,6 +2029,13 @@ class ConversationProvider:
         request: Request,
     ):
         request_id = str(request_record["request_id"])
+        try:
+            agent_builder_control = graph_transfer_control(
+                payload.tools,
+                payload.tool_choice,
+            )
+        except ValueError:
+            agent_builder_control = None
         created = int(time.time())
         initial = {
             "id": request_id,
@@ -1935,7 +2069,7 @@ class ConversationProvider:
                 record,
                 run,
             )
-            if latest_native.startswith(native_snapshot):
+            if not agent_builder_control and latest_native.startswith(native_snapshot):
                 raw_delta = latest_native[len(native_snapshot) :]
                 native_snapshot = latest_native
                 visible_delta = redactor.feed(raw_delta)
@@ -1991,32 +2125,103 @@ class ConversationProvider:
             if record["state"] in TERMINAL_REQUEST_STATES:
                 if record["state"] == "completed":
                     output = await asyncio.to_thread(self._conversation_output, record, run)
-                    flushed = redactor.flush()
-                    if flushed:
-                        emitted_content += flushed
-                    remaining = output[len(emitted_content) :] if output.startswith(emitted_content) else ""
-                    terminal_delta = flushed + remaining
-                    if emitted_content and not output.startswith(emitted_content):
-                        terminal_delta = (
-                            "\n\n[The harness corrected its final response after terminal reconciliation.]\n"
-                            + output
-                        )
-                    if terminal_delta:
-                        content_chunk = {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": payload.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": terminal_delta},
-                                    "finish_reason": None,
+                    if agent_builder_control:
+                        try:
+                            decision = parse_graph_transfer_output(
+                                output,
+                                agent_builder_control,
+                            )
+                        except ValueError:
+                            error_chunk = {
+                                "id": request_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": payload.model,
+                                "error": {
+                                    "message": "GlassHive harness returned invalid Agent Builder graph control output",
+                                    "type": "glasshive_runtime_error",
+                                    "code": "invalid_agent_builder_control_output",
+                                },
+                                "choices": [],
+                            }
+                            yield f"data: {json.dumps(error_chunk, separators=(',', ':'))}\n\n"
+                            output = ""
+                            finish_reason = "stop"
+                        else:
+                            output = str(decision.get("content") or "")
+                            if output:
+                                content_chunk = {
+                                    "id": request_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": payload.model,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": output},
+                                            "finish_reason": None,
+                                        }
+                                    ],
                                 }
-                            ],
-                        }
-                        yield f"data: {json.dumps(content_chunk, separators=(',', ':'))}\n\n"
-                    finish_reason = "stop"
+                                yield f"data: {json.dumps(content_chunk, separators=(',', ':'))}\n\n"
+                            if decision["type"] == "tool_call":
+                                tool_name = str(decision["tool_name"])
+                                tool_chunk = {
+                                    "id": request_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": payload.model,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {
+                                                "tool_calls": [
+                                                    {
+                                                        "index": 0,
+                                                        "id": self._graph_transfer_call_id(record, tool_name),
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": tool_name,
+                                                            "arguments": "{}",
+                                                        },
+                                                    }
+                                                ]
+                                            },
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                                yield f"data: {json.dumps(tool_chunk, separators=(',', ':'))}\n\n"
+                                finish_reason = "tool_calls"
+                            else:
+                                finish_reason = "stop"
+                    else:
+                        flushed = redactor.flush()
+                        if flushed:
+                            emitted_content += flushed
+                        remaining = output[len(emitted_content) :] if output.startswith(emitted_content) else ""
+                        terminal_delta = flushed + remaining
+                        if emitted_content and not output.startswith(emitted_content):
+                            terminal_delta = (
+                                "\n\n[The harness corrected its final response after terminal reconciliation.]\n"
+                                + output
+                            )
+                        if terminal_delta:
+                            content_chunk = {
+                                "id": request_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": payload.model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": terminal_delta},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(content_chunk, separators=(',', ':'))}\n\n"
+                        finish_reason = "stop"
                 else:
                     error = _redact_text(str(run.get("failure_user_message") or run.get("error_text") or "GlassHive run failed"))
                     error_type, error_code = _provider_failure_error(run)
@@ -2472,6 +2677,16 @@ def install_conversation_provider_routes(
     async def provider_http_exception_handler(request: Request, exc: HTTPException):
         if not _is_provider_path(request.url.path):
             return await http_exception_handler(request, exc)
+        if isinstance(exc.detail, dict):
+            message = str(exc.detail.get("message") or "Request failed")
+            code = str(exc.detail.get("code") or _http_error_code(exc.status_code))
+            param = str(exc.detail.get("param") or "").strip() or None
+            return _openai_error(
+                exc.status_code,
+                message,
+                code,
+                param=param,
+            )
         return _openai_error(
             exc.status_code,
             str(exc.detail),

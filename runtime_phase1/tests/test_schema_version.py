@@ -91,7 +91,7 @@ def test_schema_migration_lock_serializes_competing_versions(tmp_path) -> None:
 @pytest.mark.parametrize(
     ("component", "factory", "unexpected_table", "newer_version"),
     [
-        ("runtime_store", Store, "projects", 5),
+        ("runtime_store", Store, "projects", 6),
         ("control_plane", ControlPlaneStore, "provider_accounts", 5),
     ],
 )
@@ -142,8 +142,8 @@ def test_failed_store_migration_rolls_back_ledger_and_retries_safely(tmp_path, m
     assert require_compatible_schema(
         verified,
         component="runtime_store",
-        target_version=4,
-    ) == 4
+        target_version=5,
+    ) == 5
 
 
 @pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX permission contract")
