@@ -3959,7 +3959,7 @@ def test_workspace_claude_command_honors_per_run_xhigh_effort(tmp_path):
         "name": "Workspace Claude Worker",
         "profile": "claude-code",
         "execution_mode": "docker",
-        "model": "claude-opus-4-8",
+        "model": "claude-opus-5",
         "bootstrap_bundle_json": json.dumps({"env": {"WPR_CLAUDE_CODE_EFFORT": "xhigh"}}),
     }
 
@@ -4058,7 +4058,7 @@ def test_host_claude_command_enables_chrome_by_default(tmp_path, monkeypatch):
         "name": "Main Host Claude Worker",
         "profile": "claude-code",
         "execution_mode": "host",
-        "model": "claude-opus-4-8",
+        "model": "claude-opus-5",
         "workspace_root": str(tmp_path / "workspaces"),
     }
     info = runtime._host_runtime_info(worker)
@@ -4090,7 +4090,7 @@ def test_host_claude_command_honors_xhigh_effort(tmp_path, monkeypatch):
         "name": "Host Claude Worker",
         "profile": "claude-code",
         "execution_mode": "host",
-        "model": "claude-opus-4-8",
+        "model": "claude-opus-5",
         "workspace_root": str(tmp_path / "workspaces"),
     }
 
@@ -4116,7 +4116,7 @@ def test_host_claude_xhigh_effort_rejects_older_effort_contract(tmp_path, monkey
         "name": "Host Claude Worker",
         "profile": "claude-code",
         "execution_mode": "host",
-        "model": "claude-opus-4-8",
+        "model": "claude-opus-5",
         "workspace_root": str(tmp_path / "workspaces"),
     }
 
@@ -4898,7 +4898,7 @@ def test_claude_code_runtime_uses_bedrock_provider_model_without_oauth(tmp_path,
         "worker_id": "wrk_claude_bedrock",
         "name": "Claude Bedrock Worker",
         "profile": "claude-code",
-        "model": "claude-opus-4-8",
+        "model": "claude-opus-5",
     }
     runtime._ensure_dirs(worker["worker_id"])
     provider_model = (

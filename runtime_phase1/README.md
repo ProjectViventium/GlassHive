@@ -112,9 +112,9 @@ and removes Anthropic API/OAuth credentials whenever Bedrock mode is enabled, pr
 unintended provider fallback.
 
 The provider-specific model value is intentionally separate from the logical model: callers can
-continue to attest `claude-opus-4-8`, while Claude Code invokes the metered application inference
-profile selected by the administrator. Do not place AWS credentials in bootstrap instructions,
-worker metadata, source control, or logs.
+continue to attest the current managed Claude model, while Claude Code invokes the metered
+application inference profile selected by the administrator. Do not place AWS credentials in
+bootstrap instructions, worker metadata, source control, or logs.
 
 ## Universal AI Endpoint
 
