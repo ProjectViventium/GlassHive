@@ -5,8 +5,12 @@ import json
 import os
 import sqlite3
 import uuid
+import weakref
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from .models import WorkspaceKind, normalize_workspace_kind, normalize_workspace_tags, utc_now
@@ -82,9 +86,19 @@ def _normalized_token_usage(usage: dict[str, Any] | None) -> dict[str, int]:
 class Store:
     def __init__(self, db_path: str) -> None:
         self.db_path = Path(db_path)
+        self._lifetime_lock = Lock()
+        self._lifetime_connection: sqlite3.Connection | None = None
+        self._lifetime_finalizer: weakref.finalize | None = None
         ensure_state_directory(self.db_path.parent)
-        self._init_db()
-        self._secure_state_files()
+        try:
+            self._init_db()
+            # Join the fully initialized WAL database. A connection opened before
+            # the first WAL transaction does not keep SQLite's sidecars resident.
+            self.open()
+            self._secure_state_files()
+        except BaseException:
+            self.close()
+            raise
 
     def _secure_state_files(self) -> None:
         if os.name == "nt":
@@ -92,12 +106,59 @@ class Store:
         for path in (self.db_path, Path(f"{self.db_path}-wal"), Path(f"{self.db_path}-shm")):
             secure_state_file(path)
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        self._secure_state_files()
-        return conn
+    def _open_connection(self, *, check_same_thread: bool = True) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=30,
+            check_same_thread=check_same_thread,
+        )
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            self._secure_state_files()
+            return conn
+        except BaseException:
+            conn.close()
+            raise
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        conn = self._open_connection()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    def open(self) -> None:
+        """Keep the WAL owner alive without sharing an operational connection."""
+
+        with self._lifetime_lock:
+            if self._lifetime_connection is not None:
+                return
+            conn = self._open_connection(check_same_thread=False)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except BaseException:
+                conn.close()
+                raise
+            self._lifetime_connection = conn
+            # Direct Store users do not always have an owning framework lifespan.
+            # Keep forgotten short-lived instances from retaining a keeper forever.
+            self._lifetime_finalizer = weakref.finalize(self, conn.close)
+
+    def close(self) -> None:
+        """Release the process-lifetime WAL owner after all store users stop."""
+
+        with self._lifetime_lock:
+            conn = self._lifetime_connection
+            self._lifetime_connection = None
+            finalizer = self._lifetime_finalizer
+            self._lifetime_finalizer = None
+            if finalizer is not None and finalizer.alive:
+                finalizer()
+            elif conn is not None:
+                conn.close()
 
     def _init_db(self) -> None:
         with self._connect() as conn:

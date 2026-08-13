@@ -1262,6 +1262,7 @@ class ConversationProvider:
         self._detached_reconciliation_lock = threading.Lock()
         self._detached_reconciliations: set[str] = set()
         self._detached_reconciliation_thread: threading.Thread | None = None
+        self._detached_reconciliation_stop = threading.Event()
         self._prestart_cancellations: dict[tuple[str, str, str], float] = {}
         self._last_retention_monotonic = 0.0
         self._apply_retention_policy()
@@ -1830,35 +1831,43 @@ class ConversationProvider:
         return bool(record and str(record.get("state") or "") not in TERMINAL_REQUEST_STATES)
 
     def _detached_reconciliation_loop(self) -> None:
-        while True:
+        try:
+            while not self._detached_reconciliation_stop.is_set():
+                with self._detached_reconciliation_lock:
+                    request_ids = sorted(self._detached_reconciliations)
+                    if not request_ids:
+                        self._detached_reconciliation_thread = None
+                        return
+                for request_id in request_ids:
+                    if self._detached_reconciliation_stop.is_set():
+                        return
+                    try:
+                        keep = self._reconcile_detached_request_once(request_id)
+                    except Exception as error:
+                        # One malformed durable record must not terminate reconciliation for every
+                        # other active request. Log only the request id and error class; request
+                        # content and private paths never belong in provider logs.
+                        logger.warning(
+                            "GlassHive detached request reconciliation failed",
+                            extra={
+                                "request_id": request_id,
+                                "error_type": type(error).__name__,
+                            },
+                        )
+                        keep = False
+                    if not keep:
+                        with self._detached_reconciliation_lock:
+                            self._detached_reconciliations.discard(request_id)
+                self._detached_reconciliation_stop.wait(0.2)
+        finally:
             with self._detached_reconciliation_lock:
-                request_ids = sorted(self._detached_reconciliations)
-                if not request_ids:
+                if self._detached_reconciliation_thread is threading.current_thread():
                     self._detached_reconciliation_thread = None
-                    return
-            for request_id in request_ids:
-                try:
-                    keep = self._reconcile_detached_request_once(request_id)
-                except Exception as error:
-                    # One malformed durable record must not terminate reconciliation for every
-                    # other active request. Log only the request id and error class; request
-                    # content and private paths never belong in provider logs.
-                    logger.warning(
-                        "GlassHive detached request reconciliation failed",
-                        extra={
-                            "request_id": request_id,
-                            "error_type": type(error).__name__,
-                        },
-                    )
-                    keep = False
-                if not keep:
-                    with self._detached_reconciliation_lock:
-                        self._detached_reconciliations.discard(request_id)
-            time.sleep(0.2)
 
     def _ensure_detached_reconciliation(self, request_id: str) -> None:
-        thread_to_start: threading.Thread | None = None
         with self._detached_reconciliation_lock:
+            if self._detached_reconciliation_stop.is_set():
+                return
             self._detached_reconciliations.add(request_id)
             if not self._detached_reconciliation_thread or not self._detached_reconciliation_thread.is_alive():
                 thread_to_start = threading.Thread(
@@ -1867,8 +1876,26 @@ class ConversationProvider:
                     name="glasshive-provider-reconcile",
                 )
                 self._detached_reconciliation_thread = thread_to_start
-        if thread_to_start:
-            thread_to_start.start()
+                # Publish only a started thread. The reconciliation target acquires this same
+                # lock before doing work, so it cannot race ahead of the owning state update.
+                thread_to_start.start()
+
+    def shutdown(self, *, timeout_seconds: float = 10.0) -> None:
+        """Stop detached reconciliation before its Store and service dependencies close."""
+
+        with self._detached_reconciliation_lock:
+            self._detached_reconciliation_stop.set()
+            thread = self._detached_reconciliation_thread
+        if thread is not None:
+            if thread is threading.current_thread():
+                raise RuntimeError("GlassHive detached reconciliation cannot join itself")
+            thread.join(timeout=max(0.0, float(timeout_seconds)))
+            if thread.is_alive():
+                raise RuntimeError("GlassHive detached reconciliation did not stop")
+        with self._detached_reconciliation_lock:
+            self._detached_reconciliations.clear()
+            if self._detached_reconciliation_thread is thread:
+                self._detached_reconciliation_thread = None
 
     def _sync_native_activity(self, request_record: dict[str, Any], run: dict[str, Any]) -> None:
         collector = getattr(self.service.runtime, "provider_activity_log", None)

@@ -1,0 +1,456 @@
+from __future__ import annotations
+
+import gc
+import sqlite3
+import time
+import weakref
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Event, Thread
+
+import pytest
+from fastapi.testclient import TestClient
+
+from workers_projects_runtime.api import create_app
+from workers_projects_runtime.openclaw_runtime import StubRuntime
+from workers_projects_runtime.store import Store
+
+
+def _sqlite_sidecars(db_path: Path) -> tuple[Path, Path]:
+    return Path(f"{db_path}-wal"), Path(f"{db_path}-shm")
+
+
+def _assert_connection_closed(connection: sqlite3.Connection) -> None:
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connection.execute("SELECT 1")
+
+
+def _create_worker(store: Store) -> tuple[dict, dict]:
+    project = store.create_project(
+        owner_id="owner",
+        title="SQLite lifetime",
+        goal="Keep runtime state available",
+        default_worker_profile="codex-cli",
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Lifetime worker",
+        role="exercise concurrent persistence",
+        profile="codex-cli",
+        backend="stub",
+        runtime="stub",
+        model="test-model",
+    )
+    return project, worker
+
+
+def test_store_keeps_wal_sidecars_for_its_explicit_lifetime(tmp_path: Path) -> None:
+    db_path = tmp_path / "runtime.db"
+    wal_path, shm_path = _sqlite_sidecars(db_path)
+    store = Store(str(db_path))
+
+    assert wal_path.is_file()
+    assert shm_path.is_file()
+
+    project, _worker = _create_worker(store)
+    assert store.get_project(project["project_id"]) is not None
+    assert wal_path.is_file()
+    assert shm_path.is_file()
+    keeper = store._lifetime_connection
+    assert keeper is not None
+
+    store.close()
+    store.close()
+
+    assert store._lifetime_connection is None
+    _assert_connection_closed(keeper)
+
+
+def test_short_lived_store_finalizer_closes_forgotten_keeper(tmp_path: Path) -> None:
+    store = Store(str(tmp_path / "runtime.db"))
+    keeper = store._lifetime_connection
+    store_reference = weakref.ref(store)
+    assert keeper is not None
+
+    del store
+    gc.collect()
+
+    assert store_reference() is None
+    _assert_connection_closed(keeper)
+
+
+def test_store_keeper_survives_concurrent_event_poll_reads_and_writes(tmp_path: Path) -> None:
+    db_path = tmp_path / "runtime.db"
+    wal_path, shm_path = _sqlite_sidecars(db_path)
+    store = Store(str(db_path))
+    project, worker = _create_worker(store)
+    start = Event()
+    writes_complete = Event()
+    observed_event_counts: list[int] = []
+    missing_sidecars: list[tuple[bool, bool]] = []
+
+    def write_events() -> None:
+        start.wait()
+        try:
+            for index in range(20):
+                store.add_event(
+                    project["project_id"],
+                    worker["worker_id"],
+                    None,
+                    "worker.progress",
+                    f"synthetic event {index}",
+                    tenant_id="local",
+                )
+        finally:
+            writes_complete.set()
+
+    def read_project() -> None:
+        start.wait()
+        for _ in range(20):
+            assert store.get_project(project["project_id"])["title"] == "SQLite lifetime"
+
+    def poll_event_stream() -> None:
+        start.wait()
+        while not writes_complete.is_set():
+            observed_event_counts.append(len(store.list_events(worker["worker_id"])))
+            time.sleep(0.001)
+        observed_event_counts.append(len(store.list_events(worker["worker_id"])))
+
+    def observe_lifetime() -> None:
+        start.wait()
+        while not writes_complete.is_set():
+            if not wal_path.is_file() or not shm_path.is_file():
+                missing_sidecars.append((wal_path.exists(), shm_path.exists()))
+            time.sleep(0.001)
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(write_events),
+                executor.submit(read_project),
+                executor.submit(poll_event_stream),
+                executor.submit(observe_lifetime),
+            ]
+            start.set()
+            for future in futures:
+                future.result(timeout=30)
+
+        events = store.list_events(worker["worker_id"])
+        assert len(events) == 21
+        assert observed_event_counts == sorted(observed_event_counts)
+        assert not missing_sidecars
+        assert wal_path.is_file()
+        assert shm_path.is_file()
+    finally:
+        store.close()
+
+
+def test_api_lifespan_closes_store_keeper_after_service_shutdown(tmp_path: Path) -> None:
+    db_path = tmp_path / "runtime.db"
+    wal_path, shm_path = _sqlite_sidecars(db_path)
+    app = create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime())
+    keeper = app.state.store._lifetime_connection
+    shutdown_order: list[str] = []
+    assert keeper is not None
+
+    provider_shutdown = app.state.provider_setup.shutdown
+    conversation_shutdown = getattr(app.state.conversation_provider, "shutdown", lambda: None)
+    service_shutdown = app.state.service.shutdown
+    store_close = app.state.store.close
+
+    def record_provider_shutdown() -> None:
+        shutdown_order.append("provider")
+        provider_shutdown()
+
+    def record_service_shutdown() -> None:
+        shutdown_order.append("service")
+        service_shutdown()
+
+    def record_conversation_shutdown() -> None:
+        shutdown_order.append("conversation")
+        conversation_shutdown()
+
+    def record_store_close() -> None:
+        shutdown_order.append("store")
+        store_close()
+
+    app.state.provider_setup.shutdown = record_provider_shutdown
+    app.state.conversation_provider.shutdown = record_conversation_shutdown
+    app.state.service.shutdown = record_service_shutdown
+    app.state.store.close = record_store_close
+
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert wal_path.is_file()
+        assert shm_path.is_file()
+
+    assert shutdown_order == ["provider", "conversation", "service", "store"]
+    assert app.state.store._lifetime_connection is None
+    _assert_connection_closed(keeper)
+
+
+def test_conversation_provider_shutdown_waits_and_cannot_restart_reconciliation(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        str(tmp_path / "runtime.db"),
+        runtime_backend="stub",
+        runtime=StubRuntime(),
+    )
+    provider = app.state.conversation_provider
+    store = app.state.store
+    reconciliation_started = Event()
+    release_reconciliation = Event()
+    shutdown_complete = Event()
+    shutdown_errors: list[BaseException] = []
+
+    def blocking_reconciliation(_request_id: str) -> bool:
+        reconciliation_started.set()
+        release_reconciliation.wait(timeout=5)
+        store.get_project("synthetic-missing-project")
+        return False
+
+    def shut_down_provider() -> None:
+        try:
+            provider.shutdown()
+        except BaseException as error:
+            shutdown_errors.append(error)
+        finally:
+            shutdown_complete.set()
+
+    provider._reconcile_detached_request_once = blocking_reconciliation
+    provider._ensure_detached_reconciliation("synthetic-blocked-request")
+    assert reconciliation_started.wait(timeout=2)
+    shutdown_thread = Thread(target=shut_down_provider)
+    shutdown_thread.start()
+
+    try:
+        assert not shutdown_complete.wait(timeout=0.1)
+        assert store._lifetime_connection is not None
+    finally:
+        release_reconciliation.set()
+        shutdown_thread.join(timeout=5)
+        with provider._detached_reconciliation_lock:
+            provider._detached_reconciliations.clear()
+        reconciliation_thread = provider._detached_reconciliation_thread
+        if reconciliation_thread is not None:
+            reconciliation_thread.join(timeout=5)
+
+    assert not shutdown_errors
+    assert not shutdown_thread.is_alive()
+    assert provider._detached_reconciliation_thread is None
+
+    provider.shutdown()
+    provider._ensure_detached_reconciliation("synthetic-after-shutdown")
+
+    assert provider._detached_reconciliation_thread is None
+    assert "synthetic-after-shutdown" not in provider._detached_reconciliations
+    app.state.service.shutdown()
+    store.close()
+
+
+def test_api_shutdown_prevents_detached_store_calls_after_keeper_close(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        str(tmp_path / "runtime.db"),
+        runtime_backend="stub",
+        runtime=StubRuntime(),
+    )
+    provider = app.state.conversation_provider
+    store = app.state.store
+    reconciliation_started = Event()
+    observed_closed_keeper: list[bool] = []
+
+    def observe_store_lifetime(_request_id: str) -> bool:
+        keeper_closed = store._lifetime_connection is None
+        observed_closed_keeper.append(keeper_closed)
+        store.get_project("synthetic-missing-project")
+        reconciliation_started.set()
+        return not keeper_closed
+
+    provider._reconcile_detached_request_once = observe_store_lifetime
+
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        provider._ensure_detached_reconciliation("synthetic-lifetime-request")
+        assert reconciliation_started.wait(timeout=2)
+
+    reconciliation_thread = provider._detached_reconciliation_thread
+    if reconciliation_thread is not None:
+        reconciliation_thread.join(timeout=2)
+
+    assert observed_closed_keeper
+    assert True not in observed_closed_keeper
+    assert reconciliation_thread is None or not reconciliation_thread.is_alive()
+
+
+def test_conversation_provider_shutdown_timeout_keeps_store_open(tmp_path: Path) -> None:
+    app = create_app(
+        str(tmp_path / "runtime.db"),
+        runtime_backend="stub",
+        runtime=StubRuntime(),
+    )
+    provider = app.state.conversation_provider
+    store = app.state.store
+    reconciliation_started = Event()
+    release_reconciliation = Event()
+
+    def blocking_reconciliation(_request_id: str) -> bool:
+        reconciliation_started.set()
+        release_reconciliation.wait(timeout=5)
+        return False
+
+    provider._reconcile_detached_request_once = blocking_reconciliation
+    provider._ensure_detached_reconciliation("synthetic-timeout-request")
+    assert reconciliation_started.wait(timeout=2)
+
+    try:
+        with pytest.raises(RuntimeError, match="detached reconciliation did not stop"):
+            provider.shutdown(timeout_seconds=0.01)
+
+        assert store._lifetime_connection is not None
+        assert provider._detached_reconciliation_thread is not None
+        assert provider._detached_reconciliation_thread.is_alive()
+    finally:
+        release_reconciliation.set()
+        provider.shutdown(timeout_seconds=2)
+        app.state.service.shutdown()
+        store.close()
+
+
+def test_concurrent_reconciliation_start_is_published_before_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(
+        str(tmp_path / "runtime.db"),
+        runtime_backend="stub",
+        runtime=StubRuntime(),
+    )
+    provider = app.state.conversation_provider
+    store = app.state.store
+    original_thread_start = Thread.start
+    first_start_entered = Event()
+    release_first_start = Event()
+    second_ensure_entered = Event()
+    second_ensure_complete = Event()
+    shutdown_complete = Event()
+    start_calls: list[Thread] = []
+    post_close_store_calls: list[str] = []
+    reconciliation_start_count = 0
+
+    def delayed_first_start(thread: Thread) -> None:
+        nonlocal reconciliation_start_count
+        start_calls.append(thread)
+        if thread.name == "glasshive-provider-reconcile":
+            reconciliation_start_count += 1
+            if reconciliation_start_count == 1:
+                first_start_entered.set()
+                assert release_first_start.wait(timeout=5)
+        original_thread_start(thread)
+
+    def observe_store_lifetime(request_id: str) -> bool:
+        if store._lifetime_connection is None:
+            post_close_store_calls.append(request_id)
+        store.get_project("synthetic-missing-project")
+        return False
+
+    monkeypatch.setattr(Thread, "start", delayed_first_start)
+    provider._reconcile_detached_request_once = observe_store_lifetime
+    first_ensure = Thread(
+        target=provider._ensure_detached_reconciliation,
+        args=("synthetic-concurrent-one",),
+    )
+    shutdown_errors: list[BaseException] = []
+
+    def second_reconciliation_request() -> None:
+        second_ensure_entered.set()
+        provider._ensure_detached_reconciliation("synthetic-concurrent-two")
+        second_ensure_complete.set()
+
+    def shut_down_provider() -> None:
+        try:
+            provider.shutdown()
+            app.state.service.shutdown()
+            store.close()
+        except BaseException as error:
+            shutdown_errors.append(error)
+        finally:
+            shutdown_complete.set()
+
+    second_ensure = Thread(target=second_reconciliation_request)
+    shutdown_thread = Thread(target=shut_down_provider)
+
+    second_ensure_blocked = False
+    shutdown_blocked = False
+    first_ensure.start()
+    try:
+        assert first_start_entered.wait(timeout=2)
+        second_ensure.start()
+        assert second_ensure_entered.wait(timeout=2)
+        second_ensure_blocked = not second_ensure_complete.wait(timeout=0.2)
+        shutdown_thread.start()
+        shutdown_blocked = not shutdown_complete.wait(timeout=0.2)
+    finally:
+        release_first_start.set()
+        for thread in (first_ensure, second_ensure, shutdown_thread):
+            if thread.ident is not None:
+                thread.join(timeout=5)
+
+    # Both callers must wait until the one assigned reconciliation thread is started.
+    assert second_ensure_blocked
+    assert shutdown_blocked
+    reconciliation_thread = provider._detached_reconciliation_thread
+    if reconciliation_thread is not None and reconciliation_thread.ident is not None:
+        reconciliation_thread.join(timeout=5)
+
+    assert not shutdown_errors
+    assert not first_ensure.is_alive()
+    assert not second_ensure.is_alive()
+    assert not shutdown_thread.is_alive()
+    reconciliation_starts = [
+        thread for thread in start_calls if thread.name == "glasshive-provider-reconcile"
+    ]
+    assert len(reconciliation_starts) == 1
+    assert provider._detached_reconciliation_thread is None
+    assert not post_close_store_calls
+    assert store._lifetime_connection is None
+
+
+def test_api_shutdown_leaves_keeper_open_when_provider_cannot_stop(tmp_path: Path) -> None:
+    app = create_app(
+        str(tmp_path / "runtime.db"),
+        runtime_backend="stub",
+        runtime=StubRuntime(),
+    )
+    store = app.state.store
+    original_conversation_shutdown = getattr(app.state.conversation_provider, "shutdown", None)
+    original_store_close = store.close
+    store_close_called = False
+
+    def refuse_shutdown() -> None:
+        raise RuntimeError("synthetic reconciliation did not stop")
+
+    def record_store_close() -> None:
+        nonlocal store_close_called
+        store_close_called = True
+        original_store_close()
+
+    app.state.conversation_provider.shutdown = refuse_shutdown
+    app.state.store.close = record_store_close
+
+    try:
+        with pytest.raises(RuntimeError, match="synthetic reconciliation did not stop"):
+            with TestClient(app) as client:
+                assert client.get("/health").status_code == 200
+
+        assert not store_close_called
+        assert store._lifetime_connection is not None
+    finally:
+        if original_conversation_shutdown is not None:
+            app.state.conversation_provider.shutdown = original_conversation_shutdown
+            original_conversation_shutdown()
+        app.state.service.shutdown()
+        original_store_close()
