@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import subprocess
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,11 +23,13 @@ from workers_projects_runtime.conversation_provider import (
     StreamingRedactor,
     _harness_auth_configured,
     _developer_instruction_snapshot,
+    _legacy_idempotency_keys,
     _history_instruction,
     _native_usage,
     _native_visible_text,
     _normalized_harness_activity,
     _system_snapshot,
+    _versioned_idempotency_key,
 )
 from workers_projects_runtime.openclaw_runtime import RuntimeErrorBase, StubRuntime
 from workers_projects_runtime.service import WorkersProjectsService
@@ -427,6 +430,32 @@ class ProviderRateLimitedRuntime(StubRuntime):
         }
 
 
+class StructuredDeliveryRuntime(StubRuntime):
+    def __init__(self, *, voice: str | None = "skip"):
+        super().__init__()
+        self.voice = voice
+
+    def run_task(
+        self,
+        worker: dict,
+        instruction: str,
+        timeout_sec: float | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        _ = worker, instruction, timeout_sec, run_id
+        bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
+        if "messaging_delivery_control" not in bundle:
+            return "Text-only answer."
+        payload = {
+            "type": "assistant_response",
+            "content": "Text-only answer.",
+            "tool_name": None,
+        }
+        if self.voice is not None:
+            payload["voice"] = self.voice
+        return json.dumps(payload)
+
+
 def test_models_expose_exact_harness_registry(tmp_path, monkeypatch):
     client = _client(tmp_path, monkeypatch)
 
@@ -451,6 +480,14 @@ def test_models_expose_exact_harness_registry(tmp_path, monkeypatch):
     assert all(model["capabilities"]["conversation_session"] for model in models.values())
     assert all(model["capabilities"]["chat_completions"] for model in models.values())
     assert all(model["capabilities"]["responses_api"] for model in models.values())
+    assert all(
+        model["capabilities"]["messaging_delivery_disposition"]
+        for model in models.values()
+    )
+    assert all(
+        model["capabilities"]["messaging_delivery_disposition_version"] == 1
+        for model in models.values()
+    )
     assert all(model["capabilities"]["voice_pipeline_llm"] for model in models.values())
     assert all(not model["capabilities"]["native_realtime_voice"] for model in models.values())
     assert models["codex-cli:gpt-5.6-sol"]["capabilities"]["incremental_text"] is False
@@ -481,6 +518,281 @@ def test_provider_rate_limit_uses_standard_openai_429_error(tmp_path, monkeypatc
             "param": None,
             "code": "rate_limit_exceeded",
         }
+    }
+
+
+def test_audio_eligible_header_requires_and_projects_structured_voice_disposition(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    headers = {
+        **AUTH,
+        "X-Viventium-Surface": "telegram",
+        "X-Viventium-Audio-Eligible": "true",
+    }
+    client = _client(tmp_path, monkeypatch, runtime=StructuredDeliveryRuntime())
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=headers,
+        json=_payload(workspace),
+    )
+
+    assert response.status_code == 200, response.text
+    message = response.json()["choices"][0]["message"]
+    assert message["content"] == "Text-only answer."
+    assert message["provider_specific_fields"] == {
+        "viventium": {
+            "delivery_disposition": {
+                "version": 1,
+                "audio": "skip",
+                "required": True,
+                "valid": True,
+                "source": "model",
+            }
+        }
+    }
+    sessions = client.app.state.store.list_provider_sessions(owner_id="owner-a")
+    worker = client.app.state.store.get_worker(sessions[0]["worker_id"])
+    bundle = json.loads(worker["bootstrap_bundle_json"])
+    assert bundle["messaging_delivery_control"] == {
+        "version": 1,
+        "audio_eligible": True,
+    }
+
+
+def test_audio_eligibility_header_rejects_ambiguous_values(tmp_path, monkeypatch):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch, runtime=StructuredDeliveryRuntime())
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={**AUTH, "X-Viventium-Audio-Eligible": "sometimes"},
+        json=_payload(workspace),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+def test_audio_eligibility_is_part_of_idempotent_request_identity(tmp_path, monkeypatch):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch, runtime=StructuredDeliveryRuntime())
+    payload = _payload(workspace)
+
+    standard = client.post(
+        "/v1/chat/completions",
+        headers=AUTH,
+        json=payload,
+    )
+    audio_eligible = client.post(
+        "/v1/chat/completions",
+        headers={**AUTH, "X-Viventium-Audio-Eligible": "true"},
+        json=payload,
+    )
+    audio_retry = client.post(
+        "/v1/chat/completions",
+        headers={**AUTH, "X-Viventium-Audio-Eligible": "true"},
+        json=payload,
+    )
+
+    assert standard.status_code == 200, standard.text
+    assert audio_eligible.status_code == 200, audio_eligible.text
+    assert audio_retry.status_code == 200, audio_retry.text
+    assert standard.json()["id"] != audio_eligible.json()["id"]
+    assert audio_retry.json()["id"] == audio_eligible.json()["id"]
+    assert "provider_specific_fields" not in standard.json()["choices"][0]["message"]
+    disposition = audio_eligible.json()["choices"][0]["message"][
+        "provider_specific_fields"
+    ]["viventium"]["delivery_disposition"]
+    assert disposition["required"] is True
+    assert disposition["valid"] is True
+
+
+def test_versioned_idempotency_namespace_cannot_collide_with_raw_user_suffix(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch, runtime=StructuredDeliveryRuntime())
+    standard_payload = _payload(workspace)
+    standard_payload["metadata"][
+        "idempotency_key"
+    ] = "x:delivery:v1:audio-eligible"
+    audio_payload = _payload(workspace)
+    audio_payload["metadata"]["idempotency_key"] = "x"
+
+    standard = client.post(
+        "/v1/chat/completions",
+        headers=AUTH,
+        json=standard_payload,
+    )
+    audio = client.post(
+        "/v1/chat/completions",
+        headers={**AUTH, "X-Viventium-Audio-Eligible": "true"},
+        json=audio_payload,
+    )
+
+    assert standard.status_code == 200, standard.text
+    assert audio.status_code == 200, audio.text
+    assert standard.json()["id"] != audio.json()["id"]
+    assert "provider_specific_fields" in audio.json()["choices"][0]["message"]
+
+
+def test_standard_retry_finds_pre_upgrade_raw_idempotency_record(tmp_path, monkeypatch):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    payload = _payload(workspace)
+
+    first = client.post("/v1/chat/completions", headers=AUTH, json=payload)
+    assert first.status_code == 200, first.text
+    request_id = first.json()["glasshive"]["request_id"]
+    with client.app.state.store._connect() as conn:
+        conn.execute(
+            "UPDATE provider_requests SET idempotency_key = ? WHERE request_id = ?",
+            ("idem-a", request_id),
+        )
+
+    retry = client.post("/v1/chat/completions", headers=AUTH, json=payload)
+
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["id"] == first.json()["id"]
+    assert len(client.app.state.store.list_provider_sessions(owner_id="owner-a")) == 1
+
+
+def test_legacy_graph_idempotency_lookup_preserves_pre_upgrade_digest():
+    payload = ChatCompletionRequest.model_validate(
+        {
+            "model": "codex-cli:gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "Consult if useful."}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lc_transfer_to_specialist",
+                        "description": "Consult a specialist.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "required": [],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ],
+            "metadata": {
+                "owner_id": "owner-a",
+                "idempotency_key": "legacy-graph",
+            },
+        }
+    )
+
+    keys = _legacy_idempotency_keys(payload)
+
+    assert len(keys) == 1
+    assert keys[0].startswith("legacy-graph:graph:")
+    assert not keys[0].startswith("viventium-request:v2:")
+
+
+def test_audio_eligible_stream_preserves_text_and_fails_audio_closed_when_disposition_is_missing(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    payload = _payload(workspace, stream=True)
+    client = _client(
+        tmp_path,
+        monkeypatch,
+        runtime=StructuredDeliveryRuntime(voice=None),
+    )
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={
+            **AUTH,
+            "X-Viventium-Surface": "telegram",
+            "X-Viventium-Audio-Eligible": "true",
+        },
+        json=payload,
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line.removeprefix("data: "))
+        for line in body.splitlines()
+        if line.startswith("data: {")
+    ]
+    visible = "".join(
+        choice.get("delta", {}).get("content", "")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+    disposition = next(
+        choice["delta"]["provider_specific_fields"]["viventium"][
+            "delivery_disposition"
+        ]
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if "provider_specific_fields" in choice.get("delta", {})
+    )
+    assert visible == "Text-only answer."
+    assert disposition == {
+        "version": 1,
+        "audio": "skip",
+        "required": True,
+        "valid": False,
+        "source": "required_missing",
+    }
+
+
+def test_audio_eligible_stream_emits_structured_disposition_outside_visible_text(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch, runtime=StructuredDeliveryRuntime())
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={
+            **AUTH,
+            "X-Viventium-Surface": "telegram",
+            "X-Viventium-Audio-Eligible": "true",
+        },
+        json=_payload(workspace, stream=True),
+    ) as response:
+        lines = [line for line in response.iter_lines() if line and line != "data: [DONE]"]
+
+    assert response.status_code == 200
+    chunks = [json.loads(line.removeprefix("data: ")) for line in lines]
+    visible = "".join(
+        choice.get("delta", {}).get("content", "")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+    disposition = next(
+        choice["delta"]["provider_specific_fields"]["viventium"][
+            "delivery_disposition"
+        ]
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if "provider_specific_fields" in choice.get("delta", {})
+    )
+    assert visible == "Text-only answer."
+    assert "{SKIP_VOICE}" not in visible
+    assert disposition == {
+        "version": 1,
+        "audio": "skip",
+        "required": True,
+        "valid": True,
+        "source": "model",
     }
 
 
@@ -609,6 +921,30 @@ def test_standard_responses_request_uses_the_same_provider_core(tmp_path, monkey
     assert len(sessions) == 1
     request = client.app.state.store.get_provider_request(body["glasshive"]["request_id"])
     assert request["session_id"] == sessions[0]["session_id"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_responses_rejects_chat_completions_only_audio_eligibility_extension(
+    tmp_path, monkeypatch, stream
+):
+    client = _scoped_client(tmp_path, monkeypatch)
+
+    response = client.post(
+        "/v1/responses",
+        headers={
+            "Authorization": "Bearer provider-test-token",
+            "X-Viventium-Audio-Eligible": "true",
+        },
+        json={
+            "model": "codex-cli:gpt-5.6-sol",
+            "input": "Portable Responses hello.",
+            "stream": stream,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert "chat/completions" in response.json()["error"]["message"]
 
 
 def test_responses_previous_response_id_reuses_only_the_authenticated_session(
@@ -1654,6 +1990,83 @@ def test_cancel_by_idempotency_before_request_prevents_a_late_native_start(tmp_p
     assert late_start.status_code == 409
     assert "cancelled before native execution" in late_start.text
     assert client.app.state.store.list_provider_sessions(owner_id="owner-a") == []
+
+
+def test_raw_idempotency_cancel_covers_audio_eligibility_identity(tmp_path, monkeypatch):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch, runtime=StructuredDeliveryRuntime())
+    audio_headers = {**AUTH, "X-Viventium-Audio-Eligible": "true"}
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=audio_headers,
+        json=_payload(workspace),
+    )
+    cancelled = client.post("/v1/requests/by-idempotency/idem-a/cancel", headers=AUTH)
+
+    assert response.status_code == 200, response.text
+    assert cancelled.status_code == 200
+    assert cancelled.json()["id"] == response.json()["id"]
+
+
+def test_prestart_raw_idempotency_cancel_blocks_audio_eligible_start(tmp_path, monkeypatch):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch, runtime=StructuredDeliveryRuntime())
+
+    cancelled = client.post("/v1/requests/by-idempotency/idem-a/cancel", headers=AUTH)
+    late_start = client.post(
+        "/v1/chat/completions",
+        headers={**AUTH, "X-Viventium-Audio-Eligible": "true"},
+        json=_payload(workspace),
+    )
+
+    assert cancelled.status_code == 200
+    assert late_start.status_code == 409
+    assert "cancelled before native execution" in late_start.text
+
+
+def test_raw_idempotency_cancel_prefers_and_cancels_active_variant():
+    standard = {
+        "request_id": "request-standard",
+        "idempotency_key": _versioned_idempotency_key(
+            "idem-a", audio_eligible=False
+        ),
+        "state": "completed",
+    }
+    audio = {
+        "request_id": "request-audio",
+        "idempotency_key": _versioned_idempotency_key(
+            "idem-a", audio_eligible=True
+        ),
+        "state": "running",
+    }
+
+    class VariantStore:
+        @staticmethod
+        def get_provider_request(**kwargs):
+            key = kwargs.get("idempotency_key")
+            return audio if key == audio["idempotency_key"] else standard
+
+    provider = ConversationProvider.__new__(ConversationProvider)
+    provider.store = VariantStore()
+    provider._start_lock = threading.RLock()
+    provider._prestart_cancellations = {}
+    provider._prune_prestart_cancellations = lambda: None
+    cancelled_ids = []
+
+    def cancel(request_id):
+        cancelled_ids.append(request_id)
+        return {**audio, "state": "cancelled"}
+
+    provider.cancel = cancel
+
+    result = provider.cancel_by_idempotency("idem-a", "owner-a")
+
+    assert cancelled_ids == ["request-audio"]
+    assert result["request_id"] == "request-audio"
+    assert result["state"] == "cancelled"
 
 
 def test_run_scoped_interrupt_cannot_cancel_a_newer_active_turn(tmp_path):

@@ -22,7 +22,7 @@ from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Callable
 
-from .agent_builder_control import graph_transfer_output_schema
+from .agent_builder_control import conversation_output_schema
 from .bootstrap import (
     GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
     GLASSHIVE_NATIVE_CAPABILITY_INVENTORY,
@@ -5391,21 +5391,24 @@ raise SystemExit(exit_code)
         raw_bundle = worker.get("bootstrap_bundle")
         return raw_bundle if isinstance(raw_bundle, dict) else {}
 
-    def _agent_builder_output_schema(self, worker: dict) -> dict[str, object] | None:
+    def _conversation_output_schema(self, worker: dict) -> dict[str, object] | None:
         if not self._conversation_mode_from_worker(worker):
             return None
         bundle = self._bootstrap_bundle_for_worker(worker)
-        schema = graph_transfer_output_schema(bundle.get("agent_builder_control"))
+        schema = conversation_output_schema(
+            bundle.get("agent_builder_control"),
+            bundle.get("messaging_delivery_control"),
+        )
         return schema if isinstance(schema, dict) else None
 
-    def _agent_builder_output_schema_path(
+    def _conversation_output_schema_path(
         self,
         worker: dict,
     ) -> Path | None:
-        schema = self._agent_builder_output_schema(worker)
+        schema = self._conversation_output_schema(worker)
         if not schema:
             return None
-        path = self._state_dir(str(worker["worker_id"])) / "agent-builder-output-schema.json"
+        path = self._state_dir(str(worker["worker_id"])) / "conversation-output-schema.json"
         if not _write_private_json(path, schema):
             raise RuntimeErrorBase("Agent Builder control schema is unavailable")
         return path
@@ -7267,7 +7270,7 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
             )
         else:
             command.append("--full-auto")
-        output_schema_path = self._agent_builder_output_schema_path(worker)
+        output_schema_path = self._conversation_output_schema_path(worker)
         if output_schema_path:
             command.extend(["--output-schema", str(output_schema_path)])
         if is_resume:
@@ -7294,8 +7297,8 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
     worker_root_name = "host_claude_code_runtime"
     binary_env_var = "WPR_CLAUDE_CODE_BIN"
 
-    def _agent_builder_output_schema(self, worker: dict) -> dict[str, object] | None:
-        schema = super()._agent_builder_output_schema(worker)
+    def _conversation_output_schema(self, worker: dict) -> dict[str, object] | None:
+        schema = super()._conversation_output_schema(worker)
         if not schema:
             return None
         # Claude Code rejects the canonical 2020-12 declaration while accepting
@@ -7596,7 +7599,7 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
                     str(worker.get("profile") or "claude-code"), "host", effort
                 )
             command.extend(["--effort", effort])
-        output_schema = self._agent_builder_output_schema(worker)
+        output_schema = self._conversation_output_schema(worker)
         if output_schema:
             command.extend(
                 [

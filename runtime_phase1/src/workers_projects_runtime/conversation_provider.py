@@ -31,7 +31,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .agent_builder_control import (
     graph_transfer_control,
-    parse_graph_transfer_output,
+    messaging_delivery_control,
+    parse_conversation_output,
 )
 from .profile_runtime import (
     _host_codex_conversation_project_instructions,
@@ -60,6 +61,57 @@ ACTIVITY_SUMMARIES = {
 }
 MODEL_CREATED_AT = int(time.time())
 DEFAULT_BOOTSTRAP_SIGNATURE_MAX_AGE_SECONDS = 5 * 60
+LEGACY_DELIVERY_IDEMPOTENCY_SUFFIX = ":delivery:v1:audio-eligible"
+
+
+def _versioned_idempotency_key(base_key: str, *, audio_eligible: bool) -> str:
+    digest = hashlib.sha256(base_key.encode()).hexdigest()[:32]
+    mode = "audio-eligible" if audio_eligible else "standard"
+    return f"viventium-request:v2:{digest}:{mode}"
+
+
+def _normalized_tool_choice(raw_tool_choice: Any) -> Any:
+    if raw_tool_choice is None or (
+        isinstance(raw_tool_choice, str)
+        and raw_tool_choice.strip().lower() == "auto"
+    ):
+        return "auto"
+    if isinstance(raw_tool_choice, str):
+        return raw_tool_choice.strip().lower()
+    if isinstance(raw_tool_choice, dict):
+        function = raw_tool_choice.get("function")
+        return {
+            "type": str(raw_tool_choice.get("type") or "").strip().lower(),
+            "function": {
+                "name": str(
+                    function.get("name") if isinstance(function, dict) else ""
+                ).strip()
+            },
+        }
+    return str(raw_tool_choice)
+
+
+def _graph_execution_digest(
+    payload: ChatCompletionRequest,
+    control: dict[str, Any],
+    *,
+    include_audio_eligibility: bool,
+) -> str:
+    model = GLASSHIVE_MODELS.get(str(payload.model or "").strip())
+    reasoning_effort = str(
+        payload.reasoning_effort or (model.recommended_effort if model else "")
+    ).strip().lower()
+    identity = {
+        "messages": [message.model_dump(mode="json") for message in payload.messages],
+        "model": str(payload.model or "").strip(),
+        "reasoning_effort": reasoning_effort,
+        "tool_choice": _normalized_tool_choice(payload.tool_choice),
+        "transfer_tools": [tool["name"] for tool in control["tools"]],
+    }
+    if include_audio_eligibility:
+        identity["audio_eligible"] = payload.metadata.audio_eligible
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:20]
 
 
 def _provider_failure_http_status(run: dict[str, Any]) -> int:
@@ -114,6 +166,8 @@ class HarnessModel:
                 "activity_stream": True,
                 "chat_completions": True,
                 "responses_api": True,
+                "messaging_delivery_disposition": True,
+                "messaging_delivery_disposition_version": 1,
                 # Native assistant messages can include working preambles. Both harnesses expose
                 # safe activity while working and publish only the terminal authored answer.
                 "incremental_text": False,
@@ -240,6 +294,7 @@ class CompletionMetadata(BaseModel):
     stream_id: str = ""
     surface: str = "web"
     input_mode: str = "text"
+    audio_eligible: bool = False
     idempotency_key: str = ""
     glasshive_options: GlassHiveOptions = Field(default_factory=GlassHiveOptions)
     bootstrap_bundle: dict[str, Any] = Field(default_factory=dict)
@@ -647,6 +702,17 @@ def _header(request: Request, name: str) -> str:
     return str(request.headers.get(name) or "").strip()
 
 
+def _optional_boolean_header(request: Request, name: str) -> bool | None:
+    raw = _header(request, name).lower()
+    if not raw:
+        return None
+    if raw in {"1", "true"}:
+        return True
+    if raw in {"0", "false"}:
+        return False
+    raise HTTPException(status_code=400, detail=f"Invalid boolean header: {name}")
+
+
 def _decode_workspace_path(request: Request) -> str:
     encoded = _header(request, "x-glasshive-workspace-path-b64")
     if not encoded:
@@ -744,6 +810,10 @@ def _hydrate_metadata(
         raise HTTPException(status_code=403, detail="Provider credential cannot delegate another owner")
     owner_id = requested_owner if auth.trust_identity_headers and requested_owner else auth.principal_id
 
+    audio_eligible_header = _optional_boolean_header(
+        request,
+        "x-viventium-audio-eligible",
+    )
     metadata = {
         **incoming,
         "owner_id": owner_id,
@@ -761,6 +831,11 @@ def _hydrate_metadata(
         or str(incoming.get("surface") or "web").strip(),
         "input_mode": _header(request, "x-viventium-input-mode")
         or str(incoming.get("input_mode") or "text").strip(),
+        "audio_eligible": (
+            audio_eligible_header
+            if audio_eligible_header is not None
+            else bool(incoming.get("audio_eligible") is True)
+        ),
         "idempotency_key": _header(request, "x-glasshive-idempotency-key")
         or str(incoming.get("idempotency_key") or "").strip(),
         "bootstrap_bundle": _decode_bootstrap_bundle(request),
@@ -907,44 +982,37 @@ def _idempotency_key(payload: ChatCompletionRequest) -> str:
                 "param": "tools",
             },
         )
-    if not control or not explicit:
+    if not explicit:
         return base_key
-    model = GLASSHIVE_MODELS.get(str(payload.model or "").strip())
-    reasoning_effort = str(
-        payload.reasoning_effort or (model.recommended_effort if model else "")
-    ).strip().lower()
-    raw_tool_choice = payload.tool_choice
-    if raw_tool_choice is None or (
-        isinstance(raw_tool_choice, str) and raw_tool_choice.strip().lower() == "auto"
-    ):
-        normalized_tool_choice: Any = "auto"
-    elif isinstance(raw_tool_choice, str):
-        normalized_tool_choice = raw_tool_choice.strip().lower()
-    elif isinstance(raw_tool_choice, dict):
-        function = raw_tool_choice.get("function")
-        normalized_tool_choice = {
-            "type": str(raw_tool_choice.get("type") or "").strip().lower(),
-            "function": {
-                "name": str(
-                    function.get("name") if isinstance(function, dict) else ""
-                ).strip()
-            },
-        }
-    else:
-        normalized_tool_choice = str(raw_tool_choice)
-    canonical = json.dumps(
-        {
-            "messages": [message.model_dump(mode="json") for message in payload.messages],
-            "model": str(payload.model or "").strip(),
-            "reasoning_effort": reasoning_effort,
-            "tool_choice": normalized_tool_choice,
-            "transfer_tools": [tool["name"] for tool in control["tools"]],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+    versioned_base_key = _versioned_idempotency_key(
+        base_key,
+        audio_eligible=payload.metadata.audio_eligible,
     )
-    execution_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
-    return f"{base_key}:graph:{execution_digest}"
+    if not control:
+        return versioned_base_key
+    execution_digest = _graph_execution_digest(
+        payload,
+        control,
+        include_audio_eligibility=True,
+    )
+    return f"{versioned_base_key}:graph:{execution_digest}"
+
+
+def _legacy_idempotency_keys(payload: ChatCompletionRequest) -> list[str]:
+    explicit = str(
+        payload.metadata.idempotency_key or payload.metadata.message_id or ""
+    ).strip()
+    if not explicit or payload.metadata.audio_eligible:
+        return []
+    control = graph_transfer_control(payload.tools, payload.tool_choice)
+    if not control:
+        return [explicit]
+    digest = _graph_execution_digest(
+        payload,
+        control,
+        include_audio_eligibility=False,
+    )
+    return [f"{explicit}:graph:{digest}"]
 
 
 def _usage(messages: list[ChatMessage], output: str) -> dict[str, int]:
@@ -1319,6 +1387,9 @@ class ConversationProvider:
             "self_delegation": False,
             "native_tools": True,
         }
+        delivery_control = messaging_delivery_control(
+            audio_eligible=payload.metadata.audio_eligible,
+        )
         if agent_builder_control:
             provider_capabilities.update(
                 {
@@ -1328,6 +1399,8 @@ class ConversationProvider:
                     ],
                 }
             )
+        if delivery_control:
+            provider_capabilities["messaging_delivery_control"] = "structured_output"
         bundle = {
             **incoming,
             "run_mode": "conversation",
@@ -1347,6 +1420,10 @@ class ConversationProvider:
             bundle["agent_builder_control"] = agent_builder_control
         else:
             bundle.pop("agent_builder_control", None)
+        if delivery_control:
+            bundle["messaging_delivery_control"] = delivery_control
+        else:
+            bundle.pop("messaging_delivery_control", None)
         return bundle
 
     @staticmethod
@@ -1555,13 +1632,17 @@ class ConversationProvider:
                     status_code=409,
                     detail="GlassHive request was cancelled before native execution started",
                 )
-            duplicate = self.store.get_provider_request(
-                tenant_id=tenant_id,
-                owner_id=payload.metadata.owner_id,
-                idempotency_key=idempotency_key,
-            )
-            if duplicate:
-                return duplicate
+            for candidate_key in [
+                idempotency_key,
+                *_legacy_idempotency_keys(payload),
+            ]:
+                duplicate = self.store.get_provider_request(
+                    tenant_id=tenant_id,
+                    owner_id=payload.metadata.owner_id,
+                    idempotency_key=candidate_key,
+                )
+                if duplicate:
+                    return duplicate
             workspace = _resolve_workspace(payload.metadata.glasshive_options)
             session, new_native_session = self._session(
                 payload,
@@ -1935,9 +2016,17 @@ class ConversationProvider:
                 detail=_redact_text(detail),
             )
         output = self._conversation_output(request_record, run)
+        audio_eligible = bool(payload.metadata and payload.metadata.audio_eligible)
         try:
-            control = graph_transfer_control(payload.tools, payload.tool_choice)
-            decision = parse_graph_transfer_output(output, control)
+            graph_control = graph_transfer_control(payload.tools, payload.tool_choice)
+            delivery_control = messaging_delivery_control(
+                audio_eligible=audio_eligible,
+            )
+            decision = parse_conversation_output(
+                output,
+                graph_control,
+                delivery_control,
+            )
         except ValueError as exc:
             raise HTTPException(
                 status_code=502,
@@ -1968,6 +2057,11 @@ class ConversationProvider:
                 "content": visible_output,
                 "reasoning_content": "",
             }
+            delivery_disposition = decision.get("delivery_disposition")
+            if isinstance(delivery_disposition, dict):
+                message["provider_specific_fields"] = {
+                    "viventium": {"delivery_disposition": delivery_disposition}
+                }
             finish_reason = "stop"
         response = {
             "id": request_record["request_id"],
@@ -2036,6 +2130,11 @@ class ConversationProvider:
             )
         except ValueError:
             agent_builder_control = None
+        audio_eligible = bool(payload.metadata and payload.metadata.audio_eligible)
+        delivery_control = messaging_delivery_control(
+            audio_eligible=audio_eligible,
+        )
+        delivery_disposition: dict[str, Any] | None = None
         created = int(time.time())
         initial = {
             "id": request_id,
@@ -2069,7 +2168,11 @@ class ConversationProvider:
                 record,
                 run,
             )
-            if not agent_builder_control and latest_native.startswith(native_snapshot):
+            if (
+                not agent_builder_control
+                and not delivery_control
+                and latest_native.startswith(native_snapshot)
+            ):
                 raw_delta = latest_native[len(native_snapshot) :]
                 native_snapshot = latest_native
                 visible_delta = redactor.feed(raw_delta)
@@ -2125,11 +2228,12 @@ class ConversationProvider:
             if record["state"] in TERMINAL_REQUEST_STATES:
                 if record["state"] == "completed":
                     output = await asyncio.to_thread(self._conversation_output, record, run)
-                    if agent_builder_control:
+                    if agent_builder_control or delivery_control:
                         try:
-                            decision = parse_graph_transfer_output(
+                            decision = parse_conversation_output(
                                 output,
                                 agent_builder_control,
+                                delivery_control,
                             )
                         except ValueError:
                             error_chunk = {
@@ -2194,6 +2298,9 @@ class ConversationProvider:
                                 yield f"data: {json.dumps(tool_chunk, separators=(',', ':'))}\n\n"
                                 finish_reason = "tool_calls"
                             else:
+                                candidate_disposition = decision.get("delivery_disposition")
+                                if isinstance(candidate_disposition, dict):
+                                    delivery_disposition = candidate_disposition
                                 finish_reason = "stop"
                     else:
                         flushed = redactor.flush()
@@ -2251,7 +2358,23 @@ class ConversationProvider:
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": payload.model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": (
+                                {
+                                    "provider_specific_fields": {
+                                        "viventium": {
+                                            "delivery_disposition": delivery_disposition
+                                        }
+                                    }
+                                }
+                                if delivery_disposition is not None
+                                else {}
+                            ),
+                            "finish_reason": finish_reason,
+                        }
+                    ],
                 }
                 yield f"data: {json.dumps(final_chunk, separators=(',', ':'))}\n\n"
                 if payload.stream_options and payload.stream_options.include_usage:
@@ -2337,16 +2460,44 @@ class ConversationProvider:
         normalized_key = str(idempotency_key or "").strip()
         if not normalized_key:
             raise HTTPException(status_code=400, detail="GlassHive idempotency key is required")
-        with self._start_lock:
-            record = self.store.get_provider_request(
-                tenant_id=tenant_id,
-                owner_id=owner_id,
-                idempotency_key=normalized_key,
+        candidate_keys = [
+            _versioned_idempotency_key(normalized_key, audio_eligible=False),
+            _versioned_idempotency_key(normalized_key, audio_eligible=True),
+            normalized_key,
+        ]
+        if not normalized_key.endswith(LEGACY_DELIVERY_IDEMPOTENCY_SUFFIX):
+            candidate_keys.append(
+                f"{normalized_key}{LEGACY_DELIVERY_IDEMPOTENCY_SUFFIX}"
             )
-            if record:
-                return self.cancel(str(record["request_id"]))
+        with self._start_lock:
+            records: list[dict[str, Any]] = []
+            for candidate_key in candidate_keys:
+                record = self.store.get_provider_request(
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                    idempotency_key=candidate_key,
+                )
+                if record:
+                    records.append(record)
+            active_records = [
+                record
+                for record in records
+                if str(record.get("state") or "") not in TERMINAL_REQUEST_STATES
+            ]
+            if active_records:
+                cancelled = [
+                    self.cancel(str(record["request_id"]))
+                    for record in active_records
+                ]
+                return cancelled[-1]
+            if records:
+                return records[-1]
             self._prune_prestart_cancellations()
-            self._prestart_cancellations[(tenant_id, owner_id, normalized_key)] = time.monotonic()
+            cancelled_at = time.monotonic()
+            for candidate_key in candidate_keys:
+                self._prestart_cancellations[
+                    (tenant_id, owner_id, candidate_key)
+                ] = cancelled_at
             return {"request_id": "", "state": "cancelled"}
 
 
@@ -2755,6 +2906,14 @@ def install_conversation_provider_routes(
     @app.post("/v1/responses")
     async def glasshive_responses(payload: ResponsesRequest, request: Request):
         auth = require_provider_auth(request)
+        if _optional_boolean_header(request, "x-viventium-audio-eligible") is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "X-Viventium-Audio-Eligible is supported only by "
+                    "POST /v1/chat/completions"
+                ),
+            )
         owner_id = owner_for_request(request, auth)
         chat_payload = _chat_request_from_responses(
             payload,

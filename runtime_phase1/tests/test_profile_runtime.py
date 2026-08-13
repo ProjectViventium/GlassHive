@@ -6266,6 +6266,51 @@ def test_host_mission_and_plain_conversation_commands_do_not_gain_graph_control_
             assert flag not in command
 
 
+def test_host_audio_eligible_conversation_projects_delivery_schema_to_both_native_clis(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    life = tmp_path / "Life"
+    life.mkdir()
+    delivery_control = {"version": 1, "audio_eligible": True}
+    runtimes_and_flags = [
+        (HostCodexCliRuntime(base_dir=str(tmp_path / "codex-state")), "--output-schema"),
+        (HostClaudeCodeRuntime(base_dir=str(tmp_path / "claude-state")), "--json-schema"),
+    ]
+
+    for index, (runtime, flag) in enumerate(runtimes_and_flags):
+        profile = "codex-cli" if isinstance(runtime, HostCodexCliRuntime) else "claude-code"
+        worker = {
+            "worker_id": f"wrk_delivery_control_{index}",
+            "profile": profile,
+            "execution_mode": "host",
+            "workspace_root": str(life),
+            "model": "gpt-5.6-sol" if profile == "codex-cli" else "opus",
+            "bootstrap_bundle_json": json.dumps(
+                {
+                    "run_mode": "conversation",
+                    "messaging_delivery_control": delivery_control,
+                }
+            ),
+        }
+
+        command, _ = runtime._build_command(
+            worker,
+            "Choose the messaging delivery disposition.",
+            runtime._host_runtime_info(worker),
+        )
+
+        assert flag in command
+        raw_schema = command[command.index(flag) + 1]
+        schema = (
+            json.loads(Path(raw_schema).read_text())
+            if flag == "--output-schema"
+            else json.loads(raw_schema)
+        )
+        assert schema["required"] == ["type", "content", "tool_name", "voice"]
+        assert schema["properties"]["voice"]["enum"] == ["eligible", "skip"]
+
+
 def test_host_capability_projection_adds_missing_entries_to_existing_worker_catalogs(
     tmp_path,
     monkeypatch,
