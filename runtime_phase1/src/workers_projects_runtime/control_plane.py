@@ -9,6 +9,8 @@ import secrets
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -201,18 +203,23 @@ class ControlPlaneStore:
         self._initialize()
         secure_state_file(self.db_path)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.db_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        if os.name != "nt":
-            for path in (
-                self.db_path,
-                Path(f"{self.db_path}-wal"),
-                Path(f"{self.db_path}-shm"),
-            ):
-                secure_state_file(path)
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            if os.name != "nt":
+                for path in (
+                    self.db_path,
+                    Path(f"{self.db_path}-wal"),
+                    Path(f"{self.db_path}-shm"),
+                ):
+                    secure_state_file(path)
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _initialize(self) -> None:
         with self._connect() as conn:

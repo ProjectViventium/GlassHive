@@ -216,6 +216,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        store.open()
         app.state.store = store
         app.state.service = service
         app.state.control_plane = control_plane
@@ -224,8 +225,16 @@ def create_app(
         try:
             yield
         finally:
-            provider_setup.shutdown()
-            service.shutdown()
+            try:
+                provider_setup.shutdown()
+            finally:
+                # Detached provider reconciliation owns Store and service calls. Stop it first;
+                # if it cannot terminate, fail closed without closing either dependency beneath it.
+                app.state.conversation_provider.shutdown()
+                try:
+                    service.shutdown()
+                finally:
+                    store.close()
 
     app = FastAPI(
         title="GlassHive Runtime",
