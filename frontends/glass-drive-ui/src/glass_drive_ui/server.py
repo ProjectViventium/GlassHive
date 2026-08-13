@@ -2876,36 +2876,51 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         documentation_url = str(
             os.environ.get("GLASSHIVE_MCP_DOCUMENTATION_URL") or ""
         ).strip()
-        guided_steps: list[str] = []
+        guided_steps = [
+            "Connect the AI app you are using to GlassHive. Follow only the matching section; do not configure another client."
+        ]
         codex_client = clients.get("codex")
         if isinstance(codex_client, dict):
-            guided_steps.extend(
-                [
-                    "For Codex, run these exact commands:",
+            codex_setup_prompt = "\n".join(
+                (
+                    "You are Codex. Connect this Codex client to GlassHive.",
+                    f"Check `codex mcp get {server_name}`. If it already exists, do not add a duplicate. Otherwise run:",
                     str(codex_client["add_command"]),
+                    "Then run:",
                     str(codex_client["login_command"]),
-                ]
+                    "Keep the native login running while I finish browser sign-in. Do not build OAuth URLs, start custom callback listeners, inspect tokens, or configure another client.",
+                    "After sign-in, start a new Codex task so MCP tools reload. In that task, call workspace_list exactly once and report the result. Do not list every tool.",
+                )
+            )
+            codex_client["setup_prompt"] = codex_setup_prompt
+            guided_steps.extend(
+                ("", "If you are Codex, follow only the Codex section.", codex_setup_prompt)
             )
         claude_client = clients.get("claude")
         if isinstance(claude_client, dict):
-            guided_steps.extend(
-                [
-                    "For Claude Code, run this exact command:",
+            claude_setup_prompt = "\n".join(
+                (
+                    "You are Claude Code. Connect this Claude Code client to GlassHive.",
+                    f"Check `claude mcp get {server_name}`. If it already exists, do not add a duplicate. Otherwise run:",
                     str(claude_client["add_command"]),
                     str(claude_client.get("login_note") or "Open /mcp and finish sign-in."),
-                ]
+                    "Use only Claude Code's native browser sign-in. Do not build OAuth URLs, start custom callback listeners, inspect tokens, or configure another client.",
+                    "After sign-in, call workspace_list exactly once and report the result. Do not list every tool.",
+                )
             )
-        guided_steps.append(
-            "Complete the sign-in I approve, then list the GlassHive tools and confirm my workspace list is available."
-        )
+            claude_client["setup_prompt"] = claude_setup_prompt
+            guided_steps.extend(
+                (
+                    "",
+                    "If you are Claude Code, follow only the Claude Code section.",
+                    claude_setup_prompt,
+                )
+            )
         return {
             "mcp_url": mcp_url,
             "server_name": server_name,
             "supported_clients": sorted(clients),
-            "guided_prompt": (
-                "Connect this AI app to my self-hosted GlassHive using the exact deployment setup below.\n\n"
-                + "\n".join(guided_steps)
-            ),
+            "guided_prompt": "\n".join(guided_steps),
             "clients": clients,
             "configuration_status": "ready" if clients else "action_required",
             "configuration_note": (

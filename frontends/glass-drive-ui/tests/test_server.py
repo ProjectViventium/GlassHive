@@ -5009,10 +5009,22 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert payload["configuration_status"] == "ready"
     assert payload["documentation_url"].endswith("/glasshive-client-registration")
     assert payload["source"]["license"] == "FSL-1.1-ALv2"
-    assert payload["clients"]["codex"]["add_command"] in payload["guided_prompt"]
-    assert payload["clients"]["codex"]["login_command"] in payload["guided_prompt"]
-    assert payload["clients"]["claude"]["add_command"] in payload["guided_prompt"]
-    assert payload["clients"]["claude"]["login_note"] in payload["guided_prompt"]
+    codex_prompt = payload["clients"]["codex"]["setup_prompt"]
+    claude_prompt = payload["clients"]["claude"]["setup_prompt"]
+    assert payload["clients"]["codex"]["add_command"] in codex_prompt
+    assert payload["clients"]["codex"]["login_command"] in codex_prompt
+    assert "Claude" not in codex_prompt
+    assert "workspace_list exactly once" in codex_prompt
+    assert payload["clients"]["claude"]["add_command"] in claude_prompt
+    assert payload["clients"]["claude"]["login_note"] in claude_prompt
+    assert "Codex" not in claude_prompt
+    assert "workspace_list exactly once" in claude_prompt
+    assert "If you are Codex, follow only the Codex section." in payload["guided_prompt"]
+    assert "If you are Claude Code, follow only the Claude Code section." in payload["guided_prompt"]
+    assert codex_prompt in payload["guided_prompt"]
+    assert claude_prompt in payload["guided_prompt"]
+    assert "list the GlassHive tools" not in payload["guided_prompt"]
+    assert "custom callback" in payload["guided_prompt"]
     assert "administrator" not in payload["guided_prompt"].lower()
     control_plane_script = (
         server_module.STATIC_DIR / "control-plane.js"
@@ -5056,9 +5068,10 @@ def test_connect_ai_advertises_only_clients_with_a_complete_deployment_contract(
 
     assert payload["supported_clients"] == ["codex"]
     assert set(payload["clients"]) == {"codex"}
+    assert payload["clients"]["codex"]["setup_prompt"] in payload["guided_prompt"]
     assert payload["clients"]["codex"]["add_command"] in payload["guided_prompt"]
     assert payload["clients"]["codex"]["login_command"] in payload["guided_prompt"]
-    assert "For Claude Code" not in payload["guided_prompt"]
+    assert "If you are Claude Code" not in payload["guided_prompt"]
 
 
 def test_external_ai_primary_ui_is_url_first_and_callbacks_are_admin_details():
@@ -5073,6 +5086,9 @@ def test_external_ai_primary_ui_is_url_first_and_callbacks_are_admin_details():
     assert 'id="connect-ai-registration-details"' in page
     assert "Copy server address" in page
     assert "Recommended" in page
+    assert "Connect this AI" in page
+    assert "Paste once. Your AI follows only its own setup." in page
+    assert "Copy connect instruction" in page
     assert "Do not open this address" in script
     assert "connectAi.mcp_url" in script
     assert "connectAi.server_name" in script

@@ -450,7 +450,7 @@ function renderConnectAi() {
     ? `${supportedNames[0]} or ${supportedNames[1]}`
     : supportedNames[0] || 'a supported AI app';
   if (supportedSummary) supportedSummary.textContent = `Control your workspaces from ${supportedText}.`;
-  if (automaticCopy) automaticCopy.textContent = `Copy this once and paste it into ${supportedText}.`;
+  if (automaticCopy) automaticCopy.textContent = `Paste this once into ${supportedText}. It will follow only its own setup.`;
   const mcpUrl = String(connectAi.mcp_url || '');
   const guidedPrompt = String(connectAi.guided_prompt || '');
   if (serverUrl) serverUrl.textContent = mcpUrl;

@@ -203,12 +203,23 @@ Prefer remote HTTP MCP with auth in front of the server when not loopback-only.
 The designed Glass Drive **Use GlassHive from another AI app** panel is the source of truth for a
 deployment's public HTTPS MCP URL and the exact clients that deployment has completely registered.
 It must not advertise Codex, Claude Code, ChatGPT, or another client unless the live endpoint returns
-that client's complete allowlisted contract. The primary `Automatic` path copies one self-contained
-instruction containing the exact deployment-generated add/sign-in command for every returned client;
-the receiving AI does not have to guess configuration from a URL it cannot contextualize. The user
-completes sign-in in the browser profile opened by the
+that client's complete allowlisted contract. The primary `Automatic` path copies one short
+self-selecting instruction: Codex follows only the Codex section and Claude Code follows only the
+Claude Code section. Each section contains that client's exact deployment-generated add/sign-in
+command, tells an existing matching registration to be reused, and ends with one `workspace_list`
+verification instead of a full tool-catalog dump. The receiving AI does not configure another
+client or guess configuration from a URL it cannot contextualize. Codex starts a new task after
+setup so the newly configured tools load; Claude Code uses `/mcp`. The user completes sign-in in the
+browser profile opened by the
 client, or copies the client-provided authorization URL into the browser profile they intend to use.
-The browser does not claim it can edit local client configuration itself.
+The browser does not claim it can edit local client configuration itself. The clients' native OAuth
+flows are authoritative: the receiving AI must not construct OAuth URLs, run a custom callback
+listener, inspect tokens, or fall back to static credentials.
+
+MCP is the capability boundary. The companion skill is a concise workflow guide that tells the AI
+which GlassHive tool to call; a plugin is optional distribution packaging, not another integration
+layer. This follows the official Codex model of starting integrations with MCP and using skills for
+reusable instructions, and Claude Code's native remote-HTTP MCP plus `/mcp` authentication flow.
 
 The generated command may carry a public client id and fixed callback flags as opaque setup
 arguments. GlassHive still validates that the configured Codex resource exactly equals the canonical
