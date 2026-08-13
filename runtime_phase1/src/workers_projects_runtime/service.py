@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Event, Lock, Thread, Timer
+from threading import Event, Lock, Thread, Timer, current_thread
 from urllib.parse import urlencode, urlparse
 
 import httpx
@@ -709,11 +709,31 @@ class WorkersProjectsService:
             )
             self._scheduler_thread.start()
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, timeout_seconds: float = 10.0) -> None:
         self._shutdown_event.set()
-        for thread in (self._callback_retry_thread, self._idle_reaper_thread, self._scheduler_thread):
+        background_threads = tuple(
+            thread
+            for thread in (
+                self._callback_retry_thread,
+                self._idle_reaper_thread,
+                self._scheduler_thread,
+            )
+            if thread is not None
+        )
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        for thread in background_threads:
+            if thread is current_thread():
+                continue
             if thread and thread.is_alive():
-                thread.join(timeout=2)
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        active_background_threads = [
+            thread.name for thread in background_threads if thread.is_alive()
+        ]
+        if active_background_threads:
+            raise RuntimeError(
+                "GlassHive background loops did not stop: "
+                + ", ".join(active_background_threads)
+            )
         self.executor.shutdown(wait=True, cancel_futures=False)
         self.conversation_executor.shutdown(wait=True, cancel_futures=False)
 

@@ -454,3 +454,105 @@ def test_api_shutdown_leaves_keeper_open_when_provider_cannot_stop(tmp_path: Pat
             original_conversation_shutdown()
         app.state.service.shutdown()
         original_store_close()
+
+
+def test_api_shutdown_keeps_store_open_when_service_loop_cannot_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GLASSHIVE_BACKGROUND_CONSUMERS_ENABLED", "false")
+    app = create_app(
+        str(tmp_path / "runtime.db"),
+        runtime_backend="stub",
+        runtime=StubRuntime(),
+    )
+    service = app.state.service
+    store = app.state.store
+    keeper = store._lifetime_connection
+    callback_started = Event()
+    release_callback = Event()
+    callback_store_calls_after_close: list[str] = []
+    cooperative_loops_stopped = [Event(), Event()]
+    store_close_called = False
+
+    assert keeper is not None
+
+    def blocked_callback_loop() -> None:
+        callback_started.set()
+        service._shutdown_event.wait(timeout=5)
+        release_callback.wait(timeout=5)
+        if store._lifetime_connection is None:
+            callback_store_calls_after_close.append("callback")
+        store.get_project("synthetic-missing-project")
+
+    def cooperative_loop(stopped: Event) -> None:
+        service._shutdown_event.wait(timeout=5)
+        stopped.set()
+
+    callback_thread = Thread(
+        target=blocked_callback_loop,
+        daemon=True,
+        name="wpr-callback-retry",
+    )
+    idle_thread = Thread(
+        target=cooperative_loop,
+        args=(cooperative_loops_stopped[0],),
+        daemon=True,
+        name="wpr-idle-reaper",
+    )
+    scheduler_thread = Thread(
+        target=cooperative_loop,
+        args=(cooperative_loops_stopped[1],),
+        daemon=True,
+        name="wpr-scheduler",
+    )
+    service._callback_retry_thread = callback_thread
+    service._idle_reaper_thread = idle_thread
+    service._scheduler_thread = scheduler_thread
+    for thread in (callback_thread, idle_thread, scheduler_thread):
+        thread.start()
+    assert callback_started.wait(timeout=2)
+
+    original_service_shutdown = service.shutdown
+    original_store_close = store.close
+
+    def bounded_service_shutdown() -> None:
+        original_service_shutdown(timeout_seconds=0.05)
+
+    def record_store_close() -> None:
+        nonlocal store_close_called
+        store_close_called = True
+        original_store_close()
+
+    service.shutdown = bounded_service_shutdown
+    store.close = record_store_close
+    shutdown_error: BaseException | None = None
+
+    try:
+        try:
+            with TestClient(app) as client:
+                assert client.get("/health").status_code == 200
+        except BaseException as error:
+            shutdown_error = error
+
+        assert isinstance(shutdown_error, RuntimeError)
+        assert "background loops did not stop" in str(shutdown_error)
+        assert "wpr-callback-retry" in str(shutdown_error)
+        assert service._shutdown_event.is_set()
+        assert all(stopped.wait(timeout=1) for stopped in cooperative_loops_stopped)
+        assert callback_thread.is_alive()
+        assert not idle_thread.is_alive()
+        assert not scheduler_thread.is_alive()
+        assert not store_close_called
+        assert store._lifetime_connection is keeper
+    finally:
+        service._shutdown_event.set()
+        release_callback.set()
+        for thread in (callback_thread, idle_thread, scheduler_thread):
+            thread.join(timeout=2)
+        service.shutdown = original_service_shutdown
+        store.close = original_store_close
+        original_service_shutdown(timeout_seconds=2)
+        original_store_close()
+
+    assert not callback_store_calls_after_close

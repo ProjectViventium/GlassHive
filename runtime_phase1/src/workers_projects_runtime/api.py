@@ -231,10 +231,10 @@ def create_app(
                 # Detached provider reconciliation owns Store and service calls. Stop it first;
                 # if it cannot terminate, fail closed without closing either dependency beneath it.
                 app.state.conversation_provider.shutdown()
-                try:
-                    service.shutdown()
-                finally:
-                    store.close()
+                # Service background loops also own Store calls. Close the keeper only after the
+                # service proves that every loop and executor is quiescent.
+                service.shutdown()
+                store.close()
 
     app = FastAPI(
         title="GlassHive Runtime",
