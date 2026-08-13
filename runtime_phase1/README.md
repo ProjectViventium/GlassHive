@@ -131,6 +131,13 @@ callable by LibreChat or any ordinary Chat Completions client:
 - provider usage-quota and rate-limit failures remain explicit across both APIs: non-streaming
   requests return OpenAI-compatible HTTP `429` errors and streams emit `rate_limit_exceeded`
   failure events; GlassHive never substitutes another model or silently retries an authoring turn
+- an audio-eligible messaging request may set `X-Viventium-Audio-Eligible: true`; GlassHive then
+  requires the native Codex or Claude worker to return a versioned `skip` or `eligible` delivery
+  disposition through its private structured-output schema. The visible answer stays plain text,
+  while Chat Completions returns the decision under
+  `provider_specific_fields.viventium.delivery_disposition`. Missing or malformed required output
+  fails closed instead of silently permitting audio. Requests without this structural header keep
+  their existing response and streaming behavior.
 - `/v1/requests/{request_id}/activity` and `/cancel` add resumable activity and explicit lifecycle
   control without making those extensions prerequisites for a standard client
 - provider, MCP, capability-broker, and runtime administrator credentials are separate
