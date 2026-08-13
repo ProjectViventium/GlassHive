@@ -2886,9 +2886,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                     "You are Codex. Connect this Codex client to GlassHive.",
                     f"Check `codex mcp get {server_name}`. If it already exists, do not add a duplicate. Otherwise run:",
                     str(codex_client["add_command"]),
+                    "On a first install Codex may start an unscoped browser login from `mcp add`; once it prints `Added`, interrupt only that automatic first login. The server configuration is already saved.",
                     "Then run:",
                     str(codex_client["login_command"]),
-                    "Keep the native login running while I finish browser sign-in. Do not build OAuth URLs, start custom callback listeners, inspect tokens, or configure another client.",
+                    "Open only the browser URL from the scoped login command and keep that native login running while I finish sign-in. Do not build OAuth URLs, start custom callback listeners, inspect tokens, or configure another client.",
                     "After sign-in, start a new Codex task so MCP tools reload. In that task, call workspace_list exactly once and report the result. Do not list every tool.",
                 )
             )

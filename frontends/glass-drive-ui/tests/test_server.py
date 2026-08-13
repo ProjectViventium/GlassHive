@@ -5013,6 +5013,8 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     claude_prompt = payload["clients"]["claude"]["setup_prompt"]
     assert payload["clients"]["codex"]["add_command"] in codex_prompt
     assert payload["clients"]["codex"]["login_command"] in codex_prompt
+    assert "once it prints `Added`, interrupt only that automatic first login" in codex_prompt
+    assert "Open only the browser URL from the scoped login command" in codex_prompt
     assert "Claude" not in codex_prompt
     assert "workspace_list exactly once" in codex_prompt
     assert payload["clients"]["claude"]["add_command"] in claude_prompt

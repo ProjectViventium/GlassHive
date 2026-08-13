@@ -216,6 +216,12 @@ The browser does not claim it can edit local client configuration itself. The cl
 flows are authoritative: the receiving AI must not construct OAuth URLs, run a custom callback
 listener, inspect tokens, or fall back to static credentials.
 
+Current Codex starts an automatic unscoped OAuth attempt immediately after a first `mcp add`, even
+though the deployment requires the scoped `mcp login` command. The generated Codex instruction
+therefore tells the client to interrupt only that automatic attempt after `Added`, then open the one
+URL from the exact scoped native login. It must not leave the user waiting through or debugging the
+known unscoped detour.
+
 MCP is the capability boundary. The companion skill is a concise workflow guide that tells the AI
 which GlassHive tool to call; a plugin is optional distribution packaging, not another integration
 layer. This follows the official Codex model of starting integrations with MCP and using skills for
