@@ -340,8 +340,8 @@ def parse_conversation_output(
         raise ValueError("Native harness returned an invalid graph transfer envelope")
     if not isinstance(tool_name, str) or tool_name not in allowed:
         raise ValueError("Native harness selected an unavailable graph transfer tool")
-    if normalized_delivery and voice != "eligible":
-        raise ValueError("Native harness cannot select voice delivery before graph transfer")
+    # A graph transfer never delivers audio. Ignore either schema-valid value and
+    # let the eventual final speaking agent own the delivery decision.
     result = {"type": action, "content": content, "tool_name": tool_name}
     return result
 

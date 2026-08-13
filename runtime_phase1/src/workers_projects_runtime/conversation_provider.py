@@ -2906,7 +2906,7 @@ def install_conversation_provider_routes(
     @app.post("/v1/responses")
     async def glasshive_responses(payload: ResponsesRequest, request: Request):
         auth = require_provider_auth(request)
-        if _optional_boolean_header(request, "x-viventium-audio-eligible") is not None:
+        if _optional_boolean_header(request, "x-viventium-audio-eligible") is True:
             raise HTTPException(
                 status_code=400,
                 detail=(

@@ -947,6 +947,28 @@ def test_responses_rejects_chat_completions_only_audio_eligibility_extension(
     assert "chat/completions" in response.json()["error"]["message"]
 
 
+@pytest.mark.parametrize("header_value", ["false", "0"])
+def test_responses_accepts_explicit_audio_ineligibility_opt_out(
+    tmp_path, monkeypatch, header_value
+):
+    client = _scoped_client(tmp_path, monkeypatch)
+
+    response = client.post(
+        "/v1/responses",
+        headers={
+            "Authorization": "Bearer provider-test-token",
+            "X-Viventium-Audio-Eligible": header_value,
+        },
+        json={
+            "model": "codex-cli:gpt-5.6-sol",
+            "input": "Portable Responses opt-out.",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "completed"
+
+
 def test_responses_previous_response_id_reuses_only_the_authenticated_session(
     tmp_path, monkeypatch
 ):

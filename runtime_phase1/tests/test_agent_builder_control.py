@@ -202,6 +202,22 @@ def test_audio_eligible_messaging_schema_composes_with_graph_transfer_control():
         "content": "",
         "tool_name": "lc_transfer_to_specialist",
     }
+    assert parse_conversation_output(
+        json.dumps(
+            {
+                "type": "tool_call",
+                "content": "",
+                "tool_name": "lc_transfer_to_specialist",
+                "voice": "skip",
+            }
+        ),
+        graph,
+        delivery,
+    ) == {
+        "type": "tool_call",
+        "content": "",
+        "tool_name": "lc_transfer_to_specialist",
+    }
 
 
 def test_malformed_delivery_envelope_preserves_plain_text_without_leaking_json():
