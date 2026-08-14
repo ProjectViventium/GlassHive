@@ -485,7 +485,7 @@ function renderConnectAi() {
 
   const rows = canSetup ? [
     ...(clients.codex ? [
-      commandRow('Codex · 1. Add server', String(clients.codex.add_command || '')),
+      commandRow('Codex · 1. Configure server', String(clients.codex.config_toml || '')),
       commandRow('Codex · 2. Sign in', String(clients.codex.login_command || '')),
     ] : []),
     ...(clients.claude ? [

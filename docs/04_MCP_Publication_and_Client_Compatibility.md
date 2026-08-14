@@ -217,10 +217,11 @@ flows are authoritative: the receiving AI must not construct OAuth URLs, run a c
 listener, inspect tokens, or fall back to static credentials.
 
 GlassHive includes the exact required scope in both protected-resource metadata and the initial
-`WWW-Authenticate` challenge. Per the MCP scope-selection contract, this makes the scope authoritative
-for first sign-in and reconnect, so a native client does not fall back to generic OpenID scopes that
-target a different Entra resource. The ordinary path is the client's own Add or Reconnect action,
-native browser sign-in, and the requested MCP call—never a hand-built authorization URL.
+`WWW-Authenticate` challenge. Current Codex releases can still fall back to generic OpenID scopes on
+an ordinary Reconnect unless the MCP server's native config persists its `scopes` value. The generated
+Codex setup therefore includes that exact config entry once; later Add/Reconnect actions use the same
+canonical resource and scope without a hand-built authorization URL. Claude Code continues to use its
+native remote-HTTP add and `/mcp` sign-in flow.
 
 MCP is the capability boundary. The companion skill is a concise workflow guide that tells the AI
 which GlassHive tool to call; a plugin is optional distribution packaging, not another integration

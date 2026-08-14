@@ -2846,6 +2846,18 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             and 1024 <= codex_callback_port_number <= 65535
             and codex_resource_matches
         ):
+            codex_config_toml = "\n".join(
+                (
+                    f"[mcp_servers.{server_name}]",
+                    f"url = {json.dumps(mcp_url)}",
+                    "scopes = ["
+                    + ", ".join(json.dumps(scope) for scope in required_scope_values)
+                    + "]",
+                    "",
+                    f"[mcp_servers.{server_name}.oauth]",
+                    f"client_id = {json.dumps(codex_client_id)}",
+                )
+            )
             codex_callback_url_override = shlex.quote(
                 'mcp_oauth_callback_url='
                 f'"http://127.0.0.1:{codex_callback_port_number}/callback"'
@@ -2864,6 +2876,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                     f"-c {codex_callback_url_override} "
                     f"{server_name}"
                 ),
+                "config_toml": codex_config_toml,
                 "callback_port": codex_callback_port_number,
                 "callback_uri": codex_callback_uri,
             }
@@ -2878,9 +2891,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             codex_setup_prompt = "\n".join(
                 (
                     "You are Codex. Connect this Codex client to GlassHive.",
-                    f"If `codex mcp get {server_name}` says it is missing, run:",
-                    str(codex_client["add_command"]),
-                    "Then run:",
+                    "If GlassHive tools already work, do not change setup; make only the requested tool call.",
+                    "Otherwise add or update this server in your native Codex MCP config, preserving unrelated settings. You must persist the exact scope so Reconnect uses the right OAuth resource:",
+                    str(codex_client["config_toml"]),
+                    "Then use native sign-in:",
                     str(codex_client["login_command"]),
                     "Complete the native browser sign-in. Do not build OAuth URLs, inspect tokens, or configure another client.",
                     "When connected, call workspace_list once to verify. Never enumerate or summarize the tool catalog.",

@@ -4954,7 +4954,7 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_SCOPES", "user_impersonation")
     monkeypatch.setenv(
         "GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES",
-        "api://00000000-0000-4000-8000-000000000123/user_impersonation",
+        "https://glasshive.example.test/mcp/access_as_user",
     )
     monkeypatch.setenv(
         "GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS",
@@ -4993,6 +4993,13 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
         "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' "
         "glasshive-d0c2dae3d5cd"
     )
+    assert payload["clients"]["codex"]["config_toml"] == (
+        "[mcp_servers.glasshive-d0c2dae3d5cd]\n"
+        'url = "https://glasshive.example.test/mcp"\n'
+        'scopes = ["https://glasshive.example.test/mcp/access_as_user"]\n\n'
+        "[mcp_servers.glasshive-d0c2dae3d5cd.oauth]\n"
+        'client_id = "registered-codex-client"'
+    )
     assert payload["clients"]["codex"]["callback_uri"] == (
         "http://127.0.0.1:49153/callback/0MLa49XNV_Yw"
     )
@@ -5010,8 +5017,10 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert payload["source"]["license"] == "FSL-1.1-ALv2"
     codex_prompt = payload["clients"]["codex"]["setup_prompt"]
     claude_prompt = payload["clients"]["claude"]["setup_prompt"]
-    assert payload["clients"]["codex"]["add_command"] in codex_prompt
+    assert payload["clients"]["codex"]["config_toml"] in codex_prompt
     assert payload["clients"]["codex"]["login_command"] in codex_prompt
+    assert "persist the exact scope" in codex_prompt
+    assert "If GlassHive tools already work" in codex_prompt
     assert "unscoped" not in codex_prompt
     assert "interrupt" not in codex_prompt
     assert "start a new Codex task" not in codex_prompt
@@ -5075,7 +5084,7 @@ def test_connect_ai_advertises_only_clients_with_a_complete_deployment_contract(
     assert payload["supported_clients"] == ["codex"]
     assert set(payload["clients"]) == {"codex"}
     assert payload["clients"]["codex"]["setup_prompt"] in payload["guided_prompt"]
-    assert payload["clients"]["codex"]["add_command"] in payload["guided_prompt"]
+    assert payload["clients"]["codex"]["config_toml"] in payload["guided_prompt"]
     assert payload["clients"]["codex"]["login_command"] in payload["guided_prompt"]
     assert "If you are Claude Code" not in payload["guided_prompt"]
 
@@ -5103,6 +5112,7 @@ def test_external_ai_primary_ui_is_url_first_and_callbacks_are_admin_details():
     assert "manualTab.tabIndex = manual ? 0 : -1" in script
     assert "if (canSetup && clients.codex)" in script
     assert "if (canSetup && clients.claude)" in script
+    assert "String(clients.codex.config_toml || '')" in script
     assert "ChatGPT or Codex" not in script
     assert "connect-ai-supported-summary" in page
     assert "connect-ai-auto-copy" in page

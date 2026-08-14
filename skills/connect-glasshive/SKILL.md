@@ -18,7 +18,9 @@ enumerate or summarize the tool catalog unless the user explicitly asks for it.
    signed-in GlassHive site and paste the copied instruction here.
 2. Follow only the section for the client you are currently running. Never configure the other
    client. If the named server already exists, reuse it instead of creating a duplicate.
-3. Use the client's native sign-in exactly as instructed. Never construct an authorization URL,
+3. For Codex, add or update the supplied native MCP config exactly, including its persistent
+   `scopes` value; this keeps ordinary Reconnect on the server's OAuth resource. Use the client's
+   native sign-in exactly as instructed. Never construct an authorization URL,
    inspect or copy tokens, or open the displayed callback address yourself.
 4. Verify with one `workspace_list` call only during first setup or reconnect verification.
 5. If native sign-in fails, report the visible client or identity-provider error and stop. Return to
