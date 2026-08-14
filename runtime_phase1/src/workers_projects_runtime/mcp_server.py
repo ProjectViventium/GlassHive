@@ -586,14 +586,6 @@ def _mcp_transport_security_settings(host: str, port: int) -> TransportSecurityS
     )
 
 
-def _host_worker_mentions() -> tuple[str, str, str]:
-    return (
-        os.environ.get("WPR_HOST_MENTION_CODEX", "@codex").strip() or "@codex",
-        os.environ.get("WPR_HOST_MENTION_CLAUDE", "@claude").strip() or "@claude",
-        os.environ.get("WPR_HOST_MENTION_OPENCLAW", "@openclaw").strip() or "@openclaw",
-    )
-
-
 def _worker_execution_instruction() -> str:
     if _host_workers_enabled():
         if _default_execution_mode() == "host":
@@ -613,143 +605,14 @@ def _worker_execution_instruction() -> str:
     )
 
 
-def _worker_surface_summary() -> str:
-    if _host_workers_enabled():
-        return (
-            "persistent projects, resumable workers, host-native workers for browser and desktop action, "
-            "local files/projects, installed CLIs, workstation sandboxes, and live operator takeover"
-        )
-    return (
-        "persistent projects, resumable workers, Docker/workstation sandboxes, generated artifacts, "
-        "sandboxed browser/desktop action, and live operator takeover"
-    )
-
-
-def _worker_surface_routing_guidance() -> str:
-    if _host_workers_enabled():
-        return (
-            "Use it when the user asks the host assistant to act in a real browser, desktop app, local file, "
-            "local project, installed tool, or current computer session; the user does not need to say "
-            "GlassHive, Codex, Computer Use, or local machine. Do not answer from memory or inference when "
-            "real browser/desktop/local state must be inspected or changed. "
-        )
-    return (
-        "Use it for advanced long-running workspace, file, code, research, artifact, sandboxed browser, "
-        "or sandboxed desktop work; host-native access to the user's real computer/session is disabled in "
-        "this deployment, so do not imply real local-browser, desktop-app, local-file, installed-CLI, or OS "
-        "control unless the host explicitly exposes a separate capability. "
-    )
-
-
 def glasshive_workers_server_instructions() -> str:
-    codex_mention, claude_mention, openclaw_mention = _host_worker_mentions()
     return (
-        f"GlassHive owns {_worker_surface_summary()}. "
-        "GlassHive workers are general intelligent workers; less is more. Give them faithful goals, "
-        "constraints, files, MCP/tool capability context, and user-visible success conditions, then trust "
-        "the worker to choose the path. The host assistant must not invent tool results, claim MCP access "
-        "was used without returned evidence, or turn its own orchestration preferences into worker goals. "
-        "Pass MCP/tool availability as context, not as a made-up success criterion. "
-        "Data in and data out must be exact: pass real file/upload references, broker grants/capabilities, "
-        "and retrieved context when available, and report unavailable data as a blocker instead of filling gaps. "
-        "When reporting exact filenames, paths, markers, IDs, or exact content in Markdown, wrap them in "
-        "backticks or escape Markdown-sensitive characters so underscores and other literals survive rendering. "
-        f"{_worker_surface_routing_guidance()}"
-        "Call the exact GlassHive tool id exposed by the host application. Some hosts namespace MCP "
-        "tools, so action names like workspace_launch may be displayed as suffixed callable ids such "
-        "as workspace_launch_mcp_glasshive-workers-projects; use the callable id, not a bare action "
-        "name that is not in the available tool list. If a needed GlassHive capability is not "
-        "currently available in the callable tool list, call `tool_search` with a non-empty "
-        "capability query and the server scope—for example, `query=<needed capability>` and "
-        "`mcp_server=glasshive-workers-projects`—select the exact returned callable id, and invoke "
-        "it in the same invocation; do not claim GlassHive is unavailable until scoped discovery "
-        "returns no matching capability or an explicit server error. "
-        f"{_worker_capability_summary()}\n\n"
-        "For connected-account facts or actions, MCP/tools are preferred when they can satisfy the task, "
-        "and broker capability belongs in context as an available option, not as an invented project goal. "
-        "Do not make tool choice a workspace success criterion unless the user explicitly asked for that. "
-        "Do not invent project goals, success criteria, provider lists, output schemas, artifacts, ranking "
-        "rules, or workflow steps that the user did not specify. For vague user adjectives like urgent "
-        "or important, pass the adjective through instead of defining a rubric unless the user defines it. "
-        "Do not add memory-derived priorities, active-thread/contact/deal lists, or guessed urgency rubrics to description, success_criteria, "
-        "or context unless the user explicitly asked to use memory/prior context; trust the GlassHive worker to find the "
-        "best path from the user's request and available context. If the user did not specify acceptance "
-        "criteria, use a minimal criterion such as: Satisfy the user's request as stated, preserving explicit "
-        "constraints. Put extra background in context, not as hard gates. Browser or computer use remains "
-        "available when MCP/tools are missing, unavailable, auth-blocked, explicitly required, or genuinely "
-        "the better visual/manual QA route.\n\n"
-        "If GlassHive injects `glasshive-user-capabilities` and another host connector also exposes the "
-        "same connected account, describe the brokered capability as the preferred scoped option; "
-        "non-broker host connectors are fallback after broker omission, unavailability, auth block, "
-        "or explicit user request. "
-        f"{_worker_execution_instruction()} "
-        "Use Docker/workstation mode for isolated sandbox, disposable browser, risky untrusted "
-        "browsing, explicit sandbox requests, or when the user says sandboxed workspace, sandbox, "
-        "Codex Workspace, or workstation. In those cases set execution_mode='docker' even if this "
-        "deployment's default execution mode is host.\n\n"
-        f"For configured mentions {codex_mention}, {claude_mention}, and {openclaw_mention}, create "
-        "or resume a worker with the matching profile semantics; prefer codex-cli for available "
-        "browser/desktop/file/code execution, claude-code when Claude is explicitly requested, "
-        "and openclaw-general only when installed or explicitly requested. Current request upload "
-        "metadata is projected through neutral GlassHive/LibreChat headers when the host supplies "
-        "it. Some standalone LibreChat builds do not expose upload metadata to MCP headers; when "
-        "attached-file text is visible in the current model context, pass it through uploaded_files "
-        "on workspace_launch or worker_delegate_once so GlassHive can materialize it under uploads/ "
-        "before the worker starts. Do not tell the worker to pass the file through again; tell it "
-        "to read the workspace-relative uploads/<filename> file directly. "
-        "If only file names/references are visible, still pass those names/references and the "
-        "requested outcome so the worker can report a real blocker instead of pretending it read "
-        "content. Preserve existing file references in bootstrap_bundle_json. If the user refers "
-        "to an attached or uploaded file and your model context cannot read the file body directly, "
-        "still call workspace_launch or worker_delegate_once; do not refuse solely because your own "
-        "model context lacks file contents.\n\nFor fresh one-off "
-        "workspace/browser/desktop/file/code tasks, prefer workspace_launch, whose fields mirror the "
-        "documented GlassHive UI: description, optional success_criteria, and optional context. "
-        "Use success_criteria for explicit user requirements only; if the user gave no distinct acceptance "
-        "criteria, omit it or keep it minimal instead of manufacturing a plan for the worker. "
-        "Connected-account read authorization comes from the host-signed broker grant when reviewed "
-        "host policy projects content-read scope; connected_account_content_intent is only a compatibility "
-        "hint for hosts that want an extra missing-broker warning, not a required authorization switch. "
-        "When the user asks to make a worker or effort the default, use workspace_preferences_set; "
-        "when profile or effort is omitted, workspace_launch and worker_delegate_once honor the "
-        "authenticated user's saved defaults before falling back to deployment defaults.\n\n"
-        f"{HIGH_EFFORT_SELECTION_GUIDANCE} "
-        "Use xhigh/max for deep research or hard, ambiguous work. Do not shorten, summarize, paraphrase, or water down the user's "
-        "request before handing it to GlassHive. Preserve the full user request, success criteria, "
-        "constraints, examples, links, file references, exclusions, and available background in "
-        "workspace_launch description/success_criteria/context or worker_delegate_once instruction. "
-        "Use the context field for the full picture when the description would otherwise become a "
-        "thin summary.\n\n"
-        f"{HOST_SIDE_ORCHESTRATION_GUIDANCE} "
-        "worker_delegate_once is the lower-level one-call fallback when the caller already has a "
-        "precise instruction/title. These high-level tools create or resume the "
-        "project/worker, include optional callback/upload context, queue the run in one call, and "
-        "return a compact View / Steer link plus result_tools for later status/result questions. "
-        "GlassHive must work standalone: callbacks are an optional host-app delivery enhancement, "
-        "not a requirement.\n\nAfter workspace_launch or worker_delegate_once, write one short "
-        "outcome-focused acknowledgement in the assistant's own voice and include the View / Steer "
-        "link when present on web/browser surfaces. If callback_ready=false, say the work is running "
-        "and can be checked with the standalone MCP status tools. If the user asks whether it is "
-        "done or what happened in the same conversation, call workspace_status for a non-blocking "
-        "check or workspace_wait for a blocking wait before answering. Request diagnostics only "
-        "when raw project/worker/run ids are explicitly needed. When the user asks to wait for the "
-        "result, use the returned completion_wait_timeout_seconds so ordinary long-running work is "
-        "not mistaken for failure just because a short poll expired; if the same-conversation wait "
-        "call omits ids GlassHive will "
-        "resolve the most recent launch scoped to the authenticated user/conversation; do not ask "
-        "the user to confirm waiting when they already asked you to wait. When you launch and then "
-        "wait in the same turn, surface the View / Steer link before entering the long wait whenever "
-        "the chat protocol allows assistant text before a tool call; always include it in the final "
-        "answer. If status/wait "
-        "returns a retryable failure and the user wants to continue, call workspace_continue so the "
-        "same worker resumes from its current workspace files/state instead of relaunching from "
-        "scratch. If a launch returns status='blocked' with failure_class such as "
-        "runtime_dependency_missing, do not claim that a worker is running; explain the blocker and "
-        "recover by choosing an available profile or sandbox mode only when that does not contradict "
-        "the user's explicit choice. After lower-level worker_run, queued only means accepted; do not "
-        "report it as done. Preserve the user's success condition and response-format constraints in "
-        "worker instructions. User-facing responses should not expose raw worker/run/provider/queue "
-        "plumbing outside the View / Steer link unless diagnostics were requested."
+        "Use the one GlassHive tool whose action matches the user's request. Make one call when one "
+        "call can complete it; never enumerate or summarize the tool catalog unless the user asks. "
+        "For a fresh delegated task, use workspace_launch. Check or wait only when the user asks. "
+        "Preserve the user's goal, constraints, files, and context without inventing plans, success "
+        "criteria, tool results, or extra workflow. Use the exact callable tool id shown by the host. "
+        f"{_worker_capability_summary()} {_worker_execution_instruction()}"
     )
 
 

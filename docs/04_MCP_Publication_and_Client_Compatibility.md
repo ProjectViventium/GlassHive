@@ -226,6 +226,9 @@ MCP is the capability boundary. The companion skill is a concise workflow guide 
 which GlassHive tool to call; a plugin is optional distribution packaging, not another integration
 layer. This follows the official Codex model of starting integrations with MCP and using skills for
 reusable instructions, and Claude Code's native remote-HTTP MCP plus `/mcp` authentication flow.
+Shared server instructions stay short because clients may present them alongside every tool. They
+say to make one matching call when one call can finish the request and never narrate the catalog;
+action-specific parameters and safety details stay with the action that owns them.
 
 The generated command may carry a public client id and fixed callback flags as opaque setup
 arguments. GlassHive still validates that the configured Codex resource exactly equals the canonical

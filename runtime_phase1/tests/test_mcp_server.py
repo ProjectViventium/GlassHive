@@ -1175,51 +1175,21 @@ def test_server_instructions_advertise_mcp_owned_usage_contract(monkeypatch):
     instructions = server.instructions.lower()
 
     for phrase in [
-        "persistent projects",
-        "resumable workers",
-        "workstation sandboxes",
-        "host-native workers",
-        "less is more",
-        "must not invent tool results",
-        "data in and data out must be exact",
-        "markdown-sensitive characters",
-        "real browser",
+        "one glasshive tool",
+        "make one call when one call can complete it",
+        "never enumerate or summarize the tool catalog",
+        "check or wait only when the user asks",
+        "without inventing plans, success criteria, tool results, or extra workflow",
+        "exact callable tool id shown by the host",
+        "real chrome/browser",
         "desktop",
-        "local files/projects",
+        "local projects",
         "installed clis",
         "workspace_launch",
-        "tool_search",
-        "query=<needed capability>",
-        "mcp_server=glasshive-workers-projects",
-        "same invocation",
-        "needed glasshive capability is not currently available",
-        "description, optional success_criteria, and optional context",
-        "worker_delegate_once",
-        "callbacks are an optional host-app delivery enhancement",
-        "neutral glasshive/librechat headers",
-        "do not refuse solely because your own model context lacks file contents",
-        "workspace_status",
-        "workspace_wait",
-        "omits ids",
-        "workspace_continue",
-        "sandboxed workspace",
-        "codex workspace",
-        "execution_mode='docker'",
-        "runtime_dependency_missing",
-        "high/xhigh",
-        "deep research",
-        "do not shorten",
-        "full picture",
-        "pass mcp/tool availability as context",
-        "view / steer",
-        "result_tools",
-        "own voice",
-        "should not expose raw worker/run/provider/queue plumbing",
-        "@codex",
-        "@claude",
-        "@openclaw",
     ]:
         assert phrase in instructions
+    assert "tool_search" not in instructions
+    assert len(server.instructions) < 1_000
 
 
 def test_server_instructions_reflect_disabled_host_workers(monkeypatch):
@@ -4937,24 +4907,12 @@ def test_tool_descriptions_advertise_mcp_owned_usage_contract(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
     server = create_mcp_server(api_client=FakeApiClient())
     instructions = mcp_server.glasshive_workers_server_instructions()
-    assert "exact GlassHive tool id exposed by the host application" in instructions
-    assert "workspace_launch_mcp_glasshive-workers-projects" in instructions
-    assert "not in the available tool list" in instructions
-    assert "Preserve host-side GlassHive orchestration requirements as context" in instructions
-    assert "not by the worker running inside the workspace" in instructions
-    assert "MCP/tools are preferred when they can satisfy the task" in instructions
-    assert "Do not make tool choice a workspace success criterion" in instructions
-    assert "Do not invent project goals, success criteria" in instructions
-    assert "memory-derived priorities" in instructions
-    assert "For vague user adjectives like urgent or important, pass the adjective through" in instructions
-    assert "trust the GlassHive worker to find the best path" in instructions
-    assert "Satisfy the user's request as stated, preserving explicit constraints" in instructions
-    assert "success_criteria as broker/tool evidence gates" not in instructions
-    assert "preferred scoped option" in instructions
-    assert "non-broker host connectors are fallback after" in instructions
-    assert "Connected-account read authorization comes from the host-signed broker grant" in instructions
-    assert "compatibility hint for hosts that want an extra missing-broker warning" in instructions
-    assert "not a required authorization switch" in instructions
+    assert "Use the one GlassHive tool" in instructions
+    assert "Make one call when one call can complete it" in instructions
+    assert "never enumerate or summarize the tool catalog" in instructions
+    assert "without inventing plans, success criteria, tool results, or extra workflow" in instructions
+    assert "Use the exact callable tool id shown by the host" in instructions
+    assert len(instructions) < 1_000
 
     public_action_tools = {
         "projects_list",
