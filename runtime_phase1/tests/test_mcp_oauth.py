@@ -1009,7 +1009,8 @@ def test_fastmcp_oauth_publishes_rfc9728_metadata_and_challenge(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_COMPONENT_REVISION", "b" * 40)
     monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ISSUER", ISSUER)
     monkeypatch.setenv("GLASSHIVE_MCP_PUBLIC_URL", RESOURCE)
-    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES", "glasshive:access")
+    required_scope = f"{RESOURCE}/access_as_user"
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES", required_scope)
     server = create_mcp_server(api_client=object())
     app = server.streamable_http_app()
     client = TestClient(app)
@@ -1027,9 +1028,10 @@ def test_fastmcp_oauth_publishes_rfc9728_metadata_and_challenge(monkeypatch):
     }
     assert metadata.json()["resource"] == RESOURCE
     assert [value.rstrip("/") for value in metadata.json()["authorization_servers"]] == [ISSUER]
-    assert metadata.json()["scopes_supported"] == ["glasshive:access"]
+    assert metadata.json()["scopes_supported"] == [required_scope]
     assert unauthorized.status_code == 401
     assert "resource_metadata=" in unauthorized.headers["www-authenticate"]
+    assert f'scope="{required_scope}"' in unauthorized.headers["www-authenticate"]
 
 
 def test_oauth_mcp_front_door_mints_narrow_signed_runtime_assertion(tmp_path, monkeypatch, signing_material):

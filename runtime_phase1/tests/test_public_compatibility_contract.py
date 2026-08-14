@@ -61,6 +61,19 @@ def _golden() -> dict[str, Any]:
     return json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
 
 
+def test_connect_skill_skips_setup_when_connected_and_never_lists_the_catalog():
+    skill = (
+        Path(__file__).parents[2] / "skills" / "connect-glasshive" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    compact_skill = " ".join(skill.split())
+
+    assert "If GlassHive is already connected" in compact_skill
+    assert "call only the one tool needed for the user's request" in compact_skill
+    assert "Never enumerate or summarize the tool catalog" in compact_skill
+    assert "only during first setup or reconnect verification" in compact_skill
+    assert "start a new task" not in compact_skill
+
+
 def _media_schemas(content: dict[str, Any] | None) -> dict[str, Any]:
     return {
         media_type: {

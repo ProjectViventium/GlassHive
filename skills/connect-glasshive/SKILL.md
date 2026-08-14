@@ -8,6 +8,10 @@ description: Connect Codex or Claude Code to a user's hosted GlassHive account t
 GlassHive is one remote MCP integration. This skill is only the short usage guide; do not create a
 second protocol, plugin, OAuth helper, callback listener, or token flow.
 
+If GlassHive is already connected and its tools are callable, skip setup and verification. Go
+straight to the user's outcome and call only the one tool needed for the user's request. Never
+enumerate or summarize the tool catalog unless the user explicitly asks for it.
+
 ## Connect once
 
 1. Ask the user to open **Connections → Use GlassHive from another AI app → Automatic** in their
@@ -16,9 +20,7 @@ second protocol, plugin, OAuth helper, callback listener, or token flow.
    client. If the named server already exists, reuse it instead of creating a duplicate.
 3. Use the client's native sign-in exactly as instructed. Never construct an authorization URL,
    inspect or copy tokens, or open the displayed callback address yourself.
-4. Verify with one `workspace_list` call. Do not enumerate the full tool catalog. Codex must start a
-   new task after setup so newly configured MCP tools load; Claude Code completes sign-in through
-   `/mcp`.
+4. Verify with one `workspace_list` call only during first setup or reconnect verification.
 5. If native sign-in fails, report the visible client or identity-provider error and stop. Return to
    the same GlassHive panel; do not improvise another auth flow.
 

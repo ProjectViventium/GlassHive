@@ -4991,7 +4991,6 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert payload["clients"]["codex"]["login_command"] == (
         "codex mcp login -c mcp_oauth_callback_port=49153 "
         "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' "
-        "--scopes api://00000000-0000-4000-8000-000000000123/user_impersonation "
         "glasshive-d0c2dae3d5cd"
     )
     assert payload["clients"]["codex"]["callback_uri"] == (
@@ -5013,20 +5012,25 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     claude_prompt = payload["clients"]["claude"]["setup_prompt"]
     assert payload["clients"]["codex"]["add_command"] in codex_prompt
     assert payload["clients"]["codex"]["login_command"] in codex_prompt
-    assert "once it prints `Added`, interrupt only that automatic first login" in codex_prompt
-    assert "Open only the browser URL from the scoped login command" in codex_prompt
+    assert "unscoped" not in codex_prompt
+    assert "interrupt" not in codex_prompt
+    assert "start a new Codex task" not in codex_prompt
+    assert "Complete the native browser sign-in" in codex_prompt
     assert "Claude" not in codex_prompt
-    assert "workspace_list exactly once" in codex_prompt
+    assert "workspace_list once" in codex_prompt
+    assert "Never enumerate or summarize the tool catalog" in codex_prompt
     assert payload["clients"]["claude"]["add_command"] in claude_prompt
     assert payload["clients"]["claude"]["login_note"] in claude_prompt
     assert "Codex" not in claude_prompt
-    assert "workspace_list exactly once" in claude_prompt
+    assert "workspace_list once" in claude_prompt
+    assert "Never enumerate or summarize the tool catalog" in claude_prompt
     assert "If you are Codex, follow only the Codex section." in payload["guided_prompt"]
     assert "If you are Claude Code, follow only the Claude Code section." in payload["guided_prompt"]
     assert codex_prompt in payload["guided_prompt"]
     assert claude_prompt in payload["guided_prompt"]
     assert "list the GlassHive tools" not in payload["guided_prompt"]
-    assert "custom callback" in payload["guided_prompt"]
+    assert "Do not build OAuth URLs" in payload["guided_prompt"]
+    assert "custom callback" not in payload["guided_prompt"]
     assert "administrator" not in payload["guided_prompt"].lower()
     control_plane_script = (
         server_module.STATIC_DIR / "control-plane.js"

@@ -2850,11 +2850,6 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 'mcp_oauth_callback_url='
                 f'"http://127.0.0.1:{codex_callback_port_number}/callback"'
             )
-            codex_scope_option = (
-                f"--scopes {shlex.quote(','.join(required_scope_values))} "
-                if required_scope_values
-                else ""
-            )
             clients["codex"] = {
                 "add_command": (
                     "codex mcp add "
@@ -2867,7 +2862,6 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                     "codex mcp login "
                     f"-c mcp_oauth_callback_port={codex_callback_port_number} "
                     f"-c {codex_callback_url_override} "
-                    f"{codex_scope_option}"
                     f"{server_name}"
                 ),
                 "callback_port": codex_callback_port_number,
@@ -2884,13 +2878,12 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             codex_setup_prompt = "\n".join(
                 (
                     "You are Codex. Connect this Codex client to GlassHive.",
-                    f"Check `codex mcp get {server_name}`. If it already exists, do not add a duplicate. Otherwise run:",
+                    f"If `codex mcp get {server_name}` says it is missing, run:",
                     str(codex_client["add_command"]),
-                    "On a first install Codex may start an unscoped browser login from `mcp add`; once it prints `Added`, interrupt only that automatic first login. The server configuration is already saved.",
                     "Then run:",
                     str(codex_client["login_command"]),
-                    "Open only the browser URL from the scoped login command and keep that native login running while I finish sign-in. Do not build OAuth URLs, start custom callback listeners, inspect tokens, or configure another client.",
-                    "After sign-in, start a new Codex task so MCP tools reload. In that task, call workspace_list exactly once and report the result. Do not list every tool.",
+                    "Complete the native browser sign-in. Do not build OAuth URLs, inspect tokens, or configure another client.",
+                    "When connected, call workspace_list once to verify. Never enumerate or summarize the tool catalog.",
                 )
             )
             codex_client["setup_prompt"] = codex_setup_prompt
@@ -2905,8 +2898,8 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                     f"Check `claude mcp get {server_name}`. If it already exists, do not add a duplicate. Otherwise run:",
                     str(claude_client["add_command"]),
                     str(claude_client.get("login_note") or "Open /mcp and finish sign-in."),
-                    "Use only Claude Code's native browser sign-in. Do not build OAuth URLs, start custom callback listeners, inspect tokens, or configure another client.",
-                    "After sign-in, call workspace_list exactly once and report the result. Do not list every tool.",
+                    "Use only Claude Code's native browser sign-in. Do not build OAuth URLs, inspect tokens, or configure another client.",
+                    "When connected, call workspace_list once to verify. Never enumerate or summarize the tool catalog.",
                 )
             )
             claude_client["setup_prompt"] = claude_setup_prompt

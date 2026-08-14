@@ -208,19 +208,19 @@ self-selecting instruction: Codex follows only the Codex section and Claude Code
 Claude Code section. Each section contains that client's exact deployment-generated add/sign-in
 command, tells an existing matching registration to be reused, and ends with one `workspace_list`
 verification instead of a full tool-catalog dump. The receiving AI does not configure another
-client or guess configuration from a URL it cannot contextualize. Codex starts a new task after
-setup so the newly configured tools load; Claude Code uses `/mcp`. The user completes sign-in in the
+client or guess configuration from a URL it cannot contextualize. If GlassHive is already connected,
+the companion skill skips setup and calls only the one tool needed for the user's request. The user completes sign-in in the
 browser profile opened by the
 client, or copies the client-provided authorization URL into the browser profile they intend to use.
 The browser does not claim it can edit local client configuration itself. The clients' native OAuth
 flows are authoritative: the receiving AI must not construct OAuth URLs, run a custom callback
 listener, inspect tokens, or fall back to static credentials.
 
-Current Codex starts an automatic unscoped OAuth attempt immediately after a first `mcp add`, even
-though the deployment requires the scoped `mcp login` command. The generated Codex instruction
-therefore tells the client to interrupt only that automatic attempt after `Added`, then open the one
-URL from the exact scoped native login. It must not leave the user waiting through or debugging the
-known unscoped detour.
+GlassHive includes the exact required scope in both protected-resource metadata and the initial
+`WWW-Authenticate` challenge. Per the MCP scope-selection contract, this makes the scope authoritative
+for first sign-in and reconnect, so a native client does not fall back to generic OpenID scopes that
+target a different Entra resource. The ordinary path is the client's own Add or Reconnect action,
+native browser sign-in, and the requested MCP call—never a hand-built authorization URL.
 
 MCP is the capability boundary. The companion skill is a concise workflow guide that tells the AI
 which GlassHive tool to call; a plugin is optional distribution packaging, not another integration

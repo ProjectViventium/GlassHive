@@ -28,6 +28,7 @@ from pydantic import Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .auth import AuthContext, multi_user_security_enabled, scoped_alias
 from .bootstrap import (
@@ -940,6 +941,58 @@ class McpHttpAuthMiddleware(BaseHTTPMiddleware):
 # Backward-compatible import name for deployments/tests that referenced the former enterprise-only
 # middleware. HTTP service authentication now applies in both local and enterprise deployments.
 EnterpriseMcpHttpAuthMiddleware = McpHttpAuthMiddleware
+
+
+class McpOAuthScopeChallengeMiddleware:
+    def __init__(self, app: ASGIApp, *, path: str, required_scopes: list[str]) -> None:
+        self.app = app
+        self.path = path
+        self.required_scope = " ".join(required_scopes)
+        if any(
+            character in {'"', "\\"} or ord(character) < 0x21 or ord(character) > 0x7E
+            for character in self.required_scope
+            if character != " "
+        ):
+            raise McpOAuthConfigurationError("MCP OAuth scopes cannot be represented in a challenge")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def send_with_scope(message: Message) -> None:
+            if (
+                message["type"] == "http.response.start"
+                and message.get("status") == 401
+                and scope.get("path") == self.path
+                and self.required_scope
+            ):
+                headers = list(message.get("headers", []))
+                for index, (name, value) in enumerate(headers):
+                    if name.lower() != b"www-authenticate":
+                        continue
+                    challenge = value.decode("latin-1")
+                    if challenge.lower().startswith("bearer ") and not re.search(
+                        r"(?:^|,)\s*scope=", challenge, flags=re.IGNORECASE
+                    ):
+                        headers[index] = (
+                            name,
+                            f'{challenge}, scope="{self.required_scope}"'.encode("latin-1"),
+                        )
+                    break
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_scope)
+
+
+class GlassHiveFastMCP(FastMCP):
+    def streamable_http_app(self):
+        app = super().streamable_http_app()
+        auth = self.settings.auth
+        if auth and auth.required_scopes:
+            app.add_middleware(
+                McpOAuthScopeChallengeMiddleware,
+                path=self.settings.streamable_http_path,
+                required_scopes=auth.required_scopes,
+            )
+        return app
 
 
 def _require_enterprise_mcp_transport(transport: str) -> None:
@@ -2797,7 +2850,7 @@ def create_mcp_server(
         )
     recent_dispatches: dict[tuple[str, str, str, str, str], RecentDispatchContext] = {}
     recent_dispatches_lock = threading.RLock()
-    server = FastMCP(
+    server = GlassHiveFastMCP(
         name="glass-hive",
         instructions=glasshive_workers_server_instructions(),
         host=host,
