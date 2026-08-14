@@ -3004,7 +3004,7 @@ def create_mcp_server(
         tags: list[str] | None = None,
         favorite: bool | None = None,
         cursor: str | None = None,
-        limit: Annotated[int, Field(ge=1, le=100)] = 25,
+        limit: int = 25,
     ) -> dict[str, Any]:
         return client.workspace_catalog(
             search=search,
@@ -3012,7 +3012,7 @@ def create_mcp_server(
             tags=tags,
             favorite=favorite,
             cursor=cursor,
-            limit=limit,
+            limit=max(1, min(int(limit), 100)),
         )
 
     @server.tool(
