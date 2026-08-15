@@ -38,7 +38,10 @@ from .control_plane import (
 )
 from .failure_classification import classify_runtime_error
 from .models import WorkspaceKind, normalize_workspace_kind, normalize_workspace_tags, utc_now
-from .mission_provider_accounts import mission_provider_account_selection
+from .mission_provider_accounts import (
+    deployment_provider_readiness,
+    mission_provider_account_selection,
+)
 from .openclaw_runtime import (
     RuntimeErrorBase,
     RuntimeInfo,
@@ -1092,6 +1095,57 @@ class WorkersProjectsService:
             raise HostWorkersDisabledError(
                 "GlassHive host-native workers are disabled by Viventium config"
             )
+
+    def _ensure_dispatch_provider_ready(self, worker: dict) -> None:
+        if not self._uses_deployment_provider_route(worker):
+            return
+        readiness, _status = deployment_provider_readiness(
+            str(worker.get("profile") or "")
+        )
+        if readiness != "deployment_managed":
+            raise ControlPlaneConflict(
+                "Work AI is not set up for this workspace. Ask an administrator to finish "
+                "provider setup or connect a personal account in Connections."
+            )
+
+    def _uses_deployment_provider_route(self, worker: dict) -> bool:
+        bundle = self._bootstrap_bundle_for(worker) or {}
+        if str(bundle.get("run_mode") or "mission").strip().lower() == "conversation":
+            return False
+        raw = bundle.get("provider_account")
+        selection = raw if isinstance(raw, dict) else {}
+        policy = str(selection.get("policy") or "legacy").strip().lower()
+        account_id = str(selection.get("account_id") or "").strip()
+        if policy in {"", "legacy", "personal_optional"} and not account_id:
+            return True
+        if policy != "personal_preferred":
+            return False
+        if not account_id or self.control_plane_store is None:
+            return True
+        account = self.control_plane_store.get_provider_account(
+            account_id=account_id,
+            tenant_id=str(worker.get("tenant_id") or "local"),
+            owner_id=str(worker.get("owner_id") or ""),
+        )
+        if account is None or str(account.get("status") or "").strip().lower() != "ready":
+            return True
+        lease = self.control_plane_store.active_provider_account_lease(account_id)
+        if lease is None:
+            return False
+        worker_id = str(worker.get("worker_id") or "")
+        active_run = self.store.get_active_run(worker_id) if worker_id else None
+        owns_active_mission_lease = bool(
+            active_run
+            and str(lease.get("worker_id") or "") == worker_id
+            and str(lease.get("run_id") or "") == str(active_run.get("run_id") or "")
+            and str(lease.get("lane") or "")
+            == f"{str(worker.get('profile') or '').strip()}:mission"
+        )
+        # A steer replaces the current worker's own active mission, whose binder
+        # releases this exact run lease during interruption. Every other lease makes
+        # personal_preferred fall back to the deployment route, so prove that route
+        # before creating or interrupting any run.
+        return not owns_active_mission_lease
 
     def _unresolved_duplication_reapprovals(self, worker: dict) -> list[dict]:
         report = worker.get("duplication_report")
@@ -2812,16 +2866,22 @@ class WorkersProjectsService:
             account_id = str(selection.get("account_id") or "") if isinstance(selection, dict) else ""
             account = accounts.get(account_id)
             if policy == "legacy":
+                readiness, status = deployment_provider_readiness(str(item.get("profile") or ""))
                 item["provider_readiness"] = {
-                    "readiness": "deployment_managed",
+                    "readiness": readiness,
                     "policy": "legacy",
                 }
+                if status:
+                    item["provider_readiness"]["status"] = status
             elif policy == "personal_preferred" and not account_id:
+                readiness, status = deployment_provider_readiness(str(item.get("profile") or ""))
                 item["provider_readiness"] = {
-                    "readiness": "deployment_managed",
+                    "readiness": readiness,
                     "policy": "personal_preferred",
                     "fallback": True,
                 }
+                if status:
+                    item["provider_readiness"]["status"] = status
             elif not account_id:
                 item["provider_readiness"] = {
                     "readiness": "action_required",
@@ -2835,6 +2895,18 @@ class WorkersProjectsService:
                     "account_id": account_id,
                     "status": "missing",
                 }
+            elif policy == "personal_preferred" and self._uses_deployment_provider_route(item):
+                readiness, status = deployment_provider_readiness(str(item.get("profile") or ""))
+                item["provider_readiness"] = {
+                    "readiness": readiness,
+                    "policy": "personal_preferred",
+                    "account_id": account_id,
+                    "provider": str(account.get("provider") or ""),
+                    "label": str(account.get("label") or ""),
+                    "fallback": True,
+                }
+                if status:
+                    item["provider_readiness"]["status"] = status
             else:
                 status = str(account.get("status") or "unknown")
                 item["provider_readiness"] = {
@@ -3888,8 +3960,17 @@ class WorkersProjectsService:
                 processed.append(updated or claimed)
             except SchedulePrincipalAuthorityError:
                 processed.append(self.store.get_schedule(schedule_id) or claimed)
-            except ControlPlaneConflict:
-                processed.append(self.store.get_schedule(schedule_id) or claimed)
+            except ControlPlaneConflict as exc:
+                # The schedule was already claimed. A provider/capability
+                # conflict must become a visible terminal outcome; leaving the
+                # row in `running` strands one-shot work forever and makes a
+                # recurring occurrence churn through stale-claim recovery.
+                updated = self.store.finalize_schedule(
+                    schedule_id,
+                    state="failed",
+                    last_error=str(exc),
+                )
+                processed.append(updated or claimed)
             except Exception as exc:
                 updated = self.store.finalize_schedule(schedule_id, state="failed", last_error=str(exc))
                 processed.append(updated or claimed)
@@ -3913,6 +3994,14 @@ class WorkersProjectsService:
             tenant_id=str(schedule.get("tenant_id") or "local"),
             owner_id=str(schedule.get("owner_id") or ""),
         )
+        effective_worker = dict(worker)
+        if runtime_bundle is not None:
+            effective_worker["bootstrap_bundle_json"] = json.dumps(
+                merge_bootstrap_bundle(self._bootstrap_bundle_for(worker), runtime_bundle) or {},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        self._ensure_dispatch_provider_ready(effective_worker)
         self._ensure_runtime_available(
             str(worker.get("profile") or ""),
             str(worker.get("execution_mode") or "docker"),
@@ -4399,6 +4488,16 @@ class WorkersProjectsService:
     ) -> dict:
         worker = self.require_worker(worker_id)
         self._ensure_execution_allowed(worker)
+        effective_worker = dict(worker)
+        effective_bundle_json = ""
+        if runtime_bundle is not None:
+            effective_bundle_json = json.dumps(
+                merge_bootstrap_bundle(self._bootstrap_bundle_for(worker), runtime_bundle) or {},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            effective_worker["bootstrap_bundle_json"] = effective_bundle_json
+        self._ensure_dispatch_provider_ready(effective_worker)
         self._ensure_runtime_available(
             str(worker.get("profile") or ""),
             str(worker.get("execution_mode") or "docker"),
@@ -4407,9 +4506,7 @@ class WorkersProjectsService:
         if runtime_bundle is not None:
             worker = self.store.update_worker(
                 worker_id,
-                bootstrap_bundle_json=json.dumps(
-                    merge_bootstrap_bundle(self._bootstrap_bundle_for(worker), runtime_bundle)
-                ),
+                bootstrap_bundle_json=effective_bundle_json,
             ) or worker
         resumed = worker["state"] == "paused"
         try:
@@ -4659,6 +4756,10 @@ class WorkersProjectsService:
     def steer_worker(self, worker_id: str, message: str) -> dict:
         worker = self.require_worker(worker_id)
         self._ensure_execution_allowed(worker)
+        # Steering replaces the active run. Prove the replacement route before
+        # interrupting useful work so missing deployment credentials are a
+        # fail-closed, non-mutating error.
+        self._ensure_dispatch_provider_ready(worker)
         active_run = self.store.get_active_run(worker_id)
         if active_run:
             interrupted = self.interrupt_worker(worker_id)
@@ -4913,6 +5014,7 @@ class WorkersProjectsService:
     def resume_worker(self, worker_id: str) -> dict:
         worker = self.require_worker(worker_id)
         self._ensure_execution_allowed(worker)
+        self._ensure_dispatch_provider_ready(worker)
         worker = self._refresh_worker_model_for_profile(worker)
         updated = self._start_worker_again(worker, event_type="worker.resumed", message="Worker resumed")
         active_run = self.store.get_active_run(worker_id)

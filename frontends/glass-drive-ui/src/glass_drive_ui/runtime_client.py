@@ -78,6 +78,12 @@ class RuntimeClient:
     def get_preferences(self) -> dict[str, Any]:
         return self._request("GET", "/v1/preferences")
 
+    def provider_readiness(self, profile: str) -> dict[str, str]:
+        return self._request(
+            "GET",
+            f"/v1/provider-readiness/{quote(str(profile or '').strip(), safe='')}",
+        )
+
     def update_preferences(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("PATCH", "/v1/preferences", json_body=payload)
 

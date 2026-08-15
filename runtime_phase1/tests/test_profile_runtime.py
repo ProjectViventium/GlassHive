@@ -3391,6 +3391,70 @@ def test_workspace_claude_command_passes_configured_api_timeout(tmp_path, monkey
     assert env["API_TIMEOUT_MS"] == "900000"
 
 
+def test_hosted_codex_command_env_exposes_only_its_selected_provider_route(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://openai.example.test/v1")
+    monkeypatch.setenv("PORTKEY_API_KEY", "synthetic-portkey")
+    monkeypatch.setenv("PORTKEY_BASE_URL", "https://portkey.example.test/v1")
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_hosted_codex_route",
+        "name": "Hosted Codex Worker",
+        "profile": "codex-cli",
+        "execution_mode": "docker",
+        "model": "gpt-test",
+    }
+
+    _command, openai_env = runtime._build_command(
+        worker, "do the work", runtime._runtime_info(worker)
+    )
+    assert openai_env["OPENAI_API_KEY"] == "synthetic-openai"
+    assert "PORTKEY_API_KEY" not in openai_env
+
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://selected.example.test/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_ENV_KEY", "PORTKEY_API_KEY")
+    _command, portkey_env = runtime._build_command(
+        worker, "do the work", runtime._runtime_info(worker)
+    )
+    assert portkey_env["PORTKEY_API_KEY"] == "synthetic-portkey"
+    assert "OPENAI_API_KEY" not in portkey_env
+
+
+def test_legacy_enterprise_flag_scopes_codex_and_openclaw_live_provider_env(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("GLASSHIVE_SECURITY_MODE", raising=False)
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://openai.example.test/v1")
+    monkeypatch.setenv("PORTKEY_API_KEY", "must-not-enter-openai-route")
+    monkeypatch.setenv("PORTKEY_BASE_URL", "https://portkey.example.test/v1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-enter-openclaw")
+
+    codex = CodexCliRuntime(base_dir=str(tmp_path / "codex"))
+    worker = {
+        "worker_id": "wrk_legacy_enterprise_codex",
+        "name": "Legacy Enterprise Codex Worker",
+        "profile": "codex-cli",
+        "execution_mode": "docker",
+        "model": "gpt-test",
+    }
+    _command, codex_env = codex._build_command(
+        worker, "do the work", codex._runtime_info(worker)
+    )
+    assert codex_env["OPENAI_API_KEY"] == "synthetic-openai"
+    assert "PORTKEY_API_KEY" not in codex_env
+
+    openclaw = OpenClawWorkstationRuntime(base_dir=str(tmp_path / "openclaw"))
+    openclaw_env = openclaw._sandbox_env()
+    assert openclaw_env["OPENAI_API_KEY"] == "synthetic-openai"
+    assert "PORTKEY_API_KEY" not in openclaw_env
+    assert "ANTHROPIC_API_KEY" not in openclaw_env
+
+
 def test_claude_usage_parser_preserves_input_output_and_cache_tokens(tmp_path):
     runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
     stdout = json.dumps(
@@ -5465,6 +5529,30 @@ def test_openclaw_can_scope_session_key_per_run(tmp_path, monkeypatch):
 
     assert command[command.index("--session-id") + 1] == "wpr-worker-wrk_openclaw-run_abc123"
     assert env
+
+
+def test_hosted_openclaw_command_env_exposes_only_its_selected_provider_route(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://openai.example.test/v1")
+    monkeypatch.setenv("PORTKEY_API_KEY", "synthetic-portkey")
+    monkeypatch.setenv("PORTKEY_BASE_URL", "https://portkey.example.test/v1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-enter-openclaw")
+    runtime = OpenClawWorkstationRuntime(base_dir=str(tmp_path / "data"))
+
+    openai_env = runtime._sandbox_env()
+    assert openai_env["OPENAI_API_KEY"] == "synthetic-openai"
+    assert "PORTKEY_API_KEY" not in openai_env
+    assert "ANTHROPIC_API_KEY" not in openai_env
+
+    monkeypatch.setenv("WPR_OPENCLAW_BASE_URL", "https://selected.example.test/v1")
+    monkeypatch.setenv("WPR_OPENCLAW_ENV_KEY", "PORTKEY_API_KEY")
+    portkey_env = runtime._sandbox_env()
+    assert portkey_env["PORTKEY_API_KEY"] == "synthetic-portkey"
+    assert "OPENAI_API_KEY" not in portkey_env
+    assert "ANTHROPIC_API_KEY" not in portkey_env
 
 
 def test_openclaw_neutralizes_default_onboarding_bootstrap_for_task_runs(tmp_path):

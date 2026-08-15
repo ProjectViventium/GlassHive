@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from workers_projects_runtime.control_plane import ControlPlaneStore
+from workers_projects_runtime.control_plane import ControlPlaneConflict, ControlPlaneStore
 from workers_projects_runtime.openclaw_runtime import RuntimeErrorBase, RuntimeInfo, StubRuntime
 from workers_projects_runtime.service import WorkersProjectsService
 from workers_projects_runtime.run_actions import RunActionError
@@ -478,6 +478,391 @@ def test_catalog_reports_personal_preferred_without_account_as_truthful_deployme
         "policy": "personal_preferred",
         "fallback": True,
     }
+
+
+def test_hosted_codex_catalog_requires_an_effective_deployment_provider_route(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    for name in (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "OPENAI_REVERSE_PROXY",
+        "PORTKEY_API_KEY",
+        "PORTKEY_BASE_URL",
+        "WPR_CODEX_CLI_BASE_URL",
+        "WPR_CODEX_CLI_ENV_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(
+        store,
+        PersistentFixtureRuntime(tmp_path / "managed-runtime"),
+        control_plane_store=ControlPlaneStore(str(tmp_path / "runtime.db")),
+        reconcile_on_startup=False,
+    )
+    try:
+        project = _project(store, title="Deployment route project")
+        service.create_worker(
+            project_id=project["project_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            name="Deployment route workspace",
+            role="main",
+            profile="codex-cli",
+            backend="codex-cli",
+            workspace_kind="named",
+            bootstrap_bundle={"provider_account": {"policy": "legacy"}},
+        )
+
+        unavailable = service.list_workspace_catalog(
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            workspace_kinds={"named"},
+        )["items"][0]["provider_readiness"]
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://provider.example.test/openai/v1")
+        monkeypatch.setenv("OPENAI_API_KEY", "synthetic-deployment-key")
+        ready = service.list_workspace_catalog(
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            workspace_kinds={"named"},
+        )["items"][0]["provider_readiness"]
+    finally:
+        service.shutdown()
+
+    assert unavailable == {
+        "readiness": "action_required",
+        "policy": "legacy",
+        "status": "deployment_provider_unavailable",
+    }
+    assert ready == {
+        "readiness": "deployment_managed",
+        "policy": "legacy",
+    }
+
+
+def test_hosted_deployment_route_blocks_dispatch_before_run_or_runtime_mutation(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_EPHEMERAL_GC_ENABLED", "false")
+    for name in (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "OPENAI_REVERSE_PROXY",
+        "PORTKEY_API_KEY",
+        "PORTKEY_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = PersistentFixtureRuntime(tmp_path / "managed-runtime")
+    service = WorkersProjectsService(
+        store,
+        runtime,
+        control_plane_store=ControlPlaneStore(str(tmp_path / "runtime.db")),
+        reconcile_on_startup=False,
+    )
+    service._ensure_worker_processor = lambda _worker_id: None  # type: ignore[method-assign]
+    try:
+        project = _project(store, title="Dispatch gate project")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            name="Dispatch gate workspace",
+            role="main",
+            profile="codex-cli",
+            backend="codex-cli",
+            workspace_kind="named",
+            bootstrap_bundle={"provider_account": {"policy": "legacy"}},
+        )
+        before = service.require_worker(worker["worker_id"])
+        with pytest.raises(ControlPlaneConflict, match="Work AI is not set up"):
+            service.assign_run(worker["worker_id"], "Must not dispatch")
+        after = service.require_worker(worker["worker_id"])
+        assert store.list_runs_for_worker(worker["worker_id"]) == []
+        assert after["state"] == before["state"]
+        assert after["last_run_id"] == before["last_run_id"]
+
+        monkeypatch.setenv("OPENAI_API_KEY", "synthetic-standard-openai-key")
+        run = service.assign_run(worker["worker_id"], "Now dispatch")
+        assert run["state"] == "queued"
+        assert len(store.list_runs_for_worker(worker["worker_id"])) == 1
+    finally:
+        service.shutdown()
+
+
+def test_hosted_steer_checks_replacement_route_before_interrupting_active_work(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_EPHEMERAL_GC_ENABLED", "false")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-standard-openai-key")
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(
+        store,
+        PersistentFixtureRuntime(tmp_path / "managed-runtime"),
+        control_plane_store=ControlPlaneStore(str(tmp_path / "runtime.db")),
+        reconcile_on_startup=False,
+    )
+    service._ensure_worker_processor = lambda _worker_id: None  # type: ignore[method-assign]
+    try:
+        project = _project(store, title="Steer gate project")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            name="Steer gate workspace",
+            role="main",
+            profile="codex-cli",
+            backend="codex-cli",
+            workspace_kind="named",
+            bootstrap_bundle={"provider_account": {"policy": "legacy"}},
+        )
+        active = service.assign_run(worker["worker_id"], "Keep this work active")
+        store.update_run(active["run_id"], state="running")
+        store.update_worker_state(worker["worker_id"], "running")
+        monkeypatch.delenv("OPENAI_API_KEY")
+
+        with pytest.raises(ControlPlaneConflict, match="Work AI is not set up"):
+            service.steer_worker(worker["worker_id"], "Do not interrupt unless replacement can run")
+
+        assert store.get_run(active["run_id"])["state"] == "running"
+        assert [item["run_id"] for item in store.list_runs_for_worker(worker["worker_id"])] == [
+            active["run_id"]
+        ]
+
+        interrupted = service.interrupt_worker(worker["worker_id"])
+        assert interrupted["worker_id"] == worker["worker_id"]
+        assert store.get_run(active["run_id"])["state"] == "interrupted"
+    finally:
+        service.shutdown()
+
+
+def test_busy_preferred_account_requires_ready_deployment_fallback_before_dispatch_or_steer(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_EPHEMERAL_GC_ENABLED", "false")
+    for name in (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "OPENAI_REVERSE_PROXY",
+        "PORTKEY_API_KEY",
+        "PORTKEY_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    database = tmp_path / "runtime.db"
+    store = Store(str(database))
+    control = ControlPlaneStore(str(database))
+    account = control.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="codex",
+        label="Synthetic preferred account",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://synthetic",
+        status="ready",
+    )
+    service = WorkersProjectsService(
+        store,
+        PersistentFixtureRuntime(tmp_path / "managed-runtime"),
+        control_plane_store=control,
+        reconcile_on_startup=False,
+    )
+    service._ensure_worker_processor = lambda _worker_id: None  # type: ignore[method-assign]
+    try:
+        project = _project(store, title="Busy preferred account")
+        lease_owner = service.create_worker(
+            project_id=project["project_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            name="Lease owner",
+            role="main",
+            profile="codex-cli",
+            backend="codex-cli",
+            workspace_kind="named",
+            bootstrap_bundle={"provider_account": {"policy": "legacy"}},
+        )
+        preferred = service.create_worker(
+            project_id=project["project_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            name="Preferred fallback",
+            role="main",
+            profile="codex-cli",
+            backend="codex-cli",
+            workspace_kind="named",
+            bootstrap_bundle={
+                "provider_account": {
+                    "policy": "personal_preferred",
+                    "account_id": account["account_id"],
+                }
+            },
+        )
+        busy_lease = control.acquire_provider_lease(
+            account_id=account["account_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            lane="provider-verify",
+            worker_id=lease_owner["worker_id"],
+            run_id="run_synthetic_busy_account",
+            ttl_seconds=180,
+        )
+
+        catalog_item = service.list_workspace_catalog(
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            workspace_kinds={"named"},
+        )["items"][0]
+        assert catalog_item["worker_id"] == preferred["worker_id"]
+        assert catalog_item["provider_readiness"] == {
+            "readiness": "action_required",
+            "policy": "personal_preferred",
+            "account_id": account["account_id"],
+            "provider": "codex",
+            "label": "Synthetic preferred account",
+            "fallback": True,
+            "status": "deployment_provider_unavailable",
+        }
+
+        with pytest.raises(ControlPlaneConflict, match="Work AI is not set up"):
+            service.assign_run(preferred["worker_id"], "Must not queue doomed fallback work")
+        assert store.list_runs_for_worker(preferred["worker_id"]) == []
+
+        monkeypatch.setenv("OPENAI_API_KEY", "synthetic-standard-openai-key")
+        fallback_item = service.list_workspace_catalog(
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            workspace_kinds={"named"},
+        )["items"][0]
+        assert fallback_item["provider_readiness"]["readiness"] == "deployment_managed"
+        assert fallback_item["provider_readiness"]["fallback"] is True
+        active = service.assign_run(preferred["worker_id"], "Keep this work active")
+        store.update_run(active["run_id"], state="running")
+        store.update_worker_state(preferred["worker_id"], "running")
+        monkeypatch.delenv("OPENAI_API_KEY")
+
+        with pytest.raises(ControlPlaneConflict, match="Work AI is not set up"):
+            service.steer_worker(
+                preferred["worker_id"],
+                "Do not interrupt unless the fallback route can run",
+            )
+        assert store.get_run(active["run_id"])["state"] == "running"
+        assert [item["run_id"] for item in store.list_runs_for_worker(preferred["worker_id"])] == [
+            active["run_id"]
+        ]
+
+        control.release_provider_lease(
+            lease_id=busy_lease["lease_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+        )
+        control.acquire_provider_lease(
+            account_id=account["account_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            lane="codex-cli:mission",
+            worker_id=preferred["worker_id"],
+            run_id=active["run_id"],
+            ttl_seconds=180,
+        )
+        # Steering this worker's own active personal mission is allowed because its
+        # binder releases this exact run lease as interruption completes.
+        service._ensure_dispatch_provider_ready(service.require_worker(preferred["worker_id"]))
+        own_lease_item = service.list_workspace_catalog(
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            workspace_kinds={"named"},
+        )["items"][0]
+        assert own_lease_item["provider_readiness"]["readiness"] == "ready"
+        assert "fallback" not in own_lease_item["provider_readiness"]
+    finally:
+        service.shutdown()
+
+
+def test_dispatch_gate_validates_effective_run_bundle_before_persisting_or_queueing(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE"):
+        monkeypatch.delenv(name, raising=False)
+    database = tmp_path / "runtime.db"
+    store = Store(str(database))
+    control = ControlPlaneStore(str(database))
+    account = control.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="codex",
+        label="Synthetic personal account",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://synthetic",
+        status="ready",
+    )
+    service = WorkersProjectsService(
+        store,
+        PersistentFixtureRuntime(tmp_path / "managed-runtime"),
+        control_plane_store=control,
+        reconcile_on_startup=False,
+    )
+    service._ensure_worker_processor = lambda _worker_id: None  # type: ignore[method-assign]
+    try:
+        project = _project(store, title="Effective bundle project")
+        legacy = service.create_worker(
+            project_id=project["project_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            name="Legacy to personal",
+            role="main",
+            profile="codex-cli",
+            backend="codex-cli",
+            workspace_kind="named",
+            bootstrap_bundle={"provider_account": {"policy": "legacy"}},
+        )
+        run = service.assign_run(
+            legacy["worker_id"],
+            "Use selected account",
+            runtime_bundle={
+                "provider_account": {
+                    "policy": "personal_required",
+                    "account_id": account["account_id"],
+                }
+            },
+        )
+        assert run["state"] == "queued"
+
+        personal = service.create_worker(
+            project_id=project["project_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            name="Personal to legacy",
+            role="main",
+            profile="codex-cli",
+            backend="codex-cli",
+            workspace_kind="named",
+            bootstrap_bundle={
+                "provider_account": {
+                    "policy": "personal_required",
+                    "account_id": account["account_id"],
+                }
+            },
+        )
+        before_bundle = personal["bootstrap_bundle_json"]
+        with pytest.raises(ControlPlaneConflict, match="Work AI is not set up"):
+            service.assign_run(
+                personal["worker_id"],
+                "Must use deployment route",
+                runtime_bundle={"provider_account": None},
+            )
+        assert store.list_runs_for_worker(personal["worker_id"]) == []
+        assert service.require_worker(personal["worker_id"])["bootstrap_bundle_json"] == before_bundle
+    finally:
+        service.shutdown()
 
 
 def test_gc_corrupt_persisted_paths_are_metadata_only_and_never_delete_arbitrary_files(tmp_path, monkeypatch):

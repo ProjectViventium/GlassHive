@@ -1,4 +1,4 @@
-import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260811m';
+import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260813a';
 import { credentialPolicyTransition, preferredProviderAccountId, shouldResumeOnWorkspaceOpen, workspaceLifecycleControl } from './launch-policy.js?v=20260811m';
 import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811m';
 import { compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery } from './workspace-overview.js?v=20260811m';
@@ -12,7 +12,7 @@ const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'terminating', '
 const MAX_VIEW_ONLY_PREVIEWS = 3;
 const ACTIVE_TILE_REFRESH_MS = 7000;
 const RETAINED_TILE_REFRESH_MS = 60000;
-const GLASSHIVE_UI_REV = '20260811m';
+const GLASSHIVE_UI_REV = '20260813a';
 const CAPABILITY_REVIEW_KEY = 'glasshive.capability-review';
 let workspaceRefreshInFlight = false;
 let csrfToken = '';
@@ -899,16 +899,20 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   const metaParts = [workspaceProfileLabel(workspace.profile), displayStateLabel(state)];
   const providerReadiness = workspace.provider_readiness || {};
   if (providerReadiness.readiness === 'action_required') {
-    const accountLabel = String(providerReadiness.label || selectedAccount?.label || 'saved personal account');
-    metaParts.push(`${accountLabel}: reconnect required`);
+    if (providerReadiness.status === 'deployment_provider_unavailable') {
+      metaParts.push('Work AI is not set up. Ask an administrator.');
+    } else {
+      const accountLabel = String(providerReadiness.label || selectedAccount?.label || 'saved personal account');
+      metaParts.push(`${accountLabel}: reconnect required`);
+    }
   } else if (providerReadiness.readiness === 'ready') {
     metaParts.push(`${String(providerReadiness.label || selectedAccount?.label || 'personal account')}: ready`);
   } else if (providerReadiness.readiness === 'deployment_managed') {
     metaParts.push(providerReadiness.policy === 'personal_preferred'
-      ? 'deployment account fallback'
-      : 'deployment account');
+      ? 'Work AI: organization fallback'
+      : 'Work AI: managed by your organization');
   } else if (currentPolicy === 'legacy') {
-    metaParts.push('deployment account');
+    metaParts.push('Work AI: managed by your organization');
   } else if (selectedAccount) {
     const accountLabel = String(selectedAccount.label || selectedAccount.provider || 'personal account');
     metaParts.push(`${accountLabel}: ${String(selectedAccount.status || 'unknown').replaceAll('_', ' ')}`);

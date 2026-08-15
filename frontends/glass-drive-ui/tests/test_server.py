@@ -332,9 +332,16 @@ class FakeRuntimeClient:
         self.activity_requests = []
         self.schedule_authority_requests = []
         self.schedule_authority_error = None
+        self.provider_readiness_response = {
+            "readiness": "deployment_managed",
+            "status": "Work AI is ready.",
+        }
 
     def health(self):
         return {"status": "ok"}
+
+    def provider_readiness(self, profile: str):
+        return {**self.provider_readiness_response, "profile": profile}
 
     def with_headers(self, headers: dict[str, str]):
         self.header_contexts.append(headers)
@@ -940,6 +947,32 @@ def test_bootstrap_and_launch_flow():
     assert launch.json()['watch_url'].startswith('/watch/wrk_new')
     assert 'surface=desktop' in launch.json()['watch_url']
     assert fake.create_worker_requests[-1]['start_synchronously'] is False
+
+
+def test_new_workspace_launch_blocks_missing_work_ai_before_any_workspace_mutation():
+    fake = FakeRuntimeClient()
+    fake.provider_readiness_response = {
+        "readiness": "action_required",
+        "status": "Work AI is not set up.",
+    }
+    client = TestClient(create_app(runtime_client=fake))
+
+    response = client.post('/api/launch', json={
+        'description': 'Create a synthetic provider readiness report',
+        'success_criteria': 'Return the report',
+        'context': '',
+        'workspace_option': 'new:codex-cli',
+    })
+
+    assert response.status_code == 409
+    assert response.json()['detail'] == (
+        'Work AI is not set up. Ask an administrator to finish provider setup '
+        'or connect a personal account in Connections.'
+    )
+    assert fake.create_project_requests == []
+    assert fake.create_worker_requests == []
+    assert fake.assign_requests == []
+    assert fake.launch_failures == []
 
 
 def test_bootstrap_labels_degraded_personal_sections_instead_of_claiming_empty_state():
@@ -1992,7 +2025,8 @@ def test_launcher_workspace_hive_static_controls():
     assert "if (workspaceCatalogStatus) workspaceCatalogStatus.textContent = '';" in app_js
     assert "cursor: append ? String(catalogState.nextCursor || '') : ''" in app_js
     assert "workspace.provider_readiness" in app_js
-    assert "deployment account fallback" in app_js
+    assert "Work AI is not set up. Ask an administrator." in app_js
+    assert "Work AI: organization fallback" in app_js
     assert "function updateWorkspaceMeta" in app_js
     assert "meta.dataset.catalogDetails" in app_js
     assert "updateWorkspaceMeta(meta, data?.worker?.profile, state);" in app_js
@@ -4920,7 +4954,7 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_SCOPES", "user_impersonation")
     monkeypatch.setenv(
         "GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES",
-        "api://00000000-0000-4000-8000-000000000123/user_impersonation",
+        "https://glasshive.example.test/mcp/access_as_user",
     )
     monkeypatch.setenv(
         "GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS",
@@ -4956,7 +4990,15 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert "--oauth-resource" not in payload["clients"]["codex"]["add_command"]
     assert payload["clients"]["codex"]["login_command"] == (
         "codex mcp login -c mcp_oauth_callback_port=49153 "
-        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive-d0c2dae3d5cd"
+        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' "
+        "glasshive-d0c2dae3d5cd"
+    )
+    assert payload["clients"]["codex"]["config_toml"] == (
+        "[mcp_servers.glasshive-d0c2dae3d5cd]\n"
+        'url = "https://glasshive.example.test/mcp"\n'
+        'scopes = ["https://glasshive.example.test/mcp/access_as_user", "offline_access"]\n\n'
+        "[mcp_servers.glasshive-d0c2dae3d5cd.oauth]\n"
+        'client_id = "registered-codex-client"'
     )
     assert payload["clients"]["codex"]["callback_uri"] == (
         "http://127.0.0.1:49153/callback/0MLa49XNV_Yw"
@@ -4973,10 +5015,33 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert payload["configuration_status"] == "ready"
     assert payload["documentation_url"].endswith("/glasshive-client-registration")
     assert payload["source"]["license"] == "FSL-1.1-ALv2"
-    assert payload["clients"]["codex"]["add_command"] in payload["guided_prompt"]
-    assert payload["clients"]["codex"]["login_command"] in payload["guided_prompt"]
-    assert payload["clients"]["claude"]["add_command"] in payload["guided_prompt"]
-    assert payload["clients"]["claude"]["login_note"] in payload["guided_prompt"]
+    codex_prompt = payload["clients"]["codex"]["setup_prompt"]
+    claude_prompt = payload["clients"]["claude"]["setup_prompt"]
+    assert payload["clients"]["codex"]["config_toml"] in codex_prompt
+    assert payload["clients"]["codex"]["login_command"] in codex_prompt
+    assert "Persist these scopes" in codex_prompt
+    assert "can renew the login" in codex_prompt
+    assert "If GlassHive tools already work" in codex_prompt
+    assert "unscoped" not in codex_prompt
+    assert "interrupt" not in codex_prompt
+    assert "start a new Codex task" not in codex_prompt
+    assert "Restart the Codex/ChatGPT desktop app once" in codex_prompt
+    assert "Complete the native browser sign-in" in codex_prompt
+    assert "Claude" not in codex_prompt
+    assert "workspace_list once" in codex_prompt
+    assert "Never enumerate or summarize the tool catalog" in codex_prompt
+    assert payload["clients"]["claude"]["add_command"] in claude_prompt
+    assert payload["clients"]["claude"]["login_note"] in claude_prompt
+    assert "Codex" not in claude_prompt
+    assert "workspace_list once" in claude_prompt
+    assert "Never enumerate or summarize the tool catalog" in claude_prompt
+    assert "If you are Codex, follow only the Codex section." in payload["guided_prompt"]
+    assert "If you are Claude Code, follow only the Claude Code section." in payload["guided_prompt"]
+    assert codex_prompt in payload["guided_prompt"]
+    assert claude_prompt in payload["guided_prompt"]
+    assert "list the GlassHive tools" not in payload["guided_prompt"]
+    assert "Do not build OAuth URLs" in payload["guided_prompt"]
+    assert "custom callback" not in payload["guided_prompt"]
     assert "administrator" not in payload["guided_prompt"].lower()
     control_plane_script = (
         server_module.STATIC_DIR / "control-plane.js"
@@ -5020,9 +5085,10 @@ def test_connect_ai_advertises_only_clients_with_a_complete_deployment_contract(
 
     assert payload["supported_clients"] == ["codex"]
     assert set(payload["clients"]) == {"codex"}
-    assert payload["clients"]["codex"]["add_command"] in payload["guided_prompt"]
+    assert payload["clients"]["codex"]["setup_prompt"] in payload["guided_prompt"]
+    assert payload["clients"]["codex"]["config_toml"] in payload["guided_prompt"]
     assert payload["clients"]["codex"]["login_command"] in payload["guided_prompt"]
-    assert "For Claude Code" not in payload["guided_prompt"]
+    assert "If you are Claude Code" not in payload["guided_prompt"]
 
 
 def test_external_ai_primary_ui_is_url_first_and_callbacks_are_admin_details():
@@ -5037,6 +5103,9 @@ def test_external_ai_primary_ui_is_url_first_and_callbacks_are_admin_details():
     assert 'id="connect-ai-registration-details"' in page
     assert "Copy server address" in page
     assert "Recommended" in page
+    assert "Connect this AI" in page
+    assert "Paste once. Your AI follows only its own setup." in page
+    assert "Copy connect instruction" in page
     assert "Do not open this address" in script
     assert "connectAi.mcp_url" in script
     assert "connectAi.server_name" in script
@@ -5045,6 +5114,7 @@ def test_external_ai_primary_ui_is_url_first_and_callbacks_are_admin_details():
     assert "manualTab.tabIndex = manual ? 0 : -1" in script
     assert "if (canSetup && clients.codex)" in script
     assert "if (canSetup && clients.claude)" in script
+    assert "String(clients.codex.config_toml || '')" in script
     assert "ChatGPT or Codex" not in script
     assert "connect-ai-supported-summary" in page
     assert "connect-ai-auto-copy" in page

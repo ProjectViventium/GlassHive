@@ -11,6 +11,7 @@ from pathlib import Path
 from threading import Condition, Event, Lock, Thread
 from typing import Callable, Iterator
 
+from .auth import multi_user_security_enabled
 from .control_plane import ControlPlaneConflict, ControlPlaneError, ControlPlaneStore
 from .openclaw_runtime import RuntimeErrorBase
 from .provider_accounts import ProviderAccountHomeManager
@@ -59,6 +60,118 @@ _CLAUDE_CONFLICTING_ENV = {
     "AWS_SESSION_TOKEN",
     "AWS_BEARER_TOKEN_BEDROCK",
 }
+
+
+def _usable_provider_value(name: str) -> str:
+    value = str(os.environ.get(name) or "").strip()
+    if not value or value == "user_provided" or (value.startswith("${") and value.endswith("}")):
+        return ""
+    return value
+
+
+def deployment_provider_readiness(profile: str) -> tuple[str, str]:
+    """Return the effective deployment-managed route state without exposing credentials."""
+
+    if not multi_user_security_enabled():
+        return "deployment_managed", ""
+    normalized = str(profile or "").strip().lower()
+    if normalized in {"codex-cli", "openclaw-codex"}:
+        base_url = (
+            _usable_provider_value("WPR_CODEX_CLI_BASE_URL")
+            or _usable_provider_value("OPENAI_BASE_URL")
+            or _usable_provider_value("OPENAI_API_BASE")
+            or _usable_provider_value("OPENAI_REVERSE_PROXY")
+            or _usable_provider_value("PORTKEY_BASE_URL")
+        )
+        key_name = (
+            _usable_provider_value("WPR_CODEX_CLI_ENV_KEY")
+        )
+        if not key_name:
+            key_name = (
+                "PORTKEY_API_KEY"
+                if _usable_provider_value("PORTKEY_BASE_URL")
+                and not any(
+                    _usable_provider_value(name)
+                    for name in (
+                        "WPR_CODEX_CLI_BASE_URL",
+                        "OPENAI_BASE_URL",
+                        "OPENAI_API_BASE",
+                        "OPENAI_REVERSE_PROXY",
+                    )
+                )
+                else "OPENAI_API_KEY"
+            )
+        if key_name not in {"OPENAI_API_KEY", "PORTKEY_API_KEY"}:
+            return "action_required", "deployment_provider_unavailable"
+        credential = _usable_provider_value(key_name)
+        disabled = any(
+            _usable_provider_value(name).lower() in {"1", "true", "yes", "on", "enabled"}
+            for name in ("WPR_CODEX_CLI_DISABLE_CUSTOM_PROVIDER",)
+        )
+        # The native OpenAI route needs only OPENAI_API_KEY; custom-compatible and
+        # Portkey routes require the selected endpoint plus its selected credential.
+        ready = bool(credential) and not disabled and (
+            bool(base_url) or key_name == "OPENAI_API_KEY"
+        )
+    elif normalized in {"openclaw", "openclaw-general"}:
+        base_url = (
+            _usable_provider_value("WPR_OPENCLAW_BASE_URL")
+            or _usable_provider_value("OPENAI_BASE_URL")
+            or _usable_provider_value("OPENAI_API_BASE")
+            or _usable_provider_value("OPENAI_REVERSE_PROXY")
+            or _usable_provider_value("PORTKEY_BASE_URL")
+        )
+        key_name = _usable_provider_value("WPR_OPENCLAW_ENV_KEY")
+        if not key_name:
+            key_name = (
+                "PORTKEY_API_KEY"
+                if _usable_provider_value("PORTKEY_BASE_URL")
+                and not any(
+                    _usable_provider_value(name)
+                    for name in (
+                        "WPR_OPENCLAW_BASE_URL",
+                        "OPENAI_BASE_URL",
+                        "OPENAI_API_BASE",
+                        "OPENAI_REVERSE_PROXY",
+                    )
+                )
+                else "OPENAI_API_KEY"
+            )
+        if key_name not in {"OPENAI_API_KEY", "PORTKEY_API_KEY"}:
+            return "action_required", "deployment_provider_unavailable"
+        credential = _usable_provider_value(key_name)
+        disabled = _usable_provider_value("WPR_OPENCLAW_DISABLE_CUSTOM_PROVIDER").lower() in {
+            "1", "true", "yes", "on", "enabled"
+        }
+        ready = bool(credential) and not disabled and (
+            bool(base_url) or key_name == "OPENAI_API_KEY"
+        )
+    elif normalized in {"claude-code", "openclaw-claude"}:
+        use_bedrock = _usable_provider_value("CLAUDE_CODE_USE_BEDROCK").lower() in {
+            "1", "true", "yes", "on", "enabled"
+        }
+        use_api_key = _usable_provider_value("WPR_CLAUDE_CODE_USE_API_KEY").lower() in {
+            "1", "true", "yes", "on", "enabled"
+        }
+        if use_bedrock:
+            ready = bool(_usable_provider_value("AWS_REGION")) and bool(
+                _usable_provider_value("AWS_BEARER_TOKEN_BEDROCK")
+                or (
+                    _usable_provider_value("AWS_ACCESS_KEY_ID")
+                    and _usable_provider_value("AWS_SECRET_ACCESS_KEY")
+                )
+            )
+        elif use_api_key:
+            ready = bool(_usable_provider_value("ANTHROPIC_API_KEY"))
+        else:
+            ready = bool(_usable_provider_value("CLAUDE_CODE_OAUTH_TOKEN"))
+    else:
+        ready = False
+    return (
+        ("deployment_managed", "")
+        if ready
+        else ("action_required", "deployment_provider_unavailable")
+    )
 
 
 @dataclass(frozen=True)
@@ -494,7 +607,13 @@ class MissionProviderAccountBinder:
         return max(15, min(requested, 60 * 60))
 
     @staticmethod
-    def _preferred_fallback(worker: dict) -> dict:
+    def _preferred_fallback(worker: dict, runtime_name: str) -> dict:
+        readiness, _status = deployment_provider_readiness(runtime_name)
+        if readiness != "deployment_managed":
+            raise RuntimeErrorBase(
+                "Work AI is not set up for this workspace. Reconnect the personal account or "
+                "ask an administrator to finish provider setup."
+            )
         return {
             **worker,
             "_glasshive_provider_account_preferred_fallback": True,
@@ -616,14 +735,14 @@ class MissionProviderAccountBinder:
         preferred = selection.policy == "personal_preferred"
         if self.store is None:
             if preferred:
-                yield self._preferred_fallback(worker)
+                yield self._preferred_fallback(worker, runtime_name)
                 return
             raise RuntimeErrorBase(
                 "Mission provider accounts are unavailable because the control-plane store is not configured"
             )
         if runtime_name not in _PROFILE_PROVIDERS:
             if preferred:
-                yield self._preferred_fallback(worker)
+                yield self._preferred_fallback(worker, runtime_name)
                 return
             raise RuntimeErrorBase(
                 "Personal provider accounts are supported only for Codex and Claude mission workers"
@@ -632,7 +751,7 @@ class MissionProviderAccountBinder:
             execution_mode == "docker" and not isolated_container
         ):
             if preferred:
-                yield self._preferred_fallback(worker)
+                yield self._preferred_fallback(worker, runtime_name)
                 return
             raise RuntimeErrorBase(
                 "Personal provider account missions require a host-native worker or the reviewed per-worker container substrate"
@@ -651,7 +770,7 @@ class MissionProviderAccountBinder:
         )
         if account is None:
             if preferred:
-                yield self._preferred_fallback(worker)
+                yield self._preferred_fallback(worker, runtime_name)
                 return
             raise RuntimeErrorBase("Selected provider account is not available for this user")
         provider = str(account.get("provider") or "").strip().lower()
@@ -661,7 +780,7 @@ class MissionProviderAccountBinder:
             )
         if str(account.get("status") or "").strip().lower() != "ready":
             if preferred:
-                yield self._preferred_fallback(worker)
+                yield self._preferred_fallback(worker, runtime_name)
                 return
             raise RuntimeErrorBase(
                 "Selected provider account is not ready; reconnect or verify it before running"
@@ -704,13 +823,13 @@ class MissionProviderAccountBinder:
         except ControlPlaneConflict as exc:
             self._close_active_route(worker_id, route_token)
             if preferred:
-                yield self._preferred_fallback(worker)
+                yield self._preferred_fallback(worker, runtime_name)
                 return
             raise RuntimeErrorBase("Selected provider account is already in use") from exc
         except ControlPlaneError as exc:
             self._close_active_route(worker_id, route_token)
             if preferred:
-                yield self._preferred_fallback(worker)
+                yield self._preferred_fallback(worker, runtime_name)
                 return
             raise RuntimeErrorBase(str(exc)) from exc
         except BaseException:

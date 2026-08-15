@@ -102,6 +102,7 @@ from .service import (
     merge_bootstrap_bundle,
     public_callback_message_text,
 )
+from .mission_provider_accounts import deployment_provider_readiness
 from .signed_links import (
     append_signed_query,
     create_signed_link_ref,
@@ -1888,6 +1889,18 @@ def create_app(
         if not auth_settings.enterprise:
             payload["metrics"] = store.metrics()
         return payload
+
+    @app.get("/v1/provider-readiness/{profile}")
+    def provider_readiness(profile: str, request: Request) -> dict[str, str]:
+        ctx = _auth_context(request)
+        if ctx.enterprise and not ctx.owner_id:
+            raise HTTPException(status_code=401, detail="Missing authenticated user assertion")
+        normalized = str(profile or "").strip().lower()
+        allowed = set(allowed_worker_profiles() or [])
+        if not normalized or (allowed and normalized not in allowed):
+            raise HTTPException(status_code=404, detail="Worker profile is not available")
+        readiness, status = deployment_provider_readiness(normalized)
+        return {"readiness": readiness, "status": status}
 
     @app.get("/favicon.ico")
     def favicon() -> Response:

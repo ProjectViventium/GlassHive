@@ -203,12 +203,36 @@ Prefer remote HTTP MCP with auth in front of the server when not loopback-only.
 The designed Glass Drive **Use GlassHive from another AI app** panel is the source of truth for a
 deployment's public HTTPS MCP URL and the exact clients that deployment has completely registered.
 It must not advertise Codex, Claude Code, ChatGPT, or another client unless the live endpoint returns
-that client's complete allowlisted contract. The primary `Automatic` path copies one self-contained
-instruction containing the exact deployment-generated add/sign-in command for every returned client;
-the receiving AI does not have to guess configuration from a URL it cannot contextualize. The user
-completes sign-in in the browser profile opened by the
+that client's complete allowlisted contract. The primary `Automatic` path copies one short
+self-selecting instruction: Codex follows only the Codex section and Claude Code follows only the
+Claude Code section. Each section contains that client's exact deployment-generated add/sign-in
+command, tells an existing matching registration to be reused, and ends with one `workspace_list`
+verification instead of a full tool-catalog dump. The receiving AI does not configure another
+client or guess configuration from a URL it cannot contextualize. If GlassHive is already connected,
+the companion skill skips setup and calls only the one tool needed for the user's request. The user completes sign-in in the
+browser profile opened by the
 client, or copies the client-provided authorization URL into the browser profile they intend to use.
-The browser does not claim it can edit local client configuration itself.
+The browser does not claim it can edit local client configuration itself. The clients' native OAuth
+flows are authoritative: the receiving AI must not construct OAuth URLs, run a custom callback
+listener, inspect tokens, or fall back to static credentials.
+
+GlassHive includes the exact required API scope in both protected-resource metadata and the initial
+`WWW-Authenticate` challenge. Current Codex releases can still fall back to generic OpenID scopes on
+an ordinary Reconnect unless the MCP server's native config persists its `scopes` values. For Entra,
+that config contains both the canonical GlassHive API scope and `offline_access`: the API scope binds
+the authorization to the MCP resource, while `offline_access` asks Entra for the refresh token needed
+to renew an expired access token. The generated Codex setup includes those values once and tells the
+user to restart Codex/ChatGPT once after changing the config; later Add/Reconnect actions use the same
+resource and renewable login without a hand-built authorization URL. Claude Code continues to use its
+native remote-HTTP add and `/mcp` sign-in flow.
+
+MCP is the capability boundary. The companion skill is a concise workflow guide that tells the AI
+which GlassHive tool to call; a plugin is optional distribution packaging, not another integration
+layer. This follows the official Codex model of starting integrations with MCP and using skills for
+reusable instructions, and Claude Code's native remote-HTTP MCP plus `/mcp` authentication flow.
+Shared server instructions stay short because clients may present them alongside every tool. They
+say to make one matching call when one call can finish the request and never narrate the catalog;
+action-specific parameters and safety details stay with the action that owns them.
 
 The generated command may carry a public client id and fixed callback flags as opaque setup
 arguments. GlassHive still validates that the configured Codex resource exactly equals the canonical
@@ -239,9 +263,12 @@ and base callback URL so an ambient user-level `mcp_oauth_callback_url` cannot r
 registration to a different host or path.
 
 The public HTTPS MCP URL is the RFC 8707 resource sent by Codex and returned in protected-resource
-metadata. It is not implicitly the JWT `aud`. Entra v2 access tokens normally use the API app's
-client-id GUID as `aud`, while delegated scopes use the authorization server's full recognized value
-such as `api://<api-app-client-id>/user_impersonation`. Multi-user MCP therefore requires explicit
+metadata. For Entra, register that exact canonical URL as an additional Application ID URI on the
+resource application and request its delegated scope as
+`<canonical-mcp-url>/access_as_user`. Keep the existing `api://<api-app-client-id>` identifier
+when another consumer still uses it. The public URL is not implicitly the JWT `aud`: Entra v2 access
+tokens normally use the API app's client-id GUID as `aud`, and the `scp` claim contains only the
+short delegated permission value. Multi-user MCP therefore requires explicit
 `GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES` independently of `GLASSHIVE_MCP_PUBLIC_URL` and validates
 issuer, one of those exact token audiences, non-conflicting tenant claims, stable subject, required
 scopes, and one explicitly
@@ -251,7 +278,9 @@ client claim names with `GLASSHIVE_MCP_OAUTH_CLIENT_ID_CLAIMS`; rotate registrat
 old and new IDs only for the bounded rollout window. Entra does not provide MCP dynamic client
 registration, so Connect AI emits no client command until the deployment config also supplies the
 same pre-registered Codex/Claude client ID, each fixed callback port, explicit token audiences and
-scopes, and the canonical Codex public resource. Resource drift, missing verifier policy, or a client
+scopes, and the canonical Codex public resource. An Entra request scope whose resource prefix differs
+from that canonical URL is invalid deployment configuration: the authorization server can reject it
+before issuing a token even when the client and callback are correct. Resource drift, missing verifier policy, or a client
 ID outside the allowlist remains `action_required` and produces no copyable command. When enrollment
 is enabled, a first fully verified MCP login enrolls the same hashed
 issuer/subject principal used by Glass Drive, while a locally disabled principal is rejected on the

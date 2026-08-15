@@ -68,6 +68,31 @@ from workers_projects_runtime.store import Store, WorkerClosedStoreError
 from workers_projects_runtime.terminal_takeover import TerminalTarget
 
 
+def test_provider_readiness_endpoint_returns_only_bounded_profile_status(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli")
+    monkeypatch.setattr(
+        api_module,
+        "deployment_provider_readiness",
+        lambda profile: (
+            "action_required",
+            "deployment_provider_unavailable",
+        ),
+    )
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub"))
+
+    response = client.get("/v1/provider-readiness/codex-cli")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "readiness": "action_required",
+        "status": "deployment_provider_unavailable",
+    }
+    unavailable = client.get("/v1/provider-readiness/unknown-profile")
+    assert unavailable.status_code == 404
+
+
 def test_runtime_signed_link_sqlite_state_is_private(tmp_path, monkeypatch):
     state_path = tmp_path / "private-state" / "link-refs.sqlite3"
     monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(state_path))
@@ -2372,6 +2397,7 @@ def test_enterprise_short_worker_view_ref_can_auto_resume_when_configured(tmp_pa
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
     monkeypatch.setenv("GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME", "true")
     monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive-ui.example.test")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-deployment-provider")
 
     client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
     headers = {
