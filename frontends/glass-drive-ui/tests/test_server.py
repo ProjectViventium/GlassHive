@@ -5022,6 +5022,9 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert "Persist these scopes" in codex_prompt
     assert "can renew the login" in codex_prompt
     assert "If GlassHive tools already work" in codex_prompt
+    assert "codex plugin marketplace add ProjectViventium/GlassHive" in codex_prompt
+    assert "codex plugin add glasshive@glasshive" in codex_prompt
+    assert "claude plugin" not in codex_prompt
     assert "unscoped" not in codex_prompt
     assert "interrupt" not in codex_prompt
     assert "start a new Codex task" not in codex_prompt
@@ -5032,6 +5035,9 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert "Never enumerate or summarize the tool catalog" in codex_prompt
     assert payload["clients"]["claude"]["add_command"] in claude_prompt
     assert payload["clients"]["claude"]["login_note"] in claude_prompt
+    assert "claude plugin marketplace add ProjectViventium/GlassHive" in claude_prompt
+    assert "claude plugin install glasshive@glasshive --scope user --yes" in claude_prompt
+    assert "codex plugin" not in claude_prompt
     assert "Codex" not in claude_prompt
     assert "workspace_list once" in claude_prompt
     assert "Never enumerate or summarize the tool catalog" in claude_prompt

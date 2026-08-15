@@ -2895,7 +2895,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 (
                     "You are Codex. Connect this Codex client to GlassHive.",
                     "If GlassHive tools already work, do not change setup; make only the requested tool call.",
-                    "Otherwise add or update this server in your native Codex MCP config, preserving unrelated settings. Persist these scopes so Reconnect uses the right OAuth resource and can renew the login:",
+                    "Otherwise install the official GlassHive skill once:",
+                    "codex plugin marketplace add ProjectViventium/GlassHive",
+                    "codex plugin add glasshive@glasshive",
+                    "Then add or update this server in your native Codex MCP config, preserving unrelated settings. Persist these scopes so Reconnect uses the right OAuth resource and can renew the login:",
                     str(codex_client["config_toml"]),
                     "Restart the Codex/ChatGPT desktop app once so it reloads the MCP config.",
                     "Then use native sign-in:",
@@ -2913,6 +2916,9 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             claude_setup_prompt = "\n".join(
                 (
                     "You are Claude Code. Connect this Claude Code client to GlassHive.",
+                    "Install the official GlassHive skill once if it is not already installed:",
+                    "claude plugin marketplace add ProjectViventium/GlassHive",
+                    "claude plugin install glasshive@glasshive --scope user --yes",
                     f"Check `claude mcp get {server_name}`. If it already exists, do not add a duplicate. Otherwise run:",
                     str(claude_client["add_command"]),
                     str(claude_client.get("login_note") or "Open /mcp and finish sign-in."),

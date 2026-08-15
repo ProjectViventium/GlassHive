@@ -75,6 +75,78 @@ def test_connect_skill_skips_setup_when_connected_and_never_lists_the_catalog():
     assert "start a new task" not in compact_skill
 
 
+def test_agent_plugins_package_the_one_canonical_connect_skill_without_a_second_mcp_contract():
+    root = Path(__file__).parents[2]
+    canonical_skill = root / "skills" / "connect-glasshive"
+    plugin_root = root / "plugins" / "glasshive"
+    packaged_skill = plugin_root / "skills" / "connect-glasshive"
+    codex_manifest = json.loads(
+        (plugin_root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+    codex_marketplace = json.loads(
+        (root / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8")
+    )
+    claude_manifest = json.loads(
+        (plugin_root / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+    claude_marketplace = json.loads(
+        (root / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
+    )
+
+    assert codex_manifest["name"] == "glasshive"
+    assert codex_manifest["skills"] == "./skills/"
+    assert "mcpServers" not in codex_manifest
+    assert codex_manifest["interface"]["defaultPrompt"] == [
+        "List my GlassHive workspaces",
+        "Start a GlassHive workspace for this goal",
+        "Show my GlassHive schedules",
+    ]
+    assert codex_marketplace == {
+        "name": "glasshive",
+        "interface": {"displayName": "GlassHive"},
+        "plugins": [
+            {
+                "name": "glasshive",
+                "source": {"source": "local", "path": "./plugins/glasshive"},
+                "policy": {
+                    "installation": "AVAILABLE",
+                    "authentication": "ON_INSTALL",
+                },
+                "category": "Productivity",
+            }
+        ],
+    }
+    assert claude_manifest == {
+        "name": "glasshive",
+        "version": "0.1.0",
+        "description": "Control GlassHive workspaces from Claude Code.",
+        "author": {"name": "Project Viventium"},
+        "homepage": "https://github.com/ProjectViventium/GlassHive",
+        "repository": "https://github.com/ProjectViventium/GlassHive",
+        "license": "FSL-1.1-ALv2",
+        "keywords": ["glasshive", "workspace", "mcp", "claude"],
+    }
+    assert claude_marketplace == {
+        "name": "glasshive",
+        "owner": {"name": "Project Viventium"},
+        "description": "The official GlassHive plugin marketplace.",
+        "plugins": [
+            {
+                "name": "glasshive",
+                "source": "./plugins/glasshive",
+                "description": "Control GlassHive workspaces from Claude Code.",
+                "category": "productivity",
+            }
+        ],
+    }
+    assert (packaged_skill / "SKILL.md").read_bytes() == (
+        canonical_skill / "SKILL.md"
+    ).read_bytes()
+    assert (packaged_skill / "agents" / "openai.yaml").read_bytes() == (
+        canonical_skill / "agents" / "openai.yaml"
+    ).read_bytes()
+
+
 def _media_schemas(content: dict[str, Any] | None) -> dict[str, Any]:
     return {
         media_type: {
