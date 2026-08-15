@@ -86,8 +86,11 @@ standalone/plain LibreChat deployments must still work without them by using:
 
 Default `workspace_launch`, `workspace_wait`, and `workspace_status` payloads are intentionally
 compact. They return user-actionable state, result tools, output text, artifact short links, and a
-View / Steer short link when available; raw project/worker/run ids and live diagnostic snapshots are
-returned only when the caller explicitly requests diagnostics. MCP outputs must not expose raw
+View / Steer short link when available. When the MCP host supplies stable conversation context,
+GlassHive remembers the launch there and keeps raw project/worker/run ids diagnostic-only. A native
+client without stable conversation context instead receives one minimal `follow_up_context` containing
+the exact ids needed by `workspace_wait`/`workspace_status`; this avoids a workspace-list discovery
+call without widening the catalog or diagnostic payload. MCP outputs must not expose raw
 `gh_token` URLs or opaque signed-link tokens; they should expose `/r/{ref}` and `/v1/link-refs/{ref}`
 indirection instead.
 
@@ -124,8 +127,9 @@ must not fall back to pasting whole generated files into chat or writing its own
 code path when GlassHive has already produced a signed artifact link.
 
 `workspace_launch` is intentionally non-blocking. If the user asks to "wait", the model should call
-`workspace_wait` with the returned completion wait timeout or rely on same-conversation scoped
-recent-dispatch resolution. If the requested run is older than the worker's latest run,
+`workspace_wait` with the returned completion wait timeout and ids, when present, or rely on
+same-conversation scoped recent-dispatch resolution. It must not enumerate workspaces to rediscover
+the launch. If the requested run is older than the worker's latest run,
 diagnostic status/wait responses preserve both the requested run outcome and the latest effective
 run so an operator can explain the lineage without exposing raw ids in normal user-facing payloads.
 Blocking waits should stay below common chat/Redis/proxy idle windows. When a bounded wait reaches

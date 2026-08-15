@@ -1548,6 +1548,7 @@ def _dispatch_follow_up_context(
     run: dict[str, Any],
     request_surface: str | None,
     expose_diagnostics: bool = False,
+    explicit_follow_up_required: bool = False,
 ) -> dict[str, Any]:
     worker_id = str(worker.get("worker_id") or "").strip()
     run_id = str(run.get("run_id") or "").strip()
@@ -1575,7 +1576,7 @@ def _dispatch_follow_up_context(
     }
     if view_steer_url:
         payload["view_steer_url"] = view_steer_url
-    if expose_diagnostics:
+    if expose_diagnostics or explicit_follow_up_required:
         payload["follow_up_context"] = {
             "project_id": project_id,
             "worker_id": worker_id,
@@ -3716,6 +3717,12 @@ def create_mcp_server(
             run=run,
             request_surface=request_surface,
             expose_diagnostics=expose_diagnostics,
+            explicit_follow_up_required=not bool(
+                _recent_dispatch_scope_keys(
+                    owner_id=str(worker.get("owner_id") or ""),
+                    for_remember=True,
+                )
+            ),
         )
         _remember_recent_dispatch_context(
             worker=worker,
@@ -3770,8 +3777,8 @@ def create_mcp_server(
             "If the user did not specify acceptance criteria, omit success_criteria or use only the minimal value 'Satisfy the user's request as stated, preserving explicit constraints.' Do not invent provider lists, output schemas, artifacts, ranking rules, workflow steps, memory-derived priorities, active-thread/contact/deal lists, or guessed urgency rubrics. For vague user adjectives like urgent or important, pass the adjective through instead of defining a rubric unless the user defines it. "
             "Connected-account read authorization comes from the host-signed broker grant when reviewed host policy projects content-read scope; connected_account_content_intent is only a compatibility hint for missing-broker warnings, not a required authorization switch. The flag alone does not unlock content reads or writes. "
             f"{HOST_SIDE_ORCHESTRATION_GUIDANCE} "
-            "Do not chain project_create, worker_create, and worker_run for routine tasks. Do not expose project/worker/run IDs unless expose_diagnostics is true. "
-        "Returns a clean non-blocking dispatch result with view_steer_url and result_tools; raw ids are hidden unless expose_diagnostics is true. "
+            "Do not chain project_create, worker_create, and worker_run for routine tasks. Raw IDs stay hidden when the host supplies stable conversation context; a minimal follow_up_context is returned when an external client does not, so status/wait needs no discovery call. "
+        "Returns a clean non-blocking dispatch result with view_steer_url and result_tools. "
         "For ordinary fresh launches, create a fresh workspace even if the host suggests a convenient alias. "
         "Reuse a stable alias only when the user explicitly asks to resume/reuse an existing workspace and "
         "reuse_existing_workspace is true; otherwise stale worker history can slow or distort one-off work. "
@@ -5609,6 +5616,12 @@ def create_mcp_server(
             project_id=str(worker.get("project_id") or previous_run.get("project_id") or ""),
             run=new_run,
             request_surface=request_surface,
+            explicit_follow_up_required=not bool(
+                _recent_dispatch_scope_keys(
+                    owner_id=str(worker.get("owner_id") or ""),
+                    for_remember=True,
+                )
+            ),
         )
         _remember_recent_dispatch_context(
             worker=worker,

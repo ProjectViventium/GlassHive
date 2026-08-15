@@ -2923,6 +2923,69 @@ def test_enterprise_launch_without_conversation_id_is_not_remembered(monkeypatch
     asyncio.run(scenario())
 
 
+def test_enterprise_launch_without_conversation_id_returns_explicit_follow_up_ids(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-token")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-GlassHive-Service-Token": "service-token",
+            "X-GlassHive-Tenant-Id": "tenant-alpha",
+            "X-GlassHive-User-Id": "user-a",
+            "X-GlassHive-Surface": "codex",
+        },
+    )
+    api_client = RememberedDispatchApiClient(tenant_id="tenant-alpha")
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            launched = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Standalone enterprise marker.",
+                    "success_criteria": "The marker exists.",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                },
+            )
+            launch_payload = _tool_json(launched)
+            assert launch_payload["status"] == "dispatched"
+            assert launch_payload["follow_up_context"] == {
+                "project_id": "prj_new",
+                "worker_id": "wrk_resumed",
+                "run_id": "run_assign",
+                "run_state": "completed",
+                "status_tool": "workspace_status",
+                "blocking_wait_tool": "workspace_wait",
+                "completion_wait_timeout_seconds": 45,
+                "live_tool": "worker_live",
+                "takeover_tool": "worker_takeover",
+                "artifact_tool": "workspace_artifacts",
+                "artifact_download_tool": "workspace_artifact_download",
+            }
+            assert "submitted_instruction" not in launch_payload
+            assert "delegation_audit" not in launch_payload
+
+            waited = await client.call_tool(
+                "workspace_wait",
+                {
+                    "run_id": launch_payload["follow_up_context"]["run_id"],
+                    "worker_id": launch_payload["follow_up_context"]["worker_id"],
+                    "timeout_seconds": 0,
+                    "poll_interval_seconds": 0.01,
+                },
+            )
+            assert _tool_json(waited)["status"] == "completed"
+
+    asyncio.run(scenario())
+
+
 def test_enterprise_diagnostic_payloads_are_suppressed_without_opt_in(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     _configure_enterprise_mcp_oauth(monkeypatch)
