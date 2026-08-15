@@ -247,7 +247,7 @@ MCP setup. The equivalent native package commands are:
 
 ```text
 codex plugin marketplace add ProjectViventium/GlassHive
-codex plugin add glasshive@glasshive
+codex plugin add glasshive@project-glasshive
 claude plugin marketplace add ProjectViventium/GlassHive
 claude plugin install glasshive@glasshive --scope user --yes
 ```

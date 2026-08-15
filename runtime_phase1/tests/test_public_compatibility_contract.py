@@ -70,6 +70,7 @@ def test_connect_skill_skips_setup_when_connected_and_never_lists_the_catalog():
     assert "If GlassHive is already connected" in compact_skill
     assert "call only the one tool needed for the user's request" in compact_skill
     assert "Never enumerate or summarize the tool catalog" in compact_skill
+    assert "Do not inspect config files, run shell checks" in compact_skill
     assert "only during first setup or reconnect verification" in compact_skill
     assert "persistent `scopes` value" in compact_skill
     assert "start a new task" not in compact_skill
@@ -102,7 +103,7 @@ def test_agent_plugins_package_the_one_canonical_connect_skill_without_a_second_
         "Show my GlassHive schedules",
     ]
     assert codex_marketplace == {
-        "name": "glasshive",
+        "name": "project-glasshive",
         "interface": {"displayName": "GlassHive"},
         "plugins": [
             {
@@ -116,6 +117,7 @@ def test_agent_plugins_package_the_one_canonical_connect_skill_without_a_second_
             }
         ],
     }
+    assert codex_marketplace["name"] != codex_manifest["name"]
     assert claude_manifest == {
         "name": "glasshive",
         "version": "0.1.0",

@@ -2897,7 +2897,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                     "If GlassHive tools already work, do not change setup; make only the requested tool call.",
                     "Otherwise install the official GlassHive skill once:",
                     "codex plugin marketplace add ProjectViventium/GlassHive",
-                    "codex plugin add glasshive@glasshive",
+                    "codex plugin add glasshive@project-glasshive",
                     "Then add or update this server in your native Codex MCP config, preserving unrelated settings. Persist these scopes so Reconnect uses the right OAuth resource and can renew the login:",
                     str(codex_client["config_toml"]),
                     "Restart the Codex/ChatGPT desktop app once so it reloads the MCP config.",

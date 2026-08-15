@@ -11,6 +11,8 @@ second protocol, plugin, OAuth helper, callback listener, or token flow.
 If GlassHive is already connected and its tools are callable, skip setup and verification. Go
 straight to the user's outcome and call only the one tool needed for the user's request. Never
 enumerate or summarize the tool catalog unless the user explicitly asks for it.
+Seeing a GlassHive MCP tool in the current session is sufficient proof that it is connected. Do not
+inspect config files, run shell checks, or repeat setup before using it.
 
 ## Connect once
 

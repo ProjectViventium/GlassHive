@@ -1,6 +1,6 @@
 {
   "name": "glasshive",
-  "version": "0.1.0",
+  "version": "0.1.0+codex.20260815155634",
   "description": "Control GlassHive workspaces, schedules, connections, and reusable capabilities from Codex.",
   "author": {
     "name": "Project Viventium",
@@ -9,7 +9,13 @@
   "homepage": "https://github.com/ProjectViventium/GlassHive/blob/main/docs/04_MCP_Publication_and_Client_Compatibility.md",
   "repository": "https://github.com/ProjectViventium/GlassHive",
   "license": "FSL-1.1-ALv2",
-  "keywords": ["glasshive", "workspace", "mcp", "codex", "automation"],
+  "keywords": [
+    "glasshive",
+    "workspace",
+    "mcp",
+    "codex",
+    "automation"
+  ],
   "skills": "./skills/",
   "interface": {
     "displayName": "GlassHive",
@@ -17,7 +23,12 @@
     "longDescription": "Use the deployment's native OAuth-protected MCP connection to list, launch, continue, duplicate, and schedule private GlassHive workspaces without tool-catalog exploration.",
     "developerName": "Project Viventium",
     "category": "Productivity",
-    "capabilities": ["Workspace control", "Scheduling", "Connections", "Library"],
+    "capabilities": [
+      "Workspace control",
+      "Scheduling",
+      "Connections",
+      "Library"
+    ],
     "websiteURL": "https://github.com/ProjectViventium/GlassHive",
     "privacyPolicyURL": "https://github.com/ProjectViventium/GlassHive/blob/main/docs/08_Repository_Structure_and_Publication_Boundaries.md",
     "termsOfServiceURL": "https://github.com/ProjectViventium/GlassHive/blob/main/LICENSE",

@@ -5023,7 +5023,7 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert "can renew the login" in codex_prompt
     assert "If GlassHive tools already work" in codex_prompt
     assert "codex plugin marketplace add ProjectViventium/GlassHive" in codex_prompt
-    assert "codex plugin add glasshive@glasshive" in codex_prompt
+    assert "codex plugin add glasshive@project-glasshive" in codex_prompt
     assert "claude plugin" not in codex_prompt
     assert "unscoped" not in codex_prompt
     assert "interrupt" not in codex_prompt
