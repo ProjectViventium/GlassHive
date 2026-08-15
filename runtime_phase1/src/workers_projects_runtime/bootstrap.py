@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .auth import multi_user_security_enabled
+from .codex_plugins import provision_codex_official_marketplace
 
 
 JsonDict = dict[str, Any]
@@ -496,6 +497,16 @@ def apply_bootstrap(
     """
     profile = bootstrap_profile_for(worker, runtime_name)
     bundle = bootstrap_bundle_for(worker)
+
+    if (
+        runtime_name == "codex-cli"
+        and str(worker.get("execution_mode") or "") == "docker"
+        and (
+            not _enterprise_mode_enabled()
+            or bool(worker.get("_glasshive_provider_account_bound"))
+        )
+    ):
+        provision_codex_official_marketplace(home_dir)
 
     if (
         profile not in {"clean-room", "none"}

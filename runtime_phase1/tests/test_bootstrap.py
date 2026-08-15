@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -12,6 +13,10 @@ from workers_projects_runtime.bootstrap import (
     refresh_project_runtime_files_for_worker,
     refresh_runtime_env_for_worker,
     sign_bootstrap_source_path,
+)
+from workers_projects_runtime.codex_plugins import (
+    OPENAI_PLUGIN_MARKETPLACE_COMMIT,
+    OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH,
 )
 
 
@@ -60,6 +65,79 @@ def test_bootstrap_materializes_canonical_worker_operating_contract(tmp_path):
     assert "use available research, browser, spreadsheet, PDF, document, deck, notebook, rendering, or verification tools" in agents_text
     assert "verify the package/tool is available" in agents_text
     assert "Do not overfit to examples" in agents_text
+
+
+def test_docker_codex_bootstrap_exposes_the_official_native_plugin_catalog(tmp_path):
+    home_dir = tmp_path / "home"
+
+    apply_bootstrap(
+        home_dir=home_dir,
+        workspace_dir=tmp_path / "workspace",
+        runtime_name="codex-cli",
+        worker={
+            "execution_mode": "docker",
+            "_glasshive_provider_account_bound": True,
+            "bootstrap_bundle_json": json.dumps({}),
+        },
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+    )
+
+    catalog = home_dir / ".codex" / ".tmp" / "plugins"
+    revision = home_dir / ".codex" / ".tmp" / "plugins.sha"
+    assert catalog.is_symlink()
+    assert str(catalog.readlink()) == OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH
+    assert revision.read_text() == f"{OPENAI_PLUGIN_MARKETPLACE_COMMIT}\n"
+
+
+def test_codex_bootstrap_never_replaces_existing_native_plugin_catalog_state(tmp_path):
+    home_dir = tmp_path / "home"
+    catalog = home_dir / ".codex" / ".tmp" / "plugins"
+    catalog.mkdir(parents=True)
+    catalog.parent.chmod(0o750)
+    marker = catalog / "must-stay"
+    marker.write_text("user state")
+
+    apply_bootstrap(
+        home_dir=home_dir,
+        workspace_dir=tmp_path / "workspace",
+        runtime_name="codex-cli",
+        worker={
+            "execution_mode": "docker",
+            "_glasshive_provider_account_bound": True,
+            "bootstrap_bundle_json": json.dumps({}),
+        },
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+    )
+
+    assert marker.read_text() == "user state"
+    assert (catalog.parent.stat().st_mode & 0o777) == 0o750
+
+
+def test_enterprise_codex_bootstrap_seeds_catalog_only_for_a_personal_account(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    unbound_home = tmp_path / "unbound-home"
+    bound_home = tmp_path / "bound-home"
+
+    for home_dir, bound in ((unbound_home, False), (bound_home, True)):
+        apply_bootstrap(
+            home_dir=home_dir,
+            workspace_dir=tmp_path / f"workspace-{bound}",
+            runtime_name="codex-cli",
+            worker={
+                "execution_mode": "docker",
+                "_glasshive_provider_account_bound": bound,
+                "bootstrap_bundle_json": json.dumps({}),
+            },
+            copy_file=lambda source, target: None,
+            copy_tree=lambda source, target: None,
+        )
+
+    assert not os.path.lexists(unbound_home / ".codex" / ".tmp" / "plugins")
+    assert (bound_home / ".codex" / ".tmp" / "plugins").is_symlink()
 
 
 def test_enterprise_bootstrap_filters_worker_env_and_projects_provider_env(monkeypatch):

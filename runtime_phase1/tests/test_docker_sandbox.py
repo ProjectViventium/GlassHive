@@ -20,7 +20,7 @@ from workers_projects_runtime.docker_sandbox import (
     DockerSandboxManager,
     SandboxInfo,
     VNC_PASSWORD_ALPHABET,
-    _CODEX_PROVIDER_RUNTIME_METADATA_SCRIPT,
+    _CODEX_PROVIDER_AUTH_LINK_SCRIPT,
     _ai_worker_browser_extension_check_script,
     _ai_worker_browser_native_host_bootstrap_script,
     _provider_account_seal_script,
@@ -36,6 +36,11 @@ from workers_projects_runtime.openclaw_release import (
     OPENCLAW_RUNTIME_LOCK_SHA256,
     OPENCLAW_RUNTIME_VERSION,
 )
+from workers_projects_runtime.codex_plugins import (
+    OPENAI_PLUGIN_MARKETPLACE_COMMIT,
+    OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH,
+    OPENAI_PLUGIN_MARKETPLACE_ORIGIN,
+)
 
 
 def test_worker_codex_uses_the_current_reviewed_stable_release():
@@ -43,7 +48,21 @@ def test_worker_codex_uses_the_current_reviewed_stable_release():
 
 
 def test_worker_claude_uses_the_current_reviewed_stable_release():
-    assert AI_WORKER_CLAUDE_CODE_NPM_SPEC == "@anthropic-ai/claude-code@2.1.224"
+    assert AI_WORKER_CLAUDE_CODE_NPM_SPEC == "@anthropic-ai/claude-code@2.1.233"
+
+
+def test_bootstrap_copy_never_follows_an_existing_destination_symlink(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path / "workers"))
+    source = tmp_path / "source-auth.json"
+    destination = tmp_path / "home" / ".codex" / "auth.json"
+    source.write_text("host credential")
+    destination.parent.mkdir(parents=True)
+    destination.symlink_to("/workspace/.provider-account/codex/auth.json")
+
+    manager._copy_file(source, destination)  # type: ignore[attr-defined]
+
+    assert destination.is_symlink()
+    assert destination.readlink() == Path("/workspace/.provider-account/codex/auth.json")
 
 
 def test_running_task_sandbox_recreate_requires_transient_task_marker():
@@ -72,13 +91,13 @@ def test_safe_docker_exec_env_preserves_claude_headless_oauth_only():
 def test_safe_docker_exec_env_preserves_bound_provider_home_selectors():
     env = _safe_docker_exec_env(
         {
-            "CODEX_HOME": "/workspace/.provider-account/codex",
+            "CODEX_HOME": "/workspace/.wpr-home/.codex",
             "CLAUDE_CONFIG_DIR": "/workspace/.provider-account/claude",
             "UNRELATED_SECRET": "must-not-pass",
         }
     )
 
-    assert env["CODEX_HOME"] == "/workspace/.provider-account/codex"
+    assert env["CODEX_HOME"] == "/workspace/.wpr-home/.codex"
     assert env["CLAUDE_CONFIG_DIR"] == "/workspace/.provider-account/claude"
     assert "UNRELATED_SECRET" not in env
 
@@ -225,6 +244,7 @@ def test_bound_provider_account_mount_grants_and_verifies_only_worker_user_acces
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     account_home = tmp_path / "provider-accounts" / "acct-safe"
     (account_home / "codex").mkdir(parents=True)
+    (account_home / "codex" / "auth.json").write_text("synthetic auth")
     calls: list[tuple[str | None, list[str]]] = []
 
     def fake_docker_exec(
@@ -246,7 +266,7 @@ def test_bound_provider_account_mount_grants_and_verifies_only_worker_user_acces
         "_glasshive_provider_account_mount_host": str(account_home),
         "_glasshive_provider_account_mount_target": "/workspace/.provider-account",
         "_glasshive_provider_account_env": {
-            "CODEX_HOME": "/workspace/.provider-account/codex"
+            "CODEX_HOME": "/workspace/.wpr-home/.codex"
         },
     }
 
@@ -254,31 +274,137 @@ def test_bound_provider_account_mount_grants_and_verifies_only_worker_user_acces
 
     assert len(calls) == 3
     assert calls[0][0] == "root"
-    grant_script = calls[0][1][-1]
-    assert "command -v setfacl" in grant_script
-    assert "setfacl -R -m u:seluser:rwX" in grant_script
-    assert "installation_id" not in grant_script
-    assert calls[1][0] == "root"
-    assert calls[1][1][:2] == ["python3", "-c"]
-    assert calls[1][1][2] == _CODEX_PROVIDER_RUNTIME_METADATA_SCRIPT
-    assert calls[1][1][3:] == [
+    assert calls[0][1][:2] == ["python3", "-c"]
+    assert calls[0][1][2] == _CODEX_PROVIDER_AUTH_LINK_SCRIPT
+    assert calls[0][1][3:] == [
         "/workspace/.provider-account",
         "codex",
+        "/workspace/.wpr-home",
         "seluser",
     ]
-    assert "os.O_NOFOLLOW" in calls[1][1][2]
-    assert "metadata.st_nlink != 1" in calls[1][1][2]
-    assert "os.fchown(installation_fd" in calls[1][1][2]
-    assert "os.fchmod(installation_fd, 0o644)" in calls[1][1][2]
-    assert "os.fchown(arg0_fd" in calls[1][1][2]
-    assert "os.fchmod(arg0_fd, 0o700)" in calls[1][1][2]
-    assert "delete" not in calls[1][1][2]
+    assert "os.O_NOFOLLOW" in calls[0][1][2]
+    assert "metadata.st_nlink != 1" in calls[0][1][2]
+    assert "os.symlink" in calls[0][1][2]
+    assert calls[1][0] == "root"
+    grant_script = calls[1][1][-1]
+    assert "command -v setfacl" in grant_script
+    assert "setfacl -m u:seluser:x /workspace/.provider-account" in grant_script
+    assert "setfacl -m u:seluser:rw /workspace/.provider-account/codex/auth.json" in grant_script
+    assert "setfacl -R" not in grant_script
     assert calls[2][0] == "seluser"
     verify_script = calls[2][1][-1]
-    assert "test -r /workspace/.provider-account/codex" in verify_script
-    assert "test -w /workspace/.provider-account/codex" in verify_script
-    assert "test -O /workspace/.provider-account/codex/installation_id" in verify_script
-    assert "stat -c %a /workspace/.provider-account/codex/installation_id" in verify_script
+    assert "test -r /workspace/.wpr-home/.codex" in verify_script
+    assert "test -w /workspace/.wpr-home/.codex" in verify_script
+    assert "readlink /workspace/.wpr-home/.codex/auth.json" in verify_script
+    assert "/workspace/.provider-account/codex/auth.json" in verify_script
+
+
+def _run_codex_provider_auth_link(
+    provider_root: Path,
+    workspace_home: Path,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _CODEX_PROVIDER_AUTH_LINK_SCRIPT,
+            str(provider_root),
+            "codex",
+            str(workspace_home),
+            f"{os.getuid()}:{os.getgid()}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def test_codex_provider_auth_link_keeps_workspace_config_and_uses_live_account_auth(tmp_path):
+    provider_root = tmp_path / "provider"
+    provider_home = provider_root / "codex"
+    provider_home.mkdir(parents=True)
+    provider_auth = provider_home / "auth.json"
+    provider_auth.write_text("synthetic live credential")
+    provider_auth.chmod(0o600)
+    workspace_home = tmp_path / "workspace-home"
+    workspace_codex = workspace_home / ".codex"
+    workspace_codex.mkdir(parents=True)
+    workspace_config = workspace_codex / "config.toml"
+    workspace_config.write_text("[features]\nplugins = true\n")
+    plugin_marker = workspace_codex / "plugins" / "installed.marker"
+    plugin_marker.parent.mkdir()
+    plugin_marker.write_text("persistent")
+
+    first = _run_codex_provider_auth_link(provider_root, workspace_home)
+    auth_link = workspace_codex / "auth.json"
+    # Codex's file backend refreshes auth with an in-place truncate/write. The
+    # live link must update the selected account file, never copy it into the
+    # reusable workspace.
+    auth_link.write_text("synthetic refreshed credential")
+    second = _run_codex_provider_auth_link(provider_root, workspace_home)
+
+    assert first.returncode == second.returncode == 0
+    assert auth_link.is_symlink()
+    assert auth_link.readlink() == provider_auth
+    assert auth_link.read_text() == "synthetic refreshed credential"
+    assert provider_auth.read_text() == "synthetic refreshed credential"
+    assert workspace_config.read_text() == "[features]\nplugins = true\n"
+    assert plugin_marker.read_text() == "persistent"
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "hardlink", "fifo"])
+def test_codex_provider_auth_link_rejects_unsafe_account_auth(tmp_path, unsafe_kind):
+    provider_root = tmp_path / "provider"
+    provider_home = provider_root / "codex"
+    provider_home.mkdir(parents=True)
+    provider_auth = provider_home / "auth.json"
+    external = tmp_path / "external"
+    external.write_text("unchanged")
+    if unsafe_kind == "symlink":
+        provider_auth.symlink_to(external)
+    elif unsafe_kind == "hardlink":
+        os.link(external, provider_auth)
+    else:
+        os.mkfifo(provider_auth)
+    workspace_home = tmp_path / "workspace-home"
+    workspace_home.mkdir()
+
+    result = _run_codex_provider_auth_link(provider_root, workspace_home)
+
+    assert result.returncode != 0
+    assert external.read_text() == "unchanged"
+    assert not (workspace_home / ".codex" / "auth.json").exists()
+
+
+@pytest.mark.parametrize("unsafe_kind", ["regular", "wrong_link"])
+def test_codex_provider_auth_link_never_replaces_workspace_auth_state(
+    tmp_path,
+    unsafe_kind,
+):
+    provider_root = tmp_path / "provider"
+    provider_home = provider_root / "codex"
+    provider_home.mkdir(parents=True)
+    provider_auth = provider_home / "auth.json"
+    provider_auth.write_text("synthetic live credential")
+    provider_auth.chmod(0o600)
+    workspace_home = tmp_path / "workspace-home"
+    workspace_codex = workspace_home / ".codex"
+    workspace_codex.mkdir(parents=True)
+    workspace_auth = workspace_codex / "auth.json"
+    if unsafe_kind == "regular":
+        workspace_auth.write_text("must stay")
+    else:
+        workspace_auth.symlink_to(tmp_path / "wrong-account" / "auth.json")
+
+    result = _run_codex_provider_auth_link(provider_root, workspace_home)
+
+    assert result.returncode != 0
+    if unsafe_kind == "regular":
+        assert workspace_auth.read_text() == "must stay"
+    else:
+        assert workspace_auth.is_symlink()
+        assert workspace_auth.readlink() == tmp_path / "wrong-account" / "auth.json"
 
 
 def test_bound_claude_account_does_not_apply_codex_runtime_metadata_contract(tmp_path):
@@ -319,63 +445,12 @@ def test_bound_claude_account_does_not_apply_codex_runtime_metadata_contract(tmp
     assert len(calls) == 2
 
 
-def _run_codex_runtime_metadata_prep(root: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            _CODEX_PROVIDER_RUNTIME_METADATA_SCRIPT,
-            str(root),
-            "codex",
-            f"{os.getuid()}:{os.getgid()}",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-
-
-def test_codex_runtime_metadata_prep_is_repeatable_and_preserves_arg0_helpers(tmp_path):
-    codex_home = tmp_path / "codex"
-    arg0_root = codex_home / "tmp" / "arg0"
-    arg0_root.mkdir(parents=True)
-    helper = arg0_root / "active-helper"
-    helper.write_text("still active")
-    installation_id = codex_home / "installation_id"
-    installation_id.write_text("00000000-0000-4000-8000-000000000001")
-    installation_id.chmod(0o600)
-    arg0_root.chmod(0o700)
-
-    first = _run_codex_runtime_metadata_prep(tmp_path)
-    # The next readiness pass applies the recursive named rw ACL first. Its
-    # mask appears in the group mode bits until the metadata helper restores
-    # Codex's required exact 0644 mode.
-    installation_id.chmod(0o664)
-    second = _run_codex_runtime_metadata_prep(tmp_path)
-
-    assert first.returncode == second.returncode == 0
-    assert stat.S_IMODE(installation_id.stat().st_mode) == 0o644
-    assert installation_id.stat().st_uid == os.getuid()
-    assert stat.S_IMODE(arg0_root.stat().st_mode) == 0o700
-    assert arg0_root.stat().st_uid == os.getuid()
-    assert helper.read_text() == "still active"
-
-
-def test_codex_runtime_metadata_prep_allows_missing_optional_metadata(tmp_path):
-    (tmp_path / "codex").mkdir()
-
-    result = _run_codex_runtime_metadata_prep(tmp_path)
-
-    assert result.returncode == 0
-
-
-def test_bound_codex_account_requires_the_exact_private_codex_home(tmp_path):
+def test_bound_codex_account_requires_the_exact_persistent_workspace_home(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     account_home = tmp_path / "provider-accounts" / "acct-safe"
     (account_home / "other").mkdir(parents=True)
 
-    with pytest.raises(RuntimeError, match="exact private directory"):
+    with pytest.raises(RuntimeError, match="exact persistent workspace home"):
         manager._grant_provider_account_access(  # type: ignore[attr-defined]
             "wpr-test",
             {
@@ -389,7 +464,7 @@ def test_bound_codex_account_requires_the_exact_private_codex_home(tmp_path):
         )
 
 
-def test_bound_codex_account_fails_closed_when_runtime_metadata_cannot_be_prepared(tmp_path):
+def test_bound_codex_account_fails_closed_when_auth_link_cannot_be_prepared(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     account_home = tmp_path / "provider-accounts" / "acct-safe"
     (account_home / "codex").mkdir(parents=True)
@@ -412,7 +487,7 @@ def test_bound_codex_account_fails_closed_when_runtime_metadata_cannot_be_prepar
 
     manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
 
-    with pytest.raises(RuntimeError, match="unsafe runtime metadata"):
+    with pytest.raises(RuntimeError, match="unsafe authentication state"):
         manager._grant_provider_account_access(  # type: ignore[attr-defined]
             "wpr-test",
             {
@@ -420,49 +495,13 @@ def test_bound_codex_account_fails_closed_when_runtime_metadata_cannot_be_prepar
                 "_glasshive_provider_account_mount_host": str(account_home),
                 "_glasshive_provider_account_mount_target": "/workspace/.provider-account",
                 "_glasshive_provider_account_env": {
-                    "CODEX_HOME": "/workspace/.provider-account/codex"
+                    "CODEX_HOME": "/workspace/.wpr-home/.codex"
                 },
             },
         )
 
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert calls[0][0] == "root"
-    assert calls[1][0] == "root"
-
-
-@pytest.mark.parametrize("unsafe_kind", ["symlink", "hardlink", "fifo"])
-def test_codex_runtime_metadata_prep_rejects_unsafe_installation_id(tmp_path, unsafe_kind):
-    codex_home = tmp_path / "codex"
-    codex_home.mkdir()
-    installation_id = codex_home / "installation_id"
-    external = tmp_path / "external"
-    external.write_text("unchanged")
-    if unsafe_kind == "symlink":
-        installation_id.symlink_to(external)
-    elif unsafe_kind == "hardlink":
-        os.link(external, installation_id)
-    else:
-        os.mkfifo(installation_id)
-
-    result = _run_codex_runtime_metadata_prep(tmp_path)
-
-    assert result.returncode != 0
-    assert external.read_text() == "unchanged"
-
-
-def test_codex_runtime_metadata_prep_rejects_arg0_symlink_without_touching_target(tmp_path):
-    tmp_root = tmp_path / "codex" / "tmp"
-    tmp_root.mkdir(parents=True)
-    external = tmp_path / "external-arg0"
-    external.mkdir()
-    marker = external / "marker"
-    marker.write_text("unchanged")
-    (tmp_root / "arg0").symlink_to(external, target_is_directory=True)
-
-    result = _run_codex_runtime_metadata_prep(tmp_path)
-
-    assert result.returncode != 0
-    assert marker.read_text() == "unchanged"
 
 
 def test_provider_account_mount_requires_private_binder_marker(tmp_path):
@@ -1582,17 +1621,21 @@ def test_ensure_image_defaults_to_no_forced_ai_worker_browser_extensions(tmp_pat
     manager._ensure_image()
 
     dockerfile = (manager.build_root / "Dockerfile").read_text()
-    assert manager.image.endswith(":phase1-node22-docs8-openclaw2026.7.1-5")
+    assert manager.image.endswith(":phase1-node22-docs8-openclaw2026.7.1-6")
     assert "FROM selenium/standalone-chromium:4.46.0-20260707@sha256:" in dockerfile
     assert "com.glasshive.workstation.provenance=reviewed-v1" in dockerfile
     assert "com.glasshive.workstation.provider-account-acl=required-v1" in dockerfile
     assert AI_WORKER_APT_SNAPSHOT == "20260801T000000Z"
     assert f"com.glasshive.workstation.apt-snapshot={AI_WORKER_APT_SNAPSHOT}" in dockerfile
+    assert f"com.glasshive.workstation.openai-plugins-commit={OPENAI_PLUGIN_MARKETPLACE_COMMIT}" in dockerfile
+    assert OPENAI_PLUGIN_MARKETPLACE_ORIGIN in dockerfile
+    assert OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH in dockerfile
+    assert f"rev-parse HEAD)\" = {OPENAI_PLUGIN_MARKETPLACE_COMMIT}" in dockerfile
     assert f"snapshot.ubuntu.com/ubuntu/{AI_WORKER_APT_SNAPSHOT}" in dockerfile
     assert "nodejs_22.23.2-1nodesource1_${arch}.deb" in dockerfile
     assert "sha256sum -c -" in dockerfile
     assert "@openai/codex@0.147.0" in dockerfile
-    assert "@anthropic-ai/claude-code@2.1.224" in dockerfile
+    assert "@anthropic-ai/claude-code@2.1.233" in dockerfile
     assert "--cache /tmp/glasshive-npm-cache" in dockerfile
     assert "rm -rf /tmp/glasshive-npm-cache /root/.npm /home/seluser/.npm" in dockerfile
     assert "/etc/chromium/policies/managed/glasshive-ai-worker-extensions.json" in dockerfile

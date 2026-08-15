@@ -4901,7 +4901,7 @@ def test_bound_docker_codex_subscription_does_not_use_deployment_provider(tmp_pa
         ),
         "_glasshive_provider_account_bound": True,
         "_glasshive_provider_account_env": {
-            "CODEX_HOME": "/workspace/.provider-account/codex",
+            "CODEX_HOME": "/workspace/.wpr-home/.codex",
         },
     }
     runtime._ensure_dirs(worker["worker_id"])
@@ -4917,7 +4917,7 @@ def test_bound_docker_codex_subscription_does_not_use_deployment_provider(tmp_pa
     joined = "\n".join(command)
     assert 'model_provider="glasshive_openai_compatible"' not in joined
     assert "deployment-gateway.example.test" not in joined
-    assert env["CODEX_HOME"] == "/workspace/.provider-account/codex"
+    assert env["CODEX_HOME"] == "/workspace/.wpr-home/.codex"
     assert "OPENAI_API_KEY" not in env
     assert "OPENAI_BASE_URL" not in env
 

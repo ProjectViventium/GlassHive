@@ -19,6 +19,11 @@ from urllib.request import Request, urlopen
 
 from .auth import multi_user_security_enabled
 from .bootstrap import apply_bootstrap
+from .codex_plugins import (
+    OPENAI_PLUGIN_MARKETPLACE_COMMIT,
+    OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH,
+    OPENAI_PLUGIN_MARKETPLACE_ORIGIN,
+)
 from .openclaw_release import (
     OPENCLAW_RUNTIME_FAST_URI_VERSION,
     OPENCLAW_RUNTIME_LOCK_SHA256,
@@ -43,8 +48,8 @@ SAFE_DOCKER_EXEC_ENV_KEYS = {
     "LC_CTYPE",
     "LC_MESSAGES",
     "PYTHONIOENCODING",
-    # These selectors point only at the control-plane-validated, mission-scoped
-    # bind mount. Without them the CLI silently falls back to the worker home.
+    # These selectors point only at control-plane-validated provider/workspace
+    # homes. Without them the CLIs silently fall back to process-global state.
     "CODEX_HOME",
     "CLAUDE_CONFIG_DIR",
     # Provider keys are run-scoped: the worker launch script unsets them before
@@ -121,14 +126,14 @@ def _provider_account_seal_script(mount_target: str) -> str:
     )
 
 
-_CODEX_PROVIDER_RUNTIME_METADATA_SCRIPT = r"""
+_CODEX_PROVIDER_AUTH_LINK_SCRIPT = r"""
 import grp
 import os
 import pwd
 import stat
 import sys
 
-mount_path, home_name, identity = sys.argv[1:4]
+mount_path, home_name, workspace_home_path, identity = sys.argv[1:5]
 user_value, separator, group_value = identity.partition(":")
 
 
@@ -145,78 +150,65 @@ def numeric_group(value: str, user_id: int) -> int:
 worker_uid = numeric_user(user_value)
 worker_gid = numeric_group(group_value if separator else "", worker_uid)
 directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-file_flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
-
-
-def open_optional(parent_fd: int, name: str, flags: int) -> int | None:
-    try:
-        return os.open(name, flags, dir_fd=parent_fd)
-    except FileNotFoundError:
-        return None
-
+file_flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
 
 mount_fd = os.open(mount_path, directory_flags)
 try:
-    home_fd = os.open(home_name, directory_flags, dir_fd=mount_fd)
+    provider_home_fd = os.open(home_name, directory_flags, dir_fd=mount_fd)
     try:
-        installation_fd = open_optional(home_fd, "installation_id", file_flags)
-        if installation_fd is not None:
-            try:
-                metadata = os.fstat(installation_fd)
-                mode = stat.S_IMODE(metadata.st_mode)
-                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                    raise RuntimeError("Codex installation metadata is not a safe regular file")
-                if metadata.st_size > 4096:
-                    raise RuntimeError("Codex installation metadata is unexpectedly large")
-                if metadata.st_uid not in {0, worker_uid}:
-                    raise RuntimeError("Codex installation metadata has an unexpected owner")
-                if metadata.st_gid not in {0, worker_gid}:
-                    raise RuntimeError("Codex installation metadata has an unexpected group")
-                if metadata.st_uid == 0 and mode & 0o007:
-                    raise RuntimeError("Sealed Codex installation metadata is publicly accessible")
-                if metadata.st_uid == worker_uid and mode not in {
-                    0o600,
-                    0o640,
-                    0o644,
-                    0o660,
-                    # A repeated recursive worker ACL grant widens the ACL
-                    # mask/group bits before this helper restores exact 0644.
-                    0o664,
-                }:
-                    raise RuntimeError("Codex installation metadata has an unexpected mode")
-                os.fchown(installation_fd, worker_uid, worker_gid)
-                os.fchmod(installation_fd, 0o644)
-                os.fsync(installation_fd)
-            finally:
-                os.close(installation_fd)
-
-        tmp_fd = open_optional(home_fd, "tmp", directory_flags)
-        if tmp_fd is not None:
-            try:
-                arg0_fd = open_optional(tmp_fd, "arg0", directory_flags)
-                if arg0_fd is not None:
-                    try:
-                        metadata = os.fstat(arg0_fd)
-                        mode = stat.S_IMODE(metadata.st_mode)
-                        if not stat.S_ISDIR(metadata.st_mode):
-                            raise RuntimeError("Codex argument metadata is not a safe directory")
-                        if metadata.st_uid not in {0, worker_uid}:
-                            raise RuntimeError("Codex argument metadata has an unexpected owner")
-                        if metadata.st_gid not in {0, worker_gid}:
-                            raise RuntimeError("Codex argument metadata has an unexpected group")
-                        if mode & 0o007:
-                            raise RuntimeError("Codex argument metadata is publicly accessible")
-                        os.fchown(arg0_fd, worker_uid, worker_gid)
-                        os.fchmod(arg0_fd, 0o700)
-                        os.fsync(arg0_fd)
-                    finally:
-                        os.close(arg0_fd)
-            finally:
-                os.close(tmp_fd)
+        auth_fd = os.open("auth.json", file_flags, dir_fd=provider_home_fd)
+        try:
+            metadata = os.fstat(auth_fd)
+            mode = stat.S_IMODE(metadata.st_mode)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise RuntimeError("Codex account authentication is not a safe regular file")
+            if metadata.st_size <= 0 or metadata.st_size > 16 * 1024 * 1024:
+                raise RuntimeError("Codex account authentication has an unsafe size")
+            if metadata.st_uid not in {0, worker_uid}:
+                raise RuntimeError("Codex account authentication has an unexpected owner")
+            if metadata.st_gid not in {0, worker_gid}:
+                raise RuntimeError("Codex account authentication has an unexpected group")
+            if mode & 0o007 or mode & 0o111:
+                raise RuntimeError("Codex account authentication has unsafe permissions")
+        finally:
+            os.close(auth_fd)
     finally:
-        os.close(home_fd)
+        os.close(provider_home_fd)
 finally:
     os.close(mount_fd)
+
+workspace_home_fd = os.open(workspace_home_path, directory_flags)
+try:
+    try:
+        os.mkdir(".codex", 0o700, dir_fd=workspace_home_fd)
+    except FileExistsError:
+        pass
+    codex_home_fd = os.open(".codex", directory_flags, dir_fd=workspace_home_fd)
+    try:
+        codex_metadata = os.fstat(codex_home_fd)
+        if codex_metadata.st_uid not in {0, worker_uid}:
+            raise RuntimeError("Workspace Codex home has an unexpected owner")
+        if codex_metadata.st_uid == 0:
+            os.fchown(codex_home_fd, worker_uid, worker_gid)
+        # Bootstrap-created directories follow the service umask. Normalize this
+        # selected worker-owned directory before exposing the account link.
+        os.fchmod(codex_home_fd, 0o700)
+
+        expected_target = os.path.join(mount_path, home_name, "auth.json")
+        try:
+            existing = os.stat("auth.json", dir_fd=codex_home_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            os.symlink(expected_target, "auth.json", dir_fd=codex_home_fd)
+        else:
+            if not stat.S_ISLNK(existing.st_mode):
+                raise RuntimeError("Workspace Codex auth path is not the managed account link")
+            if os.readlink("auth.json", dir_fd=codex_home_fd) != expected_target:
+                raise RuntimeError("Workspace Codex auth link selects an unexpected account path")
+        os.fsync(codex_home_fd)
+    finally:
+        os.close(codex_home_fd)
+finally:
+    os.close(workspace_home_fd)
 """.strip()
 
 AI_WORKER_BROWSER_EXTENSION_UPDATE_URL = "https://clients2.google.com/service/update2/crx"
@@ -237,8 +229,8 @@ AI_WORKER_CODEX_NPM_SPEC = (
     or "@openai/codex@0.147.0"
 )
 AI_WORKER_CLAUDE_CODE_NPM_SPEC = (
-    os.environ.get("WPR_SANDBOX_CLAUDE_CODE_NPM_SPEC", "@anthropic-ai/claude-code@2.1.224").strip()
-    or "@anthropic-ai/claude-code@2.1.224"
+    os.environ.get("WPR_SANDBOX_CLAUDE_CODE_NPM_SPEC", "@anthropic-ai/claude-code@2.1.233").strip()
+    or "@anthropic-ai/claude-code@2.1.233"
 )
 AI_WORKER_BASE_IMAGE = os.environ.get(
     "WPR_SANDBOX_BASE_IMAGE",
@@ -562,7 +554,7 @@ def _safe_docker_exec_env(env: dict[str, str] | None) -> dict[str, str]:
 class DockerSandboxManager:
     _build_lock = Lock()
     _desktop_credentials_lock = Lock()
-    _default_image = "workers-projects-runtime-workstation:phase1-node22-docs8-openclaw2026.7.1-5"
+    _default_image = "workers-projects-runtime-workstation:phase1-node22-docs8-openclaw2026.7.1-6"
     _provider_account_mount_target = "/workspace/.provider-account"
 
     def __init__(self, base_dir: str | None = None) -> None:
@@ -1751,27 +1743,62 @@ screen -ls | awk -v target="$target" '
             raise RuntimeError("Provider account mount is missing its private runtime home")
         runtime_env_name, runtime_home_value = next(iter(raw_environment.items()))
         runtime_home = Path(str(runtime_home_value or "").strip())
-        try:
-            runtime_home.relative_to(mount_target)
-        except ValueError as exc:
-            raise RuntimeError("Provider account runtime home is outside its private mount") from exc
-        if runtime_home == mount_target:
-            raise RuntimeError("Provider account runtime home must select one provider directory")
-
         quoted_mount = shlex.quote(str(mount_target))
         quoted_home = shlex.quote(str(runtime_home))
         container_user_name = self.user.split(":", 1)[0] or self.user
         container_user = shlex.quote(container_user_name)
         is_codex_home = str(runtime_env_name) == "CODEX_HOME"
-        if is_codex_home and runtime_home != mount_target / "codex":
-            raise RuntimeError("Codex provider runtime home must use its exact private directory")
-        grant_script = (
-            "set -e; "
-            "command -v setfacl >/dev/null 2>&1; "
-            f"test -d {quoted_mount}; test -d {quoted_home}; "
-            f"setfacl -R -m u:{container_user}:rwX {quoted_mount}; "
-            f"find {quoted_mount} -type d -exec setfacl -m d:u:{container_user}:rwX {{}} +"
-        )
+        if is_codex_home:
+            expected_codex_home = Path(self.home_mount) / ".codex"
+            if runtime_home != expected_codex_home:
+                raise RuntimeError("Codex must use its exact persistent workspace home")
+            # Keep account credentials in the selected provider home while all
+            # plugin, MCP, connector, and session state stays in the reusable
+            # workspace home. Codex's file auth backend opens/truncates auth.json,
+            # so the exact live symlink also carries safe token refreshes back to
+            # the account store without copying credential bytes.
+            prepared = self._docker_exec(
+                container_name,
+                [
+                    "python3",
+                    "-c",
+                    _CODEX_PROVIDER_AUTH_LINK_SCRIPT,
+                    str(mount_target),
+                    "codex",
+                    self.home_mount,
+                    self.user,
+                ],
+                cwd=self.workspace_mount,
+                user="root",
+            )
+            if prepared.returncode != 0:
+                raise RuntimeError(
+                    "The selected Codex account or workspace contains unsafe authentication state"
+                )
+            quoted_provider_home = shlex.quote(str(mount_target / "codex"))
+            quoted_auth = shlex.quote(str(mount_target / "codex" / "auth.json"))
+            grant_script = (
+                "set -e; "
+                "command -v setfacl >/dev/null 2>&1; "
+                f"test -d {quoted_mount}; test -d {quoted_provider_home}; test -f {quoted_auth}; "
+                f"setfacl -m u:{container_user}:x {quoted_mount}; "
+                f"setfacl -m u:{container_user}:x {quoted_provider_home}; "
+                f"setfacl -m u:{container_user}:rw {quoted_auth}"
+            )
+        else:
+            try:
+                runtime_home.relative_to(mount_target)
+            except ValueError as exc:
+                raise RuntimeError("Provider account runtime home is outside its private mount") from exc
+            if runtime_home == mount_target:
+                raise RuntimeError("Provider account runtime home must select one provider directory")
+            grant_script = (
+                "set -e; "
+                "command -v setfacl >/dev/null 2>&1; "
+                f"test -d {quoted_mount}; test -d {quoted_home}; "
+                f"setfacl -R -m u:{container_user}:rwX {quoted_mount}; "
+                f"find {quoted_mount} -type d -exec setfacl -m d:u:{container_user}:rwX {{}} +"
+            )
         granted = self._docker_exec(
             container_name,
             ["bash", "-c", grant_script],
@@ -1783,44 +1810,16 @@ screen -ls | awk -v target="$target" '
                 "Provider account isolation requires POSIX ACL support in the reviewed worker image"
             )
 
-        if is_codex_home:
-            # Codex 0.146+ requires an existing installation_id to be owned by
-            # the invoking user with exact mode 0644, and unconditionally chmods
-            # its tmp/arg0 directory. ACLs cannot supply fchmod ownership. Use
-            # descriptor-relative, no-follow validation to transfer only those
-            # non-secret runtime metadata paths for this exclusive worker lease;
-            # post-run sealing restores service ownership and private modes.
-            prepared = self._docker_exec(
-                container_name,
-                [
-                    "python3",
-                    "-c",
-                    _CODEX_PROVIDER_RUNTIME_METADATA_SCRIPT,
-                    str(mount_target),
-                    "codex",
-                    self.user,
-                ],
-                cwd=self.workspace_mount,
-                user="root",
-            )
-            if prepared.returncode != 0:
-                raise RuntimeError(
-                    "The selected Codex account contains unsafe runtime metadata"
-                )
-
         verify_script = (
             f"set -e; test -r {quoted_home}; test -w {quoted_home}; test -x {quoted_home}"
         )
         if is_codex_home:
-            quoted_installation_id = shlex.quote(str(runtime_home / "installation_id"))
-            quoted_arg0_root = shlex.quote(str(runtime_home / "tmp" / "arg0"))
+            quoted_auth_link = shlex.quote(str(runtime_home / "auth.json"))
+            quoted_auth_target = shlex.quote(str(mount_target / "codex" / "auth.json"))
             verify_script += (
-                f"; if [ -e {quoted_installation_id} ]; then "
-                f"test -O {quoted_installation_id}; "
-                f"test \"$(stat -c %a {quoted_installation_id})\" = 644; fi"
-                f"; if [ -e {quoted_arg0_root} ]; then "
-                f"test -O {quoted_arg0_root}; "
-                f"test \"$(stat -c %a {quoted_arg0_root})\" = 700; fi"
+                f"; test -L {quoted_auth_link}; "
+                f"test \"$(readlink {quoted_auth_link})\" = {quoted_auth_target}; "
+                f"test -r {quoted_auth_link}; test -w {quoted_auth_link}"
             )
         verified = self._docker_exec(
             container_name,
@@ -1948,7 +1947,7 @@ screen -ls | awk -v target="$target" '
         )
 
     def _copy_file(self, src: Path, dest: Path) -> None:
-        if not src.exists() or dest.exists():
+        if not src.exists() or os.path.lexists(dest):
             return
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
@@ -2045,6 +2044,7 @@ screen -ls | awk -v target="$target" '
                         f"LABEL com.glasshive.workstation.apt-snapshot={AI_WORKER_APT_SNAPSHOT}",
                         f"LABEL com.glasshive.workstation.codex-spec={AI_WORKER_CODEX_NPM_SPEC}",
                         f"LABEL com.glasshive.workstation.claude-spec={AI_WORKER_CLAUDE_CODE_NPM_SPEC}",
+                        f"LABEL com.glasshive.workstation.openai-plugins-commit={OPENAI_PLUGIN_MARKETPLACE_COMMIT}",
                         f"LABEL com.glasshive.workstation.openclaw-version={OPENCLAW_RUNTIME_VERSION}",
                         f"LABEL com.glasshive.workstation.openclaw-lock-sha256={OPENCLAW_RUNTIME_LOCK_SHA256}",
                         f"LABEL com.glasshive.workstation.python-lock-sha256={AI_WORKER_PYTHON_LOCK_SHA256}",
@@ -2055,6 +2055,18 @@ screen -ls | awk -v target="$target" '
                         "RUN if [ ! -x /usr/bin/locale-check ]; then printf '%s\\n' '#!/bin/sh' 'locale_value=${1:-C.UTF-8}' 'echo LANG=$locale_value' 'echo LC_ALL=$locale_value' > /usr/bin/locale-check && chmod +x /usr/bin/locale-check; fi",
                         "RUN arch=$(dpkg --print-architecture) && case \"$arch\" in amd64) node_sha=eed0c5f0ab411f28783f81f051fcf7928ae8bf833e2df11f48f3fa78270025cb ;; arm64) node_sha=0018ee0bf997fce587042a2382941dcfac9f404fb994a5c3267fe7d12d8d837b ;; *) echo \"unsupported architecture: $arch\" >&2; exit 1 ;; esac && curl -fsSL \"https://deb.nodesource.com/node_22.x/pool/main/n/nodejs/nodejs_22.23.2-1nodesource1_${arch}.deb\" -o /tmp/nodejs.deb && echo \"${node_sha}  /tmp/nodejs.deb\" | sha256sum -c - && apt-get update && apt-get install -y --no-install-recommends /tmp/nodejs.deb && rm -f /tmp/nodejs.deb && node --version && npm --version && rm -rf /var/lib/apt/lists/*",
                         f"RUN npm install -g --cache /tmp/glasshive-npm-cache {npm_worker_specs} && npm cache clean --force --cache /tmp/glasshive-npm-cache && rm -rf /tmp/glasshive-npm-cache /root/.npm /home/seluser/.npm",
+                        (
+                            f"RUN git init {shlex.quote(OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH)} "
+                            f"&& git -C {shlex.quote(OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH)} remote add origin {shlex.quote(OPENAI_PLUGIN_MARKETPLACE_ORIGIN)} "
+                            f"&& git -C {shlex.quote(OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH)} fetch --depth 1 origin {OPENAI_PLUGIN_MARKETPLACE_COMMIT} "
+                            f"&& git -C {shlex.quote(OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH)} checkout --detach FETCH_HEAD "
+                            f"&& test \"$(git -C {shlex.quote(OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH)} rev-parse HEAD)\" = {OPENAI_PLUGIN_MARKETPLACE_COMMIT} "
+                            f"&& test \"$(git -C {shlex.quote(OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH)} remote get-url origin)\" = {shlex.quote(OPENAI_PLUGIN_MARKETPLACE_ORIGIN)} "
+                            f"&& test -z \"$(git -C {shlex.quote(OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH)} status --porcelain)\" "
+                            f"&& test \"$(jq -r .name {shlex.quote(OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH)}/.agents/plugins/marketplace.json)\" = openai-curated "
+                            f"&& git config --system --add safe.directory {shlex.quote(OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH)} "
+                            f"&& chmod -R a-w {shlex.quote(OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH)}"
+                        ),
                         "COPY openclaw-runtime-lock/ /opt/glasshive-openclaw-runtime/",
                         (
                             "RUN cd /opt/glasshive-openclaw-runtime "
@@ -2102,6 +2114,7 @@ screen -ls | awk -v target="$target" '
             "com.glasshive.workstation.apt-snapshot": AI_WORKER_APT_SNAPSHOT,
             "com.glasshive.workstation.codex-spec": AI_WORKER_CODEX_NPM_SPEC,
             "com.glasshive.workstation.claude-spec": AI_WORKER_CLAUDE_CODE_NPM_SPEC,
+            "com.glasshive.workstation.openai-plugins-commit": OPENAI_PLUGIN_MARKETPLACE_COMMIT,
             "com.glasshive.workstation.openclaw-version": OPENCLAW_RUNTIME_VERSION,
             "com.glasshive.workstation.openclaw-lock-sha256": OPENCLAW_RUNTIME_LOCK_SHA256,
             "com.glasshive.workstation.python-lock-sha256": AI_WORKER_PYTHON_LOCK_SHA256,

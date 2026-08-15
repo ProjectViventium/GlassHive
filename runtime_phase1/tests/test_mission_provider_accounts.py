@@ -148,7 +148,7 @@ def test_multi_user_docker_mission_projects_only_the_selected_account_home(
 
     bound = observed["worker"]
     assert bound["_glasshive_provider_account_env"] == {  # type: ignore[index]
-        "CODEX_HOME": "/workspace/.provider-account/codex"
+        "CODEX_HOME": "/workspace/.wpr-home/.codex"
     }
     mount_home = Path(  # type: ignore[index]
         bound["_glasshive_provider_account_mount_host"]
@@ -439,7 +439,7 @@ def test_desktop_action_projects_the_exact_active_mission_provider_binding(tmp_p
         assert recorder.worker is not None
         assert recorder.worker["_glasshive_provider_account_bound"] is True
         assert recorder.worker["_glasshive_provider_account_env"] == {
-            "CODEX_HOME": "/workspace/.provider-account/codex"
+            "CODEX_HOME": "/workspace/.wpr-home/.codex"
         }
         assert recorder.worker["_glasshive_provider_account_mount_host"] == str(
             account_home.resolve(strict=True)

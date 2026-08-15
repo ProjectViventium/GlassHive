@@ -34,6 +34,7 @@ _EXPECTED_HOME_KEYS = {
     "claude-code": "CLAUDE_CONFIG_DIR",
 }
 _CONTAINER_ACCOUNT_MOUNT = "/workspace/.provider-account"
+_DEFAULT_CONTAINER_WORKSPACE_HOME = "/workspace/.wpr-home"
 _CODEX_CONFLICTING_ENV = {
     "CODEX_API_KEY",
     "OPENAI_API_KEY",
@@ -858,6 +859,16 @@ class MissionProviderAccountBinder:
                     key: f"{_CONTAINER_ACCOUNT_MOUNT}/{Path(value).name}"
                     for key, value in environment.items()
                 }
+                # Codex keeps auth, plugins, MCP configuration, and connector state
+                # under one CODEX_HOME. Keep the selected account's live auth.json
+                # on its private mount, but let the CLI use the persistent workspace
+                # home; Docker projects only auth.json into it for this lease.
+                if "CODEX_HOME" in environment:
+                    workspace_home = str(
+                        os.environ.get("WPR_SANDBOX_HOME")
+                        or _DEFAULT_CONTAINER_WORKSPACE_HOME
+                    ).rstrip("/")
+                    environment["CODEX_HOME"] = f"{workspace_home}/.codex"
         except BaseException as exc:
             if execution_mode == "docker":
                 try:
