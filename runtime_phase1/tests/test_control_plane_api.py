@@ -24,6 +24,7 @@ def test_pending_change_metadata_and_activity_are_owner_scoped(tmp_path, monkeyp
     monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-public-safe")
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "synthetic-signed-link-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-deployment-provider-key")
     database = tmp_path / "runtime.db"
     client = TestClient(create_app(db_path=str(database), runtime_backend="stub"))
     user_a = {

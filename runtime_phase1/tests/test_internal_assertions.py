@@ -451,6 +451,7 @@ def test_viewer_communication_scope_is_exactly_limited_to_message_and_steer(
 ):
     private_key, jwks = assertion_keys
     configure_signed_assertions(monkeypatch, jwks)
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-deployment-provider-key")
     client = TestClient(create_app(db_path=str(tmp_path / "runtime.db"), runtime_backend="stub"))
     project = client.post(
         "/v1/projects",
