@@ -227,12 +227,29 @@ resource and renewable login without a hand-built authorization URL. Claude Code
 native remote-HTTP add and `/mcp` sign-in flow.
 
 MCP is the capability boundary. The companion skill is a concise workflow guide that tells the AI
-which GlassHive tool to call; a plugin is optional distribution packaging, not another integration
-layer. This follows the official Codex model of starting integrations with MCP and using skills for
-reusable instructions, and Claude Code's native remote-HTTP MCP plus `/mcp` authentication flow.
+which GlassHive tool to call; the native packages are distribution only, not another integration
+layer. One plugin directory at `plugins/glasshive/` contains the shared skill plus native Codex and
+Claude manifests. It deliberately contains no MCP server definition because the deployment-specific
+URL, client registration, and scopes come from the signed-in Glass Drive panel. This follows the
+official Codex model of packaging skills and MCP integrations as plugins, and Claude Code's native
+plugin plus remote-HTTP MCP and `/mcp` authentication flow.
 Shared server instructions stay short because clients may present them alongside every tool. They
 say to make one matching call when one call can finish the request and never narrate the catalog;
 action-specific parameters and safety details stay with the action that owns them.
+
+The same public repository is the marketplace for both clients. A user pastes the Automatic
+instruction once; the current client installs only its own package and then applies the exact live
+MCP setup. The equivalent native package commands are:
+
+```text
+codex plugin marketplace add ProjectViventium/GlassHive
+codex plugin add glasshive@glasshive
+claude plugin marketplace add ProjectViventium/GlassHive
+claude plugin install glasshive@glasshive --scope user --yes
+```
+
+Existing exact installations are reused. Installation never triggers tool-catalog enumeration, and
+ordinary use calls only the operation needed for the user's outcome.
 
 The generated command may carry a public client id and fixed callback flags as opaque setup
 arguments. GlassHive still validates that the configured Codex resource exactly equals the canonical
