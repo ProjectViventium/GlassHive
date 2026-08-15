@@ -19,8 +19,9 @@ enumerate or summarize the tool catalog unless the user explicitly asks for it.
 2. Follow only the section for the client you are currently running. Never configure the other
    client. If the named server already exists, reuse it instead of creating a duplicate.
 3. For Codex, add or update the supplied native MCP config exactly, including its persistent
-   `scopes` value; this keeps ordinary Reconnect on the server's OAuth resource. Use the client's
-   native sign-in exactly as instructed. Never construct an authorization URL,
+   `scopes` values; this keeps ordinary Reconnect on the server's OAuth resource and keeps the login
+   renewable. Restart the Codex/ChatGPT desktop app once after changing that config, then use the
+   client's native sign-in exactly as instructed. Never construct an authorization URL,
    inspect or copy tokens, or open the displayed callback address yourself.
 4. Verify with one `workspace_list` call only during first setup or reconnect verification.
 5. If native sign-in fails, report the visible client or identity-provider error and stop. Return to

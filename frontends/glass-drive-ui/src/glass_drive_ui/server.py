@@ -2846,12 +2846,15 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             and 1024 <= codex_callback_port_number <= 65535
             and codex_resource_matches
         ):
+            codex_scope_values = list(required_scope_values)
+            if "offline_access" not in codex_scope_values:
+                codex_scope_values.append("offline_access")
             codex_config_toml = "\n".join(
                 (
                     f"[mcp_servers.{server_name}]",
                     f"url = {json.dumps(mcp_url)}",
                     "scopes = ["
-                    + ", ".join(json.dumps(scope) for scope in required_scope_values)
+                    + ", ".join(json.dumps(scope) for scope in codex_scope_values)
                     + "]",
                     "",
                     f"[mcp_servers.{server_name}.oauth]",
@@ -2892,8 +2895,9 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 (
                     "You are Codex. Connect this Codex client to GlassHive.",
                     "If GlassHive tools already work, do not change setup; make only the requested tool call.",
-                    "Otherwise add or update this server in your native Codex MCP config, preserving unrelated settings. You must persist the exact scope so Reconnect uses the right OAuth resource:",
+                    "Otherwise add or update this server in your native Codex MCP config, preserving unrelated settings. Persist these scopes so Reconnect uses the right OAuth resource and can renew the login:",
                     str(codex_client["config_toml"]),
+                    "Restart the Codex/ChatGPT desktop app once so it reloads the MCP config.",
                     "Then use native sign-in:",
                     str(codex_client["login_command"]),
                     "Complete the native browser sign-in. Do not build OAuth URLs, inspect tokens, or configure another client.",

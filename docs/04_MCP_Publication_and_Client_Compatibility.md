@@ -216,11 +216,14 @@ The browser does not claim it can edit local client configuration itself. The cl
 flows are authoritative: the receiving AI must not construct OAuth URLs, run a custom callback
 listener, inspect tokens, or fall back to static credentials.
 
-GlassHive includes the exact required scope in both protected-resource metadata and the initial
+GlassHive includes the exact required API scope in both protected-resource metadata and the initial
 `WWW-Authenticate` challenge. Current Codex releases can still fall back to generic OpenID scopes on
-an ordinary Reconnect unless the MCP server's native config persists its `scopes` value. The generated
-Codex setup therefore includes that exact config entry once; later Add/Reconnect actions use the same
-canonical resource and scope without a hand-built authorization URL. Claude Code continues to use its
+an ordinary Reconnect unless the MCP server's native config persists its `scopes` values. For Entra,
+that config contains both the canonical GlassHive API scope and `offline_access`: the API scope binds
+the authorization to the MCP resource, while `offline_access` asks Entra for the refresh token needed
+to renew an expired access token. The generated Codex setup includes those values once and tells the
+user to restart Codex/ChatGPT once after changing the config; later Add/Reconnect actions use the same
+resource and renewable login without a hand-built authorization URL. Claude Code continues to use its
 native remote-HTTP add and `/mcp` sign-in flow.
 
 MCP is the capability boundary. The companion skill is a concise workflow guide that tells the AI

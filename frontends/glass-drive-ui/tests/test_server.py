@@ -4996,7 +4996,7 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert payload["clients"]["codex"]["config_toml"] == (
         "[mcp_servers.glasshive-d0c2dae3d5cd]\n"
         'url = "https://glasshive.example.test/mcp"\n'
-        'scopes = ["https://glasshive.example.test/mcp/access_as_user"]\n\n'
+        'scopes = ["https://glasshive.example.test/mcp/access_as_user", "offline_access"]\n\n'
         "[mcp_servers.glasshive-d0c2dae3d5cd.oauth]\n"
         'client_id = "registered-codex-client"'
     )
@@ -5019,11 +5019,13 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     claude_prompt = payload["clients"]["claude"]["setup_prompt"]
     assert payload["clients"]["codex"]["config_toml"] in codex_prompt
     assert payload["clients"]["codex"]["login_command"] in codex_prompt
-    assert "persist the exact scope" in codex_prompt
+    assert "Persist these scopes" in codex_prompt
+    assert "can renew the login" in codex_prompt
     assert "If GlassHive tools already work" in codex_prompt
     assert "unscoped" not in codex_prompt
     assert "interrupt" not in codex_prompt
     assert "start a new Codex task" not in codex_prompt
+    assert "Restart the Codex/ChatGPT desktop app once" in codex_prompt
     assert "Complete the native browser sign-in" in codex_prompt
     assert "Claude" not in codex_prompt
     assert "workspace_list once" in codex_prompt
