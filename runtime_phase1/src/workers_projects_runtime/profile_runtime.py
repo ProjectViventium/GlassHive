@@ -1416,7 +1416,12 @@ class ProfiledWorkerRuntime:
             ),
         ) as bound_worker:
             if bound_worker.get("_glasshive_provider_account_bound"):
-                runtime.ensure_worker_ready(bound_worker)
+                bound_task_worker = {
+                    **bound_worker,
+                    "_active_run_id": effective_run_id,
+                    "_glasshive_task_run": True,
+                }
+                runtime.ensure_worker_ready(bound_task_worker)
                 self.provider_account_binder.mark_active_route_ready(
                     bound_worker,
                     runtime_name=runtime_name,

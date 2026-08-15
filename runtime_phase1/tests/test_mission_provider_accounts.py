@@ -32,9 +32,11 @@ class RecordingRuntime:
         self.reconciled_homes: list[Path] = []
         self.release_callback = None
         self.ensure_calls = 0
+        self.ensured_workers: list[dict] = []
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         self.ensure_calls += 1
+        self.ensured_workers.append(dict(worker))
         return RuntimeInfo(
             runtime=str(worker.get("profile") or "synthetic"),
             model="synthetic",
@@ -159,6 +161,38 @@ def test_multi_user_docker_mission_projects_only_the_selected_account_home(
         account["account_id"], "codex-cli:mission"
     ) is None
     assert runtime.codex.released_workers == ["wrk_personal"]  # type: ignore[attr-defined]
+
+
+def test_provider_bound_preflight_can_recreate_a_stale_task_sandbox(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    recorder = RecordingRuntime()
+    runtime.codex = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = {
+        **_worker(account["account_id"]),
+        "execution_mode": "docker",
+        "state": "running",
+    }
+
+    runtime.run_task(worker, "resume the saved workspace", run_id="run_recreate")
+
+    assert recorder.ensured_workers
+    assert recorder.ensured_workers[0]["_glasshive_task_run"] is True
+    assert recorder.ensured_workers[0]["_active_run_id"] == "run_recreate"
+    assert recorder.worker is not None
+    assert "_glasshive_task_run" not in recorder.worker
+    assert "_active_run_id" not in recorder.worker
+    assert "_glasshive_task_run" not in worker
+    assert "_active_run_id" not in worker
 
 
 def test_docker_provider_mount_is_removed_before_lease_release(tmp_path, monkeypatch):

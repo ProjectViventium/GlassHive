@@ -14,6 +14,8 @@ import pytest
 
 from workers_projects_runtime.docker_sandbox import (
     AI_WORKER_APT_SNAPSHOT,
+    AI_WORKER_CLAUDE_CODE_NPM_SPEC,
+    AI_WORKER_CODEX_NPM_SPEC,
     AI_WORKER_PYTHON_LOCK_PATH,
     DockerSandboxManager,
     SandboxInfo,
@@ -34,6 +36,23 @@ from workers_projects_runtime.openclaw_release import (
     OPENCLAW_RUNTIME_LOCK_SHA256,
     OPENCLAW_RUNTIME_VERSION,
 )
+
+
+def test_worker_codex_uses_the_current_reviewed_stable_release():
+    assert AI_WORKER_CODEX_NPM_SPEC == "@openai/codex@0.147.0"
+
+
+def test_worker_claude_uses_the_current_reviewed_stable_release():
+    assert AI_WORKER_CLAUDE_CODE_NPM_SPEC == "@anthropic-ai/claude-code@2.1.224"
+
+
+def test_running_task_sandbox_recreate_requires_transient_task_marker():
+    assert DockerSandboxManager._worker_state_allows_substrate_recreate(
+        {"state": "running", "_glasshive_task_run": True}
+    )
+    assert not DockerSandboxManager._worker_state_allows_substrate_recreate(
+        {"state": "running"}
+    )
 
 
 def test_safe_docker_exec_env_preserves_claude_headless_oauth_only():
@@ -1572,8 +1591,8 @@ def test_ensure_image_defaults_to_no_forced_ai_worker_browser_extensions(tmp_pat
     assert f"snapshot.ubuntu.com/ubuntu/{AI_WORKER_APT_SNAPSHOT}" in dockerfile
     assert "nodejs_22.23.2-1nodesource1_${arch}.deb" in dockerfile
     assert "sha256sum -c -" in dockerfile
-    assert "@openai/codex@0.146.1" in dockerfile
-    assert "@anthropic-ai/claude-code@2.1.223" in dockerfile
+    assert "@openai/codex@0.147.0" in dockerfile
+    assert "@anthropic-ai/claude-code@2.1.224" in dockerfile
     assert "--cache /tmp/glasshive-npm-cache" in dockerfile
     assert "rm -rf /tmp/glasshive-npm-cache /root/.npm /home/seluser/.npm" in dockerfile
     assert "/etc/chromium/policies/managed/glasshive-ai-worker-extensions.json" in dockerfile

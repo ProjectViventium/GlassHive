@@ -232,10 +232,13 @@ AI_WORKER_BROWSER_EXTENSION_POLICY_PATHS = (
     "/etc/chromium/policies/managed/glasshive-ai-worker-extensions.json",
     "/etc/opt/chrome/policies/managed/glasshive-ai-worker-extensions.json",
 )
-AI_WORKER_CODEX_NPM_SPEC = os.environ.get("WPR_SANDBOX_CODEX_NPM_SPEC", "@openai/codex@0.146.1").strip() or "@openai/codex@0.146.1"
+AI_WORKER_CODEX_NPM_SPEC = (
+    os.environ.get("WPR_SANDBOX_CODEX_NPM_SPEC", "@openai/codex@0.147.0").strip()
+    or "@openai/codex@0.147.0"
+)
 AI_WORKER_CLAUDE_CODE_NPM_SPEC = (
-    os.environ.get("WPR_SANDBOX_CLAUDE_CODE_NPM_SPEC", "@anthropic-ai/claude-code@2.1.223").strip()
-    or "@anthropic-ai/claude-code@2.1.223"
+    os.environ.get("WPR_SANDBOX_CLAUDE_CODE_NPM_SPEC", "@anthropic-ai/claude-code@2.1.224").strip()
+    or "@anthropic-ai/claude-code@2.1.224"
 )
 AI_WORKER_BASE_IMAGE = os.environ.get(
     "WPR_SANDBOX_BASE_IMAGE",
