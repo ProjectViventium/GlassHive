@@ -120,7 +120,7 @@ def test_agent_plugins_package_the_one_canonical_connect_skill_without_a_second_
     assert codex_marketplace["name"] != codex_manifest["name"]
     assert claude_manifest == {
         "name": "glasshive",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "description": "Control GlassHive workspaces from Claude Code.",
         "author": {"name": "Project Viventium"},
         "homepage": "https://github.com/ProjectViventium/GlassHive",

@@ -1,6 +1,6 @@
 {
   "name": "glasshive",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Control GlassHive workspaces from Claude Code.",
   "author": {
     "name": "Project Viventium"
