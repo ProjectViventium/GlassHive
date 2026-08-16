@@ -30,7 +30,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .auth import AuthContext, multi_user_security_enabled, scoped_alias
+from .auth import AuthContext, multi_user_security_enabled, normalize_identity_segment, scoped_alias
 from .bootstrap import (
     BOOTSTRAP_SOURCE_TOKEN_KEY,
     GLASSHIVE_CAPABILITY_BROKER_TOKEN_ENV,
@@ -766,19 +766,29 @@ def _require_enterprise_payload_scope(
         raise PermissionError(f"GlassHive {label} is not owned by the authenticated user")
 
 
-def _request_scoped_alias(alias: str) -> str:
+def _request_alias_input(alias: str) -> tuple[AuthContext | None, str]:
     clean_alias = alias.strip()
     if not clean_alias or not _enterprise_mode_enabled():
-        return clean_alias
-    headers = _request_headers()
-    _require_enterprise_mcp_service_auth(headers)
-    _require_enterprise_mcp_identity_assertion(headers)
-    tenant_id = (
-        _header_value(headers, HEADER_TENANT_ID)
-        or _configured_enterprise_tenant_id()
+        return None, clean_alias
+    tenant_id, user_id = _enterprise_request_scope()
+    ctx = AuthContext(tenant_id=tenant_id, user_id=user_id, enterprise=True)
+    prefix = (
+        f"{normalize_identity_segment(tenant_id, 'tenant')}--"
+        f"{normalize_identity_segment(user_id, 'user')}--"
     )
-    user_id = _header_value(headers, HEADER_USER_ID) or DEFAULT_OWNER_ID
-    return scoped_alias(AuthContext(tenant_id=tenant_id, user_id=user_id, enterprise=True), clean_alias)
+    if clean_alias.startswith(prefix):
+        clean_alias = clean_alias[len(prefix) :]
+    return ctx, clean_alias
+
+
+def _request_unscoped_alias(alias: str) -> str:
+    _, clean_alias = _request_alias_input(alias)
+    return clean_alias
+
+
+def _request_scoped_alias(alias: str) -> str:
+    ctx, clean_alias = _request_alias_input(alias)
+    return scoped_alias(ctx, clean_alias) if ctx is not None else clean_alias
 
 
 def _sanitize_context_value(value: str | None) -> str:
@@ -3564,7 +3574,9 @@ def create_mcp_server(
                 f"User-visible success condition:\n{explicit_goal}"
             )
         worker_instruction = _with_worker_host_side_orchestration_rule(worker_instruction_body)
-        reusable_alias = (alias or _slugify_alias(resolved_profile, clean_title)).strip()
+        reusable_alias = _request_unscoped_alias(
+            alias or _slugify_alias(resolved_profile, clean_title)
+        )
         resolved_alias = reusable_alias if reuse_existing_workspace else _fresh_worker_alias(reusable_alias)
         blocked = _runtime_dependency_blocked_payload(
             profile=resolved_profile,
@@ -4104,7 +4116,9 @@ def create_mcp_server(
                 profile=resolved_profile,
                 execution_mode=resolved_execution_mode,
                 effort=resolved_effort,
-                alias=(workspace_alias or _slugify_alias(resolved_profile, title)).strip(),
+                alias=_request_unscoped_alias(
+                    workspace_alias or _slugify_alias(resolved_profile, title)
+                ),
             )
         bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json) or {}
         bundle.setdefault(
@@ -4149,7 +4163,9 @@ def create_mcp_server(
                 ),
             }
 
-        resolved_alias = (workspace_alias or _slugify_alias(resolved_profile, title)).strip()
+        resolved_alias = _request_unscoped_alias(
+            workspace_alias or _slugify_alias(resolved_profile, title)
+        )
         existing_workspace = None
         if workspace_alias:
             existing_workspace = client.find_worker_by_alias_across_projects(

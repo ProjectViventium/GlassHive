@@ -29,6 +29,10 @@ inspect config files, run shell checks, or repeat setup before using it.
 5. If native sign-in fails, report the visible client or identity-provider error and stop. Return to
    the same GlassHive panel; do not improvise another auth flow.
 
+When a workspace opens a provider-owned authorization or installation page, first make sure the
+browser is signed in to the same personal AI account selected for that worker. A success message in
+another account is not proof; verify the connection with one read-only use from that worker.
+
 ## Use directly
 
 Call only the MCP tool needed for the requested outcome:
@@ -48,6 +52,9 @@ surfaces. Use a short, natural workspace name on the first line and preserve the
 in the remaining description/context. Set `favorite=true` when the user asked to favorite or pin
 the reusable workspace. If the workspace is still running and the user asked you to
 wait, repeat only `workspace_wait`; do not explore other tools while it works.
+
+When the user names GlassHive or a saved GlassHive workspace, do not substitute the controlling
+client's own apps for the workspace. Send the requested outcome to that workspace.
 
 Use the human names and stable ids returned by GlassHive. Keep the user's goal intact and let the
 workspace decide its own execution plan. If a tool returns a browser confirmation URL, show it and

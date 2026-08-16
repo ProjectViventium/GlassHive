@@ -4936,7 +4936,7 @@ def test_worker_delegate_once_reuses_alias_when_explicit(monkeypatch):
     assert worker_payload["alias"] == "marketing-sandbox"
 
 
-def test_workspace_launch_reuses_enterprise_scoped_workspace_alias(monkeypatch):
+def test_workspace_launch_reuses_enterprise_catalog_alias_without_scoping_twice(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     _configure_enterprise_mcp_oauth(monkeypatch)
@@ -4987,7 +4987,7 @@ def test_workspace_launch_reuses_enterprise_scoped_workspace_alias(monkeypatch):
                 {
                     "description": "Tell JohnDoe to use my Marketing sandbox for the next task.",
                     "success_criteria": "The enterprise-scoped workspace alias is reused.",
-                    "workspace_alias": "marketing-sandbox",
+                    "workspace_alias": "tenant-alpha--user-a--marketing-sandbox",
                     "reuse_existing_workspace": True,
                     "profile": "codex-cli",
                     "require_callback": False,
