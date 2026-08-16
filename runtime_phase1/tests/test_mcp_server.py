@@ -5276,6 +5276,112 @@ def test_workspace_launch_reuse_rejects_every_closed_workspace_state(monkeypatch
     assert "assign_run" not in api.calls
 
 
+def test_workspace_launch_reuses_legacy_workspace_by_exact_alias(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+
+    class LegacyCatalogApi(TrackingApiClient):
+        def workspace_catalog(self, **kwargs):
+            assert kwargs["kind"] == ""
+            return {
+                "items": [
+                    {
+                        "worker_id": "wrk_legacy",
+                        "project_id": "prj_legacy",
+                        "name": "Legacy work hub",
+                        "alias": "legacy-work-hub",
+                        "workspace_kind": "legacy",
+                        "execution_mode": "docker",
+                        "state": "paused",
+                    }
+                ],
+                "next_cursor": None,
+            }
+
+        def list_projects(self, owner_id: str | None = None):
+            self.calls.append("list_projects")
+            return [{"project_id": "prj_legacy", "owner_id": "demo-owner", "title": "Legacy work hub"}]
+
+        def list_workers(self, project_id: str):
+            self.calls.append("list_workers")
+            return [
+                {
+                    "worker_id": "wrk_legacy",
+                    "project_id": project_id,
+                    "owner_id": "demo-owner",
+                    "name": "Legacy work hub",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                    "alias": "legacy-work-hub",
+                    "workspace_kind": "legacy",
+                    "state": "paused",
+                }
+            ]
+
+    api = LegacyCatalogApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            result = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Legacy work hub\nRead connected accounts without changing anything.",
+                    "workspace_alias": "legacy-work-hub",
+                    "reuse_existing_workspace": True,
+                    "profile": "codex-cli",
+                },
+            )
+            assert _tool_json(result)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+
+    assert "create_project" not in api.calls
+    assert api.find_or_resume_payloads[-1]["project_id"] == "prj_legacy"
+    assert api.find_or_resume_payloads[-1]["alias"] == "legacy-work-hub"
+
+
+def test_workspace_launch_reuse_rejects_execution_mode_mismatch_without_creation(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+
+    class MismatchedModeCatalogApi(TrackingApiClient):
+        def workspace_catalog(self, **kwargs):
+            return {
+                "items": [
+                    {
+                        "worker_id": "wrk_workstation",
+                        "project_id": "prj_workstation",
+                        "name": "Microsoft work hub",
+                        "alias": "microsoft-work-hub",
+                        "execution_mode": "workstation",
+                        "state": "paused",
+                    }
+                ],
+                "next_cursor": None,
+            }
+
+    api = MismatchedModeCatalogApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="Could not resolve existing workspace alias"):
+                await client.call_tool(
+                    "workspace_launch",
+                    {
+                        "description": "Microsoft work hub\nRead connected accounts without changing anything.",
+                        "workspace_alias": "microsoft-work-hub",
+                        "reuse_existing_workspace": True,
+                        "profile": "codex-cli",
+                        "execution_mode": "docker",
+                    },
+                )
+
+    asyncio.run(scenario())
+
+    assert "create_project" not in api.calls
+    assert "assign_run" not in api.calls
+
+
 def test_workspace_launch_reuse_rejects_unknown_explicit_alias_without_creation(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
 

@@ -3674,6 +3674,11 @@ def create_mcp_server(
                 alias=reusable_alias,
                 execution_mode=resolved_execution_mode,
             )
+            if existing_workspace is None:
+                raise ValueError(
+                    f"Could not resolve existing workspace alias {reusable_alias!r} for "
+                    f"execution_mode={resolved_execution_mode!r}; no workspace was created"
+                )
         if existing_workspace and provider_selection is not None:
             raise ValueError(
                 "Existing workspaces keep their saved provider account policy"
@@ -3972,7 +3977,7 @@ def create_mcp_server(
             resolved_catalog_alias = ""
             catalog = client.workspace_catalog(
                 search=lookup_name,
-                kind="named",
+                kind="",
                 limit=100,
             )
             items = catalog.get("items") if isinstance(catalog, dict) else None
