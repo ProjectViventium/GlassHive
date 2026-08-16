@@ -4822,6 +4822,108 @@ def test_docker_codex_command_appends_completion_contract(tmp_path):
     assert "FINAL REPORT:" in stdin_text
 
 
+def test_docker_codex_stale_resume_replays_same_instruction_as_fresh_task(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(tmp_path / "fake-codex")
+    runtime.sandbox.home_mount = str(tmp_path / "container-home")
+    worker = {
+        "worker_id": "wrk_stale_resume",
+        "name": "Reusable Codex Worker",
+        "profile": "codex-cli",
+        "model": "gpt-test",
+        "_active_run_id": "run_stale_resume",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_session_key(worker["worker_id"], "thread_missing")
+    instruction_path = (
+        Path(runtime.sandbox.home_mount)
+        / ".glasshive-runs"
+        / worker["_active_run_id"]
+        / "instruction.stdin"
+    )
+    instruction_path.parent.mkdir(parents=True)
+    instruction_path.write_text("Install the official native plugins.\n")
+    calls_path = tmp_path / "calls.log"
+    runtime.binary = str(tmp_path / "fake-codex")
+    Path(runtime.binary).write_text(
+        "#!/bin/sh\n"
+        "payload=$(cat)\n"
+        "printf '%s|%s\\n' \"$*\" \"$payload\" >> \"$FAKE_CODEX_CALLS\"\n"
+        "case \" $* \" in\n"
+        "  *' exec resume '*)\n"
+        "    printf '%s\\n' 'Error: thread/resume: thread/resume failed: no rollout found for thread id thread_missing' >&2\n"
+        "    exit 1\n"
+        "    ;;\n"
+        "esac\n"
+        "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread_fresh\"}'\n"
+        "printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"FINAL REPORT:\\nRecovered.\"}}'\n"
+    )
+    Path(runtime.binary).chmod(0o755)
+    monkeypatch.setenv("FAKE_CODEX_CALLS", str(calls_path))
+
+    command, _env = runtime._build_command(
+        worker,
+        "Install the official native plugins.",
+        runtime._runtime_info(worker),
+    )
+    completed = subprocess.run(command, capture_output=True, text=True, env=os.environ.copy())
+
+    assert completed.returncode == 0
+    assert "thread_fresh" in completed.stdout
+    assert "no rollout found" not in completed.stderr
+    calls = calls_path.read_text().splitlines()
+    assert len(calls) == 2
+    assert "exec resume" in calls[0]
+    assert "exec --json" in calls[1]
+    assert all("Install the official native plugins." in call for call in calls)
+
+
+def test_docker_codex_resume_does_not_retry_unrelated_failure(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(tmp_path / "fake-codex")
+    runtime.sandbox.home_mount = str(tmp_path / "container-home")
+    worker = {
+        "worker_id": "wrk_failed_resume",
+        "name": "Reusable Codex Worker",
+        "profile": "codex-cli",
+        "model": "gpt-test",
+        "_active_run_id": "run_failed_resume",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_session_key(worker["worker_id"], "thread_current")
+    instruction_path = (
+        Path(runtime.sandbox.home_mount)
+        / ".glasshive-runs"
+        / worker["_active_run_id"]
+        / "instruction.stdin"
+    )
+    instruction_path.parent.mkdir(parents=True)
+    instruction_path.write_text("Continue the task.\n")
+    calls_path = tmp_path / "calls.log"
+    Path(runtime.binary).write_text(
+        "#!/bin/sh\n"
+        "cat >/dev/null\n"
+        "printf '%s\\n' \"$*\" >> \"$FAKE_CODEX_CALLS\"\n"
+        "printf '%s\\n' 'Error: provider is temporarily unavailable' >&2\n"
+        "exit 41\n"
+    )
+    Path(runtime.binary).chmod(0o755)
+    monkeypatch.setenv("FAKE_CODEX_CALLS", str(calls_path))
+
+    command, _env = runtime._build_command(
+        worker,
+        "Continue the task.",
+        runtime._runtime_info(worker),
+    )
+    completed = subprocess.run(command, capture_output=True, text=True, env=os.environ.copy())
+
+    assert completed.returncode == 41
+    assert "provider is temporarily unavailable" in completed.stderr
+    calls = calls_path.read_text().splitlines()
+    assert len(calls) == 1
+    assert "exec resume" in calls[0]
+
+
 def test_docker_claude_command_enables_chrome_and_appends_completion_contract(tmp_path, monkeypatch):
     runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.delenv("WPR_CLAUDE_CODE_ENABLE_CHROME", raising=False)

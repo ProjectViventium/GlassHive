@@ -82,6 +82,7 @@ logger = logging.getLogger(__name__)
 
 _CODEX_MCP_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 _HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
+_CODEX_STALE_THREAD_ERROR = "thread/resume failed: no rollout found for thread id"
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off", "none", "disabled"}
 _CODEX_BROKER_CONFLICTING_ENV = {
     "CODEX_API_KEY",
@@ -3757,10 +3758,14 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         if include_reasoning_effort:
             self._append_codex_reasoning_effort_config(command, worker)
 
-    def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
-        existing_session = self._read_session_key(worker["worker_id"])
-        model = self._codex_model_for_worker(worker, "WPR_MODEL_CODEX_CLI")
-        is_resume = bool(existing_session and not existing_session.startswith("codex-worker:"))
+    def _codex_exec_command(
+        self,
+        worker: dict,
+        *,
+        model: str,
+        session_key: str | None = None,
+    ) -> list[str]:
+        is_resume = bool(session_key)
         dangerous_mode = os.environ.get("WPR_CODEX_DANGEROUS", "1").strip().lower() in {"1", "true", "yes", "on"}
         if is_resume:
             command = [self.binary, "exec", "resume"]
@@ -3787,8 +3792,61 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         elif not is_resume:
             command.append("--full-auto")
         if is_resume:
-            command.append(existing_session)
+            command.append(str(session_key))
         command.append("-")
+        return command
+
+    def _codex_resume_with_fresh_fallback(
+        self,
+        worker: dict,
+        *,
+        resume_command: list[str],
+        fresh_command: list[str],
+    ) -> list[str]:
+        run_id = str(worker.get("_active_run_id") or "").strip()
+        if not run_id:
+            return resume_command
+        run_root = self._container_run_root(run_id)
+        instruction_path = f"{run_root}/instruction.stdin"
+        resume_error_path = f"{run_root}/codex-resume.stderr"
+        resume_invocation = shlex.join(resume_command)
+        fresh_invocation = shlex.join(fresh_command)
+        script = "\n".join(
+            [
+                "set -o pipefail",
+                f"resume_error={shlex.quote(resume_error_path)}",
+                'rm -f -- "$resume_error"',
+                'trap \'rm -f -- "$resume_error"\' EXIT',
+                (
+                    f"if {resume_invocation} < {shlex.quote(instruction_path)} "
+                    '2> "$resume_error"; then exit 0; else status=$?; fi'
+                ),
+                f"if grep -Fq -- {shlex.quote(_CODEX_STALE_THREAD_ERROR)} \"$resume_error\"; then",
+                '  rm -f -- "$resume_error"',
+                "  trap - EXIT",
+                f"  exec {fresh_invocation} < {shlex.quote(instruction_path)}",
+                "fi",
+                'cat -- "$resume_error" >&2',
+                'exit "$status"',
+            ]
+        )
+        return ["bash", "-c", script]
+
+    def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
+        existing_session = self._read_session_key(worker["worker_id"])
+        model = self._codex_model_for_worker(worker, "WPR_MODEL_CODEX_CLI")
+        is_resume = bool(existing_session and not existing_session.startswith("codex-worker:"))
+        command = self._codex_exec_command(
+            worker,
+            model=model,
+            session_key=existing_session if is_resume else None,
+        )
+        if is_resume:
+            command = self._codex_resume_with_fresh_fallback(
+                worker,
+                resume_command=command,
+                fresh_command=self._codex_exec_command(worker, model=model),
+            )
         provider_keys = [
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
