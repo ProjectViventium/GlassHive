@@ -251,6 +251,9 @@ class FakeApiClient:
     def lifecycle(self, worker_id: str, action: str):
         return {"worker_id": worker_id, "state": "ready", "action": action}
 
+    def update_workspace(self, worker_id: str, payload: dict):
+        return {"worker_id": worker_id, **payload}
+
     def desktop_action(self, worker_id: str, action: str, url: str | None = None):
         return {"worker_id": worker_id, "action": action, "url": url, "view_url": "http://127.0.0.1:62310/?autoconnect=1"}
 
@@ -273,6 +276,7 @@ class TrackingApiClient(FakeApiClient):
         self.assign_run_payloads: list[dict] = []
         self.schedule_run_payloads: list[dict] = []
         self.sent_messages: list[dict] = []
+        self.update_workspace_payloads: list[dict] = []
 
     def list_projects(self, owner_id: str | None = None):
         self.calls.append("list_projects")
@@ -305,6 +309,11 @@ class TrackingApiClient(FakeApiClient):
         self.calls.append("send_message")
         self.sent_messages.append({"worker_id": worker_id, "message": message})
         return super().send_message(worker_id, message)
+
+    def update_workspace(self, worker_id: str, payload: dict):
+        self.calls.append("update_workspace")
+        self.update_workspace_payloads.append({"worker_id": worker_id, **payload})
+        return super().update_workspace(worker_id, payload)
 
     def schedule_run(self, worker_id: str, instruction: str, *, run_at: str | None = None, schedule_text: str | None = None, delay_seconds: int | None = None, bootstrap_bundle: dict | None = None):
         self.schedule_run_payloads.append(
@@ -4239,6 +4248,33 @@ def test_workspace_launch_uses_documented_ui_fields_without_low_level_chain(monk
     assert "Satisfy the user's request as stated, preserving explicit constraints." in minimal_instruction
     assert "Treat explicit success criteria as hard acceptance gates." not in minimal_instruction
     assert "do not invent extra gates" in minimal_instruction
+
+
+def test_workspace_launch_can_favorite_the_created_workspace_in_the_same_call(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    api = TrackingApiClient()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            result = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Personal research workspace\nKeep this workspace reusable.",
+                    "favorite": True,
+                    "provider_account_policy": "personal_required",
+                    "require_callback": False,
+                },
+            )
+            assert _tool_json(result)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+
+    assert api.update_workspace_payloads == [
+        {"worker_id": "wrk_resumed", "favorite": True}
+    ]
+    assert api.calls.index("update_workspace") < api.calls.index("assign_run")
+    assert api.find_or_resume_payloads[0]["name"] == "Personal research workspace"
 
 
 def test_workspace_launch_returns_structured_quota_block_with_reuse_options(monkeypatch):

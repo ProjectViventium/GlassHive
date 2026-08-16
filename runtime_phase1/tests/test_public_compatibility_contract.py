@@ -73,6 +73,10 @@ def test_connect_skill_skips_setup_when_connected_and_never_lists_the_catalog():
     assert "Do not inspect config files, run shell checks" in compact_skill
     assert "only during first setup or reconnect verification" in compact_skill
     assert "persistent `scopes` value" in compact_skill
+    assert "inside a GlassHive workspace" in compact_skill
+    assert "Do not install that capability in the controlling AI client" in compact_skill
+    assert "Set `favorite=true`" in compact_skill
+    assert "repeat only `workspace_wait`" in compact_skill
     assert "start a new task" not in compact_skill
 
 

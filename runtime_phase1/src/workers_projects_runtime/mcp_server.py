@@ -3493,6 +3493,15 @@ def create_mcp_server(
                 )
             ),
         ] = False,
+        favorite: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Set true when the user explicitly asks to favorite or pin this reusable workspace. "
+                    "GlassHive applies it before the run is queued."
+                )
+            ),
+        ] = False,
         profile: ProfileParam = "",
         backend: BackendParam = None,
         execution_mode: ExecutionModeParam = None,
@@ -3695,6 +3704,12 @@ def create_mcp_server(
         if not worker_id:
             raise ValueError("GlassHive worker create/resume did not return worker_id")
 
+        if favorite:
+            worker = {
+                **worker,
+                **client.update_workspace(worker_id, {"favorite": True}),
+            }
+
         try:
             run = client.assign_run(
                 worker_id,
@@ -3770,6 +3785,7 @@ def create_mcp_server(
         description=(
             "Primary user-facing GlassHive launch tool. Use this for ordinary LibreChat requests that need a resumable workspace, browser/desktop work, local files, generated artifacts, or a long-running worker. "
             "Its inputs intentionally mirror the documented GlassHive UI: description, optional success_criteria, and optional context. "
+            "Use a short natural workspace name on the first line of description; keep the full request on following lines or in context. "
             "Do not shorten, summarize, paraphrase, or water down the user's request. Use description for the outcome, success_criteria for hard gates, and context for the full available background, constraints, examples, links, file references, exclusions, and any original wording that matters. "
             "For connected-account facts or actions, include broker/tool availability as context and let the GlassHive worker choose how to satisfy the user's goal; do not turn tool choice into a success criterion unless the user explicitly asked for that. Browser or computer UI inspection remains available when MCP/tools are missing, unavailable, auth-blocked, explicitly required, or genuinely the better visual/manual QA route. "
             "The host assistant must not fabricate MCP/tool results or force a downloadable artifact; only pass real data/capabilities and let the worker decide whether a file, chat answer, browser action, or other output is appropriate. "
@@ -3797,7 +3813,15 @@ def create_mcp_server(
         structured_output=True,
     )
     def workspace_launch(
-        description: Annotated[str, Field(description="Describe your project or task in the user's own outcome language.")],
+        description: Annotated[
+            str,
+            Field(
+                description=(
+                    "Describe the project in the user's own outcome language. Use a short, natural workspace "
+                    "name on the first line and preserve the complete request on following lines or in context."
+                )
+            ),
+        ],
         success_criteria: Annotated[
             str | None,
             Field(
@@ -3830,6 +3854,14 @@ def create_mcp_server(
         reuse_existing_workspace: Annotated[
             bool,
             Field(description="Set true only when the user explicitly asked to resume/reuse the named workspace_alias. Leave false for fresh one-off tasks."),
+        ] = False,
+        favorite: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Set true when the user explicitly asks to favorite or pin this reusable workspace."
+                )
+            ),
         ] = False,
         profile: ProfileParam = "",
         execution_mode: ExecutionModeParam = None,
@@ -3907,6 +3939,7 @@ def create_mcp_server(
             goal=clean_success_criteria,
             alias=delegate_alias,
             reuse_existing_workspace=reuse_existing_workspace,
+            favorite=favorite,
             profile=profile,
             execution_mode=execution_mode,
             bootstrap_bundle_json=bootstrap_bundle_json,

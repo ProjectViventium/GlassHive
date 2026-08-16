@@ -145,6 +145,13 @@ Fresh `workspace_launch` calls must not accidentally resume stale workspaces. A 
 fresh one-off project/worker for the new request. Use explicit reuse only when the user asked to
 resume or reuse that existing workspace. Deliberate operator-level reuse remains available through
 `worker_find_or_resume`, `workspace_continue`, and explicit lifecycle tools.
+When the user asks for a reusable favorite workspace, the same `workspace_launch` call sets
+`favorite=true` before queueing the run; no catalog/update tool chain is required. The first line of
+`description` is the short human workspace name, while following lines and `context` preserve the
+complete request. Capability setup requested inside that workspace stays in the launched worker:
+the controlling AI must not install the capability into itself or wander through account, Library,
+connection, or tool catalogs. If the run is still active and the user asked to wait, it repeats only
+`workspace_wait`.
 An explicitly closed workspace is permanently closed from the moment teardown begins. That includes
 `terminating`, `termination_failed` (compute teardown needs retry/operator attention), and
 `terminated`: run, message, pause, interrupt, resume, desktop/terminal, account-switch, and schedule

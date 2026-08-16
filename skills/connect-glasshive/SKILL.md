@@ -40,6 +40,15 @@ Call only the MCP tool needed for the requested outcome:
 - inspect accounts, connected services, or reusable capabilities only when asked:
   `worker_accounts_list`, `connections_list`, or `library_list`
 
+When the user asks to add, connect, configure, or use a capability **inside a GlassHive workspace**,
+put that outcome in `workspace_launch` or `workspace_continue` and let the workspace handle its own
+native setup. Do not install that capability in the controlling AI client, and do not inspect
+accounts, Connections, Library, or the tool catalog unless the user separately asked about those
+surfaces. Use a short, natural workspace name on the first line and preserve the complete request
+in the remaining description/context. Set `favorite=true` when the user asked to favorite or pin
+the reusable workspace. If the workspace is still running and the user asked you to
+wait, repeat only `workspace_wait`; do not explore other tools while it works.
+
 Use the human names and stable ids returned by GlassHive. Keep the user's goal intact and let the
 workspace decide its own execution plan. If a tool returns a browser confirmation URL, show it and
 wait for the signed-in user; never claim approval happened before GlassHive confirms it.
