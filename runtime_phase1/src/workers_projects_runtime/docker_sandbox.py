@@ -188,11 +188,10 @@ try:
         codex_metadata = os.fstat(codex_home_fd)
         if codex_metadata.st_uid not in {0, worker_uid}:
             raise RuntimeError("Workspace Codex home has an unexpected owner")
-        if codex_metadata.st_uid == 0:
-            os.fchown(codex_home_fd, worker_uid, worker_gid)
-        # Bootstrap-created directories follow the service umask. Normalize this
-        # selected worker-owned directory before exposing the account link.
-        os.fchmod(codex_home_fd, 0o700)
+        # Keep the bind-mounted home owned by the host runtime. Container-root
+        # chown maps through the rootless user namespace and would make the
+        # persisted .codex tree inaccessible to later host-side bootstrap work.
+        # The reviewed workspace ACL contract grants the worker access.
 
         expected_target = os.path.join(mount_path, home_name, "auth.json")
         try:
@@ -1960,6 +1959,12 @@ screen -ls | awk -v target="$target" '
     def _require_docker(self) -> None:
         if shutil.which("docker") is None:
             raise RuntimeError("Docker CLI is required for sandboxed workers but was not found on PATH")
+
+    def prepare_image(self) -> None:
+        """Ensure the reviewed workstation image exists before user traffic begins."""
+
+        self._require_docker()
+        self._ensure_image()
 
     def _ensure_image(self) -> None:
         now = time.monotonic()

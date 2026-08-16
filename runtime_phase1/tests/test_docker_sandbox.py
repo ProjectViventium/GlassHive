@@ -335,6 +335,8 @@ def test_codex_provider_auth_link_keeps_workspace_config_and_uses_live_account_a
     plugin_marker = workspace_codex / "plugins" / "installed.marker"
     plugin_marker.parent.mkdir()
     plugin_marker.write_text("persistent")
+    workspace_codex.chmod(0o750)
+    original_owner = (workspace_codex.stat().st_uid, workspace_codex.stat().st_gid)
 
     first = _run_codex_provider_auth_link(provider_root, workspace_home)
     auth_link = workspace_codex / "auth.json"
@@ -351,6 +353,13 @@ def test_codex_provider_auth_link_keeps_workspace_config_and_uses_live_account_a
     assert provider_auth.read_text() == "synthetic refreshed credential"
     assert workspace_config.read_text() == "[features]\nplugins = true\n"
     assert plugin_marker.read_text() == "persistent"
+    assert (workspace_codex.stat().st_uid, workspace_codex.stat().st_gid) == original_owner
+    assert stat.S_IMODE(workspace_codex.stat().st_mode) == 0o750
+
+
+def test_codex_provider_auth_link_preserves_host_managed_workspace_home_contract():
+    assert "os.fchown(codex_home_fd" not in _CODEX_PROVIDER_AUTH_LINK_SCRIPT
+    assert "os.fchmod(codex_home_fd" not in _CODEX_PROVIDER_AUTH_LINK_SCRIPT
 
 
 @pytest.mark.parametrize("unsafe_kind", ["symlink", "hardlink", "fifo"])
