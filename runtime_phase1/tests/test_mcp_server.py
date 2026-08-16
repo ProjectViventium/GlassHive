@@ -37,6 +37,9 @@ def _configure_enterprise_mcp_oauth(monkeypatch):
 
 
 class FakeApiClient:
+    def workspace_catalog(self, **kwargs):
+        return {"items": [], "next_cursor": None}
+
     def list_projects(self, owner_id: str | None = None):
         items = [
             {"project_id": "prj_123", "owner_id": "demo-owner", "title": "Inbox Zero", "goal": "Triage open loops"},
@@ -5003,7 +5006,27 @@ def test_workspace_launch_reuses_enterprise_catalog_alias_without_scoping_twice(
     assert api.find_or_resume_payloads[-1]["alias"] == "marketing-sandbox"
 
 
-def test_workspace_launch_resolves_exact_saved_name_when_reuse_alias_is_omitted(monkeypatch):
+@pytest.mark.parametrize(
+    ("workspace_alias", "description", "expected_search"),
+    [
+        (
+            None,
+            "Microsoft work hub\nRead connected accounts without changing anything.",
+            "Microsoft work hub",
+        ),
+        (
+            "Microsoft work hub",
+            "Microsoft work hub check\nRead connected accounts without changing anything.",
+            "Microsoft work hub",
+        ),
+    ],
+)
+def test_workspace_launch_resolves_exact_saved_name_for_human_reuse_inputs(
+    monkeypatch,
+    workspace_alias,
+    description,
+    expected_search,
+):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     _configure_enterprise_mcp_oauth(monkeypatch)
@@ -5024,7 +5047,7 @@ def test_workspace_launch_resolves_exact_saved_name_when_reuse_alias_is_omitted(
 
     class ExactNameCatalogApi(TrackingApiClient):
         def workspace_catalog(self, **kwargs):
-            assert kwargs["search"] == "Microsoft work hub"
+            assert kwargs["search"] == expected_search
             return {
                 "items": [
                     {
@@ -5064,10 +5087,11 @@ def test_workspace_launch_resolves_exact_saved_name_when_reuse_alias_is_omitted(
             result = await client.call_tool(
                 "workspace_launch",
                 {
-                    "description": "Microsoft work hub\nRead connected accounts without changing anything.",
+                    "description": description,
                     "reuse_existing_workspace": True,
                     "profile": "codex-cli",
                     "require_callback": False,
+                    **({"workspace_alias": workspace_alias} if workspace_alias else {}),
                 },
             )
             assert _tool_json(result)["status"] == "dispatched"

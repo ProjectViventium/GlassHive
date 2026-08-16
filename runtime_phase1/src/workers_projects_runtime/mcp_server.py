@@ -3861,7 +3861,12 @@ def create_mcp_server(
         ] = None,
         workspace_alias: Annotated[
             str | None,
-            Field(description="Optional stable workspace alias. Honored only when reuse_existing_workspace is true; omit for a new one-off workspace."),
+            Field(
+                description=(
+                    "Optional stable workspace alias or exact saved human name. Honored only when "
+                    "reuse_existing_workspace is true; omit for a new one-off workspace."
+                )
+            ),
         ] = None,
         reuse_existing_workspace: Annotated[
             bool,
@@ -3952,9 +3957,10 @@ def create_mcp_server(
         )
         title = clean_description.splitlines()[0].strip()[:120] or "GlassHive workspace"
         delegate_alias = workspace_alias if reuse_existing_workspace else None
-        if reuse_existing_workspace and not str(delegate_alias or "").strip():
+        if reuse_existing_workspace:
+            lookup_name = str(delegate_alias or "").strip() or title
             catalog = client.workspace_catalog(
-                search=title,
+                search=lookup_name,
                 kind="named",
                 limit=100,
             )
@@ -3964,15 +3970,21 @@ def create_mcp_server(
                 item
                 for item in (items if isinstance(items, list) else [])
                 if isinstance(item, dict)
-                and str(item.get("name") or "").strip().casefold() == title.casefold()
+                and str(item.get("name") or "").strip().casefold() == lookup_name.casefold()
                 and str(item.get("alias") or "").strip()
             ]
-            if len(exact_matches) != 1 or next_cursor:
+            if len(exact_matches) > 1 or next_cursor:
                 raise ValueError(
-                    f"Could not resolve exactly one saved workspace named {title!r}; "
+                    f"Could not resolve exactly one saved workspace named {lookup_name!r}; "
                     "use workspace_list once and retry with its workspace_alias"
                 )
-            delegate_alias = str(exact_matches[0]["alias"]).strip()
+            if len(exact_matches) == 1:
+                delegate_alias = str(exact_matches[0]["alias"]).strip()
+            elif not str(delegate_alias or "").strip():
+                raise ValueError(
+                    f"Could not resolve exactly one saved workspace named {lookup_name!r}; "
+                    "use workspace_list once and retry with its workspace_alias"
+                )
         return worker_delegate_once(
             title=title,
             instruction="\n".join(brief_sections),
