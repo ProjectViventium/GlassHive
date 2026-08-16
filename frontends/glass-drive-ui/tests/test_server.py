@@ -36,6 +36,7 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "WPR_API_TOKEN",
         "GLASSHIVE_DEFAULT_OWNER_ID",
         "GLASSHIVE_ENTERPRISE_MODE",
+        "GLASSHIVE_PUBLIC_LINKS_ONLY",
         "WPR_ENTERPRISE_MODE",
         "GLASSHIVE_AUTH_MODE",
         "GLASSHIVE_ENTERPRISE_TENANT_ID",
@@ -57,11 +58,15 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "GLASSHIVE_MAX_WATCH_SESSION_DURATION_S",
         "WPR_DEFAULT_EXECUTION_MODE",
         "WPR_ALLOWED_WORKER_PROFILES",
+        "WPR_DB_PATH",
         "WPR_LINK_REF_TTL_SECONDS",
         "VIVENTIUM_ENV_FILE",
         "VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV",
     ):
         monkeypatch.delenv(name, raising=False)
+    # Keep unit tests isolated from the currently installed Viventium runtime.
+    # Individual runtime-env loading tests opt into their own synthetic env file.
+    monkeypatch.setenv("VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV", "1")
     monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(tmp_path / "link_refs.sqlite3"))
     server_module._NOVNC_VIEW_URL_CACHE.clear()
     server_module._NOVNC_ASSET_CACHE.clear()
@@ -791,7 +796,6 @@ def test_active_novnc_websocket_closes_at_watch_session_cap(tmp_path, monkeypatc
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
     monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "1")
     monkeypatch.setenv("GLASSHIVE_WATCH_SESSION_STATE_PATH", str(tmp_path / "watch-sessions.sqlite3"))
-    token = signed_worker_token(secret)
     upstreams = []
 
     class FakeUpstream:
@@ -827,7 +831,10 @@ def test_active_novnc_websocket_closes_at_watch_session_cap(tmp_path, monkeypatc
     monkeypatch.setattr(server_module.websockets, "connect", fake_connect)
     client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
 
-    with client.websocket_connect(f"/novnc/wrk_1/websockify?gh_token={token}") as websocket:
+    # An authenticated operator websocket remains interactive, but is bounded
+    # by the configured session cap. Shareable worker_view links are rejected
+    # by the separate read-only capability regression.
+    with client.websocket_connect("/novnc/wrk_1/websockify") as websocket:
         with pytest.raises(WebSocketDisconnect) as exc:
             websocket.receive_text()
 
@@ -1228,6 +1235,54 @@ def test_signed_watch_token_is_worker_scoped_for_control_and_desktop_routes(monk
     assert runtime.header_contexts == []
 
 
+def test_signed_worker_view_is_read_only_for_same_worker_even_after_cookie_bootstrap(monkeypatch):
+    secret = "ui-signed-link-secret"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    token = signed_worker_token(secret)
+
+    # The GET is a valid read-only watch bootstrap and stores the scoped token
+    # in an HttpOnly cookie. Neither the explicit bearer nor that cookie may be
+    # promoted into a mutable member session.
+    assert client.get(f"/watch/wrk_1?gh_token={token}").status_code == 200
+    probes = [
+        ("post", "/api/worker/wrk_1/steer", {"message": "must not steer"}),
+        ("post", "/api/worker/wrk_1/message", {"message": "must not queue"}),
+        ("post", "/api/worker/wrk_1/metadata", {"favorite": True}),
+        ("post", "/api/worker/wrk_1/action/pause", None),
+        ("post", "/api/worker/wrk_1/action/resume", None),
+        ("post", "/api/worker/wrk_1/action/interrupt", None),
+        ("post", "/api/worker/wrk_1/action/terminate", None),
+        ("post", "/api/worker/wrk_1/action/browser", {"url": "https://example.test"}),
+        ("post", "/v1/workers/wrk_1/pause", None),
+        ("patch", "/ui/workers/wrk_1", {"favorite": True}),
+    ]
+    for method, path, body in probes:
+        request = getattr(client, method)
+        response = request(path, json=body) if body is not None else request(path)
+        assert response.status_code == 403, path
+
+    assert runtime.steer_requests == []
+    assert runtime.message_requests == []
+    assert runtime.metadata_requests == []
+    assert runtime.lifecycle_requests == []
+    assert runtime.desktop_actions == []
+
+
+def test_signed_worker_view_cannot_open_interactive_novnc_websocket(monkeypatch):
+    secret = "ui-signed-link-secret"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    token = signed_worker_token(secret)
+
+    with pytest.raises(WebSocketDisconnect) as captured:
+        with client.websocket_connect(f"/novnc/wrk_1/websockify?gh_token={token}"):
+            pass
+
+    assert captured.value.code == 1008
+
+
 def test_runtime_proxy_strips_signed_query_params_before_upstream(monkeypatch):
     service_secret = "ui-service-secret"
     signed_secret = "ui-signed-link-secret"
@@ -1269,6 +1324,160 @@ def test_runtime_proxy_strips_signed_query_params_before_upstream(monkeypatch):
     assert captured["url"] == "http://runtime.test/v1/workers/wrk_1/live?worker_id=wrk_1&path=outputs%2Freport.txt"
     assert captured["headers"]["X-WPR-Token"] == service_secret
     assert captured["headers"]["X-Viventium-User-Id"] == "user-a"
+
+
+def test_operator_work_view_proxies_exact_opaque_ref_to_configured_runtime(monkeypatch):
+    runtime = FakeRuntimeClient()
+    captured = {}
+    ref_id = "ghr_1234567890abcdef12345678"
+
+    class FakeUpstreamResponse:
+        status_code = 200
+        content = b"<html><body>Read-only mission view</body></html>"
+        headers = {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+            "x-content-type-options": "nosniff",
+        }
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            captured.update(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers or {},
+                    "content": content,
+                }
+            )
+            return FakeUpstreamResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.get(f"/w/{ref_id}?gh_token=must-not-be-forwarded")
+
+    assert response.status_code == 200
+    assert response.text == "<html><body>Read-only mission view</body></html>"
+    assert captured["method"] == "GET"
+    assert captured["url"] == f"http://runtime.test/w/{ref_id}"
+    assert captured["client_kwargs"]["follow_redirects"] is False
+    assert "X-WPR-Token" not in captured["headers"]
+    assert "X-Viventium-User-Id" not in captured["headers"]
+    assert runtime.lifecycle_requests == []
+
+
+@pytest.mark.parametrize(
+    "ref_id",
+    [
+        "not-a-view-ref",
+        "ghr_short",
+        "ghr_1234567890abcdef12345678%2Factions",
+    ],
+)
+def test_operator_work_view_rejects_invalid_opaque_ref_before_upstream(monkeypatch, ref_id):
+    class UnexpectedAsyncClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("invalid work-view refs must not reach the runtime")
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", UnexpectedAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get(f"/w/{ref_id}")
+
+    assert response.status_code in {400, 404}
+
+
+def test_operator_work_view_preserves_runtime_invalid_ref_response(monkeypatch):
+    ref_id = "ghr_1234567890abcdef12345678"
+
+    class FakeUpstreamResponse:
+        status_code = 401
+        content = b'{"detail":"Invalid or expired GlassHive workspace link"}'
+        headers = {"content-type": "application/json"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            return FakeUpstreamResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get(f"/w/{ref_id}")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid or expired GlassHive workspace link"
+
+
+def test_operator_work_view_never_proxies_mutations(monkeypatch):
+    ref_id = "ghr_1234567890abcdef12345678"
+
+    class UnexpectedAsyncClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("work-view mutations must not reach the runtime")
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", UnexpectedAsyncClient)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    action = client.post(f"/w/{ref_id}/actions/terminate")
+    desktop = client.post(f"/w/{ref_id}/desktop-action", json={"action": "terminal"})
+    direct = client.post(f"/w/{ref_id}")
+
+    assert action.status_code in {404, 405}
+    assert desktop.status_code in {404, 405}
+    assert direct.status_code == 405
+    assert runtime.lifecycle_requests == []
+    assert runtime.desktop_actions == []
+
+
+def test_operator_work_view_does_not_expose_ref_in_upstream_redirect(monkeypatch):
+    ref_id = "ghr_1234567890abcdef12345678"
+
+    class FakeUpstreamResponse:
+        status_code = 307
+        content = b""
+        headers = {"location": f"http://runtime.test/w/{ref_id}"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            return FakeUpstreamResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get(f"/w/{ref_id}", follow_redirects=False)
+
+    assert response.status_code == 502
+    assert "location" not in response.headers
+    assert ref_id not in response.text
 
 
 def test_novnc_submodule_imports_can_inherit_signed_token_from_referer(monkeypatch):
@@ -1325,7 +1534,7 @@ def test_signed_watch_sets_worker_scoped_cookie(monkeypatch):
     assert runtime.lifecycle_requests == []
 
 
-def test_short_worker_view_ref_can_auto_resume_when_configured(monkeypatch):
+def test_short_worker_view_ref_stays_read_only_when_legacy_auto_resume_is_configured(monkeypatch):
     secret = "ui-signed-link-secret"
     monkeypatch.setenv("WPR_API_TOKEN", secret)
     monkeypatch.setenv("GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME", "true")
@@ -1342,7 +1551,7 @@ def test_short_worker_view_ref_can_auto_resume_when_configured(monkeypatch):
     assert response.headers["location"] == "http://testserver/watch/wrk_1?surface=desktop"
     assert "gh_token=" not in response.headers["location"]
     assert runtime.worker_view_open_requests == ["wrk_1"]
-    assert runtime.lifecycle_requests == [{"worker_id": "wrk_1", "action": "resume"}]
+    assert runtime.lifecycle_requests == []
 
 
 def test_short_worker_view_ref_redirects_and_sets_worker_cookie(monkeypatch):
@@ -1366,6 +1575,70 @@ def test_short_worker_view_ref_redirects_and_sets_worker_cookie(monkeypatch):
     assert "glasshive_gh_token_wrk_1=" not in set_cookie
     assert "HttpOnly" in set_cookie
     assert "SameSite=lax" in set_cookie
+
+
+@pytest.mark.parametrize("failure_kind, expected_status", [("terminated", 404), ("unavailable", 503)])
+def test_short_worker_view_ref_requires_authoritative_runtime_acceptance(
+    tmp_path,
+    monkeypatch,
+    failure_kind,
+    expected_status,
+):
+    secret = "ui-signed-link-secret"
+    mismatched_runtime_db = tmp_path / "ambient" / "wrong-runtime.db"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    monkeypatch.setenv("WPR_DB_PATH", str(mismatched_runtime_db))
+
+    class RejectingRuntime(FakeRuntimeClient):
+        def record_worker_view_open(self, worker_id: str):
+            self.worker_view_open_requests.append(worker_id)
+            request = httpx.Request("POST", f"http://runtime.test/v1/workers/{worker_id}/view-opened")
+            if failure_kind == "unavailable":
+                raise httpx.ConnectError("synthetic runtime unavailable", request=request)
+            response = httpx.Response(404, request=request)
+            raise httpx.HTTPStatusError("synthetic terminated worker", request=request, response=response)
+
+    runtime = RejectingRuntime()
+    client = TestClient(create_app(runtime_client=runtime))
+    token = signed_worker_token(secret)
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/watch/wrk_1?surface=desktop&gh_token={token}",
+    )
+
+    response = client.get(f"/r/{ref_id}", follow_redirects=False)
+
+    assert response.status_code == expected_status
+    assert "location" not in response.headers
+    assert "set-cookie" not in response.headers
+    assert runtime.worker_view_open_requests == ["wrk_1"]
+    assert not mismatched_runtime_db.exists()
+
+
+def test_direct_worker_view_token_requires_authoritative_runtime_acceptance(
+    tmp_path,
+    monkeypatch,
+):
+    secret = "ui-signed-link-secret"
+    mismatched_runtime_db = tmp_path / "ambient" / "wrong-runtime.db"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    monkeypatch.setenv("WPR_DB_PATH", str(mismatched_runtime_db))
+
+    class UnavailableRuntime(FakeRuntimeClient):
+        def record_worker_view_open(self, worker_id: str):
+            self.worker_view_open_requests.append(worker_id)
+            request = httpx.Request("POST", f"http://runtime.test/v1/workers/{worker_id}/view-opened")
+            raise httpx.ConnectError("synthetic runtime unavailable", request=request)
+
+    runtime = UnavailableRuntime()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.get(f"/watch/wrk_1?gh_token={signed_worker_token(secret)}")
+
+    assert response.status_code == 503
+    assert "set-cookie" not in response.headers
+    assert runtime.worker_view_open_requests == ["wrk_1"]
+    assert not mismatched_runtime_db.exists()
 
 
 def test_short_worker_view_ref_rejects_unconfigured_absolute_redirect_target(monkeypatch):
@@ -1561,16 +1834,17 @@ def test_short_worker_view_ref_ttl_config_can_expire_refs(monkeypatch):
 
 
 def test_ui_sensitive_url_log_filter_redacts_signed_tokens():
+    view_ref = "ghr_1234567890abcdef12345678"
     raw = (
         'GET /novnc/wrk_1/websockify?gh_token=secret-token&gh_sig=signature&gh_exp=123 '
-        'GET /v1/signed-links/opaque-token?download=1'
+        f'GET /v1/signed-links/opaque-token?download=1 GET /w/{view_ref}'
     )
 
     cookie = f"Set-Cookie: {worker_cookie_name('wrk_1')}=worker-secret; HttpOnly; SameSite=lax"
 
     assert redact_sensitive_url_text(f"{raw} {cookie}") == (
         'GET /novnc/wrk_1/websockify?gh_token=[redacted]&gh_sig=[redacted]&gh_exp=[redacted] '
-        'GET /v1/signed-links/[redacted]?download=1 '
+        'GET /v1/signed-links/[redacted]?download=1 GET /w/[redacted] '
         f"Set-Cookie: {worker_cookie_name('wrk_1')}=[redacted]; HttpOnly; SameSite=lax"
     )
     assert redact_sensitive_url_text("gh_sig=signature&gh_token=secret-token") == (
@@ -1588,6 +1862,7 @@ def test_ui_sensitive_url_log_filter_redacts_signed_tokens():
     assert SensitiveUrlLogFilter().filter(record) is True
     assert "secret-token" not in record.args[0]
     assert "opaque-token" not in record.args[0]
+    assert view_ref not in record.args[0]
     assert "worker-secret" not in record.args[0]
     assert "gh_token=[redacted]" in record.args[0]
     assert f"{worker_cookie_name('wrk_1')}=[redacted]" in record.args[0]
@@ -1716,6 +1991,83 @@ def test_enterprise_ui_requires_service_token_at_startup(monkeypatch):
 
     with pytest.raises(RuntimeError, match="requires WPR_API_TOKEN"):
         create_app(runtime_client=FakeRuntimeClient())
+
+
+def test_public_links_only_ui_requires_signed_link_secret_at_startup(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
+
+    with pytest.raises(RuntimeError, match="public link mode requires GLASSHIVE_SIGNED_LINK_SECRET"):
+        create_app(runtime_client=FakeRuntimeClient())
+
+
+def test_public_links_only_ui_rejects_operator_surfaces_without_signed_session(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-link-secret")
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    assert client.get("/docs").status_code == 404
+    assert client.get("/").status_code == 401
+    assert client.get("/api/bootstrap").status_code == 401
+    assert client.get("/watch/wrk_1").status_code == 401
+    assert client.get("/v1/workers/wrk_1").status_code == 401
+
+
+def test_public_links_only_worker_ref_opens_scoped_watch_session(monkeypatch):
+    secret = "public-link-secret"
+    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
+    token = signed_worker_token(secret)
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url="/watch/wrk_1?project_id=prj_1&surface=desktop",
+    )
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get(f"/r/{ref_id}", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"].startswith("/watch/wrk_1?")
+    assert client.get(response.headers["location"]).status_code == 200
+
+
+def test_public_links_only_artifact_ref_is_bearer_but_raw_token_route_is_closed(monkeypatch):
+    secret = "public-link-secret"
+    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
+    token = signed_artifact_token(secret, kind="artifact_open")
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/v1/signed-links/{token}",
+    )
+    captured = {}
+
+    class FakeUpstreamResponse:
+        status_code = 200
+        content = b"<html><body>artifact preview</body></html>"
+        headers = {"content-type": "text/html; charset=utf-8"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            captured.update({"method": method, "url": url, "headers": headers or {}})
+            return FakeUpstreamResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get(f"/v1/link-refs/{ref_id}")
+
+    assert response.status_code == 200
+    assert captured["url"] == f"http://runtime.test/v1/link-refs/{ref_id}"
+    assert client.get(f"/v1/signed-links/{token}").status_code == 404
 
 
 def test_enterprise_ui_requires_signed_link_secret_at_startup(monkeypatch):

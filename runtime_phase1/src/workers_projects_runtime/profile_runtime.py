@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import json
 import base64
+import fcntl
 import hashlib
 import logging
+import math
 import os
 import re
 import secrets
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
+import sys
+import tempfile
 import time
+from contextlib import contextmanager
+from urllib.parse import urlsplit
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 compatibility
@@ -20,11 +27,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
 
+from .agent_builder_control import graph_transfer_output_schema
 from .bootstrap import (
     GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
     GLASSHIVE_NATIVE_CAPABILITY_INVENTORY,
     GLASSHIVE_SAFETY_CHECKPOINT_RULE,
     GLASSHIVE_WORKER_COMPLETION_CONTRACT,
+    PARALLEL_CLEAN_ROOM_EXECUTION_POLICY,
+    bootstrap_bundle_for,
     bootstrap_env_for,
     claude_project_mcp_payload_for_bundle,
     glasshive_project_claude_md,
@@ -35,11 +45,16 @@ from .bootstrap import (
     resolve_bootstrap_source_path,
 )
 from .docker_sandbox import DockerSandboxManager
+from .durable_capture import DurableSecretScrubber, scrub_durable_text_artifacts
 from .failure_classification import classify_cli_failure, classify_runtime_error
+from .native_team import project_native_events
 from .openclaw_runtime import (
+    HostCapacityError,
+    ProviderRateLimitError,
     RuntimeErrorBase,
     RuntimeDependencyMissingError,
     RuntimeInfo,
+    RunStartupRejectedError,
     WorkerInterruptedError,
     WorkerPausedError,
     WorkerRuntime,
@@ -48,6 +63,7 @@ from .openclaw_runtime import (
 )
 from .runtime_requirements import host_runtime_requirement_issue
 from .run_evidence import (
+    FINAL_REPORT_PATTERN,
     build_constraint_ledger,
     build_run_evidence,
     write_constraint_ledger,
@@ -58,9 +74,203 @@ from .terminal_takeover import TerminalTarget
 
 logger = logging.getLogger(__name__)
 
+
+def _drain_scrubbed_provider_stream(
+    stream: object,
+    destination: object,
+    scrubber: DurableSecretScrubber,
+    errors: list[BaseException],
+) -> None:
+    """Copy one provider pipe into a durable transcript after structural scrubbing."""
+
+    try:
+        for line in stream:  # type: ignore[union-attr]
+            destination.write(scrubber.scrub_text(str(line)))  # type: ignore[union-attr]
+            destination.flush()  # type: ignore[union-attr]
+    except BaseException as exc:  # pragma: no cover - defensive pipe/filesystem boundary
+        errors.append(exc)
+    finally:
+        try:
+            stream.close()  # type: ignore[union-attr]
+        except (AttributeError, OSError):
+            pass
+
+
+def _scrub_provider_owned_artifacts(
+    *,
+    state_dir: Path,
+    home_dir: Path,
+    run_root: Path,
+    workspace: Path,
+    scrubber: DurableSecretScrubber,
+) -> None:
+    # Deliberately exclude the worker workspace: it can contain user-authored
+    # files and deliverables whose contents GlassHive must never rewrite.
+    roots = [state_dir, home_dir, run_root]
+    harness_workspace = workspace / "glasshive-run"
+    if harness_workspace.exists():
+        roots.append(harness_workspace)
+    scrub_durable_text_artifacts(roots, scrubber=scrubber)
+
+
+def _provider_process_exit_error(
+    *,
+    runtime_name: str,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    message: str,
+) -> RuntimeErrorBase:
+    classification = classify_cli_failure(
+        stdout=stdout,
+        stderr=stderr,
+        runtime_name=runtime_name,
+        exit_code=exit_code,
+    )
+    if (
+        classification.failure_class == "provider_rate_limited"
+        and classification.retry_after_s is not None
+    ):
+        return ProviderRateLimitError(
+            message,
+            retry_after_s=classification.retry_after_s,
+        )
+    error = RuntimeErrorBase(message)
+    # Preserve the structured provider classification across the process-exit boundary. Downstream
+    # recovery must not infer authentication state from localized CLI prose.
+    if classification.structured:
+        error.failure_class = classification.failure_class
+        error.failure_retryable = classification.retryable
+    return error
+
 _CODEX_MCP_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 _HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
+_CODEX_NATIVE_WEB_LOCKDOWN_FEATURES = (
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "computer_use",
+    "in_app_browser",
+    "plugins",
+    "remote_plugin",
+)
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off", "none", "disabled"}
+_CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+_CLAUDE_ACCESS_TOKEN_EXPIRY_BUFFER_MS = 60_000
+
+
+def _usable_claude_oauth_token(value: object) -> str:
+    token = str(value or "").strip()
+    if not token or token == "user_provided" or "${" in token:
+        return ""
+    return token
+
+
+def _usable_explicit_claude_oauth_token() -> str:
+    return _usable_claude_oauth_token(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
+
+
+def _read_claude_keychain_oauth() -> dict[str, object]:
+    if sys.platform != "darwin" or not shutil.which("security"):
+        return {}
+    try:
+        completed = subprocess.run(
+            ["security", "find-generic-password", "-s", _CLAUDE_KEYCHAIN_SERVICE, "-w"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+        credential = json.loads(completed.stdout) if completed.returncode == 0 else {}
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return {}
+    oauth = credential.get("claudeAiOauth") if isinstance(credential, dict) else {}
+    return oauth if isinstance(oauth, dict) else {}
+
+
+def _claude_keychain_access_token_is_fresh(
+    oauth: dict[str, object], *, now_ms: int | None = None
+) -> bool:
+    access_token = str(oauth.get("accessToken") or "").strip()
+    if not access_token:
+        return False
+    try:
+        expires_at = float(oauth.get("expiresAt"))
+    except (TypeError, ValueError):
+        return False
+    if not expires_at or not math.isfinite(expires_at):
+        return False
+    current_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    return expires_at > current_ms + _CLAUDE_ACCESS_TOKEN_EXPIRY_BUFFER_MS
+
+
+def _claude_cli_managed_auth_available(
+    binary: str, *, child_env: dict[str, str] | None
+) -> bool:
+    if child_env is None:
+        return False
+    resolved_binary = str(binary or "").strip()
+    if not resolved_binary:
+        return False
+    if not Path(resolved_binary).is_absolute():
+        resolved_binary = str(shutil.which(resolved_binary) or "")
+    if not resolved_binary:
+        return False
+    try:
+        completed = subprocess.run(
+            [resolved_binary, "auth", "status"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            env=dict(child_env),
+        )
+        payload = json.loads(completed.stdout) if completed.returncode == 0 else {}
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("loggedIn") is True
+
+
+def _claude_host_auth_available(
+    binary: str, *, child_env: dict[str, str] | None = None
+) -> bool:
+    if child_env and _usable_claude_oauth_token(child_env.get("CLAUDE_CODE_OAUTH_TOKEN")):
+        return True
+    if _usable_explicit_claude_oauth_token():
+        return True
+    keychain_oauth = _read_claude_keychain_oauth()
+    if _claude_keychain_access_token_is_fresh(keychain_oauth):
+        return True
+    return _claude_cli_managed_auth_available(binary, child_env=child_env)
+
+
+def _atomic_write_private_text(path: Path, text: str) -> None:
+    """Publish private runtime state without exposing partial cross-process reads."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        handle = os.fdopen(descriptor, "w")
+        descriptor = -1  # fdopen owns the descriptor from this point onward.
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            if descriptor >= 0:
+                os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary_name)
+        except OSError:
+            pass
+        raise
 
 
 def _codex_mcp_section_server_name(section_name: str) -> str | None:
@@ -289,6 +499,80 @@ def _toml_table_name(name: str) -> str:
     return name if re.fullmatch(r"[A-Za-z0-9_-]+", name) else _toml_string(name)
 
 
+_PLUGIN_ID_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*"
+)
+
+
+def _host_plugin_denylist() -> tuple[str, ...]:
+    raw = (
+        os.environ.get("GLASSHIVE_HOST_PLUGIN_DENYLIST", "").strip()
+        or os.environ.get("WPR_HOST_PLUGIN_DENYLIST", "").strip()
+    )
+    values: list[str] = []
+    for item in raw.split(","):
+        plugin_id = item.strip()
+        if not plugin_id:
+            continue
+        if not _PLUGIN_ID_RE.fullmatch(plugin_id):
+            raise RuntimeErrorBase(
+                "Host plugin denylist entries must use the canonical name@marketplace plugin ID"
+            )
+        if plugin_id not in values:
+            values.append(plugin_id)
+    return tuple(values)
+
+
+def _host_codex_personality() -> str:
+    personality = os.environ.get("WPR_CODEX_CLI_PERSONALITY", "inherit").strip().lower()
+    if personality not in {"inherit", "none", "friendly", "pragmatic"}:
+        raise RuntimeErrorBase(
+            "Host Codex personality must be inherit, none, friendly, or pragmatic"
+        )
+    return personality
+
+
+def _host_codex_conversation_project_instructions() -> str:
+    mode = os.environ.get(
+        "WPR_CODEX_CLI_CONVERSATION_PROJECT_INSTRUCTIONS",
+        "inherit",
+    ).strip().lower()
+    if mode not in {"inherit", "exclude"}:
+        raise RuntimeErrorBase(
+            "Host Codex conversation project instructions must be inherit or exclude"
+        )
+    return mode
+
+
+def _host_native_web_access() -> str:
+    mode = (
+        os.environ.get("WPR_HOST_NATIVE_WEB_ACCESS", "").strip()
+        or os.environ.get("GLASSHIVE_HOST_NATIVE_WEB_ACCESS", "inherit").strip()
+    ).lower()
+    if mode not in {"inherit", "disabled"}:
+        raise RuntimeErrorBase(
+            "Host native web access must be inherit or disabled"
+        )
+    return mode
+
+
+def _host_codex_personality_policy_state() -> str:
+    configured = _host_codex_personality()
+    if configured != "inherit":
+        return configured
+    source_config = Path(
+        os.environ.get("CODEX_HOME") or (Path.home() / ".codex")
+    ).expanduser() / "config.toml"
+    try:
+        parsed = tomllib.loads(source_config.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return "inherit"
+    inherited = str(parsed.get("personality") or "").strip().lower()
+    if inherited in {"none", "friendly", "pragmatic"}:
+        return f"inherit:{inherited}"
+    return "inherit"
+
+
 def _render_codex_mcp_server_from_json(name: str, config: object, manifest_dir: Path) -> str:
     if not isinstance(config, dict):
         return ""
@@ -380,6 +664,97 @@ def _sanitize_codex_source_config(config_text: str, preserve_names: set[str], ap
         if kept_servers:
             sanitized["mcp_servers"] = kept_servers
     return _render_toml_document(sanitized)
+
+
+def _apply_codex_plugin_denylist(config_text: str, plugin_ids: tuple[str, ...]) -> str:
+    if not plugin_ids:
+        return config_text.strip()
+    try:
+        parsed = tomllib.loads(config_text) if config_text.strip() else {}
+    except Exception as exc:
+        raise RuntimeErrorBase(
+            "Cannot apply the host plugin denylist because the worker Codex config is invalid"
+        ) from exc
+    if not isinstance(parsed, dict):
+        parsed = {}
+    plugins = parsed.get("plugins")
+    if not isinstance(plugins, dict):
+        plugins = {}
+        parsed["plugins"] = plugins
+    for plugin_id in plugin_ids:
+        existing = plugins.get(plugin_id)
+        entry = dict(existing) if isinstance(existing, dict) else {}
+        entry["enabled"] = False
+        plugins[plugin_id] = entry
+    return _render_toml_document(parsed)
+
+
+def _apply_codex_personality(config_text: str, personality: str) -> str:
+    if personality == "inherit":
+        return config_text.strip()
+    try:
+        parsed = tomllib.loads(config_text) if config_text.strip() else {}
+    except Exception as exc:
+        raise RuntimeErrorBase(
+            "Cannot apply the host Codex personality because the worker config is invalid"
+        ) from exc
+    if not isinstance(parsed, dict):
+        parsed = {}
+    parsed["personality"] = personality
+    return _render_toml_document(parsed)
+
+
+def _apply_codex_developer_instructions(
+    config_text: str,
+    developer_instructions: str | None,
+) -> str:
+    if developer_instructions is None:
+        return config_text.strip()
+    try:
+        parsed = tomllib.loads(config_text) if config_text.strip() else {}
+    except Exception as exc:
+        raise RuntimeErrorBase(
+            "Cannot apply host Codex developer instructions because the worker config is invalid"
+        ) from exc
+    if not isinstance(parsed, dict):
+        parsed = {}
+    if developer_instructions:
+        parsed["developer_instructions"] = developer_instructions
+    else:
+        parsed.pop("developer_instructions", None)
+    return _render_toml_document(parsed)
+
+
+def _assert_codex_worker_policy(
+    config_text: str,
+    *,
+    plugin_ids: tuple[str, ...],
+    personality: str,
+    developer_instructions: str | None = None,
+) -> None:
+    try:
+        parsed = tomllib.loads(config_text) if config_text.strip() else {}
+    except Exception as exc:
+        raise RuntimeErrorBase("Host Codex worker policy config is invalid") from exc
+    plugins = parsed.get("plugins") if isinstance(parsed, dict) else None
+    for plugin_id in plugin_ids:
+        entry = plugins.get(plugin_id) if isinstance(plugins, dict) else None
+        if not isinstance(entry, dict) or entry.get("enabled") is not False:
+            raise RuntimeErrorBase(
+                "Host Codex plugin denylist policy was not materialized; refusing to launch"
+            )
+    if personality != "inherit" and (
+        not isinstance(parsed, dict) or parsed.get("personality") != personality
+    ):
+        raise RuntimeErrorBase(
+            "Host Codex personality policy was not materialized; refusing to launch"
+        )
+    if developer_instructions is not None and str(
+        parsed.get("developer_instructions") or ""
+    ) != developer_instructions:
+        raise RuntimeErrorBase(
+            "Host Codex developer instruction authority was not materialized; refusing to launch"
+        )
 
 
 # Keep prompt templates near the top. Host-native workers read these through real files in their
@@ -626,6 +1001,8 @@ def _instruction_file_pointer_message(path: str) -> str:
 
 
 class ProfiledWorkerRuntime:
+    requires_run_start_identity = True
+
     def __init__(self, base_dir: str | None = None) -> None:
         self.openclaw = OpenClawWorkstationRuntime(base_dir=base_dir)
         self.codex = CodexCliRuntime(base_dir=base_dir)
@@ -633,6 +1010,10 @@ class ProfiledWorkerRuntime:
         self.host_openclaw = HostOpenClawRuntime(base_dir=base_dir)
         self.host_codex = HostCodexCliRuntime(base_dir=base_dir)
         self.host_claude = HostClaudeCodeRuntime(base_dir=base_dir)
+        self._provider_log_cache: dict[tuple[str, str], dict[str, object]] = {}
+        self._provider_log_cache_lock = Lock()
+        self._isolated_readiness_cache: tuple[float, dict[str, object]] | None = None
+        self._isolated_readiness_lock = Lock()
 
     def _runtime_for_profile(self, profile: str, execution_mode: str = "docker") -> WorkerRuntime:
         if execution_mode == "host":
@@ -664,11 +1045,85 @@ class ProfiledWorkerRuntime:
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).ensure_worker_ready(worker)
 
+    def prepare_run_authority_context(
+        self, worker: dict, run_id: str | None = None
+    ) -> dict[str, str]:
+        """Return an exact live container generation before Core mints a run bearer."""
+
+        if (
+            str(worker.get("execution_mode") or "docker") != "docker"
+            or str(bootstrap_bundle_for(worker).get("execution_policy") or "").strip()
+            != PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+        ):
+            raise RuntimeErrorBase(
+                "Run-local capability authority requires the Parallel clean-room policy"
+            )
+        runtime = self._runtime_for_worker(worker)
+        runtime.ensure_worker_ready(worker)
+        sandbox_manager = getattr(runtime, "sandbox", None)
+        if sandbox_manager is None:
+            raise RuntimeErrorBase(
+                "The exact mission container generation is unavailable"
+            )
+        inspection = sandbox_manager.inspect_fresh(str(worker.get("worker_id") or ""))
+        sandbox = inspection.sandbox
+        matches_policy = getattr(
+            sandbox_manager, "_sandbox_matches_parallel_clean_room_policy", None
+        )
+        if (
+            inspection.status != "present"
+            or sandbox is None
+            or str(sandbox.state or "").lower() != "running"
+            or not callable(matches_policy)
+            or not matches_policy(sandbox)
+        ):
+            raise RuntimeErrorBase(
+                "The exact mission container generation is unavailable"
+            )
+        container_id = str(sandbox.container_id or "").strip()
+        if not re.fullmatch(r"[a-f0-9]{64}", container_id):
+            raise RuntimeErrorBase(
+                "The exact mission container generation is unavailable"
+            )
+        return {"container_generation_id": container_id}
+
+    def repair_parallel_clean_room_mission_networks(self) -> tuple[str, ...]:
+        return self.codex.sandbox.repair_parallel_clean_room_mission_networks()
+
     def pause_worker(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).pause_worker(worker)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).terminate_worker(worker)
+
+    def compute_identity(self, worker: dict) -> dict[str, str]:
+        runtime = self._runtime_for_worker(worker)
+        if str(worker.get("execution_mode") or "docker") != "docker":
+            return {"container_id": ""}
+        sandbox = getattr(runtime, "sandbox", None)
+        if sandbox is None:
+            return {"container_id": ""}
+        worker_id = str(worker.get("worker_id") or "")
+        inspect_fresh = getattr(sandbox, "inspect_fresh", None)
+        if callable(inspect_fresh):
+            inspection = inspect_fresh(worker_id)
+            status = str(getattr(inspection, "status", "") or "")
+            if status == "unavailable":
+                raise RuntimeErrorBase(
+                    "The exact Docker generation could not be inspected"
+                )
+            inspected = (
+                getattr(inspection, "sandbox", None)
+                if status == "present"
+                else None
+            )
+        else:
+            inspected = sandbox.inspect(worker_id)
+        return {
+            "container_id": str(
+                getattr(inspected, "container_id", None) if inspected else ""
+            ).strip()
+        }
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
         runtime = self._runtime_for_worker(worker)
@@ -684,6 +1139,15 @@ class ProfiledWorkerRuntime:
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
         return self._runtime_for_worker(worker).run_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
 
+    def clear_run_local_capability_grant(self, worker: dict) -> None:
+        cleaner = getattr(
+            self._runtime_for_worker(worker),
+            "clear_run_local_capability_grant",
+            None,
+        )
+        if callable(cleaner):
+            cleaner(worker)
+
     def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
         runtime = self._runtime_for_worker(worker)
         checker = getattr(runtime, "worker_capacity_error", None)
@@ -691,8 +1155,226 @@ class ProfiledWorkerRuntime:
             return checker(worker)
         return None
 
+    def set_host_process_observer(self, observer) -> None:
+        # The persisted admission ledger now bounds both host-native and
+        # Docker mission roots. Docker therefore needs the same exact-run
+        # process observation used to retain/reconcile a lease after restart.
+        for runtime in (
+            self.openclaw,
+            self.codex,
+            self.claude,
+            self.host_openclaw,
+            self.host_codex,
+            self.host_claude,
+        ):
+            setter = getattr(runtime, "set_host_process_observer", None)
+            if callable(setter):
+                setter(observer)
+
+    def set_run_start_observer(self, observer) -> None:
+        for runtime in (
+            self.openclaw,
+            self.codex,
+            self.claude,
+            self.host_openclaw,
+            self.host_codex,
+            self.host_claude,
+        ):
+            setter = getattr(runtime, "set_run_start_observer", None)
+            if callable(setter):
+                setter(observer)
+
+    def set_native_event_observer(self, observer) -> None:
+        for runtime in (
+            self.codex,
+            self.claude,
+            self.host_openclaw,
+            self.host_codex,
+            self.host_claude,
+        ):
+            setter = getattr(runtime, "set_native_event_observer", None)
+            if callable(setter):
+                setter(observer)
+
+    def host_process_identity(self, worker: dict, run_id: str) -> dict[str, object] | None:
+        runtime = self._runtime_for_worker(worker)
+        reader = getattr(runtime, "host_process_identity", None)
+        if not callable(reader):
+            return None
+        return reader(worker, run_id)
+
+    def host_process_absence(self, worker: dict, run_id: str) -> bool:
+        runtime = self._runtime_for_worker(worker)
+        reader = getattr(runtime, "host_process_absence", None)
+        if not callable(reader):
+            return False
+        return reader(worker, run_id) is True
+
+    def host_active_process_status(self, worker: dict) -> dict[str, object]:
+        runtime = self._runtime_for_worker(worker)
+        reader = getattr(runtime, "host_active_process_status", None)
+        if not callable(reader):
+            return {"state": "uncertain"}
+        return reader(worker)
+
+    def isolated_parallel_readiness(
+        self, *, cached_only: bool = False
+    ) -> dict[str, object]:
+        """Bounded read-only proof that the Docker execution substrate exists.
+
+        This deliberately never builds or starts an image. Authoritative worker
+        creation still performs its full profile-specific preflight.
+        """
+
+        with self._isolated_readiness_lock:
+            cached = self._isolated_readiness_cache
+        if cached and cached[0] + 30.0 > time.monotonic():
+            return dict(cached[1])
+        if cached_only:
+            return {"ready": False, "reason": "docker_readiness_snapshot_unavailable"}
+        return self.refresh_isolated_parallel_readiness()
+
+    def refresh_isolated_parallel_readiness(self) -> dict[str, object]:
+        def store_result(result: dict[str, object]) -> dict[str, object]:
+            with self._isolated_readiness_lock:
+                self._isolated_readiness_cache = (time.monotonic(), result)
+            return dict(result)
+
+        sandbox = getattr(self.codex, "sandbox", None)
+        if sandbox is None:
+            return store_result(
+                {"ready": False, "reason": "docker_runtime_unavailable"}
+            )
+        try:
+            daemon = sandbox._docker(
+                ["info", "--format", "{{.ServerVersion}}"],
+                check=False,
+                capture_output=True,
+                timeout_sec=2,
+            )
+            if daemon.returncode != 0:
+                return store_result(
+                    {"ready": False, "reason": "docker_unavailable"}
+                )
+            image = sandbox._docker(
+                ["image", "inspect", str(sandbox.image)],
+                check=False,
+                capture_output=True,
+                timeout_sec=2,
+            )
+            if image.returncode != 0:
+                return store_result(
+                    {"ready": False, "reason": "workspace_image_unavailable"}
+                )
+        except Exception:
+            return store_result(
+                {"ready": False, "reason": "docker_probe_unavailable"}
+            )
+
+        policy_probe = getattr(sandbox, "parallel_clean_room_readiness", None)
+        if not callable(policy_probe):
+            return store_result(
+                {
+                    "ready": False,
+                    "reason": "parallel_clean_room_policy_probe_unavailable",
+                }
+            )
+        try:
+            policy_result = policy_probe()
+        except Exception:
+            return store_result(
+                {
+                    "ready": False,
+                    "reason": "parallel_clean_room_policy_probe_unavailable",
+                }
+            )
+        if not isinstance(policy_result, dict) or policy_result.get("ready") is not True:
+            result = (
+                dict(policy_result)
+                if isinstance(policy_result, dict)
+                else {
+                    "ready": False,
+                    "reason": "parallel_clean_room_policy_probe_unavailable",
+                }
+            )
+            result["ready"] = False
+            return store_result(result)
+
+        resource_usage = self.isolated_resource_usage(cached_only=False)
+        if not (
+            resource_usage.get("process_probe_ok")
+            and resource_usage.get("memory_probe_ok")
+            and resource_usage.get("disk_probe_ok")
+        ):
+            result = {
+                **policy_result,
+                "ready": False,
+                "reason": "docker_resource_probe_unavailable",
+            }
+        else:
+            result = dict(policy_result)
+        return store_result(result)
+
+    def isolated_resource_usage(
+        self, *, cached_only: bool = False
+    ) -> dict[str, object]:
+        usage = (
+            self.codex.sandbox.cached_resource_usage(max_age_seconds=30.0)
+            if cached_only
+            else self.codex.sandbox.resource_usage()
+        )
+        if usage is None:
+            return {
+                "child_processes": 0,
+                "threads": 0,
+                "available_memory_bytes": 0,
+                "available_disk_bytes": 0,
+                "running_worker_containers": 0,
+                "running_worker_ids": [],
+                "process_probe_ok": False,
+                "memory_probe_ok": False,
+                "disk_probe_ok": False,
+            }
+        return {
+            "child_processes": usage.child_processes,
+            "threads": usage.threads,
+            "available_memory_bytes": usage.available_memory_bytes,
+            "available_disk_bytes": usage.available_disk_bytes,
+            "running_worker_containers": usage.running_worker_containers,
+            "running_worker_ids": list(usage.running_worker_ids),
+            "worker_process_counts": {
+                worker_id: {
+                    "child_processes": child_processes,
+                    "threads": threads,
+                }
+                for worker_id, child_processes, threads in usage.worker_process_counts
+            },
+            "process_probe_ok": usage.process_probe_ok,
+            "memory_probe_ok": usage.memory_probe_ok,
+            "disk_probe_ok": usage.disk_probe_ok,
+        }
+
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).reconcile_worker(worker)
+
+    def cleanup_orphaned_run(self, worker: dict, run_id: str) -> RuntimeInfo | None:
+        runtime = self._runtime_for_worker(worker)
+        cleanup = getattr(runtime, "cleanup_orphaned_run", None)
+        if not callable(cleanup):
+            return None
+        return cleanup(worker, run_id)
+
+    def cleanup_unconfirmed_run_start(
+        self,
+        worker: dict,
+        run_id: str,
+        lease_identity: dict[str, object],
+    ) -> bool:
+        runtime = self._runtime_for_worker(worker)
+        cleanup = getattr(runtime, "cleanup_unconfirmed_run_start", None)
+        if not callable(cleanup):
+            return False
+        return bool(cleanup(worker, run_id, lease_identity))
 
     def terminal_target(self, worker: dict) -> TerminalTarget:
         runtime = self._runtime_for_worker(worker)
@@ -725,6 +1407,98 @@ class ProfiledWorkerRuntime:
             return {}
         projection = resolver(worker)
         return dict(projection) if isinstance(projection, dict) else {}
+
+    def provider_activity_log(self, worker: dict, run_id: str) -> tuple[str, str]:
+        """Return the private native JSONL log used for provider activity normalization."""
+
+        clean_run_id = str(run_id or "").strip()
+        if not clean_run_id or "/" in clean_run_id or "\\" in clean_run_id or clean_run_id in {".", ".."}:
+            raise ValueError("invalid run id")
+        runtime = self._runtime_for_worker(worker)
+        run_root = runtime._run_root(str(worker["worker_id"]), clean_run_id)
+        stdout_path = run_root / "stdout.log"
+        if not stdout_path.is_file():
+            return str(worker.get("profile") or ""), ""
+        try:
+            max_bytes = max(
+                1024,
+                int(
+                    os.environ.get(
+                        "GLASSHIVE_PROVIDER_LOG_WINDOW_BYTES",
+                        str(8 * 1024 * 1024),
+                    )
+                    or str(8 * 1024 * 1024)
+                ),
+            )
+        except ValueError:
+            max_bytes = 8 * 1024 * 1024
+        cache_key = (str(worker["worker_id"]), clean_run_id)
+        stat = stdout_path.stat()
+        with self._provider_log_cache_lock:
+            cached = self._provider_log_cache.get(cache_key)
+            if (
+                cached
+                and int(cached.get("size") or -1) == stat.st_size
+                and int(cached.get("mtime_ns") or -1) == stat.st_mtime_ns
+            ):
+                return str(worker.get("profile") or ""), str(cached.get("rendered") or "")
+
+            data = b""
+            previous_size = int(cached.get("size") or 0) if cached else 0
+            previous_data = cached.get("data") if cached else b""
+            if (
+                cached
+                and isinstance(previous_data, bytes)
+                and previous_size < stat.st_size
+                and stat.st_size - previous_size <= max_bytes
+            ):
+                with stdout_path.open("rb") as handle:
+                    handle.seek(previous_size)
+                    data = previous_data + handle.read()
+            else:
+                with stdout_path.open("rb") as handle:
+                    handle.seek(max(0, stat.st_size - max_bytes))
+                    data = handle.read(max_bytes)
+
+            if len(data) > max_bytes:
+                data = data[-max_bytes:]
+            excluded_bytes = max(0, stat.st_size - len(data))
+            if excluded_bytes:
+                newline = data.find(b"\n")
+                if newline >= 0:
+                    data = data[newline + 1 :]
+                else:
+                    data = b""
+                excluded_bytes = stat.st_size - len(data)
+            text = data.decode("utf-8", errors="ignore")
+            if excluded_bytes:
+                marker = json.dumps(
+                    {
+                        "type": "glasshive.log_compacted",
+                        "excluded_prefix_bytes": excluded_bytes,
+                    },
+                    separators=(",", ":"),
+                )
+                text = f"{marker}\n{text}"
+            self._provider_log_cache[cache_key] = {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "data": data,
+                "rendered": text,
+            }
+            while len(self._provider_log_cache) > 16:
+                self._provider_log_cache.pop(next(iter(self._provider_log_cache)))
+        return str(worker.get("profile") or ""), text
+
+    def provider_citation_sources(self, worker: dict, run_id: str) -> list[dict[str, str]]:
+        """Return structured public provenance retained by the native runtime."""
+
+        runtime = self._runtime_for_worker(worker)
+        collector = getattr(runtime, "provider_citation_sources", None)
+        if not callable(collector):
+            return []
+        sources = collector(worker, run_id)
+        return [dict(source) for source in sources if isinstance(source, dict)]
 
     def collect_completed_run(
         self,
@@ -764,6 +1538,7 @@ class ProfiledWorkerRuntime:
 
 
 class BaseCliWorkerRuntime:
+    requires_run_start_identity = True
     runtime_name = "cli"
     worker_root_name = "cli_runtime"
     binary_env_var = ""
@@ -781,10 +1556,20 @@ class BaseCliWorkerRuntime:
         self._process_lock = Lock()
         self._active_processes: dict[str, subprocess.Popen[str]] = {}
         self._stop_reasons: dict[tuple[str, str | None], str] = {}
+        self._host_process_observer = None
+        self._run_start_observer = None
+        self._native_event_observer = None
         self.sandbox = DockerSandboxManager(base_dir=str(self.base_dir))
 
     def resolve_model(self, profile: str) -> str:
         raise NotImplementedError
+
+    def _agent_type(self) -> str:
+        if self.runtime_name == "codex-cli":
+            return "codex"
+        if self.runtime_name == "claude-code":
+            return "claude"
+        return "openclaw"
 
     def preflight_worker_profile(self, profile: str, execution_mode: str = "docker") -> None:
         return None
@@ -816,6 +1601,18 @@ class BaseCliWorkerRuntime:
     def _active_session_meta_path(self, worker_id: str) -> Path:
         return self._state_dir(worker_id) / "active_terminal_session.json"
 
+    @contextmanager
+    def _active_session_file_lock(self, worker_id: str):
+        lock_path = self._state_dir(worker_id) / "active_terminal_session.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as handle:
+            lock_path.chmod(0o600)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def _run_root(self, worker_id: str, run_id: str) -> Path:
         return self._home_dir(worker_id) / ".glasshive-runs" / run_id
 
@@ -839,8 +1636,7 @@ class BaseCliWorkerRuntime:
 
     def _write_session_key(self, worker_id: str, session_key: str) -> None:
         path = self._session_meta_path(worker_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"session_key": session_key}, indent=2))
+        _atomic_write_private_text(path, json.dumps({"session_key": session_key}, indent=2))
 
     def _read_active_session(self, worker_id: str) -> dict[str, object] | None:
         path = self._active_session_meta_path(worker_id)
@@ -864,26 +1660,645 @@ class BaseCliWorkerRuntime:
             "argv_for_evidence_json": str(data.get("argv_for_evidence_json") or "").strip(),
             "started_at": str(data.get("started_at") or "").strip(),
             "process_pid": data.get("process_pid"),
+            "process_group": data.get("process_group"),
+            "process_start_identity": str(data.get("process_start_identity") or "").strip(),
+            "lease_pid": data.get("lease_pid"),
+            "lease_process_group": data.get("lease_process_group"),
+            "lease_process_start_identity": str(
+                data.get("lease_process_start_identity") or ""
+            ).strip(),
+            "owner_pid": data.get("owner_pid"),
             "heartbeat_path": str(data.get("heartbeat_path") or "").strip(),
             "timeout_seconds": data.get("timeout_seconds"),
+            "run_mode": str(data.get("run_mode") or "").strip(),
+            "native_session_id": str(data.get("native_session_id") or "").strip(),
             "instruction_redacted": bool(data.get("instruction_redacted")),
+            "termination_unconfirmed": bool(data.get("termination_unconfirmed")),
+            "container_id": str(data.get("container_id") or "").strip(),
+            "startup_token_digest": str(
+                data.get("startup_token_digest") or ""
+            ).strip(),
         }
 
-    def _write_active_session(self, worker_id: str, payload: dict[str, object]) -> None:
+    def _write_active_session(
+        self,
+        worker_id: str,
+        payload: dict[str, object],
+        *,
+        expected_session: dict[str, object] | None = None,
+        publish_run_start: bool = False,
+        worker: dict | None = None,
+        spawned_process: subprocess.Popen[str] | None = None,
+    ) -> bool:
         path = self._active_session_meta_path(worker_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
         safe_payload = dict(payload)
+        if publish_run_start and isinstance(worker, dict):
+            token_digest = str(
+                worker.get("_run_startup_token_digest") or ""
+            ).strip()
+            if re.fullmatch(r"[0-9a-f]{64}", token_digest):
+                safe_payload["startup_token_digest"] = token_digest
         if "instruction" in safe_payload:
             safe_payload.pop("instruction", None)
             safe_payload["instruction_redacted"] = True
-        path.write_text(json.dumps(safe_payload, indent=2))
+        with self._active_session_file_lock(worker_id):
+            if expected_session is not None:
+                current = self._read_active_session(worker_id)
+                if self._active_session_fingerprint(
+                    current
+                ) != self._active_session_fingerprint(expected_session):
+                    return False
+            _atomic_write_private_text(path, json.dumps(safe_payload, indent=2))
+        observer = self._host_process_observer
+        if callable(observer):
+            try:
+                pid = int(
+                    safe_payload.get("lease_pid")
+                    or safe_payload.get("process_pid")
+                    or 0
+                )
+                process_group = int(
+                    safe_payload.get("lease_process_group")
+                    or safe_payload.get("process_group")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                pid = 0
+                process_group = 0
+            run_id = str(safe_payload.get("run_id") or "").strip()
+            start_identity = str(
+                safe_payload.get("lease_process_start_identity")
+                or safe_payload.get("process_start_identity")
+                or ""
+            ).strip()
+            if run_id and pid > 0 and start_identity:
+                container_id = str(safe_payload.get("container_id") or "").strip()
+                session_id = str(safe_payload.get("session_name") or "").strip()
+                try:
+                    observer(
+                        {
+                            "worker_id": worker_id,
+                            "run_id": run_id,
+                            "identity_kind": (
+                                "docker_session" if container_id else "host_process"
+                            ),
+                            "pid": pid,
+                            "process_group": process_group or pid,
+                            "process_start_identity": start_identity,
+                            "container_id": container_id,
+                            "session_id": session_id,
+                        }
+                    )
+                except Exception:
+                    logger.exception(
+                        "Host process observer failed for worker %s run %s",
+                        worker_id,
+                        run_id,
+                    )
+        if publish_run_start:
+            durable_session = self._read_active_session(worker_id)
+            if self._active_session_fingerprint(
+                durable_session
+            ) != self._active_session_fingerprint(safe_payload):
+                raise RunStartupRejectedError(
+                    "The durable run startup identity changed before publication.",
+                    termination_confirmed=False,
+                )
+            start_observer = self._run_start_observer
+            if not callable(start_observer):
+                self._cleanup_rejected_run_start(
+                    worker_id=worker_id,
+                    expected_session=durable_session,
+                    expected_container_id=str(
+                        durable_session.get("container_id") or ""
+                    ).strip(),
+                    spawned_process=spawned_process,
+                    worker=worker,
+                )
+                raise RunStartupRejectedError(
+                    "No durable run startup observer is configured.",
+                    termination_confirmed=True,
+                )
+            assert durable_session is not None
+            container_id = str(durable_session.get("container_id") or "").strip()
+            try:
+                pid = int(
+                    durable_session.get("lease_pid")
+                    or durable_session.get("process_pid")
+                    or 0
+                )
+                process_group = int(
+                    durable_session.get("lease_process_group")
+                    or durable_session.get("process_group")
+                    or pid
+                    or 0
+                )
+            except (TypeError, ValueError):
+                pid = 0
+                process_group = 0
+            start_identity = str(
+                durable_session.get("lease_process_start_identity")
+                or durable_session.get("process_start_identity")
+                or ""
+            ).strip()
+            payload = {
+                "worker_id": worker_id,
+                "run_id": str(durable_session.get("run_id") or ""),
+                "identity_kind": (
+                    "docker_session" if container_id else "host_process"
+                ),
+                "pid": pid,
+                "process_group": process_group,
+                "process_start_identity": start_identity,
+                "container_id": container_id,
+                "session_id": str(
+                    durable_session.get("session_name") or ""
+                ),
+            }
+            try:
+                start_observer(payload)
+            except Exception as exc:
+                self._cleanup_rejected_run_start(
+                    worker_id=worker_id,
+                    expected_session=durable_session,
+                    expected_container_id=container_id,
+                    spawned_process=spawned_process,
+                    worker=worker,
+                )
+                raise RunStartupRejectedError(
+                    str(exc), termination_confirmed=True
+                ) from exc
+        return True
 
-    def _clear_active_session(self, worker_id: str) -> None:
-        path = self._active_session_meta_path(worker_id)
-        try:
-            path.unlink()
-        except FileNotFoundError:
+    def set_host_process_observer(self, observer) -> None:
+        self._host_process_observer = observer
+
+    def set_run_start_observer(self, observer) -> None:
+        self._run_start_observer = observer
+
+    def _mark_rejected_run_start_unconfirmed(
+        self,
+        worker_id: str,
+        expected_session: dict[str, object],
+    ) -> None:
+        current = self._read_active_session(worker_id)
+        if self._active_session_fingerprint(
+            current
+        ) != self._active_session_fingerprint(expected_session):
             return
+        self._write_active_session(
+            worker_id,
+            {**expected_session, "termination_unconfirmed": True},
+            expected_session=expected_session,
+        )
+
+    def _cleanup_rejected_run_start(
+        self,
+        *,
+        worker_id: str,
+        expected_session: dict[str, object],
+        expected_container_id: str = "",
+        spawned_process: subprocess.Popen[str] | None = None,
+        worker: dict | None = None,
+    ) -> None:
+        """Stop only the exact just-published generation or fail closed."""
+
+        try:
+            if expected_container_id:
+                self.sandbox.stop_screen_session(
+                    worker_id,
+                    self.runtime_name,
+                    str(expected_session.get("session_name") or ""),
+                    worker=worker,
+                    missing_ok=True,
+                    expected_container_id=expected_container_id,
+                )
+                self.sandbox.terminate_run_processes(
+                    worker_id,
+                    self.runtime_name,
+                    str(expected_session.get("run_id") or ""),
+                    worker=worker,
+                    missing_ok=True,
+                    expected_container_id=expected_container_id,
+                )
+            else:
+                try:
+                    expected_pid = int(expected_session.get("process_pid") or 0)
+                    expected_group = int(
+                        expected_session.get("process_group") or expected_pid or 0
+                    )
+                except (TypeError, ValueError):
+                    expected_pid = 0
+                    expected_group = 0
+                expected_identity = str(
+                    expected_session.get("process_start_identity") or ""
+                ).strip()
+                if (
+                    spawned_process is None
+                    or spawned_process.pid != expected_pid
+                    or expected_pid <= 0
+                    or not expected_identity
+                ):
+                    raise RuntimeErrorBase(
+                        "The exact host startup process identity is ambiguous."
+                    )
+                if spawned_process.poll() is None:
+                    current_identity = self._process_start_identity(expected_pid)
+                    if current_identity != expected_identity:
+                        raise RuntimeErrorBase(
+                            "The exact host startup process identity changed."
+                        )
+
+                    def signal_exact(sig: signal.Signals) -> None:
+                        try:
+                            if expected_group and expected_group != os.getpgrp():
+                                os.killpg(expected_group, sig)
+                            else:
+                                os.kill(expected_pid, sig)
+                        except ProcessLookupError:
+                            return
+
+                    signal_exact(signal.SIGTERM)
+                    try:
+                        spawned_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        signal_exact(signal.SIGKILL)
+                        spawned_process.wait(timeout=2)
+                if spawned_process.poll() is None:
+                    raise RuntimeErrorBase(
+                        "The exact host startup process did not stop."
+                    )
+                if not self._clear_process(
+                    worker_id, expected_process=spawned_process
+                ):
+                    raise RuntimeErrorBase(
+                        "Host startup process ownership changed during cleanup."
+                    )
+            if not self._clear_active_session(
+                worker_id, expected_session=expected_session
+            ):
+                raise RuntimeErrorBase(
+                    "Run startup ownership changed during cleanup."
+                )
+            if not expected_container_id:
+                release_slot = getattr(self, "_release_host_slot", None)
+                if callable(release_slot):
+                    release_slot(worker_id)
+        except Exception as exc:
+            self._mark_rejected_run_start_unconfirmed(
+                worker_id, expected_session
+            )
+            raise RunStartupRejectedError(
+                str(exc), termination_confirmed=False
+            ) from exc
+
+    def set_native_event_observer(self, observer) -> None:
+        self._native_event_observer = observer
+
+    def host_process_identity(self, worker: dict, run_id: str) -> dict[str, object] | None:
+        """Verify an exact Docker run without relying on an executor process.
+
+        Docker screen PIDs live in the container namespace, while the lease
+        ledger needs a stable restart identity. The exact run/session mapping
+        plus the immutable container id is the process-start identity; a live
+        screen lookup proves the session still exists before a stale lease is
+        renewed.
+        """
+
+        worker_id = str(worker.get("worker_id") or "").strip()
+        expected_run_id = str(run_id or "").strip()
+        active_session = self._read_active_session(worker_id)
+        if (
+            not worker_id
+            or not expected_run_id
+            or str((active_session or {}).get("run_id") or "").strip()
+            != expected_run_id
+        ):
+            return None
+        session_name = str((active_session or {}).get("session_name") or "").strip()
+        if not session_name:
+            return None
+        try:
+            sandbox = self.sandbox.inspect(worker_id)
+            if (
+                sandbox is None
+                or str(sandbox.state or "").lower() != "running"
+                or not str(sandbox.container_id or "").strip()
+            ):
+                return None
+            screen_pid = self.sandbox.screen_session_pid(
+                worker_id,
+                self.runtime_name,
+                session_name,
+                worker=worker,
+            )
+        except Exception:
+            return None
+        try:
+            current_screen_pid = int(screen_pid or 0)
+            recorded_screen_pid = int(
+                (active_session or {}).get("process_pid") or 0
+            )
+        except (TypeError, ValueError):
+            return None
+        if current_screen_pid <= 0 or (
+            recorded_screen_pid > 0 and recorded_screen_pid != current_screen_pid
+        ):
+            return None
+        container_id = str(sandbox.container_id).strip()
+        identity = (
+            f"docker:{container_id}:{session_name}:"
+            f"{expected_run_id}:{current_screen_pid}"
+        )
+        recorded_identity = str(
+            (active_session or {}).get("lease_process_start_identity")
+            or ""
+        ).strip()
+        if recorded_identity and recorded_identity != identity:
+            return None
+        lease_pid = int(sandbox.pid or 0) or current_screen_pid
+        return {
+            "identity_kind": "docker_session",
+            "pid": lease_pid,
+            "process_group": lease_pid,
+            "process_start_identity": identity,
+            "container_id": container_id,
+            "session_id": session_name,
+            "startup_token_digest": str(
+                (active_session or {}).get("startup_token_digest") or ""
+            ),
+            "verified": True,
+        }
+
+    def host_process_absence(self, worker: dict, run_id: str) -> bool:
+        """Prove that the canonical Docker generation is absent without guessing.
+
+        This is intentionally narrower than a failed liveness read: timeouts,
+        malformed inspect output, a present container, and every host-mode
+        worker remain unproven so their durable safety fence stays active.
+        """
+
+        if str(worker.get("execution_mode") or "docker") != "docker" or not str(
+            run_id or ""
+        ).strip():
+            return False
+        try:
+            inspection = self.sandbox.inspect_fresh(str(worker.get("worker_id") or ""))
+        except Exception:
+            return False
+        return str(getattr(inspection, "status", "") or "") == "confirmed_absent"
+
+    def cleanup_unconfirmed_run_start(
+        self,
+        worker: dict,
+        run_id: str,
+        lease_identity: dict[str, object],
+    ) -> bool:
+        """Clean only a pre-confirmation generation captured by the durable lease.
+
+        A replacement active-session file is never cleanup authority. Docker is
+        targeted by immutable container id + exact screen/run identity; host mode
+        is targeted by PID start identity. Absence of that old generation is a
+        successful cleanup proof, while ambiguity fails closed.
+        """
+
+        worker_id = str(worker.get("worker_id") or "").strip()
+        expected_run_id = str(run_id or "").strip()
+        identity_kind = str(lease_identity.get("identity_kind") or "").strip()
+        try:
+            expected_pid = int(lease_identity.get("pid") or 0)
+            expected_group = int(
+                lease_identity.get("process_group") or expected_pid or 0
+            )
+        except (TypeError, ValueError):
+            return False
+        expected_start_identity = str(
+            lease_identity.get("process_start_identity") or ""
+        ).strip()
+        if not worker_id or not expected_run_id or not expected_start_identity:
+            return False
+
+        if identity_kind == "docker_session":
+            container_id = str(lease_identity.get("container_id") or "").strip()
+            session_id = str(lease_identity.get("session_id") or "").strip()
+            if not container_id or not session_id:
+                return False
+            self.sandbox.stop_screen_session(
+                worker_id,
+                self.runtime_name,
+                session_id,
+                worker=worker,
+                missing_ok=True,
+                expected_container_id=container_id,
+            )
+            self.sandbox.terminate_run_processes(
+                worker_id,
+                self.runtime_name,
+                expected_run_id,
+                worker=worker,
+                missing_ok=True,
+                expected_container_id=container_id,
+            )
+        elif identity_kind == "host_process":
+            if expected_pid <= 0 or not expected_start_identity.startswith("ps-lstart:"):
+                return False
+            if self._recorded_process_is_running(expected_pid, expected_start_identity):
+
+                def signal_exact(sig: signal.Signals) -> None:
+                    current_identity = self._process_start_identity(expected_pid)
+                    if current_identity != expected_start_identity:
+                        return
+                    try:
+                        if expected_group > 0 and expected_group != os.getpgrp():
+                            os.killpg(expected_group, sig)
+                        else:
+                            os.kill(expected_pid, sig)
+                    except ProcessLookupError:
+                        return
+
+                signal_exact(signal.SIGTERM)
+                if not self._wait_for_recorded_process_exit(
+                    expected_pid, expected_start_identity, timeout=5.0
+                ):
+                    signal_exact(signal.SIGKILL)
+                    if not self._wait_for_recorded_process_exit(
+                        expected_pid, expected_start_identity, timeout=2.0
+                    ):
+                        return False
+            # A failed liveness probe is not itself death proof: permissions,
+            # transient ps failure, or an unreadable fingerprint must keep the
+            # startup fence. Only ESRCH/zombie or a different PID incarnation
+            # proves the captured generation is gone.
+            if not self._recorded_pid_is_proven_gone(
+                expected_pid, expected_start_identity
+            ):
+                return False
+        else:
+            return False
+
+        current = self._read_active_session(worker_id)
+        if current:
+            try:
+                current_pid = int(
+                    current.get("lease_pid")
+                    or current.get("process_pid")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                current_pid = 0
+            current_identity = str(
+                current.get("lease_process_start_identity")
+                or current.get("process_start_identity")
+                or ""
+            ).strip()
+            current_matches_old = bool(
+                str(current.get("run_id") or "") == expected_run_id
+                and current_pid == expected_pid
+                and current_identity == expected_start_identity
+            )
+            if identity_kind == "docker_session":
+                current_matches_old = bool(
+                    current_matches_old
+                    and str(current.get("container_id") or "")
+                    == str(lease_identity.get("container_id") or "")
+                    and str(current.get("session_name") or "")
+                    == str(lease_identity.get("session_id") or "")
+                )
+            if current_matches_old and not self._clear_active_session(
+                worker_id, expected_session=current
+            ):
+                return False
+        if identity_kind == "host_process":
+            release_slot = getattr(self, "_release_host_slot", None)
+            if callable(release_slot):
+                release_slot(worker_id)
+        return True
+
+    @staticmethod
+    def _native_session_id_from_event_line(line: str) -> str:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return ""
+        if not isinstance(event, dict):
+            return ""
+        if str(event.get("type") or "") == "thread.started":
+            session_id = str(event.get("thread_id") or "").strip()
+        else:
+            session_id = str(event.get("session_id") or "").strip()
+        if not session_id or len(session_id) > 256 or any(ord(char) < 32 for char in session_id):
+            return ""
+        return session_id
+
+    def _observe_native_session_events(
+        self,
+        worker_id: str,
+        stdout_path: Path,
+        stop_event: Event,
+        run_id: str | None = None,
+    ) -> None:
+        """Tail native JSONL and durably publish session identity as soon as it appears."""
+
+        offset = 0
+        buffered = ""
+
+        def observe_line(line: str) -> None:
+            session_id = self._native_session_id_from_event_line(line)
+            if session_id:
+                self._write_session_key(worker_id, session_id)
+                active_session = self._read_active_session(worker_id)
+                if active_session and active_session.get("native_session_id") != session_id:
+                    self._write_active_session(
+                        worker_id,
+                        {**active_session, "native_session_id": session_id},
+                        expected_session=active_session,
+                    )
+            observer = self._native_event_observer
+            if not callable(observer):
+                return
+            active_session = self._read_active_session(worker_id)
+            effective_run_id = str(
+                run_id or (active_session or {}).get("run_id") or ""
+            ).strip()
+            if not effective_run_id:
+                return
+            provider = self._agent_type()
+            for event in project_native_events(provider, line):
+                try:
+                    observer(
+                        {
+                            "worker_id": worker_id,
+                            "run_id": effective_run_id,
+                            "provider": provider,
+                            "event": event,
+                        }
+                    )
+                except Exception:
+                    logger.exception(
+                        "Native event observer failed for worker %s run %s",
+                        worker_id,
+                        effective_run_id,
+                    )
+
+        while True:
+            chunk = ""
+            try:
+                with stdout_path.open("r") as handle:
+                    handle.seek(offset)
+                    chunk = handle.read()
+                    offset = handle.tell()
+            except FileNotFoundError:
+                pass
+            if chunk:
+                buffered += chunk
+                complete = buffered.split("\n")
+                buffered = complete.pop()
+                for line in complete:
+                    observe_line(line.strip())
+            if stop_event.is_set():
+                if buffered.strip():
+                    observe_line(buffered.strip())
+                return
+            stop_event.wait(0.05)
+
+    @staticmethod
+    def _active_session_fingerprint(session: dict[str, object] | None) -> tuple[object, ...]:
+        if not session:
+            return ()
+        return (
+            str(session.get("run_id") or ""),
+            str(session.get("session_name") or ""),
+            str(session.get("exit_path") or ""),
+            session.get("process_pid"),
+            str(session.get("process_start_identity") or ""),
+            session.get("owner_pid"),
+            session.get("lease_pid"),
+            str(session.get("lease_process_start_identity") or ""),
+            str(session.get("container_id") or ""),
+            str(session.get("startup_token_digest") or ""),
+        )
+
+    def _clear_active_session(
+        self,
+        worker_id: str,
+        *,
+        expected_session: dict[str, object] | None = None,
+    ) -> bool:
+        path = self._active_session_meta_path(worker_id)
+        with self._active_session_file_lock(worker_id):
+            if expected_session is not None:
+                current = self._read_active_session(worker_id)
+                if current is None and not path.exists():
+                    return True
+                if self._active_session_fingerprint(current) != self._active_session_fingerprint(
+                    expected_session
+                ):
+                    return False
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                return True
+        return True
 
     def _run_root_candidates(self, worker_id: str) -> list[Path]:
         root = self._home_dir(worker_id) / ".glasshive-runs"
@@ -950,12 +2365,199 @@ class BaseCliWorkerRuntime:
             }
         return None
 
-    def _active_pid(self, worker_id: str) -> int | None:
+    @staticmethod
+    def _pid_is_live(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # A process owned by another account cannot normally be a Viventium
+            # owner, but it is live. The owner PID + heartbeat checks still have
+            # to pass before the child is accepted.
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _recorded_pid_is_proven_gone(
+        self,
+        pid: int,
+        start_identity: str = "",
+    ) -> bool:
+        """Accept only affirmative death or a proven PID-incarnation mismatch."""
+
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except (PermissionError, OSError):
+            return False
+        if self._pid_is_zombie(pid):
+            return True
+        recorded_identity = str(start_identity or "").strip()
+        if not recorded_identity.startswith("ps-lstart:"):
+            return False
+        current_identity = self._process_start_identity(pid)
+        return bool(current_identity and current_identity != recorded_identity)
+
+    @staticmethod
+    def _process_start_identity(pid: int) -> str:
+        """Return a stable identity for one PID incarnation, not merely the PID."""
+
+        if pid <= 0:
+            return ""
+        try:
+            completed = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        started = " ".join(completed.stdout.split())
+        return f"ps-lstart:{started}" if completed.returncode == 0 and started else ""
+
+    @staticmethod
+    def _process_group_identity(pid: int) -> int:
+        """Capture a new-session process group without failing on a fast exit."""
+
+        try:
+            return os.getpgid(pid)
+        except (OSError, ProcessLookupError):
+            # Host subprocesses are always launched with start_new_session=True,
+            # so their initial PGID is their PID. A missing start identity keeps
+            # this fallback from ever authorizing a later kill of a reused PID.
+            return pid
+
+    @staticmethod
+    def _pid_is_zombie(pid: int) -> bool:
+        try:
+            completed = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        state = completed.stdout.strip().upper()
+        return completed.returncode == 0 and state.startswith("Z")
+
+    def _recorded_process_is_running(self, pid: int, start_identity: str) -> bool:
+        if pid <= 0 or not start_identity or not self._pid_is_live(pid) or self._pid_is_zombie(pid):
+            return False
+        return self._process_start_identity(pid) == start_identity
+
+    def _wait_for_recorded_process_exit(
+        self,
+        pid: int,
+        start_identity: str,
+        *,
+        timeout: float,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while self._recorded_process_is_running(pid, start_identity):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+        return True
+
+    @staticmethod
+    def _active_session_heartbeat_stale_seconds() -> float:
+        raw = os.environ.get("GLASSHIVE_ACTIVE_SESSION_HEARTBEAT_STALE_S", "").strip()
+        try:
+            parsed = float(raw) if raw else 20.0
+        except ValueError:
+            parsed = 20.0
+        return max(10.0, parsed)
+
+    def _durable_active_session_pid(
+        self,
+        worker_id: str,
+        *,
+        expected_run_id: str | None = None,
+    ) -> int | None:
+        active_session = self._read_active_session(worker_id)
+        recorded_run_id = str((active_session or {}).get("run_id") or "").strip()
+        if not active_session or not recorded_run_id:
+            return None
+        if expected_run_id and recorded_run_id != expected_run_id:
+            return None
+        try:
+            recorded_pid = int(active_session.get("process_pid") or 0)
+            owner_pid = int(active_session.get("owner_pid") or 0)
+        except (TypeError, ValueError):
+            return None
+        # The child may have exited while its live owner is parsing and committing
+        # the terminal result. A fresh owner heartbeat is the short finalization
+        # lease; child liveness alone is neither necessary nor sufficient.
+        if recorded_pid <= 0 or not self._pid_is_live(owner_pid):
+            return None
+
+        recorded_start_identity = str(active_session.get("process_start_identity") or "").strip()
+        if recorded_start_identity and not self._recorded_process_is_running(
+            recorded_pid, recorded_start_identity
+        ):
+            return None
+
+        raw_heartbeat_path = str(active_session.get("heartbeat_path") or "").strip()
+        if not raw_heartbeat_path:
+            return None
+        try:
+            heartbeat = json.loads(Path(raw_heartbeat_path).read_text())
+            heartbeat_run_id = str(heartbeat.get("run_id") or "").strip()
+            heartbeat_state = str(heartbeat.get("state") or "").strip()
+            heartbeat_pid = int(heartbeat.get("process_pid") or 0)
+            heartbeat_at = datetime.fromisoformat(
+                str(heartbeat.get("last_heartbeat_at") or "").replace("Z", "+00:00")
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+        if heartbeat_at.tzinfo is None:
+            heartbeat_at = heartbeat_at.replace(tzinfo=timezone.utc)
+        age_seconds = max(
+            0.0,
+            datetime.now(timezone.utc).timestamp() - heartbeat_at.astimezone(timezone.utc).timestamp(),
+        )
+        if (
+            heartbeat_run_id != recorded_run_id
+            or heartbeat_state != "running"
+            or heartbeat_pid != recorded_pid
+            or age_seconds > self._active_session_heartbeat_stale_seconds()
+        ):
+            return None
+        return recorded_pid
+
+    def _active_pid(self, worker_id: str, expected_run_id: str | None = None) -> int | None:
         with self._process_lock:
             process = self._active_processes.get(worker_id)
             if process and process.poll() is None:
-                return process.pid
-            return None
+                if not expected_run_id:
+                    return process.pid
+                active_session = self._read_active_session(worker_id)
+                if str((active_session or {}).get("run_id") or "").strip() == expected_run_id:
+                    return process.pid
+                return None
+        # Host CLI runs are owned by the service process that launched them, but
+        # reconciliation can run in another service process sharing the same
+        # runtime root and database. The active-session record is the durable
+        # cross-process ownership signal; do not orphan a run whose recorded host
+        # process is still alive merely because it is absent from this instance's
+        # in-memory Popen map.
+        return self._durable_active_session_pid(
+            worker_id,
+            expected_run_id=expected_run_id,
+        )
 
     def _note_stop_reason(self, worker_id: str, reason: str, run_id: str | None = None) -> None:
         with self._process_lock:
@@ -973,43 +2575,181 @@ class BaseCliWorkerRuntime:
         with self._process_lock:
             self._active_processes[worker_id] = process
 
-    def _clear_process(self, worker_id: str) -> None:
+    def _clear_process(
+        self,
+        worker_id: str,
+        *,
+        expected_process: subprocess.Popen[str] | None = None,
+    ) -> bool:
         with self._process_lock:
+            if (
+                expected_process is not None
+                and self._active_processes.get(worker_id) is not expected_process
+            ):
+                return False
             self._active_processes.pop(worker_id, None)
+        return True
 
-    def _stop_active_process(self, worker_id: str, *, worker: dict | None = None, run_id: str | None = None) -> None:
+    def _stop_active_process(
+        self,
+        worker_id: str,
+        *,
+        worker: dict | None = None,
+        run_id: str | None = None,
+        allow_stale_terminal_session: bool = False,
+    ) -> bool:
+        expected_container_id = str(
+            (worker or {}).get("_compute_release_container_id") or ""
+        ).strip()
+        exact_container_absence = bool(
+            worker is not None
+            and "_compute_release_container_id" in worker
+            and not expected_container_id
+        )
         active_session = self._read_active_session(worker_id)
+        with self._process_lock:
+            captured_process = self._active_processes.get(worker_id)
         if active_session and run_id and active_session.get("run_id") != run_id:
+            if exact_container_absence:
+                raise RuntimeErrorBase(
+                    "Docker run ownership changed during exact-run stop"
+                )
             active_session = None
-        if not active_session:
+            captured_process = None
+        if exact_container_absence and active_session:
+            if not (
+                allow_stale_terminal_session
+                and self._stale_terminal_session_is_proven_dead(
+                    worker_id,
+                    active_session,
+                    expected_run_id=run_id,
+                )
+            ):
+                if not self._write_active_session(
+                    worker_id,
+                    {**active_session, "termination_unconfirmed": True},
+                    expected_session=active_session,
+                ):
+                    raise RuntimeErrorBase(
+                        "Docker run ownership changed during exact-run stop"
+                    )
+                raise RuntimeErrorBase(
+                    "Docker run termination could not be confirmed"
+                )
+            if not self._clear_active_session(worker_id, expected_session=active_session):
+                raise RuntimeErrorBase(
+                    "Docker run ownership changed during exact-run stop"
+                )
+            active_session = None
+        if not active_session and not exact_container_absence:
             active_session = self._infer_active_session(worker or {"worker_id": worker_id}, run_id=run_id)
-        if not active_session and run_id:
+        if not active_session and run_id and not exact_container_absence:
             active_session = self._run_payload(worker_id, run_id)
-        if active_session:
+        if (
+            active_session
+            and allow_stale_terminal_session
+            and self._stale_terminal_session_is_proven_dead(
+                worker_id,
+                active_session,
+                expected_run_id=run_id,
+            )
+        ):
+            if not self._clear_active_session(
+                worker_id,
+                expected_session=active_session,
+            ):
+                raise RuntimeErrorBase(
+                    "Docker run ownership changed during terminal cleanup"
+                )
+            active_session = None
+        if active_session and expected_container_id:
+            # A needs-input or paused cleanup can be recovered after the exact
+            # Docker generation has already exited.  Docker exec is impossible
+            # in that state, but a fresh inspect of the captured immutable
+            # container id is sufficient proof that no run process remains.
+            # Probe uncertainty or a replacement generation stays fenced.
             try:
+                inspection = self.sandbox.inspect_fresh(
+                    worker_id,
+                    require_configured_image=False,
+                )
+            except Exception:
+                inspection = None
+            inspection_status = str(
+                getattr(inspection, "status", "") or ""
+            ).lower()
+            inspected_sandbox = getattr(inspection, "sandbox", None)
+            exact_generation_inactive = (
+                inspection_status == "present"
+                and str(getattr(inspected_sandbox, "container_id", "") or "")
+                == expected_container_id
+                and str(getattr(inspected_sandbox, "state", "") or "").lower()
+                in {"dead", "exited"}
+            )
+            if exact_generation_inactive:
+                if not self._clear_active_session(
+                    worker_id,
+                    expected_session=active_session,
+                ):
+                    raise RuntimeErrorBase(
+                        "Docker run ownership changed during inactive-generation cleanup"
+                    )
+                active_session = None
+        if active_session:
+            stop_errors: list[Exception] = []
+            try:
+                stop_kwargs: dict[str, object] = {
+                    "worker": worker,
+                    "missing_ok": True,
+                }
+                if expected_container_id:
+                    stop_kwargs["expected_container_id"] = expected_container_id
                 self.sandbox.stop_screen_session(
                     worker_id,
                     self.runtime_name,
                     active_session["session_name"],
-                    worker=worker,
-                    missing_ok=True,
+                    **stop_kwargs,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                stop_errors.append(exc)
             try:
+                terminate_kwargs: dict[str, object] = {"worker": worker}
+                if expected_container_id:
+                    terminate_kwargs["expected_container_id"] = expected_container_id
                 self.sandbox.terminate_run_processes(
                     worker_id,
                     self.runtime_name,
                     active_session["run_id"],
-                    worker=worker,
+                    **terminate_kwargs,
                 )
-            except Exception:
-                pass
-            self._clear_active_session(worker_id)
-        with self._process_lock:
-            process = self._active_processes.get(worker_id)
+            except Exception as exc:
+                stop_errors.append(exc)
+            if stop_errors:
+                # The active-session record is the durable exact-run ownership
+                # handle. Keep it when either Docker termination primitive fails
+                # so reconciliation cannot mistake an unproven stop for success.
+                if not self._write_active_session(
+                    worker_id,
+                    {**active_session, "termination_unconfirmed": True},
+                    expected_session=active_session,
+                ):
+                    raise RuntimeErrorBase(
+                        "Docker run ownership changed during exact-run stop"
+                    )
+                raise RuntimeErrorBase(
+                    "Docker run termination could not be confirmed"
+                ) from stop_errors[0]
+        process = captured_process
         if not process or process.poll() is not None:
-            return
+            if process is not None:
+                self._clear_process(worker_id, expected_process=process)
+            if active_session and not self._clear_active_session(
+                worker_id, expected_session=active_session
+            ):
+                raise RuntimeErrorBase(
+                    "Docker run ownership changed during exact-run stop"
+                )
+            return True
         try:
             process.terminate()
             process.wait(timeout=5)
@@ -1018,9 +2758,133 @@ class BaseCliWorkerRuntime:
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                pass
-        except OSError:
-            return
+                raise RuntimeErrorBase(
+                    "Docker run termination could not be confirmed"
+                )
+        except OSError as exc:
+            raise RuntimeErrorBase(
+                "Docker run termination could not be confirmed"
+            ) from exc
+        if process.poll() is None:
+            raise RuntimeErrorBase("Docker run termination could not be confirmed")
+        if not self._clear_process(worker_id, expected_process=process):
+            raise RuntimeErrorBase(
+                "Docker run ownership changed during exact-run stop"
+            )
+        if active_session and not self._clear_active_session(
+            worker_id, expected_session=active_session
+        ):
+            raise RuntimeErrorBase(
+                "Docker run ownership changed during exact-run stop"
+            )
+        return True
+
+    def _stale_terminal_session_is_proven_dead(
+        self,
+        worker_id: str,
+        active_session: dict[str, object],
+        *,
+        expected_run_id: str | None,
+    ) -> bool:
+        """Prove a completed Docker session is stale without trusting workspace paths."""
+
+        run_id = str(active_session.get("run_id") or "").strip()
+        if (
+            not expected_run_id
+            or run_id != expected_run_id
+            or str(active_session.get("session_name") or "").strip()
+            != self._session_name_for_run_id(run_id)
+        ):
+            return False
+
+        canonical_exit = self._run_root(worker_id, run_id) / "exit_code"
+        recorded_exit = Path(str(active_session.get("exit_path") or "").strip())
+        try:
+            if recorded_exit.resolve(strict=True) != canonical_exit.resolve(strict=True):
+                return False
+            raw_exit_code = canonical_exit.read_text().strip()
+            exit_code = int(raw_exit_code)
+        except (OSError, TypeError, ValueError):
+            return False
+        if str(exit_code) != raw_exit_code or not 0 <= exit_code <= 255:
+            return False
+
+        with self._process_lock:
+            process = self._active_processes.get(worker_id)
+        if process and process.poll() is None:
+            return False
+
+        lease_identity = str(
+            active_session.get("lease_process_start_identity") or ""
+        ).strip()
+        identity_parts = lease_identity.split(":")
+        if len(identity_parts) == 5 and identity_parts[0] == "docker":
+            _, container_id, identity_session, identity_run, identity_screen_pid = (
+                identity_parts
+            )
+            try:
+                recorded_screen_pid = int(active_session.get("process_pid") or 0)
+                recorded_owner_pid = int(active_session.get("owner_pid") or 0)
+                recorded_container_pid = int(active_session.get("lease_pid") or 0)
+                identity_screen_pid_value = int(identity_screen_pid or 0)
+            except (TypeError, ValueError):
+                return False
+            if (
+                not container_id
+                or identity_session != str(active_session.get("session_name") or "")
+                or identity_run != run_id
+                or recorded_screen_pid <= 0
+                or identity_screen_pid_value != recorded_screen_pid
+                or recorded_owner_pid <= 0
+                or recorded_container_pid <= 0
+            ):
+                return False
+            try:
+                sandbox = self.sandbox.inspect(worker_id)
+            except Exception:
+                return False
+            if sandbox is not None:
+                if (
+                    str(sandbox.container_id or "").strip() != container_id
+                    or str(sandbox.state or "").lower() != "running"
+                    or int(sandbox.pid or 0) != recorded_container_pid
+                ):
+                    return False
+                try:
+                    live_screen_pid = self.sandbox.screen_session_pid(
+                        worker_id,
+                        self.runtime_name,
+                        identity_session,
+                        worker={"worker_id": worker_id, "state": "running"},
+                    )
+                except Exception:
+                    return False
+                if int(live_screen_pid or 0) > 0:
+                    return False
+                return self._recorded_pid_is_proven_gone(recorded_owner_pid)
+
+        recorded_processes: list[tuple[int, str]] = []
+        for key, identity_key in (
+            ("process_pid", "process_start_identity"),
+            ("owner_pid", ""),
+            ("lease_pid", "lease_process_start_identity"),
+        ):
+            try:
+                pid = int(active_session.get(key) or 0)
+            except (TypeError, ValueError):
+                return False
+            if pid <= 0:
+                return False
+            start_identity = (
+                str(active_session.get(identity_key) or "").strip()
+                if identity_key
+                else ""
+            )
+            recorded_processes.append((pid, start_identity))
+        return all(
+            self._recorded_pid_is_proven_gone(pid, start_identity)
+            for pid, start_identity in recorded_processes
+        )
 
     def _runtime_info(self, worker: dict, *, pid: int | None = None) -> RuntimeInfo:
         worker_id = worker["worker_id"]
@@ -1041,31 +2905,108 @@ class BaseCliWorkerRuntime:
         )
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
-        fast_sandbox = getattr(self.sandbox, "fast_sandbox_from_worker", lambda _worker: None)(worker)
+        fast_sandbox = (
+            None
+            if self._uses_parallel_clean_room(worker)
+            else getattr(
+                self.sandbox, "fast_sandbox_from_worker", lambda _worker: None
+            )(worker)
+        )
         sandbox = fast_sandbox or self.sandbox.ensure_ready(worker, self.runtime_name)
         return self._runtime_info(worker, pid=sandbox.pid)
 
+    def clear_run_local_capability_grant(self, worker: dict) -> None:
+        """Rewrite run env from durable metadata so an admitted bearer cannot linger."""
+
+        refresh_runtime_env_for_worker(self._home_dir(str(worker["worker_id"])), worker)
+
     def pause_worker(self, worker: dict) -> RuntimeInfo:
-        self.sandbox.pause(worker["worker_id"])
+        expected_container_id = str(
+            worker.get("_compute_release_container_id") or ""
+        ).strip()
+        sandbox = (
+            self.sandbox.pause(
+                worker["worker_id"],
+                expected_container_id=expected_container_id,
+            )
+            if expected_container_id
+            else self.sandbox.pause(worker["worker_id"])
+        )
+        if str(sandbox.state or "").lower() != "paused":
+            raise RuntimeErrorBase("Docker pause could not be confirmed")
         return self._runtime_info(worker, pid=None)
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
         self._note_stop_reason(worker["worker_id"], "interrupted", run_id=run_id)
-        self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
-        sandbox = self.sandbox.inspect(worker["worker_id"])
-        pid = sandbox.pid if sandbox and sandbox.state == "running" else None
-        return self._runtime_info(worker, pid=pid)
+        confirmed = self._stop_active_process(
+            worker["worker_id"], worker=worker, run_id=run_id
+        )
+        if not confirmed:
+            raise RuntimeErrorBase("Docker run termination could not be confirmed")
+        return self._runtime_info(worker, pid=None)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
         self._note_stop_reason(worker["worker_id"], "terminated")
-        self._stop_active_process(worker["worker_id"])
-        self.sandbox.terminate(worker["worker_id"])
+        terminal_run_id = str(worker.get("_terminal_run_id") or "").strip()
+        expected_container_id = str(
+            worker.get("_compute_release_container_id") or ""
+        ).strip()
+        expected_container_absence = bool(
+            "_compute_release_container_id" in worker
+            and not expected_container_id
+        )
+        terminate_kwargs = {}
+        if self._uses_parallel_clean_room(worker):
+            terminate_kwargs["execution_policy"] = (
+                PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+            )
+        self._stop_active_process(
+            worker["worker_id"],
+            worker=worker,
+            run_id=terminal_run_id or None,
+            allow_stale_terminal_session=bool(terminal_run_id),
+        )
+        if expected_container_absence:
+            self.sandbox.terminate(
+                worker["worker_id"],
+                expected_absent=True,
+                **terminate_kwargs,
+            )
+        else:
+            if expected_container_id:
+                self.sandbox.terminate(
+                    worker["worker_id"],
+                    expected_container_id=expected_container_id,
+                    **terminate_kwargs,
+                )
+            else:
+                self.sandbox.terminate(worker["worker_id"], **terminate_kwargs)
         return self._runtime_info(worker, pid=None)
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         sandbox = self.sandbox.inspect(worker["worker_id"])
-        active_pid = self._active_pid(worker["worker_id"])
-        pid = active_pid or (sandbox.pid if sandbox and sandbox.state == "running" else None)
+        active_run_id = str(worker.get("_active_run_id") or "").strip()
+        if active_run_id:
+            active_session = self._read_active_session(worker["worker_id"])
+            if (
+                active_session
+                and str(active_session.get("run_id") or "") == active_run_id
+                and bool(active_session.get("termination_unconfirmed"))
+            ):
+                pending_pid = (
+                    sandbox.pid
+                    if sandbox and str(sandbox.state or "").lower() == "running"
+                    else None
+                )
+                return self._runtime_info(worker, pid=pending_pid)
+            identity = self.host_process_identity(worker, active_run_id)
+            pid = (
+                int(identity.get("pid") or 0) or None
+                if identity and bool(identity.get("verified"))
+                else None
+            )
+        else:
+            pid = sandbox.pid if sandbox and sandbox.state == "running" else None
         return self._runtime_info(worker, pid=pid)
 
     def _log_paths(self, worker_id: str) -> tuple[Path, Path]:
@@ -1192,6 +3133,65 @@ class BaseCliWorkerRuntime:
                 env[key] = value
         return env
 
+    @staticmethod
+    def _uses_parallel_clean_room(worker: dict) -> bool:
+        return (
+            str(bootstrap_bundle_for(worker).get("execution_policy") or "").strip()
+            == PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+        )
+
+    def _container_env_for_worker(
+        self, worker: dict, *legacy_ambient_keys: str
+    ) -> dict[str, str]:
+        if not self._uses_parallel_clean_room(worker):
+            return self._container_env(*legacy_ambient_keys)
+
+        configuration, reason = self.sandbox._parallel_clean_room_configuration(
+            require_proxy_containers=False
+        )
+        if configuration is None:
+            raise RuntimeErrorBase(
+                "Parallel clean-room provider proxy configuration is unavailable "
+                f"({reason})"
+            )
+        # Automatic missions receive no ambient provider login/key/base-URL
+        # authority. The internal network and its attested egress proxy own the
+        # provider route; the capability grant is loaded from the run-only
+        # private secret projection inside the script, never a docker-exec arg.
+        env = self._container_env()
+        provider_hostname = str(configuration["provider_proxy_hostname"])
+        env.update(
+            {
+                "HTTP_PROXY": configuration["provider_proxy_url"],
+                "HTTPS_PROXY": configuration["provider_proxy_url"],
+                "NO_PROXY": (
+                    f"{provider_hostname},host.docker.internal,localhost,127.0.0.1"
+                ),
+            }
+        )
+        return env
+
+    def _parallel_clean_room_provider_base_url(
+        self, worker: dict, provider: str
+    ) -> str:
+        if not self._uses_parallel_clean_room(worker):
+            return ""
+        configuration, reason = self.sandbox._parallel_clean_room_configuration(
+            require_proxy_containers=False
+        )
+        if configuration is None:
+            raise RuntimeErrorBase(
+                "Parallel clean-room provider proxy configuration is unavailable "
+                f"({reason})"
+            )
+        provider_path = {
+            "openai": "openai/v1",
+            "anthropic": "anthropic",
+        }.get(str(provider or "").strip().lower())
+        if not provider_path:
+            raise RuntimeErrorBase("Parallel clean-room provider route is unsupported")
+        return f"{str(configuration['provider_proxy_url']).rstrip('/')}/{provider_path}"
+
     def terminal_target(self, worker: dict) -> TerminalTarget:
         self.ensure_worker_ready(worker)
         active_session = self._infer_active_session(worker)
@@ -1309,10 +3309,20 @@ class BaseCliWorkerRuntime:
             )
             detail = _redact_text((stderr or stdout or "").strip(), max_chars=2000)
             return {
-                "state": "failed",
+                "state": (
+                    "needs_input"
+                    if classification.failure_class
+                    == "provider_auth_projection_unavailable"
+                    else "failed"
+                ),
                 "output_text": "",
                 "error_text": _redact_text(f"{self.runtime_name} exited with code {exit_code}: {detail}"),
                 **classification.as_store_fields(),
+                **(
+                    {"provider_retry_after_s": classification.retry_after_s}
+                    if classification.retry_after_s is not None
+                    else {}
+                ),
             }
         info = self.reconcile_worker(worker)
         try:
@@ -1377,8 +3387,45 @@ class BaseCliWorkerRuntime:
             "_active_run_id": effective_run_id,
             "_glasshive_task_run": True,
         }
+        clean_room = self._uses_parallel_clean_room(worker_for_run)
         info = self.ensure_worker_ready(worker_for_run)
-        refresh_runtime_env_for_worker(self._home_dir(worker_for_run["worker_id"]), worker_for_run)
+        run_secret_paths: dict[str, str] | None = None
+        run_secret_container_id = ""
+        if clean_room:
+            run_sandbox_inspection = self.sandbox.inspect_fresh(
+                worker_for_run["worker_id"]
+            )
+            run_sandbox = run_sandbox_inspection.sandbox
+            if (
+                run_sandbox_inspection.status != "present"
+                or run_sandbox is None
+                or not str(run_sandbox.container_id or "").strip()
+            ):
+                raise RuntimeErrorBase(
+                    "Parallel clean-room sandbox generation is unavailable for run authority"
+                )
+            run_secret_container_id = str(run_sandbox.container_id or "").strip()
+            binding = worker_for_run.get("_run_local_capability_binding")
+            bound_container_id = str(
+                binding.get("containerGenerationId")
+                if isinstance(binding, dict)
+                else ""
+            ).strip()
+            if (
+                not re.fullmatch(r"[a-f0-9]{64}", bound_container_id)
+                or bound_container_id != run_secret_container_id
+            ):
+                raise RuntimeErrorBase(
+                    "The run-local capability grant does not match the exact sandbox generation"
+                )
+            secret_root = f"/run/glasshive/{effective_run_id}"
+            run_secret_paths = {
+                "env_file": f"{secret_root}/secret-runtime.env",
+                "keys_file": f"{secret_root}/secret-runtime.keys",
+            }
+        refresh_runtime_env_for_worker(
+            self._home_dir(worker_for_run["worker_id"]), worker_for_run
+        )
         workspace = Path(str(info.workspace_dir or self._workspace_dir(worker_for_run["worker_id"])))
         refresh_project_runtime_files_for_worker(
             self._home_dir(worker_for_run["worker_id"]),
@@ -1424,6 +3471,7 @@ class BaseCliWorkerRuntime:
             [
                 "#!/usr/bin/env bash",
                 "set -o pipefail",
+                "umask 077",
                 f"mkdir -p {shlex.quote(container_run_root)}",
                 (
                     "write_exit() { "
@@ -1432,22 +3480,83 @@ class BaseCliWorkerRuntime:
                     "fi; "
                     "}"
                 ),
-                "abort_run() { write_exit \"${1:-130}\"; exit \"${1:-130}\"; }",
+                (
+                    "GLASSHIVE_SECRET_ENV_KEYS_FILE="
+                    + shlex.quote(str(run_secret_paths["keys_file"]))
+                    if run_secret_paths is not None
+                    else 'GLASSHIVE_SECRET_ENV_KEYS_FILE="$HOME/.glasshive/secret-runtime.keys"'
+                ),
+                (
+                    "GLASSHIVE_SECRET_ENV_FILE="
+                    + shlex.quote(str(run_secret_paths["env_file"]))
+                    if run_secret_paths is not None
+                    else 'GLASSHIVE_SECRET_ENV_FILE="$HOME/.glasshive/secret-runtime.env"'
+                ),
+                (
+                    "GLASSHIVE_SECRET_ENV_DIR="
+                    + shlex.quote(str(Path(run_secret_paths["env_file"]).parent))
+                    if run_secret_paths is not None
+                    else "GLASSHIVE_SECRET_ENV_DIR=''"
+                ),
+                (
+                    "scrub_run_secrets() { "
+                    'if [ -f "$GLASSHIVE_SECRET_ENV_KEYS_FILE" ]; then '
+                    'while IFS= read -r key; do [ -n "$key" ] && unset "$key"; done '
+                    '< "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; fi; '
+                    'rm -f "$GLASSHIVE_SECRET_ENV_FILE" "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; '
+                    'if [ -n "$GLASSHIVE_SECRET_ENV_DIR" ]; then '
+                    'rmdir "$GLASSHIVE_SECRET_ENV_DIR" 2>/dev/null || true; fi; '
+                    "}"
+                ),
+                "abort_run() { scrub_run_secrets; write_exit \"${1:-130}\"; exit \"${1:-130}\"; }",
                 "trap 'abort_run 130' HUP INT TERM",
                 f"cd {shlex.quote(self.sandbox.workspace_mount)} || exit 1",
                 f"export GLASSHIVE_ACTIVE_RUN_ID={shlex.quote(effective_run_id)}",
                 f"export GLASSHIVE_ACTIVE_WORKER_ID={shlex.quote(worker_for_run['worker_id'])}",
                 'if [ -f "$HOME/.glasshive/runtime.env" ]; then set -a; source "$HOME/.glasshive/runtime.env"; set +a; fi',
-                'GLASSHIVE_SECRET_ENV_KEYS_FILE="$HOME/.glasshive/secret-runtime.keys"',
-                'GLASSHIVE_SECRET_ENV_FILE="$HOME/.glasshive/secret-runtime.env"',
                 'if [ -f "$GLASSHIVE_SECRET_ENV_FILE" ]; then set -a; source "$GLASSHIVE_SECRET_ENV_FILE"; set +a; rm -f "$GLASSHIVE_SECRET_ENV_FILE"; fi',
+                *(
+                    [
+                        ': "${GLASSHIVE_CAPABILITY_BROKER_TOKEN:?missing run capability grant}"',
+                        'export OPENAI_API_KEY="$GLASSHIVE_CAPABILITY_BROKER_TOKEN"',
+                        'export ANTHROPIC_API_KEY="$GLASSHIVE_CAPABILITY_BROKER_TOKEN"',
+                        'export ANTHROPIC_AUTH_TOKEN="$GLASSHIVE_CAPABILITY_BROKER_TOKEN"',
+                        (
+                            "export OPENAI_BASE_URL="
+                            + shlex.quote(
+                                self._parallel_clean_room_provider_base_url(
+                                    worker_for_run, "openai"
+                                )
+                            )
+                        ),
+                        (
+                            "export ANTHROPIC_BASE_URL="
+                            + shlex.quote(
+                                self._parallel_clean_room_provider_base_url(
+                                    worker_for_run, "anthropic"
+                                )
+                            )
+                        ),
+                    ]
+                    if clean_room
+                    else []
+                ),
                 'if [ -f "$HOME/.wpr-openclaw/openclaw.env" ]; then set -a; source "$HOME/.wpr-openclaw/openclaw.env"; set +a; fi',
                 f"{command_invocation} > >(tee -a {shlex.quote(container_stdout)}) 2> >(tee -a {shlex.quote(container_stderr)} >&2)",
                 "status=$?",
-                'if [ -f "$GLASSHIVE_SECRET_ENV_KEYS_FILE" ]; then while IFS= read -r key; do [ -n "$key" ] && unset "$key"; done < "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; rm -f "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; fi',
+                "scrub_run_secrets",
                 "write_exit \"$status\"",
-                "printf '\\n[glasshive] run finished with exit code %s. Interactive shell remains open for takeover.\\n' \"$status\"",
-                "exec bash --noprofile --norc",
+                *(
+                    [
+                        "printf '\\n[glasshive] run finished with exit code %s; credential-free session exiting.\\n' \"$status\"",
+                        'exit "$status"',
+                    ]
+                    if clean_room
+                    else [
+                        "printf '\\n[glasshive] run finished with exit code %s. Interactive shell remains open for takeover.\\n' \"$status\"",
+                        "exec bash --noprofile --norc",
+                    ]
+                ),
             ]
         )
         host_script.write_text(script + "\n")
@@ -1460,15 +3569,43 @@ class BaseCliWorkerRuntime:
         )
 
         self._stop_active_process(worker_for_run["worker_id"], worker=worker_for_run)
-        start_result = self.sandbox.start_screen_session(
-            worker_for_run["worker_id"],
-            self.runtime_name,
-            session_name,
-            ["bash", "--noprofile", "--norc", container_script],
-            env=env,
-            worker=worker_for_run,
-        )
+        run_authority_projected = False
+        if clean_room:
+            projected_paths = self.sandbox.project_parallel_clean_room_run_secrets(
+                worker_for_run["worker_id"],
+                expected_container_id=run_secret_container_id,
+                run_id=effective_run_id,
+                env=bootstrap_env_for(worker_for_run),
+            )
+            if projected_paths != run_secret_paths:
+                raise RuntimeErrorBase(
+                    "Parallel clean-room run authority projection path is invalid"
+                )
+            run_authority_projected = True
+        try:
+            start_result = self.sandbox.start_screen_session(
+                worker_for_run["worker_id"],
+                self.runtime_name,
+                session_name,
+                ["bash", "--noprofile", "--norc", container_script],
+                env=env,
+                worker=worker_for_run,
+            )
+        except Exception:
+            if run_authority_projected:
+                self.sandbox.clear_parallel_clean_room_run_secrets(
+                    worker_for_run["worker_id"],
+                    expected_container_id=run_secret_container_id,
+                    run_id=effective_run_id,
+                )
+            raise
         if start_result.returncode != 0:
+            if run_authority_projected:
+                self.sandbox.clear_parallel_clean_room_run_secrets(
+                    worker_for_run["worker_id"],
+                    expected_container_id=run_secret_container_id,
+                    run_id=effective_run_id,
+                )
             detail = (start_result.stderr or start_result.stdout or "").strip()[-1600:]
             raise RuntimeErrorBase(f"Failed to start attached {self.runtime_name} session: {detail}")
         process_pid = self.sandbox.screen_session_pid(
@@ -1476,6 +3613,33 @@ class BaseCliWorkerRuntime:
             self.runtime_name,
             session_name,
             worker=worker_for_run,
+        )
+        try:
+            sandbox_identity = self.sandbox.inspect(worker_for_run["worker_id"])
+        except Exception:
+            # The owning executor still heartbeats the lease. A transient
+            # Docker inspect failure must not abandon an already-started run;
+            # restart reconciliation will fail closed unless it can prove the
+            # exact container/session later.
+            sandbox_identity = None
+        container_id = str(
+            (getattr(sandbox_identity, "container_id", None) if sandbox_identity else None)
+            or ""
+        ).strip()
+        try:
+            screen_pid = int(process_pid or 0)
+            container_pid = int(
+                (getattr(sandbox_identity, "pid", None) if sandbox_identity else None)
+                or 0
+            )
+        except (TypeError, ValueError):
+            screen_pid = 0
+            container_pid = 0
+        lease_process_identity = (
+            f"docker:{container_id}:{session_name}:"
+            f"{effective_run_id}:{screen_pid}"
+            if container_id and screen_pid > 0
+            else ""
         )
 
         run_timeout_sec = self._run_timeout_sec(timeout_sec)
@@ -1490,6 +3654,8 @@ class BaseCliWorkerRuntime:
         heartbeat_path = _active_run_status_path(workspace, effective_run_id)
         heartbeat_stop = Event()
         heartbeat_thread: Thread | None = None
+        native_session_stop = Event()
+        native_session_thread: Thread | None = None
         self._write_active_session(
             worker_for_run["worker_id"],
             {
@@ -1503,11 +3669,30 @@ class BaseCliWorkerRuntime:
                 "argv_for_evidence_json": json.dumps([_redact_command_arg(part) for part in command]),
                 "started_at": started_at_iso,
                 "process_pid": process_pid,
+                "lease_pid": container_pid or screen_pid or None,
+                "lease_process_group": container_pid or screen_pid or None,
+                "lease_process_start_identity": lease_process_identity,
+                "container_id": container_id,
+                "owner_pid": os.getpid(),
                 "heartbeat_path": str(heartbeat_path),
                 "timeout_seconds": run_timeout_sec,
                 "instruction": instruction,
             },
+            publish_run_start=True,
+            worker=worker_for_run,
         )
+        native_session_thread = Thread(
+            target=self._observe_native_session_events,
+            args=(
+                worker_for_run["worker_id"],
+                host_stdout,
+                native_session_stop,
+                effective_run_id,
+            ),
+            name=f"glasshive-docker-native-session-{effective_run_id[:12]}",
+            daemon=True,
+        )
+        native_session_thread.start()
         _write_active_run_status(
             path=heartbeat_path,
             worker=worker_for_run,
@@ -1579,9 +3764,26 @@ class BaseCliWorkerRuntime:
             )
             raise
         finally:
+            native_session_stop.set()
+            if native_session_thread:
+                native_session_thread.join(timeout=1)
             heartbeat_stop.set()
             if heartbeat_thread:
                 heartbeat_thread.join(timeout=1)
+            if run_authority_projected:
+                self.sandbox.clear_parallel_clean_room_run_secrets(
+                    worker_for_run["worker_id"],
+                    expected_container_id=run_secret_container_id,
+                    run_id=effective_run_id,
+                )
+            try:
+                self.sandbox.harden_worker_host_tree(
+                    worker_for_run["worker_id"]
+                )
+            except Exception as exc:
+                raise RuntimeErrorBase(
+                    "Docker worker host permissions could not be secured after the run."
+                ) from exc
         self.sandbox.ensure_container_writable_paths(
             worker_for_run["worker_id"],
             self.runtime_name,
@@ -1686,7 +3888,13 @@ class BaseCliWorkerRuntime:
                 stop_reason="process_exit",
                 evidence_path=evidence_path,
             )
-            raise RuntimeErrorBase(f"{self.runtime_name} exited with code {exit_code}: {detail}")
+            raise _provider_process_exit_error(
+                runtime_name=self.runtime_name,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                message=f"{self.runtime_name} exited with code {exit_code}: {detail}",
+            )
 
         session_key, output = self._parse_output(worker_for_run, stdout, stderr, info)
         if session_key:
@@ -1998,7 +4206,7 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
         return self._env_flag("WPR_OPENCLAW_START_GATEWAY", False)
 
     def _gateway_env(self, worker: dict) -> dict[str, str]:
-        env = self._sandbox_env()
+        env = self._sandbox_env(worker)
         env["OPENCLAW_STATE_DIR"] = self._container_openclaw_state_dir()
         env["OPENCLAW_CONFIG_PATH"] = self._container_openclaw_config_path()
         env["OPENCLAW_MODEL"] = self._openclaw_model_for_worker(worker)
@@ -2052,8 +4260,8 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
             detail = (wait_result.stderr or wait_result.stdout or "").strip()[-500:]
             logger.warning("OpenClaw gateway did not become ready for %s: %s", worker.get("worker_id"), detail)
 
-    def _sandbox_env(self) -> dict[str, str]:
-        env = self._container_env(*_PROVIDER_ENV_KEYS)
+    def _sandbox_env(self, worker: dict) -> dict[str, str]:
+        env = self._container_env_for_worker(worker, *_PROVIDER_ENV_KEYS)
         env["HOME"] = self.sandbox.home_mount
         env["TERM"] = self.sandbox.term_value
         env["DISPLAY"] = self.sandbox.display_value
@@ -2111,28 +4319,80 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
         bootstrap_path.write_text(task_mode_text)
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
-        fast_sandbox = getattr(self.sandbox, "fast_sandbox_from_worker", lambda _worker: None)(worker)
+        fast_sandbox = (
+            None
+            if self._uses_parallel_clean_room(worker)
+            else getattr(
+                self.sandbox, "fast_sandbox_from_worker", lambda _worker: None
+            )(worker)
+        )
         sandbox = fast_sandbox or self.sandbox.ensure_ready(worker, self.runtime_name)
         self._write_gateway_config(worker, self._gateway_token(worker))
         self._start_openclaw_gateway(worker, sandbox)
         return self._runtime_info(worker, pid=sandbox.pid)
 
     def pause_worker(self, worker: dict) -> RuntimeInfo:
-        self.sandbox.pause(worker["worker_id"])
+        expected_container_id = str(
+            worker.get("_compute_release_container_id") or ""
+        ).strip()
+        sandbox = (
+            self.sandbox.pause(
+                worker["worker_id"],
+                expected_container_id=expected_container_id,
+            )
+            if expected_container_id
+            else self.sandbox.pause(worker["worker_id"])
+        )
+        if str(sandbox.state or "").lower() != "paused":
+            raise RuntimeErrorBase("Docker pause could not be confirmed")
         return self._runtime_info(worker, pid=None)
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
         if str(worker.get("state") or "") == "running":
             self._note_stop_reason(worker["worker_id"], "interrupted", run_id=run_id)
-        self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
-        sandbox = self.sandbox.inspect(worker["worker_id"])
-        pid = sandbox.pid if sandbox and sandbox.state == "running" else None
-        return self._runtime_info(worker, pid=pid)
+        confirmed = self._stop_active_process(
+            worker["worker_id"], worker=worker, run_id=run_id
+        )
+        if not confirmed:
+            raise RuntimeErrorBase("Docker run termination could not be confirmed")
+        return self._runtime_info(worker, pid=None)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
         self._note_stop_reason(worker["worker_id"], "terminated")
-        self._stop_active_process(worker["worker_id"])
-        self.sandbox.terminate(worker["worker_id"])
+        terminal_run_id = str(worker.get("_terminal_run_id") or "").strip()
+        expected_container_id = str(
+            worker.get("_compute_release_container_id") or ""
+        ).strip()
+        expected_container_absence = bool(
+            "_compute_release_container_id" in worker
+            and not expected_container_id
+        )
+        terminate_kwargs = {}
+        if self._uses_parallel_clean_room(worker):
+            terminate_kwargs["execution_policy"] = (
+                PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+            )
+        self._stop_active_process(
+            worker["worker_id"],
+            worker=worker,
+            run_id=terminal_run_id or None,
+            allow_stale_terminal_session=bool(terminal_run_id),
+        )
+        if expected_container_absence:
+            self.sandbox.terminate(
+                worker["worker_id"],
+                expected_absent=True,
+                **terminate_kwargs,
+            )
+        else:
+            if expected_container_id:
+                self.sandbox.terminate(
+                    worker["worker_id"],
+                    expected_container_id=expected_container_id,
+                    **terminate_kwargs,
+                )
+            else:
+                self.sandbox.terminate(worker["worker_id"], **terminate_kwargs)
         return self._runtime_info(worker, pid=None)
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
@@ -2141,12 +4401,28 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
             return self._runtime_info(worker, pid=None)
         if sandbox.state == "paused":
             return self._runtime_info(worker, pid=None)
+        active_run_id = str(worker.get("_active_run_id") or "").strip()
+        if active_run_id:
+            active_session = self._read_active_session(worker["worker_id"])
+            if (
+                active_session
+                and str(active_session.get("run_id") or "") == active_run_id
+                and bool(active_session.get("termination_unconfirmed"))
+            ):
+                return self._runtime_info(worker, pid=sandbox.pid)
+            identity = self.host_process_identity(worker, active_run_id)
+            pid = (
+                int(identity.get("pid") or 0) or None
+                if identity and bool(identity.get("verified"))
+                else None
+            )
+            return self._runtime_info(worker, pid=pid)
         return self._runtime_info(worker, pid=sandbox.pid)
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_id = info.session_key or self._default_session_key(worker) or f"agent:main:wpr:worker:{worker['worker_id']}"
         self._neutralize_default_openclaw_bootstrap(worker)
-        env = self._sandbox_env()
+        env = self._sandbox_env(worker)
         env["OPENCLAW_STATE_DIR"] = self._container_openclaw_state_dir()
         env["OPENCLAW_CONFIG_PATH"] = self._container_openclaw_config_path()
         env["OPENCLAW_MODEL"] = self._openclaw_model_for_worker(worker)
@@ -2264,6 +4540,165 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
     def _command_stdin_text(self, worker: dict, instruction: str, info: RuntimeInfo) -> str | None:
         return _instruction_with_completion_contract(instruction)
 
+    def _codex_native_session_is_available(
+        self,
+        worker_id: str,
+        session_key: str,
+    ) -> bool:
+        """Return false only when local Codex state proves a resume target is gone."""
+
+        codex_home = self._home_dir(worker_id) / ".codex"
+        state_databases = sorted(codex_home.glob("state_*.sqlite"))
+        queried_native_store = False
+        for database_path in state_databases:
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = sqlite3.connect(
+                    f"{database_path.resolve().as_uri()}?mode=ro",
+                    uri=True,
+                    timeout=0.1,
+                )
+                row = connection.execute(
+                    "SELECT rollout_path FROM threads WHERE id = ? LIMIT 1",
+                    (session_key,),
+                ).fetchone()
+                queried_native_store = True
+            except (OSError, sqlite3.Error):
+                continue
+            finally:
+                if connection is not None:
+                    connection.close()
+            if row is None:
+                continue
+            rollout_value = str(row[0] or "").strip()
+            if not rollout_value:
+                return False
+            rollout_path = Path(rollout_value)
+            if rollout_path.is_file():
+                return True
+            codex_marker = f"{os.sep}.codex{os.sep}"
+            if codex_marker in rollout_value:
+                relative_rollout = rollout_value.split(codex_marker, 1)[1]
+                return (codex_home / relative_rollout).is_file()
+            # A row in a compatible future store is stronger evidence than a
+            # host-side path that this runtime does not know how to translate.
+            return True
+        if queried_native_store:
+            return False
+
+        legacy_sessions = codex_home / "sessions"
+        if legacy_sessions.is_dir():
+            try:
+                return any(legacy_sessions.rglob(f"*{session_key}.jsonl"))
+            except OSError:
+                return True
+        # Older or externally managed Codex installations may not expose a
+        # local index that GlassHive can safely inspect. Preserve resume there.
+        return True
+
+    def _resumable_codex_session_key(self, worker: dict) -> str:
+        session_key = str(self._read_session_key(worker["worker_id"]) or "").strip()
+        if not session_key or session_key.startswith("codex-worker:"):
+            return ""
+        if self._codex_native_session_is_available(worker["worker_id"], session_key):
+            return session_key
+        logger.warning(
+            "Codex native session is unavailable; starting fresh in the durable workspace",
+            extra={"worker_id": str(worker.get("worker_id") or "")},
+        )
+        return ""
+
+    def provider_citation_sources(self, worker: dict, run_id: str) -> list[dict[str, str]]:
+        """Resolve cited public URLs from the private Codex rollout ledger.
+
+        ``codex exec --json`` exposes citation anchors in the assistant message but keeps the
+        corresponding URL/title records in its private session rollout. Export only that small
+        provenance tuple; snippets and other native-session content stay private.
+        """
+
+        clean_run_id = str(run_id or "").strip()
+        if (
+            not clean_run_id
+            or "/" in clean_run_id
+            or "\\" in clean_run_id
+            or clean_run_id in {".", ".."}
+        ):
+            raise ValueError("invalid run id")
+        stdout_path = self._run_root(str(worker["worker_id"]), clean_run_id) / "stdout.log"
+        if not stdout_path.is_file():
+            return []
+        thread_id = ""
+        try:
+            with stdout_path.open(errors="ignore") as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(event, dict) and event.get("type") == "thread.started":
+                        thread_id = str(event.get("thread_id") or "").strip()
+                        if thread_id:
+                            break
+        except OSError:
+            return []
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", thread_id):
+            return []
+
+        sessions_root = self._home_dir(str(worker["worker_id"])) / ".codex" / "sessions"
+        if not sessions_root.is_dir():
+            return []
+        try:
+            candidates = list(sessions_root.rglob(f"*{thread_id}.jsonl"))
+        except OSError:
+            return []
+        if not candidates:
+            return []
+        try:
+            rollout_path = max(candidates, key=lambda path: path.stat().st_mtime_ns)
+        except OSError:
+            return []
+
+        sources: dict[str, dict[str, str]] = {}
+        try:
+            with rollout_path.open(errors="ignore") as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict) or event.get("type") != "event_msg":
+                        continue
+                    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                    if payload.get("type") != "web_search_end":
+                        continue
+                    results = payload.get("results") if isinstance(payload.get("results"), list) else []
+                    for result in results:
+                        if not isinstance(result, dict):
+                            continue
+                        ref_id = str(result.get("ref_id") or "").strip()
+                        url = str(result.get("url") or "").strip()
+                        try:
+                            parsed_url = urlsplit(url)
+                        except ValueError:
+                            continue
+                        if (
+                            not re.fullmatch(r"turn\d+[A-Za-z_][A-Za-z0-9_-]*?\d+", ref_id)
+                            or parsed_url.scheme not in {"http", "https"}
+                            or not parsed_url.netloc
+                            or any(character.isspace() or ord(character) < 32 for character in url)
+                        ):
+                            continue
+                        raw_title = str(result.get("title") or result.get("domain") or parsed_url.netloc)
+                        title = " ".join(raw_title.split())
+                        sources[ref_id] = {
+                            "ref_id": ref_id,
+                            "title": title[:300] or parsed_url.netloc,
+                            "url": url,
+                        }
+        except OSError:
+            return []
+        return list(sources.values())
+
     def _ensure_git_workspace(self, workspace_dir: str) -> None:
         git_dir = Path(workspace_dir) / ".git"
         if git_dir.exists():
@@ -2348,8 +4783,11 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
 
     def _compatible_provider_allowed_reasoning_efforts(self) -> set[str]:
         raw = os.environ.get("WPR_CODEX_CLI_ALLOWED_REASONING_EFFORTS", "").strip()
-        valid = {"none", "minimal", "low", "medium", "high", "xhigh"}
+        valid = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
         if not raw:
+            # Keep the generic OpenAI-compatible route conservative. The GlassHive core
+            # provider uses the native host CLI path and advertises its own richer effort set;
+            # compatible gateways must explicitly declare anything beyond this proven set.
             allowed = {"none", "low", "medium", "high"}
             if self._codex_xhigh_route_proven():
                 allowed.add("xhigh")
@@ -2418,7 +4856,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
 
     def _append_codex_reasoning_effort_config(self, command: list[str], worker: dict) -> None:
         reasoning_effort = self._codex_reasoning_effort_for_worker(worker)
-        if reasoning_effort in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+        if reasoning_effort in {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
             command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
         if reasoning_effort == "minimal":
             command.extend(["-c", 'web_search="disabled"'])
@@ -2435,9 +4873,14 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         *,
         include_reasoning_effort: bool = True,
     ) -> None:
-        if not self._compatible_provider_enabled():
+        clean_room = self._uses_parallel_clean_room(worker)
+        if not clean_room and not self._compatible_provider_enabled():
             return
-        base_url = self._compatible_provider_base_url()
+        base_url = (
+            self._parallel_clean_room_provider_base_url(worker, "openai")
+            if clean_room
+            else self._compatible_provider_base_url()
+        )
         if not base_url:
             return
         provider_id = self._compatible_provider_id()
@@ -2455,7 +4898,15 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
                 "-c",
                 f'model_providers.{provider_id}.base_url="{base_url}"',
                 "-c",
-                f'model_providers.{provider_id}.env_key="{self._compatible_provider_env_key()}"',
+                (
+                    f'model_providers.{provider_id}.env_key="'
+                    + (
+                        "GLASSHIVE_CAPABILITY_BROKER_TOKEN"
+                        if clean_room
+                        else self._compatible_provider_env_key()
+                    )
+                    + '"'
+                ),
                 "-c",
                 f'model_providers.{provider_id}.wire_api="{wire_api}"',
                 "-c",
@@ -2470,9 +4921,9 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             self._append_codex_reasoning_effort_config(command, worker)
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
-        existing_session = self._read_session_key(worker["worker_id"])
+        existing_session = self._resumable_codex_session_key(worker)
         model = self._codex_model_for_worker(worker, "WPR_MODEL_CODEX_CLI")
-        is_resume = bool(existing_session and not existing_session.startswith("codex-worker:"))
+        is_resume = bool(existing_session)
         dangerous_mode = os.environ.get("WPR_CODEX_DANGEROUS", "1").strip().lower() in {"1", "true", "yes", "on"}
         if is_resume:
             command = [self.binary, "exec", "resume"]
@@ -2496,7 +4947,8 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         if is_resume:
             command.append(existing_session)
         command.append("-")
-        env = self._container_env(
+        env = self._container_env_for_worker(
+            worker,
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "OPENAI_API_BASE",
@@ -2588,6 +5040,8 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
                     output_parts.append(text)
         if output_parts:
             return session_key, _select_user_facing_agent_output(output_parts)
+        if getattr(self, "_conversation_mode_from_worker", lambda _worker: False)(worker):
+            return session_key, "The harness completed without a user-facing response."
         fallback = self._extract_plain_output(stdout, stderr)
         selected = _select_user_facing_agent_output([fallback])
         return session_key, (selected or fallback)[-4000:]
@@ -2685,10 +5139,11 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             "--permission-mode",
             permission_mode,
             "--output-format",
-            "json",
+            "stream-json",
             "--model",
             model,
         ]
+        command.append("--verbose")
         if self._chrome_enabled():
             command.insert(2, "--chrome")
         effort = self._effort_for_worker(worker)
@@ -2701,7 +5156,8 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             )
         if session_key and not session_key.startswith("claude-worker:"):
             command.extend(["--resume", session_key])
-        env = self._container_env(
+        env = self._container_env_for_worker(
+            worker,
             "ANTHROPIC_API_KEY",
             "CLAUDE_CODE_OAUTH_TOKEN",
             "ANTHROPIC_BASE_URL",
@@ -2724,7 +5180,56 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
     def _parse_output(self, worker: dict, stdout: str, stderr: str, info: RuntimeInfo) -> tuple[str | None, str]:
         raw = stdout.strip()
         if not raw:
+            if getattr(self, "_conversation_mode_from_worker", lambda _worker: False)(worker):
+                return info.session_key, "The harness completed without a user-facing response."
             return info.session_key, (stderr.strip() or "")[-4000:]
+        stream_events: list[dict[str, object]] = []
+        for line in raw.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                stream_events.append(event)
+        if getattr(self, "_conversation_mode_from_worker", lambda _worker: False)(worker) or len(stream_events) > 1:
+            session_key = info.session_key
+            assistant_parts: list[str] = []
+            result_parts: list[str] = []
+            structured_parts: list[str] = []
+            for event in stream_events:
+                maybe_session = str(event.get("session_id") or "").strip()
+                if maybe_session:
+                    session_key = maybe_session
+                if str(event.get("type") or "") == "result":
+                    structured = event.get(
+                        "structured_output", event.get("structuredOutput")
+                    )
+                    if isinstance(structured, dict):
+                        structured_parts.append(
+                            json.dumps(
+                                structured,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                        )
+                    result = str(event.get("result") or "").strip()
+                    if result:
+                        result_parts.append(result)
+                if str(event.get("type") or "") != "assistant":
+                    continue
+                message = event.get("message") if isinstance(event.get("message"), dict) else {}
+                content = message.get("content") if isinstance(message.get("content"), list) else []
+                text = "".join(
+                    str(block.get("text") or "")
+                    for block in content
+                    if isinstance(block, dict) and str(block.get("type") or "") == "text"
+                ).strip()
+                if text:
+                    assistant_parts.append(text)
+            selected = _select_user_facing_agent_output(
+                structured_parts or result_parts or assistant_parts
+            )
+            return session_key, selected or "The harness completed without a user-facing response."
         try:
             payload = json.loads(raw.splitlines()[-1])
         except json.JSONDecodeError:
@@ -2735,8 +5240,8 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
 
 
 _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"/Users/[^/\s\"'`]+(?:/[^\s\"'`]+)+"), "[REDACTED_LOCAL_PATH]"),
-    (re.compile(r"~/[^\s\"'`]+(?:/[^\s\"'`]+)+"), "[REDACTED_LOCAL_PATH]"),
+    (re.compile(r"/Users/[^/\s\"'`]+(?:/[^\s\"'`]*)*"), "[REDACTED_LOCAL_PATH]"),
+    (re.compile(r"~/[^\s\"'`]+(?:/[^\s\"'`]*)*"), "[REDACTED_LOCAL_PATH]"),
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)((?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s\"']{6,}"), r"\1[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
@@ -2744,7 +5249,6 @@ _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{256,}"), "[REDACTED_IMAGE_BASE64]"),
     (re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{512,}={0,2}(?![A-Za-z0-9+/=])"), "[REDACTED_LONG_BASE64]"),
 )
-_FINAL_REPORT_PATTERN = re.compile(r"(?m)^[ \t]*FINAL REPORT:\s*")
 _HOST_RUN_OUTPUT_MAX_CHARS = 64000
 
 
@@ -2754,7 +5258,7 @@ def _select_user_facing_agent_output(output_parts: list[str]) -> str:
     if not cleaned:
         return ""
     for part in reversed(cleaned):
-        marker_matches = list(_FINAL_REPORT_PATTERN.finditer(part))
+        marker_matches = list(FINAL_REPORT_PATTERN.finditer(part))
         if marker_matches:
             return part[marker_matches[-1].end() :].strip()
     return cleaned[-1]
@@ -3209,8 +5713,7 @@ def _write_active_run_status(
             "transcript_progress": _active_run_transcript_progress(path, transcript_paths),
             "evidence_path": evidence_path,
         }
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        path.chmod(0o600)
+        _atomic_write_private_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     except Exception as exc:  # pragma: no cover - heartbeat must not mask the real worker result
         logger.warning(
             "Failed to write GlassHive active run status",
@@ -3260,10 +5763,81 @@ def _safe_slug(value: str) -> str:
 class HostNativeCliMixin:
     execution_mode = "host"
     worker_root_name = "host_cli_runtime"
-    _host_active_worker_id: str | None = None
+
+    def _host_active_slots(self) -> dict[str, object]:
+        slots = self.__dict__.get("_viventium_host_active_slots")
+        if not isinstance(slots, dict):
+            slots = {}
+            self.__dict__["_viventium_host_active_slots"] = slots
+        return slots
+
+    def _host_worker_lanes(self) -> dict[str, str]:
+        lanes = self.__dict__.get("_viventium_host_worker_lanes")
+        if not isinstance(lanes, dict):
+            lanes = {}
+            self.__dict__["_viventium_host_worker_lanes"] = lanes
+        return lanes
+
+    def _host_capacity_lane(self, worker: dict | None) -> str:
+        return "conversation" if self._conversation_mode_from_worker(worker) else "mission"
+
+    def host_active_process_status(self, worker: dict) -> dict[str, object]:
+        active_session = self._read_active_session(
+            str(worker.get("worker_id") or "")
+        )
+        if not active_session:
+            return {"state": "absent"}
+        try:
+            pid = int(active_session.get("process_pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        start_identity = str(
+            active_session.get("process_start_identity") or ""
+        ).strip()
+        run_id = str(active_session.get("run_id") or "").strip()
+        if pid <= 0 or not start_identity:
+            return {"state": "uncertain", "run_id": run_id}
+        if not self._pid_is_live(pid) or self._pid_is_zombie(pid):
+            return {"state": "absent", "run_id": run_id}
+        current_identity = self._process_start_identity(pid)
+        if not current_identity:
+            return {"state": "uncertain", "run_id": run_id}
+        if current_identity != start_identity:
+            return {"state": "absent", "run_id": run_id}
+        return {
+            "state": "active",
+            "run_id": run_id,
+            "pid": pid,
+            "process_start_identity": start_identity,
+        }
 
     def _instruction_with_completion_contract(self, instruction: str) -> str:
         return _instruction_with_completion_contract(instruction)
+
+    def _command_stdin_text(self, worker: dict, instruction: str, info: RuntimeInfo) -> str | None:
+        _ = info
+        if self._conversation_mode_from_worker(worker):
+            return str(instruction or "").strip()
+        return self._instruction_with_completion_contract(instruction)
+
+    def _run_mode_from_worker(self, worker: dict | None) -> str:
+        if not isinstance(worker, dict):
+            return "mission"
+        return (
+            "conversation"
+            if str(worker.get("trusted_run_lane") or "").strip().lower()
+            == "conversation"
+            else "mission"
+        )
+
+    def _conversation_mode_from_worker(self, worker: dict | None) -> bool:
+        return self._run_mode_from_worker(worker) == "conversation"
+
+    def _conversation_evidence_workspace(self, worker: dict, run_id: str) -> Path:
+        path = self._run_root(str(worker["worker_id"]), run_id) / "private-evidence"
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o700)
+        return path
 
     def _agent_type(self) -> str:
         if self.runtime_name == "codex-cli":
@@ -3300,10 +5874,13 @@ class HostNativeCliMixin:
         if existing:
             return Path(existing).expanduser()
         root = self._host_workspace_root(worker)
+        if self._conversation_mode_from_worker(worker):
+            return root
         date_prefix = datetime.now().strftime("%Y-%m-%d")
         alias = str(worker.get("alias") or worker.get("name") or worker.get("worker_id") or "project")
         slug = _safe_slug(alias)
-        return root / self._agent_type() / f"{date_prefix}-{slug}"
+        worker_suffix = _safe_slug(str(worker.get("worker_id") or "worker"))
+        return root / self._agent_type() / f"{date_prefix}-{slug}-{worker_suffix}"
 
     def _host_project_definition(self, worker: dict) -> str:
         bundle = self._bootstrap_bundle_for_worker(worker)
@@ -3342,6 +5919,27 @@ class HostNativeCliMixin:
                 return {}
         raw_bundle = worker.get("bootstrap_bundle")
         return raw_bundle if isinstance(raw_bundle, dict) else {}
+
+    def _agent_builder_output_schema(self, worker: dict) -> dict[str, object] | None:
+        if not self._conversation_mode_from_worker(worker):
+            return None
+        bundle = self._bootstrap_bundle_for_worker(worker)
+        schema = graph_transfer_output_schema(bundle.get("agent_builder_control"))
+        return schema if isinstance(schema, dict) else None
+
+    def _agent_builder_output_schema_path(
+        self,
+        worker: dict,
+    ) -> Path | None:
+        schema = self._agent_builder_output_schema(worker)
+        if not schema:
+            return None
+        path = self._state_dir(str(worker["worker_id"])) / "agent-builder-output-schema.json"
+        _atomic_write_private_text(
+            path,
+            json.dumps(schema, separators=(",", ":"), sort_keys=True),
+        )
+        return path
 
     def _write_workspace_file(self, workspace: Path, relative_path: str, content: str, *, overwrite: bool = True) -> None:
         relative = Path(relative_path)
@@ -3396,6 +5994,12 @@ class HostNativeCliMixin:
 
     def _host_codex_home(self, worker: dict) -> Path:
         return self._home_dir(worker["worker_id"]) / ".codex"
+
+    def _host_plugin_denylist(self) -> tuple[str, ...]:
+        return _host_plugin_denylist()
+
+    def _host_codex_personality(self) -> str:
+        return _host_codex_personality()
 
     def _source_host_codex_home(self) -> Path:
         return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
@@ -3482,13 +6086,25 @@ class HostNativeCliMixin:
                 )
         return "\n\n".join(blocks).strip()
 
-    def _host_codex_worker_config(self, codex_config_append: str) -> str:
+    def _host_codex_worker_config(
+        self,
+        codex_config_append: str,
+        *,
+        developer_instructions: str | None = None,
+    ) -> str:
         append = codex_config_append.strip()
         append_names = _codex_mcp_server_names(append)
-        preserve_names = self._host_codex_native_mcp_allowlist() - append_names
+        native_web_locked = _host_native_web_access() == "disabled"
+        preserve_names = (
+            set() if native_web_locked else self._host_codex_native_mcp_allowlist() - append_names
+        )
         source_config_path = self._source_host_codex_home() / "config.toml"
         preserved = ""
-        if source_config_path.exists() and source_config_path.is_file():
+        if (
+            not native_web_locked
+            and source_config_path.exists()
+            and source_config_path.is_file()
+        ):
             try:
                 source_config = source_config_path.read_text()
             except OSError:
@@ -3503,9 +6119,55 @@ class HostNativeCliMixin:
         native = "\n\n".join(
             part for part in (preserved, plugin_preserved, known_native) if part.strip()
         ).strip()
+        personality = self._host_codex_personality()
+        native = _apply_codex_personality(native, personality)
+        native = _apply_codex_developer_instructions(native, developer_instructions)
+        denied_plugins = self._host_plugin_denylist()
+        native = _apply_codex_plugin_denylist(native, denied_plugins)
         if append_names:
             native = _strip_codex_mcp_server_blocks(native, append_names)
-        return "\n\n".join(part for part in (native, append) if part.strip()).strip()
+        config = "\n\n".join(part for part in (native, append) if part.strip()).strip()
+        _assert_codex_worker_policy(
+            config,
+            plugin_ids=denied_plugins,
+            personality=personality,
+            developer_instructions=developer_instructions,
+        )
+        return config
+
+    def _assert_host_codex_worker_policy(self, worker: dict) -> None:
+        denied_plugins = self._host_plugin_denylist()
+        personality = self._host_codex_personality()
+        bundle = self._bootstrap_bundle_for_worker(worker)
+        developer_instructions = (
+            str(bundle.get("developer_instructions") or "")
+            if self._conversation_mode_from_worker(worker)
+            and "developer_instructions" in bundle
+            else None
+        )
+        if (
+            not denied_plugins
+            and personality == "inherit"
+            and developer_instructions is None
+        ):
+            return
+        config_path = self._host_codex_home(worker) / "config.toml"
+        if not config_path.is_file():
+            raise RuntimeErrorBase(
+                "Host Codex worker policy config is missing; refusing to launch"
+            )
+        try:
+            config_text = config_path.read_text()
+        except OSError as exc:
+            raise RuntimeErrorBase(
+                "Host Codex worker policy config is unreadable; refusing to launch"
+            ) from exc
+        _assert_codex_worker_policy(
+            config_text,
+            plugin_ids=denied_plugins,
+            personality=personality,
+            developer_instructions=developer_instructions,
+        )
 
     def _write_host_project_mcp_files(self, worker: dict, workspace: Path, bundle: dict[str, object]) -> None:
         """Project scoped MCP/client config for host-native workers.
@@ -3535,8 +6197,21 @@ class HostNativeCliMixin:
             target.chmod(0o600)
 
         codex_config_append = str(bundle.get("codex_config_append") or "").strip()
-        if codex_config_append:
-            codex_config = self._host_codex_worker_config(codex_config_append)
+        developer_instructions = (
+            str(bundle.get("developer_instructions") or "")
+            if "developer_instructions" in bundle
+            else None
+        )
+        if (
+            codex_config_append
+            or self._host_plugin_denylist()
+            or self._host_codex_personality() != "inherit"
+            or developer_instructions is not None
+        ):
+            codex_config = self._host_codex_worker_config(
+                codex_config_append,
+                developer_instructions=developer_instructions,
+            )
             target = workspace / ".codex" / "config.toml"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(codex_config + "\n")
@@ -3549,12 +6224,60 @@ class HostNativeCliMixin:
             codex_target.chmod(0o600)
             self._copy_host_codex_auth(codex_home)
 
+    def _write_conversation_runtime_files(self, worker: dict, bundle: dict[str, object]) -> None:
+        """Write harness configuration under private worker state, never inside LIFE."""
+
+        profile = str(worker.get("profile") or "").strip()
+        if profile == "codex-cli":
+            codex_home = self._host_codex_home(worker)
+            codex_home.mkdir(parents=True, exist_ok=True)
+            codex_home.chmod(0o700)
+            codex_config = self._host_codex_worker_config(
+                str(bundle.get("codex_config_append") or ""),
+                developer_instructions=(
+                    str(bundle.get("developer_instructions") or "")
+                    if "developer_instructions" in bundle
+                    else None
+                ),
+            )
+            config_path = codex_home / "config.toml"
+            config_path.write_text((codex_config.rstrip() + "\n") if codex_config else "")
+            config_path.chmod(0o600)
+            self._copy_host_codex_auth(codex_home)
+            return
+
+        if profile != "claude-code":
+            return
+        claude_home = self._home_dir(str(worker["worker_id"])) / ".claude"
+        claude_home.mkdir(parents=True, exist_ok=True)
+        claude_home.chmod(0o700)
+        project_mcp = bundle.get("claude_project_mcp")
+        state_dir = self._state_dir(str(worker["worker_id"]))
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_dir.chmod(0o700)
+        mcp_path = state_dir / "conversation-mcp.json"
+        if isinstance(project_mcp, dict):
+            payload = claude_project_mcp_payload_for_bundle(bundle, project_mcp)
+            mcp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            mcp_path.chmod(0o600)
+        else:
+            try:
+                mcp_path.unlink()
+            except FileNotFoundError:
+                pass
+
     def _materialize_workspace(self, worker: dict, workspace: Path) -> None:
         root = self._host_workspace_root(worker)
         root.mkdir(parents=True, exist_ok=True)
         if not os.access(root, os.W_OK):
             raise RuntimeErrorBase(f"Host workspace root is not writable: {root}")
         workspace.mkdir(parents=True, exist_ok=True)
+        if self._conversation_mode_from_worker(worker):
+            self._write_conversation_runtime_files(
+                worker,
+                self._bootstrap_bundle_for_worker(worker),
+            )
+            return
         bundle = self._bootstrap_bundle_for_worker(worker)
         self._write_workspace_file(workspace, "project-definition.md", self._host_project_definition(worker), overwrite=False)
         if not (workspace / "work-log.md").exists():
@@ -3687,6 +6410,8 @@ class HostNativeCliMixin:
                 raise RuntimeErrorBase(f"Bootstrap file {path} is missing content or source_path")
 
     def _append_work_log(self, worker: dict, message: str) -> None:
+        if self._conversation_mode_from_worker(worker):
+            return
         path = self._host_workspace_dir(worker) / "work-log.md"
         try:
             with path.open("a") as handle:
@@ -3724,10 +6449,33 @@ class HostNativeCliMixin:
         for key, value in os.environ.items():
             if key.startswith("LC_") and value:
                 env[key] = value
-        env.setdefault("HOME", str(Path.home()))
         env.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
         env.setdefault("SHELL", os.environ.get("SHELL", "/bin/zsh"))
         env.update(bootstrap_env_for(worker))
+        # Service-only authority must never cross into a mission process even if
+        # a deployment accidentally lists it in a worker bootstrap allowlist.
+        env.pop("VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET", None)
+        env.pop("VIVENTIUM_GLASSHIVE_ADMISSION_URL", None)
+        env.pop("VIVENTIUM_GLASSHIVE_ADMISSION_SECRET", None)
+        worker_id = str(worker.get("worker_id") or "unknown")
+        home = self._home_dir(worker_id)
+        isolated_dirs = {
+            "HOME": home,
+            "CODEX_HOME": home / ".codex",
+            "CLAUDE_CONFIG_DIR": home / ".claude",
+            "TMPDIR": home / ".tmp",
+            "XDG_CACHE_HOME": home / ".cache",
+            "XDG_CONFIG_HOME": home / ".config",
+            "XDG_STATE_HOME": home / ".local" / "state",
+            "GLASSHIVE_LOG_DIR": self._state_dir(worker_id) / "logs",
+        }
+        for key, path in isolated_dirs.items():
+            path.mkdir(parents=True, exist_ok=True)
+            try:
+                path.chmod(0o700)
+            except OSError:
+                pass
+            env[key] = str(path)
         workspace = self._host_workspace_dir(worker)
         env["GLASSHIVE_WORKER_ID"] = str(worker.get("worker_id") or "")
         env["GLASSHIVE_WORKER_RUNTIME"] = self.runtime_name
@@ -3837,7 +6585,7 @@ class HostNativeCliMixin:
         stop_reason: str,
         error_text: str,
     ) -> None:
-        if not active_session:
+        if self._conversation_mode_from_worker(worker) or not active_session:
             return
         run_id = str(active_session.get("run_id") or "").strip()
         if not run_id:
@@ -3908,10 +6656,176 @@ class HostNativeCliMixin:
             evidence_path=evidence_path,
         )
 
+    def _host_control_receipt_path(self, worker_id: str) -> Path:
+        return self._state_dir(worker_id) / "host_control_receipt.json"
+
+    def _read_host_control_receipt(
+        self, worker_id: str
+    ) -> dict[str, object] | None:
+        path = self._host_control_receipt_path(worker_id)
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _write_host_control_receipt(
+        self,
+        worker: dict,
+        *,
+        active_session: dict[str, object],
+        run_id: str,
+        operation: str,
+        confirmed: bool,
+    ) -> dict[str, object]:
+        """Persist exact host-control intent before signaling its process.
+
+        The receipt contains only runtime identity/evidence metadata already
+        present in the private active-session record.  It lets crash recovery
+        distinguish a proven-dead exact generation from an empty identity.
+        """
+
+        worker_id = str(worker["worker_id"])
+        prior = self._read_host_control_receipt(worker_id) or {}
+        same_generation = bool(
+            str(prior.get("run_id") or "") == run_id
+            and str(prior.get("operation") or "") == operation
+            and str(prior.get("process_start_identity") or "")
+            == str(active_session.get("process_start_identity") or "")
+        )
+        status = (
+            "confirmed"
+            if confirmed or (same_generation and prior.get("status") == "confirmed")
+            else "requested"
+        )
+        payload: dict[str, object] = {
+            "version": 1,
+            "worker_id": worker_id,
+            "run_id": run_id,
+            "operation": operation,
+            "status": status,
+            "session_name": str(active_session.get("session_name") or ""),
+            "process_pid": active_session.get("process_pid"),
+            "process_group": active_session.get("process_group"),
+            "process_start_identity": str(
+                active_session.get("process_start_identity") or ""
+            ),
+            "requested_at": str(prior.get("requested_at") or "") or _utc_iso(),
+            "confirmed_at": _utc_iso() if status == "confirmed" else "",
+            "session": dict(active_session),
+        }
+        _atomic_write_private_text(
+            self._host_control_receipt_path(worker_id),
+            json.dumps(payload, indent=2, sort_keys=True),
+        )
+        return payload
+
+    @staticmethod
+    def _host_control_generation_matches(
+        *,
+        worker: dict,
+        lease: dict,
+        session: dict[str, object],
+        run_id: str,
+    ) -> bool:
+        try:
+            lease_pid = int(lease.get("pid") or 0)
+            lease_group = int(lease.get("process_group") or 0)
+            session_pid = int(session.get("process_pid") or 0)
+            session_group = int(session.get("process_group") or 0)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            str(lease.get("worker_id") or "") == str(worker["worker_id"])
+            and str(lease.get("run_id") or "") == run_id
+            and str(lease.get("status") or "") == "active"
+            and str(lease.get("startup_state") or "") == "confirmed"
+            and str(lease.get("startup_identity_kind") or "") == "host_process"
+            and str(session.get("run_id") or "") == run_id
+            and str(session.get("session_name") or "")
+            == str(lease.get("startup_session_id") or "")
+            and lease_pid > 0
+            and lease_pid == session_pid
+            and lease_group > 0
+            and lease_group == session_group
+            and str(lease.get("process_start_identity") or "").strip()
+            and str(lease.get("process_start_identity") or "").strip()
+            == str(session.get("process_start_identity") or "").strip()
+        )
+
+    def _confirmed_host_control_session(
+        self,
+        worker: dict,
+        *,
+        run_id: str,
+        operation: str,
+    ) -> dict[str, object]:
+        """Bind a host control to the service-confirmed lease and session file."""
+
+        lease = worker.get("_host_run_lease")
+        active_session = self._read_active_session(str(worker["worker_id"]))
+        if not isinstance(lease, dict):
+            raise RuntimeErrorBase(
+                "The exact host process identity is not confirmed"
+            )
+        if isinstance(active_session, dict):
+            if not self._host_control_generation_matches(
+                worker=worker,
+                lease=lease,
+                session=active_session,
+                run_id=run_id,
+            ):
+                raise RuntimeErrorBase(
+                    "The exact host process identity is not confirmed"
+                )
+            return active_session
+
+        receipt = self._read_host_control_receipt(str(worker["worker_id"]))
+        receipt_session = (
+            receipt.get("session") if isinstance(receipt, dict) else None
+        )
+        if (
+            not isinstance(receipt, dict)
+            or not isinstance(receipt_session, dict)
+            or str(receipt.get("operation") or "") != operation
+            or str(receipt.get("status") or "") not in {"requested", "confirmed"}
+            or not self._host_control_generation_matches(
+                worker=worker,
+                lease=lease,
+                session=receipt_session,
+                run_id=run_id,
+            )
+        ):
+            raise RuntimeErrorBase(
+                "The exact host process identity is not confirmed"
+            )
+        return dict(receipt_session)
+
     def pause_worker(self, worker: dict) -> RuntimeInfo:
-        active_session = self._read_active_session(worker["worker_id"])
+        run_id = str(worker.get("_active_run_id") or "").strip()
+        active_session = self._confirmed_host_control_session(
+            worker, run_id=run_id, operation="pause_run"
+        )
+        self._write_host_control_receipt(
+            worker,
+            active_session=active_session,
+            run_id=run_id,
+            operation="pause_run",
+            confirmed=False,
+        )
         self._note_stop_reason(worker["worker_id"], "paused")
-        self._stop_active_process(worker["worker_id"], worker=worker)
+        confirmed = self._stop_active_process(
+            worker["worker_id"], worker=worker, run_id=run_id
+        )
+        if not confirmed:
+            raise RuntimeErrorBase("Host run termination could not be confirmed")
+        self._write_host_control_receipt(
+            worker,
+            active_session=active_session,
+            run_id=run_id,
+            operation="pause_run",
+            confirmed=True,
+        )
         self._write_stopped_active_run_evidence(
             worker,
             active_session=active_session,
@@ -3922,11 +6836,35 @@ class HostNativeCliMixin:
         return self._host_runtime_info(worker, pid=None)
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
-        active_session = self._read_active_session(worker["worker_id"])
-        if active_session and run_id and active_session.get("run_id") != run_id:
-            active_session = None
+        exact_run_id = str(run_id or worker.get("_active_run_id") or "").strip()
+        operation = (
+            "steer_run"
+            if str(worker.get("compute_release_kind") or "") == "steer_run"
+            else "interrupt_run"
+        )
+        active_session = self._confirmed_host_control_session(
+            worker, run_id=exact_run_id, operation=operation
+        )
+        self._write_host_control_receipt(
+            worker,
+            active_session=active_session,
+            run_id=exact_run_id,
+            operation=operation,
+            confirmed=False,
+        )
         self._note_stop_reason(worker["worker_id"], "interrupted", run_id=run_id)
-        self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
+        confirmed = self._stop_active_process(
+            worker["worker_id"], worker=worker, run_id=exact_run_id
+        )
+        if not confirmed:
+            raise RuntimeErrorBase("Host run termination could not be confirmed")
+        self._write_host_control_receipt(
+            worker,
+            active_session=active_session,
+            run_id=exact_run_id,
+            operation=operation,
+            confirmed=True,
+        )
         self._write_stopped_active_run_evidence(
             worker,
             active_session=active_session,
@@ -3934,12 +6872,45 @@ class HostNativeCliMixin:
             error_text="Worker run was interrupted by the operator",
         )
         self._append_work_log(worker, "Active run interrupted by operator.")
-        return self._host_runtime_info(worker, pid=None)
+        pending_pid = None
+        return self._host_runtime_info(worker, pid=pending_pid)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
-        active_session = self._read_active_session(worker["worker_id"])
+        run_id = str(worker.get("_active_run_id") or "").strip()
+        operation = str(worker.get("compute_release_kind") or "").strip() or "terminate_worker"
+        active_session = (
+            self._confirmed_host_control_session(
+                worker, run_id=run_id, operation=operation
+            )
+            if run_id
+            else self._read_active_session(worker["worker_id"])
+        )
+        if not run_id and active_session:
+            raise RuntimeErrorBase(
+                "The exact host process identity is not confirmed"
+            )
+        if run_id and active_session:
+            self._write_host_control_receipt(
+                worker,
+                active_session=active_session,
+                run_id=run_id,
+                operation=operation,
+                confirmed=False,
+            )
         self._note_stop_reason(worker["worker_id"], "terminated")
-        self._stop_active_process(worker["worker_id"], worker=worker)
+        confirmed = self._stop_active_process(
+            worker["worker_id"], worker=worker, run_id=run_id or None
+        )
+        if not confirmed:
+            raise RuntimeErrorBase("Host run termination could not be confirmed")
+        if run_id and active_session:
+            self._write_host_control_receipt(
+                worker,
+                active_session=active_session,
+                run_id=run_id,
+                operation=operation,
+                confirmed=True,
+            )
         self._write_stopped_active_run_evidence(
             worker,
             active_session=active_session,
@@ -3950,66 +6921,250 @@ class HostNativeCliMixin:
         return self._host_runtime_info(worker, pid=None)
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
-        return self._host_runtime_info(worker, pid=self._active_pid(worker["worker_id"]))
+        return self._host_runtime_info(
+            worker,
+            pid=self._active_pid(
+                worker["worker_id"],
+                str(worker.get("_active_run_id") or "").strip() or None,
+            ),
+        )
 
-    def _stop_active_process(self, worker_id: str, *, worker: dict | None = None, run_id: str | None = None) -> None:
+    def host_process_identity(self, worker: dict, run_id: str) -> dict[str, object] | None:
+        active_session = self._read_active_session(str(worker.get("worker_id") or ""))
+        if str((active_session or {}).get("run_id") or "") != str(run_id):
+            return None
+        try:
+            pid = int((active_session or {}).get("process_pid") or 0)
+            process_group = int((active_session or {}).get("process_group") or 0)
+        except (TypeError, ValueError):
+            return None
+        start_identity = str(
+            (active_session or {}).get("process_start_identity") or ""
+        ).strip()
+        verified = self._recorded_process_is_running(pid, start_identity)
+        if not verified:
+            return None
+        return {
+            "identity_kind": "host_process",
+            "pid": pid,
+            "process_group": process_group or pid,
+            "process_start_identity": start_identity,
+            "container_id": "",
+            "session_id": str((active_session or {}).get("session_name") or ""),
+            "startup_token_digest": str(
+                (active_session or {}).get("startup_token_digest") or ""
+            ),
+            "verified": True,
+        }
+
+    def cleanup_orphaned_run(self, worker: dict, run_id: str) -> RuntimeInfo:
+        worker_id = str(worker["worker_id"])
+        active_session = self._read_active_session(worker_id)
+        if str((active_session or {}).get("run_id") or "").strip() != str(run_id):
+            return self._host_runtime_info(worker, pid=None)
+        try:
+            process_pid = int((active_session or {}).get("process_pid") or 0)
+        except (TypeError, ValueError):
+            process_pid = 0
+        if process_pid > 0 and process_pid != os.getpid() and self._pid_is_live(process_pid):
+            try:
+                process_group = os.getpgid(process_pid)
+                if process_group != os.getpgrp():
+                    os.killpg(process_group, signal.SIGTERM)
+                else:
+                    os.kill(process_pid, signal.SIGTERM)
+            except OSError:
+                pass
+        self._clear_active_session(worker_id, expected_session=active_session)
+        self._release_host_slot(worker_id)
+        return self._host_runtime_info(worker, pid=None)
+
+    def _stop_active_process(
+        self,
+        worker_id: str,
+        *,
+        worker: dict | None = None,
+        run_id: str | None = None,
+    ) -> bool:
+        active_session = self._read_active_session(worker_id)
+        lease = worker.get("_host_run_lease") if isinstance(worker, dict) else None
+        if (
+            active_session
+            and run_id
+            and str(active_session.get("run_id") or "") != run_id
+        ):
+            return False
+        if (
+            isinstance(lease, dict)
+            and run_id
+            and str(lease.get("run_id") or "") != run_id
+        ):
+            return False
         with self._process_lock:
             process = self._active_processes.get(worker_id)
-        if not process or process.poll() is not None:
-            return
+        local_process = process if process and process.poll() is None else None
+
         try:
-            pgid = os.getpgid(process.pid)
-            os.killpg(pgid, signal.SIGTERM)
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
+            recorded_pid = int(
+                (active_session or {}).get("process_pid")
+                or (lease or {}).get("pid")
+                or 0
+            )
+            recorded_group = int(
+                (active_session or {}).get("process_group")
+                or (lease or {}).get("process_group")
+                or 0
+            )
+        except (TypeError, ValueError):
+            recorded_pid = 0
+            recorded_group = 0
+        recorded_identity = str(
+            (active_session or {}).get("process_start_identity")
+            or (lease or {}).get("process_start_identity")
+            or ""
+        ).strip()
+
+        if local_process is not None:
+            target_pid = local_process.pid
+            target_identity = recorded_identity or self._process_start_identity(target_pid)
+        elif recorded_pid > 0 and recorded_identity:
+            if not self._recorded_process_is_running(recorded_pid, recorded_identity):
+                if active_session and not self._clear_active_session(
+                    worker_id, expected_session=active_session
+                ):
+                    raise RuntimeErrorBase(
+                        "Host run ownership changed during exact-run stop"
+                    )
+                self._release_host_slot(worker_id)
+                return True
+            target_pid = recorded_pid
+            target_identity = recorded_identity
+        elif active_session or lease:
+            # A foreign process may only act on a persisted PID when the PID's
+            # start identity is present. Legacy PID-only records fail closed.
+            return False
+        else:
+            return True
+
+        def signal_process_group(sig: signal.Signals) -> None:
             try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                process_group = recorded_group or os.getpgid(target_pid)
+                if process_group != os.getpgrp():
+                    os.killpg(process_group, sig)
+                else:
+                    os.kill(target_pid, sig)
             except OSError:
                 pass
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-        except OSError:
-            try:
-                process.terminate()
-            except OSError:
-                pass
+
+        try:
+            signal_process_group(signal.SIGTERM)
+            if local_process is not None:
+                try:
+                    local_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    signal_process_group(signal.SIGKILL)
+                    try:
+                        local_process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+                confirmed = local_process.poll() is not None
+            else:
+                confirmed = self._wait_for_recorded_process_exit(
+                    target_pid, target_identity, timeout=5
+                )
+                if not confirmed:
+                    signal_process_group(signal.SIGKILL)
+                    confirmed = self._wait_for_recorded_process_exit(
+                        target_pid, target_identity, timeout=2
+                    )
         finally:
-            self._clear_process(worker_id)
-            if self._host_active_worker_id == worker_id:
-                self._host_active_worker_id = None
+            if local_process is not None and local_process.poll() is not None:
+                self._clear_process(worker_id, expected_process=local_process)
+        if confirmed:
+            if active_session and not self._clear_active_session(
+                worker_id, expected_session=active_session
+            ):
+                raise RuntimeErrorBase(
+                    "Host run ownership changed during exact-run stop"
+                )
+            self._release_host_slot(worker_id)
+        return confirmed
 
     def _acquire_host_slot(self, worker: dict) -> None:
-        if os.environ.get("WPR_HOST_ALLOW_CONCURRENT_SAME_CLI", "").strip().lower() in {"1", "true", "yes", "on"}:
-            return
         worker_id = worker["worker_id"]
+        lane = self._host_capacity_lane(worker)
         with self._process_lock:
-            error = self._host_capacity_error_locked(worker_id)
+            error = self._host_capacity_error_locked(worker_id, lane)
             if error is not None:
                 raise error
-            self._host_active_worker_id = worker_id
+            active = self._host_active_slots().get(lane)
+            if isinstance(active, set):
+                workers = active
+            elif isinstance(active, (list, tuple)):
+                workers = {str(item) for item in active if str(item)}
+            elif active:
+                workers = {str(active)}
+            else:
+                workers = set()
+            workers.add(worker_id)
+            self._host_active_slots()[lane] = workers
+            self._host_worker_lanes()[worker_id] = lane
 
-    def _host_capacity_error_locked(self, worker_id: str) -> RuntimeErrorBase | None:
-        active = self._host_active_worker_id
-        active_process = self._active_processes.get(active or "")
-        if active and active != worker_id and (active_process is None or active_process.poll() is None):
-            return RuntimeErrorBase(
-                f"Host-native {self.runtime_name} already has an active worker ({active}); "
-                "v1 allows one active host worker per CLI family."
+    def _host_capacity_error_locked(
+        self,
+        worker_id: str,
+        lane: str = "mission",
+    ) -> RuntimeErrorBase | None:
+        raw_active = self._host_active_slots().get(lane)
+        if isinstance(raw_active, set):
+            candidates = set(raw_active)
+        elif isinstance(raw_active, (list, tuple)):
+            candidates = {str(item) for item in raw_active if str(item)}
+        elif raw_active:
+            candidates = {str(raw_active)}
+        else:
+            candidates = set()
+        live: set[str] = set()
+        for candidate in candidates:
+            process = self._active_processes.get(candidate)
+            if process is None or process.poll() is None:
+                live.add(candidate)
+        live.discard(worker_id)
+        limit_name = (
+            "WPR_HOST_CONVERSATION_SLOTS_PER_CLI"
+            if lane == "conversation"
+            else "WPR_HOST_MISSION_SLOTS_PER_CLI"
+        )
+        default = 2 if lane == "conversation" else 3
+        try:
+            limit = max(1, int(str(os.environ.get(limit_name, default))))
+        except ValueError:
+            limit = default
+        if len(live) >= limit:
+            return HostCapacityError(
+                f"Host-native {self.runtime_name} {lane} lane is at capacity.",
+                capacity_class="family_lane",
             )
         return None
 
     def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
-        if os.environ.get("WPR_HOST_ALLOW_CONCURRENT_SAME_CLI", "").strip().lower() in {"1", "true", "yes", "on"}:
-            return None
         with self._process_lock:
-            return self._host_capacity_error_locked(str(worker["worker_id"]))
+            return self._host_capacity_error_locked(
+                str(worker["worker_id"]),
+                self._host_capacity_lane(worker),
+            )
 
     def _release_host_slot(self, worker_id: str) -> None:
         with self._process_lock:
-            if self._host_active_worker_id == worker_id:
-                self._host_active_worker_id = None
+            lane = self._host_worker_lanes().pop(worker_id, None)
+            if lane:
+                raw_active = self._host_active_slots().get(lane)
+                if isinstance(raw_active, set):
+                    raw_active.discard(worker_id)
+                    if not raw_active:
+                        self._host_active_slots().pop(lane, None)
+                elif raw_active == worker_id:
+                    self._host_active_slots().pop(lane, None)
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         raise NotImplementedError
@@ -4032,7 +7187,307 @@ class HostNativeCliMixin:
             return None
         return parsed if parsed > 0 else None
 
+    def _run_conversation_task(
+        self,
+        worker: dict,
+        instruction: str,
+        *,
+        timeout_sec: float | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        """Run a natural harness turn without mission scaffolding or LIFE-side runtime files."""
+        effective_run_id = (run_id or secrets.token_hex(8)).strip()
+        worker = {**worker, "_active_run_id": effective_run_id, "_glasshive_conversation_run": True}
+        info = self.ensure_worker_ready(worker)
+        command, env = self._build_command(worker, instruction, info)
+        stdin_text = self._command_stdin_text(worker, instruction, info)
+        env["GLASSHIVE_RUN_ID"] = effective_run_id
+        env["GLASSHIVE_RUN_MODE"] = "conversation"
+        workspace = Path(str(info.workspace_dir or self._host_workspace_dir(worker)))
+        self._acquire_host_slot(worker)
+
+        run_root = self._run_root(str(worker["worker_id"]), effective_run_id)
+        run_root.mkdir(parents=True, exist_ok=True)
+        run_root.chmod(0o700)
+        raw_stdout = run_root / "stdout.log"
+        raw_stderr = run_root / "stderr.log"
+        host_stdin = run_root / "instruction.stdin"
+        exit_path = run_root / "exit_code"
+        if stdin_text is not None:
+            host_stdin.write_text(stdin_text)
+            host_stdin.chmod(0o600)
+
+        self._write_action_audit(
+            worker,
+            {
+                "kind": "conversation.started",
+                "run_id": effective_run_id,
+                "cwd": str(workspace),
+                "argv_redacted": [_redact_command_arg(part) for part in command],
+                "env_keys": sorted(env.keys()),
+                "effort_projection": _effort_projection_for_audit(worker),
+            },
+        )
+        run_timeout_sec = self._host_run_timeout_sec(timeout_sec)
+        started_at_iso = _utc_iso()
+        heartbeat_path = run_root / "active-run.json"
+        heartbeat_stop = Event()
+        heartbeat_thread: Thread | None = None
+        transcript_paths = {
+            "stdout": str(raw_stdout),
+            "stderr": str(raw_stderr),
+            "exit_code": str(exit_path),
+        }
+        scrubber = DurableSecretScrubber(
+            exact_values=(env.get("GLASSHIVE_CAPABILITY_BROKER_TOKEN", ""),)
+        )
+        process: subprocess.Popen[str] | None = None
+        owned_session: dict[str, object] | None = None
+        startup_cleanup_unconfirmed = False
+        capture_threads: list[Thread] = []
+        capture_errors: list[BaseException] = []
+        try:
+            with raw_stdout.open("w") as stdout_handle, raw_stderr.open("w") as stderr_handle:
+                raw_stdout.chmod(0o600)
+                raw_stderr.chmod(0o600)
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(workspace),
+                    env=env,
+                    text=True,
+                    stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=1,
+                    start_new_session=True,
+                )
+                if process.stdout is None or process.stderr is None:  # pragma: no cover
+                    raise RuntimeErrorBase("Provider transcript pipes were not created")
+                capture_threads = [
+                    Thread(
+                        target=_drain_scrubbed_provider_stream,
+                        args=(process.stdout, stdout_handle, scrubber, capture_errors),
+                        name=f"glasshive-conversation-stdout-{effective_run_id[:12]}",
+                        daemon=True,
+                    ),
+                    Thread(
+                        target=_drain_scrubbed_provider_stream,
+                        args=(process.stderr, stderr_handle, scrubber, capture_errors),
+                        name=f"glasshive-conversation-stderr-{effective_run_id[:12]}",
+                        daemon=True,
+                    ),
+                ]
+                for capture_thread in capture_threads:
+                    capture_thread.start()
+                self._register_process(str(worker["worker_id"]), process)
+                owned_session = {
+                    "session_name": f"conversation-{effective_run_id[:12]}",
+                    "run_id": effective_run_id,
+                    "stdout_path": str(raw_stdout),
+                    "stderr_path": str(raw_stderr),
+                    "exit_path": str(exit_path),
+                    "model": str(info.model or ""),
+                    "argv_for_evidence_json": json.dumps(
+                        [_redact_command_arg(part) for part in command]
+                    ),
+                    "started_at": started_at_iso,
+                    "process_pid": process.pid,
+                    "process_group": self._process_group_identity(process.pid),
+                    "process_start_identity": self._process_start_identity(process.pid),
+                    "owner_pid": os.getpid(),
+                    "heartbeat_path": str(heartbeat_path),
+                    "timeout_seconds": run_timeout_sec,
+                    "instruction": instruction,
+                    "run_mode": "conversation",
+                }
+                try:
+                    self._write_active_session(
+                        str(worker["worker_id"]),
+                        owned_session,
+                        publish_run_start=True,
+                        worker=worker,
+                        spawned_process=process,
+                    )
+                except RunStartupRejectedError as exc:
+                    startup_cleanup_unconfirmed = not exc.termination_confirmed
+                    raise
+                _write_active_run_status(
+                    path=heartbeat_path,
+                    worker=worker,
+                    run_id=effective_run_id,
+                    runtime_name=self.runtime_name,
+                    model=str(info.model or ""),
+                    state="running",
+                    transcript_paths=transcript_paths,
+                    started_at=started_at_iso,
+                    process_pid=process.pid,
+                    timeout_seconds=run_timeout_sec,
+                )
+                heartbeat_thread = _start_active_run_heartbeat(
+                    path=heartbeat_path,
+                    worker=worker,
+                    run_id=effective_run_id,
+                    runtime_name=self.runtime_name,
+                    model=str(info.model or ""),
+                    transcript_paths=transcript_paths,
+                    started_at=started_at_iso,
+                    process_pid=process.pid,
+                    timeout_seconds=run_timeout_sec,
+                    stop_event=heartbeat_stop,
+                )
+                try:
+                    if stdin_text is not None:
+                        try:
+                            if process.stdin is not None:
+                                process.stdin.write(stdin_text)
+                                process.stdin.flush()
+                        except BrokenPipeError:
+                            pass
+                        finally:
+                            if process.stdin is not None:
+                                process.stdin.close()
+                    exit_code = process.wait(timeout=run_timeout_sec)
+                except subprocess.TimeoutExpired as exc:
+                    self._note_stop_reason(str(worker["worker_id"]), "terminated", run_id=effective_run_id)
+                    self._stop_active_process(str(worker["worker_id"]), worker=worker, run_id=effective_run_id)
+                    _write_active_run_status(
+                        path=heartbeat_path,
+                        worker=worker,
+                        run_id=effective_run_id,
+                        runtime_name=self.runtime_name,
+                        model=str(info.model or ""),
+                        state="timeout",
+                        transcript_paths=transcript_paths,
+                        started_at=started_at_iso,
+                        process_pid=None,
+                        timeout_seconds=run_timeout_sec,
+                        stop_reason="timeout",
+                    )
+                    raise RuntimeErrorBase(f"{self.runtime_name} timed out after {run_timeout_sec:g}s") from exc
+                finally:
+                    for capture_thread in capture_threads:
+                        capture_thread.join(timeout=2)
+                if capture_errors:
+                    raise RuntimeErrorBase(
+                        f"Could not safely capture {self.runtime_name} provider output"
+                    ) from capture_errors[0]
+
+            exit_path.write_text(str(exit_code))
+            exit_path.chmod(0o600)
+            stdout = raw_stdout.read_text() if raw_stdout.exists() else ""
+            stderr = raw_stderr.read_text() if raw_stderr.exists() else ""
+            self._finalize_stop_reason(str(worker["worker_id"]), run_id=effective_run_id)
+            if exit_code != 0:
+                detail = (_redact_text(stderr, max_chars=2000) or _redact_text(stdout, max_chars=2000)).strip()
+                _write_active_run_status(
+                    path=heartbeat_path,
+                    worker=worker,
+                    run_id=effective_run_id,
+                    runtime_name=self.runtime_name,
+                    model=str(info.model or ""),
+                    state="failed",
+                    transcript_paths=transcript_paths,
+                    started_at=started_at_iso,
+                    process_pid=None,
+                    timeout_seconds=run_timeout_sec,
+                    exit_code=exit_code,
+                    stop_reason="process_exit",
+                )
+                self._write_action_audit(
+                    worker,
+                    {
+                        "kind": "conversation.failed",
+                        "run_id": effective_run_id,
+                        "exit_code": exit_code,
+                        "detail": detail,
+                    },
+                )
+                raise _provider_process_exit_error(
+                    runtime_name=self.runtime_name,
+                    exit_code=exit_code,
+                    stdout=stdout,
+                    stderr=stderr,
+                    message=f"{self.runtime_name} exited with code {exit_code}: {detail}",
+                )
+
+            session_key, output = self._parse_output(worker, stdout, stderr, info)
+            if session_key:
+                self._write_session_key(str(worker["worker_id"]), session_key)
+            redacted_output = _redact_text(str(output or "").strip())
+            if len(redacted_output) > _HOST_RUN_OUTPUT_MAX_CHARS:
+                redacted_output = f"{redacted_output[: _HOST_RUN_OUTPUT_MAX_CHARS - 3].rstrip()}..."
+            _write_active_run_status(
+                path=heartbeat_path,
+                worker=worker,
+                run_id=effective_run_id,
+                runtime_name=self.runtime_name,
+                model=str(info.model or ""),
+                state="completed",
+                transcript_paths=transcript_paths,
+                started_at=started_at_iso,
+                process_pid=None,
+                timeout_seconds=run_timeout_sec,
+                exit_code=exit_code,
+                stop_reason="process_exit",
+            )
+            self._write_action_audit(
+                worker,
+                {
+                    "kind": "conversation.completed",
+                    "run_id": effective_run_id,
+                    "exit_code": exit_code,
+                    "output_chars": len(redacted_output),
+                },
+            )
+            return redacted_output
+        finally:
+            if not startup_cleanup_unconfirmed:
+                if process is not None and process.poll() is None:
+                    self._note_stop_reason(
+                        str(worker["worker_id"]),
+                        "terminated",
+                        run_id=effective_run_id,
+                    )
+                    self._stop_active_process(
+                        str(worker["worker_id"]),
+                        worker=worker,
+                        run_id=effective_run_id,
+                    )
+                heartbeat_stop.set()
+                if heartbeat_thread:
+                    heartbeat_thread.join(timeout=1)
+                for capture_thread in capture_threads:
+                    capture_thread.join(timeout=1)
+                _scrub_provider_owned_artifacts(
+                    state_dir=self._state_dir(str(worker["worker_id"])),
+                    home_dir=self._home_dir(str(worker["worker_id"])),
+                    run_root=run_root,
+                    workspace=workspace,
+                    scrubber=scrubber,
+                )
+                if process is not None:
+                    self._clear_process(
+                        str(worker["worker_id"]), expected_process=process
+                    )
+                self._release_host_slot(str(worker["worker_id"]))
+                if owned_session is not None:
+                    current_session = self._read_active_session(
+                        str(worker["worker_id"])
+                    )
+                    if (
+                        current_session
+                        and str(current_session.get("run_id") or "")
+                        == effective_run_id
+                    ):
+                        owned_session = current_session
+                    self._clear_active_session(
+                        str(worker["worker_id"]),
+                        expected_session=owned_session,
+                    )
+
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        if self._conversation_mode_from_worker(worker):
+            return self._run_conversation_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
         effective_run_id = (run_id or secrets.token_hex(8)).strip()
         worker = {
             **worker,
@@ -4097,6 +7552,8 @@ class HostNativeCliMixin:
         heartbeat_path = _active_run_status_path(workspace, effective_run_id)
         heartbeat_stop = Event()
         heartbeat_thread: Thread | None = None
+        native_session_stop = Event()
+        native_session_thread: Thread | None = None
         with raw_stdout.open("w") as stdout_handle, raw_stderr.open("w") as stderr_handle:
             raw_stdout.chmod(0o600)
             raw_stderr.chmod(0o600)
@@ -4125,11 +7582,24 @@ class HostNativeCliMixin:
                     "argv_for_evidence_json": json.dumps([_redact_command_arg(part) for part in command]),
                     "started_at": started_at_iso,
                     "process_pid": process.pid,
+                    "process_group": self._process_group_identity(process.pid),
+                    "process_start_identity": self._process_start_identity(process.pid),
+                    "owner_pid": os.getpid(),
                     "heartbeat_path": str(heartbeat_path),
                     "timeout_seconds": run_timeout_sec,
                     "instruction": instruction,
                 },
+                publish_run_start=True,
+                worker=worker,
+                spawned_process=process,
             )
+            native_session_thread = Thread(
+                target=self._observe_native_session_events,
+                args=(worker["worker_id"], raw_stdout, native_session_stop, effective_run_id),
+                name=f"glasshive-native-session-{effective_run_id[:12]}",
+                daemon=True,
+            )
+            native_session_thread.start()
             _write_active_run_status(
                 path=heartbeat_path,
                 worker=worker,
@@ -4212,7 +7682,10 @@ class HostNativeCliMixin:
                 heartbeat_stop.set()
                 if heartbeat_thread:
                     heartbeat_thread.join(timeout=1)
-                self._clear_process(worker["worker_id"])
+                native_session_stop.set()
+                if native_session_thread:
+                    native_session_thread.join(timeout=1)
+                self._clear_process(worker["worker_id"], expected_process=process)
                 self._release_host_slot(worker["worker_id"])
 
         exit_path.write_text(str(exit_code))
@@ -4330,12 +7803,18 @@ class HostNativeCliMixin:
                 stop_reason="process_exit",
                 evidence_path=evidence_path,
             )
-            raise RuntimeErrorBase(f"{self.runtime_name} exited with code {exit_code}: {detail}")
+            raise _provider_process_exit_error(
+                runtime_name=self.runtime_name,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                message=f"{self.runtime_name} exited with code {exit_code}: {detail}",
+            )
 
         session_key, output = self._parse_output(worker, stdout, stderr, info)
         if session_key:
             self._write_session_key(worker["worker_id"], session_key)
-        if _FINAL_REPORT_PATTERN.search(stdout) and not _FINAL_REPORT_PATTERN.search(output):
+        if FINAL_REPORT_PATTERN.search(stdout) and not FINAL_REPORT_PATTERN.search(output):
             output = f"FINAL REPORT:\n{output.strip()}"
         redacted_output = _redact_text(output.strip())
         if len(redacted_output) > _HOST_RUN_OUTPUT_MAX_CHARS:
@@ -4502,9 +7981,35 @@ class HostNativeCliMixin:
         }
 
 
+def _codex_binary_with_discoverable_companion(binary: str) -> str:
+    """Resolve a Codex symlink only when its canonical bundle carries the required host."""
+    resolved = shutil.which(binary)
+    if not resolved:
+        return binary
+    invoked = Path(resolved)
+    if not invoked.is_symlink():
+        return binary
+    canonical = invoked.resolve()
+    companion = canonical.parent / "codex-code-mode-host"
+    if (
+        canonical.is_file()
+        and os.access(canonical, os.X_OK)
+        and companion.is_file()
+        and os.access(companion, os.X_OK)
+    ):
+        return str(canonical)
+    return binary
+
+
 class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
     worker_root_name = "host_codex_cli_runtime"
     binary_env_var = "WPR_CODEX_BIN"
+
+    def __init__(self, base_dir: str | None = None) -> None:
+        super().__init__(base_dir=base_dir)
+        # Standalone GlassHive installs may not pass through Viventium's config
+        # compiler. Keep the runtime's own host-worker boundary capability-aware.
+        self.binary = _codex_binary_with_discoverable_companion(self.binary)
 
     def resolve_model(self, profile: str) -> str:
         if profile != "codex-cli":
@@ -4525,20 +8030,96 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         info = HostNativeCliMixin.ensure_worker_ready(self, worker)
+        # An explicit local host Codex worker has an isolated CODEX_HOME, so it
+        # needs the same owner-local login baseline even when no optional MCP,
+        # personality, or developer-instruction bundle was supplied.  Automatic
+        # Parallel work is Docker-only and enterprise deployments must project
+        # server-owned credentials instead of copying host authority.
+        if not (
+            self._env_flag("GLASSHIVE_ENTERPRISE_MODE", False)
+            or self._env_flag("WPR_ENTERPRISE_MODE", False)
+        ):
+            self._copy_host_codex_auth(self._host_codex_home(worker))
         workspace = Path(str(info.workspace_dir or ""))
-        if workspace.exists() and not (workspace / ".git").exists():
+        if (
+            not self._conversation_mode_from_worker(worker)
+            and workspace.exists()
+            and not (workspace / ".git").exists()
+        ):
             self._ensure_git_workspace(str(workspace))
         return info
 
+    def _codex_reasoning_effort_for_worker(self, worker: dict) -> str:
+        if not self._conversation_mode_from_worker(worker):
+            return super()._codex_reasoning_effort_for_worker(worker)
+        requested = (
+            self._bootstrap_env_value(worker, "WPR_CODEX_CLI_REASONING_EFFORT")
+            or os.environ.get("WPR_CODEX_CLI_REASONING_EFFORT", "")
+            or os.environ.get("WPR_CODEX_CLI_DEFAULT_REASONING_EFFORT", "")
+        ).strip().lower()
+        allowed = {"low", "medium", "high", "xhigh", "max", "ultra"}
+        if requested and requested not in allowed:
+            raise RuntimeErrorBase(
+                f"Unsupported native Codex conversation effort: {requested}"
+            )
+        if requested:
+            worker["_effort_projection"] = {
+                "requested": requested,
+                "effective": requested,
+                "allowed": sorted(allowed),
+                "route_proven": True,
+                "fallback_reason": "",
+            }
+        return requested
+
+    def _conversation_primary_workspace(
+        self,
+        worker: dict,
+        workspace: str,
+    ) -> tuple[str, str]:
+        if (
+            not self._conversation_mode_from_worker(worker)
+            or _host_codex_conversation_project_instructions() == "inherit"
+        ):
+            return workspace, ""
+        primary = self._state_dir(str(worker["worker_id"])) / "conversation-workspace"
+        primary.mkdir(parents=True, exist_ok=True)
+        primary.chmod(0o700)
+        return str(primary), workspace
+
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
-        existing_session = self._read_session_key(worker["worker_id"])
+        self._assert_host_codex_worker_policy(worker)
+        existing_session = self._resumable_codex_session_key(worker)
         model = self._codex_model_for_worker(worker, "WPR_MODEL_HOST_CODEX_CLI")
-        is_resume = bool(existing_session and not existing_session.startswith("codex-worker:"))
+        is_resume = bool(existing_session)
         dangerous_mode = os.environ.get("WPR_CODEX_DANGEROUS", "1").strip().lower() in {"1", "true", "yes", "on"}
+        access_mode = "full"
+        if self._conversation_mode_from_worker(worker):
+            bundle = self._bootstrap_bundle_for_worker(worker)
+            access_mode = str(bundle.get("access_mode") or "full").strip().lower()
+            dangerous_mode = access_mode == "full"
+        read_only_mode = access_mode == "read_only"
+        conversation_mode = self._conversation_mode_from_worker(worker)
+        workspace = str(info.workspace_dir or ".")
+        primary_workspace, additional_workspace = self._conversation_primary_workspace(
+            worker,
+            workspace,
+        )
         if is_resume:
             command = [self.binary, "exec", "resume"]
+            if conversation_mode:
+                command.extend(["--json", "--skip-git-repo-check"])
         else:
-            command = [self.binary, "exec", "--json", "--skip-git-repo-check", "-C", str(info.workspace_dir or ".")]
+            command = [
+                self.binary,
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "-C",
+                primary_workspace,
+            ]
+            if additional_workspace:
+                command.extend(["--add-dir", additional_workspace])
         if model:
             if is_resume:
                 command.extend(["-c", f'model="{model}"'])
@@ -4546,19 +8127,59 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
                 command.extend(["-m", model])
         self._append_codex_user_config_policy(command, worker)
         self._append_codex_reasoning_effort_config(command, worker)
-        if dangerous_mode:
+        native_web_locked = _host_native_web_access() == "disabled"
+        if native_web_locked:
+            command.extend(["-c", 'web_search="disabled"'])
+            for feature in _CODEX_NATIVE_WEB_LOCKDOWN_FEATURES:
+                command.extend(["--disable", feature])
+            command.extend(
+                [
+                    "-c",
+                    f'sandbox_mode="{"read-only" if read_only_mode else "workspace-write"}"',
+                    "-c",
+                    'approval_policy="never"',
+                ]
+            )
+            if not read_only_mode:
+                command.extend(
+                    ["-c", "sandbox_workspace_write.network_access=false"]
+                )
+        if native_web_locked:
+            pass
+        elif read_only_mode:
+            command.extend(
+                [
+                    "-c",
+                    'sandbox_mode="read-only"',
+                    "-c",
+                    'approval_policy="never"',
+                ]
+            )
+        elif dangerous_mode:
             if is_resume:
                 command.append("--dangerously-bypass-approvals-and-sandbox")
             else:
                 command.extend(["-s", "danger-full-access", "--dangerously-bypass-approvals-and-sandbox"])
-        elif not is_resume:
+        elif is_resume:
+            command.extend(
+                [
+                    "-c",
+                    'sandbox_mode="workspace-write"',
+                    "-c",
+                    'approval_policy="never"',
+                ]
+            )
+        else:
             command.append("--full-auto")
+        output_schema_path = self._agent_builder_output_schema_path(worker)
+        if output_schema_path:
+            command.extend(["--output-schema", str(output_schema_path)])
         if is_resume:
             command.append(existing_session)
         command.append("-")
         env = self._host_env(worker)
         codex_home = self._host_codex_home(worker)
-        if (codex_home / "config.toml").exists():
+        if conversation_mode or (codex_home / "config.toml").exists():
             env["CODEX_HOME"] = str(codex_home)
         return command, env
 
@@ -4566,6 +8187,18 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
 class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
     worker_root_name = "host_claude_code_runtime"
     binary_env_var = "WPR_CLAUDE_CODE_BIN"
+
+    def _agent_builder_output_schema(self, worker: dict) -> dict[str, object] | None:
+        schema = super()._agent_builder_output_schema(worker)
+        if not schema:
+            return None
+        # Claude Code validates an unqualified JSON Schema with its bundled
+        # dialect. Supplying the canonical 2020-12 metaschema URI makes the CLI
+        # reject the request before execution. Remove only that declaration;
+        # every control-envelope constraint remains identical to Codex.
+        projected_schema = dict(schema)
+        projected_schema.pop("$schema", None)
+        return projected_schema
 
     def _chrome_supported(self) -> bool:
         return self._help_supports("--chrome")
@@ -4600,7 +8233,7 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
 
     def _raise_missing_effort_support(self, profile: str, execution_mode: str) -> None:
         raise RuntimeDependencyMissingError(
-            "Claude Code workers requested `max` effort, but the configured Claude Code CLI "
+            "Claude Code workers requested an explicit effort level, but the configured Claude Code CLI "
             "does not expose the native --effort flag.",
             binary=self.binary,
             runtime_name=self.runtime_name,
@@ -4617,7 +8250,11 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
         super().preflight_worker_profile(profile, execution_mode)
         if os.environ.get("WPR_CLAUDE_CODE_EFFORT", "").strip().lower() == "max" and not self._effort_supported():
             self._raise_missing_effort_support(profile, execution_mode)
-        if self._chrome_enabled() and not self._chrome_supported():
+        if (
+            _host_native_web_access() != "disabled"
+            and self._chrome_enabled()
+            and not self._chrome_supported()
+        ):
             raise RuntimeDependencyMissingError(
                 "Claude Code host workers require a Claude Code CLI that supports --chrome, "
                 "or WPR_CLAUDE_CODE_ENABLE_CHROME=0 for an explicit locked-down launch.",
@@ -4632,41 +8269,163 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
                 ),
             )
 
+    def _inject_private_subscription_auth(self, env: dict[str, str]) -> None:
+        """Project access-only Claude auth without copying or refreshing user credentials."""
+        env.pop("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", None)
+        projected_access_token = _usable_claude_oauth_token(
+            env.get("CLAUDE_CODE_OAUTH_TOKEN")
+        )
+        if projected_access_token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = projected_access_token
+            return
+
+        explicit_access_token = _usable_explicit_claude_oauth_token()
+        if explicit_access_token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = explicit_access_token
+            return
+
+        keychain_oauth = _read_claude_keychain_oauth()
+        if _claude_keychain_access_token_is_fresh(keychain_oauth):
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = str(keychain_oauth.get("accessToken") or "").strip()
+            return
+
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        if _claude_cli_managed_auth_available(self.binary, child_env=env):
+            return
+        raise RuntimeErrorBase(
+            "Claude Code authentication is unavailable for this host worker. "
+            "Run `claude auth login` for managed local authentication or provision a supported "
+            "headless token with `claude setup-token`, then try again."
+        )
+
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_key = self._read_session_key(worker["worker_id"])
         model = worker.get("model") or self.resolve_model(worker.get("profile", "claude-code"))
+        native_web_locked = _host_native_web_access() == "disabled"
         permission_mode = os.environ.get("WPR_CLAUDE_CODE_PERMISSION_MODE", "bypassPermissions")
+        if self._conversation_mode_from_worker(worker):
+            bundle = self._bootstrap_bundle_for_worker(worker)
+            access_mode = str(bundle.get("access_mode") or "full").strip().lower()
+            if access_mode == "full":
+                permission_mode = "bypassPermissions"
+            elif access_mode == "read_only":
+                permission_mode = "plan"
+            else:
+                permission_mode = "acceptEdits"
+        if native_web_locked:
+            permission_mode = "acceptEdits"
+        output_format = "stream-json"
         command = [
             self.binary,
             "-p",
             "--permission-mode",
             permission_mode,
             "--output-format",
-            "json",
+            output_format,
             "--model",
             model,
         ]
-        if self._chrome_enabled():
+        settings: dict[str, object] = {}
+        denied_plugins = self._host_plugin_denylist()
+        if denied_plugins:
+            settings["enabledPlugins"] = {
+                plugin_id: False for plugin_id in denied_plugins
+            }
+        command.append("--verbose")
+        if self._conversation_mode_from_worker(worker):
+            mcp_path = self._state_dir(str(worker["worker_id"])) / "conversation-mcp.json"
+            if mcp_path.is_file():
+                command.extend(["--mcp-config", str(mcp_path), "--strict-mcp-config"])
+            bundle = self._bootstrap_bundle_for_worker(worker)
+            if str(bundle.get("access_mode") or "full").strip().lower() == "workspace":
+                workspace = str(Path(str(info.workspace_dir or ".")).resolve())
+                settings.update(
+                    {
+                        "permissions": {"defaultMode": "acceptEdits"},
+                        "sandbox": {
+                            "enabled": True,
+                            "failIfUnavailable": True,
+                            "allowUnsandboxedCommands": False,
+                            "filesystem": {
+                                "denyRead": [str(Path.home().resolve())],
+                                "allowRead": [workspace],
+                            },
+                        },
+                    }
+                )
+        if native_web_locked:
+            sandbox = settings.setdefault("sandbox", {})
+            if isinstance(sandbox, dict):
+                sandbox.update(
+                    {
+                        "enabled": True,
+                        "failIfUnavailable": True,
+                        "allowUnsandboxedCommands": False,
+                        "network": {
+                            "allowedDomains": [],
+                            "strictAllowlist": True,
+                        },
+                    }
+                )
+            command.extend(["--setting-sources", ""])
+        if settings:
+            command.extend(
+                ["--settings", json.dumps(settings, separators=(",", ":"))]
+            )
+        if native_web_locked:
+            command.extend(["--disallowedTools", "WebSearch", "WebFetch"])
+            command.insert(2, "--no-chrome")
+        elif self._chrome_enabled():
             command.insert(2, "--chrome")
         effort = (
             self._bootstrap_env_value(worker, "WPR_CLAUDE_CODE_EFFORT")
             or os.environ.get("WPR_CLAUDE_CODE_EFFORT", "")
         ).strip().lower()
-        if effort == "max":
+        if effort and effort != "default":
             if not self._effort_supported():
                 self._raise_missing_effort_support(str(worker.get("profile") or "claude-code"), "host")
             command.extend(["--effort", effort])
-        elif effort and effort != "default":
-            logger.warning(
-                "Ignoring unsupported Claude Code effort",
-                extra={"worker_id": str(worker.get("worker_id") or ""), "effort": effort},
+        output_schema = self._agent_builder_output_schema(worker)
+        if output_schema:
+            command.extend(
+                [
+                    "--json-schema",
+                    json.dumps(output_schema, separators=(",", ":"), sort_keys=True),
+                ]
             )
         if session_key and not session_key.startswith("claude-worker:"):
             command.extend(["--resume", session_key])
         env = self._host_env(worker)
+        env.pop("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", None)
         use_api_key = os.environ.get("WPR_CLAUDE_CODE_USE_API_KEY", "0").strip().lower() in {"1", "true", "yes", "on"}
         if not use_api_key:
             env.pop("ANTHROPIC_API_KEY", None)
+        enterprise_mode = any(
+            str(os.environ.get(name, "")).strip().lower()
+            in {"1", "true", "yes", "on"}
+            for name in ("GLASSHIVE_ENTERPRISE_MODE", "WPR_ENTERPRISE_MODE")
+        )
+        if not enterprise_mode:
+            # Every host Claude worker runs with an isolated CLAUDE_CONFIG_DIR.
+            # Local mission roots therefore need the same access-only owner auth
+            # projection as the conversation lane even when no optional bundle
+            # exists. Automatic Parallel work remains Docker-only.
+            self._inject_private_subscription_auth(env)
+        else:
+            # Enterprise host workers may consume only server-projected access
+            # authority. Never fall back to the workstation owner's Keychain or
+            # managed local login from this boundary.
+            projected_access_token = _usable_claude_oauth_token(
+                env.get("CLAUDE_CODE_OAUTH_TOKEN")
+            )
+            projected_api_key = str(env.get("ANTHROPIC_API_KEY") or "").strip()
+            if projected_access_token:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = projected_access_token
+            elif not (use_api_key and projected_api_key):
+                env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+                raise RuntimeErrorBase(
+                    "Enterprise host worker server-owned Claude Code authentication is unavailable."
+                )
         return command, env
 
 

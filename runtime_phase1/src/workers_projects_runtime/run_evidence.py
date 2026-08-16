@@ -51,8 +51,11 @@ _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
     (re.compile(r"\b[A-Za-z0-9_]{8,}:[A-Za-z0-9_./+=-]{20,}\b"), "[REDACTED_CREDENTIAL]"),
 )
-_FINAL_REPORT_RE = re.compile(
-    r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*)?(?:[*_]{1,3})?FINAL REPORT\s*:\s*(?:[*_]{1,3})?",
+FINAL_REPORT_PATTERN = re.compile(
+    r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*)?"
+    r"(?P<final_report_emphasis>[*_]{1,3})?"
+    r"FINAL REPORT[ \t]*:[ \t]*"
+    r"(?(final_report_emphasis)(?P=final_report_emphasis))[ \t]*",
     re.I,
 )
 
@@ -312,11 +315,11 @@ def _stdout_agent_has_final_report(stdout_text: str) -> bool:
         for item in iter_dicts(payload):
             for key in final_text_keys:
                 text = str(item.get(key) or "")
-                if _FINAL_REPORT_RE.search(text):
+                if FINAL_REPORT_PATTERN.search(text):
                     return True
         if str(payload.get("type") or "") == "result":
             result_text = str(payload.get("result") or "")
-            if _FINAL_REPORT_RE.search(result_text):
+            if FINAL_REPORT_PATTERN.search(result_text):
                 return True
         item = payload.get("item")
         if not isinstance(item, dict):
@@ -324,9 +327,9 @@ def _stdout_agent_has_final_report(stdout_text: str) -> bool:
         if str(item.get("type") or "") not in {"agent_message", "assistant_message"}:
             continue
         text = str(item.get("text") or "")
-        if _FINAL_REPORT_RE.search(text):
+        if FINAL_REPORT_PATTERN.search(text):
             return True
-    return bool(_FINAL_REPORT_RE.search(str(stdout_text or "")))
+    return bool(FINAL_REPORT_PATTERN.search(str(stdout_text or "")))
 
 
 def _safe_env_keys(env: dict[str, str] | None) -> list[str]:
@@ -2385,7 +2388,7 @@ def build_run_evidence(
     else:
         exit_source = normalized_stop_reason or "unknown"
     has_final_report = bool(
-        _FINAL_REPORT_RE.search(output_text)
+        FINAL_REPORT_PATTERN.search(output_text)
         or _stdout_agent_has_final_report(stdout_text)
     )
     final_output = {

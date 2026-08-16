@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import os
 import hmac
+import re
 import time
 from hashlib import sha256
 from collections import deque
@@ -25,10 +26,14 @@ from .auth import (
     owner_matches_auth_context,
     scoped_alias,
 )
+from .conversation_provider import install_conversation_provider_routes
 from .deliverables import deliverable_payload, is_user_deliverable_relative_path
 from .failure_classification import classify_runtime_error
 from .models import (
+    ActiveWorkActionRequest,
     AssignRunRequest,
+    CallbackAssociationVerifyRequest,
+    CreateDelegationRequest,
     CreateProjectRequest,
     CreateWorkerRequest,
     DesktopActionRequest,
@@ -38,6 +43,8 @@ from .models import (
     LaunchFailureRequest,
     MetricsSummary,
     ProjectResponse,
+    RunActionRequest,
+    RunActionResponse,
     RunResponse,
     ScheduleResponse,
     ScheduleRunRequest,
@@ -52,10 +59,18 @@ from .openclaw_runtime import RuntimeDependencyMissingError, StubRuntime, Worker
 from .profile_runtime import ProfiledWorkerRuntime, _redact_text
 from .runtime_env import load_viventium_runtime_env
 from .runtime_identity import derive_legacy_backend_label
+from .run_actions import ACTION_CAPABILITY_HEADER, ACTION_ENDPOINT, RunActionError
+from .service_assertions import (
+    SERVICE_ASSERTION_AUDIENCE,
+    SERVICE_ASSERTION_HEADER,
+    ServiceAssertionError,
+    verify_service_assertion,
+)
 from .service import (
     GlassHiveProfileNotAllowedError,
     GlassHiveQuotaExceededError,
     HostWorkersDisabledError,
+    ParallelExecutionIsolationError,
     WorkersProjectsService,
     allowed_worker_profiles,
     merge_bootstrap_bundle,
@@ -71,7 +86,12 @@ from .signed_links import (
     verify_signed_link,
     verify_signed_link_token,
 )
-from .store import Store
+from .store import (
+    ActiveWorkActionConflictError,
+    DelegationIdempotencyConflictError,
+    Store,
+    WorkAdmissionError,
+)
 from .terminal_takeover import TerminalTarget, bridge_terminal
 
 load_viventium_runtime_env()
@@ -125,19 +145,11 @@ def _build_runtime(runtime_backend: str, db_path: str, runtime: WorkerRuntime | 
     return ProfiledWorkerRuntime(base_dir=str(Path(db_path).resolve().parent))
 
 
-def _workspace_link_auto_resume_enabled() -> bool:
-    return str(os.environ.get("GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
 def create_app(
     db_path: str | None = None,
     runtime_backend: str | None = None,
     runtime: WorkerRuntime | None = None,
+    reconcile_on_startup: bool | None = None,
 ) -> FastAPI:
     load_viventium_runtime_env()
     resolved_db_path = db_path or os.environ.get("WPR_DB_PATH", str(DEFAULT_DB_PATH))
@@ -145,7 +157,9 @@ def create_app(
     data_root = Path(resolved_db_path).resolve().parent
     store = Store(resolved_db_path)
     runtime_impl = _build_runtime(resolved_runtime_backend, resolved_db_path, runtime)
-    service = WorkersProjectsService(store, runtime_impl)
+    service = WorkersProjectsService(
+        store, runtime_impl, reconcile_on_startup=reconcile_on_startup
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -161,11 +175,38 @@ def create_app(
         version="0.3.0",
         lifespan=lifespan,
     )
+    app.state.store = store
+    app.state.service = service
+
+    @app.exception_handler(WorkAdmissionError)
+    async def work_admission_handler(
+        request: Request, exc: WorkAdmissionError
+    ) -> JSONResponse:
+        _ = request
+        return JSONResponse(
+            status_code=409,
+            content={"detail": {"code": exc.code, "message": str(exc)}},
+        )
 
     @app.exception_handler(HostWorkersDisabledError)
     async def host_workers_disabled_handler(request: Request, exc: HostWorkersDisabledError) -> JSONResponse:
         _ = request
         return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+    @app.exception_handler(ParallelExecutionIsolationError)
+    async def parallel_execution_isolation_handler(
+        request: Request, exc: ParallelExecutionIsolationError
+    ) -> JSONResponse:
+        _ = request
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": {
+                    "code": "parallel_execution_isolation_required",
+                    "message": str(exc),
+                }
+            },
+        )
 
     @app.exception_handler(GlassHiveQuotaExceededError)
     async def quota_exceeded_handler(request: Request, exc: GlassHiveQuotaExceededError) -> JSONResponse:
@@ -269,6 +310,7 @@ def create_app(
     unauthenticated_prefixes = (
         "/health",
         "/r/",
+        "/w/",
         "/v1/signed-links",
         "/favicon.ico",
     ) if auth_settings.enterprise else (
@@ -277,6 +319,7 @@ def create_app(
         "/openapi.json",
         "/redoc",
         "/r/",
+        "/w/",
         "/ui",
         "/v1/link-refs",
         "/v1/signed-links",
@@ -300,16 +343,11 @@ def create_app(
                 if path_parts[3:] != ["artifacts", expected_action]:
                     return None
                 artifact_path = str(request.query_params.get("path") or "").strip().lstrip("/")
-            elif kind == "worker_view" and path_parts[3:] and path_parts[3] in {
-                "assign",
-                "desktop-action",
-                "interrupt",
-                "live",
-                "message",
-                "pause",
-                "resume",
-                "terminate",
-            }:
+            elif (
+                kind == "worker_view"
+                and request.method.upper() == "GET"
+                and path_parts[3:] == ["live"]
+            ):
                 artifact_path = ""
             else:
                 return None
@@ -321,8 +359,13 @@ def create_app(
             return None
 
         worker = store.get_worker(worker_id)
-        if not worker:
+        # VIVENTIUM START: authoritative signed-link termination fence
+        # Signed-link helpers may consult a separate ambient database or a
+        # best-effort revocation sink. The FastAPI app's own Store is the
+        # authoritative worker lifecycle source for every legacy query open.
+        if not worker or str(worker.get("state") or "") == "terminated":
             return None
+        # VIVENTIUM END: authoritative signed-link termination fence
         if not verify_signed_link(
             kind=kind,
             worker_id=worker_id,
@@ -347,9 +390,150 @@ def create_app(
                 return token
         return ""
 
+    def _service_auth_context_from_headers(headers) -> AuthContext:
+        normalized_headers = {
+            str(key).lower(): value for key, value in headers.items()
+        }
+        if auth_settings.enterprise:
+            return auth_settings.context_from_headers(normalized_headers)
+        asserted_owner = header_identity_value(
+            normalized_headers, auth_settings.user_header
+        )
+        asserted_tenant = header_identity_value(
+            normalized_headers, auth_settings.tenant_header
+        )
+        return AuthContext(
+            tenant_id=asserted_tenant or "local",
+            user_id=asserted_owner,
+            email=header_identity_value(
+                normalized_headers, auth_settings.email_header
+            ),
+            role=header_identity_value(
+                normalized_headers, auth_settings.role_header
+            ),
+            auth_mode="service_identity" if asserted_owner else "service",
+            enterprise=False,
+        )
+
+    def _is_account_api_path(path: str) -> bool:
+        return (
+            path == "/v1/delegations"
+            or path.startswith("/v1/delegations/by-origin/")
+            or path == "/v1/orchestration-capabilities"
+            or path == "/v1/active-work"
+            or path.startswith("/v1/active-work/")
+            or path.startswith("/v1/work/")
+            or path == "/v1/callback-associations/verify"
+        )
+
+    def _account_auth_error(exc: ServiceAssertionError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": {"code": exc.code, "message": str(exc)}},
+        )
+
     @app.middleware("http")
     async def optional_bearer_auth(request: Request, call_next):
         request.state.auth_context = AuthContext()
+        if _is_account_api_path(request.url.path):
+            assertion_secret = str(
+                os.environ.get("VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET") or ""
+            ).strip()
+            if not api_token or not assertion_secret:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "detail": {
+                            "code": "service_assertion_unavailable",
+                            "message": "The GlassHive account API is not configured.",
+                        }
+                    },
+                )
+            authorization = str(request.headers.get("authorization") or "").strip()
+            scheme, _, bearer = authorization.partition(" ")
+            if scheme.lower() != "bearer" or not _token_matches(bearer.strip(), api_token):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "detail": {
+                            "code": "service_auth_required",
+                            "message": "A valid GlassHive service bearer token is required.",
+                        }
+                    },
+                )
+            try:
+                claims = verify_service_assertion(
+                    str(request.headers.get(SERVICE_ASSERTION_HEADER) or ""),
+                    secret=assertion_secret,
+                )
+            except ServiceAssertionError as exc:
+                return _account_auth_error(exc)
+            if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+                consumed = store.consume_service_assertion_nonce(
+                    audience=SERVICE_ASSERTION_AUDIENCE,
+                    tenant_id=str(claims["tenant_id"]),
+                    owner_id=str(claims["owner_id"]),
+                    nonce=str(claims["nonce"]),
+                    issued_at_epoch=int(claims["iat"]),
+                    expires_at_epoch=int(claims["exp"]),
+                    request_method=request.method,
+                    request_path=request.url.path,
+                )
+                if not consumed:
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "detail": {
+                                "code": "service_assertion_replayed",
+                                "message": "The Viventium service assertion nonce was already used.",
+                            }
+                        },
+                    )
+            request.state.service_assertion_claims = claims
+            request.state.auth_context = AuthContext(
+                tenant_id=str(claims["tenant_id"]),
+                user_id=str(claims["owner_id"]),
+                auth_mode="service_assertion",
+                enterprise=True,
+            )
+            return await call_next(request)
+        if request.method.upper() == "POST" and request.url.path == ACTION_ENDPOINT:
+            capability = str(request.headers.get(ACTION_CAPABILITY_HEADER) or "").strip()
+            if not capability:
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "detail": {
+                            "code": "capability_required",
+                            "message": "A scoped action capability is required.",
+                        }
+                    },
+                )
+            try:
+                claims = service.verify_action_capability(capability)
+            except RunActionError as exc:
+                return JSONResponse(
+                    status_code=exc.status_code,
+                    content={"detail": {"code": exc.code, "message": str(exc)}},
+                )
+            if auth_settings.enterprise and str(claims["tenantId"]) != auth_settings.tenant_id:
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "detail": {
+                            "code": "capability_scope_mismatch",
+                            "message": "The action capability does not match this deployment tenant.",
+                        }
+                    },
+                )
+            request.state.run_action_claims = claims
+            request.state.auth_context = AuthContext(
+                tenant_id=str(claims["tenantId"]),
+                user_id=str(claims["ownerId"]),
+                auth_mode="action_capability",
+                enterprise=auth_settings.enterprise,
+            )
+            return await call_next(request)
         if not api_token:
             return await call_next(request)
         if request.url.path.startswith(unauthenticated_prefixes):
@@ -364,8 +548,8 @@ def create_app(
         if not (_token_matches(token, api_token) or _token_matches(bearer, api_token)):
             return Response(status_code=401, content="Unauthorized")
         try:
-            request.state.auth_context = auth_settings.context_from_headers(
-                {str(key).lower(): value for key, value in request.headers.items()}
+            request.state.auth_context = _service_auth_context_from_headers(
+                request.headers
             )
         except GlassHiveAuthError as exc:
             return JSONResponse(status_code=401, content={"detail": str(exc)})
@@ -378,13 +562,13 @@ def create_app(
         return value if isinstance(value, AuthContext) else AuthContext()
 
     def _tenant_filter(ctx: AuthContext) -> str | None:
-        return ctx.tenant_id if ctx.enterprise else None
+        return ctx.tenant_id if ctx.is_user_scoped else None
 
     def _owner_filter(ctx: AuthContext) -> str | None:
-        return ctx.owner_id if ctx.enterprise else None
+        return ctx.owner_id if ctx.is_user_scoped else None
 
     def _request_owner(ctx: AuthContext, requested: str) -> str:
-        return ctx.owner_id if ctx.enterprise else requested
+        return ctx.owner_id if ctx.is_user_scoped else requested
 
     def _configured_default_worker_profile() -> str:
         configured = os.environ.get("GLASSHIVE_DEFAULT_WORKER_PROFILE", "").strip()
@@ -429,7 +613,7 @@ def create_app(
         )
 
     def _preference_owner(ctx: AuthContext) -> str:
-        if ctx.enterprise:
+        if ctx.is_user_scoped:
             return ctx.owner_id
         return os.environ.get("WPR_DEFAULT_OWNER_ID", "").strip() or "demo-owner"
 
@@ -512,7 +696,7 @@ def create_app(
             project = service.require_project(project_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        if ctx.enterprise and (
+        if ctx.is_user_scoped and (
             project.get("tenant_id") != ctx.tenant_id or project.get("owner_id") != ctx.owner_id
         ):
             raise HTTPException(status_code=404, detail="Project not found")
@@ -524,12 +708,30 @@ def create_app(
             worker = service.require_worker(worker_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        if ctx.enterprise and (
+        if ctx.is_user_scoped and (
             worker.get("tenant_id") != ctx.tenant_id or worker.get("owner_id") != ctx.owner_id
         ):
             raise HTTPException(status_code=404, detail="Worker not found")
+        # VIVENTIUM START: authoritative signed-link termination fence
+        # A signed read must not heal/mutate worker state and must never rely
+        # on ambient WPR_DB_PATH to decide whether a terminal worker is live.
+        if ctx.auth_mode == "signed_link":
+            if str(worker.get("state") or "") == "terminated":
+                raise HTTPException(status_code=404, detail="Worker not found")
+            return worker
+        # VIVENTIUM END: authoritative signed-link termination fence
         service.heal_worker(worker_id)
         return service.require_worker(worker_id)
+
+    # VIVENTIUM START: authoritative signed-link termination fence
+    def _require_authoritative_signed_link_worker(worker_id: str) -> dict:
+        """Resolve signed-link authority only from this app's bound Store."""
+
+        worker = store.get_worker(str(worker_id or "").strip())
+        if not worker or str(worker.get("state") or "") == "terminated":
+            raise HTTPException(status_code=404, detail="Worker not found")
+        return worker
+    # VIVENTIUM END: authoritative signed-link termination fence
 
     def require_run(run_id: str, request: Request | None = None) -> dict:
         ctx = _auth_context(request)
@@ -537,7 +739,7 @@ def create_app(
             run = service.require_run(run_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        if ctx.enterprise:
+        if ctx.is_user_scoped:
             worker = store.get_worker(str(run.get("worker_id") or ""))
             if not worker or worker.get("tenant_id") != ctx.tenant_id or worker.get("owner_id") != ctx.owner_id:
                 raise HTTPException(status_code=404, detail="Run not found")
@@ -840,6 +1042,8 @@ def create_app(
         return f"/v1/workers/{quote(worker_id)}/artifacts/{action}?path={quote(str(relative_path or ''), safe='')}"
 
     def _signed_artifact_action_url(worker: dict, relative_path: str, *, kind: str, fallback_action: str) -> str:
+        if str(worker.get("state") or "") == "terminated":
+            return ""
         worker_id = str(worker.get("worker_id") or "")
         token = sign_link_token(
             kind=kind,
@@ -854,6 +1058,8 @@ def create_app(
         return _artifact_query_url(worker_id, fallback_action, relative_path)
 
     def _signed_watch_action_url(worker: dict) -> str:
+        if str(worker.get("state") or "") == "terminated":
+            return ""
         worker_id = str(worker.get("worker_id") or "")
         project_id = str(worker.get("project_id") or "")
         token = sign_link_token(
@@ -1214,6 +1420,965 @@ def create_app(
             "deliverable": deliverable,
         }
 
+    app.state.conversation_provider = install_conversation_provider_routes(
+        app,
+        store=store,
+        service=service,
+        tenant_for_request=lambda request: (
+            _auth_context(request).tenant_id if _auth_context(request).enterprise else "local"
+        ),
+        provider_token=api_token,
+    )
+
+    def _account_scope(request: Request) -> tuple[str, str]:
+        ctx = _auth_context(request)
+        if ctx.auth_mode != "service_assertion" or not ctx.tenant_id or not ctx.owner_id:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "code": "service_assertion_required",
+                    "message": "A Viventium account-service assertion is required.",
+                },
+            )
+        return ctx.tenant_id, ctx.owner_id
+
+    def _canonical_digest(value: object) -> str:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return sha256(encoded).hexdigest()
+
+    def _validated_idempotency_key(request: Request) -> str:
+        value = str(request.headers.get("idempotency-key") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@-]{7,191}", value):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "idempotency_key_required",
+                    "message": "A valid trusted Idempotency-Key header is required.",
+                },
+            )
+        return value
+
+    def _encode_active_work_cursor(record: dict) -> str:
+        cursor_payload = {
+            "c": str(record.get("created_at") or ""),
+            "u": str(record.get("updated_at") or ""),
+            "v": 1,
+            "w": str(record.get("work_ref") or ""),
+        }
+        payload_segment = base64.urlsafe_b64encode(
+            json.dumps(
+                cursor_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        secret = str(
+            os.environ.get("VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET") or ""
+        )
+        signature = hmac.new(
+            secret.encode("utf-8"), payload_segment.encode("ascii"), sha256
+        ).digest()
+        signature_segment = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+        return f"{payload_segment}.{signature_segment}"
+
+    def _decode_active_work_cursor(value: str) -> tuple[str, str, str]:
+        invalid = HTTPException(
+            status_code=400,
+            detail={
+                "code": "active_work_cursor_invalid",
+                "message": "The active-work cursor is invalid.",
+            },
+        )
+        token = str(value or "").strip()
+        if not token or len(token) > 2048 or token.count(".") != 1:
+            raise invalid
+        payload_segment, signature_segment = token.split(".", 1)
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", payload_segment) or not re.fullmatch(
+            r"[A-Za-z0-9_-]+", signature_segment
+        ):
+            raise invalid
+        secret = str(
+            os.environ.get("VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET") or ""
+        )
+        expected = hmac.new(
+            secret.encode("utf-8"), payload_segment.encode("ascii"), sha256
+        ).digest()
+        try:
+            supplied = base64.urlsafe_b64decode(
+                signature_segment + "=" * (-len(signature_segment) % 4)
+            )
+            payload_bytes = base64.urlsafe_b64decode(
+                payload_segment + "=" * (-len(payload_segment) % 4)
+            )
+            decoded = json.loads(payload_bytes)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            raise invalid
+        if not hmac.compare_digest(supplied, expected):
+            raise invalid
+        if not isinstance(decoded, dict) or set(decoded) != {"c", "u", "v", "w"}:
+            raise invalid
+        if decoded.get("v") != 1:
+            raise invalid
+        canonical = json.dumps(
+            decoded, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        if canonical != payload_bytes:
+            raise invalid
+        created_at = str(decoded.get("c") or "")
+        updated_at = str(decoded.get("u") or "")
+        work_ref = str(decoded.get("w") or "")
+        if (
+            not created_at
+            or len(created_at) > 64
+            or not updated_at
+            or len(updated_at) > 64
+            or not re.fullmatch(r"work_[A-Za-z0-9_-]{8,180}", work_ref)
+        ):
+            raise invalid
+        return updated_at, created_at, work_ref
+
+    def _delegation_origin_ref(payload: CreateDelegationRequest) -> str:
+        explicit = str(payload.origin_ref or "").strip()
+        bundle = payload.bootstrap_bundle if isinstance(payload.bootstrap_bundle, dict) else {}
+        callbacks = bundle.get("callbacks") if isinstance(bundle, dict) else None
+        nested_value = callbacks.get("origin_ref") if isinstance(callbacks, dict) else None
+        if nested_value is not None and not isinstance(nested_value, str):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "delegation_origin_ref_invalid",
+                    "message": "The delegation origin reference is invalid.",
+                },
+            )
+        nested = str(nested_value or "").strip()
+        if nested and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@-]{7,191}", nested):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "delegation_origin_ref_invalid",
+                    "message": "The delegation origin reference is invalid.",
+                },
+            )
+        if explicit and nested and explicit != nested:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "delegation_origin_ref_conflict",
+                    "message": "The explicit and callback origin references do not match.",
+                },
+            )
+        return explicit or nested
+
+    def _validated_delegation_identity(
+        bundle: dict[str, object] | None,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, object] | None:
+        raw = bundle.get("viventium_delegation_identity") if isinstance(bundle, dict) else None
+        if raw is None:
+            return None
+        invalid = HTTPException(
+            status_code=400,
+            detail={
+                "code": "delegation_identity_invalid",
+                "message": "The trusted delegation identity is invalid.",
+            },
+        )
+        if not isinstance(raw, dict):
+            raise invalid
+        version = raw.get("version")
+        expected_fields = {
+            "version",
+            "idempotency_key",
+            "goal_digest",
+            "call_identity_digest",
+            "source_event_id",
+            "objective_ordinal",
+        }
+        if version == 2:
+            expected_fields.add("launch_payload_digest")
+        if set(raw) != expected_fields:
+            raise invalid
+        identity_key = str(raw.get("idempotency_key") or "")
+        goal_digest = str(raw.get("goal_digest") or "")
+        launch_payload_digest = str(raw.get("launch_payload_digest") or "")
+        call_identity_digest = str(raw.get("call_identity_digest") or "")
+        source_event_id = str(raw.get("source_event_id") or "")
+        ordinal = raw.get("objective_ordinal")
+        if (
+            isinstance(version, bool)
+            or version not in {1, 2}
+            or not re.fullmatch(r"[0-9a-f]{64}", identity_key)
+            or not re.fullmatch(r"[0-9a-f]{64}", goal_digest)
+            or (
+                version == 2
+                and not re.fullmatch(r"[0-9a-f]{64}", launch_payload_digest)
+            )
+            or not re.fullmatch(r"[0-9a-f]{64}", call_identity_digest)
+            or not source_event_id
+            or len(source_event_id) > 512
+            or any(ord(char) < 32 or ord(char) == 127 for char in source_event_id)
+            or isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or ordinal < 0
+            or ordinal > 1_000_000
+            or not hmac.compare_digest(identity_key, idempotency_key)
+        ):
+            raise invalid
+        return dict(raw)
+
+    def _delegation_digest_bundle(
+        bundle: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        """Exclude presentation-only objective order from atomic identity."""
+
+        if not isinstance(bundle, dict):
+            return bundle
+        identity = bundle.get("viventium_delegation_identity")
+        if not isinstance(identity, dict):
+            return bundle
+        digest_identity = {
+            key: value for key, value in identity.items() if key != "objective_ordinal"
+        }
+        return {**bundle, "viventium_delegation_identity": digest_identity}
+
+    def _active_work_state(record: dict) -> str:
+        worker_state = str(record.get("worker_state") or "")
+        run_state = str(record.get("run_state") or "")
+        if worker_state == "stopping":
+            return "stopping"
+        if worker_state == "paused" and run_state in {"queued", "running", "settling", "paused"}:
+            return "paused"
+        if run_state == "queued" and worker_state == "created":
+            return "accepted"
+        if run_state == "queued" and worker_state in {"starting", "resuming"}:
+            return "starting"
+        if run_state in {
+            "queued",
+            "running",
+            "settling",
+            "paused",
+            "needs_input",
+            "completed",
+            "failed",
+            "cancelled",
+        }:
+            return run_state
+        if run_state == "interrupted":
+            return "cancelled"
+        return "failed" if worker_state == "failed" else "queued"
+
+    def _active_work_actions(record: dict, state: str) -> list[str]:
+        if state in {"accepted", "queued", "starting"}:
+            return ["queue", "message", "steer", "pause", "stop"]
+        if state == "running":
+            return ["queue", "message", "steer", "pause", "stop"]
+        if state == "settling":
+            return ["queue", "message", "stop"]
+        if state == "paused":
+            return ["queue", "message", "resume", "stop"]
+        if state == "needs_input":
+            return ["queue", "message", "resume", "stop"]
+        if state == "failed" and bool(record.get("run_failure_retryable")):
+            return ["retry", "dismiss"]
+        if state in {"completed", "failed", "cancelled"}:
+            return ["dismiss"]
+        return []
+
+    def _active_work_status(record: dict, state: str) -> str:
+        labels = {
+            "accepted": "Accepted",
+            "queued": "Queued",
+            "starting": "Starting",
+            "running": "Running",
+            "settling": "Settling native team",
+            "paused": "Paused",
+            "needs_input": "Needs input",
+            "stopping": "Stopping",
+            "completed": "Completed",
+            "cancelled": "Cancelled",
+            "failed": "Failed",
+        }
+        label = labels.get(state, state.replace("_", " ").title())
+        if state == "queued" and str(record.get("run_failure_class") or "") == "host_capacity":
+            return "Queued — waiting for host capacity"
+        if state not in {"failed", "needs_input"}:
+            return label
+        user_message = " ".join(
+            str(record.get("run_failure_user_message") or "").split()
+        ).strip()
+        safe_message = _redact_text(user_message, max_chars=500) if user_message else ""
+        return f"{label}: {safe_message}" if safe_message else label
+
+    def _active_work_view_ref(record: dict) -> str | None:
+        worker_id = str(record.get("worker_id") or "")
+        token = sign_link_token(
+            kind="worker_view",
+            worker_id=worker_id,
+            tenant_id=str(record.get("tenant_id") or ""),
+            owner_id=str(record.get("owner_id") or ""),
+        )
+        if not token:
+            return None
+        ref_id = create_signed_link_ref(token=token)
+        if not ref_id:
+            return None
+        base = (
+            os.environ.get("GLASSHIVE_OPERATOR_BASE_URL", "").strip()
+            or os.environ.get("WPR_OPERATOR_BASE_URL", "").strip()
+            or os.environ.get("GLASSHIVE_RUNTIME_PUBLIC_BASE_URL", "").strip()
+            or os.environ.get("WPR_PUBLIC_BASE_URL", "").strip()
+        ).rstrip("/")
+        return f"{base}/w/{ref_id}" if base else f"/w/{ref_id}"
+
+    def _active_work_provider(record: dict) -> str:
+        profile = str(record.get("worker_profile") or "").strip()
+        lowered = profile.lower()
+        if lowered.startswith("codex"):
+            return "codex"
+        if lowered.startswith("claude"):
+            return "claude"
+        return profile or "unknown"
+
+    def _active_work_native_team(
+        capabilities: dict[str, object],
+        summary: dict[str, object],
+        *,
+        detail: bool,
+    ) -> dict[str, object] | None:
+        """Project provider telemetry into a bounded, identifier-free public shape."""
+
+        if capabilities.get("childProjection") is not True:
+            return None
+        children = summary.get("children")
+        if not isinstance(children, list):
+            children = []
+        live_states = {"accepted", "pending", "queued", "starting", "running", "paused"}
+        attention_states = {"paused", "failed", "unknown"}
+        allowed_states = live_states | {
+            "completed",
+            "failed",
+            "stopped",
+            "cancelled",
+            "unknown",
+        }
+        active = 0
+        needs_attention = 0
+        total = 0
+        topology_counts: dict[tuple[str, str], int] = {}
+        for raw_child in children[:10_000]:
+            if not isinstance(raw_child, dict):
+                continue
+            state = str(raw_child.get("state") or "unknown").strip().lower()
+            if state not in allowed_states:
+                state = "unknown"
+            role_text = " ".join(str(raw_child.get("role") or "worker").split())
+            # Provider role fields can contain an agent path or arbitrary
+            # account text. Only publish a small human label; paths, emails,
+            # punctuation-rich identifiers, and controls collapse to worker.
+            role = (
+                role_text
+                if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _-]{0,79}", role_text)
+                else "worker"
+            )
+            total += 1
+            active += int(state in live_states)
+            needs_attention += int(state in attention_states)
+            key = (role, state)
+            topology_counts[key] = topology_counts.get(key, 0) + 1
+        projected: dict[str, object] = {
+            "active": active,
+            "total": total,
+            "needsAttention": needs_attention,
+            "degraded": summary.get("degraded") is True
+            or any(state == "unknown" for _, state in topology_counts),
+        }
+        if detail:
+            groups = sorted(
+                (
+                    {"role": role, "state": state, "count": count}
+                    for (role, state), count in topology_counts.items()
+                ),
+                key=lambda item: (str(item["state"]), str(item["role"])),
+            )
+            visible_groups = groups[:16]
+            projected["topology"] = visible_groups
+            projected["overflowCount"] = sum(
+                int(item["count"]) for item in groups[len(visible_groups) :]
+            )
+        return projected
+
+    def _active_work_payload(record: dict, *, detail: bool = False) -> dict[str, object]:
+        state = _active_work_state(record)
+        native_capabilities: dict[str, object] = {}
+        native_summary: dict[str, object] = {}
+        try:
+            decoded_capabilities = json.loads(
+                str(record.get("run_native_capabilities_json") or "{}")
+            )
+            if isinstance(decoded_capabilities, dict):
+                native_capabilities = decoded_capabilities
+            decoded_summary = json.loads(
+                str(record.get("run_native_child_summary_json") or "{}")
+            )
+            if isinstance(decoded_summary, dict):
+                native_summary = decoded_summary
+        except (TypeError, json.JSONDecodeError):
+            native_capabilities = {}
+            native_summary = {}
+        native_team = _active_work_native_team(
+            native_capabilities,
+            native_summary,
+            detail=detail,
+        )
+        payload: dict[str, object] = {
+            "workRef": str(record.get("work_ref") or ""),
+            "title": str(record.get("title") or ""),
+            "state": state,
+            "statusSummary": _active_work_status(record, state),
+            "provider": _active_work_provider(record),
+            "originSurface": str(record.get("origin_surface") or "web"),
+            # Native child projection is deliberately capability-gated. Null is
+            # truthful until a provider adapter can observe the whole team.
+            "nativeTeam": native_team,
+            "delivery": {
+                # GlassHive knows callback transport acceptance, not user-surface
+                # delivery. Core enriches this pending projection from its ledger.
+                "state": "pending",
+                "unreadTerminal": state in {"completed", "failed", "cancelled"}
+                and not bool(record.get("dismissed_at")),
+            },
+            "createdAt": str(record.get("created_at") or ""),
+            "updatedAt": str(
+                record.get("run_ended_at")
+                or record.get("run_started_at")
+                or record.get("updated_at")
+                or ""
+            ),
+            "actions": _active_work_actions(record, state),
+        }
+        view_ref = _active_work_view_ref(record)
+        if view_ref:
+            payload["viewRef"] = view_ref
+        if state == "failed" and not bool(record.get("run_failure_retryable")):
+            payload["attention"] = {
+                "kind": "input",
+                "summary": _active_work_status(record, state),
+            }
+        if state == "needs_input":
+            attention_code = str(record.get("run_failure_class") or "needs_input")
+            payload["attention"] = {
+                "kind": (
+                    "auth"
+                    if attention_code == "capability_authorization_horizon_expired"
+                    else "input"
+                ),
+                "code": attention_code,
+                "summary": _active_work_status(record, state),
+            }
+        if detail:
+            payload["executionMode"] = str(record.get("worker_execution_mode") or "")
+            payload["lifecycle"] = {
+                "queuedAt": str(record.get("run_queued_at") or ""),
+                "startedAt": str(record.get("run_started_at") or "") or None,
+                "endedAt": str(record.get("run_ended_at") or "") or None,
+            }
+        return payload
+
+    @app.post("/v1/delegations", status_code=202)
+    def create_delegation(
+        payload: CreateDelegationRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        tenant_id, owner_id = _account_scope(request)
+        idempotency_key = _validated_idempotency_key(request)
+        title = payload.title.strip()
+        goal = payload.goal.strip()
+        instruction = payload.instruction.strip()
+        if not title or not goal or not instruction:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "delegation_request_invalid",
+                    "message": "Delegation title, goal, and instruction must not be blank.",
+                },
+            )
+        profile = payload.profile.strip() or _configured_default_worker_profile()
+        execution_mode = _execution_mode_for_request(payload.execution_mode)
+        origin_ref = _delegation_origin_ref(payload)
+        _validated_delegation_identity(
+            payload.bootstrap_bundle,
+            idempotency_key=idempotency_key,
+        )
+        canonical_request = {
+            "title": title,
+            "goal": goal,
+            "instruction": instruction,
+            "profile": profile,
+            "executionMode": execution_mode,
+            "workerName": payload.worker_name.strip() or title,
+            "workerRole": payload.worker_role.strip() or "General intelligent worker",
+            "workspaceRoot": payload.workspace_root,
+            "bootstrapProfile": payload.bootstrap_profile,
+            "bootstrapBundle": _delegation_digest_bundle(payload.bootstrap_bundle),
+            "originRef": origin_ref or None,
+            "originSurface": payload.origin_surface,
+        }
+        try:
+            record = service.reserve_delegation(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                idempotency_key=idempotency_key,
+                request_digest=_canonical_digest(canonical_request),
+                origin_ref=origin_ref,
+                title=title,
+                goal=goal,
+                instruction=instruction,
+                origin_surface=payload.origin_surface,
+                worker_name=str(canonical_request["workerName"]),
+                worker_role=str(canonical_request["workerRole"]),
+                profile=profile,
+                execution_mode=execution_mode,
+                workspace_root=payload.workspace_root,
+                bootstrap_profile=payload.bootstrap_profile,
+                bootstrap_bundle=payload.bootstrap_bundle,
+            )
+        except DelegationIdempotencyConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "delegation_idempotency_conflict", "message": str(exc)},
+            ) from exc
+        except ParallelExecutionIsolationError as exc:
+            reason_code = str(getattr(exc, "reason_code", "") or "").strip()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "parallel_execution_isolation_required",
+                    "message": str(exc),
+                    **({"reason": reason_code} if reason_code else {}),
+                },
+            ) from exc
+        response = _active_work_payload(record)
+        response["idempotentReplay"] = bool(record.get("idempotent_replay"))
+        return response
+
+    @app.get("/v1/active-work")
+    def list_active_work(
+        request: Request,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, object]:
+        tenant_id, owner_id = _account_scope(request)
+        bounded_limit = max(1, min(int(limit), 100))
+        before = _decode_active_work_cursor(cursor) if cursor else None
+        items = store.list_active_delegations(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            limit=bounded_limit,
+            before=before,
+        )
+        total = store.count_active_delegations(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            before=before,
+        )
+        overflow_count = max(0, total - len(items))
+        response: dict[str, object] = {
+            "snapshot": "fresh",
+            "work": [_active_work_payload(item) for item in items],
+            "overflowCount": overflow_count,
+        }
+        if items and overflow_count:
+            response["cursor"] = _encode_active_work_cursor(items[-1])
+        return response
+
+    @app.get("/v1/orchestration-capabilities")
+    def get_orchestration_capabilities(
+        request: Request, response: Response
+    ) -> dict[str, object]:
+        # The assertion establishes the trusted Core control plane even though
+        # host-process exclusion is intentionally global to this Unix runtime.
+        _account_scope(request)
+        response.headers["Cache-Control"] = "no-store"
+        return service.orchestration_capabilities()
+
+    @app.post("/v1/callback-associations/verify")
+    def verify_callback_association(
+        payload: CallbackAssociationVerifyRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        tenant_id, owner_id = _account_scope(request)
+        association = store.verify_callback_association(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            origin_ref=payload.origin_ref,
+            work_ref=payload.work_ref,
+            worker_id=payload.worker_id,
+            run_id=payload.run_id,
+        )
+        if not association:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "callback_association_not_found",
+                    "message": "The callback association was not found.",
+                },
+            )
+        return {
+            "valid": True,
+            "originRef": str(association.get("origin_ref") or ""),
+            "workRef": str(association.get("work_ref") or ""),
+        }
+
+    @app.get("/v1/delegations/by-origin/{origin_ref}")
+    def get_delegation_by_origin(origin_ref: str, request: Request) -> dict[str, object]:
+        tenant_id, owner_id = _account_scope(request)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@-]{7,191}", origin_ref):
+            record = None
+        else:
+            record = store.get_delegation_by_origin(
+                origin_ref,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+        if not record:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "delegation_not_found",
+                    "message": "The delegation was not found.",
+                },
+            )
+        return {
+            "workRef": str(record.get("work_ref") or ""),
+            "state": _active_work_state(record),
+        }
+
+    @app.get("/v1/active-work/{work_ref}", include_in_schema=False)
+    @app.get("/v1/work/{work_ref}")
+    def get_active_work(work_ref: str, request: Request) -> dict[str, object]:
+        tenant_id, owner_id = _account_scope(request)
+        record = store.get_delegation(work_ref, tenant_id=tenant_id, owner_id=owner_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="Active work not found")
+        return _active_work_payload(record, detail=True)
+
+    @app.post("/v1/active-work/{work_ref}/actions", status_code=202, include_in_schema=False)
+    @app.post("/v1/work/{work_ref}/actions", status_code=202)
+    def active_work_action(
+        work_ref: str,
+        payload: ActiveWorkActionRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        tenant_id, owner_id = _account_scope(request)
+        record = store.get_delegation(work_ref, tenant_id=tenant_id, owner_id=owner_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="Active work not found")
+        instruction = str(payload.instruction or "").strip()
+        if payload.action in {"queue", "message", "steer"} and not instruction:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "active_work_instruction_required",
+                    "message": "This active-work action requires an instruction.",
+                },
+            )
+        capability_reauthorization = (
+            payload.capability_reauthorization.model_dump()
+            if payload.capability_reauthorization is not None
+            else None
+        )
+        if capability_reauthorization is not None and payload.action != "resume":
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "capability_reauthorization_invalid",
+                    "message": "Capability reauthorization is valid only for an authorization-attention resume.",
+                },
+            )
+        action_request = {
+            "action": payload.action,
+            "instruction": instruction,
+            "capabilityReauthorization": capability_reauthorization,
+        }
+        try:
+            reservation = store.reserve_active_work_action(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                work_ref=work_ref,
+                idempotency_key=payload.idempotency_key,
+                action=payload.action,
+                payload_digest=_canonical_digest(action_request),
+                expected_current_run_id=str(record.get("current_run_id") or ""),
+                expected_source_run_id=str(record.get("run_id") or ""),
+                expected_source_state=str(record.get("run_state") or ""),
+                expected_source_started_at=str(record.get("run_started_at") or ""),
+                executor_id=service.executor_id,
+                lease_seconds=float(
+                    os.environ.get("WPR_ACTIVE_WORK_ACTION_LEASE_S", "30") or "30"
+                ),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Active work not found") from exc
+        except ActiveWorkActionConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": str(
+                        getattr(exc, "code", "active_work_idempotency_conflict")
+                    ),
+                    "message": str(exc),
+                },
+            ) from exc
+        should_execute = bool(reservation.get("should_execute"))
+        recovery_takeover = bool(reservation.get("recovery_takeover"))
+        if (
+            bool(reservation.get("idempotent_replay"))
+            and str(reservation.get("status") or "") == "failed"
+            and str(reservation.get("response_json") or "").strip()
+        ):
+            try:
+                failure_response = json.loads(str(reservation["response_json"]))
+                failure_status = int(failure_response["statusCode"])
+                failure_detail = failure_response["detail"]
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "active_work_action_result_unavailable",
+                        "message": "The prior active-work action result is unavailable.",
+                    },
+                ) from exc
+            raise HTTPException(status_code=failure_status, detail=failure_detail)
+        if (
+            bool(reservation.get("idempotent_replay"))
+            and str(reservation.get("status") or "") != "completed"
+            and payload.action in {"pause", "resume", "steer", "stop"}
+            and not str(reservation.get("lifecycle_operation_id") or "").strip()
+            and should_execute
+        ):
+            failed = store.fail_unbound_active_work_control(
+                str(reservation.get("action_use_id") or ""),
+                executor_id=service.executor_id,
+            )
+            if not failed:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "active_work_action_ownership_changed",
+                        "message": "The active-work action owner changed; refresh before retrying.",
+                    },
+                )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "active_work_action_binding_unavailable",
+                    "message": (
+                        "This unfinished control predates durable lifecycle binding. "
+                        "Refresh and reissue it with a new idempotency key."
+                    ),
+                },
+            )
+        if not should_execute or recovery_takeover:
+            if str(reservation.get("status") or "") != "completed":
+                reconciled = service.reconcile_active_work_action(
+                    record,
+                    action=payload.action,
+                    instruction=instruction,
+                    idempotency_key=payload.idempotency_key,
+                    source_run_id=str(reservation.get("source_run_id") or ""),
+                    capability_reauthorization=capability_reauthorization,
+                    action_use_id=str(reservation.get("action_use_id") or ""),
+                )
+                if reconciled is None and not should_execute:
+                    exact_pending = service.active_work_action_claim_is_pending(
+                        reservation
+                    )
+                    if exact_pending:
+                        return {
+                            "workRef": work_ref,
+                            "action": payload.action,
+                            "status": "pending",
+                            "state": (
+                                "stopping"
+                                if payload.action == "stop"
+                                else _active_work_state(record)
+                            ),
+                            "confirmationPending": True,
+                            "idempotentReplay": True,
+                            "updatedAt": str(record.get("updated_at") or ""),
+                        }
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "active_work_action_in_progress",
+                            "message": "The matching active-work action is still in progress.",
+                            "retryAfterSeconds": 1,
+                        },
+                    )
+                if reconciled is None:
+                    # A stale/released execution lease with no committed effect
+                    # is safe to take over below using the same operation ID.
+                    if service.active_work_action_claim_is_pending(reservation):
+                        return {
+                            "workRef": work_ref,
+                            "action": payload.action,
+                            "status": "pending",
+                            "state": (
+                                "stopping"
+                                if payload.action == "stop"
+                                else _active_work_state(record)
+                            ),
+                            "confirmationPending": True,
+                            "idempotentReplay": True,
+                            "updatedAt": str(record.get("updated_at") or ""),
+                        }
+                else:
+                    reconciled_run_id = str(reconciled.get("run_id") or "")
+                    prior: dict[str, object] = {
+                        "workRef": work_ref,
+                        "action": payload.action,
+                        "status": str(reconciled.get("status") or "accepted"),
+                        "state": str(reconciled.get("state") or _active_work_state(record)),
+                        "confirmationPending": bool(
+                            reconciled.get("confirmation_pending")
+                        ),
+                        "idempotentReplay": True,
+                        "updatedAt": str(record.get("updated_at") or ""),
+                    }
+                    if reconciled.get("resume_mode"):
+                        prior["resumeMode"] = str(reconciled["resume_mode"])
+                    if reconciled.get("delivery_mode"):
+                        prior["deliveryMode"] = str(reconciled["delivery_mode"])
+                    if reconciled.get("control_outcome"):
+                        prior["controlOutcome"] = str(
+                            reconciled["control_outcome"]
+                        )
+                        prior["runId"] = reconciled_run_id
+                    finished_action = store.finish_active_work_action(
+                        str(reservation.get("action_use_id") or ""),
+                        response={**prior, "idempotentReplay": False},
+                        current_run_id=(
+                            reconciled_run_id
+                            if payload.action in {"queue", "message", "steer", "retry"}
+                            and bool(reconciled.get("advance_current_run", True))
+                            else None
+                        ),
+                        executor_id=service.executor_id,
+                    )
+                    if not finished_action:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "active_work_action_ownership_changed",
+                                "message": "The active-work action owner changed; refresh before retrying.",
+                            },
+                        )
+                    persisted_response = json.loads(
+                        str(finished_action.get("response_json") or "{}")
+                    )
+                    prior["updatedAt"] = str(
+                        persisted_response.get("updatedAt") or prior["updatedAt"]
+                    )
+                    return prior
+            elif not should_execute:
+                try:
+                    prior = json.loads(str(reservation.get("response_json") or "{}"))
+                except json.JSONDecodeError as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "active_work_action_result_unavailable",
+                            "message": "The prior active-work action result is unavailable.",
+                        },
+                    ) from exc
+                prior["idempotentReplay"] = True
+                return prior
+        action_use_id = str(reservation.get("action_use_id") or "")
+        try:
+            result = service.execute_active_work_action(
+                record,
+                action=payload.action,
+                instruction=instruction,
+                idempotency_key=payload.idempotency_key,
+                capability_reauthorization=capability_reauthorization,
+                action_use_id=action_use_id,
+            )
+            new_run_id = str(result.get("run_id") or "")
+            response: dict[str, object] = {
+                "workRef": work_ref,
+                "action": payload.action,
+                "status": str(result.get("status") or "accepted"),
+                "state": str(result.get("state") or _active_work_state(record)),
+                "confirmationPending": bool(result.get("confirmation_pending")),
+                "idempotentReplay": bool(reservation.get("idempotent_replay")),
+                "updatedAt": str(record.get("updated_at") or ""),
+            }
+            if result.get("resume_mode"):
+                response["resumeMode"] = str(result["resume_mode"])
+            if result.get("delivery_mode"):
+                response["deliveryMode"] = str(result["delivery_mode"])
+            if result.get("control_outcome"):
+                response["controlOutcome"] = str(result["control_outcome"])
+                response["runId"] = new_run_id
+            finished_action = store.finish_active_work_action(
+                action_use_id,
+                response=response,
+                current_run_id=(
+                    new_run_id
+                    if payload.action in {"queue", "message", "steer", "retry"}
+                    and str(result.get("control_outcome") or "") != "terminal_won"
+                    else None
+                ),
+                executor_id=service.executor_id,
+            )
+            if not finished_action:
+                raise RuntimeError("active_work_action_ownership_changed")
+            persisted_response = json.loads(
+                str(finished_action.get("response_json") or "{}")
+            )
+            response["updatedAt"] = str(
+                persisted_response.get("updatedAt") or response["updatedAt"]
+            )
+            return response
+        except ValueError as exc:
+            code = str(exc)
+            detail = {"code": code, "message": code.replace("_", " ")}
+            store.fail_active_work_action(
+                action_use_id,
+                code,
+                executor_id=service.executor_id,
+                failure_response={"statusCode": 400, "detail": detail},
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=detail,
+            ) from exc
+        except RuntimeError as exc:
+            code = str(exc)
+            detail = {"code": code, "message": code.replace("_", " ")}
+            store.fail_active_work_action(
+                action_use_id,
+                code,
+                executor_id=service.executor_id,
+                failure_response={"statusCode": 409, "detail": detail},
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=detail,
+            ) from exc
+        except Exception as exc:
+            store.fail_active_work_action(
+                action_use_id, str(exc), executor_id=service.executor_id
+            )
+            raise
+
     @app.get("/health")
     def health() -> dict[str, object]:
         default_profile = _configured_default_worker_profile()
@@ -1241,7 +2406,7 @@ def create_app(
     @app.get("/v1/preferences", response_model=UserPreferencesResponse)
     def get_preferences(request: Request) -> UserPreferencesResponse:
         ctx = _auth_context(request)
-        tenant_id = ctx.tenant_id if ctx.enterprise else "local"
+        tenant_id = ctx.tenant_id if ctx.is_user_scoped else "local"
         owner_id = _preference_owner(ctx)
         if ctx.enterprise and not owner_id:
             raise HTTPException(status_code=401, detail="Missing authenticated user assertion")
@@ -1251,7 +2416,7 @@ def create_app(
     @app.patch("/v1/preferences", response_model=UserPreferencesResponse)
     def update_preferences(payload: UpdateUserPreferencesRequest, request: Request) -> UserPreferencesResponse:
         ctx = _auth_context(request)
-        tenant_id = ctx.tenant_id if ctx.enterprise else "local"
+        tenant_id = ctx.tenant_id if ctx.is_user_scoped else "local"
         owner_id = _preference_owner(ctx)
         if ctx.enterprise and not owner_id:
             raise HTTPException(status_code=401, detail="Missing authenticated user assertion")
@@ -1263,7 +2428,7 @@ def create_app(
     def create_project(payload: CreateProjectRequest, request: Request) -> ProjectResponse:
         ctx = _auth_context(request)
         owner_id = _request_owner(ctx, payload.owner_id)
-        tenant_id = ctx.tenant_id if ctx.enterprise else "local"
+        tenant_id = ctx.tenant_id if ctx.is_user_scoped else "local"
         profile = payload.default_worker_profile.strip() or _configured_default_worker_profile()
         return ProjectResponse(**service.create_project(owner_id, payload.title, payload.goal, profile, tenant_id=tenant_id))
 
@@ -1294,7 +2459,10 @@ def create_app(
         ctx = _auth_context(request)
         project = require_project(project_id, request)
         owner_id = _request_owner(ctx, payload.owner_id)
-        tenant_id = str(project.get("tenant_id") or ctx.tenant_id if ctx.enterprise else "local")
+        tenant_id = str(
+            project.get("tenant_id")
+            or (ctx.tenant_id if ctx.is_user_scoped else "local")
+        )
         profile = _profile_for_project(project, payload.profile)
         execution_mode = _execution_mode_for_request(payload.execution_mode)
         worker = service.create_worker(
@@ -1305,7 +2473,9 @@ def create_app(
             profile=profile,
             backend=payload.backend,
             execution_mode=execution_mode,
-            alias=scoped_alias(ctx, payload.alias or payload.name) if ctx.enterprise else payload.alias,
+            alias=scoped_alias(ctx, payload.alias or payload.name)
+            if ctx.is_user_scoped
+            else payload.alias,
             workspace_root=payload.workspace_root,
             bootstrap_profile=payload.bootstrap_profile,
             bootstrap_bundle=payload.bootstrap_bundle,
@@ -1319,11 +2489,14 @@ def create_app(
         ctx = _auth_context(request)
         project = require_project(project_id, request)
         owner_id = _request_owner(ctx, payload.owner_id)
-        tenant_id = str(project.get("tenant_id") or ctx.tenant_id if ctx.enterprise else "local")
+        tenant_id = str(
+            project.get("tenant_id")
+            or (ctx.tenant_id if ctx.is_user_scoped else "local")
+        )
         profile = _profile_for_project(project, payload.profile)
         execution_mode = _execution_mode_for_request(payload.execution_mode)
         alias = (payload.alias or payload.name or profile).strip()
-        if ctx.enterprise:
+        if ctx.is_user_scoped:
             alias = scoped_alias(ctx, alias)
         worker = service.find_or_create_worker(
             project_id=project_id,
@@ -1439,8 +2612,64 @@ def create_app(
                 _assign_effort_bundle(worker, payload.effort),
                 payload.bootstrap_bundle,
             ),
+            idempotency_key=str(request.headers.get("x-glasshive-idempotency-key") or "").strip()
+            or None,
         )
         return RunResponse(**run)
+
+    @app.get("/v1/workers/{worker_id}/assignments/by-idempotency/{idempotency_key}", response_model=RunResponse)
+    def get_assignment_by_idempotency(
+        worker_id: str,
+        idempotency_key: str,
+        request: Request,
+    ) -> RunResponse:
+        require_worker(worker_id, request)
+        run_id = "run_idem_" + sha256(f"{worker_id}\0{idempotency_key}".encode("utf-8")).hexdigest()[:32]
+        run = store.get_run(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Assignment not found")
+        return RunResponse(**run)
+
+    @app.post(ACTION_ENDPOINT, response_model=RunActionResponse, status_code=202)
+    def execute_run_action(
+        payload: RunActionRequest,
+        request: Request,
+    ) -> RunActionResponse:
+        claims = getattr(request.state, "run_action_claims", None)
+        if not isinstance(claims, dict):
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "capability_required", "message": "A scoped action capability is required."},
+            )
+        try:
+            result = service.execute_run_action(
+                claims,
+                capability_id=payload.capabilityId,
+                action=payload.action,
+                project_id=payload.projectId,
+                worker_id=payload.workerId,
+                run_id=payload.runId,
+                idempotency_key=payload.idempotencyKey,
+            )
+        except RunActionError as exc:
+            if exc.code == "run_already_completed" and payload.action == "cancel":
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "version": 1,
+                        "status": "already_completed",
+                        "action": "cancel",
+                        "projectId": payload.projectId,
+                        "workerId": payload.workerId,
+                        "sourceRunId": payload.runId,
+                        "state": "completed",
+                    },
+                )
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
+        return RunActionResponse(**result)
 
     @app.post("/v1/workers/{worker_id}/message", response_model=RunResponse, status_code=202)
     def send_message(worker_id: str, payload: SendMessageRequest, request: Request) -> RunResponse:
@@ -1501,6 +2730,12 @@ def create_app(
     @app.post("/v1/workers/{worker_id}/view-opened", status_code=204)
     def worker_view_opened(worker_id: str, request: Request) -> Response:
         worker = require_worker(worker_id, request)
+        # VIVENTIUM START: authoritative operator-view revocation
+        # The UI uses this scoped runtime response as its final authorization
+        # gate, so terminal workers must fail before any redirect/cookie.
+        if str(worker.get("state") or "") == "terminated":
+            raise HTTPException(status_code=404, detail="Worker not found")
+        # VIVENTIUM END: authoritative operator-view revocation
         store.add_event(worker["project_id"], worker_id, None, "worker.view_opened", "Worker view opened")
         return Response(status_code=204)
 
@@ -1587,6 +2822,7 @@ def create_app(
 
     def _fresh_worker_view_token(payload: dict[str, object]) -> tuple[str, dict[str, object]]:
         worker_id = str(payload.get("worker_id") or "").strip()
+        _require_authoritative_signed_link_worker(worker_id)
         token = sign_link_token(
             kind="worker_view",
             worker_id=worker_id,
@@ -1601,9 +2837,7 @@ def create_app(
 
     def _open_verified_signed_link(payload: dict[str, object], request: Request) -> Response:
         worker_id = str(payload.get("worker_id") or "").strip()
-        worker = store.get_worker(worker_id)
-        if not worker:
-            raise HTTPException(status_code=404, detail="Worker not found")
+        worker = _require_authoritative_signed_link_worker(worker_id)
         tenant_id = str(payload.get("tenant_id") or "")
         owner_id = str(payload.get("owner_id") or "")
         if tenant_id != str(worker.get("tenant_id") or "") or owner_id != str(worker.get("owner_id") or ""):
@@ -1616,11 +2850,16 @@ def create_app(
         )
         kind = str(payload.get("kind") or "")
         if kind in {"artifact_download", "artifact_open"}:
+            # Re-read immediately before resolving/serving bytes so a token
+            # verified against an earlier live snapshot cannot outlive it.
+            worker = _require_authoritative_signed_link_worker(worker_id)
             path = str(payload.get("path") or "").strip().lstrip("/")
             target = _artifact_path(worker, path)
             if kind == "artifact_open":
+                worker = _require_authoritative_signed_link_worker(worker_id)
                 store.add_event(worker["project_id"], worker_id, None, "worker.artifact_opened", target.name)
                 return _artifact_open_page(worker, target, path, request)
+            worker = _require_authoritative_signed_link_worker(worker_id)
             store.add_event(worker["project_id"], worker_id, None, "worker.artifact_downloaded", target.name)
             return FileResponse(target, filename=target.name, headers=ARTIFACT_DOWNLOAD_SECURITY_HEADERS)
         raise HTTPException(status_code=400, detail="Signed link kind is not supported")
@@ -1661,13 +2900,13 @@ def create_app(
         )
         if not target_url:
             raise HTTPException(status_code=400, detail="Signed link reference has no target")
-        worker = service.require_worker(worker_id)
+        worker = _require_authoritative_signed_link_worker(worker_id)
+        if (
+            str(payload.get("tenant_id") or "") != str(worker.get("tenant_id") or "")
+            or str(payload.get("owner_id") or "") != str(worker.get("owner_id") or "")
+        ):
+            raise HTTPException(status_code=404, detail="GlassHive workspace link not found")
         store.add_event(worker["project_id"], worker_id, None, "worker.view_opened", "Worker view opened")
-        if _workspace_link_auto_resume_enabled():
-            try:
-                service.resume_worker(worker_id)
-            except Exception as exc:
-                logger.warning("Failed to auto-resume GlassHive workspace from short link for %s: %s", worker_id, exc)
         response = RedirectResponse(target_url, status_code=307)
         session_token, session_payload = _fresh_worker_view_token(payload)
         _set_signed_worker_cookie(
@@ -1690,7 +2929,7 @@ def create_app(
         worker_id = str(payload.get("worker_id") or "").strip()
         if not worker_id:
             raise HTTPException(status_code=401, detail="GlassHive workspace link is invalid or expired")
-        worker = service.require_worker(worker_id)
+        worker = _require_authoritative_signed_link_worker(worker_id)
         tenant_id = str(payload.get("tenant_id") or "")
         owner_id = str(payload.get("owner_id") or "")
         if tenant_id != str(worker.get("tenant_id") or "") or owner_id != str(worker.get("owner_id") or ""):
@@ -1726,6 +2965,26 @@ def create_app(
         worker_id = str(worker.get("worker_id") or "")
         store.add_event(worker["project_id"], worker_id, None, "worker.view_opened", "Worker view opened")
         runtime_details = _runtime_details(worker)
+        # Public worker-view references are intentionally presentation-only.
+        # Control flows use owner-scoped service assertions or one-use exact-run
+        # action capabilities; a leaked view reference must never be upgraded.
+        return HTMLResponse(
+            f"""
+            <html><head><title>{escape(worker['name'])} mission view</title>
+            <style>
+              body {{ font-family: system-ui,sans-serif; margin:0; background:#0f172a; color:#e5e7eb; }}
+              main {{ max-width:760px; margin:8vh auto; padding:1.5rem; }}
+              .card {{ border:1px solid rgba(255,255,255,.14); border-radius:16px; padding:1.5rem; background:#111827; }}
+              .meta {{ color:#cbd5e1; }} .notice {{ color:#94a3b8; border-top:1px solid rgba(255,255,255,.12); padding-top:1rem; }}
+            </style></head><body><main><div class="card">
+              <h1>{escape(worker['name'])}</h1>
+              <p class="meta">{escape(str(runtime_details.get('mode') or worker.get('runtime') or 'worker'))} · {escape(str(worker.get('state') or 'unknown'))}</p>
+              <p>Read-only mission view</p>
+              <p class="notice">Mission controls require an authenticated, action-scoped, one-use capability.</p>
+            </div></main></body></html>
+            """,
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
         external_view_url = str(runtime_details.get("view_url") or "").strip()
         subtitle = escape(str(runtime_details.get("mode") or worker.get("runtime") or "worker view"))
         openclaw_action_button = (
@@ -1826,6 +3085,7 @@ def create_app(
     @app.get("/w/{ref_id}/desktop", response_class=HTMLResponse)
     def open_ref_workspace_desktop(ref_id: str, request: Request) -> Response:
         payload, worker = _require_worker_view_ref(ref_id, request)
+        raise HTTPException(status_code=403, detail="Read-only view links cannot open an interactive desktop")
         worker_id = str(worker.get("worker_id") or "")
         runtime_details = _runtime_details(worker)
         external_view_url = str(runtime_details.get("view_url") or "").strip()
@@ -1860,6 +3120,7 @@ def create_app(
     @app.get("/w/{ref_id}/desktop-frame")
     def open_ref_workspace_desktop_frame(ref_id: str, request: Request) -> Response:
         payload, worker = _require_worker_view_ref(ref_id, request)
+        raise HTTPException(status_code=403, detail="Read-only view links cannot open an interactive desktop")
         worker_id = str(worker.get("worker_id") or "")
         runtime_details = _runtime_details(worker)
         external_view_url = str(runtime_details.get("view_url") or "").strip()
@@ -1871,6 +3132,7 @@ def create_app(
     @app.post("/w/{ref_id}/actions/{action_name}", status_code=202)
     def ref_workspace_action(ref_id: str, action_name: str, request: Request) -> dict[str, object]:
         payload, worker = _require_worker_view_ref(ref_id, request)
+        raise HTTPException(status_code=403, detail="Read-only view links cannot control work")
         worker_id = str(worker.get("worker_id") or "")
         action = str(action_name or "").strip().lower()
         if action == "resume":
@@ -1890,6 +3152,7 @@ def create_app(
     @app.post("/w/{ref_id}/desktop-action", response_model=DesktopActionResponse, status_code=202)
     def ref_workspace_desktop_action(ref_id: str, payload: DesktopActionRequest, request: Request) -> DesktopActionResponse:
         _ref_payload, worker = _require_worker_view_ref(ref_id, request)
+        raise HTTPException(status_code=403, detail="Read-only view links cannot control a desktop")
         worker_id = str(worker.get("worker_id") or "")
         try:
             launched = service.desktop_action(worker_id, payload.action, url=payload.url, run_id=payload.run_id)
@@ -1924,14 +3187,22 @@ def create_app(
     @app.get("/v1/workers/{worker_id}/artifacts/open")
     def open_worker_artifact(worker_id: str, path: str, request: Request) -> HTMLResponse:
         worker = require_worker(worker_id, request)
+        if _auth_context(request).auth_mode == "signed_link":
+            worker = _require_authoritative_signed_link_worker(worker_id)
         target = _artifact_path(worker, path)
+        if _auth_context(request).auth_mode == "signed_link":
+            worker = _require_authoritative_signed_link_worker(worker_id)
         store.add_event(worker["project_id"], worker_id, None, "worker.artifact_opened", target.name)
         return _artifact_open_page(worker, target, path, request)
 
     @app.get("/v1/workers/{worker_id}/artifacts/download")
     def download_worker_artifact(worker_id: str, path: str, request: Request) -> FileResponse:
         worker = require_worker(worker_id, request)
+        if _auth_context(request).auth_mode == "signed_link":
+            worker = _require_authoritative_signed_link_worker(worker_id)
         target = _artifact_path(worker, path)
+        if _auth_context(request).auth_mode == "signed_link":
+            worker = _require_authoritative_signed_link_worker(worker_id)
         store.add_event(worker["project_id"], worker_id, None, "worker.artifact_downloaded", target.name)
         return FileResponse(target, filename=target.name, headers=ARTIFACT_DOWNLOAD_SECURITY_HEADERS)
 
@@ -3044,38 +4315,24 @@ def create_app(
         ctx = AuthContext()
         if api_token:
             signed_worker = store.get_worker(worker_id)
-            if signed_worker and verify_signed_link(
-                kind=str(websocket.query_params.get("gh_kind") or ""),
-                worker_id=worker_id,
-                tenant_id=str(signed_worker.get("tenant_id") or ""),
-                owner_id=str(signed_worker.get("owner_id") or ""),
-                expires_at=str(websocket.query_params.get("gh_exp") or ""),
-                signature=str(websocket.query_params.get("gh_sig") or ""),
-            ):
-                ctx = AuthContext(
-                    tenant_id=str(signed_worker.get("tenant_id") or "local"),
-                    user_id=str(signed_worker.get("owner_id") or ""),
-                    auth_mode="signed_link",
-                    enterprise=auth_settings.enterprise,
-                )
-            else:
-                token = _service_token_from_headers(websocket.headers)
-                auth_header = websocket.headers.get("authorization", "")
-                bearer = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
-                if not (_token_matches(token, api_token) or _token_matches(bearer, api_token)):
-                    await websocket.close(code=4401)
-                    return
-                try:
-                    ctx = auth_settings.context_from_headers(
-                        {str(key).lower(): value for key, value in websocket.headers.items()}
-                    )
-                except GlassHiveAuthError:
-                    await websocket.close(code=4401)
-                    return
+            # A read-only worker_view token is never terminal authority. The
+            # interactive shell requires normal authenticated operator access.
+            _ = signed_worker
+            token = _service_token_from_headers(websocket.headers)
+            auth_header = websocket.headers.get("authorization", "")
+            bearer = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
+            if not (_token_matches(token, api_token) or _token_matches(bearer, api_token)):
+                await websocket.close(code=4401)
+                return
+            try:
+                ctx = _service_auth_context_from_headers(websocket.headers)
+            except GlassHiveAuthError:
+                await websocket.close(code=4401)
+                return
         worker = store.get_worker(
             worker_id,
-            tenant_id=ctx.tenant_id if ctx.enterprise else None,
-            owner_id=ctx.owner_id if ctx.enterprise else None,
+            tenant_id=ctx.tenant_id if ctx.is_user_scoped else None,
+            owner_id=ctx.owner_id if ctx.is_user_scoped else None,
         )
         if not worker:
             await websocket.close(code=4404)

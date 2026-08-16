@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import secrets
 import shlex
 import signal
@@ -74,6 +75,36 @@ class RuntimeErrorBase(RuntimeError):
     pass
 
 
+class ProviderRateLimitError(RuntimeErrorBase):
+    """Structured provider throttling with an authoritative bounded retry delay."""
+
+    failure_class = "provider_rate_limited"
+    retryable = True
+
+    def __init__(self, message: str, *, retry_after_s: float) -> None:
+        super().__init__(message)
+        self.retry_after_s = max(0.1, min(float(retry_after_s), 86_400.0))
+
+
+class HostCapacityError(RuntimeErrorBase):
+    """Structured, retryable host admission pressure; never a terminal run failure."""
+
+    code = "host_capacity"
+    failure_class = "host_capacity"
+    retryable = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        capacity_class: str,
+        retry_after_s: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.capacity_class = str(capacity_class or "host")
+        self.retry_after_s = retry_after_s
+
+
 class RuntimeDependencyMissingError(RuntimeErrorBase):
     def __init__(
         self,
@@ -111,6 +142,14 @@ class WorkerInterruptedError(RuntimeErrorBase):
     pass
 
 
+class RunStartupRejectedError(RuntimeErrorBase):
+    """A spawned exact run could not cross the durable startup fence."""
+
+    def __init__(self, message: str, *, termination_confirmed: bool) -> None:
+        super().__init__(message)
+        self.termination_confirmed = bool(termination_confirmed)
+
+
 class WorkerRuntime(Protocol):
     def resolve_model(self, profile: str) -> str: ...
 
@@ -130,6 +169,10 @@ class WorkerRuntime(Protocol):
 
 
 class StubRuntime:
+    # The deterministic test runtime has no external process/session identity.
+    # The service may therefore confirm its in-process generation before entry.
+    requires_run_start_identity = False
+
     def resolve_model(self, profile: str) -> str:
         return {
             "openclaw-codex": "stub/openai-codex",
@@ -141,8 +184,30 @@ class StubRuntime:
     def preflight_worker_profile(self, profile: str, execution_mode: str = "docker") -> None:
         return None
 
+    def isolated_resource_usage(self) -> dict[str, object]:
+        # Deterministic synthetic substrate used only by unit/API test setups.
+        return {
+            "child_processes": 0,
+            "threads": 0,
+            "available_memory_bytes": 16 * 1024**3,
+            "available_disk_bytes": 64 * 1024**3,
+            "running_worker_containers": 0,
+            "process_probe_ok": True,
+            "memory_probe_ok": True,
+            "disk_probe_ok": True,
+        }
+
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         worker_id = worker["worker_id"]
+        workspace_dir = f"/tmp/{worker_id}/workspace"
+        raw_bundle = worker.get("bootstrap_bundle_json")
+        if isinstance(raw_bundle, str) and raw_bundle.strip():
+            try:
+                bundle = json.loads(raw_bundle)
+            except json.JSONDecodeError:
+                bundle = {}
+            if isinstance(bundle, dict) and bundle.get("run_mode") == "conversation":
+                workspace_dir = str(Path(str(worker.get("workspace_root") or workspace_dir)).expanduser().resolve())
         return RuntimeInfo(
             runtime="openclaw-stub",
             model=worker.get("model") or self.resolve_model(worker.get("profile", "openclaw-general")),
@@ -151,7 +216,7 @@ class StubRuntime:
             gateway_token=None,
             session_key=worker.get("session_key") or f"agent:main:wpr:worker:{worker_id}",
             state_dir=f"/tmp/{worker_id}/state",
-            workspace_dir=f"/tmp/{worker_id}/workspace",
+            workspace_dir=workspace_dir,
             pid=99999,
         )
 
@@ -159,7 +224,11 @@ class StubRuntime:
         return self.ensure_worker_ready(worker)
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
-        return self.ensure_worker_ready(worker)
+        info = self.ensure_worker_ready(worker)
+        # The in-process stub has no durable child process. Returning no PID is
+        # its explicit proof that the synthetic exact run stopped synchronously.
+        info.pid = None
+        return info
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
         return self.ensure_worker_ready(worker)

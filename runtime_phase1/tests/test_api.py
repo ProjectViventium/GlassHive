@@ -8,12 +8,13 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import time
 import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread, active_count
 from urllib.parse import urlencode, urlsplit
 
 import httpx
@@ -30,13 +31,17 @@ from workers_projects_runtime.deliverables import (
     is_user_deliverable_relative_path,
 )
 from workers_projects_runtime.openclaw_runtime import (
+    HostCapacityError,
     RuntimeErrorBase,
+    ProviderRateLimitError,
     RuntimeInfo,
+    RunStartupRejectedError,
     StubRuntime,
     WorkerInterruptedError,
     WorkerPausedError,
     WorkerTerminatedError,
 )
+from workers_projects_runtime.profile_runtime import HostCodexCliRuntime, ProfiledWorkerRuntime
 from workers_projects_runtime.service import (
     GlassHiveQuotaExceededError,
     WorkersProjectsService,
@@ -56,7 +61,11 @@ from workers_projects_runtime.signed_links import (
     verify_signed_link,
     verify_signed_link_token,
 )
-from workers_projects_runtime.store import Store
+from workers_projects_runtime.store import (
+    ActiveWorkActionConflictError,
+    Store,
+    WorkAdmissionError,
+)
 
 
 def write_minimal_docx(path: Path) -> None:
@@ -105,6 +114,55 @@ def wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> None:
             return
         time.sleep(interval)
     raise AssertionError("Condition did not become true before timeout")
+
+
+def test_due_retry_scheduler_round_robins_accounts_before_draining_backlog(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    workers_by_owner: dict[str, list[str]] = {"owner-a": [], "owner-b": []}
+    for owner_id, count in (("owner-a", 5), ("owner-b", 1)):
+        project = store.create_project(
+            owner_id,
+            f"Project {owner_id}",
+            "Fair retry scheduling",
+            "codex-cli",
+            tenant_id="tenant-a",
+        )
+        for index in range(count):
+            worker = store.create_worker(
+                project_id=project["project_id"],
+                owner_id=owner_id,
+                name=f"Worker {owner_id} {index}",
+                role="worker",
+                profile="codex-cli",
+                backend="codex-cli",
+                runtime="codex-cli",
+                model="test",
+                tenant_id="tenant-a",
+            )
+            run = store.create_run(
+                worker["worker_id"],
+                project["project_id"],
+                f"Run {owner_id} {index}",
+            )
+            # Account A is globally older and would monopolize a FIFO slice.
+            queued_at = (
+                datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=index)
+                if owner_id == "owner-a"
+                else datetime(2026, 1, 2, tzinfo=timezone.utc)
+            )
+            store.update_run(run["run_id"], queued_at=queued_at.isoformat())
+            workers_by_owner[owner_id].append(worker["worker_id"])
+
+    first_slice = store.list_due_retry_worker_ids(limit=2)
+    second_slice = store.list_due_retry_worker_ids(limit=6)
+
+    assert first_slice[0] in workers_by_owner["owner-a"]
+    assert first_slice[1] in workers_by_owner["owner-b"]
+    assert set(first_slice) == {
+        workers_by_owner["owner-a"][0],
+        workers_by_owner["owner-b"][0],
+    }
+    assert second_slice[2:] == workers_by_owner["owner-a"][1:]
 
 
 def test_fresh_user_artifact_deliverable_accepts_standard_deliverable_roots(tmp_path):
@@ -217,8 +275,425 @@ def test_store_migrates_compute_released_marker_for_existing_db(tmp_path):
         runtime="codex-cli",
         model="stub/codex-cli",
     )
+    worker = migrated.get_worker(worker["worker_id"]) or worker
 
     assert worker["compute_released_at"] is None
+
+
+def test_store_migrates_destructive_operation_scope_columns_idempotently(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    scoped_columns = {
+        "compute_release_kind",
+        "compute_release_target_run_id",
+        "compute_release_target_started_at",
+    }
+    with store._connect() as conn:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(workers)")
+        }
+        assert scoped_columns <= columns
+        for column in scoped_columns:
+            try:
+                conn.execute(f"ALTER TABLE workers DROP COLUMN {column}")
+            except sqlite3.OperationalError as exc:
+                pytest.skip(f"SQLite runtime does not support DROP COLUMN: {exc}")
+
+    migrated = Store(str(db_path))
+    remigrated = Store(str(db_path))
+    with remigrated._connect() as conn:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(workers)")
+        }
+        assert scoped_columns <= columns
+    project = migrated.create_project(
+        "owner", "Scope migration", "Verify operation defaults", "codex-cli"
+    )
+    worker = migrated.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Scope migration worker",
+        role="coder",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="stub/codex-cli",
+    )
+    worker = migrated.get_worker(worker["worker_id"]) or worker
+    assert worker["compute_release_kind"] == ""
+    assert worker["compute_release_target_run_id"] == ""
+    assert worker["compute_release_target_started_at"] == ""
+
+
+def test_store_migrates_work_tombstone_identity_and_operation_effects_idempotently(
+    tmp_path,
+):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    worker_columns = {
+        "compute_release_scope",
+        "compute_release_session_fingerprint",
+        "work_stop_id",
+        "work_stop_requested_at",
+        "work_stop_settled_at",
+        "work_stop_outcome",
+    }
+    with store._connect() as conn:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(workers)")
+        }
+        assert worker_columns <= columns
+        effect_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(lifecycle_operation_effects)")
+        }
+        assert {
+            "effect_id",
+            "operation_digest",
+            "operation_epoch",
+            "operation_kind",
+            "effect_kind",
+            "worker_id",
+            "run_id",
+            "status",
+            "lease_owner",
+            "lease_epoch",
+            "lease_expires_at",
+            "attempts",
+            "last_error_code",
+        } <= effect_columns
+
+    remigrated = Store(str(db_path))
+    project = remigrated.create_project(
+        "owner", "Operation migration", "Verify safe defaults", "codex-cli"
+    )
+    worker = remigrated.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Operation migration worker",
+        role="coder",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="stub/codex-cli",
+    )
+    worker = remigrated.get_worker(worker["worker_id"]) or worker
+    assert worker["compute_release_scope"] == "compute_only"
+    assert worker["compute_release_session_fingerprint"] == ""
+    assert worker["work_stop_id"] == ""
+    assert worker["work_stop_requested_at"] is None
+    assert worker["work_stop_settled_at"] is None
+    assert worker["work_stop_outcome"] == ""
+
+
+def test_store_backfills_legacy_inflight_stop_claim_as_pending_work_tombstone(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    project = store.create_project(
+        "owner", "Legacy stop", "Recover a pre-migration fence", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Legacy stop worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    claimed_at = datetime.now(timezone.utc).isoformat()
+    with store._connect() as conn:
+        conn.execute(
+            """
+            UPDATE workers
+            SET compute_release_token = 'legacy_fence',
+                compute_release_kind = 'stop_run',
+                compute_release_scope = 'compute_only',
+                compute_release_claimed_at = ?,
+                work_stop_id = '', work_stop_requested_at = NULL
+            WHERE worker_id = ?
+            """,
+            (claimed_at, worker["worker_id"]),
+        )
+
+    migrated = Store(str(db_path))
+    recovered = migrated.get_worker(worker["worker_id"]) or {}
+    assert recovered["compute_release_scope"] == "work"
+    assert recovered["work_stop_id"] == "legacy_fence"
+    assert recovered["work_stop_requested_at"] == claimed_at
+    assert recovered["work_stop_settled_at"] is None
+    assert recovered["work_stop_outcome"] == ""
+
+
+def test_store_repairs_every_active_operation_scope_on_each_idempotent_init(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    expected_scopes = {
+        "idle": "compute_only",
+        "paused": "compute_only",
+        "max_duration": "run",
+        "stop_run": "work",
+        "terminate_worker": "worker",
+    }
+    worker_ids: dict[str, str] = {}
+    project = store.create_project(
+        "owner", "Scope repair", "Repair every active operation", "openclaw-general"
+    )
+    for kind in expected_scopes:
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name=f"Scope repair {kind}",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        worker_ids[kind] = worker["worker_id"]
+    with store._connect() as conn:
+        for kind, expected_scope in expected_scopes.items():
+            deliberately_wrong = "worker" if expected_scope != "worker" else "compute_only"
+            conn.execute(
+                """
+                UPDATE workers
+                SET compute_release_token = ?, compute_release_kind = ?,
+                    compute_release_scope = ?, compute_release_claimed_at = updated_at
+                WHERE worker_id = ?
+                """,
+                (f"legacy-{kind}", kind, deliberately_wrong, worker_ids[kind]),
+            )
+
+    repaired = Store(str(db_path))
+    for kind, expected_scope in expected_scopes.items():
+        row = repaired.get_worker(worker_ids[kind]) or {}
+        assert row["compute_release_scope"] == expected_scope
+        if kind == "stop_run":
+            assert row["work_stop_id"] == "legacy-stop_run"
+
+    # A second initialization must preserve the same canonical projection.
+    repaired_again = Store(str(db_path))
+    for kind, expected_scope in expected_scopes.items():
+        assert (repaired_again.get_worker(worker_ids[kind]) or {})[
+            "compute_release_scope"
+        ] == expected_scope
+
+
+def test_store_migrates_legacy_effect_identity_without_losing_pending_rows(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    project = store.create_project(
+        "owner", "Effect migration", "Preserve pending operations", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Effect migration worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    with store._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        effect_id = store._enqueue_lifecycle_effects(
+            conn,
+            operation_token="legacy-effect-operation",
+            operation_epoch=4,
+            operation_kind="terminate_worker",
+            worker_id=worker["worker_id"],
+            effect_kinds=("signed_links.revoke_worker",),
+        )[0]
+        conn.execute("COMMIT")
+        conn.executescript(
+            """
+            DROP INDEX IF EXISTS idx_lifecycle_effects_status_lease;
+            ALTER TABLE lifecycle_operation_effects RENAME TO lifecycle_effects_current;
+            CREATE TABLE lifecycle_operation_effects (
+                effect_id TEXT PRIMARY KEY,
+                operation_digest TEXT NOT NULL,
+                operation_epoch INTEGER NOT NULL,
+                operation_kind TEXT NOT NULL,
+                effect_kind TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                run_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                lease_owner TEXT NOT NULL DEFAULT '',
+                lease_epoch INTEGER NOT NULL DEFAULT 0,
+                lease_expires_at TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error_code TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                applied_at TEXT,
+                UNIQUE(operation_digest, operation_epoch, effect_kind, run_id)
+            );
+            INSERT INTO lifecycle_operation_effects (
+                effect_id, operation_digest, operation_epoch, operation_kind,
+                effect_kind, worker_id, run_id, status, lease_owner,
+                lease_epoch, lease_expires_at, attempts, last_error_code,
+                created_at, updated_at, applied_at
+            )
+            SELECT
+                effect_id, operation_digest, operation_epoch, operation_kind,
+                effect_kind, worker_id, run_id, status, lease_owner,
+                lease_epoch, lease_expires_at, attempts, last_error_code,
+                created_at, updated_at, applied_at
+            FROM lifecycle_effects_current;
+            DROP TABLE lifecycle_effects_current;
+            """
+        )
+
+    migrated = Store(str(db_path))
+    rows = migrated.list_lifecycle_operation_effects(worker_id=worker["worker_id"])
+    assert len(rows) == 1
+    assert rows[0]["effect_id"] == effect_id
+    assert rows[0]["status"] == "pending"
+    with migrated._connect() as conn:
+        table_sql = "".join(
+            str(
+                conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'lifecycle_operation_effects'"
+                ).fetchone()["sql"]
+            )
+            .lower()
+            .split()
+        )
+    assert (
+        "unique(operation_digest,operation_epoch,operation_kind,"
+        "effect_kind,worker_id,run_id)"
+    ) in table_sql
+
+
+def test_store_recovers_interrupted_effect_identity_swap_exactly_once(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    project = store.create_project(
+        "owner", "Effect crash recovery", "Recover an interrupted table swap", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Effect crash recovery worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    with store._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        effect_ids: list[str] = []
+        for index in range(3):
+            effect_ids.extend(
+                store._enqueue_lifecycle_effects(
+                    conn,
+                    operation_token=f"crash-effect-{index}",
+                    operation_epoch=index + 1,
+                    operation_kind="terminate_worker",
+                    worker_id=worker["worker_id"],
+                    effect_kinds=("signed_links.revoke_worker",),
+                )
+            )
+        conn.execute(
+            """
+            UPDATE lifecycle_operation_effects
+            SET status = 'applying', lease_owner = 'executor-a', lease_epoch = 4,
+                lease_expires_at = '2026-08-13T16:00:00+00:00', attempts = 2,
+                last_error_code = 'transient_dependency'
+            WHERE effect_id = ?
+            """,
+            (effect_ids[1],),
+        )
+        conn.execute(
+            """
+            UPDATE lifecycle_operation_effects
+            SET status = 'applied', lease_epoch = 7, attempts = 3,
+                applied_at = '2026-08-13T15:00:00+00:00'
+            WHERE effect_id = ?
+            """,
+            (effect_ids[2],),
+        )
+        conn.execute("COMMIT")
+        conn.executescript(
+            """
+            DROP INDEX IF EXISTS idx_lifecycle_effects_status_lease;
+            ALTER TABLE lifecycle_operation_effects
+                RENAME TO lifecycle_operation_effects_legacy_identity;
+            CREATE TABLE lifecycle_operation_effects (
+                effect_id TEXT PRIMARY KEY,
+                operation_digest TEXT NOT NULL,
+                operation_epoch INTEGER NOT NULL,
+                operation_kind TEXT NOT NULL,
+                effect_kind TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                run_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                lease_owner TEXT NOT NULL DEFAULT '',
+                lease_epoch INTEGER NOT NULL DEFAULT 0,
+                lease_expires_at TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error_code TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                applied_at TEXT,
+                UNIQUE(
+                    operation_digest, operation_epoch, operation_kind,
+                    effect_kind, worker_id, run_id
+                )
+            );
+            """
+        )
+        # Model a crash after only one row was copied into the new table.
+        conn.execute(
+            """
+            INSERT INTO lifecycle_operation_effects (
+                effect_id, operation_digest, operation_epoch, operation_kind,
+                effect_kind, worker_id, run_id, status, lease_owner,
+                lease_epoch, lease_expires_at, attempts, last_error_code,
+                created_at, updated_at, applied_at
+            )
+            SELECT
+                effect_id, operation_digest, operation_epoch, operation_kind,
+                effect_kind, worker_id, run_id, status, lease_owner,
+                lease_epoch, lease_expires_at, attempts, last_error_code,
+                created_at, updated_at, applied_at
+            FROM lifecycle_operation_effects_legacy_identity
+            WHERE effect_id = ?
+            """,
+            (effect_ids[0],),
+        )
+
+    recovered = Store(str(db_path))
+    rows = recovered.list_lifecycle_operation_effects(worker_id=worker["worker_id"])
+    assert [row["effect_id"] for row in rows] == effect_ids
+    applying = next(row for row in rows if row["effect_id"] == effect_ids[1])
+    assert applying["status"] == "applying"
+    assert applying["lease_owner"] == "executor-a"
+    assert applying["lease_epoch"] == 4
+    assert applying["lease_expires_at"] == "2026-08-13T16:00:00+00:00"
+    assert applying["attempts"] == 2
+    assert applying["last_error_code"] == "transient_dependency"
+    applied = next(row for row in rows if row["effect_id"] == effect_ids[2])
+    assert applied["status"] == "applied"
+    assert applied["lease_epoch"] == 7
+    assert applied["attempts"] == 3
+    assert applied["applied_at"] == "2026-08-13T15:00:00+00:00"
+    with recovered._connect() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'lifecycle_operation_effects_legacy_identity'"
+        ).fetchone() is None
+
+    recovered_again = Store(str(db_path))
+    assert len(
+        recovered_again.list_lifecycle_operation_effects(
+            worker_id=worker["worker_id"]
+        )
+    ) == 3
 
 
 def test_terminal_callback_message_prefers_final_report():
@@ -279,6 +754,95 @@ def test_user_preferences_are_scoped_and_validate_profile_allowlist(tmp_path, mo
     assert "not allowed" in rejected.text
 
 
+def test_local_service_identity_cannot_cross_owner_project_worker_or_run_scope(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("WPR_API_TOKEN", "service-token")
+    app = create_app(
+        db_path=str(tmp_path / "local-owner-scope.db"),
+        runtime_backend="stub",
+        reconcile_on_startup=False,
+    )
+    app.state.service._ensure_worker_processor = lambda _worker_id: None
+    client = TestClient(app)
+    owner_a = {
+        "Authorization": "Bearer service-token",
+        "X-Viventium-Tenant-Id": "tenant-local",
+        "X-Viventium-User-Id": "owner-a",
+    }
+    owner_b = {
+        "Authorization": "Bearer service-token",
+        "X-Viventium-Tenant-Id": "tenant-local",
+        "X-Viventium-User-Id": "owner-b",
+    }
+
+    created_project = client.post(
+        "/v1/projects",
+        headers=owner_a,
+        json={"owner_id": "forged-owner", "title": "Owner A", "goal": "Scoped work"},
+    )
+    assert created_project.status_code == 201
+    project = created_project.json()
+    assert project["owner_id"] == "owner-a"
+    created_worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=owner_a,
+        json={
+            "owner_id": "owner-b",
+            "name": "Owner A worker",
+            "role": "Scoped worker",
+            "profile": "codex-cli",
+            "start_synchronously": False,
+        },
+    )
+    assert created_worker.status_code == 201
+    worker = created_worker.json()
+    assert worker["owner_id"] == "owner-a"
+    assigned = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        headers=owner_a,
+        json={"instruction": "Do owner A work."},
+    )
+    assert assigned.status_code == 202
+    run = assigned.json()
+
+    assert [item["project_id"] for item in client.get("/v1/projects", headers=owner_b).json()["items"]] == []
+    for path in (
+        f"/v1/projects/{project['project_id']}",
+        f"/v1/projects/{project['project_id']}/workers",
+        f"/v1/workers/{worker['worker_id']}",
+        f"/v1/runs/{run['run_id']}",
+    ):
+        assert client.get(path, headers=owner_b).status_code == 404
+    assert client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=owner_b,
+        json={
+            "owner_id": "owner-b",
+            "name": "Intruder",
+            "role": "Must not attach",
+            "profile": "codex-cli",
+            "start_synchronously": False,
+        },
+    ).status_code == 404
+    assert client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        headers=owner_b,
+        json={"instruction": "Cross-owner assignment"},
+    ).status_code == 404
+    assert client.post(
+        f"/v1/workers/{worker['worker_id']}/pause", headers=owner_b
+    ).status_code == 404
+    with pytest.raises(WebSocketDisconnect) as cross_owner_terminal:
+        with client.websocket_connect(
+            f"/ws/workers/{worker['worker_id']}/terminal",
+            headers=owner_b,
+        ):
+            pass
+    assert cross_owner_terminal.value.code == 4404
+
+
 def test_terminal_callback_message_uses_line_anchored_final_report_marker():
     output = "\n".join(
         [
@@ -296,6 +860,28 @@ def test_terminal_callback_message_accepts_inline_final_report_marker():
     output = "Progress that should not surface.\nFINAL REPORT: Captured 42 rows."
 
     assert terminal_callback_message(output) == "Captured 42 rows."
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "**FINAL REPORT:**",
+        "## FINAL REPORT:",
+        "> _FINAL REPORT:_",
+    ],
+)
+def test_terminal_callback_message_strips_markdown_final_report_marker(marker):
+    output = f"Progress that should not surface.\n{marker}\nCaptured 42 rows."
+
+    assert terminal_callback_message(output) == "Captured 42 rows."
+
+
+def test_terminal_callback_message_preserves_bold_content_after_plain_marker():
+    output = "FINAL REPORT:\n\n**Neighborhood Book Swap**\nFive steps follow."
+
+    assert terminal_callback_message(output) == (
+        "**Neighborhood Book Swap**\nFive steps follow."
+    )
 
 
 def test_terminal_callback_message_uses_tail_without_mid_word_fragment():
@@ -695,7 +1281,14 @@ def test_retryable_host_busy_waits_and_retries_without_terminal_failure(tmp_path
 
         run = service.assign_run(worker["worker_id"], "finish when capacity is free")
 
-        wait_until(lambda: (store.get_run(run["run_id"]) or {}).get("retry_attempts") == 1)
+        wait_until(
+            lambda: (
+                (store.get_run(run["run_id"]) or {}).get("state") == "queued"
+                and (store.get_run(run["run_id"]) or {}).get("failure_class")
+                == "host_worker_busy"
+                and bool((store.get_run(run["run_id"]) or {}).get("retry_after"))
+            )
+        )
         waiting = store.get_run(run["run_id"])
         assert waiting["state"] == "queued"
         assert waiting["failure_class"] == "host_worker_busy"
@@ -717,17 +1310,566 @@ def test_retryable_host_busy_waits_and_retries_without_terminal_failure(tmp_path
         completed = store.get_run(run["run_id"])
         assert completed["state"] == "completed"
         assert "Completed after capacity wait" in completed["output_text"]
+        assert completed["failure_class"] == ""
+        assert completed["failure_retryable"] == 0
+        assert completed["failure_structured"] == 0
+        assert completed["failure_user_message"] == ""
+        assert completed["failure_recommended_recovery"] == ""
+        assert completed["failure_diagnostic_summary"] == ""
+        assert completed["retry_after"] is None
+        assert completed["retry_attempts"] == 0
+        assert completed["last_retry_class"] == "host_worker_busy"
         assert runtime.run_calls == 1
         assert not any(payload.get("event") == "run.failed" for payload in payloads)
+        wait_until(
+            lambda: any(payload.get("event") == "run.completed" for payload in payloads),
+            timeout=3.0,
+        )
+        completed_payload = next(
+            payload for payload in payloads if payload.get("event") == "run.completed"
+        )
+        assert "failure_code" not in completed_payload
+        assert "failure_class" not in completed_payload
+        assert "failure_retryable" not in completed_payload
     finally:
         service.shutdown()
 
 
-def test_retryable_capacity_wait_has_max_attempts(tmp_path, monkeypatch):
+def test_structured_provider_rate_limit_honors_retry_after_without_model_downgrade(
+    tmp_path, monkeypatch
+):
+    class RateLimitedOnceRuntime(StubRuntime):
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec: float | None = None,
+            run_id: str | None = None,
+        ) -> str:
+            bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
+            self.calls.append(
+                (
+                    str(worker.get("model") or ""),
+                    str(bundle.get("reasoning_effort") or ""),
+                )
+            )
+            if len(self.calls) == 1:
+                raise ProviderRateLimitError(
+                    "Structured provider 429",
+                    retry_after_s=0.2,
+                )
+            return "RATE_LIMIT_RETRY_OK"
+
+    monkeypatch.setenv("GLASSHIVE_RETRY_BASE_DELAY_S", "0.05")
+    monkeypatch.setenv("GLASSHIVE_RETRY_MAX_DELAY_S", "1")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = RateLimitedOnceRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = service.create_project(
+            "owner", "Rate limit", "Honor provider Retry-After.", "codex-cli"
+        )
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Rate Limited Worker",
+            role="worker",
+            profile="codex-cli",
+            backend="codex-cli",
+            bootstrap_bundle={"reasoning_effort": "high"},
+        )
+        run = service.assign_run(worker["worker_id"], "Retry exactly once.")
+        wait_until(
+            lambda: (
+                (store.get_run(run["run_id"]) or {}).get("state") == "queued"
+                and (store.get_run(run["run_id"]) or {}).get("failure_class")
+                == "provider_rate_limited"
+                and bool((store.get_run(run["run_id"]) or {}).get("retry_after"))
+            )
+        )
+        waiting = store.get_run(run["run_id"])
+        retry_at = datetime.fromisoformat(waiting["retry_after"])
+        assert retry_at - datetime.now(timezone.utc) >= timedelta(seconds=0.15)
+        assert waiting["state"] == "queued"
+        assert waiting["failure_class"] == "provider_rate_limited"
+        assert waiting["last_retry_class"] == "provider_rate_limited"
+
+        wait_until(
+            lambda: (store.get_run(run["run_id"]) or {}).get("state") == "completed",
+            timeout=3,
+        )
+        assert runtime.calls == [
+            (worker["model"], "high"),
+            (worker["model"], "high"),
+        ]
+    finally:
+        service.shutdown()
+
+
+def test_future_capacity_retry_does_not_resubmit_processor_or_create_timer(tmp_path, monkeypatch):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), max_workers=1)
+    try:
+        project = store.create_project("owner", "Future Retry", "Wait without spinning.", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Future Retry Worker",
+            role="worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+        )
+        run = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "wait until capacity is available",
+            state="queued",
+        )
+        retry_after = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        store.update_run(run["run_id"], retry_after=retry_after)
+
+        immediate_restarts: list[str] = []
+        timer_requests: list[tuple[str, float]] = []
+        service._ensure_worker_processor = lambda worker_id: immediate_restarts.append(worker_id)  # type: ignore[method-assign]
+        service._wake_worker_processor_later = (  # type: ignore[method-assign]
+            lambda worker_id, delay_s: timer_requests.append((worker_id, delay_s))
+        )
+        generation = 1
+        service._active_processors.add(worker["worker_id"])
+        service._processor_generations[worker["worker_id"]] = generation
+
+        service._process_worker_queue(worker["worker_id"], generation)
+
+        assert immediate_restarts == []
+        assert timer_requests == []
+        assert (store.get_run(run["run_id"]) or {})["state"] == "queued"
+    finally:
+        service.shutdown()
+
+
+def test_single_scheduler_wakes_each_due_retry_worker_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "3600")
+    scheduler_started = Event()
+    monkeypatch.setattr(
+        WorkersProjectsService,
+        "_process_scheduler_cycle",
+        lambda self: scheduler_started.set(),
+    )
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), max_workers=1)
+    try:
+        assert scheduler_started.wait(1)
+        due_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        future_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        due_worker_ids: list[str] = []
+        future_worker_id = ""
+        for index in range(25):
+            project = store.create_project(
+                "owner",
+                f"Retry Project {index}",
+                "Wake due retries without one timer per run.",
+                "codex-cli",
+            )
+            worker = store.create_worker(
+                project_id=project["project_id"],
+                owner_id="owner",
+                name=f"Retry Worker {index}",
+                role="worker",
+                profile="codex-cli",
+                backend="openclaw",
+                runtime="codex-cli",
+                model="stub/codex-cli",
+            )
+            run = store.create_run(
+                worker["worker_id"],
+                project["project_id"],
+                f"retry {index}",
+                state="queued",
+            )
+            is_future = index == 24
+            store.update_run(run["run_id"], retry_after=future_at if is_future else due_at)
+            if is_future:
+                future_worker_id = worker["worker_id"]
+            else:
+                due_worker_ids.append(worker["worker_id"])
+
+        restart_requests: list[str] = []
+        service._ensure_worker_processor = lambda worker_id: restart_requests.append(worker_id)  # type: ignore[method-assign]
+
+        processed = service.process_due_worker_retries_once(limit=100)
+
+        assert set(processed) == set(due_worker_ids)
+        assert restart_requests == due_worker_ids
+        assert future_worker_id not in restart_requests
+    finally:
+        service.shutdown()
+
+
+def test_persisted_future_retry_wakes_after_service_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SCHEDULER_INTERVAL_S", "60")
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    project = store.create_project("owner", "Restart Retry", "Resume a persisted retry.", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Restart Retry Worker",
+        role="worker",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="stub/codex-cli",
+    )
+    run = store.create_run(
+        worker["worker_id"],
+        project["project_id"],
+        "resume after restart",
+        state="queued",
+    )
+    store.update_run(
+        run["run_id"],
+        retry_after=(datetime.now(timezone.utc) + timedelta(seconds=0.15)).isoformat(),
+    )
+
+    restarted = WorkersProjectsService(Store(str(db_path)), StubRuntime(), max_workers=1)
+    try:
+        wait_until(
+            lambda: (restarted.store.get_run(run["run_id"]) or {}).get("state") == "completed",
+            timeout=2.0,
+        )
+        completed = restarted.store.get_run(run["run_id"])
+        assert completed["state"] == "completed"
+        assert "resume after restart" in completed["output_text"]
+    finally:
+        restarted.shutdown()
+
+
+def test_hundreds_of_future_capacity_retries_do_not_create_retry_threads(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_HOST_BUSY_RETRY_BASE_DELAY_S", "300")
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), max_workers=1)
+    try:
+        project = store.create_project(
+            "owner",
+            "Capacity Backlog",
+            "Keep a large persisted backlog on one scheduler.",
+            "codex-cli",
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Capacity Backlog Worker",
+            role="worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+        )
+        baseline_threads = active_count()
+        capacity_error = RuntimeErrorBase("synthetic host capacity contention")
+        failure_fields = {
+            "failure_class": "host_worker_busy",
+            "failure_retryable": 1,
+            "failure_structured": 1,
+            "failure_user_message": "The worker is waiting for host capacity.",
+            "failure_recommended_recovery": "Wait for capacity.",
+            "failure_diagnostic_summary": "Synthetic capacity wait.",
+        }
+
+        for index in range(200):
+            run = store.create_run(
+                worker["worker_id"],
+                project["project_id"],
+                f"capacity retry {index}",
+                state="running",
+            )
+            service._requeue_retryable_run(
+                worker,
+                run,
+                capacity_error,
+                failure_fields=failure_fields,
+            )
+
+        queued = store.list_runs_for_worker(worker["worker_id"], limit=250)
+        assert len([run for run in queued if run["state"] == "queued"]) == 200
+        assert all(run["retry_after"] for run in queued)
+        assert active_count() <= baseline_threads + 1
+    finally:
+        service.shutdown()
+
+
+def test_retry_scheduler_boundary_rechecks_immediately_when_deadline_just_crossed(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), max_workers=1)
+    try:
+        service.store.next_queued_retry_after = (  # type: ignore[method-assign]
+            lambda now_iso=None: (datetime.now(timezone.utc) - timedelta(milliseconds=1)).isoformat()
+        )
+        assert service._next_scheduler_wait_s(3600) <= 0.05
+    finally:
+        service.shutdown()
+
+
+def test_retry_scheduler_excludes_non_dispatchable_workers_before_limit(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    due_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    eligible_worker_id = ""
+    for index, state in enumerate(
+        ("paused", "needs_input", "stopping", "terminated", "ready")
+    ):
+        project = store.create_project(
+            "owner",
+            f"Worker State {index}",
+            "Do not let ineligible retries starve ready work.",
+            "codex-cli",
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name=f"Worker State {index}",
+            role="worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+        )
+        run = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            f"retry {state}",
+            state="queued",
+        )
+        store.update_run(run["run_id"], retry_after=due_at)
+        store.update_worker(worker["worker_id"], state=state)
+        if state == "ready":
+            eligible_worker_id = worker["worker_id"]
+
+    assert store.list_due_retry_worker_ids(limit=1) == [eligible_worker_id]
+
+
+def test_needs_input_worker_with_queued_followup_does_not_resubmit_processor(
+    tmp_path,
+):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(
+        store,
+        StubRuntime(),
+        max_workers=1,
+        reconcile_on_startup=False,
+    )
+    try:
+        project = store.create_project(
+            "owner",
+            "Needs input queue",
+            "Wait for the operator without spinning.",
+            "codex-cli",
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Needs input worker",
+            role="worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+        )
+        store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "blocked source",
+            state="needs_input",
+        )
+        followup = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "queued follow-up",
+            state="queued",
+        )
+        store.update_worker(worker["worker_id"], state="needs_input")
+
+        resubmissions: list[str] = []
+        service._ensure_worker_processor = (  # type: ignore[method-assign]
+            lambda worker_id: resubmissions.append(worker_id)
+        )
+        generation = 1
+        service._active_processors.add(worker["worker_id"])
+        service._processor_generations[worker["worker_id"]] = generation
+
+        service._process_worker_queue(worker["worker_id"], generation)
+
+        assert resubmissions == []
+        assert (store.get_run(followup["run_id"]) or {})["state"] == "queued"
+        assert store.list_due_retry_worker_ids() == []
+    finally:
+        service.shutdown()
+
+
+@pytest.mark.parametrize("worker_state", ["paused", "needs_input", "stopping", "terminated"])
+def test_non_dispatchable_worker_never_consumes_processor_slot(tmp_path, worker_state):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(
+        store,
+        StubRuntime(),
+        max_workers=1,
+        reconcile_on_startup=False,
+    )
+    try:
+        project = store.create_project(
+            "owner",
+            f"{worker_state} queue",
+            "Remain dormant until a valid lifecycle transition.",
+            "codex-cli",
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name=f"{worker_state} worker",
+            role="worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+        )
+        store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "queued follow-up",
+            state="queued",
+        )
+        store.update_worker(worker["worker_id"], state=worker_state)
+
+        submissions: list[tuple] = []
+        service.executor.submit = (  # type: ignore[method-assign]
+            lambda *args, **kwargs: submissions.append((args, kwargs))
+        )
+
+        service._ensure_worker_processor(worker["worker_id"])
+
+        assert submissions == []
+        assert worker["worker_id"] not in service._active_processors
+    finally:
+        service.shutdown()
+
+
+def test_retry_scheduler_does_not_dispatch_after_shutdown_begins(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), max_workers=1)
+    try:
+        project = store.create_project("owner", "Shutdown Retry", "Stay stopped.", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Shutdown Retry Worker",
+            role="worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+        )
+        run = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "must not start after shutdown",
+            state="queued",
+        )
+        store.update_run(
+            run["run_id"],
+            retry_after=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        )
+        service._shutdown_event.set()
+        restart_requests: list[str] = []
+        service._ensure_worker_processor = lambda worker_id: restart_requests.append(worker_id)  # type: ignore[method-assign]
+
+        assert service.process_due_worker_retries_once() == []
+        assert restart_requests == []
+        assert (store.get_run(run["run_id"]) or {})["state"] == "queued"
+    finally:
+        service.shutdown()
+
+
+def test_scheduler_cycle_contains_one_phase_failure_and_runs_the_other(tmp_path, caplog):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), max_workers=1)
+    try:
+        retry_phase_calls: list[bool] = []
+
+        def fail_schedule_phase():
+            raise sqlite3.OperationalError("synthetic scheduler read failure")
+
+        service.process_due_schedules_once = fail_schedule_phase  # type: ignore[method-assign]
+        service.process_due_worker_retries_once = (  # type: ignore[method-assign]
+            lambda **kwargs: retry_phase_calls.append(True) or []
+        )
+
+        with caplog.at_level(logging.ERROR):
+            service._process_scheduler_cycle()
+
+        assert retry_phase_calls == [True]
+        assert "GlassHive scheduler phase failed" in caplog.text
+    finally:
+        service.shutdown()
+
+
+def test_scheduler_wait_lookup_failure_uses_interval_and_stays_observable(tmp_path, caplog):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), max_workers=1)
+    try:
+        def fail_retry_lookup(now_iso=None):
+            _ = now_iso
+            raise sqlite3.OperationalError("synthetic retry deadline read failure")
+
+        service.store.next_queued_retry_after = fail_retry_lookup  # type: ignore[method-assign]
+        with caplog.at_level(logging.ERROR):
+            wait_s = service._safe_next_scheduler_wait_s(17)
+
+        assert wait_s == 17
+        assert "GlassHive scheduler wait calculation failed" in caplog.text
+    finally:
+        service.shutdown()
+
+
+def test_shutdown_during_scheduler_cycle_terminates_scheduler_thread(tmp_path, monkeypatch):
+    cycle_started = Event()
+    release_cycle = Event()
+
+    def block_scheduler_cycle(self):
+        cycle_started.set()
+        release_cycle.wait(2)
+
+    monkeypatch.setattr(WorkersProjectsService, "_process_scheduler_cycle", block_scheduler_cycle)
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), max_workers=1)
+    assert cycle_started.wait(1)
+
+    shutdown_thread = Thread(target=service.shutdown)
+    shutdown_thread.start()
+    try:
+        assert service._shutdown_event.wait(1)
+        release_cycle.set()
+        shutdown_thread.join(timeout=2)
+        assert not shutdown_thread.is_alive()
+        assert not service._scheduler_thread.is_alive()
+    finally:
+        release_cycle.set()
+        shutdown_thread.join(timeout=2)
+        if shutdown_thread.is_alive():
+            service.shutdown()
+
+
+def test_structured_capacity_wait_never_exhausts_a_fixed_retry_budget(tmp_path, monkeypatch):
     class AlwaysBusyRuntime(StubRuntime):
         def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
             _ = worker
-            return RuntimeErrorBase("Host-native codex-cli already has an active worker (wrk_busy123456).")
+            return HostCapacityError(
+                "Host mission lane is full.",
+                capacity_class="family_lane",
+            )
 
         def run_task(
             self,
@@ -781,21 +1923,39 @@ def test_retryable_capacity_wait_has_max_attempts(tmp_path, monkeypatch):
             },
         )
 
-        run = service.assign_run(worker["worker_id"], "wait, but not forever")
+        run = service.assign_run(worker["worker_id"], "wait until capacity is available")
 
-        wait_until(lambda: (store.get_run(run["run_id"]) or {}).get("state") == "failed", timeout=3.0)
-        failed = store.get_run(run["run_id"])
-        assert failed["retry_attempts"] == 1
-        assert failed["failure_class"] == "host_worker_busy"
-        assert failed["failure_retryable"] == 0
-        assert failed["retry_after"] is None
-        assert "stopped retrying" in failed["failure_user_message"]
+        wait_until(
+            lambda: len(
+                [
+                    event
+                    for event in store.list_events(worker["worker_id"])
+                    if event["event_type"] == "run.waiting_on_capacity"
+                ]
+            )
+            >= 2,
+            timeout=3.0,
+        )
+        waiting = store.get_run(run["run_id"])
+        assert waiting["state"] == "queued"
+        assert waiting["retry_attempts"] == 0
+        assert waiting["failure_class"] == "host_capacity"
+        assert waiting["failure_retryable"] == 1
+        assert waiting["retry_after"]
         assert (store.get_worker(worker["worker_id"]) or {})["state"] == "ready"
-        assert len([payload for payload in payloads if payload.get("event") == "run.waiting_on_capacity"]) == 1
-        wait_until(lambda: any(payload.get("event") == "run.failed" for payload in payloads), timeout=3.0)
-        failed_payloads = [payload for payload in payloads if payload.get("event") == "run.failed"]
-        assert len(failed_payloads) == 1
-        assert "stopped retrying" in failed_payloads[0]["message"]
+        wait_until(
+            lambda: len(
+                [
+                    payload
+                    for payload in payloads
+                    if payload.get("event") == "run.waiting_on_capacity"
+                ]
+            )
+            >= 2,
+            timeout=3.0,
+        )
+        assert len([payload for payload in payloads if payload.get("event") == "run.waiting_on_capacity"]) >= 2
+        assert not [payload for payload in payloads if payload.get("event") == "run.failed"]
     finally:
         service.shutdown()
 
@@ -886,7 +2046,6 @@ def test_project_worker_lifecycle_with_stub_runtime(tmp_path):
     message_run = wait_for_run(client, message_resp.json()["run_id"])
     assert message_run["state"] == "completed"
     assert "Operator message" in message_run["instruction"]
-
     events_resp = client.get(f"/v1/workers/{worker_id}/events")
     assert events_resp.status_code == 200
     assert len(events_resp.json()["items"]) >= 6
@@ -903,6 +2062,40 @@ def test_project_worker_lifecycle_with_stub_runtime(tmp_path):
     assert metrics["runs"] == 2
     assert metrics["queued_runs"] == 0
     assert metrics["events"] >= 7
+
+
+def test_assign_idempotency_key_reuses_one_durable_run(tmp_path):
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "synthetic-owner", "title": "Synthetic", "goal": "Test idempotency"},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "synthetic-owner",
+            "name": "Synthetic Worker",
+            "role": "general",
+            "profile": "openclaw-general",
+            "backend": "openclaw",
+        },
+    ).json()
+    headers = {"x-glasshive-idempotency-key": "scheduled-occurrence-synthetic"}
+    first = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        headers=headers,
+        json={"instruction": "Perform the synthetic scheduled task."},
+    )
+    duplicate = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        headers=headers,
+        json={"instruction": "Perform the synthetic scheduled task."},
+    )
+    assert first.status_code == 202
+    assert duplicate.status_code == 202
+    assert duplicate.json()["run_id"] == first.json()["run_id"]
+    runs = client.get(f"/v1/workers/{worker['worker_id']}/runs").json()["items"]
+    assert [run["run_id"] for run in runs].count(first.json()["run_id"]) == 1
 
 
 def test_api_uses_configured_default_worker_profile_when_project_omits_it(tmp_path, monkeypatch):
@@ -1195,7 +2388,9 @@ def test_enterprise_mode_scopes_projects_workers_and_artifacts(tmp_path, monkeyp
     assert signed_live.status_code == 200
     assert signed_live.json()["worker"]["owner_id"] == "user-a"
     signed_pause = client.post(f"/v1/workers/{worker_a_payload['worker_id']}/pause?{signed_watch_query}")
-    assert signed_pause.status_code == 202
+    # A view link is intentionally read-only; account/run-action capabilities
+    # own mutations and cannot be forged from a shareable watch URL.
+    assert signed_pause.status_code == 401
     forged_signed_download = client.get(
         f"/v1/workers/{worker_a_payload['worker_id']}/artifacts/download",
         params={"path": "../runtime.db", **signed},
@@ -1333,7 +2528,7 @@ def test_enterprise_opaque_signed_links_reject_tamper_expiry_and_mismatch(tmp_pa
     assert client.get(f"/v1/signed-links/{expired}").status_code == 401
 
 
-def test_enterprise_short_worker_view_ref_can_auto_resume_when_configured(tmp_path, monkeypatch):
+def test_enterprise_short_worker_view_ref_stays_read_only_when_legacy_auto_resume_is_configured(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
@@ -1384,9 +2579,9 @@ def test_enterprise_short_worker_view_ref_can_auto_resume_when_configured(tmp_pa
     assert redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
     assert "gh_token=" not in redirect.headers["location"]
     live = client.get(f"/v1/workers/{worker['worker_id']}/live", headers=headers).json()
-    assert live["worker"]["state"] == "ready"
+    assert live["worker"]["state"] == "paused"
     assert any(event["event_type"] == "worker.view_opened" for event in live["events"])
-    assert any(event["event_type"] == "worker.resumed" for event in live["events"])
+    assert not any(event["event_type"] == "worker.resumed" for event in live["events"])
 
 
 def test_link_refs_are_redacted_deduplicated_and_secret_rotation_bound(monkeypatch):
@@ -1490,6 +2685,134 @@ def test_terminate_revokes_worker_link_refs(tmp_path, monkeypatch):
 
     assert client.post(f"/v1/workers/{worker['worker_id']}/terminate", headers=headers).status_code == 202
     assert resolve_signed_link_ref(ref_id) is None
+
+
+@pytest.mark.parametrize("ambient_runtime_db", ["unset", "mismatched"])
+def test_terminated_worker_artifact_credentials_fail_closed_when_revocation_sink_is_unavailable(
+    tmp_path,
+    monkeypatch,
+    ambient_runtime_db,
+):
+    """The app-bound worker row, not ambient/tombstone state, revokes old links."""
+
+    runtime_db = tmp_path / "authoritative" / "runtime.db"
+    missing_ambient_db = tmp_path / "ambient" / "wrong-runtime.db"
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    if ambient_runtime_db == "unset":
+        monkeypatch.delenv("WPR_DB_PATH", raising=False)
+    else:
+        monkeypatch.setenv("WPR_DB_PATH", str(missing_ambient_db))
+
+    app = create_app(str(runtime_db), runtime_backend="stub", runtime=StubRuntime())
+    client = TestClient(app)
+    service_headers = {"X-WPR-Token": "service-secret"}
+    project = client.post(
+        "/v1/projects",
+        headers=service_headers,
+        json={
+            "owner_id": "demo-owner",
+            "title": "Authoritative link revocation",
+            "goal": "Reject every old artifact credential after termination.",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=service_headers,
+        json={
+            "owner_id": "demo-owner",
+            "name": "Revocation worker",
+            "role": "writer",
+            "profile": "codex-cli",
+        },
+    ).json()
+    artifact = Path(worker["workspace_dir"]) / "result.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    secret_bytes = b"authoritative artifact bytes"
+    artifact.write_bytes(secret_bytes)
+
+    opaque_token = sign_link_token(
+        kind="artifact_download",
+        worker_id=worker["worker_id"],
+        tenant_id=worker["tenant_id"],
+        owner_id=worker["owner_id"],
+        path="result.txt",
+    )
+    opaque_ref = create_signed_link_ref(token=opaque_token)
+    legacy_query = sign_link_params(
+        kind="artifact_download",
+        worker_id=worker["worker_id"],
+        tenant_id=worker["tenant_id"],
+        owner_id=worker["owner_id"],
+        path="result.txt",
+    )
+    legacy_path = f"/v1/workers/{worker['worker_id']}/artifacts/download"
+    legacy_params = {"path": "result.txt", **legacy_query}
+    view_token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id=worker["tenant_id"],
+        owner_id=worker["owner_id"],
+    )
+    view_ref = create_signed_link_ref(
+        token=view_token,
+        target_url=f"/watch/{worker['worker_id']}?surface=desktop&gh_token={view_token}",
+    )
+    legacy_view_query = sign_link_params(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id=worker["tenant_id"],
+        owner_id=worker["owner_id"],
+    )
+
+    # The same credentials remain valid while their authoritative worker is live.
+    before_termination = (
+        client.get(f"/v1/signed-links/{opaque_token}"),
+        client.get(f"/v1/link-refs/{opaque_ref}"),
+        client.get(legacy_path, params=legacy_params),
+    )
+    assert [response.status_code for response in before_termination] == [200, 200, 200]
+    assert all(response.content == secret_bytes for response in before_termination)
+    assert client.get(
+        f"/v1/workers/{worker['worker_id']}/live",
+        params=legacy_view_query,
+    ).status_code == 200
+    assert client.get(f"/r/{view_ref}", follow_redirects=False).status_code == 307
+    assert client.get(f"/w/{view_ref}").status_code == 200
+
+    def fail_revocation_sink(_worker_id: str) -> int:
+        raise sqlite3.OperationalError("synthetic revocation sink failure")
+
+    monkeypatch.setitem(
+        WorkersProjectsService._apply_lifecycle_effect.__globals__,
+        "revoke_signed_link_refs_for_worker",
+        fail_revocation_sink,
+    )
+    terminated = client.post(
+        f"/v1/workers/{worker['worker_id']}/terminate",
+        headers=service_headers,
+    )
+    assert terminated.status_code == 202
+    assert app.state.store.get_worker(worker["worker_id"])["state"] == "terminated"
+    assert client.post(
+        f"/v1/workers/{worker['worker_id']}/view-opened",
+        headers=service_headers,
+    ).status_code != 204
+
+    after_termination = (
+        client.get(f"/v1/signed-links/{opaque_token}"),
+        client.get(f"/v1/link-refs/{opaque_ref}"),
+        client.get(legacy_path, params=legacy_params),
+    )
+    assert all(response.status_code != 200 for response in after_termination)
+    assert all(secret_bytes not in response.content for response in after_termination)
+    assert client.get(
+        f"/v1/workers/{worker['worker_id']}/live",
+        params=legacy_view_query,
+    ).status_code != 200
+    assert client.get(f"/r/{view_ref}", follow_redirects=False).status_code != 307
+    assert client.get(f"/w/{view_ref}").status_code != 200
+    assert not missing_ambient_db.exists()
 
 
 def test_enterprise_short_artifact_ref_is_auth_gated_and_durable_by_default(tmp_path, monkeypatch):
@@ -2663,6 +3986,2898 @@ def test_idle_reaper_preserves_completed_worker_state(tmp_path, monkeypatch):
         service.shutdown()
 
 
+def test_provider_needs_input_releases_compute_and_preserves_attention_state(
+    tmp_path,
+):
+    class NeedsInputRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminated: list[str] = []
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated.append(worker["worker_id"])
+            return RuntimeInfo(
+                runtime=str(worker.get("runtime") or "openclaw-stub"),
+                model=str(worker.get("model") or "stub-model"),
+                gateway_url="",
+                gateway_port=None,
+                gateway_token=None,
+                session_key=str(worker.get("session_key") or ""),
+                state_dir=str(worker.get("state_dir") or ""),
+                workspace_dir=str(worker.get("workspace_dir") or ""),
+                pid=None,
+            )
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = NeedsInputRuntime()
+    service = WorkersProjectsService(
+        store,
+        runtime,
+        reconcile_on_startup=False,
+    )
+    try:
+        project = service.create_project(
+            "owner",
+            "Needs input release",
+            "Release compute without losing attention state",
+            "openclaw-general",
+        )
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Needs input worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+        )
+        run = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "Await provider authorization",
+            state="running",
+        )
+        store.update_worker(
+            worker["worker_id"],
+            state="running",
+            last_run_id=run["run_id"],
+        )
+
+        service._apply_recovered_run(
+            store.get_worker(worker["worker_id"]) or worker,
+            store.get_run(run["run_id"]) or run,
+            {
+                "state": "needs_input",
+                "error_text": "Synthetic connected model authorization is unavailable",
+                "failure_class": "provider_auth_projection_unavailable",
+                "failure_user_message": "Connect a model account, then resume this work.",
+            },
+        )
+
+        durable_run = store.get_run(run["run_id"])
+        durable_worker = store.get_worker(worker["worker_id"])
+        assert durable_run and durable_run["state"] == "needs_input"
+        assert durable_worker and durable_worker["state"] == "needs_input"
+        assert durable_worker["compute_released_at"]
+        assert durable_worker["compute_release_token"] == ""
+        assert runtime.terminated == [worker["worker_id"]]
+        assert any(
+            event["event_type"] == "worker.needs_input_compute_terminated"
+            for event in store.list_events(worker["worker_id"])
+        )
+    finally:
+        service.shutdown()
+
+
+def test_needs_input_reaper_releases_compute_with_queued_sibling(tmp_path):
+    class NeedsInputRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminated: list[str] = []
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated.append(worker["worker_id"])
+            return RuntimeInfo(
+                runtime=str(worker.get("runtime") or "openclaw-stub"),
+                model=str(worker.get("model") or "stub-model"),
+                gateway_url="",
+                gateway_port=None,
+                gateway_token=None,
+                session_key=str(worker.get("session_key") or ""),
+                state_dir=str(worker.get("state_dir") or ""),
+                workspace_dir=str(worker.get("workspace_dir") or ""),
+                pid=None,
+            )
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = NeedsInputRuntime()
+    service = WorkersProjectsService(
+        store,
+        runtime,
+        reconcile_on_startup=False,
+    )
+    try:
+        project = service.create_project(
+            "owner",
+            "Needs input recovery",
+            "Recover compute release after a crash",
+            "openclaw-general",
+        )
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Needs input recovery worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+        )
+        blocked = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "Blocked source",
+            state="needs_input",
+        )
+        queued = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "Queued sibling",
+            state="queued",
+        )
+        store.update_worker(
+            worker["worker_id"],
+            state="needs_input",
+            last_run_id=blocked["run_id"],
+        )
+
+        reaped = service.reap_needs_input_workers_once()
+
+        assert [item["worker_id"] for item in reaped] == [worker["worker_id"]]
+        assert runtime.terminated == [worker["worker_id"]]
+        durable_worker = store.get_worker(worker["worker_id"])
+        assert durable_worker and durable_worker["state"] == "needs_input"
+        assert durable_worker["compute_released_at"]
+        assert (store.get_run(blocked["run_id"]) or {})["state"] == "needs_input"
+        assert (store.get_run(queued["run_id"]) or {})["state"] == "queued"
+        assert service.reap_needs_input_workers_once() == []
+    finally:
+        service.shutdown()
+
+
+def test_failed_needs_input_release_recovers_exact_claim_after_expiry(tmp_path):
+    class RecoveringNeedsInputRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("synthetic container removal failure")
+            return RuntimeInfo(
+                runtime=str(worker.get("runtime") or "openclaw-stub"),
+                model=str(worker.get("model") or "stub-model"),
+                gateway_url="",
+                gateway_port=None,
+                gateway_token=None,
+                session_key=str(worker.get("session_key") or ""),
+                state_dir=str(worker.get("state_dir") or ""),
+                workspace_dir=str(worker.get("workspace_dir") or ""),
+                pid=None,
+            )
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = RecoveringNeedsInputRuntime()
+    service = WorkersProjectsService(
+        store,
+        runtime,
+        reconcile_on_startup=False,
+    )
+    try:
+        project = service.create_project(
+            "owner",
+            "Needs input release recovery",
+            "Recover exact compute release",
+            "openclaw-general",
+        )
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Needs input release recovery worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+        )
+        blocked = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "Blocked source",
+            state="needs_input",
+        )
+        queued = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "Queued sibling",
+            state="queued",
+        )
+        store.update_worker(
+            worker["worker_id"],
+            state="needs_input",
+            last_run_id=blocked["run_id"],
+        )
+
+        assert service.reap_needs_input_workers_once() == []
+        claimed = store.get_worker(worker["worker_id"])
+        assert claimed and claimed["compute_release_kind"] == "needs_input"
+        assert claimed["compute_release_token"]
+        assert runtime.calls == 1
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET compute_release_expires_at = ? WHERE worker_id = ?",
+                ("2000-01-01T00:00:00+00:00", worker["worker_id"]),
+            )
+
+        recovered = service.recover_expired_compute_release_claims_once()
+
+        assert [item["worker_id"] for item in recovered] == [worker["worker_id"]]
+        durable = store.get_worker(worker["worker_id"])
+        assert durable and durable["state"] == "needs_input"
+        assert durable["compute_released_at"]
+        assert durable["compute_release_token"] == ""
+        assert (store.get_run(queued["run_id"]) or {})["state"] == "queued"
+        assert runtime.calls == 2
+        assert service.recover_expired_compute_release_claims_once() == []
+        assert runtime.calls == 2
+    finally:
+        service.shutdown()
+
+
+def test_idle_reaper_release_claim_holds_concurrent_followup_until_finalize(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    other_store = Store(str(tmp_path / "runtime.db"))
+    queued_during_release: list[dict] = []
+
+    class RacingReaperRuntime(StubRuntime):
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            durable = other_store.get_worker(worker["worker_id"])
+            assert durable and durable["compute_release_token"]
+            queued = other_store.create_run(
+                worker["worker_id"], worker["project_id"], "Concurrent follow-up"
+            )
+            queued_during_release.append(queued)
+            assert other_store.claim_next_queued_run(worker["worker_id"]) is None
+            return RuntimeInfo(
+                runtime="openclaw-stub",
+                model="stub-model",
+                gateway_url="",
+                gateway_port=None,
+                gateway_token=None,
+                session_key=None,
+                state_dir=None,
+                workspace_dir=str(tmp_path / "preserved-workspace"),
+                pid=None,
+            )
+
+    project = store.create_project(
+        "owner", "Concurrent release", "Preserve queued work", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Concurrent release worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    terminal = store.create_run(
+        worker["worker_id"], project["project_id"], "Finished", state="completed"
+    )
+    store.update_worker(
+        worker["worker_id"], state="completed", last_run_id=terminal["run_id"]
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+            (
+                (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+                worker["worker_id"],
+            ),
+        )
+    service = WorkersProjectsService(
+        store, RacingReaperRuntime(), reconcile_on_startup=False
+    )
+    scheduled: list[str] = []
+    service._ensure_worker_processor = lambda worker_id: scheduled.append(worker_id)  # type: ignore[method-assign]
+    try:
+        reaped = service.reap_idle_workers_once()
+
+        assert [item["worker_id"] for item in reaped] == [worker["worker_id"]]
+        assert len(queued_during_release) == 1
+        queued = store.get_run(queued_during_release[0]["run_id"])
+        assert queued and queued["state"] == "queued"
+        refreshed = store.get_worker(worker["worker_id"])
+        assert refreshed and refreshed["compute_release_token"] == ""
+        assert refreshed["compute_released_at"]
+        assert refreshed["state"] == "starting"
+        assert scheduled == [worker["worker_id"]]
+        claimed = other_store.claim_next_queued_run(worker["worker_id"])
+        assert claimed and claimed["run_id"] == queued["run_id"]
+    finally:
+        service.shutdown()
+
+
+def test_failed_release_claim_blocks_work_until_expired_restart_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    other_store = Store(str(tmp_path / "runtime.db"))
+    queued_during_release: list[dict] = []
+
+    class FailingReaperRuntime(StubRuntime):
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            queued_during_release.append(
+                other_store.create_run(
+                    worker["worker_id"], worker["project_id"], "Wait for recovery"
+                )
+            )
+            raise RuntimeError("synthetic container removal failure")
+
+    project = store.create_project(
+        "owner", "Failed release", "Recover safely", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Failed release worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    terminal = store.create_run(
+        worker["worker_id"], project["project_id"], "Finished", state="completed"
+    )
+    store.update_worker(
+        worker["worker_id"], state="completed", last_run_id=terminal["run_id"]
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+            (
+                (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+                worker["worker_id"],
+            ),
+        )
+    service = WorkersProjectsService(
+        store, FailingReaperRuntime(), reconcile_on_startup=False
+    )
+    try:
+        assert service.reap_idle_workers_once() == []
+        claimed_worker = store.get_worker(worker["worker_id"])
+        assert claimed_worker and claimed_worker["compute_release_token"]
+        assert claimed_worker["compute_released_at"] is None
+        assert other_store.claim_next_queued_run(worker["worker_id"]) is None
+    finally:
+        service.shutdown()
+
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE workers SET compute_release_expires_at = ? WHERE worker_id = ?",
+            (
+                (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+                worker["worker_id"],
+            ),
+        )
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        WorkersProjectsService,
+        "_ensure_worker_processor",
+        lambda _self, worker_id: scheduled.append(worker_id),
+    )
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "0")
+    monkeypatch.setenv("GLASSHIVE_PAUSED_TERMINATE_AFTER_S", "0")
+    monkeypatch.setenv("GLASSHIVE_MAX_RUN_DURATION_S", "0")
+    restarted = WorkersProjectsService(
+        other_store, StubRuntime(), reconcile_on_startup=False
+    )
+    try:
+        deadline = time.monotonic() + 2
+        while (
+            (other_store.get_worker(worker["worker_id"]) or {}).get(
+                "compute_release_token"
+            )
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        refreshed = other_store.get_worker(worker["worker_id"])
+        assert refreshed and refreshed["compute_release_token"] == ""
+        assert refreshed["compute_released_at"] is None
+        assert (other_store.get_run(queued_during_release[0]["run_id"]) or {})[
+            "state"
+        ] == "queued"
+        assert worker["worker_id"] in scheduled
+    finally:
+        restarted.shutdown()
+
+
+def test_expired_idle_release_abandons_stale_generation_when_follow_up_is_queued(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+
+    class ChangingGenerationRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.container_id = "a" * 64
+            self.fail_termination = True
+            self.termination_attempts: list[str] = []
+
+        def compute_identity(self, _worker: dict) -> dict[str, str]:
+            return {"container_id": self.container_id}
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.termination_attempts.append(
+                str(worker.get("_compute_release_container_id") or "")
+            )
+            if self.fail_termination:
+                raise RuntimeError("synthetic old-generation removal failure")
+            return super().terminate_worker(worker)
+
+    project = store.create_project(
+        "owner", "Stale idle claim", "Do not terminate newer work", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Stale idle claim worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    terminal = store.create_run(
+        worker["worker_id"], project["project_id"], "Finished", state="completed"
+    )
+    store.update_worker(
+        worker["worker_id"], state="completed", last_run_id=terminal["run_id"]
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+            (
+                (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+                worker["worker_id"],
+            ),
+        )
+
+    runtime = ChangingGenerationRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    scheduled: list[str] = []
+    service._ensure_worker_processor = lambda worker_id: scheduled.append(worker_id)  # type: ignore[method-assign]
+    try:
+        assert service.reap_idle_workers_once() == []
+        claimed = store.get_worker(worker["worker_id"])
+        assert claimed and claimed["compute_release_container_id"] == "a" * 64
+        queued = store.create_run(
+            worker["worker_id"], project["project_id"], "New work after failed release"
+        )
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET compute_release_expires_at = ? WHERE worker_id = ?",
+                (
+                    (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+                    worker["worker_id"],
+                ),
+            )
+        runtime.container_id = "b" * 64
+        runtime.fail_termination = False
+
+        assert service.recover_expired_compute_release_claims_once() == []
+
+        refreshed = store.get_worker(worker["worker_id"])
+        assert refreshed and refreshed["compute_release_token"] == ""
+        assert refreshed["compute_released_at"] is None
+        assert runtime.termination_attempts == ["a" * 64]
+        assert scheduled == [worker["worker_id"]]
+        claimed_follow_up = store.claim_next_queued_run(worker["worker_id"])
+        assert claimed_follow_up and claimed_follow_up["run_id"] == queued["run_id"]
+    finally:
+        service.shutdown()
+
+
+def test_expired_idle_release_rebinds_new_generation_before_termination(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+
+    class ChangingGenerationRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.container_id = "a" * 64
+            self.fail_termination = True
+            self.termination_attempts: list[str] = []
+
+        def compute_identity(self, _worker: dict) -> dict[str, str]:
+            return {"container_id": self.container_id}
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            captured = str(worker.get("_compute_release_container_id") or "")
+            self.termination_attempts.append(captured)
+            if self.fail_termination:
+                raise RuntimeError("synthetic old-generation removal failure")
+            assert captured == self.container_id
+            return super().terminate_worker(worker)
+
+    project = store.create_project(
+        "owner", "Rebound idle claim", "Stop only the current generation", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Rebound idle claim worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    terminal = store.create_run(
+        worker["worker_id"], project["project_id"], "Finished", state="completed"
+    )
+    store.update_worker(
+        worker["worker_id"], state="completed", last_run_id=terminal["run_id"]
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+            (
+                (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+                worker["worker_id"],
+            ),
+        )
+
+    runtime = ChangingGenerationRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        assert service.reap_idle_workers_once() == []
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET compute_release_expires_at = ? WHERE worker_id = ?",
+                (
+                    (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+                    worker["worker_id"],
+                ),
+            )
+        runtime.container_id = "b" * 64
+        runtime.fail_termination = False
+
+        reaped = service.reap_idle_workers_once()
+
+        assert [item["worker_id"] for item in reaped] == [worker["worker_id"]]
+        assert runtime.termination_attempts == ["a" * 64, "b" * 64]
+        refreshed = store.get_worker(worker["worker_id"])
+        assert refreshed and refreshed["compute_release_token"] == ""
+        assert refreshed["compute_released_at"]
+    finally:
+        service.shutdown()
+
+
+def test_worker_termination_with_only_queued_work_never_requires_runtime_identity(
+    tmp_path,
+):
+    store = Store(str(tmp_path / "runtime.db"))
+
+    class NoRuntimeTermination(StubRuntime):
+        def terminate_worker(self, _worker: dict) -> RuntimeInfo:
+            raise AssertionError("queued work has no external runtime to terminate")
+
+    project = store.create_project(
+        "owner", "Queued worker termination", "Cancel before launch", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Queued worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+        execution_mode="host",
+    )
+    queued = store.create_run(
+        worker["worker_id"], project["project_id"], "Never started"
+    )
+    service = WorkersProjectsService(
+        store, NoRuntimeTermination(), reconcile_on_startup=False
+    )
+    try:
+        terminated = service.terminate_worker(worker["worker_id"])
+
+        assert terminated["state"] == "terminated"
+        assert (store.get_run(queued["run_id"]) or {})["state"] == "cancelled"
+        assert (store.get_worker(worker["worker_id"]) or {})[
+            "compute_release_token"
+        ] == ""
+    finally:
+        service.shutdown()
+
+
+def test_expired_release_takeover_waits_for_suspended_owner_and_never_unlocks_work(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    other_store = Store(str(tmp_path / "runtime.db"))
+    old_entered = Event()
+    allow_old_finish = Event()
+    old_terminations: list[str] = []
+    takeover_terminations: list[str] = []
+
+    class SuspendedReleaseRuntime(StubRuntime):
+        def compute_identity(self, _worker: dict):
+            return {"container_id": "container-a"}
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            old_terminations.append(worker.get("_compute_release_container_id") or "")
+            old_entered.set()
+            assert allow_old_finish.wait(timeout=2)
+            return super().terminate_worker(worker)
+
+    class TakeoverRuntime(StubRuntime):
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            takeover_terminations.append(
+                worker.get("_compute_release_container_id") or ""
+            )
+            return super().terminate_worker(worker)
+
+    project = store.create_project(
+        "owner", "Suspended release", "Fence work", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Suspended release worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    terminal = store.create_run(
+        worker["worker_id"], project["project_id"], "Finished", state="completed"
+    )
+    store.update_worker(
+        worker["worker_id"], state="completed", last_run_id=terminal["run_id"]
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+            (
+                (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+                worker["worker_id"],
+            ),
+        )
+    first = WorkersProjectsService(
+        store, SuspendedReleaseRuntime(), reconcile_on_startup=False
+    )
+    second = WorkersProjectsService(
+        other_store, TakeoverRuntime(), reconcile_on_startup=False
+    )
+    scheduled: list[str] = []
+    first._ensure_worker_processor = lambda worker_id: scheduled.append(worker_id)  # type: ignore[method-assign]
+    second._ensure_worker_processor = lambda worker_id: scheduled.append(worker_id)  # type: ignore[method-assign]
+    old_result: list[list[dict[str, object]]] = []
+    takeover_result: list[list[dict[str, object]]] = []
+    old_thread = Thread(target=lambda: old_result.append(first.reap_idle_workers_once()))
+    old_thread.start()
+    try:
+        assert old_entered.wait(timeout=2)
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET compute_release_expires_at = ? WHERE worker_id = ?",
+                (
+                    (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+                    worker["worker_id"],
+                ),
+            )
+        queued = other_store.create_run(
+            worker["worker_id"], project["project_id"], "Queued while owner suspended"
+        )
+        takeover_thread = Thread(
+            target=lambda: takeover_result.append(
+                second.recover_expired_compute_release_claims_once()
+            )
+        )
+        takeover_thread.start()
+        time.sleep(0.05)
+
+        assert takeover_thread.is_alive()
+        assert other_store.claim_next_queued_run(worker["worker_id"]) is None
+        assert (other_store.get_run(queued["run_id"]) or {})["state"] == "queued"
+        assert takeover_terminations == []
+
+        allow_old_finish.set()
+        old_thread.join(timeout=2)
+        takeover_thread.join(timeout=2)
+        assert not old_thread.is_alive()
+        assert not takeover_thread.is_alive()
+        assert old_terminations == ["container-a"]
+        assert takeover_terminations == []
+        assert old_result and len(old_result[0]) == 1
+        assert takeover_result == [[]]
+        refreshed = other_store.get_worker(worker["worker_id"])
+        assert refreshed and refreshed["compute_release_token"] == ""
+        claimed = other_store.claim_next_queued_run(worker["worker_id"])
+        assert claimed and claimed["run_id"] == queued["run_id"]
+    finally:
+        allow_old_finish.set()
+        old_thread.join(timeout=2)
+        first.shutdown()
+        second.shutdown()
+
+
+@pytest.mark.parametrize("action", ["resume", "desktop"])
+def test_active_release_claim_blocks_direct_compute_start(
+    tmp_path,
+    monkeypatch,
+    action,
+):
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "0")
+
+    class StartTrackingRuntime(StubRuntime):
+        def __init__(self):
+            super().__init__()
+            self.starts = 0
+
+        def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+            self.starts += 1
+            return super().ensure_worker_ready(worker)
+
+        def desktop_action(self, worker: dict, action: str, **_kwargs):
+            self.starts += 1
+            return {"status": "launched", "notes": action}
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = StartTrackingRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = store.create_project(
+            "owner", "Start fence", "Block starts", "openclaw-general"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Start fence worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        snapshot = store.get_worker(worker["worker_id"])
+        claim = store.try_claim_worker_compute_release(
+            worker["worker_id"],
+            expected_updated_at=snapshot["updated_at"],
+            expected_last_run_id="",
+            expected_state=str(snapshot["state"]),
+            expected_container_id="container-a",
+            owner="reaper-a",
+            ttl_s=300,
+        )
+        assert claim is not None
+
+        with pytest.raises(RuntimeErrorBase, match="release is in progress"):
+            if action == "resume":
+                service.resume_worker(worker["worker_id"])
+            else:
+                service.desktop_action(worker["worker_id"], "open", url="https://example.com")
+        assert runtime.starts == 0
+    finally:
+        service.shutdown()
+
+
+def test_running_worker_desktop_action_still_obeys_active_release_claim(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "0")
+
+    class StartTrackingRuntime(StubRuntime):
+        def __init__(self):
+            super().__init__()
+            self.starts = 0
+
+        def desktop_action(self, worker: dict, action: str, **_kwargs):
+            self.starts += 1
+            return {"status": "launched", "notes": action}
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = StartTrackingRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = store.create_project(
+            "owner", "Running desktop fence", "Block starts", "openclaw-general"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Running desktop fence worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        snapshot = store.get_worker(worker["worker_id"])
+        claim = store.try_claim_worker_compute_release(
+            worker["worker_id"],
+            expected_updated_at=snapshot["updated_at"],
+            expected_last_run_id="",
+            expected_state=str(snapshot["state"]),
+            expected_container_id="container-a",
+            owner="reaper-a",
+            ttl_s=300,
+        )
+        assert claim is not None
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET state = 'running' WHERE worker_id = ?",
+                (worker["worker_id"],),
+            )
+
+        with pytest.raises(RuntimeErrorBase, match="release is in progress"):
+            service.desktop_action(worker["worker_id"], "open", url="https://example.com")
+        assert runtime.starts == 0
+    finally:
+        service.shutdown()
+
+
+def test_exact_stop_fences_follow_up_claim_until_stop_finalizes(tmp_path, monkeypatch):
+    class BlockingStopRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = Event()
+            self.release = Event()
+            self.run_calls: list[str] = []
+
+        def compute_identity(self, _worker: dict) -> dict[str, str]:
+            return {"container_id": "container-stop-generation"}
+
+        def interrupt_worker(
+            self, worker: dict, run_id: str | None = None
+        ) -> RuntimeInfo:
+            self.entered.set()
+            assert self.release.wait(2)
+            return super().interrupt_worker(worker, run_id=run_id)
+
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec=None,
+            run_id=None,
+        ) -> str:
+            self.run_calls.append(str(run_id or ""))
+            return "follow-up completed once"
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    db_path = tmp_path / "runtime.db"
+    stop_store = Store(str(db_path))
+    followup_store = Store(str(db_path))
+    runtime = BlockingStopRuntime()
+    service = WorkersProjectsService(
+        stop_store, runtime, reconcile_on_startup=False
+    )
+    stop_result: list[dict[str, object]] = []
+    stop_thread: Thread | None = None
+    try:
+        project = stop_store.create_project(
+            "owner", "Exact stop fence", "Keep the follow-up queued", "openclaw-general"
+        )
+        worker = stop_store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Exact stop worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        running = stop_store.create_run(
+            worker["worker_id"], project["project_id"], "old work", state="running"
+        )
+        stop_store.update_worker_state(worker["worker_id"], "running")
+
+        stop_thread = Thread(
+            target=lambda: stop_result.append(
+                service.stop_run(worker["worker_id"], running["run_id"])
+            )
+        )
+        stop_thread.start()
+        assert runtime.entered.wait(2)
+        claimed_worker = followup_store.get_worker(worker["worker_id"]) or {}
+        assert claimed_worker.get("compute_release_token")
+        assert claimed_worker.get("compute_release_target_run_id") == running["run_id"]
+        with pytest.raises(WorkAdmissionError) as blocked:
+            followup_store.create_run(
+                worker["worker_id"], project["project_id"], "follow-up", state="queued"
+            )
+        assert blocked.value.code == "work_stopping"
+        assert followup_store.claim_next_queued_run(worker["worker_id"]) is None
+    finally:
+        runtime.release.set()
+        if stop_thread is not None:
+            stop_thread.join(timeout=2)
+        service.shutdown()
+
+    assert stop_thread is not None and not stop_thread.is_alive()
+    assert stop_result and stop_result[0]["confirmation_pending"] is False
+    assert runtime.run_calls == []
+    assert not (followup_store.get_worker(worker["worker_id"]) or {}).get(
+        "compute_release_token"
+    )
+
+
+def test_work_stop_wins_before_startup_identity_and_provider_never_launches(
+    tmp_path, monkeypatch
+):
+    class StartupRuntime(StubRuntime):
+        requires_run_start_identity = False
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.run_calls: list[str] = []
+
+        def run_task(self, worker, instruction, timeout_sec=None, run_id=None):
+            self.run_calls.append(str(run_id or ""))
+            return "must not launch"
+
+    class StopRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.interrupt_calls: list[str] = []
+
+        def interrupt_worker(self, worker, run_id=None):
+            self.interrupt_calls.append(str(run_id or ""))
+            return super().interrupt_worker(worker, run_id=run_id)
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    db_path = tmp_path / "runtime.db"
+    start_store = Store(str(db_path))
+    stop_store = Store(str(db_path))
+    start_runtime = StartupRuntime()
+    stop_runtime = StopRuntime()
+    starter = WorkersProjectsService(
+        start_store, start_runtime, reconcile_on_startup=False
+    )
+    stopper = WorkersProjectsService(
+        stop_store, stop_runtime, reconcile_on_startup=False
+    )
+    reserved = Event()
+    allow_starter = Event()
+    original_acquire = starter._acquire_host_run_lease
+
+    def acquire_then_wait(worker, run):
+        lease = original_acquire(worker, run)
+        reserved.set()
+        assert allow_starter.wait(2)
+        return lease
+
+    monkeypatch.setattr(starter, "_acquire_host_run_lease", acquire_then_wait)
+    try:
+        project = start_store.create_project(
+            "owner", "Stop preidentity", "Stop before provider launch", "openclaw-general"
+        )
+        worker = start_store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Stop preidentity worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        run = start_store.create_run(
+            worker["worker_id"], project["project_id"], "queued", state="queued"
+        )
+        starter.start_assigned_run(worker["worker_id"])
+        assert reserved.wait(2)
+
+        stopped = stopper.stop_run(worker["worker_id"], run["run_id"])
+        assert stopped["confirmation_pending"] is False
+        allow_starter.set()
+        deadline = time.monotonic() + 2
+        while starter._active_processors and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert start_runtime.run_calls == []
+        assert stop_runtime.interrupt_calls == []
+        assert (stop_store.get_run(run["run_id"]) or {})["state"] == "cancelled"
+        lease = stop_store.get_active_host_run_lease_for_run(run["run_id"])
+        assert lease is None
+        assert not any(
+            event["event_type"] == "run.started"
+            for event in stop_store.list_events(worker["worker_id"])
+        )
+    finally:
+        allow_starter.set()
+        starter.shutdown()
+        stopper.shutdown()
+
+
+def test_startup_winner_persists_identity_and_started_event_before_provider_continues(
+    tmp_path, monkeypatch
+):
+    class ObservedStartupRuntime(StubRuntime):
+        requires_run_start_identity = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.observer = None
+            self.confirmed = Event()
+            self.release = Event()
+            self.continued = False
+            self.order: list[str] = []
+
+        def set_run_start_observer(self, observer) -> None:
+            self.observer = observer
+
+        def run_task(self, worker, instruction, timeout_sec=None, run_id=None):
+            assert callable(self.observer)
+            self.order.append("session_persisted")
+            self.observer(
+                {
+                    "worker_id": worker["worker_id"],
+                    "run_id": str(run_id or ""),
+                    "identity_kind": "host_process",
+                    "pid": 4242,
+                    "process_group": 4242,
+                    "process_start_identity": "synthetic-start-identity",
+                    "container_id": "",
+                    "session_id": "host-observed-startup",
+                }
+            )
+            self.order.append("observer_confirmed")
+            self.confirmed.set()
+            assert self.release.wait(2)
+            self.continued = True
+            self.order.append("provider_continued")
+            return "FINAL REPORT:\nstarted safely"
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = ObservedStartupRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    callback_acquired_lifecycle_lock = Event()
+
+    def deliver_after_start(worker, record, callbacks):
+        _ = record, callbacks
+        guard = service._acquire_worker_lifecycle_guard(worker["worker_id"])
+        try:
+            callback_acquired_lifecycle_lock.set()
+        finally:
+            guard.release()
+
+    monkeypatch.setattr(service, "_deliver_callback_record", deliver_after_start)
+    try:
+        project = store.create_project(
+            "owner", "Startup winner", "Persist identity first", "openclaw-general"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Startup winner worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+            execution_mode="host",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "synthetic-callback-secret",
+                }
+            },
+        )
+        run = store.create_run(
+            worker["worker_id"], project["project_id"], "start", state="queued"
+        )
+        service.start_assigned_run(worker["worker_id"])
+        assert runtime.confirmed.wait(2)
+
+        lease = store.get_active_host_run_lease_for_run(run["run_id"]) or {}
+        assert lease["startup_state"] == "confirmed"
+        assert lease["startup_identity_kind"] == "host_process"
+        assert lease["startup_session_id"] == "host-observed-startup"
+        started = [
+            event
+            for event in store.list_events(worker["worker_id"])
+            if event["event_type"] == "run.started"
+            and event["run_id"] == run["run_id"]
+        ]
+        assert len(started) == 1
+        assert callback_acquired_lifecycle_lock.wait(2)
+        pending_callbacks = store.list_pending_callbacks()
+        assert len(pending_callbacks) == 1
+        assert pending_callbacks[0]["event_type"] == "run.started"
+        assert runtime.continued is False
+        assert runtime.order == ["session_persisted", "observer_confirmed"]
+    finally:
+        runtime.release.set()
+        service.shutdown()
+
+    assert runtime.continued is True
+    assert runtime.order == [
+        "session_persisted",
+        "observer_confirmed",
+        "provider_continued",
+    ]
+
+
+@pytest.mark.parametrize("termination_confirmed", [True, False])
+def test_startup_rejection_preserves_ambiguous_lease_or_safely_requeues(
+    tmp_path, monkeypatch, termination_confirmed
+):
+    class RejectedStartupRuntime(StubRuntime):
+        requires_run_start_identity = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.observer = None
+
+        def set_run_start_observer(self, observer) -> None:
+            self.observer = observer
+
+        def run_task(self, worker, instruction, timeout_sec=None, run_id=None):
+            raise RunStartupRejectedError(
+                "exact startup cleanup result",
+                termination_confirmed=termination_confirmed,
+            )
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = RejectedStartupRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = store.create_project(
+            "owner", "Rejected startup", "Keep ambiguous identity fenced", "openclaw-general"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Rejected startup worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        run = store.create_run(
+            worker["worker_id"], project["project_id"], "start", state="queued"
+        )
+        service.start_assigned_run(worker["worker_id"])
+        deadline = time.monotonic() + 2
+        while service._active_processors and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        durable_run = store.get_run(run["run_id"]) or {}
+        lease = store.get_active_host_run_lease_for_run(run["run_id"])
+        started = [
+            event
+            for event in store.list_events(worker["worker_id"])
+            if event["event_type"] == "run.started"
+            and event["run_id"] == run["run_id"]
+        ]
+        assert started == []
+        if termination_confirmed:
+            assert durable_run["state"] == "queued"
+            assert lease is None
+        else:
+            assert durable_run["state"] == "running"
+            assert lease is not None
+            assert lease["startup_state"] == "termination_unconfirmed"
+    finally:
+        service.shutdown()
+
+
+def test_worker_lifecycle_lock_wait_is_bounded_and_public_safe(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_WORKER_LIFECYCLE_LOCK_TIMEOUT_S", "0.1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    db_path = tmp_path / "runtime.db"
+    owner = WorkersProjectsService(
+        Store(str(db_path)), StubRuntime(), reconcile_on_startup=False
+    )
+    contender = WorkersProjectsService(
+        Store(str(db_path)), StubRuntime(), reconcile_on_startup=False
+    )
+    guard = owner._acquire_worker_lifecycle_guard("worker-lock-test")
+    started = time.monotonic()
+    try:
+        with pytest.raises(RuntimeErrorBase) as error:
+            contender._acquire_worker_lifecycle_guard("worker-lock-test")
+        assert time.monotonic() - started < 1
+        assert str(error.value) == "Worker lifecycle control is busy; retry shortly"
+        assert "runtime.db" not in str(error.value)
+    finally:
+        guard.release()
+        owner.shutdown()
+        contender.shutdown()
+
+
+def test_exact_stop_failure_retains_fence_and_target_until_safe_recovery(
+    tmp_path, monkeypatch
+):
+    class RecoverableStopRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail = True
+            self.interrupt_calls: list[str] = []
+
+        def compute_identity(self, _worker: dict) -> dict[str, str]:
+            return {"container_id": "container-stop-recovery"}
+
+        def interrupt_worker(
+            self, worker: dict, run_id: str | None = None
+        ) -> RuntimeInfo:
+            self.interrupt_calls.append(str(run_id or ""))
+            if self.fail:
+                raise RuntimeErrorBase("exact stop could not be confirmed")
+            return super().interrupt_worker(worker, run_id=run_id)
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = RecoverableStopRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    callbacks: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_emit_callback",
+        lambda _worker, event_type, **_kwargs: callbacks.append(event_type),
+    )
+    try:
+        project = store.create_project(
+            "owner", "Stop recovery", "Recover the exact stop", "openclaw-general"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Stop recovery worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        running = store.create_run(
+            worker["worker_id"], project["project_id"], "running", state="running"
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+
+        pending = service.stop_run(worker["worker_id"], running["run_id"])
+
+        assert pending["accepted"] is True
+        assert pending["confirmation_pending"] is True
+        assert (store.get_run(running["run_id"]) or {})["state"] == "running"
+        claimed = store.get_worker(worker["worker_id"]) or {}
+        assert claimed["state"] == "stopping"
+        assert claimed["compute_release_kind"] == "stop_run"
+        assert claimed["compute_release_target_run_id"] == running["run_id"]
+        assert claimed["compute_release_container_id"] == "container-stop-recovery"
+        assert not any(
+            event["event_type"] == "run.cancelled"
+            for event in store.list_events(worker["worker_id"])
+        )
+        assert callbacks == []
+
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET compute_release_expires_at = ? WHERE worker_id = ?",
+                (
+                    (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+                    worker["worker_id"],
+                ),
+            )
+        runtime.fail = False
+        recovered = service.recover_expired_compute_release_claims_once()
+
+        assert recovered and recovered[0]["kind"] == "stop_run"
+        assert (store.get_run(running["run_id"]) or {})["state"] == "cancelled"
+        refreshed = store.get_worker(worker["worker_id"]) or {}
+        assert refreshed["compute_release_token"] == ""
+        assert refreshed["state"] == "ready"
+        assert runtime.interrupt_calls == [running["run_id"], running["run_id"]]
+    finally:
+        service.shutdown()
+
+
+def test_exact_stop_terminal_completion_wins_without_cancel_side_effects(
+    tmp_path, monkeypatch
+):
+    class BlockingStopRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = Event()
+            self.release = Event()
+
+        def compute_identity(self, _worker: dict) -> dict[str, str]:
+            return {"container_id": "container-stop-terminal-wins"}
+
+        def interrupt_worker(
+            self, worker: dict, run_id: str | None = None
+        ) -> RuntimeInfo:
+            self.entered.set()
+            assert self.release.wait(2)
+            return super().interrupt_worker(worker, run_id=run_id)
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    db_path = tmp_path / "runtime.db"
+    owner_store = Store(str(db_path))
+    completion_store = Store(str(db_path))
+    runtime = BlockingStopRuntime()
+    service = WorkersProjectsService(
+        owner_store, runtime, reconcile_on_startup=False
+    )
+    callbacks: list[str] = []
+    schedule_finalizations: list[str] = []
+    processor_wakes: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_emit_callback",
+        lambda _worker, event_type, **_kwargs: callbacks.append(event_type),
+    )
+    monkeypatch.setattr(
+        owner_store,
+        "finalize_schedule_for_run",
+        lambda run_id, **_kwargs: schedule_finalizations.append(run_id),
+    )
+    monkeypatch.setattr(
+        service,
+        "_ensure_worker_processor",
+        lambda worker_id: processor_wakes.append(worker_id),
+    )
+    result: list[dict[str, object]] = []
+    thread: Thread | None = None
+    try:
+        project = owner_store.create_project(
+            "owner", "Stop terminal wins", "Preserve completion", "openclaw-general"
+        )
+        worker = owner_store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Stop terminal wins worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        running = owner_store.create_run(
+            worker["worker_id"], project["project_id"], "finishing", state="running"
+        )
+        owner_store.update_worker_state(worker["worker_id"], "running")
+
+        thread = Thread(
+            target=lambda: result.append(
+                service.stop_run(worker["worker_id"], running["run_id"])
+            )
+        )
+        thread.start()
+        assert runtime.entered.wait(2)
+        completion_store.update_run(
+            running["run_id"],
+            state="completed",
+            output_text="durable completed output",
+            ended_at=datetime.now(timezone.utc).isoformat(),
+        )
+        with pytest.raises(WorkAdmissionError) as blocked:
+            completion_store.create_run(
+                worker["worker_id"], project["project_id"], "follow-up", state="queued"
+            )
+        assert blocked.value.code == "work_stopping"
+    finally:
+        runtime.release.set()
+        if thread is not None:
+            thread.join(timeout=2)
+        service.shutdown()
+
+    assert thread is not None and not thread.is_alive()
+    assert result and result[0]["accepted"] is True
+    assert result[0]["work_stop_outcome"] == "completion_won"
+    terminal = completion_store.get_run(running["run_id"]) or {}
+    assert terminal["state"] == "completed"
+    assert terminal["output_text"] == "durable completed output"
+    assert schedule_finalizations == []
+    assert callbacks == []
+    assert processor_wakes == []
+    assert not any(
+        event["event_type"] == "run.cancelled"
+        for event in completion_store.list_events(worker["worker_id"])
+    )
+    assert completion_store.list_lifecycle_operation_effects(
+        worker_id=worker["worker_id"]
+    ) == []
+    final_worker = completion_store.get_worker(worker["worker_id"]) or {}
+    assert final_worker["state"] == "ready"
+    assert final_worker["work_stop_id"].startswith("op_")
+    assert final_worker["work_stop_settled_at"]
+    assert final_worker["work_stop_outcome"] == "completion_won"
+    assert not final_worker.get("compute_release_token")
+
+
+def test_expired_exact_stop_claim_recovers_after_target_completed(tmp_path, monkeypatch):
+    class RecoveryRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.interrupt_calls: list[str] = []
+
+        def compute_identity(self, _worker: dict) -> dict[str, str]:
+            return {"container_id": "container-stop-completed-recovery"}
+
+        def interrupt_worker(
+            self, worker: dict, run_id: str | None = None
+        ) -> RuntimeInfo:
+            self.interrupt_calls.append(str(run_id or ""))
+            return super().interrupt_worker(worker, run_id=run_id)
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = RecoveryRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = store.create_project(
+            "owner", "Stop completed recovery", "Recover exact fence", "openclaw-general"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Stop completed recovery worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        running = store.create_run(
+            worker["worker_id"], project["project_id"], "finishing", state="running"
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+        snapshot = store.get_worker(worker["worker_id"]) or {}
+        claim = store.try_claim_worker_compute_release(
+            worker["worker_id"],
+            expected_updated_at=str(snapshot["updated_at"]),
+            expected_last_run_id=str(snapshot.get("last_run_id") or ""),
+            expected_state="running",
+            expected_container_id="container-stop-completed-recovery",
+            owner="crashed-owner",
+            ttl_s=30,
+            kind="stop_run",
+            target_run_id=running["run_id"],
+            expected_target_started_at=str(running.get("started_at") or ""),
+            now=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+        assert claim is not None
+        store.update_run(
+            running["run_id"],
+            state="completed",
+            output_text="completion won before claim recovery",
+            ended_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+        recovered = service.recover_expired_compute_release_claims_once()
+
+        assert recovered and recovered[0]["kind"] == "stop_run"
+        assert recovered[0]["target_transitioned"] is False
+        terminal = store.get_run(running["run_id"]) or {}
+        assert terminal["state"] == "completed"
+        assert terminal["output_text"] == "completion won before claim recovery"
+        refreshed = store.get_worker(worker["worker_id"]) or {}
+        assert refreshed["state"] == "ready"
+        assert refreshed["compute_release_token"] == ""
+        assert runtime.interrupt_calls == []
+    finally:
+        service.shutdown()
+
+
+def test_work_stop_finalize_cancels_full_cohort_and_tombstones_enqueue(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner", "Work stop", "Cancel exact work cohort", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Work stop worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    running = store.create_run(
+        worker["worker_id"], project["project_id"], "active", state="running"
+    )
+    queued = store.create_run(
+        worker["worker_id"], project["project_id"], "follow-up", state="queued"
+    )
+    waiting = store.create_run(
+        worker["worker_id"], project["project_id"], "waiting", state="needs_input"
+    )
+    store.update_worker_state(worker["worker_id"], "running")
+    snapshot = store.get_worker(worker["worker_id"]) or {}
+    claim = store.try_claim_worker_compute_release(
+        worker["worker_id"],
+        expected_updated_at=str(snapshot["updated_at"]),
+        expected_last_run_id=str(snapshot.get("last_run_id") or ""),
+        expected_state="running",
+        expected_container_id="container-work-stop",
+        owner="stop-owner",
+        ttl_s=300,
+        kind="stop_run",
+        scope="work",
+        target_run_id=running["run_id"],
+        expected_target_started_at=str(running.get("started_at") or ""),
+    )
+    assert claim is not None
+
+    finalized = store.finalize_worker_work_stop_claim(
+        worker["worker_id"],
+        str(claim["token"]),
+        int(claim["epoch"]),
+        target_run_id=running["run_id"],
+        runtime_fields={},
+        compute_released_at=datetime.now(timezone.utc).isoformat(),
+        error_text="Stopped by operator",
+    )
+
+    assert finalized is not None
+    for run in (running, queued, waiting):
+        assert (store.get_run(run["run_id"]) or {})["state"] == "cancelled"
+    stopped = store.get_worker(worker["worker_id"]) or {}
+    assert stopped["work_stop_id"]
+    assert stopped["work_stop_requested_at"]
+    assert stopped["work_stop_settled_at"]
+    assert stopped["work_stop_outcome"] == "cancelled"
+    assert stopped["compute_release_token"] == ""
+    with pytest.raises(RuntimeError, match="stopped"):
+        store.create_run(
+            worker["worker_id"], project["project_id"], "too late", state="queued"
+        )
+
+
+def test_queued_only_work_stop_settles_atomically_but_terminal_target_is_not_tombstoned(
+    tmp_path,
+):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner", "Queued stop", "Settle without runtime ownership", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Queued stop worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    queued = store.create_run(
+        worker["worker_id"], project["project_id"], "queued", state="queued"
+    )
+    snapshot = store.get_worker(worker["worker_id"]) or {}
+    claim = store.try_claim_worker_compute_release(
+        worker["worker_id"],
+        expected_updated_at=str(snapshot["updated_at"]),
+        expected_last_run_id=str(snapshot.get("last_run_id") or ""),
+        expected_state=str(snapshot["state"]),
+        expected_container_id="",
+        owner="stop-owner",
+        ttl_s=300,
+        kind="stop_run",
+        target_run_id=queued["run_id"],
+        expected_target_started_at="",
+    )
+    assert claim is not None
+    result = store.finalize_worker_work_stop_claim(
+        worker["worker_id"],
+        str(claim["token"]),
+        int(claim["epoch"]),
+        target_run_id=queued["run_id"],
+        runtime_fields={},
+        compute_released_at=None,
+        error_text="Stopped by operator",
+    )
+    assert result and result["target_transitioned"] is True
+    assert (store.get_run(queued["run_id"]) or {})["state"] == "cancelled"
+    settled = store.get_worker(worker["worker_id"]) or {}
+    assert settled["work_stop_outcome"] == "cancelled"
+    assert settled["work_stop_settled_at"]
+
+    other = store.create_project(
+        "owner", "Terminal stop", "Do not close completed work", "openclaw-general"
+    )
+    terminal_worker = store.create_worker(
+        project_id=other["project_id"],
+        owner_id="owner",
+        name="Terminal stop worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    terminal = store.create_run(
+        terminal_worker["worker_id"], other["project_id"], "done", state="completed"
+    )
+    terminal_snapshot = store.get_worker(terminal_worker["worker_id"]) or {}
+    assert store.try_claim_worker_compute_release(
+        terminal_worker["worker_id"],
+        expected_updated_at=str(terminal_snapshot["updated_at"]),
+        expected_last_run_id=str(terminal_snapshot.get("last_run_id") or ""),
+        expected_state=str(terminal_snapshot["state"]),
+        expected_container_id="",
+        owner="stop-owner",
+        ttl_s=300,
+        kind="stop_run",
+        target_run_id=terminal["run_id"],
+        expected_target_started_at=str(terminal.get("started_at") or ""),
+    ) is None
+    assert (store.get_worker(terminal_worker["worker_id"]) or {})["work_stop_id"] == ""
+
+
+def test_work_stop_finalizer_commits_deterministic_safe_effects_with_terminal_transition(
+    tmp_path,
+):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner", "Stop effects", "Commit callback intent atomically", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Stop effects worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    run = store.create_run(
+        worker["worker_id"], project["project_id"], "running", state="running"
+    )
+    snapshot = store.get_worker(worker["worker_id"]) or {}
+    claim = store.try_claim_worker_compute_release(
+        worker["worker_id"],
+        expected_updated_at=str(snapshot["updated_at"]),
+        expected_last_run_id=str(snapshot.get("last_run_id") or ""),
+        expected_state=str(snapshot["state"]),
+        expected_container_id="container-stop-effects",
+        owner="stop-owner",
+        ttl_s=300,
+        kind="stop_run",
+        target_run_id=run["run_id"],
+        expected_target_started_at=str(run.get("started_at") or ""),
+    )
+    assert claim is not None
+    result = store.finalize_worker_work_stop_claim(
+        worker["worker_id"],
+        str(claim["token"]),
+        int(claim["epoch"]),
+        target_run_id=run["run_id"],
+        runtime_fields={},
+        compute_released_at=datetime.now(timezone.utc).isoformat(),
+        error_text="Stopped by operator",
+    )
+    assert result and len(result["effect_ids"]) == 1
+    rows = store.list_lifecycle_operation_effects(worker_id=worker["worker_id"])
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["effect_id"] == result["effect_ids"][0]
+    assert row["operation_kind"] == "stop_run"
+    assert row["effect_kind"] == "callback.work_stopped"
+    assert row["run_id"] == run["run_id"]
+    assert row["status"] == "pending"
+    assert row["operation_digest"] == hashlib.sha256(
+        str((claim["worker"] or {})["compute_release_operation_id"]).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    serialized = json.dumps(row, sort_keys=True)
+    assert str(claim["token"]) not in serialized
+    assert "container-stop-effects" not in serialized
+
+
+def test_lifecycle_effect_claim_is_leased_recoverable_and_owner_cas_protected(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner", "Effect lease", "Recover effect application", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Effect lease worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    with store._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        first_ids = store._enqueue_lifecycle_effects(
+            conn,
+            operation_token="synthetic_operation_token",
+            operation_epoch=2,
+            operation_kind="terminate_worker",
+            worker_id=worker["worker_id"],
+            effect_kinds=("signed_links.revoke_worker",),
+        )
+        second_ids = store._enqueue_lifecycle_effects(
+            conn,
+            operation_token="synthetic_operation_token",
+            operation_epoch=2,
+            operation_kind="terminate_worker",
+            worker_id=worker["worker_id"],
+            effect_kinds=("signed_links.revoke_worker",),
+        )
+        conn.execute("COMMIT")
+    assert first_ids == second_ids
+    assert len(store.list_lifecycle_operation_effects()) == 1
+
+    origin = datetime.now(timezone.utc)
+    first = store.claim_next_lifecycle_effect("executor-a", ttl_s=30, now=origin)
+    assert first and first["attempts"] == 1
+    assert store.claim_next_lifecycle_effect(
+        "executor-b", ttl_s=30, now=origin + timedelta(seconds=5)
+    ) is None
+    assert store.mark_lifecycle_effect_applied(
+        str(first["effect_id"]),
+        "executor-b",
+        lease_epoch=int(first["lease_epoch"]),
+    ) is None
+    takeover = store.claim_next_lifecycle_effect(
+        "executor-b", ttl_s=30, now=origin + timedelta(seconds=31)
+    )
+    assert takeover and takeover["effect_id"] == first["effect_id"]
+    assert takeover["attempts"] == 2
+    retried = store.retry_lifecycle_effect(
+        str(first["effect_id"]),
+        "executor-b",
+        lease_epoch=int(takeover["lease_epoch"]),
+        error_code="signed_link_revoke_failed",
+    )
+    assert retried and retried["status"] == "pending"
+    with pytest.raises(ValueError, match="safe error code"):
+        store.retry_lifecycle_effect(
+            str(first["effect_id"]),
+            "executor-b",
+            lease_epoch=int(takeover["lease_epoch"]),
+            error_code="private exception with /local/path",
+        )
+
+
+def test_terminated_worker_rejects_new_run_transactionally(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner", "Ended worker", "Reject new work", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Ended worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    store.update_worker_state(worker["worker_id"], "terminated")
+
+    with pytest.raises(RuntimeError, match="ended"):
+        store.create_run(
+            worker["worker_id"], project["project_id"], "too late", state="queued"
+        )
+    assert store.list_runs_for_worker(worker["worker_id"]) == []
+
+
+def test_work_stop_tombstone_blocks_every_run_reactivation_but_preserves_reads_and_replay(
+    tmp_path,
+):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner", "Stopped admission", "Fence every work mutation", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Stopped admission worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    replayable, created = store.create_idempotent_run(
+        run_id="run_stable_replay",
+        worker_id=worker["worker_id"],
+        project_id=project["project_id"],
+        instruction="stable replay",
+    )
+    assert created is True
+    paused = store.create_run(
+        worker["worker_id"], project["project_id"], "paused", state="paused"
+    )
+    retrying = store.create_run(
+        worker["worker_id"], project["project_id"], "retry", state="running"
+    )
+    scheduled = store.create_scheduled_run(
+        worker_id=worker["worker_id"],
+        project_id=project["project_id"],
+        owner_id="owner",
+        instruction="later",
+        run_at=datetime.now(timezone.utc).isoformat(),
+    )
+    with store._connect() as conn:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """
+            UPDATE workers SET work_stop_id = 'stop_public_safe',
+                work_stop_requested_at = ?, work_stop_settled_at = ?,
+                work_stop_outcome = 'cancelled'
+            WHERE worker_id = ?
+            """,
+            (now, now, worker["worker_id"]),
+        )
+
+    replay, replay_created = store.create_idempotent_run(
+        run_id="run_stable_replay",
+        worker_id=worker["worker_id"],
+        project_id=project["project_id"],
+        instruction="stable replay",
+    )
+    assert replay_created is False
+    assert replay["run_id"] == replayable["run_id"]
+    assert store.get_run(paused["run_id"])["state"] == "paused"
+    assert store.list_runs_for_worker(worker["worker_id"])
+
+    with pytest.raises(RuntimeError, match="stopped"):
+        store.create_run(worker["worker_id"], project["project_id"], "late")
+    with pytest.raises(RuntimeError, match="stopped"):
+        store.transition_run_if_state(paused["run_id"], "paused", "running")
+    with pytest.raises(RuntimeError, match="stopped"):
+        store.update_run(paused["run_id"], state="running")
+    with pytest.raises(RuntimeError, match="stopped"):
+        store.requeue_run_for_retry(
+            retrying["run_id"], retry_after=datetime.now(timezone.utc).isoformat()
+        )
+    assert store.claim_next_queued_run(worker["worker_id"]) is None
+    assert store.begin_worker_compute_start(worker["worker_id"]) is None
+    with pytest.raises(RuntimeError, match="stopped"):
+        store.create_scheduled_run(
+            worker_id=worker["worker_id"],
+            project_id=project["project_id"],
+            owner_id="owner",
+            instruction="too late",
+            run_at=datetime.now(timezone.utc).isoformat(),
+        )
+    with pytest.raises(RuntimeError, match="stopped"):
+        store.claim_schedule(scheduled["schedule_id"])
+
+
+def test_work_stop_fences_every_nonterminal_projection_and_generic_tombstone_mutation(
+    tmp_path,
+):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner", "Stopped projections", "Fence every nonterminal state", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Stopped projection worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    run = store.create_run(
+        worker["worker_id"], project["project_id"], "paused", state="paused"
+    )
+    with store._connect() as conn:
+        conn.execute(
+            """
+            UPDATE workers
+            SET work_stop_id = 'settled-stop', work_stop_requested_at = updated_at,
+                work_stop_settled_at = updated_at, work_stop_outcome = 'cancelled'
+            WHERE worker_id = ?
+            """,
+            (worker["worker_id"],),
+        )
+
+    for target_state in ("queued", "running", "settling", "paused", "needs_input"):
+        with pytest.raises(WorkAdmissionError) as update_blocked:
+            store.update_run(run["run_id"], state=target_state)
+        assert update_blocked.value.code == "work_stopped"
+        with pytest.raises(WorkAdmissionError) as transition_blocked:
+            store.transition_run_if_state(
+                run["run_id"], "paused", target_state
+            )
+        assert transition_blocked.value.code == "work_stopped"
+        assert (store.get_run(run["run_id"]) or {})["state"] == "paused"
+
+    with pytest.raises(ValueError, match="work-stop"):
+        store.update_worker(worker["worker_id"], work_stop_outcome="")
+
+
+def test_work_stop_finalizer_atomically_settles_related_rows_event_and_failure_truth(
+    tmp_path,
+):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner", "Atomic stop", "Settle all durable stop truth", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Atomic stop worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    running = store.create_run(
+        worker["worker_id"], project["project_id"], "running", state="running"
+    )
+    queued = store.create_run(
+        worker["worker_id"], project["project_id"], "queued", state="queued"
+    )
+    for run in (running, queued):
+        store.update_run(
+            run["run_id"],
+            failure_class="provider_failure",
+            failure_retryable=1,
+            failure_structured=1,
+            failure_user_message="stale",
+            failure_recommended_recovery="stale",
+            failure_diagnostic_summary="stale",
+            retry_after=datetime.now(timezone.utc).isoformat(),
+            retry_attempts=4,
+            last_retry_class="provider_failure",
+        )
+    pending_schedule = store.create_scheduled_run(
+        worker_id=worker["worker_id"],
+        project_id=project["project_id"],
+        owner_id="owner",
+        instruction="later",
+        run_at=datetime.now(timezone.utc).isoformat(),
+    )
+    linked_schedule = store.create_scheduled_run(
+        worker_id=worker["worker_id"],
+        project_id=project["project_id"],
+        owner_id="owner",
+        instruction="linked",
+        run_at=datetime.now(timezone.utc).isoformat(),
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE scheduled_runs SET state = 'queued', queued_run_id = ? WHERE schedule_id = ?",
+            (queued["run_id"], linked_schedule["schedule_id"]),
+        )
+    action = store.reserve_cancel_run_action(
+        capability_id="cap_atomic_stop",
+        idempotency_key="cancel-atomic-stop",
+        project_id=project["project_id"],
+        worker_id=worker["worker_id"],
+        source_run_id=running["run_id"],
+        tenant_id="local",
+        owner_id="owner",
+    )
+    assert action["action"]["status"] == "executing"
+    store.update_worker_state(worker["worker_id"], "running")
+    snapshot = store.get_worker(worker["worker_id"]) or {}
+    claim = store.try_claim_worker_compute_release(
+        worker["worker_id"],
+        expected_updated_at=str(snapshot["updated_at"]),
+        expected_last_run_id=str(snapshot.get("last_run_id") or ""),
+        expected_state="running",
+        expected_container_id="container-atomic-stop",
+        owner="stop-owner",
+        ttl_s=300,
+        kind="stop_run",
+        target_run_id=running["run_id"],
+        expected_target_started_at=str(running.get("started_at") or ""),
+    )
+    assert claim is not None
+    result = store.finalize_worker_work_stop_claim(
+        worker["worker_id"],
+        str(claim["token"]),
+        int(claim["epoch"]),
+        target_run_id=running["run_id"],
+        runtime_fields={},
+        compute_released_at=datetime.now(timezone.utc).isoformat(),
+        error_text="Stopped by operator",
+    )
+    assert result is not None
+
+    for run in (running, queued):
+        settled = store.get_run(run["run_id"]) or {}
+        assert settled["state"] == "cancelled"
+        assert settled["failure_class"] == ""
+        assert settled["failure_retryable"] == 0
+        assert settled["failure_structured"] == 0
+        assert settled["failure_user_message"] == ""
+        assert settled["failure_recommended_recovery"] == ""
+        assert settled["failure_diagnostic_summary"] == ""
+        assert settled["retry_after"] is None
+        assert settled["retry_attempts"] == 0
+        assert settled["last_retry_class"] == ""
+    assert (store.get_schedule(pending_schedule["schedule_id"]) or {})["state"] == "cancelled"
+    assert (store.get_schedule(linked_schedule["schedule_id"]) or {})["state"] == "cancelled"
+    assert (store.get_run_action("cap_atomic_stop") or {})["status"] == "accepted"
+    events = [
+        item
+        for item in store.list_events(worker["worker_id"])
+        if item["event_type"] == "run.cancelled"
+    ]
+    assert len(events) == 1
+    assert events[0]["event_id"].startswith("evt_op_")
+
+
+def test_lifecycle_effect_identity_includes_operation_kind_and_worker(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner", "Effect identity", "Keep the full operation identity", "openclaw-general"
+    )
+    workers = [
+        store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name=f"Effect worker {index}",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        for index in range(2)
+    ]
+    with store._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        first = store._enqueue_lifecycle_effects(
+            conn,
+            operation_token="shared-synthetic-token",
+            operation_epoch=7,
+            operation_kind="max_duration",
+            worker_id=workers[0]["worker_id"],
+            run_id="same-run-ref",
+            effect_kinds=("callback.run_cancelled",),
+        )
+        second = store._enqueue_lifecycle_effects(
+            conn,
+            operation_token="shared-synthetic-token",
+            operation_epoch=7,
+            operation_kind="stop_run",
+            worker_id=workers[0]["worker_id"],
+            run_id="same-run-ref",
+            effect_kinds=("callback.run_cancelled",),
+        )
+        third = store._enqueue_lifecycle_effects(
+            conn,
+            operation_token="shared-synthetic-token",
+            operation_epoch=7,
+            operation_kind="max_duration",
+            worker_id=workers[1]["worker_id"],
+            run_id="same-run-ref",
+            effect_kinds=("callback.run_cancelled",),
+        )
+        conn.execute("COMMIT")
+    assert len({*first, *second, *third}) == 3
+    assert len(store.list_lifecycle_operation_effects()) == 3
+
+
+def test_work_stop_tombstone_allows_completed_action_replay_and_stop_but_denies_new_work_actions(
+    tmp_path,
+):
+    store = Store(str(tmp_path / "runtime.db"))
+    work = store.reserve_delegation(
+        tenant_id="tenant-a",
+        owner_id="owner-a",
+        idempotency_key="delegation-a",
+        request_digest="request-digest",
+        origin_ref="origin-a",
+        title="Admission action matrix",
+        goal="Preserve replay truth",
+        instruction="Initial work",
+        origin_surface="test",
+        worker_name="Admission worker",
+        worker_role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+        execution_mode="docker",
+    )
+    first = store.reserve_active_work_action(
+        tenant_id="tenant-a",
+        owner_id="owner-a",
+        work_ref=work["work_ref"],
+        idempotency_key="queue-a",
+        action="queue",
+        payload_digest="queue-digest",
+    )
+    store.finish_active_work_action(
+        first["action_use_id"], response={"status": "queued"}
+    )
+    with store._connect() as conn:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """
+            UPDATE workers SET work_stop_id = 'stop_public_safe',
+                work_stop_requested_at = ?, work_stop_settled_at = ?,
+                work_stop_outcome = 'cancelled'
+            WHERE worker_id = ?
+            """,
+            (now, now, work["worker_id"]),
+        )
+
+    replay = store.reserve_active_work_action(
+        tenant_id="tenant-a",
+        owner_id="owner-a",
+        work_ref=work["work_ref"],
+        idempotency_key="queue-a",
+        action="queue",
+        payload_digest="queue-digest",
+    )
+    assert replay["idempotent_replay"] is True
+    assert replay["should_execute"] is False
+    assert replay["status"] == "completed"
+    with pytest.raises(ActiveWorkActionConflictError, match="stopped"):
+        store.reserve_active_work_action(
+            tenant_id="tenant-a",
+            owner_id="owner-a",
+            work_ref=work["work_ref"],
+            idempotency_key="queue-b",
+            action="queue",
+            payload_digest="queue-b-digest",
+        )
+    stop = store.reserve_active_work_action(
+        tenant_id="tenant-a",
+        owner_id="owner-a",
+        work_ref=work["work_ref"],
+        idempotency_key="stop-replay",
+        action="stop",
+        payload_digest="stop-digest",
+    )
+    assert stop["should_execute"] is True
+
+
+def test_compute_release_finalizer_rejects_wrong_operation_kind(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner", "Finalizer scope", "Keep operation kind exact", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Finalizer scope worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    snapshot = store.get_worker(worker["worker_id"]) or {}
+    claim = store.try_claim_worker_compute_release(
+        worker["worker_id"],
+        expected_updated_at=str(snapshot["updated_at"]),
+        expected_last_run_id="",
+        expected_state=str(snapshot["state"]),
+        expected_container_id="container-idle",
+        owner="idle-owner",
+        ttl_s=300,
+        kind="idle",
+    )
+    assert claim is not None
+
+    assert store.finalize_worker_compute_release(
+        worker["worker_id"],
+        str(claim["token"]),
+        int(claim["epoch"]),
+        expected_kind="paused",
+        target_run_id="",
+        compute_released_at=datetime.now(timezone.utc).isoformat(),
+        runtime_fields={},
+        idle_state="paused",
+    ) is None
+    assert store.list_lifecycle_operation_effects(worker_id=worker["worker_id"]) == []
+    assert (store.get_worker(worker["worker_id"]) or {})["compute_release_token"] == claim["token"]
+
+
+def test_expired_destructive_takeover_cannot_change_kind_target_or_generation(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner", "Takeover scope", "Keep destructive scope exact", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Takeover scope worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    running = store.create_run(
+        worker["worker_id"], project["project_id"], "running", state="running"
+    )
+    store.update_worker_state(worker["worker_id"], "running")
+    snapshot = store.get_worker(worker["worker_id"]) or {}
+    claim = store.try_claim_worker_compute_release(
+        worker["worker_id"],
+        expected_updated_at=snapshot["updated_at"],
+        expected_last_run_id=str(snapshot.get("last_run_id") or ""),
+        expected_state="running",
+        expected_container_id="container-exact",
+        owner="owner-a",
+        ttl_s=30,
+        kind="stop_run",
+        target_run_id=running["run_id"],
+        expected_target_started_at=str(running.get("started_at") or ""),
+        now=datetime.now(timezone.utc) - timedelta(minutes=5),
+    )
+    assert claim is not None
+    claimed = store.get_worker(worker["worker_id"]) or {}
+
+    for wrong_kind, wrong_target, wrong_container, wrong_started_at in (
+        ("max_duration", running["run_id"], "container-exact", str(running.get("started_at") or "")),
+        ("stop_run", "run-other", "container-exact", ""),
+        ("stop_run", running["run_id"], "container-other", str(running.get("started_at") or "")),
+        ("stop_run", running["run_id"], "container-exact", "different-start"),
+    ):
+        assert store.try_claim_worker_compute_release(
+            worker["worker_id"],
+            expected_updated_at=str(claimed["updated_at"]),
+            expected_last_run_id=str(claimed.get("last_run_id") or ""),
+            expected_state=str(claimed["state"]),
+            expected_container_id=wrong_container,
+            owner="owner-b",
+            ttl_s=30,
+            kind=wrong_kind,
+            target_run_id=wrong_target,
+            expected_target_started_at=wrong_started_at,
+        ) is None
+    unchanged = store.get_worker(worker["worker_id"]) or {}
+    assert unchanged["compute_release_token"] == claim["token"]
+    assert unchanged["compute_release_epoch"] == claim["epoch"]
+
+    takeover = store.try_claim_worker_compute_release(
+        worker["worker_id"],
+        expected_updated_at=str(unchanged["updated_at"]),
+        expected_last_run_id=str(unchanged.get("last_run_id") or ""),
+        expected_state=str(unchanged["state"]),
+        expected_container_id="container-exact",
+        owner="owner-b",
+        ttl_s=30,
+        kind="stop_run",
+        target_run_id=running["run_id"],
+        expected_target_started_at=str(running.get("started_at") or ""),
+    )
+    assert takeover is not None and takeover["takeover"] is True
+    assert takeover["epoch"] == int(claim["epoch"]) + 1
+
+
+def test_explicit_worker_termination_fences_followup_and_commits_once_confirmed(
+    tmp_path, monkeypatch
+):
+    class BlockingTerminateRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = Event()
+            self.release = Event()
+            self.terminations: list[dict[str, object]] = []
+
+        def compute_identity(self, _worker: dict) -> dict[str, str]:
+            return {"container_id": "container-explicit-terminate"}
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminations.append(dict(worker))
+            self.entered.set()
+            assert self.release.wait(2)
+            return super().terminate_worker(worker)
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    db_path = tmp_path / "runtime.db"
+    owner_store = Store(str(db_path))
+    other_store = Store(str(db_path))
+    runtime = BlockingTerminateRuntime()
+    service = WorkersProjectsService(
+        owner_store, runtime, reconcile_on_startup=False
+    )
+    result: list[dict] = []
+    thread: Thread | None = None
+    try:
+        project = owner_store.create_project(
+            "owner", "Explicit terminate", "Terminate safely", "openclaw-general"
+        )
+        worker = owner_store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Explicit terminate worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        running = owner_store.create_run(
+            worker["worker_id"], project["project_id"], "running", state="running"
+        )
+        owner_store.update_worker_state(worker["worker_id"], "running")
+
+        thread = Thread(
+            target=lambda: result.append(service.terminate_worker(worker["worker_id"]))
+        )
+        thread.start()
+        assert runtime.entered.wait(2)
+        claimed = other_store.get_worker(worker["worker_id"]) or {}
+        assert claimed["compute_release_kind"] == "terminate_worker"
+        assert claimed["compute_release_target_run_id"] == running["run_id"]
+        assert claimed["compute_release_container_id"] == "container-explicit-terminate"
+        assert (other_store.get_run(running["run_id"]) or {})["state"] == "running"
+        with pytest.raises(WorkAdmissionError) as blocked:
+            other_store.create_run(
+                worker["worker_id"], project["project_id"], "follow-up", state="queued"
+            )
+        assert blocked.value.code == "work_stopping"
+        assert other_store.claim_next_queued_run(worker["worker_id"]) is None
+        assert not any(
+            event["event_type"] == "worker.terminated"
+            for event in other_store.list_events(worker["worker_id"])
+        )
+    finally:
+        runtime.release.set()
+        if thread is not None:
+            thread.join(timeout=2)
+        service.shutdown()
+
+    assert thread is not None and not thread.is_alive()
+    assert result and result[0]["state"] == "terminated"
+    assert (other_store.get_run(running["run_id"]) or {})["state"] == "cancelled"
+    assert len(
+        [
+            event
+            for event in other_store.list_events(worker["worker_id"])
+            if event["event_type"] == "worker.terminated"
+        ]
+    ) == 1
+    termination_effects = other_store.list_lifecycle_operation_effects(
+        worker_id=worker["worker_id"]
+    )
+    assert {item["effect_kind"] for item in termination_effects} == {
+        "callback.worker_terminated",
+        "signed_links.revoke_worker",
+    }
+
+
+def test_explicit_worker_termination_failure_retains_truth_and_no_callback(
+    tmp_path, monkeypatch
+):
+    class FailingTerminateRuntime(StubRuntime):
+        def compute_identity(self, _worker: dict) -> dict[str, str]:
+            return {"container_id": "container-explicit-failure"}
+
+        def terminate_worker(self, _worker: dict) -> RuntimeInfo:
+            raise RuntimeErrorBase("container termination unconfirmed")
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(
+        store, FailingTerminateRuntime(), reconcile_on_startup=False
+    )
+    try:
+        project = store.create_project(
+            "owner", "Terminate failure", "Preserve truth", "openclaw-general"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Terminate failure worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        running = store.create_run(
+            worker["worker_id"], project["project_id"], "running", state="running"
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+
+        with pytest.raises(RuntimeErrorBase, match="unconfirmed"):
+            service.terminate_worker(worker["worker_id"])
+
+        assert (store.get_run(running["run_id"]) or {})["state"] == "running"
+        claimed = store.get_worker(worker["worker_id"]) or {}
+        assert claimed["state"] == "stopping"
+        assert claimed["compute_release_kind"] == "terminate_worker"
+        assert claimed["compute_release_target_run_id"] == running["run_id"]
+        assert not any(
+            event["event_type"] == "worker.terminated"
+            for event in store.list_events(worker["worker_id"])
+        )
+    finally:
+        service.shutdown()
+
+
+def test_explicit_worker_termination_replay_has_no_duplicate_runtime_or_callback(
+    tmp_path, monkeypatch
+):
+    class CountingTerminateRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def compute_identity(self, _worker: dict) -> dict[str, str]:
+            return {"container_id": "container-explicit-replay"}
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.calls += 1
+            return super().terminate_worker(worker)
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = CountingTerminateRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    callbacks: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_emit_callback",
+        lambda _worker, event_type, **_kwargs: callbacks.append(event_type),
+    )
+    try:
+        project = store.create_project(
+            "owner", "Terminate replay", "One destructive effect", "openclaw-general"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Terminate replay worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+            bootstrap_bundle={
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/events"
+                }
+            },
+        )
+
+        first = service.terminate_worker(worker["worker_id"])
+        replay = service.terminate_worker(worker["worker_id"])
+
+        assert first["state"] == replay["state"] == "terminated"
+        assert runtime.calls == 1
+        assert callbacks == ["worker.terminated"]
+        assert len(
+            [
+                event
+                for event in store.list_events(worker["worker_id"])
+                if event["event_type"] == "worker.terminated"
+            ]
+        ) == 1
+    finally:
+        service.shutdown()
+
+
+def test_queued_processor_waits_without_resubmit_spin_and_starts_once_after_release(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "0")
+    runtime_calls: list[str] = []
+
+    class CountingRuntime(StubRuntime):
+        def run_task(
+            self,
+            worker: dict,
+            instruction: str,
+            timeout_sec=None,
+            run_id=None,
+        ) -> str:
+            runtime_calls.append(str(run_id or ""))
+            return "Completed exactly once"
+
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = CountingRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = store.create_project(
+            "owner", "Processor fence", "Start once", "openclaw-general"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Processor fence worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        terminal = store.create_run(
+            worker["worker_id"], project["project_id"], "Finished", state="completed"
+        )
+        store.update_worker(
+            worker["worker_id"], state="completed", last_run_id=terminal["run_id"]
+        )
+        snapshot = store.get_worker(worker["worker_id"])
+        claim = store.try_claim_worker_compute_release(
+            worker["worker_id"],
+            expected_updated_at=snapshot["updated_at"],
+            expected_last_run_id=terminal["run_id"],
+            expected_state="completed",
+            expected_container_id="",
+            owner="reaper-a",
+            ttl_s=300,
+        )
+        assert claim is not None
+
+        queued = service.assign_run(worker["worker_id"], "Run after release")
+        time.sleep(0.05)
+        assert (store.get_run(queued["run_id"]) or {})["state"] == "queued"
+        assert runtime_calls == []
+        with service._processors_lock:
+            assert worker["worker_id"] not in service._active_processors
+
+        updated = store.finalize_worker_compute_release(
+            worker["worker_id"],
+            str(claim["token"]),
+            int(claim["epoch"]),
+            expected_kind="idle",
+            compute_released_at=datetime.now(timezone.utc).isoformat(),
+            runtime_fields={"runtime": "openclaw-stub", "pid": None},
+            idle_state="completed",
+        )
+        assert updated and updated["state"] == "starting"
+        service._ensure_worker_processor(worker["worker_id"])
+        deadline = time.monotonic() + 2
+        while (
+            (store.get_run(queued["run_id"]) or {}).get("state") != "completed"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+
+        assert (store.get_run(queued["run_id"]) or {})["state"] == "completed"
+        assert runtime_calls == [queued["run_id"]]
+    finally:
+        service.shutdown()
+
+
+def test_idle_reaper_releases_docker_compute_after_proven_dead_terminal_session(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = ProfiledWorkerRuntime(base_dir=str(tmp_path / "runtime"))
+    runtime.refresh_isolated_parallel_readiness = lambda: {"ready": True, "reason": ""}  # type: ignore[method-assign]
+    docker_runtime = runtime.codex
+    terminated_containers: list[str] = []
+    exact_cleanup_calls: list[str] = []
+    docker_runtime._recorded_pid_is_proven_gone = lambda _pid, _identity="": True  # type: ignore[method-assign]
+
+    def fail_exact_cleanup(*_args, **_kwargs):
+        exact_cleanup_calls.append("attempted")
+        raise RuntimeError("stale exact-run cleanup is unavailable")
+
+    docker_runtime.sandbox.stop_screen_session = fail_exact_cleanup  # type: ignore[method-assign]
+    docker_runtime.sandbox.terminate_run_processes = fail_exact_cleanup  # type: ignore[method-assign]
+    docker_runtime.sandbox.terminate = lambda worker_id, **_kwargs: terminated_containers.append(worker_id)  # type: ignore[method-assign]
+
+    project = store.create_project(
+        "owner",
+        "Completed Docker Worker",
+        "Release retained compute without deleting workspace state.",
+        "codex-cli",
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Completed Docker Worker",
+        role="research",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="test",
+        execution_mode="docker",
+    )
+    run = store.create_run(
+        worker["worker_id"],
+        project["project_id"],
+        "Finish before the retained container becomes idle.",
+        state="running",
+    )
+    store.update_run(
+        run["run_id"],
+        state="completed",
+        ended_at=None,
+        output_text="Synthetic completed result",
+    )
+    store.update_worker(
+        worker["worker_id"],
+        state="completed",
+        last_run_id=run["run_id"],
+    )
+
+    docker_runtime._ensure_dirs(worker["worker_id"])
+    workspace_marker = docker_runtime._workspace_dir(worker["worker_id"]) / "preserved.txt"
+    workspace_marker.write_text("workspace survives compute release")
+    run_root = docker_runtime._run_root(worker["worker_id"], run["run_id"])
+    run_root.mkdir(parents=True, exist_ok=True)
+    exit_path = run_root / "exit_code"
+    exit_path.write_text("0")
+    docker_runtime._write_active_session(
+        worker["worker_id"],
+        {
+            "session_name": docker_runtime._session_name_for_run_id(run["run_id"]),
+            "run_id": run["run_id"],
+            "stdout_path": str(run_root / "stdout.log"),
+            "stderr_path": str(run_root / "stderr.log"),
+            "exit_path": str(exit_path),
+            "process_pid": 41001,
+            "owner_pid": 41002,
+            "lease_pid": 41003,
+            "termination_unconfirmed": True,
+        },
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+            (
+                (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+                worker["worker_id"],
+            ),
+        )
+
+    service = WorkersProjectsService(
+        store,
+        runtime,
+        reconcile_on_startup=False,
+    )
+    try:
+        reaped = service.reap_idle_workers_once()
+
+        assert [item["worker_id"] for item in reaped] == [worker["worker_id"]]
+        assert terminated_containers == [worker["worker_id"]]
+        assert exact_cleanup_calls == []
+        assert docker_runtime._read_active_session(worker["worker_id"]) is None
+        refreshed = store.get_worker(worker["worker_id"])
+        assert refreshed is not None
+        assert refreshed["state"] == "completed"
+        assert refreshed["compute_released_at"]
+        assert (store.get_run(run["run_id"]) or {})["ended_at"] is None
+        assert workspace_marker.read_text() == "workspace survives compute release"
+        assert store.list_events(worker["worker_id"])[-1]["event_type"] == "worker.idle_terminated"
+    finally:
+        service.shutdown()
+
+
+@pytest.mark.parametrize("ambiguous", [False, True], ids=["live-process", "missing-pid-proof"])
+def test_idle_reaper_fails_closed_when_terminal_session_liveness_is_not_proven_dead(
+    tmp_path,
+    monkeypatch,
+    ambiguous,
+):
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = ProfiledWorkerRuntime(base_dir=str(tmp_path / "runtime"))
+    runtime.refresh_isolated_parallel_readiness = lambda: {"ready": True, "reason": ""}  # type: ignore[method-assign]
+    docker_runtime = runtime.codex
+    terminated_containers: list[str] = []
+    live_pid = 42001
+    docker_runtime._recorded_pid_is_proven_gone = (  # type: ignore[method-assign]
+        lambda pid, _identity="": pid != live_pid
+    )
+    docker_runtime.sandbox.stop_screen_session = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("exact-run stop could not be confirmed")
+        )
+    )
+    docker_runtime.sandbox.terminate_run_processes = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    docker_runtime.sandbox.terminate = lambda worker_id, **_kwargs: terminated_containers.append(worker_id)  # type: ignore[method-assign]
+
+    project = store.create_project(
+        "owner",
+        "Unconfirmed Docker Worker",
+        "Keep ambiguous or live run ownership fail closed.",
+        "codex-cli",
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Unconfirmed Docker Worker",
+        role="research",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="test",
+        execution_mode="docker",
+    )
+    run = store.create_run(
+        worker["worker_id"],
+        project["project_id"],
+        "Retain exact-run ownership until termination is proved.",
+        state="completed",
+    )
+    store.update_worker(
+        worker["worker_id"],
+        state="completed",
+        last_run_id=run["run_id"],
+    )
+    docker_runtime._ensure_dirs(worker["worker_id"])
+    run_root = docker_runtime._run_root(worker["worker_id"], run["run_id"])
+    run_root.mkdir(parents=True, exist_ok=True)
+    exit_path = run_root / "exit_code"
+    exit_path.write_text("0")
+    docker_runtime._write_active_session(
+        worker["worker_id"],
+        {
+            "session_name": docker_runtime._session_name_for_run_id(run["run_id"]),
+            "run_id": run["run_id"],
+            "exit_path": str(exit_path),
+            "process_pid": live_pid if not ambiguous else 0,
+            "owner_pid": 42002,
+            "lease_pid": 42003,
+        },
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+            (
+                (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+                worker["worker_id"],
+            ),
+        )
+
+    service = WorkersProjectsService(
+        store,
+        runtime,
+        reconcile_on_startup=False,
+    )
+    try:
+        assert service.reap_idle_workers_once() == []
+        assert terminated_containers == []
+        active_session = docker_runtime._read_active_session(worker["worker_id"])
+        assert active_session is not None
+        assert active_session["termination_unconfirmed"] is True
+        assert (store.get_worker(worker["worker_id"]) or {})["compute_released_at"] is None
+    finally:
+        service.shutdown()
+
+
+@pytest.mark.parametrize("marker_case", ["corrupt", "mismatched-path"])
+def test_idle_reaper_fails_closed_without_canonical_terminal_exit_marker(
+    tmp_path,
+    monkeypatch,
+    marker_case,
+):
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = ProfiledWorkerRuntime(base_dir=str(tmp_path / "runtime"))
+    runtime.refresh_isolated_parallel_readiness = lambda: {"ready": True, "reason": ""}  # type: ignore[method-assign]
+    docker_runtime = runtime.codex
+    docker_runtime._recorded_pid_is_proven_gone = lambda _pid, _identity="": True  # type: ignore[method-assign]
+    terminated_containers: list[str] = []
+    docker_runtime.sandbox.stop_screen_session = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("exact-run stop could not be confirmed")
+        )
+    )
+    docker_runtime.sandbox.terminate_run_processes = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    docker_runtime.sandbox.terminate = lambda worker_id, **_kwargs: terminated_containers.append(worker_id)  # type: ignore[method-assign]
+
+    project = store.create_project(
+        "owner",
+        "Untrusted Exit Marker",
+        "Do not release compute from untrusted terminal evidence.",
+        "codex-cli",
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Untrusted Exit Marker Worker",
+        role="research",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="test",
+        execution_mode="docker",
+    )
+    run = store.create_run(
+        worker["worker_id"],
+        project["project_id"],
+        "Retain compute unless exit evidence is canonical.",
+        state="completed",
+    )
+    store.update_worker(
+        worker["worker_id"],
+        state="completed",
+        last_run_id=run["run_id"],
+    )
+    docker_runtime._ensure_dirs(worker["worker_id"])
+    canonical_root = docker_runtime._run_root(worker["worker_id"], run["run_id"])
+    canonical_root.mkdir(parents=True, exist_ok=True)
+    canonical_exit = canonical_root / "exit_code"
+    recorded_exit = canonical_exit
+    if marker_case == "corrupt":
+        canonical_exit.write_text("not-an-exit-code")
+    else:
+        recorded_exit = tmp_path / "forged-exit-code"
+        recorded_exit.write_text("0")
+    docker_runtime._write_active_session(
+        worker["worker_id"],
+        {
+            "session_name": docker_runtime._session_name_for_run_id(run["run_id"]),
+            "run_id": run["run_id"],
+            "exit_path": str(recorded_exit),
+            "process_pid": 43001,
+            "owner_pid": 43002,
+            "lease_pid": 43003,
+        },
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+            (
+                (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+                worker["worker_id"],
+            ),
+        )
+
+    service = WorkersProjectsService(
+        store,
+        runtime,
+        reconcile_on_startup=False,
+    )
+    try:
+        assert service.reap_idle_workers_once() == []
+        assert terminated_containers == []
+        assert docker_runtime._read_active_session(worker["worker_id"])["termination_unconfirmed"] is True
+        assert (store.get_worker(worker["worker_id"]) or {})["compute_released_at"] is None
+    finally:
+        service.shutdown()
+
+
 def test_paused_reaper_stops_paused_compute_without_deleting_workspace(tmp_path, monkeypatch):
     class ReaperRuntime(StubRuntime):
         def __init__(self) -> None:
@@ -2732,6 +6947,321 @@ def test_paused_reaper_stops_paused_compute_without_deleting_workspace(tmp_path,
         service.shutdown()
 
 
+def test_paused_reaper_accepts_and_binds_real_durable_paused_run(
+    tmp_path, monkeypatch
+):
+    class ReaperRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminated: list[str] = []
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated.append(worker["worker_id"])
+            return super().terminate_worker(worker)
+
+    monkeypatch.setenv("GLASSHIVE_PAUSED_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = ReaperRuntime()
+    service = WorkersProjectsService(
+        store, runtime, reconcile_on_startup=False
+    )
+    try:
+        project = store.create_project(
+            "owner", "Paused durable run", "Release paused compute", "openclaw-general"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Paused durable run worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        paused_run = store.create_run(
+            worker["worker_id"], project["project_id"], "paused work", state="running"
+        )
+        paused_run = store.transition_run_if_state(
+            paused_run["run_id"], "running", "paused", ended_at=None
+        ) or paused_run
+        queued = store.create_run(
+            worker["worker_id"], project["project_id"], "queued sibling", state="queued"
+        )
+        lease = store.acquire_host_run_lease(
+            runtime_family="openclaw",
+            lane="mission",
+            tenant_id="local",
+            owner_id="owner",
+            worker_id=worker["worker_id"],
+            run_id=paused_run["run_id"],
+            executor_id="paused-owner",
+            conversation_limit=2,
+            mission_limit=3,
+            account_mission_limit=4,
+            tenant_mission_limit=12,
+            lease_ttl_s=300,
+        )
+        store.update_worker_state(worker["worker_id"], "paused")
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+                (
+                    (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+                    worker["worker_id"],
+                ),
+            )
+
+        reaped = service.reap_paused_workers_once()
+
+        assert reaped and reaped[0]["worker_id"] == worker["worker_id"]
+        assert runtime.terminated == [worker["worker_id"]]
+        assert (store.get_run(paused_run["run_id"]) or {})["state"] == "paused"
+        assert (store.get_run(queued["run_id"]) or {})["state"] == "queued"
+        assert (store.get_host_run_lease(lease["lease_id"]) or {})["status"] == "released"
+        refreshed = store.get_worker(worker["worker_id"]) or {}
+        assert refreshed["state"] == "paused"
+        assert refreshed["compute_released_at"]
+        assert refreshed["compute_release_token"] == ""
+    finally:
+        service.shutdown()
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["running", "settling", "needs_input", "two_paused", "mismatched_lease", "second_lease"],
+)
+def test_paused_release_claim_rejects_ambiguous_durable_shapes(tmp_path, shape):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner", "Paused shape", "Reject ambiguous paused ownership", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Paused shape worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    paused = store.create_run(
+        worker["worker_id"], project["project_id"], "paused", state="running"
+    )
+    paused = store.transition_run_if_state(
+        paused["run_id"], "running", "paused", ended_at=None
+    ) or paused
+    if shape in {"running", "settling", "needs_input"}:
+        store.create_run(
+            worker["worker_id"], project["project_id"], shape, state=shape
+        )
+    elif shape == "two_paused":
+        store.create_run(
+            worker["worker_id"], project["project_id"], "second paused", state="paused"
+        )
+    if shape in {"mismatched_lease", "second_lease"}:
+        other = store.create_run(
+            worker["worker_id"], project["project_id"], "queued", state="queued"
+        )
+        store.acquire_host_run_lease(
+            runtime_family="openclaw",
+            lane="mission",
+            tenant_id="local",
+            owner_id="owner",
+            worker_id=worker["worker_id"],
+            run_id=(other if shape == "mismatched_lease" else paused)["run_id"],
+            executor_id="lease-a",
+            conversation_limit=2,
+            mission_limit=8,
+            account_mission_limit=8,
+            tenant_mission_limit=8,
+            lease_ttl_s=300,
+        )
+        if shape == "second_lease":
+            store.acquire_host_run_lease(
+                runtime_family="openclaw",
+                lane="mission",
+                tenant_id="local",
+                owner_id="owner",
+                worker_id=worker["worker_id"],
+                run_id=other["run_id"],
+                executor_id="lease-b",
+                conversation_limit=2,
+                mission_limit=8,
+                account_mission_limit=8,
+                tenant_mission_limit=8,
+                lease_ttl_s=300,
+            )
+    store.update_worker_state(worker["worker_id"], "paused")
+    snapshot = store.get_worker(worker["worker_id"]) or {}
+
+    claim = store.try_claim_worker_compute_release(
+        worker["worker_id"],
+        expected_updated_at=str(snapshot["updated_at"]),
+        expected_last_run_id=str(snapshot.get("last_run_id") or ""),
+        expected_state="paused",
+        expected_container_id="container-paused",
+        owner="reaper",
+        ttl_s=300,
+        kind="paused",
+        target_run_id=paused["run_id"],
+        expected_target_started_at=str(paused.get("started_at") or ""),
+    )
+
+    assert claim is None
+
+
+def test_paused_release_takeover_keeps_exact_target_while_queue_grows(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner", "Paused takeover", "Keep exact paused target", "openclaw-general"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Paused takeover worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw-stub",
+        model="stub-model",
+    )
+    paused = store.create_run(
+        worker["worker_id"], project["project_id"], "paused", state="running"
+    )
+    paused = store.transition_run_if_state(
+        paused["run_id"], "running", "paused", ended_at=None
+    ) or paused
+    store.update_worker_state(worker["worker_id"], "paused")
+    snapshot = store.get_worker(worker["worker_id"]) or {}
+    first = store.try_claim_worker_compute_release(
+        worker["worker_id"],
+        expected_updated_at=str(snapshot["updated_at"]),
+        expected_last_run_id=str(snapshot.get("last_run_id") or ""),
+        expected_state="paused",
+        expected_container_id="container-paused",
+        owner="reaper-a",
+        ttl_s=30,
+        kind="paused",
+        target_run_id=paused["run_id"],
+        expected_target_started_at=str(paused.get("started_at") or ""),
+        now=datetime.now(timezone.utc) - timedelta(minutes=5),
+    )
+    assert first is not None
+    queued = store.create_run(
+        worker["worker_id"], project["project_id"], "arrived later", state="queued"
+    )
+    claimed = store.get_worker(worker["worker_id"]) or {}
+
+    takeover = store.try_claim_worker_compute_release(
+        worker["worker_id"],
+        expected_updated_at=str(claimed["updated_at"]),
+        expected_last_run_id=str(claimed.get("last_run_id") or ""),
+        expected_state="paused",
+        expected_container_id="container-paused",
+        owner="reaper-b",
+        ttl_s=300,
+        kind="paused",
+        target_run_id=paused["run_id"],
+        expected_target_started_at=str(paused.get("started_at") or ""),
+    )
+
+    assert takeover is not None and takeover["takeover"] is True
+    exact = takeover["worker"]
+    assert exact["compute_release_target_run_id"] == paused["run_id"]
+    assert exact["compute_release_target_started_at"] == str(paused.get("started_at") or "")
+    assert (store.get_run(queued["run_id"]) or {})["state"] == "queued"
+
+
+def test_paused_reaper_fences_concurrent_cross_process_resume(tmp_path, monkeypatch):
+    class BlockingReleaseRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = Event()
+            self.release = Event()
+            self.terminated_workers: list[dict[str, object]] = []
+
+        def compute_identity(self, _worker: dict) -> dict[str, str]:
+            return {"container_id": "container-paused-generation"}
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated_workers.append(dict(worker))
+            self.entered.set()
+            assert self.release.wait(2)
+            return super().terminate_worker(worker)
+
+    class ResumeTrackingRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.starts = 0
+
+        def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+            self.starts += 1
+            return super().ensure_worker_ready(worker)
+
+    monkeypatch.setenv("GLASSHIVE_PAUSED_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    db_path = tmp_path / "runtime.db"
+    release_store = Store(str(db_path))
+    resume_store = Store(str(db_path))
+    release_runtime = BlockingReleaseRuntime()
+    resume_runtime = ResumeTrackingRuntime()
+    release_service = WorkersProjectsService(
+        release_store, release_runtime, reconcile_on_startup=False
+    )
+    resume_service = WorkersProjectsService(
+        resume_store, resume_runtime, reconcile_on_startup=False
+    )
+    reaper_thread: Thread | None = None
+    try:
+        project = release_store.create_project(
+            "owner", "Paused release fence", "Preserve new compute", "openclaw-general"
+        )
+        worker = release_store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Paused release worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        release_store.update_worker_state(worker["worker_id"], "paused")
+        with release_store._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+                (
+                    (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+                    worker["worker_id"],
+                ),
+            )
+
+        reaper_thread = Thread(target=release_service.reap_paused_workers_once)
+        reaper_thread.start()
+        assert release_runtime.entered.wait(2)
+        claimed = resume_store.get_worker(worker["worker_id"]) or {}
+        assert claimed.get("compute_release_token")
+        with pytest.raises(RuntimeErrorBase, match="release is in progress"):
+            resume_service.resume_worker(worker["worker_id"])
+        assert resume_runtime.starts == 0
+    finally:
+        release_runtime.release.set()
+        if reaper_thread is not None:
+            reaper_thread.join(timeout=2)
+        release_service.shutdown()
+        resume_service.shutdown()
+
+    assert not reaper_thread or not reaper_thread.is_alive()
+    assert release_runtime.terminated_workers
+    assert (
+        release_runtime.terminated_workers[0].get("_compute_release_container_id")
+        == "container-paused-generation"
+    )
+
+
 def test_max_run_duration_cancels_expired_run_and_releases_compute(tmp_path, monkeypatch):
     class ReaperRuntime(StubRuntime):
         def __init__(self) -> None:
@@ -2786,8 +7316,292 @@ def test_max_run_duration_cancels_expired_run_and_releases_compute(tmp_path, mon
         assert refreshed_worker is not None and refreshed_worker["state"] == "paused"
         assert refreshed_worker["compute_released_at"]
         assert store.list_events(worker["worker_id"])[-1]["event_type"] == "run.duration_exceeded"
+        effects = store.list_lifecycle_operation_effects(worker_id=worker["worker_id"])
+        assert len(effects) == 1
+        assert effects[0]["operation_kind"] == "max_duration"
+        assert effects[0]["effect_kind"] == "callback.run_cancelled"
+        assert effects[0]["run_id"] == run["run_id"]
     finally:
         service.shutdown()
+
+
+def test_max_duration_reaper_fences_concurrent_cross_process_resume(tmp_path, monkeypatch):
+    class BlockingReleaseRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = Event()
+            self.release = Event()
+            self.terminated_workers: list[dict[str, object]] = []
+
+        def compute_identity(self, _worker: dict) -> dict[str, str]:
+            return {"container_id": "container-expired-generation"}
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated_workers.append(dict(worker))
+            self.entered.set()
+            assert self.release.wait(2)
+            return super().terminate_worker(worker)
+
+    class ResumeTrackingRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.starts = 0
+
+        def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+            self.starts += 1
+            return super().ensure_worker_ready(worker)
+
+    monkeypatch.setenv("GLASSHIVE_MAX_RUN_DURATION_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    db_path = tmp_path / "runtime.db"
+    release_store = Store(str(db_path))
+    resume_store = Store(str(db_path))
+    release_runtime = BlockingReleaseRuntime()
+    resume_runtime = ResumeTrackingRuntime()
+    release_service = WorkersProjectsService(
+        release_store, release_runtime, reconcile_on_startup=False
+    )
+    resume_service = WorkersProjectsService(
+        resume_store, resume_runtime, reconcile_on_startup=False
+    )
+    reaper_thread: Thread | None = None
+    try:
+        project = release_store.create_project(
+            "owner", "Expired release fence", "Preserve new compute", "openclaw-general"
+        )
+        worker = release_store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Expired release worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        run = release_store.create_run(
+            worker["worker_id"], project["project_id"], "run too long", state="running"
+        )
+        release_store.update_worker_state(worker["worker_id"], "running")
+        with release_store._connect() as conn:
+            conn.execute(
+                "UPDATE runs SET started_at = ? WHERE run_id = ?",
+                (
+                    (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+                    run["run_id"],
+                ),
+            )
+
+        reaper_thread = Thread(target=release_service.reap_expired_runs_once)
+        reaper_thread.start()
+        assert release_runtime.entered.wait(2)
+        claimed = resume_store.get_worker(worker["worker_id"]) or {}
+        assert claimed.get("compute_release_token")
+        with pytest.raises(RuntimeErrorBase, match="release is in progress"):
+            resume_service.resume_worker(worker["worker_id"])
+        assert resume_runtime.starts == 0
+    finally:
+        release_runtime.release.set()
+        if reaper_thread is not None:
+            reaper_thread.join(timeout=2)
+        release_service.shutdown()
+        resume_service.shutdown()
+
+    assert not reaper_thread or not reaper_thread.is_alive()
+    assert release_runtime.terminated_workers
+    assert (
+        release_runtime.terminated_workers[0].get("_compute_release_container_id")
+        == "container-expired-generation"
+    )
+
+
+def test_max_duration_failure_retains_exact_claim_until_recovery(tmp_path, monkeypatch):
+    class RecoverableReleaseRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail = True
+            self.terminations: list[dict[str, object]] = []
+
+        def compute_identity(self, _worker: dict) -> dict[str, str]:
+            return {"container_id": "container-max-recovery"}
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminations.append(dict(worker))
+            if self.fail:
+                raise RuntimeErrorBase("container removal unconfirmed")
+            return super().terminate_worker(worker)
+
+    monkeypatch.setenv("GLASSHIVE_MAX_RUN_DURATION_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = RecoverableReleaseRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = store.create_project(
+            "owner", "Max recovery", "Recover exact max stop", "openclaw-general"
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Max recovery worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        running = store.create_run(
+            worker["worker_id"], project["project_id"], "long run", state="running"
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE runs SET started_at = ? WHERE run_id = ?",
+                (
+                    (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+                    running["run_id"],
+                ),
+            )
+
+        assert service.reap_expired_runs_once() == []
+        assert (store.get_run(running["run_id"]) or {})["state"] == "running"
+        claimed = store.get_worker(worker["worker_id"]) or {}
+        assert claimed["compute_release_kind"] == "max_duration"
+        assert claimed["compute_release_target_run_id"] == running["run_id"]
+        assert claimed["compute_release_container_id"] == "container-max-recovery"
+        assert claimed["compute_released_at"] is None
+
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET compute_release_expires_at = ? WHERE worker_id = ?",
+                (
+                    (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+                    worker["worker_id"],
+                ),
+            )
+        runtime.fail = False
+        recovered = service.recover_expired_compute_release_claims_once()
+
+        assert recovered and recovered[0]["kind"] == "max_duration"
+        assert (store.get_run(running["run_id"]) or {})["state"] == "cancelled"
+        refreshed = store.get_worker(worker["worker_id"]) or {}
+        assert refreshed["state"] == "paused"
+        assert refreshed["compute_released_at"]
+        assert refreshed["compute_release_token"] == ""
+        assert [
+            item.get("_compute_release_container_id") for item in runtime.terminations
+        ] == ["container-max-recovery", "container-max-recovery"]
+    finally:
+        service.shutdown()
+
+
+def test_max_duration_terminal_completion_wins_without_cancel_side_effects(
+    tmp_path, monkeypatch
+):
+    class BlockingReleaseRuntime(StubRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = Event()
+            self.release = Event()
+
+        def compute_identity(self, _worker: dict) -> dict[str, str]:
+            return {"container_id": "container-max-terminal-wins"}
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.entered.set()
+            assert self.release.wait(2)
+            return super().terminate_worker(worker)
+
+    monkeypatch.setenv("GLASSHIVE_MAX_RUN_DURATION_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    db_path = tmp_path / "runtime.db"
+    owner_store = Store(str(db_path))
+    completion_store = Store(str(db_path))
+    runtime = BlockingReleaseRuntime()
+    service = WorkersProjectsService(
+        owner_store, runtime, reconcile_on_startup=False
+    )
+    callbacks: list[str] = []
+    schedule_finalizations: list[str] = []
+    processor_wakes: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_emit_callback",
+        lambda _worker, event_type, **_kwargs: callbacks.append(event_type),
+    )
+    monkeypatch.setattr(
+        owner_store,
+        "finalize_schedule_for_run",
+        lambda run_id, **_kwargs: schedule_finalizations.append(run_id),
+    )
+    monkeypatch.setattr(
+        service,
+        "_ensure_worker_processor",
+        lambda worker_id: processor_wakes.append(worker_id),
+    )
+    result: list[list[dict[str, object]]] = []
+    thread: Thread | None = None
+    try:
+        project = owner_store.create_project(
+            "owner", "Max terminal wins", "Preserve completion", "openclaw-general"
+        )
+        worker = owner_store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Max terminal wins worker",
+            role="research",
+            profile="openclaw-general",
+            backend="openclaw",
+            runtime="openclaw-stub",
+            model="stub-model",
+        )
+        running = owner_store.create_run(
+            worker["worker_id"], project["project_id"], "finishing", state="running"
+        )
+        owner_store.update_worker_state(worker["worker_id"], "running")
+        with owner_store._connect() as conn:
+            conn.execute(
+                "UPDATE runs SET started_at = ? WHERE run_id = ?",
+                (
+                    (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+                    running["run_id"],
+                ),
+            )
+
+        thread = Thread(target=lambda: result.append(service.reap_expired_runs_once()))
+        thread.start()
+        assert runtime.entered.wait(2)
+        completion_store.update_run(
+            running["run_id"],
+            state="completed",
+            output_text="durable completed output",
+            ended_at=datetime.now(timezone.utc).isoformat(),
+        )
+        queued = completion_store.create_run(
+            worker["worker_id"], project["project_id"], "follow-up", state="queued"
+        )
+    finally:
+        runtime.release.set()
+        if thread is not None:
+            thread.join(timeout=2)
+        service.shutdown()
+
+    assert thread is not None and not thread.is_alive()
+    assert result and result[0] and result[0][0]["target_transitioned"] is False
+    terminal = completion_store.get_run(running["run_id"]) or {}
+    assert terminal["state"] == "completed"
+    assert terminal["output_text"] == "durable completed output"
+    assert schedule_finalizations == []
+    assert callbacks == []
+    assert processor_wakes == [worker["worker_id"]]
+    assert (completion_store.get_run(queued["run_id"]) or {})["state"] == "queued"
+    assert not any(
+        event["event_type"] == "run.duration_exceeded"
+        for event in completion_store.list_events(worker["worker_id"])
+    )
+    final_worker = completion_store.get_worker(worker["worker_id"]) or {}
+    assert final_worker["state"] == "starting"
+    assert not final_worker.get("compute_release_token")
 
 
 def test_max_run_duration_treats_malformed_run_timestamp_as_expired(tmp_path, monkeypatch):
@@ -3008,7 +7822,7 @@ def test_callbacks_retry_transient_delivery_failures(tmp_path, monkeypatch):
     assert not [event for event in store.list_events(worker["worker_id"]) if event["event_type"] == "callback.failed"]
 
 
-def test_duplicate_callback_is_treated_as_delivered(tmp_path, monkeypatch):
+def test_conflicting_callback_is_not_treated_as_duplicate_acceptance(tmp_path, monkeypatch):
     attempts: list[int] = []
 
     class Response:
@@ -3017,7 +7831,7 @@ def test_duplicate_callback_is_treated_as_delivered(tmp_path, monkeypatch):
         def raise_for_status(self):
             request = httpx.Request("POST", "http://callback.local/glasshive")
             response = httpx.Response(409, request=request)
-            raise httpx.HTTPStatusError("duplicate callback", request=request, response=response)
+            raise httpx.HTTPStatusError("callback conflict", request=request, response=response)
 
     def fake_post(url, *, content, headers, timeout):
         _ = url, content, headers, timeout
@@ -3048,12 +7862,24 @@ def test_duplicate_callback_is_treated_as_delivered(tmp_path, monkeypatch):
         run = store.create_run(worker["worker_id"], project["project_id"], "Open Chrome", state="running")
 
         service._emit_callback(worker, "run.completed", run=run, message="Done")
-        wait_until(lambda: len(attempts) == 1)
+        wait_until(
+            lambda: bool(
+                [
+                    event
+                    for event in store.list_events(worker["worker_id"])
+                    if event["event_type"] == "callback.dead_lettered"
+                ]
+            )
+        )
     finally:
         service.shutdown()
 
     assert len(attempts) == 1
-    assert not [event for event in store.list_events(worker["worker_id"]) if event["event_type"] == "callback.failed"]
+    assert [
+        event
+        for event in store.list_events(worker["worker_id"])
+        if event["event_type"] == "callback.dead_lettered"
+    ]
 
 
 def test_failed_callback_stays_pending_and_replays_on_restart(tmp_path, monkeypatch):
@@ -3138,7 +7964,7 @@ def test_failed_callback_stays_pending_and_replays_on_restart(tmp_path, monkeypa
     assert not store.list_pending_callbacks()
     with store._connect() as conn:
         row = conn.execute("SELECT status, attempts FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
-    assert row["status"] == "delivered"
+    assert row["status"] == "http_accepted"
     assert row["attempts"] >= 2
     assert attempts[0] == 500
     assert attempts[-1] == 200
@@ -3488,7 +8314,7 @@ def test_local_scheduling_callback_404_is_retryable(tmp_path, monkeypatch):
         service.shutdown()
 
     row = _callback_row(store, record["callback_id"])
-    assert row["status"] == "delivered"
+    assert row["status"] == "http_accepted"
     assert row["attempts"] == 2
     assert row["last_error"] == ""
     assert len(attempts) == 2
@@ -3611,7 +8437,7 @@ def test_stale_delivering_callback_is_reclaimed_for_replay(tmp_path, monkeypatch
         service.shutdown()
 
     row = _callback_row(store, record["callback_id"])
-    assert row["status"] == "delivered"
+    assert row["status"] == "http_accepted"
     assert row["attempts"] == 1
     assert len(attempts) == 1
 
@@ -3749,6 +8575,428 @@ def test_callback_config_recovers_runtime_env_url_and_secret(tmp_path, monkeypat
     assert "runtime-secret" not in caplog.text
 
 
+def test_startup_reconcile_repairs_parallel_mission_networks_before_work_recovery(
+    tmp_path,
+):
+    class RepairingRuntime(StubRuntime):
+        def __init__(self) -> None:
+            self.repairs = 0
+
+        def repair_parallel_clean_room_mission_networks(self) -> tuple[str, ...]:
+            self.repairs += 1
+            return ("synthetic-mission-network",)
+
+    runtime = RepairingRuntime()
+    service = WorkersProjectsService(
+        Store(str(tmp_path / "runtime.db")),
+        runtime,
+        reconcile_on_startup=True,
+    )
+    try:
+        assert runtime.repairs == 1
+    finally:
+        service.shutdown()
+
+
+def test_startup_reconcile_does_not_postpone_idle_compute_release(tmp_path, monkeypatch):
+    class RestartReaperRuntime(StubRuntime):
+        def __init__(self) -> None:
+            self.terminated: list[str] = []
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated.append(str(worker["worker_id"]))
+            info = super().ensure_worker_ready(worker)
+            info.pid = None
+            return info
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner",
+        "Restart Idle Reaper",
+        "Release retained compute after a service restart.",
+        "openclaw-general",
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Completed Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    completed_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+    run = store.create_run(
+        worker["worker_id"],
+        project["project_id"],
+        "Complete before restart",
+        state="running",
+    )
+    store.update_run(
+        run["run_id"],
+        state="completed",
+        ended_at=completed_at.isoformat(),
+        output_text="Synthetic completed result",
+    )
+    store.update_worker(
+        worker["worker_id"],
+        state="completed",
+        last_run_id=run["run_id"],
+    )
+    idle_at = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+            (idle_at, worker["worker_id"]),
+        )
+
+    runtime = RestartReaperRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=True)
+    try:
+        reconciled = store.get_worker(worker["worker_id"])
+        assert reconciled is not None
+        assert reconciled["updated_at"] == idle_at
+        workspace_dir = reconciled["workspace_dir"]
+
+        reaped = service.reap_idle_workers_once()
+
+        assert [item["worker_id"] for item in reaped] == [worker["worker_id"]]
+        assert runtime.terminated == [worker["worker_id"]]
+        released = store.get_worker(worker["worker_id"])
+        assert released is not None
+        assert released["state"] == "completed"
+        assert released["compute_released_at"]
+        assert released["workspace_dir"] == workspace_dir
+        assert (store.get_run(run["run_id"]) or {})["state"] == "completed"
+    finally:
+        service.shutdown()
+
+
+def test_idle_reaper_uses_terminal_run_end_after_restart_lifecycle_refresh(
+    tmp_path,
+    monkeypatch,
+):
+    class RestartRefreshedRuntime(StubRuntime):
+        def __init__(self) -> None:
+            self.terminated: list[str] = []
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated.append(str(worker["worker_id"]))
+            info = super().ensure_worker_ready(worker)
+            info.pid = None
+            return info
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "60")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner",
+        "Restart Refreshed Idle Reaper",
+        "Release terminal compute even when lifecycle reconciliation refreshed the worker row.",
+        "openclaw-general",
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Cancelled Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    ended_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    run = store.create_run(
+        worker["worker_id"],
+        project["project_id"],
+        "Cancel before restart",
+        state="running",
+    )
+    store.update_run(
+        run["run_id"],
+        state="cancelled",
+        ended_at=ended_at.isoformat(),
+    )
+    store.update_worker(
+        worker["worker_id"],
+        state="ready",
+        last_run_id=run["run_id"],
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+            (datetime.now(timezone.utc).isoformat(), worker["worker_id"]),
+        )
+
+    runtime = RestartRefreshedRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        reaped = service.reap_idle_workers_once()
+
+        assert [item["worker_id"] for item in reaped] == [worker["worker_id"]]
+        assert runtime.terminated == [worker["worker_id"]]
+        released = store.get_worker(worker["worker_id"])
+        assert released is not None
+        assert released["compute_released_at"]
+        assert (store.get_run(run["run_id"]) or {})["state"] == "cancelled"
+    finally:
+        service.shutdown()
+
+
+def test_startup_reconcile_keeps_capacity_queued_worker_retry_eligible(tmp_path):
+    class MissingProcessRuntime(StubRuntime):
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            info = super().reconcile_worker(worker)
+            info.pid = None
+            return info
+
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner",
+        "Restart Capacity Retry",
+        "Resume queued capacity work after restart.",
+        "openclaw-general",
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Capacity Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    # Reproduce the durable state left by the older startup reconciler: the
+    # capacity-wait run is still queued, but its no-PID worker was persisted paused.
+    store.update_worker_state(worker["worker_id"], "paused")
+    assert (store.get_worker(worker["worker_id"]) or {})["pid"] is None
+    run = store.create_run(
+        worker["worker_id"],
+        project["project_id"],
+        "Retry after host capacity recovers",
+        state="queued",
+    )
+    retry_after = datetime.now(timezone.utc) + timedelta(days=1)
+    store.update_run(
+        run["run_id"],
+        retry_after=retry_after.isoformat(),
+        retry_attempts=1,
+        last_retry_class="host_capacity",
+        failure_class="host_capacity",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+
+    alias_resumed_worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Alias Resumed Capacity Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    store.add_event(
+        project["project_id"],
+        alias_resumed_worker["worker_id"],
+        None,
+        "worker.paused",
+        "Worker paused",
+    )
+    store.add_event(
+        project["project_id"],
+        alias_resumed_worker["worker_id"],
+        None,
+        "worker.resumed_by_alias",
+        "Worker resumed by alias",
+    )
+    store.update_worker_state(alias_resumed_worker["worker_id"], "paused")
+    alias_resumed_run = store.create_run(
+        alias_resumed_worker["worker_id"],
+        project["project_id"],
+        "Resume the alias-reused capacity wait after legacy reconcile",
+        state="queued",
+    )
+    store.update_run(
+        alias_resumed_run["run_id"],
+        retry_after=retry_after.isoformat(),
+        retry_attempts=1,
+        last_retry_class="host_capacity",
+        failure_class="host_capacity",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+
+    paused_worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Operator Paused Capacity Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    store.update_worker_state(paused_worker["worker_id"], "paused")
+    paused_run = store.create_run(
+        paused_worker["worker_id"],
+        project["project_id"],
+        "Stay paused despite persisted capacity retry",
+        state="paused",
+    )
+    store.update_run(
+        paused_run["run_id"],
+        retry_after=retry_after.isoformat(),
+        retry_attempts=1,
+        last_retry_class="host_capacity",
+        failure_class="host_capacity",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+    store.add_event(
+        project["project_id"],
+        paused_worker["worker_id"],
+        paused_run["run_id"],
+        "worker.paused",
+        "Worker paused",
+    )
+    paused_sibling = store.create_run(
+        paused_worker["worker_id"],
+        project["project_id"],
+        "Queued capacity sibling must not override the paused mission",
+        state="queued",
+    )
+    store.update_run(
+        paused_sibling["run_id"],
+        retry_after=retry_after.isoformat(),
+        retry_attempts=1,
+        last_retry_class="host_capacity",
+        failure_class="host_capacity",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+
+    incomplete_worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Incomplete Capacity Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    store.update_worker_state(incomplete_worker["worker_id"], "paused")
+    incomplete_run = store.create_run(
+        incomplete_worker["worker_id"],
+        project["project_id"],
+        "Do not infer retry eligibility from a capacity label alone",
+        state="queued",
+    )
+    store.update_run(
+        incomplete_run["run_id"],
+        last_retry_class="host_capacity",
+        failure_class="host_capacity",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+
+    stale_class_worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Stale Capacity Class Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    store.update_worker_state(stale_class_worker["worker_id"], "paused")
+    stale_class_run = store.create_run(
+        stale_class_worker["worker_id"],
+        project["project_id"],
+        "Do not recover a retry whose current failure is not capacity",
+        state="queued",
+    )
+    store.update_run(
+        stale_class_run["run_id"],
+        retry_after=retry_after.isoformat(),
+        retry_attempts=1,
+        last_retry_class="host_capacity",
+        failure_class="provider_temporarily_unavailable",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+
+    manual_idle_worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Manually Paused Idle Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    store.update_worker_state(manual_idle_worker["worker_id"], "paused")
+    store.add_event(
+        project["project_id"],
+        manual_idle_worker["worker_id"],
+        None,
+        "worker.paused",
+        "Worker paused",
+    )
+    manual_idle_run = store.create_run(
+        manual_idle_worker["worker_id"],
+        project["project_id"],
+        "A capacity queue must not resume an explicit idle pause",
+        state="queued",
+    )
+    store.update_run(
+        manual_idle_run["run_id"],
+        retry_after=retry_after.isoformat(),
+        retry_attempts=1,
+        last_retry_class="host_capacity",
+        failure_class="host_capacity",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+
+    service = WorkersProjectsService(
+        store,
+        MissingProcessRuntime(),
+        reconcile_on_startup=True,
+    )
+    try:
+        reconciled = store.get_worker(worker["worker_id"])
+        assert reconciled is not None
+        assert reconciled["state"] == "ready"
+        assert (store.get_worker(alias_resumed_worker["worker_id"]) or {})["state"] == "ready"
+        assert (store.get_worker(paused_worker["worker_id"]) or {})["state"] == "paused"
+        assert (store.get_worker(incomplete_worker["worker_id"]) or {})["state"] == "paused"
+        assert (store.get_worker(stale_class_worker["worker_id"]) or {})["state"] == "paused"
+        assert (store.get_worker(manual_idle_worker["worker_id"]) or {})["state"] == "paused"
+        due_after_restart = store.list_due_retry_worker_ids(
+            now_iso=(retry_after + timedelta(seconds=1)).isoformat()
+        )
+        assert set(due_after_restart) == {
+            worker["worker_id"],
+            alias_resumed_worker["worker_id"],
+        }
+        queued = store.get_run(run["run_id"])
+        assert queued is not None
+        assert queued["state"] == "queued"
+        assert queued["failure_class"] == "host_capacity"
+        assert queued["retry_after"] == retry_after.isoformat()
+    finally:
+        service.shutdown()
+
+
 def test_reconcile_interrupts_active_run_when_worker_process_is_missing(tmp_path):
     class MissingProcessRuntime(StubRuntime):
         def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
@@ -3784,6 +9032,290 @@ def test_reconcile_interrupts_active_run_when_worker_process_is_missing(tmp_path
     assert store.get_worker(worker["worker_id"])["state"] == "paused"
     assert store.metrics()["active_runs"] == 0
     assert any(event["event_type"] == "run.orphaned" for event in store.list_events(worker["worker_id"]))
+
+
+def test_reconcile_preserves_active_run_while_local_processor_is_finalizing(tmp_path):
+    class FinalizingRuntime(StubRuntime):
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            info = super().reconcile_worker(worker)
+            # A host CLI can exit before its processor has parsed and durably stored the
+            # successful result. During that finalization window there is no live PID.
+            info.pid = None
+            return info
+
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, FinalizingRuntime(), reconcile_on_startup=False)
+    try:
+        project = store.create_project(
+            "owner",
+            "Finalization Race",
+            "Do not orphan a locally owned run while its result is being finalized",
+            "codex-cli",
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.4",
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+        run = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "Host turn whose process just exited",
+            state="running",
+        )
+        with service._processors_lock:
+            service._active_processors.add(worker["worker_id"])
+            service._processor_generations[worker["worker_id"]] = 1
+
+        service.reconcile_all_workers()
+    finally:
+        with service._processors_lock:
+            service._active_processors.discard(worker["worker_id"])
+        service.shutdown()
+
+    reconciled_run = store.get_run(run["run_id"])
+    assert reconciled_run["state"] == "running"
+    assert store.get_worker(worker["worker_id"])["state"] == "running"
+    assert not any(
+        event["event_type"] == "run.orphaned"
+        for event in store.list_events(worker["worker_id"])
+    )
+
+
+def test_foreign_reconcile_preserves_run_owned_by_live_recorded_host_process(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime_root = tmp_path / "runtime-state"
+    store = Store(str(db_path))
+    owner_runtime = HostCodexCliRuntime(base_dir=str(runtime_root))
+    foreign_runtime = HostCodexCliRuntime(base_dir=str(runtime_root))
+    service = WorkersProjectsService(store, foreign_runtime, reconcile_on_startup=False)
+    process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        project = store.create_project(
+            "owner",
+            "Cross-process ownership",
+            "Do not orphan a host run owned by another service instance",
+            "codex-cli",
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            execution_mode="host",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.6-sol",
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+        run = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "Long host task",
+            state="running",
+        )
+        heartbeat_path = tmp_path / "active-run.json"
+        heartbeat_path.write_text(
+            json.dumps(
+                {
+                    "schema": "glasshive.active_run.v1",
+                    "run_id": run["run_id"],
+                    "state": "running",
+                    "last_heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                    "process_pid": process.pid,
+                }
+            )
+        )
+        owner_runtime._write_active_session(
+            worker["worker_id"],
+            {
+                "session_name": f"conversation-{run['run_id'][:12]}",
+                "run_id": run["run_id"],
+                "process_pid": process.pid,
+                "owner_pid": os.getpid(),
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "stdout_path": str(tmp_path / "still-running.stdout.log"),
+                "stderr_path": str(tmp_path / "still-running.stderr.log"),
+                "exit_path": str(tmp_path / "still-running.exit-code"),
+                "heartbeat_path": str(heartbeat_path),
+            },
+        )
+
+        assert foreign_runtime._active_pid(worker["worker_id"], run["run_id"]) == process.pid
+        service.reconcile_all_workers()
+
+        assert store.get_run(run["run_id"])["state"] == "running"
+        assert store.get_worker(worker["worker_id"])["state"] == "running"
+        assert not any(
+            event["event_type"] == "run.orphaned"
+            for event in store.list_events(worker["worker_id"])
+        )
+        assert not any(
+            event["event_type"] == "worker.reconcile_failed"
+            for event in store.list_events(worker["worker_id"])
+        )
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+        owner_runtime._clear_active_session(worker["worker_id"] if "worker" in locals() else "")
+        service.shutdown()
+
+
+def test_foreign_reconcile_rejects_live_child_when_owner_process_is_gone(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime_root = tmp_path / "runtime-state"
+    store = Store(str(db_path))
+    owner_runtime = HostCodexCliRuntime(base_dir=str(runtime_root))
+    foreign_runtime = HostCodexCliRuntime(base_dir=str(runtime_root))
+    service = WorkersProjectsService(store, foreign_runtime, reconcile_on_startup=False)
+    child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    exited_owner = subprocess.Popen(["true"])
+    exited_owner.wait(timeout=5)
+    try:
+        project = store.create_project(
+            "owner",
+            "Expired cross-process owner",
+            "Do not preserve a child process after its owning service exits",
+            "codex-cli",
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            execution_mode="host",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.6-sol",
+        )
+        store.update_worker_state(worker["worker_id"], "running")
+        run = store.create_run(
+            worker["worker_id"],
+            project["project_id"],
+            "Host task whose service owner exited",
+            state="running",
+        )
+        heartbeat_path = tmp_path / "expired-owner-active-run.json"
+        heartbeat_path.write_text(
+            json.dumps(
+                {
+                    "schema": "glasshive.active_run.v1",
+                    "run_id": run["run_id"],
+                    "state": "running",
+                    "last_heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                    "process_pid": child.pid,
+                }
+            )
+        )
+        owner_runtime._write_active_session(
+            worker["worker_id"],
+            {
+                "session_name": f"conversation-{run['run_id'][:12]}",
+                "run_id": run["run_id"],
+                "process_pid": child.pid,
+                "owner_pid": exited_owner.pid,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "stdout_path": str(tmp_path / "expired-owner.stdout.log"),
+                "stderr_path": str(tmp_path / "expired-owner.stderr.log"),
+                "exit_path": str(tmp_path / "expired-owner.exit-code"),
+                "heartbeat_path": str(heartbeat_path),
+            },
+        )
+
+        assert foreign_runtime._active_pid(worker["worker_id"], run["run_id"]) is None
+        service.reconcile_all_workers()
+
+        interrupted = store.get_run(run["run_id"])
+        assert interrupted["state"] == "interrupted"
+        assert interrupted["failure_class"] == "provider_temporarily_unavailable"
+        assert interrupted["failure_retryable"] == 1
+        assert interrupted["failure_structured"] == 1
+        wait_until(lambda: child.poll() is not None)
+        assert owner_runtime._read_active_session(worker["worker_id"]) is None
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+        owner_runtime._clear_active_session(worker["worker_id"] if "worker" in locals() else "")
+        service.shutdown()
+
+
+def test_fresh_owner_heartbeat_preserves_cross_process_finalization_lease(tmp_path):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "runtime-state"))
+    child = subprocess.Popen(["true"], start_new_session=True)
+    child.wait(timeout=5)
+    worker_id = "wrk_finalization_lease"
+    run_id = "run_finalization_lease"
+    heartbeat_path = tmp_path / "finalization-active-run.json"
+    heartbeat_path.write_text(
+        json.dumps(
+            {
+                "schema": "glasshive.active_run.v1",
+                "run_id": run_id,
+                "state": "running",
+                "last_heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                "process_pid": child.pid,
+            }
+        )
+    )
+    runtime._write_active_session(
+        worker_id,
+        {
+            "session_name": f"conversation-{run_id[:12]}",
+            "run_id": run_id,
+            "process_pid": child.pid,
+            "owner_pid": os.getpid(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "heartbeat_path": str(heartbeat_path),
+        },
+    )
+    try:
+        assert runtime._active_pid(worker_id, run_id) == child.pid
+    finally:
+        runtime._clear_active_session(worker_id)
+
+
+def test_stale_owner_heartbeat_cannot_pin_a_reused_live_pid(tmp_path):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "runtime-state"))
+    unrelated_process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    worker_id = "wrk_stale_lease"
+    run_id = "run_stale_lease"
+    heartbeat_path = tmp_path / "stale-active-run.json"
+    heartbeat_path.write_text(
+        json.dumps(
+            {
+                "schema": "glasshive.active_run.v1",
+                "run_id": run_id,
+                "state": "running",
+                "last_heartbeat_at": "2000-01-01T00:00:00+00:00",
+                "process_pid": unrelated_process.pid,
+            }
+        )
+    )
+    runtime._write_active_session(
+        worker_id,
+        {
+            "session_name": f"conversation-{run_id[:12]}",
+            "run_id": run_id,
+            "process_pid": unrelated_process.pid,
+            "owner_pid": os.getpid(),
+            "started_at": "2000-01-01T00:00:00+00:00",
+            "heartbeat_path": str(heartbeat_path),
+        },
+    )
+    try:
+        assert runtime._active_pid(worker_id, run_id) is None
+    finally:
+        unrelated_process.terminate()
+        unrelated_process.wait(timeout=5)
+        runtime._clear_active_session(worker_id)
 
 
 def test_reconcile_orphaned_running_run_emits_interrupted_callback(tmp_path):
@@ -3828,7 +9360,7 @@ def test_reconcile_orphaned_running_run_emits_interrupted_callback(tmp_path):
     assert len(callbacks) == 1
     payload = json.loads(callbacks[0]["payload_json"])
     assert payload["event"] == "run.interrupted"
-    assert payload["run_state"] == "interrupted"
+    assert payload["run_state"] == "cancelled"
     assert "not running during reconcile" in payload["message"]
 
 
@@ -3997,14 +9529,19 @@ def test_reconcile_continues_when_one_completed_run_collection_raises(tmp_path):
     )
 
 
-def test_reconcile_skips_idle_paused_workers_and_cleans_inconsistent_runs(tmp_path):
+def test_reconcile_skips_idle_paused_workers_and_repairs_inconsistent_runs(tmp_path):
     class CountingRuntime(StubRuntime):
         def __init__(self) -> None:
             self.reconciled_worker_ids: list[str] = []
+            self.paused_worker_ids: list[str] = []
 
         def reconcile_worker(self, worker: dict) -> RuntimeInfo:
             self.reconciled_worker_ids.append(worker["worker_id"])
             return super().reconcile_worker(worker)
+
+        def pause_worker(self, worker: dict) -> RuntimeInfo:
+            self.paused_worker_ids.append(worker["worker_id"])
+            return super().pause_worker(worker)
 
     store = Store(str(tmp_path / "runtime.db"))
     project = store.create_project("owner", "Startup Efficiency", "Avoid Docker scans for paused workspaces", "codex-cli")
@@ -4051,8 +9588,9 @@ def test_reconcile_skips_idle_paused_workers_and_cleans_inconsistent_runs(tmp_pa
         service.shutdown()
 
     assert runtime.reconciled_worker_ids == [ready_worker["worker_id"]]
-    assert store.get_run(active_run["run_id"])["state"] == "interrupted"
-    assert any(event["event_type"] == "run.orphaned" for event in store.list_events(paused_with_run["worker_id"]))
+    assert runtime.paused_worker_ids == [paused_with_run["worker_id"]]
+    assert store.get_run(active_run["run_id"])["state"] == "paused"
+    assert any(event["event_type"] == "run.paused" for event in store.list_events(paused_with_run["worker_id"]))
 
 
 def test_reconcile_does_not_regress_completed_run_when_process_is_missing(tmp_path):
@@ -4443,7 +9981,7 @@ def test_assign_run_effort_updates_claude_worker_bootstrap_bundle(tmp_path):
     assert "Claude effort" in rejected.json()["detail"]
 
 
-def test_signed_worker_view_cannot_inject_bootstrap_bundle_on_assign(tmp_path, monkeypatch):
+def test_signed_worker_view_cannot_assign_or_inject_bootstrap_bundle(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
     monkeypatch.setenv("WPR_API_TOKEN", "api-token")
 
@@ -4487,15 +10025,14 @@ def test_signed_worker_view_cannot_inject_bootstrap_bundle_on_assign(tmp_path, m
             "bootstrap_bundle": {"env": {"UNTRUSTED_FROM_LINK": "1"}},
         },
     )
-    assert injected.status_code == 403
-    assert "cannot modify worker bootstrap context" in injected.json()["detail"]
+    assert injected.status_code == 401
 
-    allowed = client.post(
+    also_read_only = client.post(
         f"/v1/workers/{worker['worker_id']}/assign",
         params=signed_watch,
         json={"instruction": "Continue without bootstrap injection.", "effort": "medium"},
     )
-    assert allowed.status_code == 202
+    assert also_read_only.status_code == 401
 
 
 def test_missing_host_cli_blocks_creation_before_worker_row(tmp_path, monkeypatch):
@@ -5307,6 +10844,8 @@ def test_deliverable_detection_ignores_glasshive_scaffold_files(tmp_path):
 
 
 class ControllableRuntime:
+    requires_run_start_identity = False
+
     def __init__(self) -> None:
         self.running = Event()
         self.release = Event()
@@ -5316,6 +10855,9 @@ class ControllableRuntime:
 
     def resolve_model(self, profile: str) -> str:
         return "controllable/test"
+
+    def isolated_resource_usage(self) -> dict[str, object]:
+        return StubRuntime().isolated_resource_usage()
 
     def _info(self, worker: dict, pid: int | None = 1234) -> RuntimeInfo:
         return RuntimeInfo(
@@ -5383,6 +10925,13 @@ class SteerableControllableRuntime(ControllableRuntime):
         return super().run_task(worker, instruction, timeout_sec=timeout_sec)
 
 
+class ControllableFailureRuntime(ControllableRuntime):
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None) -> str:
+        self.running.set()
+        assert self.release.wait(timeout=3)
+        raise RuntimeErrorBase("Synthetic late provider failure")
+
+
 class RefreshingModelRuntime(ControllableRuntime):
     def __init__(self, model: str) -> None:
         super().__init__()
@@ -5395,6 +10944,98 @@ class RefreshingModelRuntime(ControllableRuntime):
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         self.ensure_models.append(str(worker.get("model") or ""))
         return self._info(worker)
+
+
+def test_late_processor_completion_cannot_overwrite_interrupted_run(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime = ControllableRuntime()
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Late completion",
+            "goal": "Preserve a durable interrupt over a late processor return.",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Late Worker", "role": "coder"},
+    ).json()
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Return only after the durable interrupt is recorded."},
+    ).json()
+    assert runtime.running.wait(timeout=2), "worker run never started"
+    store = client.app.state.store
+    assert store.finalize_run_if_state(
+        run["run_id"],
+        "running",
+        "interrupted",
+        error_text="Synthetic durable interrupt",
+    )
+
+    runtime.release.set()
+    wait_until(lambda: not client.app.state.service._local_processor_owns(worker["worker_id"]))
+
+    settled = store.get_run(run["run_id"])
+    assert settled["state"] == "interrupted"
+    assert settled["output_text"] == ""
+    assert not any(
+        event["event_type"] == "run.completed" and event["run_id"] == run["run_id"]
+        for event in store.list_events(worker["worker_id"])
+    )
+
+
+def test_late_processor_failure_cannot_overwrite_structured_interruption(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime = ControllableFailureRuntime()
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "demo-owner",
+            "title": "Late failure",
+            "goal": "Preserve a durable structured interruption over a late processor error.",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Late Failure Worker", "role": "coder"},
+    ).json()
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Fail only after the durable interruption is recorded."},
+    ).json()
+    assert runtime.running.wait(timeout=2), "worker run never started"
+    store = client.app.state.store
+    assert store.finalize_run_if_state(
+        run["run_id"],
+        "running",
+        "interrupted",
+        error_text="Synthetic owner lease expired",
+        failure_class="provider_temporarily_unavailable",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+
+    runtime.release.set()
+    wait_until(lambda: not client.app.state.service._local_processor_owns(worker["worker_id"]))
+
+    settled = store.get_run(run["run_id"])
+    assert settled["state"] == "interrupted"
+    assert settled["failure_class"] == "provider_temporarily_unavailable"
+    assert settled["failure_retryable"] == 1
+    assert settled["failure_structured"] == 1
+    events = store.list_events(worker["worker_id"])
+    assert not any(
+        event["event_type"] == "run.failed" and event["run_id"] == run["run_id"]
+        for event in events
+    )
+    assert any(
+        event["event_type"] == "run.late_completion_ignored" and event["run_id"] == run["run_id"]
+        for event in events
+    )
 
 
 def test_assign_run_refreshes_stale_worker_model_before_queue(tmp_path):
@@ -5478,7 +11119,7 @@ def test_pause_resume_freezes_active_run_without_losing_it(tmp_path):
     assert paused.json()["state"] == "paused"
 
     run_during_pause = client.get(f"/v1/runs/{run['run_id']}").json()
-    assert run_during_pause["state"] == "running"
+    assert run_during_pause["state"] == "paused"
 
     resumed = client.post(f"/v1/workers/{worker['worker_id']}/resume")
     assert resumed.status_code == 202
@@ -5490,13 +11131,182 @@ def test_pause_resume_freezes_active_run_without_losing_it(tmp_path):
     assert settled["output_text"] == "CONTROLLABLE_OK"
 
 
+class CompletionDuringPauseRuntime(ControllableRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.store: Store | None = None
+        self.run_id = ""
+
+    def pause_worker(self, worker: dict) -> RuntimeInfo:
+        assert self.store is not None
+        assert self.store.finalize_run_if_state(
+            self.run_id,
+            "running",
+            "completed",
+            output_text="COMPLETED_DURING_PAUSE",
+        )
+        return super().pause_worker(worker)
+
+
+def test_completion_wins_pause_race_and_worker_does_not_regress_to_paused(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime = CompletionDuringPauseRuntime()
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
+    runtime.store = client.app.state.store
+
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Pause race", "goal": "Keep terminal truth."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Pause Race Worker", "role": "coder"},
+    ).json()
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Complete while pause is being accepted."},
+    ).json()
+    runtime.run_id = run["run_id"]
+    assert runtime.running.wait(timeout=2), "worker run never started"
+
+    paused = client.post(f"/v1/workers/{worker['worker_id']}/pause")
+
+    assert paused.status_code == 202
+    assert client.get(f"/v1/runs/{run['run_id']}").json()["state"] == "completed"
+    assert client.get(f"/v1/workers/{worker['worker_id']}").json()["state"] == "ready"
+
+
+class RestartingHostPauseRuntime:
+    requires_run_start_identity = True
+
+    def __init__(self) -> None:
+        self.first_started = Event()
+        self.pause_requested = Event()
+        self.invocations = 0
+        self._run_start_observer = None
+
+    def set_run_start_observer(self, observer) -> None:
+        self._run_start_observer = observer
+
+    def resolve_model(self, profile: str) -> str:
+        return "host-pause-restart/test"
+
+    def _info(self, worker: dict, pid: int | None = None) -> RuntimeInfo:
+        return RuntimeInfo(
+            runtime="host-pause-restart",
+            model=worker.get("model") or self.resolve_model(worker.get("profile", "")),
+            gateway_url="",
+            gateway_port=None,
+            gateway_token=None,
+            session_key=f"host-pause-restart:{worker['worker_id']}",
+            state_dir=f"/tmp/{worker['worker_id']}/state",
+            workspace_dir=f"/tmp/{worker['worker_id']}/workspace",
+            pid=pid,
+        )
+
+    def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+        self.pause_requested.clear()
+        return self._info(worker)
+
+    def pause_worker(self, worker: dict) -> RuntimeInfo:
+        self.pause_requested.set()
+        return self._info(worker)
+
+    def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
+        self.pause_requested.set()
+        return self._info(worker)
+
+    def terminate_worker(self, worker: dict) -> RuntimeInfo:
+        self.pause_requested.set()
+        return self._info(worker)
+
+    def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker)
+
+    def run_task(
+        self,
+        worker: dict,
+        instruction: str,
+        timeout_sec: float | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        self.invocations += 1
+        pid = 4241 + self.invocations
+        assert self._run_start_observer is not None
+        self._run_start_observer(
+            {
+                "worker_id": worker["worker_id"],
+                "run_id": run_id,
+                "identity_kind": "host_process",
+                "pid": pid,
+                "process_group": pid,
+                "process_start_identity": f"ps-lstart:synthetic-host-{self.invocations}",
+                "container_id": "",
+                "session_id": f"synthetic-host-session-{self.invocations}",
+            }
+        )
+        if self.invocations == 1:
+            self.first_started.set()
+            assert self.pause_requested.wait(timeout=3)
+            raise WorkerPausedError("Host provider stopped for durable pause")
+        return "HOST_RESUMED_SAME_RUN_OK"
+
+
+def test_host_pause_resume_restarts_provider_on_the_same_durable_run(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = RestartingHostPauseRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = service.create_project(
+            "demo-owner", "Host pause resume", "Resume the exact host mission.", "codex-cli"
+        )
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="demo-owner",
+            name="Host Pause Worker",
+            role="coder",
+            profile="codex-cli",
+            backend="codex-cli",
+            execution_mode="host",
+        )
+        run = service.assign_run(worker["worker_id"], "Continue after a host pause.")
+        assert runtime.first_started.wait(timeout=2)
+
+        service.pause_worker(worker["worker_id"])
+        wait_until(lambda: not service._local_processor_owns(worker["worker_id"]))
+        assert store.get_run(run["run_id"])["state"] == "paused"
+
+        service.resume_worker(worker["worker_id"])
+        wait_until(
+            lambda: (store.get_run(run["run_id"]) or {}).get("state") == "completed",
+            timeout=3,
+        )
+
+        durable = store.get_run(run["run_id"])
+        assert durable["output_text"] == "HOST_RESUMED_SAME_RUN_OK"
+        assert runtime.invocations == 2
+        assert [item["run_id"] for item in store.list_runs_for_worker(worker["worker_id"])] == [
+            run["run_id"]
+        ]
+    finally:
+        service.shutdown()
+
+
 class RaisingPauseRuntime:
+    requires_run_start_identity = False
+
     def __init__(self) -> None:
         self.running = Event()
         self.paused = Event()
 
     def resolve_model(self, profile: str) -> str:
         return "pause-raising/test"
+
+    def isolated_resource_usage(self) -> dict[str, object]:
+        return StubRuntime().isolated_resource_usage()
 
     def _info(self, worker: dict, pid: int | None = 2222) -> RuntimeInfo:
         return RuntimeInfo(
@@ -5575,7 +11385,7 @@ def test_worker_paused_error_finalizes_run_as_paused(tmp_path):
 
     assert settled is not None, "run did not settle into paused state"
     assert settled["state"] == "paused"
-    assert "paused while a run was active" in settled["error_text"]
+    assert settled["error_text"] == "Paused by operator"
 
 
 def test_interrupt_stops_active_run_and_keeps_worker_ready(tmp_path):
@@ -5775,6 +11585,8 @@ def test_heal_worker_repairs_starting_worker_without_active_run(tmp_path):
 
 
 class HealingRaceRuntime:
+    requires_run_start_identity = False
+
     def __init__(self) -> None:
         self.initial_started = Event()
         self.release_initial = Event()
@@ -5784,6 +11596,9 @@ class HealingRaceRuntime:
 
     def resolve_model(self, profile: str) -> str:
         return "healing-race/test"
+
+    def isolated_resource_usage(self) -> dict[str, object]:
+        return StubRuntime().isolated_resource_usage()
 
     def _info(self, worker: dict, pid: int | None = 4242) -> RuntimeInfo:
         return RuntimeInfo(
@@ -6017,6 +11832,22 @@ class RuntimeIoFailureWithDeliverableArtifactRuntime(RuntimeErrorWithDeliverable
         }
 
 
+class ProviderAuthNeedsInputRecoveryRuntime(RuntimeErrorWithPartialArtifactsRuntime):
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
+        self.collect_run_ids.append(run_id)
+        return {
+            "state": "needs_input",
+            "output_text": "",
+            "error_text": "The connected model account is unavailable for this mission.",
+            "failure_class": "provider_auth_projection_unavailable",
+            "failure_retryable": 0,
+            "failure_structured": 1,
+            "failure_user_message": "The connected model account is unavailable for this mission.",
+            "failure_recommended_recovery": "Connect or reauthorize the model account, then resume this work.",
+            "failure_diagnostic_summary": "The clean-room provider broker returned needs-input truth.",
+        }
+
+
 class EvidenceFailureWithCompletedRecoveryRuntime(RuntimeErrorWithDeliverableArtifactRuntime):
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
         _, workspace_dir = self._worker_paths(worker["worker_id"])
@@ -6099,6 +11930,70 @@ def test_runtime_error_recovers_codex_failure_metadata_and_artifacts(tmp_path, m
     assert refreshed_worker["workspace_dir"]
     artifacts = client.get(f"/v1/workers/{worker['worker_id']}/artifacts").json()
     assert any(item["path"] == "reports/partial_result.csv" for item in artifacts["items"])
+
+
+def test_runtime_provider_auth_recovery_persists_needs_input_and_callback(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive-ui.example.test")
+    payloads: list[dict] = []
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def capture_post(url, *, content, headers, timeout):
+        _ = url, headers, timeout
+        payloads.append(json.loads(content.decode("utf-8")))
+        return Response()
+
+    monkeypatch.setattr("workers_projects_runtime.service.httpx.post", capture_post)
+    runtime = ProviderAuthNeedsInputRecoveryRuntime(tmp_path / "workers")
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=runtime))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Provider auth", "goal": "Wait for account auth."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "demo-owner",
+            "name": "Codex Worker",
+            "role": "research",
+            "profile": "codex-cli",
+            "bootstrap_bundle": {
+                "callbacks": {
+                    "events_webhook_url": "http://callback.local/glasshive",
+                    "hmac_secret": "callback-secret",
+                    "conversation_id": "conv-auth",
+                    "parent_message_id": "msg-user-auth",
+                    "message_id": "msg-assistant-auth",
+                    "surface": "web",
+                }
+            },
+        },
+    ).json()
+
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "continue only after connected account authorization"},
+    ).json()
+    wait_until(
+        lambda: client.get(f"/v1/runs/{run['run_id']}").json().get("state")
+        == "needs_input"
+    )
+    blocked = client.get(f"/v1/runs/{run['run_id']}").json()
+
+    assert blocked["state"] == "needs_input"
+    assert blocked["failure_class"] == "provider_auth_projection_unavailable"
+    assert blocked["failure_retryable"] == 0
+    assert client.get(f"/v1/workers/{worker['worker_id']}").json()["state"] == "needs_input"
+    wait_until(lambda: any(payload.get("event") == "run.needs_input" for payload in payloads))
+    callback = next(payload for payload in payloads if payload.get("event") == "run.needs_input")
+    assert callback["failure_code"] == "provider_auth_projection_unavailable"
+    assert "connected model account" in callback["message"]
+    assert runtime.collect_run_ids == [run["run_id"]]
 
 
 def test_provider_failure_after_fresh_artifact_is_delivered_as_completed(tmp_path, monkeypatch):
@@ -6317,12 +12212,17 @@ def test_worker_terminated_error_recovers_completed_artifacts(tmp_path):
 
 
 class DesktopStubRuntime:
+    requires_run_start_identity = False
+
     def __init__(self, root: Path) -> None:
         self.root = root
         self.last_desktop_action: dict[str, object] | None = None
 
     def resolve_model(self, profile: str) -> str:
         return "desktop-stub/test"
+
+    def isolated_resource_usage(self) -> dict[str, object]:
+        return StubRuntime().isolated_resource_usage()
 
     def _worker_paths(self, worker_id: str) -> tuple[Path, Path]:
         state_dir = self.root / worker_id / "state"

@@ -170,7 +170,7 @@ class AuthContext:
 
     @property
     def is_user_scoped(self) -> bool:
-        return bool(self.enterprise and self.user_id)
+        return bool(self.user_id and self.auth_mode not in {"", DEFAULT_AUTH_MODE})
 
 
 def owner_matches_auth_context(owner_id: object, ctx: AuthContext) -> bool:

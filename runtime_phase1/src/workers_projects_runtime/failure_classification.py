@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 
@@ -13,11 +15,14 @@ class FailureClassification:
     user_message: str
     recommended_recovery: str
     diagnostic_summary: str
+    structured: bool = False
+    retry_after_s: float | None = None
 
     def as_store_fields(self) -> dict[str, Any]:
         return {
             "failure_class": self.failure_class,
             "failure_retryable": 1 if self.retryable else 0,
+            "failure_structured": 1 if self.structured else 0,
             "failure_user_message": self.user_message,
             "failure_recommended_recovery": self.recommended_recovery,
             "failure_diagnostic_summary": self.diagnostic_summary,
@@ -39,9 +44,37 @@ def classify_cli_failure(
     evidence = _collect_structured_failure_evidence(stdout)
     if not evidence:
         evidence = _collect_structured_failure_evidence(stderr)
+    if not evidence and not stdout.strip():
+        evidence = _collect_prefixed_cli_stderr_failure_evidence(stderr)
     diagnostic_source = "\n".join(evidence) if evidence else stderr or stdout
     diagnostic_summary = _redact_failure_text(diagnostic_source.strip(), max_chars=1200)
     lowered = diagnostic_summary.lower()
+    structured_capacity = _structured_provider_capacity_class(stdout, stderr)
+    structured_auth = _structured_provider_auth_failure(stdout, stderr)
+
+    if (
+        evidence
+        and "unexpected status 409 conflict" in lowered
+        and "the connected model account is unavailable for this mission" in lowered
+        and "provider-egress" in lowered
+        and (
+            "/openai/v1/responses" in lowered
+            or "/anthropic/v1/messages" in lowered
+        )
+    ):
+        return FailureClassification(
+            failure_class="provider_auth_projection_unavailable",
+            retryable=False,
+            user_message=(
+                "The connected model account is unavailable for this mission."
+            ),
+            recommended_recovery=(
+                "Connect or reauthorize the model account, then resume this work from the "
+                "same durable workspace."
+            ),
+            diagnostic_summary=diagnostic_summary,
+            structured=True,
+        )
 
     if "content_filter" in lowered or "content filter" in lowered:
         return FailureClassification(
@@ -55,19 +88,36 @@ def classify_cli_failure(
                 "success criteria, or adjust the request if the filter was expected."
             ),
             diagnostic_summary=diagnostic_summary,
+            structured=bool(evidence),
         )
-    if _looks_like_rate_limit_failure(lowered):
+    if structured_capacity == "provider_quota_exhausted":
+        return FailureClassification(
+            failure_class="provider_quota_exhausted",
+            retryable=True,
+            user_message=(
+                "The selected model provider quota was exhausted before the worker could finish."
+            ),
+            recommended_recovery=(
+                "Keep the same configured model and effort queued until its provider quota resets, "
+                "unless the user explicitly chooses a different model."
+            ),
+            diagnostic_summary=diagnostic_summary,
+            structured=bool(evidence),
+        )
+    if structured_capacity == "provider_rate_limited":
         return FailureClassification(
             failure_class="provider_rate_limited",
             retryable=True,
             user_message=(
-                "The worker made progress, but the model or research provider rate-limited the run before it finished."
+                "The model or research provider rate-limited the worker before it could finish."
             ),
             recommended_recovery=(
                 "Use workspace_continue to resume the same workspace after a short wait, preserving the "
                 "original task and any files already produced."
             ),
             diagnostic_summary=diagnostic_summary,
+            structured=bool(evidence),
+            retry_after_s=extract_structured_retry_after_seconds(stdout, stderr),
         )
     if (
         "request rejected" in lowered
@@ -87,7 +137,7 @@ def classify_cli_failure(
             ),
             diagnostic_summary=diagnostic_summary,
         )
-    if _looks_like_provider_service_failure(lowered, structured=bool(evidence)):
+    if structured_capacity == "provider_response_failed":
         return FailureClassification(
             failure_class="provider_response_failed",
             retryable=True,
@@ -100,7 +150,7 @@ def classify_cli_failure(
             ),
             diagnostic_summary=diagnostic_summary,
         )
-    if _looks_like_provider_auth_failure(lowered):
+    if structured_auth:
         return FailureClassification(
             failure_class="provider_auth_missing",
             retryable=False,
@@ -110,6 +160,7 @@ def classify_cli_failure(
                 "then use workspace_continue to resume the same workspace."
             ),
             diagnostic_summary=diagnostic_summary,
+            structured=True,
         )
     if "response.failed" in lowered or "turn.failed" in lowered:
         return FailureClassification(
@@ -213,7 +264,37 @@ def classify_runtime_error(
     actual_version = str(getattr(exc, "actual_version", "") or "").strip()
     recovery_hint = str(getattr(exc, "recovery_hint", "") or "").strip()
 
-    if _looks_like_provider_auth_failure(lowered):
+    if str(getattr(exc, "failure_class", "") or "") == "host_capacity":
+        capacity_class = str(getattr(exc, "capacity_class", "host") or "host")
+        return FailureClassification(
+            failure_class="host_capacity",
+            retryable=True,
+            user_message="The worker is waiting for host capacity and will retry.",
+            recommended_recovery=(
+                "No action is required. GlassHive will continue through the durable capacity queue; "
+                "the exact work can also be stopped explicitly."
+            ),
+            diagnostic_summary=f"host capacity class={capacity_class}: {message}",
+            structured=True,
+        )
+
+    if str(getattr(exc, "failure_class", "") or "") == "provider_rate_limited":
+        return FailureClassification(
+            failure_class="provider_rate_limited",
+            retryable=True,
+            user_message=(
+                "The model or research provider rate-limited the worker before it could finish."
+            ),
+            recommended_recovery=(
+                "No action is required while GlassHive honors the provider retry window and retries "
+                "the same workspace without changing the configured model or effort."
+            ),
+            diagnostic_summary=message,
+            structured=True,
+            retry_after_s=float(getattr(exc, "retry_after_s", 0) or 0) or None,
+        )
+
+    if str(getattr(exc, "failure_class", "") or "") == "provider_auth_missing":
         return FailureClassification(
             failure_class="provider_auth_missing",
             retryable=False,
@@ -224,6 +305,7 @@ def classify_runtime_error(
                 "workspace_continue to resume the same workspace."
             ),
             diagnostic_summary=message,
+            structured=True,
         )
     if _looks_like_sandbox_lifecycle_failure(lowered):
         return FailureClassification(
@@ -348,6 +430,189 @@ def _collect_structured_failure_evidence(text: str) -> list[str]:
     return evidence
 
 
+def extract_structured_retry_after_seconds(*texts: str) -> float | None:
+    """Read provider Retry-After only from JSONL control events, never prose."""
+
+    delays: list[float] = []
+
+    def parse_delay(value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            delay = float(value)
+        elif isinstance(value, str):
+            clean = value.strip()
+            try:
+                delay = float(clean)
+            except ValueError:
+                try:
+                    parsed = parsedate_to_datetime(clean)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                delay = (
+                    parsed.astimezone(timezone.utc) - datetime.now(timezone.utc)
+                ).total_seconds()
+        else:
+            return None
+        if not (delay > 0):
+            return None
+        return min(delay, 86_400.0)
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = re.sub(r"[-_]", "", str(key)).lower()
+                if normalized in {"retryafter", "retryafterseconds"}:
+                    parsed = parse_delay(child)
+                    if parsed is not None:
+                        delays.append(parsed)
+                if isinstance(child, (dict, list)):
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    for text in texts:
+        for line in str(text or "").splitlines():
+            raw = line.strip()
+            if not raw.startswith("{"):
+                continue
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            visit(decoded)
+    return max(delays) if delays else None
+
+
+_STRUCTURED_RATE_LIMIT_CODES = frozenset(
+    {
+        "rate_limit",
+        "rate_limit_error",
+        "rate_limit_exceeded",
+        "resource_exhausted",
+        "throttled",
+        "throttling_error",
+    }
+)
+_STRUCTURED_QUOTA_CODES = frozenset(
+    {
+        "insufficient_quota",
+        "plan_limit_reached",
+        "quota_exhausted",
+        "usage_limit_reached",
+        "weekly_limit_reached",
+    }
+)
+_STRUCTURED_PROVIDER_OUTAGE_CODES = frozenset(
+    {
+        "overloaded",
+        "overloaded_error",
+        "provider_unavailable",
+        "service_unavailable",
+    }
+)
+_STRUCTURED_PROVIDER_AUTH_CODES = frozenset(
+    {
+        "authentication_error",
+        "authentication_required",
+        "expired_token",
+        "invalid_api_key",
+        "invalid_authentication",
+        "invalid_token",
+        "not_authenticated",
+        "oauth_required",
+        "permission_denied",
+        "provider_auth_missing",
+        "unauthorized",
+    }
+)
+_STRUCTURED_STATUS_KEYS = frozenset(
+    {"apierrorstatus", "httpstatus", "statuscode"}
+)
+_STRUCTURED_CODE_KEYS = frozenset(
+    {"code", "errorcode", "errortype", "type"}
+)
+
+
+def _normalized_structured_code(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def _structured_provider_signals(*texts: str) -> tuple[set[int], set[str]]:
+    """Extract exact provider control fields from JSONL without reading prose."""
+
+    statuses: set[int] = set()
+    codes: set[str] = set()
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized_key = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                if normalized_key in _STRUCTURED_STATUS_KEYS and not isinstance(child, bool):
+                    try:
+                        status = int(child)
+                    except (TypeError, ValueError):
+                        status = 0
+                    if 100 <= status <= 599:
+                        statuses.add(status)
+                if normalized_key in _STRUCTURED_CODE_KEYS:
+                    code = _normalized_structured_code(child)
+                    if code:
+                        codes.add(code)
+                if isinstance(child, (dict, list)):
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    for text in texts:
+        for line in str(text or "").splitlines():
+            raw = line.strip()
+            if not raw.startswith("{"):
+                continue
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            visit(decoded)
+    return statuses, codes
+
+
+def _structured_provider_capacity_class(*texts: str) -> str:
+    """Map only exact provider/runtime controls into capacity classes.
+
+    Human-readable messages, stderr prose, and user/task output are deliberately
+    excluded. Unknown structured failures remain generic provider failures.
+    """
+
+    statuses, codes = _structured_provider_signals(*texts)
+    if codes & _STRUCTURED_QUOTA_CODES:
+        return "provider_quota_exhausted"
+    if 429 in statuses or codes & _STRUCTURED_RATE_LIMIT_CODES:
+        return "provider_rate_limited"
+    if statuses & {503, 529} or codes & _STRUCTURED_PROVIDER_OUTAGE_CODES:
+        return "provider_response_failed"
+    return ""
+
+
+def _structured_provider_auth_failure(*texts: str) -> bool:
+    """Recognize provider authentication only from exact JSONL control fields."""
+
+    statuses, codes = _structured_provider_signals(*texts)
+    return bool(statuses & {401, 403} or codes & _STRUCTURED_PROVIDER_AUTH_CODES)
+
+
+def _collect_prefixed_cli_stderr_failure_evidence(text: str) -> list[str]:
+    """Collect native-CLI control errors without treating ordinary task prose as evidence."""
+
+    return [line.strip() for line in text.splitlines() if line.lstrip().startswith("ERROR:")]
+
+
 def _extract_failure_strings(value: Any, *, path: str = "", failure_context: bool = False) -> list[str]:
     results: list[str] = []
     if isinstance(value, dict):
@@ -450,25 +715,6 @@ def _looks_failure_field(key: str) -> bool:
     }
 
 
-def _looks_like_provider_service_failure(lowered: str, *, structured: bool = False) -> bool:
-    if (
-        "api_error_status" in lowered and "529" in lowered
-    ) or (
-        "529" in lowered and "overloaded" in lowered
-    ) or (
-        "503" in lowered and ("service unavailable" in lowered or "temporarily unavailable" in lowered)
-    ):
-        return True
-    if not structured:
-        return False
-    return (
-        "overloaded" in lowered
-        or "server-side issue" in lowered
-        or "service unavailable" in lowered
-        or "temporarily unavailable" in lowered
-    )
-
-
 def _has_contextual_status_code(lowered: str, codes: tuple[str, ...]) -> bool:
     for code in codes:
         status_after_label = re.search(
@@ -485,27 +731,6 @@ def _has_contextual_status_code(lowered: str, codes: tuple[str, ...]) -> bool:
         if status_after_label or status_before_reason:
             return True
     return False
-
-
-def _looks_like_rate_limit_failure(lowered: str) -> bool:
-    return (
-        "too many requests" in lowered
-        or "rate limit" in lowered
-        or "rate_limit" in lowered
-        or _has_contextual_status_code(lowered, ("429",))
-    )
-
-
-def _looks_like_provider_auth_failure(lowered: str) -> bool:
-    return (
-        "unauthorized" in lowered
-        or "forbidden" in lowered
-        or "invalid api key" in lowered
-        or "not logged in" in lowered
-        or "please run /login" in lowered
-        or "please run login" in lowered
-        or _has_contextual_status_code(lowered, ("401", "403"))
-    )
 
 
 def _looks_like_runtime_dependency_or_version_failure(lowered: str) -> bool:
@@ -545,9 +770,6 @@ def _looks_failure_related(value: str) -> bool:
         "failure",
         "content_filter",
         "content filter",
-        "too many requests",
-        "rate limit",
-        "rate_limit",
         "unauthorized",
         "forbidden",
         "invalid api key",
@@ -562,7 +784,7 @@ def _looks_failure_related(value: str) -> bool:
     )
     return any(marker in lowered for marker in markers) or _has_contextual_status_code(
         lowered,
-        ("400", "401", "403", "429", "503", "529"),
+        ("400", "401", "403", "503", "529"),
     )
 
 

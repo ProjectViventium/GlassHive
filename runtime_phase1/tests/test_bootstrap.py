@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+import workers_projects_runtime.bootstrap as bootstrap_module
 
 from workers_projects_runtime.bootstrap import (
     GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
@@ -120,6 +121,7 @@ def test_local_bootstrap_env_filters_user_provider_tokens_without_blocking_provi
                 "env": {
                     "OPENAI_API_KEY": "bundle-openai",
                     "PRIVATE_INTERNAL_TOKEN": "local-mode-keeps-existing-behavior",
+                    "PATH": "/tmp/untrusted-path",
                     "GOOGLE_REFRESH_TOKEN": "must-not-project",
                     "GOOGLE_OAUTH_CLIENT_SECRET": "must-not-project",
                     "MS365_ACCESS_TOKEN": "must-not-project",
@@ -132,6 +134,7 @@ def test_local_bootstrap_env_filters_user_provider_tokens_without_blocking_provi
 
     assert env["OPENAI_API_KEY"] == "bundle-openai"
     assert env["PRIVATE_INTERNAL_TOKEN"] == "local-mode-keeps-existing-behavior"
+    assert "PATH" not in env
     assert "GOOGLE_REFRESH_TOKEN" not in env
     assert "GOOGLE_OAUTH_CLIENT_SECRET" not in env
     assert "MS365_ACCESS_TOKEN" not in env
@@ -154,6 +157,387 @@ def test_enterprise_bootstrap_does_not_copy_host_auth_or_identity_files(tmp_path
 
     assert copied_files == []
     assert copied_trees == []
+
+
+def test_clean_room_bootstrap_purges_reused_host_credentials_and_ambient_provider_env(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("GLASSHIVE_ENTERPRISE_MODE", raising=False)
+    monkeypatch.delenv("WPR_ENTERPRISE_MODE", raising=False)
+    monkeypatch.setenv("GLASSHIVE_PROJECT_PROVIDER_ENV", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-ambient-provider-key")
+    home_dir = tmp_path / "reused-home"
+    workspace_dir = tmp_path / "workspace"
+    trusted_state_dir = tmp_path / "trusted-state"
+    stale_credentials = [
+        home_dir / ".codex" / "auth.json",
+        home_dir / ".claude.json",
+        home_dir / ".claude" / ".credentials.json",
+        home_dir / ".gitconfig",
+        home_dir / ".git-credentials",
+        home_dir / ".config" / "git" / "credentials",
+        home_dir / ".config" / "gh" / "hosts.yml",
+        home_dir / ".config" / "glab-cli" / "config.yml",
+    ]
+    for path in stale_credentials:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("synthetic-stale-host-credential")
+    stale_codex_config = home_dir / ".codex" / "config.toml"
+    stale_codex_config.write_text(
+        '[mcp_servers.host-private]\ncommand = "synthetic-host-command"\n'
+    )
+    stale_host_tree_paths = [
+        home_dir / ".claude" / "settings.json",
+        home_dir / ".claude" / "plugins" / "host-hook.json",
+        home_dir / ".claude" / "projects" / "host-session.jsonl",
+        home_dir / ".codex" / "sessions" / "host-session.jsonl",
+    ]
+    for path in stale_host_tree_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("synthetic-stale-host-authority")
+    stale_manifest = home_dir / ".glasshive" / "bootstrap-manifest.json"
+    stale_manifest.parent.mkdir(parents=True, exist_ok=True)
+    stale_manifest.write_text(
+        json.dumps({"execution_policy": "parallel-clean-room-v1"})
+    )
+    broker_url = "http://host.docker.internal:3080/api/viventium/glasshive/capabilities/mcp"
+    worker = {
+        "bootstrap_profile": "clean-room",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "execution_policy": "parallel-clean-room-v1",
+                "env": {
+                    "OPENAI_API_KEY": "synthetic-caller-provider-key",
+                    "GLASSHIVE_CAPABILITY_BROKER_TOKEN": "synthetic-run-grant",
+                },
+                "codex_config_append": (
+                    "[mcp_servers.glasshive-user-capabilities]\n"
+                    f'url = "{broker_url}"\n'
+                    'bearer_token_env_var = "GLASSHIVE_CAPABILITY_BROKER_TOKEN"'
+                ),
+            }
+        ),
+    }
+    copied_files = []
+    copied_trees = []
+
+    apply_bootstrap(
+        home_dir=home_dir,
+        workspace_dir=workspace_dir,
+        runtime_name="codex-cli",
+        worker=worker,
+        copy_file=lambda source, target: copied_files.append((source, target)),
+        copy_tree=lambda source, target: copied_trees.append((source, target)),
+        trusted_state_dir=trusted_state_dir,
+    )
+
+    assert copied_files == []
+    assert copied_trees == []
+    assert all(not path.exists() for path in stale_credentials)
+    assert all(not path.exists() for path in stale_host_tree_paths)
+    codex_config = stale_codex_config.read_text()
+    assert "host-private" not in codex_config
+    assert "glasshive-user-capabilities" in codex_config
+    assert 'url = "http://host.docker.internal:8080/mcp"' in codex_config
+    assert broker_url not in codex_config
+    runtime_files = "\n".join(
+        path.read_text()
+        for path in (
+            home_dir / ".glasshive" / "runtime.env",
+            home_dir / ".glasshive" / "secret-runtime.env",
+        )
+        if path.exists()
+    )
+    assert "synthetic-ambient-provider-key" not in runtime_files
+    assert "synthetic-caller-provider-key" not in runtime_files
+    assert "GLASSHIVE_CAPABILITY_BROKER_TOKEN" not in runtime_files
+    runtime_env = home_dir / ".glasshive" / "runtime.env"
+    secret_env = home_dir / ".glasshive" / "secret-runtime.env"
+    secret_keys = home_dir / ".glasshive" / "secret-runtime.keys"
+    assert not runtime_env.exists()
+    assert not secret_env.exists()
+    assert not secret_keys.exists()
+    assert (trusted_state_dir / ".parallel-clean-room-v1").read_text() == (
+        "parallel-clean-room-v1\n"
+    )
+
+    worker_session = home_dir / ".claude" / "projects" / "worker-session.jsonl"
+    worker_session.parent.mkdir(parents=True, exist_ok=True)
+    worker_session.write_text("synthetic-worker-session")
+    apply_bootstrap(
+        home_dir=home_dir,
+        workspace_dir=workspace_dir,
+        runtime_name="claude-code",
+        worker=worker,
+        copy_file=lambda source, target: copied_files.append((source, target)),
+        copy_tree=lambda source, target: copied_trees.append((source, target)),
+        trusted_state_dir=trusted_state_dir,
+    )
+    assert worker_session.read_text() == "synthetic-worker-session"
+
+
+def _install_clean_room_ancestor_swap_race(
+    monkeypatch,
+    *,
+    ancestor,
+    displaced_ancestor,
+    outside_dir,
+):
+    """Swap an authority ancestor after either the legacy check or its safe fd open."""
+
+    original_exists = bootstrap_module.Path.exists
+    original_open = bootstrap_module.os.open
+    race = {"swapped": False}
+
+    def swap_ancestor():
+        if race["swapped"]:
+            return
+        ancestor.rename(displaced_ancestor)
+        ancestor.symlink_to(outside_dir, target_is_directory=True)
+        race["swapped"] = True
+
+    def racing_exists(path):
+        exists = original_exists(path)
+        if path == ancestor and exists and not race["swapped"]:
+            swap_ancestor()
+        return exists
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if str(path) == ancestor.name and dir_fd is not None and not race["swapped"]:
+            swap_ancestor()
+        return descriptor
+
+    monkeypatch.setattr(bootstrap_module.Path, "exists", racing_exists)
+    monkeypatch.setattr(bootstrap_module.os, "open", racing_open)
+    return race
+
+
+def test_clean_room_authority_file_removal_does_not_follow_swapped_ancestor(
+    tmp_path, monkeypatch
+):
+    home_dir = tmp_path / "home"
+    workspace_dir = tmp_path / "workspace"
+    trusted_state_dir = tmp_path / "trusted-state"
+    claude_dir = home_dir / ".claude"
+    displaced_claude_dir = home_dir / ".claude-displaced"
+    outside_dir = tmp_path / "outside"
+    worker = {
+        "bootstrap_profile": "clean-room",
+        "bootstrap_bundle_json": json.dumps(
+            {"execution_policy": "parallel-clean-room-v1"}
+        ),
+    }
+    apply_bootstrap(
+        home_dir=home_dir,
+        workspace_dir=workspace_dir,
+        runtime_name="claude-code",
+        worker=worker,
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+        trusted_state_dir=trusted_state_dir,
+    )
+    assert (trusted_state_dir / ".parallel-clean-room-v1").exists()
+    claude_dir.mkdir(parents=True)
+    outside_dir.mkdir()
+    (claude_dir / ".credentials.json").write_text("synthetic-stale-worker-copy")
+    outside_credential = outside_dir / ".credentials.json"
+    outside_credential.write_text("synthetic-outside-sentinel")
+    race = _install_clean_room_ancestor_swap_race(
+        monkeypatch,
+        ancestor=claude_dir,
+        displaced_ancestor=displaced_claude_dir,
+        outside_dir=outside_dir,
+    )
+
+    apply_bootstrap(
+        home_dir=home_dir,
+        workspace_dir=workspace_dir,
+        runtime_name="claude-code",
+        worker=worker,
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+        trusted_state_dir=trusted_state_dir,
+    )
+
+    assert race["swapped"] is True
+    assert outside_credential.read_text() == "synthetic-outside-sentinel"
+    assert not (displaced_claude_dir / ".credentials.json").exists()
+    assert not claude_dir.exists()
+    assert not claude_dir.is_symlink()
+
+
+def test_clean_room_authority_tree_removal_does_not_follow_swapped_ancestor(
+    tmp_path, monkeypatch
+):
+    home_dir = tmp_path / "home"
+    claude_dir = home_dir / ".claude"
+    displaced_claude_dir = home_dir / ".claude-displaced"
+    outside_dir = tmp_path / "outside"
+    stale_tree_file = claude_dir / "plugins" / "synthetic-host-hook.json"
+    stale_tree_file.parent.mkdir(parents=True)
+    stale_tree_file.write_text("synthetic-stale-worker-copy")
+    outside_tree_file = outside_dir / "plugins" / "sentinel.json"
+    outside_tree_file.parent.mkdir(parents=True)
+    outside_tree_file.write_text("synthetic-outside-sentinel")
+    race = _install_clean_room_ancestor_swap_race(
+        monkeypatch,
+        ancestor=claude_dir,
+        displaced_ancestor=displaced_claude_dir,
+        outside_dir=outside_dir,
+    )
+
+    bootstrap_module._remove_sandbox_authority_path(home_dir, ".claude/plugins")
+
+    assert race["swapped"] is True
+    assert outside_tree_file.read_text() == "synthetic-outside-sentinel"
+    assert not (displaced_claude_dir / "plugins").exists()
+    assert not claude_dir.exists()
+    assert not claude_dir.is_symlink()
+
+
+def test_clean_room_glasshive_cleanup_does_not_follow_swapped_home(
+    tmp_path, monkeypatch
+):
+    home_dir = tmp_path / "home"
+    displaced_home_dir = tmp_path / "home-displaced"
+    workspace_dir = tmp_path / "workspace"
+    trusted_state_dir = tmp_path / "trusted-state"
+    outside_dir = tmp_path / "outside"
+    outside_glasshive_target = tmp_path / "outside-glasshive-target"
+    home_dir.mkdir()
+    workspace_dir.mkdir()
+    trusted_state_dir.mkdir()
+    outside_dir.mkdir()
+    outside_glasshive_target.mkdir()
+    (trusted_state_dir / ".parallel-clean-room-v1").write_text(
+        "parallel-clean-room-v1\n"
+    )
+    outside_glasshive = outside_dir / ".glasshive"
+    outside_glasshive.symlink_to(outside_glasshive_target, target_is_directory=True)
+    original_marker_check = bootstrap_module._has_trusted_clean_room_policy_marker
+    race = {"swapped": False}
+
+    def marker_check_then_swap(state_dir):
+        result = original_marker_check(state_dir)
+        if result and not race["swapped"]:
+            home_dir.rename(displaced_home_dir)
+            home_dir.symlink_to(outside_dir, target_is_directory=True)
+            race["swapped"] = True
+        return result
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "_has_trusted_clean_room_policy_marker",
+        marker_check_then_swap,
+    )
+
+    with pytest.raises(PermissionError, match="real directory"):
+        bootstrap_module._purge_clean_room_authority(
+            home_dir,
+            workspace_dir,
+            trusted_state_dir,
+        )
+
+    assert race["swapped"] is True
+    assert outside_glasshive.is_symlink()
+    assert outside_glasshive.resolve() == outside_glasshive_target
+
+
+def test_parallel_clean_room_workspace_files_do_not_follow_worker_symlinks(tmp_path):
+    home_dir = tmp_path / "home"
+    workspace_dir = tmp_path / "workspace"
+    outside_dir = tmp_path / "outside"
+    workspace_dir.mkdir()
+    outside_dir.mkdir()
+    (workspace_dir / "uploads").symlink_to(outside_dir, target_is_directory=True)
+    worker = {
+        "bootstrap_profile": "clean-room",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "execution_policy": "parallel-clean-room-v1",
+                "files": [
+                    {
+                        "scope": "workspace",
+                        "path": "uploads/escape.txt",
+                        "content": "must-stay-in-workspace",
+                    }
+                ],
+            }
+        ),
+    }
+
+    with pytest.raises(PermissionError, match="symbolic links"):
+        apply_bootstrap(
+            home_dir=home_dir,
+            workspace_dir=workspace_dir,
+            runtime_name="codex-cli",
+            worker=worker,
+            copy_file=lambda source, target: None,
+            copy_tree=lambda source, target: None,
+            trusted_state_dir=tmp_path / "state",
+        )
+
+    assert not (outside_dir / "escape.txt").exists()
+
+
+def test_parallel_clean_room_marker_is_invalidated_across_legacy_profile_transition(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("GLASSHIVE_ENTERPRISE_MODE", raising=False)
+    home_dir = tmp_path / "home"
+    workspace_dir = tmp_path / "workspace"
+    trusted_state_dir = tmp_path / "trusted-state"
+    clean_worker = {
+        "bootstrap_profile": "clean-room",
+        "bootstrap_bundle_json": json.dumps(
+            {"execution_policy": "parallel-clean-room-v1"}
+        ),
+    }
+
+    apply_bootstrap(
+        home_dir=home_dir,
+        workspace_dir=workspace_dir,
+        runtime_name="claude-code",
+        worker=clean_worker,
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+        trusted_state_dir=trusted_state_dir,
+    )
+    marker = trusted_state_dir / ".parallel-clean-room-v1"
+    assert marker.exists()
+
+    def copy_legacy_claude_tree(source, target):
+        del source
+        for relative in ("plugins/host-hook.json", "projects/host-session.jsonl"):
+            destination = target / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text("synthetic-host-authority")
+
+    apply_bootstrap(
+        home_dir=home_dir,
+        workspace_dir=workspace_dir,
+        runtime_name="claude-code",
+        worker={"bootstrap_profile": "claude-host", "bootstrap_bundle_json": "{}"},
+        copy_file=lambda source, target: None,
+        copy_tree=copy_legacy_claude_tree,
+        trusted_state_dir=trusted_state_dir,
+    )
+    assert not marker.exists()
+    assert (home_dir / ".claude" / "plugins" / "host-hook.json").exists()
+
+    apply_bootstrap(
+        home_dir=home_dir,
+        workspace_dir=workspace_dir,
+        runtime_name="claude-code",
+        worker=clean_worker,
+        copy_file=lambda source, target: None,
+        copy_tree=lambda source, target: None,
+        trusted_state_dir=trusted_state_dir,
+    )
+    assert marker.exists()
+    assert not (home_dir / ".claude" / "plugins" / "host-hook.json").exists()
+    assert not (home_dir / ".claude" / "projects" / "host-session.jsonl").exists()
 
 
 def test_enterprise_bootstrap_keeps_provider_secrets_out_of_interactive_runtime_env(tmp_path, monkeypatch):
@@ -370,6 +754,37 @@ def test_local_bootstrap_keeps_legacy_interactive_runtime_env_behavior(tmp_path,
     assert not (tmp_path / "home" / ".glasshive" / "secret-runtime.env").exists()
 
 
+@pytest.mark.parametrize("enterprise", [False, True])
+def test_server_only_authority_is_never_projected_to_worker_env(monkeypatch, enterprise):
+    if enterprise:
+        monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+        monkeypatch.setenv(
+            "GLASSHIVE_WORKER_ENV_ALLOWLIST",
+            "VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET,"
+            "VIVENTIUM_GLASSHIVE_ADMISSION_URL,"
+            "VIVENTIUM_GLASSHIVE_ADMISSION_SECRET",
+        )
+    worker = {
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "env": {
+                    "VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET": "synthetic-do-not-project",
+                    "VIVENTIUM_GLASSHIVE_ADMISSION_URL": "https://internal.example/admit",
+                    "VIVENTIUM_GLASSHIVE_ADMISSION_SECRET": "synthetic-admission-secret",
+                    "SAFE_WORKER_VALUE": "visible",
+                }
+            }
+        )
+    }
+
+    env = bootstrap_env_for(worker)
+
+    assert "VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET" not in env
+    assert "VIVENTIUM_GLASSHIVE_ADMISSION_URL" not in env
+    assert "VIVENTIUM_GLASSHIVE_ADMISSION_SECRET" not in env
+    assert "synthetic-do-not-project" not in json.dumps(env)
+
+
 def test_enterprise_bootstrap_rejects_unsigned_source_path(tmp_path, monkeypatch):
     uploads_root = tmp_path / "uploads"
     other_user_file = uploads_root / "user-b" / "brief.txt"
@@ -404,6 +819,28 @@ def test_enterprise_bootstrap_rejects_unsigned_source_path(tmp_path, monkeypatch
             copy_file=lambda source, target: target.write_text(source.read_text()),
             copy_tree=lambda source, target: None,
         )
+
+
+def test_enterprise_bootstrap_source_signing_never_reuses_service_or_callback_secrets(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "uploads" / "user-a" / "brief.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("synthetic source")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.delenv("GLASSHIVE_BOOTSTRAP_SOURCE_SECRET", raising=False)
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret-must-not-sign-files")
+    monkeypatch.setenv(
+        "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET",
+        "callback-secret-must-not-sign-files",
+    )
+
+    assert sign_bootstrap_source_path(
+        source,
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    ) == ""
 
 
 def test_enterprise_bootstrap_accepts_signed_source_path_for_same_user(tmp_path, monkeypatch):

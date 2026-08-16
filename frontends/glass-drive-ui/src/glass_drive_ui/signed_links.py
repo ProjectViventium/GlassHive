@@ -19,7 +19,7 @@ LINK_REF_ROUTE = "/r"
 _SAFE_LINK_REF_RE = re.compile(r"^[A-Za-z0-9_-]{12,96}$")
 _SENSITIVE_QUERY_RE = re.compile(r"(?i)((?:^|[?&])(?:gh_token|gh_sig|gh_exp|gh_kind)=)([^&#\s\"']+)")
 _SIGNED_LINK_PATH_RE = re.compile(r"(?i)(/v1/signed-links/)([^/?#\s\"']+)")
-_LINK_REF_PATH_RE = re.compile(r"(?i)(/(?:v1/link-refs|r)/)(ghr_[A-Za-z0-9_-]{12,96})")
+_LINK_REF_PATH_RE = re.compile(r"(?i)(/(?:v1/link-refs|r|w)/)(ghr_[A-Za-z0-9_-]{8,92})")
 _WORKER_COOKIE_TOKEN_RE = re.compile(r"(?i)(\bglasshive_gh_token_[A-Za-z0-9._-]+=)([^;\s\"']+)")
 _LOG_FILTER_INSTALLED = False
 _LOG_RECORD_FACTORY_INSTALLED = False
@@ -54,6 +54,31 @@ def signed_link_secret() -> str:
         os.environ.get("GLASSHIVE_SIGNED_LINK_SECRET", "").strip()
         or os.environ.get("WPR_API_TOKEN", "").strip()
     )
+
+
+def _worker_is_terminated_in_runtime_db(worker_id: str) -> bool:
+    clean_worker_id = str(worker_id or "").strip()
+    raw_db_path = str(os.environ.get("WPR_DB_PATH") or "").strip()
+    if not clean_worker_id or not raw_db_path:
+        return False
+    db_path = Path(raw_db_path).expanduser()
+    if not db_path.is_file():
+        return False
+    try:
+        with sqlite3.connect(db_path, timeout=1) as conn:
+            row = conn.execute(
+                "SELECT state FROM workers WHERE worker_id = ?",
+                (clean_worker_id,),
+            ).fetchone()
+    except sqlite3.Error:
+        return False
+    return bool(row and str(row[0] or "") == "terminated")
+
+
+def worker_signed_links_blocked(worker_id: str) -> bool:
+    return _worker_is_terminated_in_runtime_db(
+        worker_id
+    ) or is_worker_signed_link_revoked(worker_id)
 
 
 def signed_link_ttl_seconds() -> int:
@@ -180,7 +205,7 @@ def sign_link_token(
     ttl_seconds: int | None = None,
 ) -> str:
     secret = signed_link_secret()
-    if not secret:
+    if not secret or worker_signed_links_blocked(worker_id):
         return ""
     payload = {
         "v": 1,
@@ -222,7 +247,12 @@ def _decode_signed_link_token(token: str, *, allow_expired: bool = False) -> dic
 
 
 def verify_signed_link_token(token: str) -> dict[str, object] | None:
-    return _decode_signed_link_token(token, allow_expired=False)
+    payload = _decode_signed_link_token(token, allow_expired=False)
+    if payload and worker_signed_links_blocked(
+        str(payload.get("worker_id") or "")
+    ):
+        return None
+    return payload
 
 
 def link_ref_state_path() -> Path:
@@ -257,6 +287,14 @@ def _link_ref_conn() -> sqlite3.Connection:
             created_at INTEGER NOT NULL,
             payload_json TEXT NOT NULL DEFAULT '',
             scope_key TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS signed_link_worker_revocations (
+            worker_id TEXT PRIMARY KEY,
+            revoked_at INTEGER NOT NULL
         )
         """
     )
@@ -363,6 +401,33 @@ def create_signed_link_ref(*, token: str, target_url: str = "") -> str:
     return ref_id
 
 
+def is_worker_signed_link_revoked(worker_id: str) -> bool:
+    clean_worker_id = str(worker_id or "").strip()
+    if not clean_worker_id:
+        return False
+    db_path = link_ref_state_path()
+    if not db_path.is_file():
+        return False
+    try:
+        with sqlite3.connect(db_path, timeout=1) as conn:
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'signed_link_worker_revocations'"
+            ).fetchone()
+            if table is None:
+                return False
+            return (
+                conn.execute(
+                    "SELECT 1 FROM signed_link_worker_revocations "
+                    "WHERE worker_id = ?",
+                    (clean_worker_id,),
+                ).fetchone()
+                is not None
+            )
+    except sqlite3.Error:
+        return False
+
+
 def revoke_signed_link_refs_for_worker(worker_id: str) -> int:
     clean_worker_id = str(worker_id or "").strip()
     if not clean_worker_id:
@@ -370,6 +435,14 @@ def revoke_signed_link_refs_for_worker(worker_id: str) -> int:
     worker_value = json.dumps(clean_worker_id, separators=(",", ":"))
     pattern = f'%"worker_id":{worker_value}%'
     with _link_ref_conn() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO signed_link_worker_revocations (
+                worker_id, revoked_at
+            ) VALUES (?, ?)
+            """,
+            (clean_worker_id, int(time.time())),
+        )
         cursor = conn.execute("DELETE FROM signed_link_refs WHERE scope_key LIKE ?", (pattern,))
         return int(cursor.rowcount or 0)
 
@@ -403,6 +476,8 @@ def resolve_signed_link_ref(ref_id: str) -> dict[str, object] | None:
     if not payload:
         payload = verified_payload
     if not payload:
+        return None
+    if worker_signed_links_blocked(str(payload.get("worker_id") or "")):
         return None
     return {
         "ref_id": clean_ref,

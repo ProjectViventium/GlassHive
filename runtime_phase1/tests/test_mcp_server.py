@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import os
 import time
 from urllib.parse import urlsplit
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
+import httpx
 import pytest
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
@@ -15,13 +18,112 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from workers_projects_runtime import mcp_server, runtime_env
+from workers_projects_runtime.api import create_app
 from workers_projects_runtime.bootstrap import sign_bootstrap_source_path
 from workers_projects_runtime.mcp_server import create_mcp_server
+from workers_projects_runtime.models import CreateDelegationRequest
+from workers_projects_runtime.openclaw_runtime import StubRuntime
 from workers_projects_runtime.signed_links import resolve_signed_link_ref
 
 
 def _fake_runtime_for_profile(profile: str) -> str:
     return "openclaw" if profile.startswith("openclaw") else profile
+
+
+def _delegation_identity_assertion(identity: dict, secret: str) -> str:
+    canonical = json.dumps(
+        {
+            "call_identity_digest": str(identity.get("call_identity_digest") or ""),
+            "goal_digest": str(identity.get("goal_digest") or ""),
+            "idempotency_key": str(identity.get("idempotency_key") or ""),
+            "objective_ordinal": int(identity.get("objective_ordinal")),
+            "source_event_id": str(identity.get("source_event_id") or ""),
+            "version": int(identity.get("version")),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hmac.new(
+        secret.encode("utf-8"),
+        b"viventium.delegation-identity.v1\0" + canonical,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _scoped_delegation_identity_assertion(
+    identity: dict,
+    secret: str,
+    *,
+    tenant_id: str,
+    owner_id: str,
+) -> str:
+    canonical = json.dumps(
+        {
+            "identity": {
+                "call_identity_digest": str(identity.get("call_identity_digest") or ""),
+                "goal_digest": str(identity.get("goal_digest") or ""),
+                "idempotency_key": str(identity.get("idempotency_key") or ""),
+                "launch_payload_digest": str(identity.get("launch_payload_digest") or ""),
+                "objective_ordinal": int(identity.get("objective_ordinal")),
+                "source_event_id": str(identity.get("source_event_id") or ""),
+                "version": int(identity.get("version")),
+            },
+            "owner_id": owner_id,
+            "tenant_id": tenant_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hmac.new(
+        secret.encode("utf-8"),
+        b"viventium.delegation-identity.v2\0" + canonical,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _launch_payload_digest(payload: dict) -> str:
+    canonical = json.dumps(
+        {
+            "alias": str(payload.get("alias") or "").strip(),
+            "backend": str(payload.get("backend") or "").strip(),
+            "bootstrap_profile": str(
+                payload.get("bootstrap_profile") or payload.get("bootstrapProfile") or ""
+            ).strip(),
+            "connected_account_content_intent": bool(
+                payload.get("connected_account_content_intent", False)
+            ),
+            "effort": str(payload.get("effort") or "").strip(),
+            "execution_mode": str(
+                payload.get("execution_mode") or payload.get("executionMode") or ""
+            ).strip(),
+            "expose_diagnostics": bool(payload.get("expose_diagnostics", False)),
+            "goal": str(payload.get("goal") or "").strip(),
+            "instruction": str(payload.get("instruction") or "").strip(),
+            "owner_id": str(payload.get("owner_id") or "").strip(),
+            "profile": str(payload.get("profile") or "").strip(),
+            "project_id": str(payload.get("project_id") or "").strip(),
+            "require_callback": bool(payload.get("require_callback", False)),
+            "reuse_existing_workspace": bool(
+                payload.get("reuse_existing_workspace", False)
+            ),
+            "title": str(payload.get("title") or "").strip(),
+            "worker_name": str(
+                payload.get("worker_name") or payload.get("workerName") or ""
+            ).strip(),
+            "worker_role": str(
+                payload.get("worker_role") or payload.get("workerRole") or ""
+            ).strip(),
+            "workspace_root": str(
+                payload.get("workspace_root") or payload.get("workspaceRoot") or ""
+            ).strip(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _patch_host_runtime_requirements_ok(monkeypatch):
@@ -1105,6 +1207,11 @@ def test_server_instructions_advertise_mcp_owned_usage_contract(monkeypatch):
         "local files/projects",
         "installed clis",
         "workspace_launch",
+        "tool_search",
+        "query=<needed capability>",
+        "mcp_server=glasshive-workers-projects",
+        "same invocation",
+        "needed glasshive capability is not currently available",
         "description, optional success_criteria, and optional context",
         "worker_delegate_once",
         "callbacks are an optional host-app delivery enhancement",
@@ -1175,6 +1282,49 @@ def test_enterprise_mcp_http_auth_middleware_gates_transport_requests(monkeypatc
     assert client.post("/mcp", headers={**good_headers, "X-GlassHive-Tenant-Id": "tenant-beta"}).status_code == 401
     assert client.post("/mcp", headers=good_headers).status_code == 200
     assert client.post("/mcp", headers={**good_headers, "Authorization": "Bearer service-token"}).status_code == 200
+
+
+def test_local_mcp_http_auth_middleware_rejects_header_laundering_without_service_auth(
+    monkeypatch,
+):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "false")
+    monkeypatch.setattr(mcp_server, "DEFAULT_API_TOKEN", "service-token")
+
+    async def ok(request):
+        return JSONResponse(
+            {
+                "owner": request.headers.get("x-viventium-user-id"),
+                "tenant": request.headers.get("x-viventium-tenant-id"),
+            }
+        )
+
+    app = Starlette(routes=[Route("/mcp", ok, methods=["POST"])])
+    app.add_middleware(mcp_server.EnterpriseMcpHttpAuthMiddleware)
+    client = TestClient(app)
+
+    forged_scope = {
+        "X-Viventium-Tenant-Id": "local",
+        "X-Viventium-User-Id": "forged-owner",
+    }
+    assert client.post("/mcp", headers=forged_scope).status_code == 401
+    assert client.post(
+        "/mcp",
+        headers={**forged_scope, "X-WPR-Token": "wrong"},
+    ).status_code == 401
+    assert client.post(
+        "/mcp",
+        headers={"X-WPR-Token": "service-token"},
+    ).status_code == 401
+
+    accepted = client.post(
+        "/mcp",
+        headers={**forged_scope, "X-WPR-Token": "service-token"},
+    )
+    assert accepted.status_code == 200
+    assert accepted.json() == {
+        "owner": "forged-owner",
+        "tenant": "local",
+    }
 
 
 def test_enterprise_mcp_requires_service_authentication(monkeypatch):
@@ -1934,6 +2084,28 @@ def test_enterprise_view_steer_url_does_not_fall_back_to_unsigned(monkeypatch):
     assert url is None
 
 
+def test_mcp_never_mints_new_view_or_artifact_refs_for_terminated_worker(
+    tmp_path,
+    monkeypatch,
+):
+    link_ref_state = tmp_path / "link-refs.sqlite3"
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(link_ref_state))
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive.example.test")
+    worker = {
+        "worker_id": "wrk_terminated",
+        "project_id": "prj_terminated",
+        "tenant_id": "local",
+        "owner_id": "owner-a",
+        "state": "terminated",
+    }
+
+    assert mcp_server._signed_view_steer_url(worker, worker["project_id"], "librechat") is None
+    assert mcp_server._signed_artifact_open_url(worker, "outputs/report.txt") is None
+    assert mcp_server._signed_artifact_download_url(worker, "outputs/report.txt") is None
+    assert not link_ref_state.exists()
+
+
 def test_enterprise_mcp_refuses_non_http_transport(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
 
@@ -2038,6 +2210,1050 @@ def test_worker_delegate_once_creates_resumes_and_runs_without_listing(monkeypat
     assert "do not mark the workspace blocked" in assigned_instruction
     assert "report only blockers observable from inside this worker workspace" in assigned_instruction
     assert assigned_instruction.count("Host-side GlassHive orchestration checks") == 1
+
+
+def test_api_client_atomic_delegation_signs_asserted_scope_and_idempotency(monkeypatch):
+    monkeypatch.setenv(
+        "VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET",
+        "synthetic-service-assertion-secret",
+    )
+
+    class CapturingClient(mcp_server.WorkersProjectsApiClient):
+        def __init__(self):
+            super().__init__(base_url="http://glasshive.example.test", api_token="service-token")
+            self.captured = None
+
+        def _request(self, method, path, *, json_body=None, extra_headers=None):
+            self.captured = {
+                "method": method,
+                "path": path,
+                "json_body": json_body,
+                "extra_headers": extra_headers,
+            }
+            return {"workRef": "work_atomic", "state": "accepted", "actions": ["stop"]}
+
+    client = CapturingClient()
+    response = client.create_delegation(
+        tenant_id="tenant-alpha",
+        owner_id="owner-alpha",
+        idempotency_key="trusted-message-key",
+        payload={"title": "Atomic work", "goal": "Finish", "instruction": "Do it"},
+    )
+
+    assert response["workRef"] == "work_atomic"
+    assert client.captured["method"] == "POST"
+    assert client.captured["path"] == "/v1/delegations"
+    assert client.captured["extra_headers"]["Idempotency-Key"] == "trusted-message-key"
+    assertion = client.captured["extra_headers"]["X-Viventium-Service-Assertion"]
+    claims = mcp_server.verify_service_assertion(
+        assertion,
+        secret="synthetic-service-assertion-secret",
+    )
+    assert claims["tenant_id"] == "tenant-alpha"
+    assert claims["owner_id"] == "owner-alpha"
+
+
+def test_mcp_request_ids_cannot_substitute_for_a_trusted_source_identity(monkeypatch):
+    """JSON-RPC ids restart per client session and cannot authorize mutation replay."""
+
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    payload = {
+        "title": "Identical synthetic objective",
+        "goal": "Finish the objective",
+        "instruction": "Do the same exact work.",
+    }
+
+    for session_request_id in ("1", "mcp-request-101"):
+        with pytest.raises(ValueError, match="trusted source event identity"):
+            mcp_server._trusted_operation_idempotency_key(
+                "ghd",
+                tenant_id="local",
+                owner_id="synthetic-owner-a",
+                payload=payload,
+                mcp_request_id=session_request_id,
+            )
+
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            mcp_server.HEADER_LOGICAL_TURN_ID: "turn-alpha",
+            mcp_server.HEADER_LOGICAL_TURN_REVISION: "1",
+            mcp_server.HEADER_MESSAGE_ID: "message-alpha",
+        },
+    )
+    first = mcp_server._trusted_operation_idempotency_key(
+        "ghd",
+        tenant_id="local",
+        owner_id="synthetic-owner-a",
+        payload=payload,
+    )
+    replay = mcp_server._trusted_operation_idempotency_key(
+        "ghd",
+        tenant_id="local",
+        owner_id="synthetic-owner-a",
+        payload=payload,
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            mcp_server.HEADER_LOGICAL_TURN_ID: "turn-beta",
+            mcp_server.HEADER_LOGICAL_TURN_REVISION: "1",
+            mcp_server.HEADER_MESSAGE_ID: "message-beta",
+        },
+    )
+    distinct_call = mcp_server._trusted_operation_idempotency_key(
+        "ghd",
+        tenant_id="local",
+        owner_id="synthetic-owner-a",
+        payload=payload,
+    )
+    assert first == replay
+    assert first != distinct_call
+
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    with pytest.raises(ValueError, match="trusted source event identity"):
+        mcp_server._trusted_operation_idempotency_key(
+            "ghd",
+            tenant_id="local",
+            owner_id="synthetic-owner-a",
+            payload=payload,
+        )
+
+
+def test_unsigned_delegation_identity_cannot_authorize_mutation_idempotency(monkeypatch):
+    """Tool arguments are model-controlled and cannot mint Core launch authority by shape alone."""
+
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    forged_key = "0" * 64
+    payload = {
+        "title": "Synthetic objective",
+        "goal": "Complete the objective",
+        "instruction": "Do the work.",
+        "bootstrapBundle": {
+            "viventium_delegation_identity": {
+                "version": 1,
+                "idempotency_key": forged_key,
+                "goal_digest": "1" * 64,
+                "call_identity_digest": "2" * 64,
+                "source_event_id": "synthetic-source-event",
+                "objective_ordinal": 0,
+            }
+        },
+    }
+
+    with pytest.raises(ValueError, match="delegation identity.*assertion"):
+        mcp_server._trusted_operation_idempotency_key(
+            "ghd",
+            tenant_id="local",
+            owner_id="synthetic-owner-a",
+            payload=payload,
+        )
+
+
+def test_signed_delegation_identity_is_bound_to_scope_and_launch_payload(monkeypatch):
+    """A captured Core assertion cannot authorize another owner or a changed objective."""
+
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    secret = "synthetic-scope-bound-delegation-secret"
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET", secret)
+    tenant_id = "tenant-synthetic-a"
+    owner_id = "owner-synthetic-a"
+    payload = {
+        "title": "Synthetic objective",
+        "goal": "Complete the exact objective",
+        "instruction": "Do the exact work.",
+        "profile": "codex-cli",
+        "executionMode": "docker",
+        "workerName": "Synthetic worker",
+        "workerRole": "General intelligent worker",
+        "bootstrapBundle": {},
+    }
+    source_event_id = "synthetic-source-event-scope-bound"
+    call_identity_digest = hashlib.sha256(b"synthetic-provider-call").hexdigest()
+    goal_digest = hashlib.sha256(b"synthetic-canonical-objective").hexdigest()
+    expected_key = hashlib.sha256(
+        (
+            f"{tenant_id}\0{owner_id}\0{source_event_id}\0"
+            f"call:{call_identity_digest}\0{goal_digest}"
+        ).encode()
+    ).hexdigest()
+    identity = {
+        "version": 2,
+        "idempotency_key": expected_key,
+        "goal_digest": goal_digest,
+        "launch_payload_digest": _launch_payload_digest(payload),
+        "call_identity_digest": call_identity_digest,
+        "source_event_id": source_event_id,
+        "objective_ordinal": 3,
+    }
+    payload["bootstrapBundle"] = {
+        "viventium_delegation_identity": identity,
+        "viventium_delegation_assertion": _scoped_delegation_identity_assertion(
+            identity,
+            secret,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        ),
+    }
+
+    assert (
+        mcp_server._trusted_operation_idempotency_key(
+            "ghd",
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            payload=payload,
+        )
+        == expected_key
+    )
+
+    with pytest.raises(ValueError, match="assertion|identity"):
+        mcp_server._trusted_operation_idempotency_key(
+            "ghd",
+            tenant_id="tenant-synthetic-b",
+            owner_id="owner-synthetic-b",
+            payload=payload,
+        )
+
+    altered = dict(payload)
+    altered["goal"] = "A different objective must not inherit the old mutation identity"
+    with pytest.raises(ValueError, match="payload|identity"):
+        mcp_server._trusted_operation_idempotency_key(
+            "ghd",
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            payload=altered,
+        )
+
+
+def test_signed_delegation_identity_rejects_whitespace_only_source_event(monkeypatch):
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    secret = "synthetic-strict-source-delegation-secret"
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET", secret)
+    tenant_id = "tenant-synthetic-source"
+    owner_id = "owner-synthetic-source"
+    payload = {
+        "title": "Synthetic objective",
+        "goal": "Complete the exact objective",
+        "instruction": "Do the exact work.",
+        "bootstrapBundle": {},
+    }
+    source_event_id = "   "
+    call_identity_digest = hashlib.sha256(b"synthetic-provider-call").hexdigest()
+    goal_digest = hashlib.sha256(b"synthetic-canonical-objective").hexdigest()
+    identity = {
+        "version": 2,
+        "idempotency_key": hashlib.sha256(
+            (
+                f"{tenant_id}\0{owner_id}\0{source_event_id}\0"
+                f"call:{call_identity_digest}\0{goal_digest}"
+            ).encode()
+        ).hexdigest(),
+        "goal_digest": goal_digest,
+        "launch_payload_digest": _launch_payload_digest(payload),
+        "call_identity_digest": call_identity_digest,
+        "source_event_id": source_event_id,
+        "objective_ordinal": 0,
+    }
+    payload["bootstrapBundle"] = {
+        "viventium_delegation_identity": identity,
+        "viventium_delegation_assertion": _scoped_delegation_identity_assertion(
+            identity,
+            secret,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        ),
+    }
+
+    with pytest.raises(ValueError, match=r"delegation.?identity"):
+        mcp_server._trusted_operation_idempotency_key(
+            "ghd",
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            payload=payload,
+        )
+
+
+@pytest.mark.parametrize("missing_field", ["viventium_delegation_identity", "viventium_delegation_assertion"])
+def test_partial_signed_delegation_authority_fails_closed(monkeypatch, missing_field):
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    bundle = {
+        "viventium_delegation_identity": {"version": 2},
+        "viventium_delegation_assertion": "a" * 64,
+    }
+    bundle.pop(missing_field)
+    with pytest.raises(ValueError, match="delegation identity|delegation assertion"):
+        mcp_server._trusted_operation_idempotency_key(
+            "ghd",
+            tenant_id="tenant-synthetic",
+            owner_id="owner-synthetic",
+            payload={
+                "title": "Synthetic objective",
+                "goal": "Complete the objective",
+                "instruction": "Do the work.",
+                "bootstrapBundle": bundle,
+            },
+        )
+
+
+def test_conversation_scope_alone_cannot_authorize_mutation_idempotency(monkeypatch):
+    """A conversation identifies a scope, not one mutation event within that scope."""
+
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {mcp_server.HEADER_CONVERSATION_ID: "conversation-synthetic"},
+    )
+
+    with pytest.raises(ValueError, match="trusted source event identity"):
+        mcp_server._trusted_operation_idempotency_key(
+            "ghd",
+            tenant_id="local",
+            owner_id="synthetic-owner-a",
+            payload={
+                "title": "Synthetic objective",
+                "goal": "Complete the objective",
+                "instruction": "Do the work.",
+            },
+        )
+
+
+def test_event_grade_mutation_identity_ignores_supplemental_route_drift(monkeypatch):
+    payload = {
+        "work_ref": "work_synthetic",
+        "action": "pause",
+        "instruction": "",
+    }
+    headers = {
+        mcp_server.HEADER_LOGICAL_TURN_ID: "logical-turn-stable",
+        mcp_server.HEADER_LOGICAL_TURN_REVISION: "2",
+        mcp_server.HEADER_MESSAGE_ID: "message-stable",
+        mcp_server.HEADER_CONVERSATION_ID: "conversation-before-reconnect",
+        mcp_server.HEADER_STREAM_ID: "stream-before-reconnect",
+    }
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: dict(headers))
+    first = mcp_server._trusted_operation_idempotency_key(
+        "gha",
+        tenant_id="local",
+        owner_id="synthetic-owner-a",
+        payload=payload,
+    )
+
+    headers[mcp_server.HEADER_CONVERSATION_ID] = "conversation-after-reconnect"
+    headers[mcp_server.HEADER_STREAM_ID] = "stream-after-reconnect"
+    replay = mcp_server._trusted_operation_idempotency_key(
+        "gha",
+        tenant_id="local",
+        owner_id="synthetic-owner-a",
+        payload=payload,
+    )
+    assert replay == first
+
+    headers[mcp_server.HEADER_LOGICAL_TURN_REVISION] = "3"
+    distinct = mcp_server._trusted_operation_idempotency_key(
+        "gha",
+        tenant_id="local",
+        owner_id="synthetic-owner-a",
+        payload=payload,
+    )
+    assert distinct != first
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {
+            mcp_server.HEADER_LOGICAL_TURN_ID: "logical-turn-incomplete",
+            mcp_server.HEADER_LOGICAL_TURN_REVISION: "not-a-revision",
+            mcp_server.HEADER_MESSAGE_ID: "message-fallback-must-not-win",
+        },
+        {
+            mcp_server.HEADER_LOGICAL_TURN_REVISION: "2",
+            mcp_server.HEADER_MESSAGE_ID: "message-fallback-must-not-win",
+        },
+        {
+            mcp_server.HEADER_LOGICAL_TURN_ID: "",
+            mcp_server.HEADER_LOGICAL_TURN_REVISION: "2",
+            mcp_server.HEADER_MESSAGE_ID: "message-fallback-must-not-win",
+        },
+        {
+            mcp_server.HEADER_MESSAGE_ID: "",
+            mcp_server.HEADER_STREAM_ID: "stream-fallback-must-not-win",
+        },
+        {
+            mcp_server.HEADER_TELEGRAM_MESSAGE_ID: "telegram-message-only",
+            mcp_server.HEADER_STREAM_ID: "stream-fallback-must-not-win",
+        },
+        {
+            mcp_server.HEADER_TELEGRAM_CHAT_ID: "telegram-chat-only",
+            mcp_server.HEADER_STREAM_ID: "stream-fallback-must-not-win",
+        },
+        {
+            mcp_server.HEADER_VOICE_REQUEST_ID: "voice-request-only",
+            mcp_server.HEADER_STREAM_ID: "stream-fallback-must-not-win",
+        },
+        {
+            mcp_server.HEADER_VOICE_CALL_SESSION_ID: "voice-session-only",
+            mcp_server.HEADER_STREAM_ID: "stream-fallback-must-not-win",
+        },
+    ],
+)
+def test_malformed_higher_grade_mutation_identity_cannot_fall_back(monkeypatch, headers):
+    """Partial trusted identity is corruption, never permission to mint a different retry key."""
+
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: dict(headers))
+    with pytest.raises(ValueError, match="source identity is invalid"):
+        mcp_server._trusted_operation_idempotency_key(
+            "ghd",
+            tenant_id="local",
+            owner_id="synthetic-owner-a",
+            payload={
+                "title": "Synthetic objective",
+                "goal": "Complete the objective",
+                "instruction": "Do the work.",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {
+            mcp_server.HEADER_LOGICAL_TURN_ID: "turn\x00evil",
+            mcp_server.HEADER_LOGICAL_TURN_REVISION: "1",
+        },
+        {mcp_server.HEADER_MESSAGE_ID: "message\nspoofed"},
+        {
+            mcp_server.HEADER_TELEGRAM_CHAT_ID: "telegram-chat",
+            mcp_server.HEADER_TELEGRAM_MESSAGE_ID: "message\x7fspoofed",
+        },
+        {
+            mcp_server.HEADER_VOICE_CALL_SESSION_ID: "s" * 513,
+            mcp_server.HEADER_VOICE_REQUEST_ID: "voice-request",
+        },
+        {mcp_server.HEADER_STREAM_ID: "stream\x00spoofed"},
+        {
+            mcp_server.HEADER_MESSAGE_ID: "canonical-message",
+            "x-glasshive-message-id": "conflicting-alias-message",
+        },
+    ],
+)
+def test_event_grade_mutation_identity_rejects_controls_bounds_and_alias_conflicts(
+    monkeypatch, headers
+):
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda: dict(headers))
+    with pytest.raises(ValueError, match="source identity is invalid"):
+        mcp_server._trusted_operation_idempotency_key(
+            "gha",
+            tenant_id="local",
+            owner_id="synthetic-owner-a",
+            payload={"work_ref": "work_synthetic", "action": "pause", "instruction": ""},
+        )
+
+
+def test_api_client_classifies_422_without_exposing_rejected_values(monkeypatch):
+    private_value = "synthetic-private-brief-that-must-not-leak"
+
+    class ValidationResponse:
+        status_code = 422
+        headers = {"content-type": "application/json"}
+
+        def json(self):
+            return {
+                "detail": [
+                    {
+                        "type": "string_too_long",
+                        "loc": ["body", "goal"],
+                        "msg": f"Rejected value: {private_value}",
+                        "input": private_value,
+                    }
+                ]
+            }
+
+        def raise_for_status(self):
+            raise AssertionError("safe validation classification should run first")
+
+    class ValidationClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def request(self, *args, **kwargs):
+            return ValidationResponse()
+
+    monkeypatch.setattr(mcp_server.httpx, "Client", ValidationClient)
+    client = mcp_server.WorkersProjectsApiClient(
+        base_url="http://glasshive.example.test",
+        api_token="",
+    )
+
+    with pytest.raises(mcp_server.GlassHiveBlockedError) as exc_info:
+        client._request(
+            "POST",
+            "/v1/delegations",
+            json_body={"goal": private_value},
+        )
+
+    payload = exc_info.value.payload
+    assert payload["failure_class"] == "glasshive_request_validation_failed"
+    assert payload["failure_retryable"] is False
+    assert payload["failure_diagnostic_summary"] == "goal:string_too_long"
+    assert private_value not in json.dumps(payload)
+
+
+def test_api_client_classifies_conflict_without_exposing_private_detail(monkeypatch):
+    private_value = "synthetic-private-conflict-detail-that-must-not-leak"
+
+    class ConflictResponse:
+        status_code = 409
+        headers = {"content-type": "application/json"}
+
+        def json(self):
+            return {
+                "detail": {
+                    "code": "parallel_execution_isolation_required",
+                    "message": private_value,
+                }
+            }
+
+        def raise_for_status(self):
+            raise AssertionError("safe conflict classification should run first")
+
+    class ConflictClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def request(self, *args, **kwargs):
+            return ConflictResponse()
+
+    monkeypatch.setattr(mcp_server.httpx, "Client", ConflictClient)
+    client = mcp_server.WorkersProjectsApiClient(
+        base_url="http://glasshive.example.test",
+        api_token="",
+    )
+
+    with pytest.raises(mcp_server.GlassHiveBlockedError) as exc_info:
+        client._request("POST", "/v1/delegations", json_body={"goal": private_value})
+
+    payload = exc_info.value.payload
+    assert payload["failure_class"] == "parallel_execution_isolation_required"
+    assert payload["failure_retryable"] is False
+    assert payload["failure_diagnostic_summary"] == (
+        "http_409:parallel_execution_isolation_required"
+    )
+    assert private_value not in json.dumps(payload)
+
+
+def test_account_api_conflict_classifies_allowlisted_parallel_bootstrap_reason():
+    failure = mcp_server._safe_account_api_failure(
+        {
+            "detail": {
+                "code": "parallel_execution_isolation_required",
+                "message": (
+                    "Automatic Parallel work rejected unsafe bootstrap authority: "
+                    "caller bootstrap environment is not allowed."
+                ),
+            }
+        },
+        status_code=409,
+    )
+    assert failure is not None
+    assert failure["failure_diagnostic_summary"] == (
+        "http_409:parallel_execution_isolation_required:caller_environment"
+    )
+
+
+def test_worker_delegate_once_and_workspace_launch_use_atomic_delegation_wrapper(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "owner-alpha",
+            "X-Viventium-Message-Id": "message-alpha",
+            "X-Viventium-Surface": "telegram",
+        },
+    )
+
+    class AtomicApi(TrackingApiClient):
+        def __init__(self):
+            super().__init__()
+            self.delegations = []
+
+        def create_delegation(self, **kwargs):
+            self.calls.append("create_delegation")
+            self.delegations.append(kwargs)
+            return {
+                "workRef": f"work_{len(self.delegations)}",
+                "title": kwargs["payload"]["title"],
+                "state": "queued",
+                "viewRef": f"/r/ghr_atomic_{len(self.delegations)}",
+                "actions": ["stop"],
+                "createdAt": "2026-08-12T00:00:00+00:00",
+                "updatedAt": "2026-08-12T00:00:00+00:00",
+                "idempotentReplay": False,
+            }
+
+    api = AtomicApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = _tool_json(
+                await client.call_tool(
+                    "worker_delegate_once",
+                    {
+                        "title": "Atomic direct mission",
+                        "goal": "Finish the direct mission",
+                        "instruction": "Do the direct mission fully.",
+                        "profile": "codex-cli",
+                        "execution_mode": "docker",
+                    },
+                )
+            )
+            launched = _tool_json(
+                await client.call_tool(
+                    "workspace_launch",
+                    {
+                        "description": "Atomic workspace mission",
+                        "profile": "codex-cli",
+                        "execution_mode": "docker",
+                    },
+                )
+            )
+            assert delegated["status"] == launched["status"] == "dispatched"
+            assert delegated["work_ref"] == "work_1"
+            assert launched["work_ref"] == "work_2"
+            assert delegated["result_tools"] == {
+                "roster": "active_work_list",
+                "status": "active_work_list",
+                "control": "active_work_action",
+            }
+            assert delegated["view_steer_url"] == "/r/ghr_atomic_1"
+            assert "project_id" not in delegated
+            assert "worker_id" not in delegated
+            assert "run_id" not in delegated
+
+    asyncio.run(scenario())
+
+    assert api.calls == ["create_delegation", "create_delegation"]
+    assert api.delegations[0]["tenant_id"] == "tenant-alpha"
+    assert api.delegations[0]["owner_id"] == "owner-alpha"
+    assert api.delegations[0]["payload"]["originSurface"] == "telegram"
+    assert api.delegations[0]["idempotency_key"].startswith("ghd_")
+    assert api.delegations[1]["idempotency_key"].startswith("ghd_")
+
+
+def test_atomic_delegate_keeps_enriched_instruction_out_of_bounded_metadata(monkeypatch):
+    """A Core-enriched brief must not become oversized account-API goal/role metadata."""
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Logical-Turn-Id": "turn-enriched-brief",
+            "X-Viventium-Logical-Turn-Revision": "1",
+            "X-Viventium-Message-Id": "message-enriched-brief",
+        },
+    )
+
+    class StrictAtomicApi(TrackingApiClient):
+        def __init__(self):
+            super().__init__()
+            self.delegations = []
+
+        def create_delegation(self, **kwargs):
+            # Exercise the real account-API request contract at the MCP boundary.
+            CreateDelegationRequest.model_validate(kwargs["payload"])
+            self.delegations.append(kwargs)
+            return {
+                "workRef": "work_enriched_brief",
+                "state": "queued",
+                "idempotentReplay": False,
+            }
+
+    api = StrictAtomicApi()
+    server = create_mcp_server(api_client=api)
+    user_brief = "Create the requested synthetic artifact exactly."
+    broker_brief = "\n".join(
+        f"Authorized synthetic host capability {index}: use only when relevant."
+        for index in range(240)
+    )
+    enriched_instruction = f"{user_brief}\n\n{broker_brief}"
+
+    async def scenario():
+        async with Client(server) as client:
+            result = _tool_json(
+                await client.call_tool(
+                    "worker_delegate_once",
+                    {
+                        "title": "Synthetic enriched mission",
+                        "instruction": enriched_instruction,
+                        "execution_mode": "docker",
+                    },
+                )
+            )
+            assert result["status"] == "dispatched"
+
+    asyncio.run(scenario())
+
+    payload = api.delegations[0]["payload"]
+    assert payload["goal"] == "Synthetic enriched mission"
+    assert payload["workerRole"] == "General intelligent worker"
+    assert enriched_instruction in payload["instruction"]
+
+
+def test_atomic_delegate_prefers_core_objective_identity_for_rapid_fire_work(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    assertion_secret = "synthetic-delegation-assertion-secret"
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET", assertion_secret)
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "owner-alpha",
+            "X-Viventium-Logical-Turn-Id": "turn-surviving-rapid-fire",
+            "X-Viventium-Message-Id": "message-surviving-rapid-fire",
+        },
+    )
+
+    class AtomicApi(TrackingApiClient):
+        def __init__(self):
+            super().__init__()
+            self.delegations = []
+
+        def create_delegation(self, **kwargs):
+            self.delegations.append(kwargs)
+            return {
+                "workRef": f"work_{len(self.delegations)}",
+                "state": "queued",
+                "actions": ["stop"],
+                "idempotentReplay": False,
+            }
+
+    api = AtomicApi()
+    server = create_mcp_server(api_client=api)
+    goal_digest = hashlib.sha256(b"identical user objective").hexdigest()
+    keys = []
+
+    async def scenario():
+        async with Client(server) as client:
+            for ordinal in range(2):
+                tool_args = {
+                    "title": "Identical substantial objective",
+                    "goal": "Complete the identical substantial objective",
+                    "instruction": "Do the identical substantial objective.",
+                }
+                call_identity_digest = hashlib.sha256(
+                    f"provider-tool-call-{ordinal}".encode()
+                ).hexdigest()
+                key = hashlib.sha256(
+                    (
+                        "tenant-alpha\0owner-alpha\0"
+                        "telegram-update-synthetic-rapid-fire\0"
+                        f"call:{call_identity_digest}\0{goal_digest}"
+                    ).encode()
+                ).hexdigest()
+                keys.append(key)
+                identity = {
+                    "version": 2,
+                    "idempotency_key": key,
+                    "goal_digest": goal_digest,
+                    "launch_payload_digest": _launch_payload_digest(tool_args),
+                    "call_identity_digest": call_identity_digest,
+                    "source_event_id": "telegram-update-synthetic-rapid-fire",
+                    "objective_ordinal": ordinal,
+                }
+                await client.call_tool(
+                    "worker_delegate_once",
+                    {
+                        **tool_args,
+                        "bootstrap_bundle_json": {
+                            "viventium_delegation_identity": identity,
+                            "viventium_delegation_assertion": _scoped_delegation_identity_assertion(
+                                identity,
+                                assertion_secret,
+                                tenant_id="tenant-alpha",
+                                owner_id="owner-alpha",
+                            ),
+                        },
+                    },
+                )
+
+    asyncio.run(scenario())
+
+    assert [item["idempotency_key"] for item in api.delegations] == keys
+    assert api.delegations[0]["payload"]["goal"] == api.delegations[1]["payload"]["goal"]
+
+
+def test_atomic_delegate_projects_trusted_triggering_segments_without_routing_leak(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    assertion_secret = "synthetic-context-assertion-secret"
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET", assertion_secret)
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "owner-alpha",
+            "X-Viventium-Telegram-Chat-Id": "must-not-enter-mission",
+            "X-Viventium-Telegram-Message-Id": "must-not-enter-mission-either",
+        },
+    )
+
+    class AtomicApi(TrackingApiClient):
+        def __init__(self):
+            super().__init__()
+            self.delegations = []
+
+        def create_delegation(self, **kwargs):
+            self.delegations.append(kwargs)
+            return {"workRef": "work_context_projection", "state": "queued"}
+
+    source_event_id = "telegram-update-synthetic-context"
+    tool_args = {
+        "title": "Preserve exact source",
+        "goal": "Complete the exact source request",
+        "instruction": "Carry out the triggering request.",
+    }
+    segment_zero = "First exact line.\nSecond exact line."
+    segment_one = "A later exact user message with --- delimiter text."
+    call_identity_digest = hashlib.sha256(b"context-provider-call").hexdigest()
+    goal_digest = hashlib.sha256(b"context-goal").hexdigest()
+    key = hashlib.sha256(
+        (
+            f"tenant-alpha\0owner-alpha\0{source_event_id}\0"
+            f"call:{call_identity_digest}\0{goal_digest}"
+        ).encode()
+    ).hexdigest()
+    identity = {
+        "version": 2,
+        "idempotency_key": key,
+        "goal_digest": goal_digest,
+        "launch_payload_digest": _launch_payload_digest(tool_args),
+        "call_identity_digest": call_identity_digest,
+        "source_event_id": source_event_id,
+        "objective_ordinal": 4,
+    }
+    bundle = {
+        "callbacks": {
+            "origin_ref": "ghi_synthetic_context_origin",
+            "events_webhook_url": "https://forged.invalid/callback",
+            "telegram_chat_id": "forged-chat",
+        },
+        "viventium_delegation_identity": identity,
+        "viventium_delegation_assertion": _scoped_delegation_identity_assertion(
+            identity,
+            assertion_secret,
+            tenant_id="tenant-alpha",
+            owner_id="owner-alpha",
+        ),
+        "viventium_delegation_context": {
+            "version": 1,
+            "source_event_id": source_event_id,
+            "surface": "telegram",
+            "recent_conversation": [
+                {
+                    "ordinal": 0,
+                    "message_id": "message-user-prior",
+                    "role": "user",
+                    "text": "Earlier user context, exactly preserved.",
+                },
+                {
+                    "ordinal": 1,
+                    "message_id": "message-assistant-prior",
+                    "parent_message_id": "message-user-prior",
+                    "role": "assistant",
+                    "text": "Earlier assistant context, not new authority.",
+                },
+            ],
+            "triggering_source_segments": [
+                {
+                    "ordinal": 0,
+                    "source_event_id": "telegram-update-prior-context",
+                    "source_index": 0,
+                    "text": segment_zero,
+                },
+                {
+                    "ordinal": 1,
+                    "source_event_id": source_event_id,
+                    "source_index": 0,
+                    "text": segment_one,
+                },
+                {
+                    "ordinal": 2,
+                    "source_event_id": source_event_id,
+                    "source_index": 1,
+                    "text": segment_zero,
+                },
+            ],
+        },
+    }
+    api = AtomicApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            await client.call_tool(
+                "worker_delegate_once",
+                {
+                    **tool_args,
+                    "bootstrap_bundle_json": bundle,
+                },
+            )
+
+    asyncio.run(scenario())
+
+    delegated = api.delegations[0]
+    payload = delegated["payload"]
+    assert delegated["idempotency_key"] == key
+    assert payload["bootstrapBundle"]["callbacks"] == {
+        "origin_ref": "ghi_synthetic_context_origin"
+    }
+    assert "glasshive_context" not in payload["bootstrapBundle"]
+    instruction = payload["instruction"]
+    project_definition = payload["bootstrapBundle"]["project_definition"]
+    for projected in (instruction, project_definition):
+        assert "Earlier user context, exactly preserved." in projected
+        assert "Earlier assistant context, not new authority." in projected
+        assert projected.index("Earlier user context") < projected.index("Earlier assistant context")
+        assert projected.index("Earlier assistant context") < projected.index(segment_zero)
+        assert "PAST USER MESSAGE 0 (user authority)" in projected
+        assert "PAST ASSISTANT MESSAGE 1 (prior assistant context only)" in projected
+        assert segment_zero in projected
+        assert segment_one in projected
+        assert projected.index(segment_zero) < projected.index(segment_one)
+        assert projected.count(segment_zero) == 2
+        assert "user authority only" in projected
+    assert payload["bootstrapBundle"]["viventium_delegation_context"][
+        "triggering_source_segments"
+    ][0]["source_event_id"] == "telegram-update-prior-context"
+    serialized = json.dumps(payload)
+    assert "must-not-enter-mission" not in serialized
+    assert "forged.invalid" not in serialized
+    assert "forged-chat" not in serialized
+
+
+def test_trusted_delegation_context_rejects_duplicate_source_identity_and_oversized_history():
+    identity = {
+        "version": 1,
+        "source_event_id": "event-current",
+    }
+    context = {
+        "version": 1,
+        "source_event_id": "event-current",
+        "triggering_source_segments": [
+            {
+                "ordinal": 0,
+                "source_event_id": "event-current",
+                "source_index": 0,
+                "text": "first",
+            },
+            {
+                "ordinal": 1,
+                "source_event_id": "event-current",
+                "source_index": 0,
+                "text": "duplicate identity",
+            },
+        ],
+    }
+    with pytest.raises(ValueError, match="viventium_delegation_context is invalid"):
+        mcp_server._trusted_triggering_source_block(
+            {
+                "viventium_delegation_identity": identity,
+                "viventium_delegation_context": context,
+            }
+        )
+
+    context["triggering_source_segments"] = []
+    context["recent_conversation"] = [
+        {
+            "ordinal": 0,
+            "message_id": "message-old",
+            "role": "user",
+            "text": "x" * (4 * 1024 + 1),
+        }
+    ]
+    with pytest.raises(ValueError, match="viventium_delegation_context is invalid"):
+        mcp_server._trusted_triggering_source_block(
+            {
+                "viventium_delegation_identity": identity,
+                "viventium_delegation_context": context,
+            }
+        )
+
+
+def test_active_work_mcp_facade_keeps_asserted_scope_and_derives_action_idempotency(monkeypatch):
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "owner-alpha",
+            "X-Viventium-Message-Id": "message-control-alpha",
+        },
+    )
+
+    class ActiveWorkApi(FakeApiClient):
+        def __init__(self):
+            self.calls = []
+
+        def list_active_work(self, **kwargs):
+            self.calls.append(("list", kwargs))
+            return {
+                "snapshot": "fresh",
+                "work": [{"workRef": "work_alpha", "title": "Alpha", "state": "running"}],
+                "overflowCount": 0,
+            }
+
+        def active_work_action(self, work_ref, **kwargs):
+            self.calls.append(("action", {"work_ref": work_ref, **kwargs}))
+            return {
+                "workRef": work_ref,
+                "action": kwargs["action"],
+                "status": "accepted",
+                "state": "stopping",
+                "confirmationPending": True,
+                "idempotentReplay": False,
+            }
+
+    api = ActiveWorkApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            roster = _tool_json(await client.call_tool("active_work_list", {}))
+            action = _tool_json(
+                await client.call_tool(
+                    "active_work_action",
+                    {"work_ref": "work_alpha", "action": "stop"},
+                )
+            )
+            assert roster["snapshot"] == "fresh"
+            assert roster["work"][0]["workRef"] == "work_alpha"
+            assert action["state"] == "stopping"
+
+    asyncio.run(scenario())
+
+    assert [entry[0] for entry in api.calls] == ["list", "action"]
+    for _name, kwargs in api.calls:
+        assert kwargs["tenant_id"] == "tenant-alpha"
+        assert kwargs["owner_id"] == "owner-alpha"
+    assert api.calls[-1][1]["idempotency_key"].startswith("gha_")
 
 
 def test_worker_delegate_once_blocks_missing_host_cli_before_api_calls(monkeypatch):
@@ -3585,6 +4801,32 @@ def test_upload_owner_id_with_path_separators_is_rejected(monkeypatch, tmp_path)
     assert "source_path" not in entry
 
 
+@pytest.mark.parametrize("enterprise_mode", [False, True])
+def test_virtual_upload_source_enforces_asserted_owner_in_every_mode(
+    monkeypatch,
+    tmp_path,
+    enterprise_mode,
+):
+    uploads_root = tmp_path / "uploads"
+    own_upload = uploads_root / "owner-a" / "brief.txt"
+    other_upload = uploads_root / "owner-b" / "brief.txt"
+    own_upload.parent.mkdir(parents=True)
+    other_upload.parent.mkdir(parents=True)
+    own_upload.write_text("owner a")
+    other_upload.write_text("owner b")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true" if enterprise_mode else "false")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
+
+    assert mcp_server._trusted_virtual_upload_source(
+        "/uploads/owner-a/brief.txt",
+        owner_id="owner-a",
+    ) == str(own_upload)
+    assert mcp_server._trusted_virtual_upload_source(
+        "/uploads/owner-b/brief.txt",
+        owner_id="owner-a",
+    ) == ""
+
+
 def test_worker_tools_use_configured_default_execution_mode(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
     server = create_mcp_server(api_client=FakeApiClient())
@@ -4614,7 +5856,8 @@ def test_tool_descriptions_advertise_mcp_owned_usage_contract(monkeypatch):
     assert "Satisfy the user's request as stated, preserving explicit constraints" in instructions
     assert "success_criteria as broker/tool evidence gates" not in instructions
     assert "preferred scoped option" in instructions
-    assert "non-broker host connectors are fallback after" in instructions
+    assert "never use a non-broker host connector to bypass" in instructions
+    assert "work enters needs_input" in instructions
     assert "Connected-account read authorization comes from the host-signed broker grant" in instructions
     assert "compatibility hint for hosts that want an extra missing-broker warning" in instructions
     assert "not a required authorization switch" in instructions
@@ -4850,6 +6093,155 @@ def test_worker_tools_default_owner_from_request_headers(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_worker_delegate_once_local_request_identity_overrides_forged_owner_and_project(
+    monkeypatch,
+):
+    class OwnerCheckingClient(FakeApiClient):
+        def __init__(self):
+            self.project_lookups: list[str] = []
+            self.created_owners: list[str | None] = []
+
+        def get_project(self, project_id: str):
+            self.project_lookups.append(project_id)
+            return {
+                "project_id": project_id,
+                "owner_id": "owner-b",
+                "title": "Sibling project",
+                "goal": "Must remain isolated",
+            }
+
+        def create_project(self, **kwargs):
+            self.created_owners.append(kwargs.get("owner_id"))
+            return super().create_project(**kwargs)
+
+    api = OwnerCheckingClient()
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "tenant-local",
+            "X-Viventium-User-Id": "owner-a",
+        },
+    )
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="project is not available"):
+                await client.call_tool(
+                    "worker_delegate_once",
+                    {
+                        "title": "Scoped mission",
+                        "instruction": "Perform only the authenticated owner's work.",
+                        "owner_id": "owner-b",
+                        "project_id": "prj_owner_b",
+                        "profile": "codex-cli",
+                        "execution_mode": "docker",
+                    },
+                )
+
+    asyncio.run(scenario())
+    assert api.created_owners == []
+    assert api.project_lookups == ["prj_owner_b"]
+
+
+def test_local_mcp_legacy_tools_forward_trusted_owner_scope_to_the_api(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("WPR_API_TOKEN", "service-token")
+    monkeypatch.delenv("GLASSHIVE_ENTERPRISE_MODE", raising=False)
+    monkeypatch.delenv("WPR_ENTERPRISE_MODE", raising=False)
+    api_app = create_app(
+        db_path=str(tmp_path / "local-mcp-owner-scope.db"),
+        runtime_backend="stub",
+        runtime=StubRuntime(),
+        reconcile_on_startup=False,
+    )
+    api_http = TestClient(api_app)
+    owner_a_headers = {
+        "Authorization": "Bearer service-token",
+        "X-Viventium-Tenant-Id": "tenant-local",
+        "X-Viventium-User-Id": "owner-a",
+    }
+    owner_b_headers = {
+        **owner_a_headers,
+        "X-Viventium-User-Id": "owner-b",
+    }
+    project_a = api_http.post(
+        "/v1/projects",
+        headers=owner_a_headers,
+        json={"owner_id": "forged", "title": "Owner A", "goal": "A only"},
+    ).json()
+    project_b = api_http.post(
+        "/v1/projects",
+        headers=owner_b_headers,
+        json={"owner_id": "forged", "title": "Owner B", "goal": "B only"},
+    ).json()
+
+    class InProcessHttpClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def request(self, method, url, json=None, headers=None):
+            parsed = urlsplit(url)
+            path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+            return api_http.request(method, path, json=json, headers=headers)
+
+    monkeypatch.setattr(mcp_server.httpx, "Client", InProcessHttpClient)
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "tenant-local",
+            "X-Viventium-User-Id": "owner-a",
+        },
+    )
+    api = mcp_server.WorkersProjectsApiClient(
+        base_url="http://glasshive.in-process",
+        api_token="service-token",
+    )
+    server = create_mcp_server(api_client=api)
+    created_projects: list[dict] = []
+
+    async def scenario():
+        async with Client(server) as mcp_client:
+            listed = _tool_json(
+                await mcp_client.call_tool("projects_list", {"owner_id": "owner-b"})
+            )
+            assert listed in ([], {"result": []})
+            with pytest.raises(ToolError):
+                await mcp_client.call_tool(
+                    "project_get", {"project_id": project_b["project_id"]}
+                )
+            created = _tool_json(
+                await mcp_client.call_tool(
+                    "project_create",
+                    {
+                        "owner_id": "owner-b",
+                        "title": "Forged owner project",
+                        "goal": "Must remain with the trusted owner",
+                    },
+                )
+            )
+            assert created["owner_id"] == "owner-a"
+            created_projects.append(created)
+
+    asyncio.run(scenario())
+    assert {item["project_id"] for item in api.list_projects()} == {
+        project_a["project_id"],
+        created_projects[0]["project_id"],
+    }
+    with pytest.raises(httpx.HTTPStatusError):
+        api.get_project(project_b["project_id"])
+
+
 def test_merge_request_context_adds_callback_metadata(monkeypatch):
     monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", "http://localhost:3080/api/viventium/glasshive/callback")
     monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "callback-secret")
@@ -4870,6 +6262,8 @@ def test_merge_request_context_adds_callback_metadata(monkeypatch):
             "X-Viventium-Telegram-Chat-Id": "chat-123",
             "X-Viventium-Telegram-User-Id": "tg-user-123",
             "X-Viventium-Telegram-Message-Id": "tg-msg-123",
+            "X-Viventium-Logical-Turn-Id": "turn-123",
+            "X-Viventium-Logical-Turn-Revision": "2",
         },
     )
 
@@ -4885,6 +6279,8 @@ def test_merge_request_context_adds_callback_metadata(monkeypatch):
     assert callbacks["stream_id"] == "stream-123"
     assert callbacks["voice_call_session_id"] == "call-123"
     assert callbacks["telegram_chat_id"] == "chat-123"
+    assert callbacks["logical_turn_id"] == "turn-123"
+    assert callbacks["logical_turn_revision"] == "2"
     assert bundle["viventium_context"]["user_id"] == "user-123"
 
 
@@ -5051,6 +6447,58 @@ def test_merge_request_context_maps_virtual_uploads_to_trusted_local_source(monk
     )
 
 
+def test_merge_request_context_preserves_ordered_media_group_metadata(monkeypatch, tmp_path):
+    uploads_root = tmp_path / "uploads"
+    owner_root = uploads_root / "user-123"
+    owner_root.mkdir(parents=True)
+    first_path = owner_root / "first-image.jpg"
+    second_path = owner_root / "second-image.jpg"
+    first_path.write_bytes(b"synthetic-first-image")
+    second_path.write_bytes(b"synthetic-second-image")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
+    files = [
+        {
+            "file_id": "file-first",
+            "filename": "first-image.jpg",
+            "filepath": "/uploads/user-123/first-image.jpg",
+            "source": "local",
+            "context": "message_attachment",
+            "media_group_index": 0,
+        },
+        {
+            "file_id": "file-second",
+            "filename": "second-image.jpg",
+            "filepath": "/uploads/user-123/second-image.jpg",
+            "source": "local",
+            "context": "message_attachment",
+            "media_group_index": 1,
+        },
+    ]
+    encoded_files = "b64:" + base64.b64encode(json.dumps(files).encode()).decode()
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "user-123",
+            "X-Viventium-Request-Files": encoded_files,
+        },
+    )
+
+    bundle = mcp_server._merge_request_context({"project_definition": "Inspect both images."})
+
+    assert [entry["file_id"] for entry in bundle["files"]] == [
+        "file-first",
+        "file-second",
+    ]
+    assert [entry["media_group_index"] for entry in bundle["files"]] == [0, 1]
+    assert [os.path.basename(entry["source_path"]) for entry in bundle["files"]] == [
+        "first-image.jpg",
+        "second-image.jpg",
+    ]
+
+
 def test_merge_request_context_uses_storage_user_id_for_upload_source(monkeypatch, tmp_path):
     uploads_root = tmp_path / "uploads"
     upload_path = uploads_root / "storage-user-123" / "uuid__brief with spaces.pdf"
@@ -5124,6 +6572,65 @@ def test_explicit_uploaded_file_uses_storage_user_id_for_filename_search(monkeyp
 
     assert bundle["files"][0]["path"] == "uploads/same-display-name.pdf"
     assert bundle["files"][0]["source_path"] == str(upload_path)
+
+
+def test_local_explicit_upload_filename_uses_header_owner_not_model_bundle_scope(
+    monkeypatch,
+    tmp_path,
+):
+    uploads_root = tmp_path / "uploads"
+    own_upload = uploads_root / "owner-a" / "uuid-a__same display name.pdf"
+    other_upload = uploads_root / "owner-b" / "uuid-b__same display name.pdf"
+    own_upload.parent.mkdir(parents=True)
+    other_upload.parent.mkdir(parents=True)
+    own_upload.write_bytes(b"%PDF-1.7\nowner a\n")
+    other_upload.write_bytes(b"%PDF-1.7\nowner b\n")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "false")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "local",
+            "X-Viventium-User-Id": "owner-a",
+        },
+    )
+    api_client = TrackingApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "title": "Owner-scoped local upload",
+                    "instruction": "Use the attached PDF.",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                    "bootstrap_bundle_json": {
+                        "glasshive_context": {
+                            "tenant_id": "forged-tenant",
+                            "user_id": "owner-b",
+                            "storage_user_id": "owner-b",
+                        }
+                    },
+                    "uploaded_files": [
+                        {
+                            "filename": "same display name.pdf",
+                            "text": "model-visible text is not file authorization",
+                        }
+                    ],
+                },
+            )
+            assert _tool_json(delegated)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+    bundle = api_client.find_or_resume_payloads[0]["bootstrap_bundle"]
+    projected = bundle["files"][0]
+    assert projected["path"] == "uploads/same-display-name.pdf"
+    assert projected["source_path"] == str(own_upload)
+    assert projected["source_path"] != str(other_upload)
 
 
 def test_storage_user_id_does_not_allow_other_storage_owner_path(monkeypatch, tmp_path):
@@ -5444,6 +6951,78 @@ def test_runtime_env_loads_host_cli_binary_paths(monkeypatch, tmp_path):
     assert os.environ["WPR_OPENCLAW_BIN"] == str(tmp_path / "openclaw")
 
 
+def test_runtime_env_loads_server_only_service_assertion_secret(monkeypatch, tmp_path):
+    runtime_file = tmp_path / "runtime.env"
+    runtime_file.write_text(
+        "VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET=synthetic-server-only-secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VIVENTIUM_ENV_FILE", str(runtime_file))
+    monkeypatch.delenv("VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET", raising=False)
+
+    loaded = runtime_env.load_viventium_runtime_env()
+
+    assert loaded["VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET"] == "synthetic-server-only-secret"
+    assert os.environ["VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET"] == "synthetic-server-only-secret"
+
+
+def test_runtime_env_loads_server_only_bootstrap_source_secret(monkeypatch, tmp_path):
+    runtime_file = tmp_path / "runtime.env"
+    runtime_file.write_text(
+        "GLASSHIVE_BOOTSTRAP_SOURCE_SECRET=synthetic-source-only-secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VIVENTIUM_ENV_FILE", str(runtime_file))
+    monkeypatch.delenv("GLASSHIVE_BOOTSTRAP_SOURCE_SECRET", raising=False)
+
+    loaded = runtime_env.load_viventium_runtime_env()
+
+    assert loaded["GLASSHIVE_BOOTSTRAP_SOURCE_SECRET"] == "synthetic-source-only-secret"
+    assert os.environ["GLASSHIVE_BOOTSTRAP_SOURCE_SECRET"] == "synthetic-source-only-secret"
+
+
+def test_runtime_env_loads_server_only_deferred_admission_config(monkeypatch, tmp_path):
+    runtime_file = tmp_path / "runtime.env"
+    runtime_file.write_text(
+        "VIVENTIUM_GLASSHIVE_ADMISSION_URL=http://127.0.0.1:3180/internal/admission\n"
+        "VIVENTIUM_GLASSHIVE_ADMISSION_SECRET=synthetic-admission-secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VIVENTIUM_ENV_FILE", str(runtime_file))
+    monkeypatch.delenv("VIVENTIUM_GLASSHIVE_ADMISSION_URL", raising=False)
+    monkeypatch.delenv("VIVENTIUM_GLASSHIVE_ADMISSION_SECRET", raising=False)
+
+    loaded = runtime_env.load_viventium_runtime_env()
+
+    assert loaded["VIVENTIUM_GLASSHIVE_ADMISSION_URL"].endswith("/internal/admission")
+    assert loaded["VIVENTIUM_GLASSHIVE_ADMISSION_SECRET"] == "synthetic-admission-secret"
+
+
+def test_runtime_env_loads_host_lease_and_resource_guards(monkeypatch, tmp_path):
+    runtime_file = tmp_path / "runtime.env"
+    expected = {
+        "WPR_HOST_CONVERSATION_SLOTS_PER_CLI": "2",
+        "WPR_HOST_MISSION_SLOTS_PER_CLI": "3",
+        "WPR_HOST_ACCOUNT_ACTIVE_LIMIT": "4",
+        "WPR_HOST_TENANT_ACTIVE_LIMIT": "12",
+        "WPR_HOST_MAX_CHILD_PROCESSES": "64",
+        "WPR_HOST_MAX_THREADS": "2048",
+        "WPR_HOST_MIN_AVAILABLE_MEMORY_MB": "2048",
+        "WPR_HOST_MIN_AVAILABLE_DISK_MB": "4096",
+    }
+    runtime_file.write_text(
+        "\n".join(f"{key}={value}" for key, value in expected.items()) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VIVENTIUM_ENV_FILE", str(runtime_file))
+    for key in expected:
+        monkeypatch.delenv(key, raising=False)
+
+    loaded = runtime_env.load_viventium_runtime_env()
+
+    assert {key: loaded[key] for key in expected} == expected
+
+
 def test_runtime_env_loads_host_worker_native_capability_knobs(monkeypatch, tmp_path):
     runtime_file = tmp_path / "runtime.env"
     runtime_file.write_text(
@@ -5455,6 +7034,10 @@ def test_runtime_env_loads_host_worker_native_capability_knobs(monkeypatch, tmp_
                 "WPR_HOST_CODEX_NATIVE_MCP_ALLOWLIST=computer-use,node_repl",
                 "GLASSHIVE_HOST_CODEX_PLUGIN_CACHE=codex-plugin-cache",
                 "WPR_HOST_CODEX_PLUGIN_CACHE=codex-plugin-cache",
+                "GLASSHIVE_HOST_PLUGIN_DENYLIST=synthetic-plugin@synthetic-marketplace",
+                "WPR_HOST_PLUGIN_DENYLIST=synthetic-plugin@synthetic-marketplace",
+                "WPR_CODEX_CLI_PERSONALITY=none",
+                "WPR_CODEX_CLI_CONVERSATION_PROJECT_INSTRUCTIONS=exclude",
                 "WPR_CODEX_CLI_IGNORE_USER_CONFIG=false",
                 "WPR_CODEX_CLI_DISABLE_FEATURES=image_generation",
                 "WPR_CODEX_CLI_PROVIDER_NAME=GlassHive Test Provider",
@@ -5473,6 +7056,10 @@ def test_runtime_env_loads_host_worker_native_capability_knobs(monkeypatch, tmp_
         "WPR_HOST_CODEX_NATIVE_MCP_ALLOWLIST",
         "GLASSHIVE_HOST_CODEX_PLUGIN_CACHE",
         "WPR_HOST_CODEX_PLUGIN_CACHE",
+        "GLASSHIVE_HOST_PLUGIN_DENYLIST",
+        "WPR_HOST_PLUGIN_DENYLIST",
+        "WPR_CODEX_CLI_PERSONALITY",
+        "WPR_CODEX_CLI_CONVERSATION_PROJECT_INSTRUCTIONS",
         "WPR_CODEX_CLI_IGNORE_USER_CONFIG",
         "WPR_CODEX_CLI_DISABLE_FEATURES",
         "WPR_CODEX_CLI_PROVIDER_NAME",
@@ -5491,6 +7078,9 @@ def test_runtime_env_loads_host_worker_native_capability_knobs(monkeypatch, tmp_
         assert os.environ[key] == loaded[key]
     assert os.environ["WPR_CLAUDE_CODE_EFFORT"] == "max"
     assert "computer-use" in os.environ["GLASSHIVE_HOST_CODEX_NATIVE_MCP_ALLOWLIST"]
+    assert os.environ["GLASSHIVE_HOST_PLUGIN_DENYLIST"] == (
+        "synthetic-plugin@synthetic-marketplace"
+    )
 
 
 def test_merge_request_context_projects_extracted_upload_text(monkeypatch):

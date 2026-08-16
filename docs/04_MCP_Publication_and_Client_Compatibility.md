@@ -172,6 +172,26 @@ For broader publication:
 - `execution_mode=host` must be an explicit tool argument; the MCP server should not infer host
   execution from natural-language phrasing
 
+### Host-owned capability projection
+
+A chat provider may expose capabilities that belong to the host application rather than to the
+worker runtime, such as conversation recall. Project those capabilities through an authenticated
+broker MCP instead of assuming every provider natively understands the host tool schema.
+
+- The signed bearer grant carries identity, allowlists, expiry, and a digest reference only. Keep it
+  under a conservative 4 KiB header budget.
+- Full conversation/resource scope remains server-side in a bounded, expiring store. Rehydrate it
+  only after signature, allowlist, expiry, and digest validation; fail closed on any mismatch.
+- Preserve the worker's declared native tools. Host-tool projection adds capability parity; it does
+  not globally disable shell, browser, or workstation capabilities.
+- Acceptance must join the user response to the exact request, run, worker, and tool ledger. A
+  correct-looking answer or a catalog entry alone does not prove the brokered tool executed.
+- Conversation-provider activity converts every terminal broker execution into one durable,
+  user-visible operation receipt. The receipt may contain only a bounded product-language task and
+  terminal status; raw broker/server names, arguments, results, invocation IDs, credentials, and
+  native event plumbing remain private. When a native harness reports the same call through more
+  than one event view, correlate it by the private call ID and emit the terminal receipt once.
+
 For Azure enterprise VM mode, the default LibreChat integration remains config-only: LibreChat sends
 the neutral `X-GlassHive-*` service, identity, request, and upload headers to the remote GlassHive
 MCP endpoint over a locked-down channel. GlassHive trusts identity headers only after service-token

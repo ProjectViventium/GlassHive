@@ -144,7 +144,9 @@ User-visible callbacks are intentionally quiet:
 - Worker lifecycle and queue/start events are lifecycle/audit-only by default.
 - `run.completed` posts the final user-facing result.
 - `run.failed` posts the blocker/failure in human terms.
-- `checkpoint.ready` posts the specific approval request.
+- `checkpoint.ready` is reserved but is not currently emitted or actionable. GlassHive has no
+  persisted resumable checkpoint primitive yet, so the runtime must not infer one from worker text
+  or mint an input/continue capability for it.
 - Repeated visible callbacks for the same run update one task-status message instead of creating
   callback branches.
 - Visible callbacks require the assistant response `message_id`; unanchored visible callbacks are
@@ -153,6 +155,69 @@ User-visible callbacks are intentionally quiet:
   worker terminal links do not leak into normal chat or voice surfaces.
 - Worker IDs, run IDs, project IDs, ports, and terminal links are diagnostic-only unless the parent
   user explicitly asks for them.
+
+### Scoped Callback Actions
+
+Real callbacks can carry a narrowly scoped `actionCapabilities` array:
+
+- A currently running `run.started` callback may carry `action: "cancel"`.
+- A persisted retryable `run.failed` callback may carry `action: "retry"` and
+  `operation: "workspace_continue"`.
+- Nonretryable failures, terminal runs, and unproven checkpoint events carry no action capability.
+
+Each item contains `version`, `capabilityId`, `action`, `operation`, the exact project/worker/run
+correlation, relative `endpoint: "/v1/run-actions"`, `expiresAt`, and an opaque `capability`.
+The absolute API origin comes only from the parent's configured GlassHive provider origin; callback
+data never chooses a host. The opaque value is added only to the outbound HTTP payload and is not
+stored in GlassHive's callback outbox, user-visible callback text, task snapshots, messages, or logs.
+
+The parent invokes `POST /v1/run-actions` with the opaque value in
+`X-Viventium-Action-Capability` and this exact body:
+
+```json
+{
+  "version": 1,
+  "capabilityId": "gac_example",
+  "action": "retry",
+  "projectId": "prj_example",
+  "workerId": "wrk_example",
+  "runId": "run_example",
+  "idempotencyKey": "parent-operation-example"
+}
+```
+
+The signed capability is sufficient authentication for this endpoint only. GlassHive revalidates
+its signature, expiry, action, tenant, owner, project, worker, run, persisted state, and one-use
+idempotency before acting. Capability segments must use canonical unpadded Base64url; alternate
+encodings with changed unused pad bits are rejected even when a permissive decoder would produce
+the same bytes. The same capability plus the same idempotency key returns the original
+result; another replay is rejected. Retry atomically queues one new run in the same workspace and
+returns canonical `newRun: {projectId, workerId, runId}` correlation. Cancel calls the exact-run
+interrupt primitive. A concurrent duplicate returns `status: "pending"`; only owner acceptance
+returns `status: "accepted"`, and both keep `confirmationPending: true` until a later
+signed `run.interrupted` or `run.cancelled` callback confirms cancellation. Retry capabilities last
+15 minutes. Cancel capabilities last up to 24 hours so extended calls can still stop active work;
+their exact-run state and one-use checks remain authoritative. Failed owner interruption is recorded
+as retryable action execution state, stale execution leases recover after a process crash, and retry
+replay always wakes the one canonical queued run's processor.
+
+If the exact run completes before cancellation is accepted, the endpoint returns HTTP 409 with the
+only special non-error outcome shape:
+
+```json
+{
+  "version": 1,
+  "status": "already_completed",
+  "action": "cancel",
+  "projectId": "prj_example",
+  "workerId": "wrk_example",
+  "sourceRunId": "run_example",
+  "state": "completed"
+}
+```
+
+The parent must validate every scoped field against the held capability before treating that result
+as completed work. GlassHive never reports that race as accepted cancellation.
 
 Voice and Telegram surfaces poll this same persisted callback message after the main response, just
 as they already do for persisted follow-ups. GlassHive does not get a separate upload or result path;
@@ -309,7 +374,7 @@ Webhooks are enough for the first real product flows:
 1. run completed
 2. run failed
 3. artifact produced
-4. checkpoint reached
+4. checkpoint reached (reserved until a persisted checkpoint primitive exists)
 5. needs human takeover
 
 ### V1 Outbound Contract
@@ -329,7 +394,7 @@ Suggested event types:
 1. `run.started`
 2. `run.completed`
 3. `run.failed`
-4. `checkpoint.ready`
+4. `checkpoint.ready` (reserved, not emitted/actionable in the current runtime)
 5. `artifact.created`
 6. `takeover.requested`
 
@@ -342,7 +407,7 @@ Suggested payload fields:
 5. `timestamp`
 6. `summary`
 7. `artifact_refs`
-8. `resume_token` or `worker_url` when relevant
+8. a scoped `actionCapabilities` item when the runtime can prove a retryable failed or active run
 
 ## C. Telegram To Worker Routing
 
@@ -407,6 +472,16 @@ Do these in order:
 6. add host-native `.mcp.json` / `.claude/settings.local.json` / Codex config parity, preserving
    the worker CLI's native browser/computer/MCP capability surface before appending broker grants
 7. run shadow QA before retiring any Google/MS365/background-agent path
+
+Controlled evidence-isolation is an explicit exception to the additive default. A parent deployment
+may configure `native_web_access: disabled` for a host worker when a QA or reviewed enterprise flow
+must prove that an assigned broker web tool is the only accepted web-evidence source. GlassHive then
+disables provider-native Codex web search or Claude WebSearch/WebFetch at the real CLI launch while
+retaining the broker MCP. The policy is never inferred from the task, Agent/provider name, or tool
+label, and changing it replaces an existing conversation session before reuse. A compiled
+`WPR_HOST_NATIVE_WEB_ACCESS` value takes precedence over the standalone
+`GLASSHIVE_HOST_NATIVE_WEB_ACCESS` fallback; the alias is consulted only when the compiled value is
+absent.
 
 Do not start with generic “bidirectional MCP federation.”
 
@@ -483,6 +558,8 @@ A future implementation based on this doc should satisfy all of these:
 5. GlassHive remains usable by non-Viventium parents such as Claude/Codex-style orchestrators
 6. a projected worker can be reconstructed from logged inputs without hidden dependence on LibreChat internals
 7. omitted MCPs are explained deterministically rather than failing silently
+8. an explicit native-web lockdown leaves the broker callable, produces no provider-native web-search
+   event, and cannot be bypassed by resuming a session created under the prior policy
 
 ## Non-Goals
 
