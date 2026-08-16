@@ -658,7 +658,9 @@ def glasshive_workers_server_instructions() -> str:
     return (
         "Use the one GlassHive tool whose action matches the user's request. Make one call when one "
         "call can complete it; never enumerate or summarize the tool catalog unless the user asks. "
-        "For a fresh delegated task, use workspace_launch. Check or wait only when the user asks. "
+        "For a fresh delegated task, use workspace_launch. When the user gives an exact saved workspace "
+        "name, launch it directly without listing first; workspace_launch resolves the human name. "
+        "Check or wait only when the user asks. "
         "Preserve the user's goal, constraints, files, and context without inventing plans, success "
         "criteria, tool results, or extra workflow. Use the exact callable tool id shown by the host. "
         f"{_worker_capability_summary()} {_worker_execution_instruction()}"
@@ -3053,7 +3055,10 @@ def create_mcp_server(
         title="Find My Workspaces",
         description=(
             "List, search, and rediscover the authenticated user's persisted GlassHive workspaces by "
-            "human name, tag, favorite state, or workspace kind. Returns an opaque next_cursor for pagination."
+            "human name, tag, favorite state, or workspace kind. Use when the user asks to browse/list, "
+            "or when a workspace name is missing or ambiguous. Do not call this before workspace_launch "
+            "when the user already supplied one exact saved human name; workspace_launch resolves it. "
+            "Returns an opaque next_cursor for pagination."
         ),
         structured_output=True,
         annotations=READ_ONLY_TOOL_ANNOTATIONS,

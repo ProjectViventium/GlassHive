@@ -5171,6 +5171,7 @@ def test_tool_descriptions_advertise_mcp_owned_usage_contract(monkeypatch):
     assert "Use the one GlassHive tool" in instructions
     assert "Make one call when one call can complete it" in instructions
     assert "never enumerate or summarize the tool catalog" in instructions
+    assert "launch it directly without listing first" in instructions
     assert "without inventing plans, success criteria, tool results, or extra workflow" in instructions
     assert "Use the exact callable tool id shown by the host" in instructions
     assert len(instructions) < 1_000
@@ -5220,6 +5221,8 @@ def test_tool_descriptions_advertise_mcp_owned_usage_contract(monkeypatch):
 
             delegate_description = tools["worker_delegate_once"]["description"]
             workspace_description = tools["workspace_launch"]["description"]
+            workspace_list_description = tools["workspace_list"]["description"]
+            assert "do not call this before workspace_launch" in workspace_list_description.lower()
             assert "description" in workspace_description
             assert "success_criteria" in workspace_description
             assert "optional context" in workspace_description
