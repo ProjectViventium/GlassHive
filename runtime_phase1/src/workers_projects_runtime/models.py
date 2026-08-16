@@ -19,6 +19,7 @@ WorkerState = Literal[
     "terminated",
 ]
 WorkerCloseState = Literal["terminating", "termination_failed", "terminated"]
+CLOSED_WORKER_STATES = frozenset({"terminating", "termination_failed", "terminated"})
 RunState = Literal["queued", "running", "interrupted", "paused", "completed", "failed", "cancelled"]
 ScheduleState = Literal["pending", "running", "queued", "completed", "failed", "cancelled"]
 RecurringScheduleOccurrenceState = Literal[

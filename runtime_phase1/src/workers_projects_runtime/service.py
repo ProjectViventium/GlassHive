@@ -37,7 +37,13 @@ from .control_plane import (
     ControlPlaneStore,
 )
 from .failure_classification import classify_runtime_error
-from .models import WorkspaceKind, normalize_workspace_kind, normalize_workspace_tags, utc_now
+from .models import (
+    CLOSED_WORKER_STATES,
+    WorkspaceKind,
+    normalize_workspace_kind,
+    normalize_workspace_tags,
+    utc_now,
+)
 from .mission_provider_accounts import (
     deployment_provider_readiness,
     mission_provider_account_selection,
@@ -84,7 +90,6 @@ from .workspace_continuation import continuation_instruction
 
 
 logger = logging.getLogger(__name__)
-CLOSED_WORKER_STATES = {"terminating", "termination_failed", "terminated"}
 TERMINAL_CALLBACK_MESSAGE_LIMIT = 4000
 FINAL_REPORT_PATTERN = re.compile(
     r"(?mi)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*)?"

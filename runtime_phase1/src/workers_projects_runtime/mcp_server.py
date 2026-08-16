@@ -40,6 +40,7 @@ from .deliverables import is_user_deliverable_relative_path
 from .operator_urls import operator_base_url, surface_aware_watch_url, surface_can_open_operator_url
 from .mcp_oauth import McpOAuthConfigurationError, oauth_from_env
 from .mcp_internal_assertions import McpInternalAssertionError, signed_runtime_assertion
+from .models import CLOSED_WORKER_STATES
 from .release_provenance import release_provenance
 from .runtime_requirements import host_runtime_requirement_issue
 from .runtime_env import load_viventium_runtime_env
@@ -2509,7 +2510,7 @@ class WorkersProjectsApiClient:
             if not project_id:
                 continue
             for worker in self.list_workers(project_id):
-                if str(worker.get("state") or "") in {"terminating", "termination_failed", "terminated"}:
+                if str(worker.get("state") or "") in CLOSED_WORKER_STATES:
                     continue
                 if execution_mode and worker.get("execution_mode") and worker.get("execution_mode") != execution_mode:
                     continue
@@ -3964,34 +3965,43 @@ def create_mcp_server(
         delegate_alias = workspace_alias if reuse_existing_workspace else None
         if reuse_existing_workspace:
             supplied_alias = str(delegate_alias or "").strip()
-            lookup_names = [title]
-            if supplied_alias and supplied_alias.casefold() != title.casefold():
-                lookup_names.append(supplied_alias)
+            lookup_name = supplied_alias or title
+            supplied_unscoped_alias = (
+                _request_unscoped_alias(supplied_alias) if supplied_alias else ""
+            )
             resolved_catalog_alias = ""
-            for lookup_name in lookup_names:
-                catalog = client.workspace_catalog(
-                    search=lookup_name,
-                    kind="named",
-                    limit=100,
+            catalog = client.workspace_catalog(
+                search=lookup_name,
+                kind="named",
+                limit=100,
+            )
+            items = catalog.get("items") if isinstance(catalog, dict) else None
+            next_cursor = catalog.get("next_cursor") if isinstance(catalog, dict) else None
+            active_items = [
+                item
+                for item in (items if isinstance(items, list) else [])
+                if isinstance(item, dict)
+                and str(item.get("state") or "").strip().lower()
+                not in CLOSED_WORKER_STATES
+                and str(item.get("alias") or "").strip()
+            ]
+            direct_alias_matches = [
+                item
+                for item in active_items
+                if supplied_unscoped_alias
+                and _request_unscoped_alias(
+                    str(item.get("alias") or "").strip()
                 )
-                items = catalog.get("items") if isinstance(catalog, dict) else None
-                next_cursor = catalog.get("next_cursor") if isinstance(catalog, dict) else None
-                active_items = [
-                    item
-                    for item in (items if isinstance(items, list) else [])
-                    if isinstance(item, dict)
-                    and str(item.get("state") or "").strip().lower() != "terminated"
-                    and str(item.get("alias") or "").strip()
-                ]
-                direct_alias_matches = [
-                    item
-                    for item in active_items
-                    if supplied_alias
-                    and str(item.get("alias") or "").strip() == supplied_alias
-                ]
-                if len(direct_alias_matches) == 1:
-                    resolved_catalog_alias = supplied_alias
-                    break
+                == supplied_unscoped_alias
+            ]
+            if direct_alias_matches and (len(direct_alias_matches) != 1 or next_cursor):
+                raise ValueError(
+                    f"Could not resolve exactly one saved workspace matching {lookup_name!r}; "
+                    "use workspace_list once and retry with its workspace_alias"
+                )
+            if len(direct_alias_matches) == 1:
+                resolved_catalog_alias = str(direct_alias_matches[0]["alias"]).strip()
+            else:
                 exact_name_matches = [
                     item
                     for item in active_items
@@ -4000,19 +4010,17 @@ def create_mcp_server(
                 ]
                 if exact_name_matches and (len(exact_name_matches) != 1 or next_cursor):
                     raise ValueError(
-                        f"Could not resolve exactly one saved workspace named {lookup_name!r}; "
+                        f"Could not resolve exactly one saved workspace matching {lookup_name!r}; "
                         "use workspace_list once and retry with its workspace_alias"
                     )
                 if len(exact_name_matches) == 1:
                     resolved_catalog_alias = str(exact_name_matches[0]["alias"]).strip()
-                    break
-            if resolved_catalog_alias:
-                delegate_alias = resolved_catalog_alias
-            elif not supplied_alias:
+            if not resolved_catalog_alias:
                 raise ValueError(
-                    f"Could not resolve exactly one saved workspace named {title!r}; "
+                    f"Could not resolve exactly one saved workspace matching {lookup_name!r}; "
                     "use workspace_list once and retry with its workspace_alias"
                 )
+            delegate_alias = resolved_catalog_alias
         return worker_delegate_once(
             title=title,
             instruction="\n".join(brief_sections),
