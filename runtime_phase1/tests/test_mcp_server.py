@@ -5007,17 +5007,22 @@ def test_workspace_launch_reuses_enterprise_catalog_alias_without_scoping_twice(
 
 
 @pytest.mark.parametrize(
-    ("workspace_alias", "description", "expected_search"),
+    ("workspace_alias", "description", "expected_searches"),
     [
         (
             None,
             "Microsoft work hub\nRead connected accounts without changing anything.",
-            "Microsoft work hub",
+            ("Microsoft work hub",),
         ),
         (
             "Microsoft work hub",
             "Microsoft work hub check\nRead connected accounts without changing anything.",
-            "Microsoft work hub",
+            ("Microsoft work hub check", "Microsoft work hub"),
+        ),
+        (
+            "microsoft-work-hub",
+            "Microsoft work hub\nRead connected accounts without changing anything.",
+            ("Microsoft work hub",),
         ),
     ],
 )
@@ -5025,7 +5030,7 @@ def test_workspace_launch_resolves_exact_saved_name_for_human_reuse_inputs(
     monkeypatch,
     workspace_alias,
     description,
-    expected_search,
+    expected_searches,
 ):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
@@ -5045,9 +5050,13 @@ def test_workspace_launch_resolves_exact_saved_name_for_human_reuse_inputs(
         },
     )
 
+    search_calls = []
+
     class ExactNameCatalogApi(TrackingApiClient):
         def workspace_catalog(self, **kwargs):
-            assert kwargs["search"] == expected_search
+            search_calls.append(kwargs["search"])
+            if kwargs["search"] != "Microsoft work hub":
+                return {"items": [], "next_cursor": None}
             return {
                 "items": [
                     {
@@ -5109,6 +5118,7 @@ def test_workspace_launch_resolves_exact_saved_name_for_human_reuse_inputs(
     assert "create_project" not in api.calls
     assert api.find_or_resume_payloads[-1]["project_id"] == "prj_existing"
     assert api.find_or_resume_payloads[-1]["alias"] == "microsoft-work-hub"
+    assert search_calls == list(expected_searches)
 
 
 @pytest.mark.parametrize("match_count", [0, 2])

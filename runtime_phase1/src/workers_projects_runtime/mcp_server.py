@@ -3958,32 +3958,54 @@ def create_mcp_server(
         title = clean_description.splitlines()[0].strip()[:120] or "GlassHive workspace"
         delegate_alias = workspace_alias if reuse_existing_workspace else None
         if reuse_existing_workspace:
-            lookup_name = str(delegate_alias or "").strip() or title
-            catalog = client.workspace_catalog(
-                search=lookup_name,
-                kind="named",
-                limit=100,
-            )
-            items = catalog.get("items") if isinstance(catalog, dict) else None
-            next_cursor = catalog.get("next_cursor") if isinstance(catalog, dict) else None
-            exact_matches = [
-                item
-                for item in (items if isinstance(items, list) else [])
-                if isinstance(item, dict)
-                and str(item.get("name") or "").strip().casefold() == lookup_name.casefold()
-                and str(item.get("state") or "").strip().lower() != "terminated"
-                and str(item.get("alias") or "").strip()
-            ]
-            if len(exact_matches) > 1 or next_cursor:
-                raise ValueError(
-                    f"Could not resolve exactly one saved workspace named {lookup_name!r}; "
-                    "use workspace_list once and retry with its workspace_alias"
+            supplied_alias = str(delegate_alias or "").strip()
+            lookup_names = [title]
+            if supplied_alias and supplied_alias.casefold() != title.casefold():
+                lookup_names.append(supplied_alias)
+            resolved_catalog_alias = ""
+            for lookup_name in lookup_names:
+                catalog = client.workspace_catalog(
+                    search=lookup_name,
+                    kind="named",
+                    limit=100,
                 )
-            if len(exact_matches) == 1:
-                delegate_alias = str(exact_matches[0]["alias"]).strip()
-            elif not str(delegate_alias or "").strip():
+                items = catalog.get("items") if isinstance(catalog, dict) else None
+                next_cursor = catalog.get("next_cursor") if isinstance(catalog, dict) else None
+                active_items = [
+                    item
+                    for item in (items if isinstance(items, list) else [])
+                    if isinstance(item, dict)
+                    and str(item.get("state") or "").strip().lower() != "terminated"
+                    and str(item.get("alias") or "").strip()
+                ]
+                direct_alias_matches = [
+                    item
+                    for item in active_items
+                    if supplied_alias
+                    and str(item.get("alias") or "").strip() == supplied_alias
+                ]
+                if len(direct_alias_matches) == 1:
+                    resolved_catalog_alias = supplied_alias
+                    break
+                exact_name_matches = [
+                    item
+                    for item in active_items
+                    if str(item.get("name") or "").strip().casefold()
+                    == lookup_name.casefold()
+                ]
+                if exact_name_matches and (len(exact_name_matches) != 1 or next_cursor):
+                    raise ValueError(
+                        f"Could not resolve exactly one saved workspace named {lookup_name!r}; "
+                        "use workspace_list once and retry with its workspace_alias"
+                    )
+                if len(exact_name_matches) == 1:
+                    resolved_catalog_alias = str(exact_name_matches[0]["alias"]).strip()
+                    break
+            if resolved_catalog_alias:
+                delegate_alias = resolved_catalog_alias
+            elif not supplied_alias:
                 raise ValueError(
-                    f"Could not resolve exactly one saved workspace named {lookup_name!r}; "
+                    f"Could not resolve exactly one saved workspace named {title!r}; "
                     "use workspace_list once and retry with its workspace_alias"
                 )
         return worker_delegate_once(
