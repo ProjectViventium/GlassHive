@@ -56,6 +56,10 @@ wait, repeat only `workspace_wait`; do not explore other tools while it works.
 When the user names GlassHive or a saved GlassHive workspace, do not substitute the controlling
 client's own apps for the workspace. Send the requested outcome to that workspace.
 
+When the user asks to reuse a saved workspace by its human name, call `workspace_launch` with that
+exact name on the first line and `reuse_existing_workspace=true`. GlassHive resolves one exact
+owner-scoped match itself. Use `workspace_list` only if the name is missing or ambiguous.
+
 Use the human names and stable ids returned by GlassHive. Keep the user's goal intact and let the
 workspace decide its own execution plan. If a tool returns a browser confirmation URL, show it and
 wait for the signed-in user; never claim approval happened before GlassHive confirms it.

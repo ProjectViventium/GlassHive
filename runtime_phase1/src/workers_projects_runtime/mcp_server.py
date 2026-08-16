@@ -3865,7 +3865,14 @@ def create_mcp_server(
         ] = None,
         reuse_existing_workspace: Annotated[
             bool,
-            Field(description="Set true only when the user explicitly asked to resume/reuse the named workspace_alias. Leave false for fresh one-off tasks."),
+            Field(
+                description=(
+                    "Set true only when the user explicitly asked to resume/reuse the named workspace. "
+                    "When workspace_alias is omitted, GlassHive resolves one exact saved workspace name "
+                    "from the first description line; zero or multiple exact matches fail without creating anything. "
+                    "Leave false for fresh one-off tasks."
+                )
+            ),
         ] = False,
         favorite: Annotated[
             bool,
@@ -3945,6 +3952,27 @@ def create_mcp_server(
         )
         title = clean_description.splitlines()[0].strip()[:120] or "GlassHive workspace"
         delegate_alias = workspace_alias if reuse_existing_workspace else None
+        if reuse_existing_workspace and not str(delegate_alias or "").strip():
+            catalog = client.workspace_catalog(
+                search=title,
+                kind="named",
+                limit=100,
+            )
+            items = catalog.get("items") if isinstance(catalog, dict) else None
+            next_cursor = catalog.get("next_cursor") if isinstance(catalog, dict) else None
+            exact_matches = [
+                item
+                for item in (items if isinstance(items, list) else [])
+                if isinstance(item, dict)
+                and str(item.get("name") or "").strip().casefold() == title.casefold()
+                and str(item.get("alias") or "").strip()
+            ]
+            if len(exact_matches) != 1 or next_cursor:
+                raise ValueError(
+                    f"Could not resolve exactly one saved workspace named {title!r}; "
+                    "use workspace_list once and retry with its workspace_alias"
+                )
+            delegate_alias = str(exact_matches[0]["alias"]).strip()
         return worker_delegate_once(
             title=title,
             instruction="\n".join(brief_sections),
