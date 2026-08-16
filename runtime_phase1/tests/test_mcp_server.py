@@ -5055,7 +5055,15 @@ def test_workspace_launch_resolves_exact_saved_name_for_human_reuse_inputs(
                         "project_id": "prj_existing",
                         "name": "Microsoft work hub",
                         "alias": "tenant-alpha--user-a--microsoft-work-hub",
-                    }
+                        "state": "paused",
+                    },
+                    {
+                        "worker_id": "wrk_old_test",
+                        "project_id": "prj_old_test",
+                        "name": "Microsoft work hub",
+                        "alias": "tenant-alpha--user-a--old-test",
+                        "state": "terminated",
+                    },
                 ],
                 "next_cursor": None,
             }

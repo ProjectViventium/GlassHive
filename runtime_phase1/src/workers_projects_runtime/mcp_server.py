@@ -3971,6 +3971,7 @@ def create_mcp_server(
                 for item in (items if isinstance(items, list) else [])
                 if isinstance(item, dict)
                 and str(item.get("name") or "").strip().casefold() == lookup_name.casefold()
+                and str(item.get("state") or "").strip().lower() != "terminated"
                 and str(item.get("alias") or "").strip()
             ]
             if len(exact_matches) > 1 or next_cursor:
