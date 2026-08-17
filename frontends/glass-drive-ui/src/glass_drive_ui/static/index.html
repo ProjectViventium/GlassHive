@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>GlassHive</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260811m" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260817n" />
   </head>
   <body class="launch-body">
     <main class="launch-shell">
@@ -229,6 +229,24 @@
                   </div>
                 </div>
                 <a id="provider-setup-link" class="primary-button setup-primary-action" href="#" target="_blank" rel="noopener" hidden>Open sign-in</a>
+                <form id="provider-setup-input-form" class="setup-input-form" hidden>
+                  <label for="provider-setup-input">Authentication code</label>
+                  <div class="setup-input-row">
+                    <input
+                      id="provider-setup-input"
+                      type="password"
+                      autocomplete="one-time-code"
+                      autocapitalize="none"
+                      spellcheck="false"
+                      maxlength="1024"
+                      aria-describedby="provider-setup-input-help"
+                      placeholder="Paste the code from Claude"
+                      required
+                    />
+                    <button id="submit-provider-setup-input" class="primary-button compact-button" type="submit">Finish connecting</button>
+                  </div>
+                  <span id="provider-setup-input-help">Sent once to Claude. GlassHive does not store this code.</span>
+                </form>
                 <div id="provider-setup-code-row" class="setup-code-row" hidden>
                   <div>
                     <span>One-time code</span>
@@ -545,6 +563,6 @@
         </div>
       </form>
     </dialog>
-    <script src="/static/app.js?v=20260817b" type="module"></script>
+    <script src="/static/app.js?v=20260817c" type="module"></script>
   </body>
 </html>

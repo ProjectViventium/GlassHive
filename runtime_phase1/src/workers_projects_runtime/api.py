@@ -36,6 +36,7 @@ from .control_plane_models import (
     CreateLibraryProposalRequest,
     CreatePendingChangeRequest,
     CreateProviderAccountRequest,
+    ProviderSetupInputRequest,
     DuplicateWorkspaceRequest,
     InstantiateWorkspaceTemplateRequest,
     PublishLibraryManifestRequest,
@@ -2361,6 +2362,18 @@ def create_app(
     def provider_account_setup_status(account_id: str, request: Request) -> dict[str, object]:
         _, tenant_id, owner_id = _current_principal(request)
         return provider_setup.status(account_id=account_id, tenant_id=tenant_id, owner_id=owner_id)
+
+    @app.post("/v1/provider-accounts/{account_id}/setup/input")
+    def submit_provider_account_setup_input(
+        account_id: str, payload: ProviderSetupInputRequest, request: Request
+    ) -> dict[str, object]:
+        _, tenant_id, owner_id = _current_principal(request)
+        return provider_setup.submit_input(
+            account_id=account_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            value=payload.value,
+        )
 
     @app.post("/v1/provider-accounts/{account_id}/setup/cancel")
     def cancel_provider_account_setup(account_id: str, request: Request) -> dict[str, object]:

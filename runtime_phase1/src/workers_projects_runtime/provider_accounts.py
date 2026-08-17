@@ -10,12 +10,13 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import termios
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import fcntl
 
@@ -35,6 +36,7 @@ ANSI_ESCAPE = re.compile(
     r"\x1B(?:\][^\x07]*?(?:\x07|\x1B\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])"
 )
 MAX_SETUP_OUTPUT_CHARS = 32_000
+MAX_SETUP_INPUT_BYTES = 1_024
 PROVIDER_VERIFY_HEARTBEAT_INTERVAL_SECONDS = 10.0
 PROVIDER_SETUP_ENV_ALLOWLIST = {
     "ALL_PROXY",
@@ -68,7 +70,7 @@ _CODEX_DEVICE_CODE = re.compile(
 _CODEX_SECURITY_SETTINGS_URL = "https://chatgpt.com/#settings/Security"
 
 
-def _provider_setup_guidance(provider: str, output: str) -> dict[str, str]:
+def _provider_setup_guidance(provider: str, output: str) -> dict[str, str | bool]:
     """Extract bounded, clickable guidance without trusting arbitrary CLI output as a URL."""
 
     normalized_provider = str(provider or "").strip().lower()
@@ -105,6 +107,11 @@ def _provider_setup_guidance(provider: str, output: str) -> dict[str, str]:
         if code_match:
             setup_code = code_match.group(1).upper()
 
+    input_required = False
+    if setup_url and normalized_provider in {"claude", "anthropic"}:
+        code_values = parse_qs(urlsplit(setup_url).query).get("code", [])
+        input_required = any(str(value).lower() == "true" for value in code_values)
+
     return {
         "provider": canonical_provider,
         "setup_url": setup_url,
@@ -114,6 +121,7 @@ def _provider_setup_guidance(provider: str, output: str) -> dict[str, str]:
             if normalized_provider in {"codex", "openai"}
             else ""
         ),
+        "input_required": input_required,
     }
 
 
@@ -372,6 +380,8 @@ class _SetupSession:
     output: str = ""
     started_at: float = field(default_factory=time.time)
     reader_done: bool = False
+    input_submitted: bool = False
+    finalizing: bool = False
 
 
 class ProviderSetupManager:
@@ -550,6 +560,11 @@ class ProviderSetupManager:
                 raise
             master_fd, slave_fd = pty.openpty()
             try:
+                terminal_attributes = termios.tcgetattr(slave_fd)
+                terminal_attributes[3] &= ~(
+                    termios.ECHO | getattr(termios, "ECHONL", 0)
+                )
+                termios.tcsetattr(slave_fd, termios.TCSANOW, terminal_attributes)
                 process = subprocess.Popen(
                     setup_command,
                     stdin=slave_fd,
@@ -607,6 +622,89 @@ class ProviderSetupManager:
             self._release_session(session)
             raise
         return self.status(account_id=account_id, tenant_id=tenant_id, owner_id=owner_id, verify=False)
+
+    @staticmethod
+    def _setup_input_bytes(value: str) -> bytes:
+        normalized = str(value or "").strip()
+        if len(normalized) > MAX_SETUP_INPUT_BYTES:
+            raise ControlPlaneError("The authentication code is too long")
+        if not normalized or any(
+            not 0x21 <= ord(character) <= 0x7E for character in normalized
+        ):
+            raise ControlPlaneError("Enter the authentication code shown by the provider")
+        encoded = normalized.encode("ascii")
+        # A physical Enter key arrives as CR in raw terminal UIs such as Ink;
+        # canonical line discipline maps it to NL for ordinary readline clients.
+        return encoded + b"\r"
+
+    def submit_input(
+        self,
+        *,
+        account_id: str,
+        tenant_id: str,
+        owner_id: str,
+        value: str,
+    ) -> dict[str, object]:
+        account = self._account(
+            account_id=account_id, tenant_id=tenant_id, owner_id=owner_id
+        )
+        payload = self._setup_input_bytes(value)
+        with self._lock:
+            session = self._sessions.get(account_id)
+            if (
+                session is None
+                or session.tenant_id != tenant_id
+                or session.owner_id != owner_id
+                or session.process.poll() is not None
+            ):
+                raise ControlPlaneConflict("Provider account setup is not waiting for input")
+            if str(account.get("provider") or "").strip().lower() not in {"claude", "anthropic"}:
+                raise ControlPlaneConflict("This provider sign-in does not accept browser input")
+            if session.input_submitted:
+                raise ControlPlaneConflict("The authentication code was already submitted")
+            guidance = _provider_setup_guidance(session.provider, session.output)
+            if not guidance.get("input_required"):
+                raise ControlPlaneConflict("Provider account setup is not waiting for input")
+            try:
+                write_fd = os.dup(session.master_fd)
+            except OSError as exc:
+                raise ControlPlaneConflict(
+                    "Provider account setup is no longer waiting for input"
+                ) from exc
+            # Reserve the one submission before releasing the process-wide lock.
+            # The duplicate pins this exact PTY even if Cancel/Restart closes and
+            # recycles the session's original descriptor before the write completes.
+            session.input_submitted = True
+            session.output = ""
+        written = 0
+        try:
+            while written < len(payload):
+                count = os.write(write_fd, payload[written:])
+                if count <= 0:
+                    raise OSError("provider input closed")
+                written += count
+        except OSError as exc:
+            owns_cleanup = False
+            with self._lock:
+                if self._sessions.get(account_id) is session:
+                    self._terminate_session_process(session)
+                    self._sessions.pop(account_id, None)
+                    owns_cleanup = True
+            if owns_cleanup:
+                self._release_session(session)
+                self.store.update_provider_account_status(
+                    account_id=account_id,
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                    status="action_required",
+                    reconnect_reason="Provider sign-in input could not be delivered; restart sign-in",
+                )
+            raise ControlPlaneConflict(
+                "Provider account setup is no longer waiting for input"
+            ) from exc
+        finally:
+            os.close(write_fd)
+        return self.status(account_id=account_id, tenant_id=tenant_id, owner_id=owner_id)
 
     def _verify(self, *, provider: str, environment: dict[str, str], account_home: Path) -> bool:
         _, status_command = self._commands(provider)
@@ -729,19 +827,44 @@ class ProviderSetupManager:
             owner_id=owner_id,
             account_id=account_id,
         )
+        finalization_in_progress = False
         with self._lock:
             session = self._sessions.get(account_id)
             if session is not None and (session.tenant_id != tenant_id or session.owner_id != owner_id):
                 raise ControlPlaneError("Provider account not found for this user")
             return_code = session.process.poll() if session is not None else None
-            output = session.output if session is not None else ""
+            if session is None or session.input_submitted:
+                output = ""
+            else:
+                output = session.output
+            if session is not None and return_code is not None:
+                if session.finalizing:
+                    finalization_in_progress = True
+                else:
+                    session.finalizing = True
         if session is not None and return_code is None:
+            guidance = _provider_setup_guidance(provider, output)
+            if session.input_submitted:
+                guidance["input_required"] = False
             return {
                 "account_id": account_id,
                 "status": "connecting",
                 "instructions": output,
                 "complete": False,
-                **_provider_setup_guidance(provider, output),
+                "input_submitted": session.input_submitted,
+                **guidance,
+            }
+        if session is not None and finalization_in_progress:
+            guidance = _provider_setup_guidance(provider, output)
+            if session.input_submitted:
+                guidance["input_required"] = False
+            return {
+                "account_id": account_id,
+                "status": "connecting",
+                "instructions": output,
+                "complete": False,
+                "input_submitted": session.input_submitted,
+                **guidance,
             }
         verification_lease: dict[str, Any] | None = None
         verification_lease_stop = threading.Event()
@@ -858,9 +981,13 @@ class ProviderSetupManager:
             raise
         finally:
             if session is not None:
+                owns_session = False
                 with self._lock:
-                    self._sessions.pop(account_id, None)
-                self._release_session(session)
+                    if self._sessions.get(account_id) is session:
+                        self._sessions.pop(account_id, None)
+                        owns_session = True
+                if owns_session:
+                    self._release_session(session)
             elif verification_lease is not None:
                 verification_lease_stop.set()
                 if verification_lease_thread is not None:

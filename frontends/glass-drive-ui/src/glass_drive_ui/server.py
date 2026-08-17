@@ -437,6 +437,10 @@ class ProviderAccountRequest(BaseModel):
     make_default: bool = False
 
 
+class ProviderSetupInputRequest(BaseModel):
+    value: str
+
+
 class PendingChangeRequest(BaseModel):
     change_type: str = Field(min_length=1, max_length=120)
     target_id: str = Field(min_length=1, max_length=200)
@@ -3274,6 +3278,19 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         except httpx.HTTPStatusError as exc:
             raise _runtime_http_exception(
                 exc, "GlassHive could not check this account connection"
+            ) from exc
+
+    @app.post("/api/provider-accounts/{account_id}/setup/input")
+    def submit_provider_account_setup_input(
+        request: Request, account_id: str, payload: ProviderSetupInputRequest
+    ) -> dict[str, Any]:
+        try:
+            return _client_for_request(request).submit_provider_account_setup_input(
+                account_id, payload.value
+            )
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not finish this account connection"
             ) from exc
 
     @app.post("/api/provider-accounts/{account_id}/setup/cancel")

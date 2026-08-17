@@ -401,6 +401,16 @@ class FakeRuntimeClient:
         self.provider_setup_requests.append({"action": "cancel", "account_id": account_id})
         return {"account_id": account_id, "status": "action_required", "complete": True}
 
+    def submit_provider_account_setup_input(self, account_id: str, value: str):
+        self.provider_setup_requests.append({"action": "input", "account_id": account_id})
+        return {
+            "account_id": account_id,
+            "status": "connecting",
+            "instructions": "",
+            "complete": False,
+            "input_required": False,
+        }
+
     def disconnect_provider_account(self, account_id: str):
         self.provider_disconnect_requests.append(account_id)
         return {"account_id": account_id, "status": "disconnected", "complete": True}
@@ -5447,15 +5457,22 @@ def test_provider_account_setup_bff_is_user_scoped_through_signed_runtime_client
     client = TestClient(create_app(runtime_client=runtime))
 
     started = client.post("/api/provider-accounts/acct_public_safe/setup")
+    submitted = client.post(
+        "/api/provider-accounts/acct_public_safe/setup/input",
+        json={"value": "synthetic-browser-code"},
+    )
     status = client.get("/api/provider-accounts/acct_public_safe/setup")
     cancelled = client.post("/api/provider-accounts/acct_public_safe/setup/cancel")
 
     assert started.status_code == 200
     assert started.json()["status"] == "connecting"
+    assert submitted.status_code == 200
+    assert "synthetic-browser-code" not in submitted.text
     assert status.json()["status"] == "ready"
     assert cancelled.json()["status"] == "action_required"
     assert runtime.provider_setup_requests == [
         {"action": "start", "account_id": "acct_public_safe"},
+        {"action": "input", "account_id": "acct_public_safe"},
         {"action": "status", "account_id": "acct_public_safe"},
         {"action": "cancel", "account_id": "acct_public_safe"},
     ]
@@ -5637,6 +5654,12 @@ def test_connections_ui_keeps_primary_account_setup_short_and_actionable():
     assert 'id="provider-setup-link"' in page
     assert 'id="provider-setup-code"' in page
     assert 'id="copy-provider-setup-code"' in page
+    assert 'id="provider-setup-input-form"' in page
+    assert 'id="provider-setup-input"' in page
+    assert 'type="password"' in page
+    assert 'autocomplete="one-time-code"' in page
+    assert 'maxlength="1024"' in page
+    assert 'id="submit-provider-setup-input"' in page
     assert 'id="restart-provider-setup"' in page
     assert 'id="provider-setup-state"' not in page
     assert '<pre id="provider-setup-instructions"' not in page
@@ -5649,6 +5672,11 @@ def test_connections_ui_keeps_primary_account_setup_short_and_actionable():
     assert "copyText" in script
     assert "Open ${providerName} sign-in" in script
     assert "Copy code" in page
+    assert "Finish connecting" in page
+    assert "/setup/input" in script
+    assert "setupInput.value = '';" in script
+    assert "&& !inputSubmitted" in script
+    assert "inputSubmitted ? 'Finishing sign-in…'" in script
     assert "Open ChatGPT security settings" in script
     assert "Having trouble?" in page
     assert "technical.dataset.autoOpened = 'true'" in script

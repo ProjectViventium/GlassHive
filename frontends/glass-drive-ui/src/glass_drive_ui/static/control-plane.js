@@ -1545,17 +1545,22 @@ function showSetup(payload) {
   const setupLink = document.getElementById('provider-setup-link');
   const setupCode = document.getElementById('provider-setup-code');
   const setupCodeRow = document.getElementById('provider-setup-code-row');
+  const setupInputForm = document.getElementById('provider-setup-input-form');
+  const setupInput = document.getElementById('provider-setup-input');
   const setupHelp = document.getElementById('provider-setup-help');
   const technical = document.getElementById('provider-setup-technical');
   const restart = document.getElementById('restart-provider-setup');
   const provider = String(payload.provider || 'codex');
   const setupUrl = String(payload.setup_url || '');
   const code = String(payload.setup_code || '');
+  const inputRequired = Boolean(payload.input_required) && !payload.complete;
+  const inputSubmitted = Boolean(payload.input_submitted) && !payload.complete;
   const helpUrl = String(payload.help_url || '');
   const rawInstructions = String(payload.instructions || payload.message || '').trim();
-  const waitingForGuidance = !payload.complete && !rawInstructions;
+  const waitingForGuidance = !payload.complete && !rawInstructions && !inputSubmitted;
   const needsFallback = !payload.complete
     && !waitingForGuidance
+    && !inputSubmitted
     && (!setupUrl || (provider === 'codex' && !code));
   const accountId = String(payload.account_id || activeSetupAccount || '');
   const accountRow = [...document.querySelectorAll('.connection-row')]
@@ -1566,7 +1571,8 @@ function showSetup(payload) {
   const accountRecovery = accountRow?.querySelector('.connection-recovery');
   const addAccount = document.getElementById('add-provider-account');
   const externalClients = document.getElementById('connect-ai-advanced');
-  if (instructions) instructions.textContent = rawInstructions || 'Preparing sign-in…';
+  if (instructions) instructions.textContent = rawInstructions
+    || (inputSubmitted ? 'Finishing sign-in…' : 'Preparing sign-in…');
   if (panel) panel.hidden = Boolean(payload.complete);
   if (setupLink) {
     setupLink.href = setupUrl || '#';
@@ -1576,6 +1582,8 @@ function showSetup(payload) {
   }
   if (setupCode) setupCode.textContent = code;
   if (setupCodeRow) setupCodeRow.hidden = !code;
+  if (setupInputForm) setupInputForm.hidden = !inputRequired;
+  if (payload.complete && setupInput) setupInput.value = '';
   if (setupHelp) {
     setupHelp.href = helpUrl || '#';
     setupHelp.textContent = 'Open ChatGPT security settings';
@@ -1585,7 +1593,13 @@ function showSetup(payload) {
     ? 'Use the provider instructions below.'
     : waitingForGuidance
       ? 'Starting secure sign-in…'
-      : (provider === 'codex' ? 'Open sign-in, then enter the code.' : 'Open sign-in to continue.');
+      : (provider === 'codex'
+        ? 'Open sign-in, then enter the code.'
+        : inputRequired
+          ? 'Open sign-in, then paste the code here.'
+          : inputSubmitted
+            ? 'Finishing secure sign-in…'
+            : 'Open sign-in to continue.');
   if (technical && needsFallback) {
     technical.open = true;
     technical.dataset.autoOpened = 'true';
@@ -1608,6 +1622,42 @@ function showSetup(payload) {
     : payload.complete
       ? String(payload.message || 'Sign-in was not completed. Try again.')
       : (needsFallback ? 'Sign-in details changed. Follow the technical details below.' : ''));
+}
+
+async function submitProviderSetupInput(event) {
+  event.preventDefault();
+  if (!activeSetupAccount) return;
+  const setupInput = document.getElementById('provider-setup-input');
+  const button = document.getElementById('submit-provider-setup-input');
+  const value = String(setupInput?.value || '').trim();
+  if (!value) {
+    setupInput?.focus();
+    return;
+  }
+  button.disabled = true;
+  button.textContent = 'Finishing…';
+  setupInput.value = '';
+  try {
+    const payload = await api.postJson(
+      `/api/provider-accounts/${encodeURIComponent(activeSetupAccount)}/setup/input`,
+      { value },
+    );
+    showSetup(payload);
+    if (payload.complete) {
+      activeSetupAccount = '';
+      stopSetupPolling();
+      await loadControlPlane();
+      showSetup(payload);
+    } else if (!setupPollTimer) {
+      setupPollTimer = window.setTimeout(pollSetup, 500);
+    }
+  } catch (error) {
+    setProviderStatus(error.message);
+    setupInput?.focus();
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Finish connecting';
+  }
 }
 
 async function cancelActiveSetup({ reload = true } = {}) {
@@ -1843,6 +1893,10 @@ export function initializeControlPlane(dependencies) {
     const codeNode = document.getElementById('provider-setup-code');
     copyText(codeNode?.textContent || '', event.currentTarget, codeNode);
   });
+  document.getElementById('provider-setup-input-form')?.addEventListener(
+    'submit',
+    submitProviderSetupInput,
+  );
   document.getElementById('restart-provider-setup')?.addEventListener('click', (event) => {
     restartActiveSetup(event.currentTarget);
   });

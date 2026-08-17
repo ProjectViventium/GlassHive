@@ -496,6 +496,246 @@ def test_native_provider_setup_support_requires_and_uses_the_canonical_claude_bi
     assert setup._binary("claude") == str(cli)
 
 
+def test_claude_setup_accepts_browser_code_once_without_echo_and_reuses_native_home(
+    tmp_path, monkeypatch
+):
+    cli = tmp_path / "synthetic-claude"
+    cli.write_text(
+        """#!/usr/bin/env python3
+import os
+import sys
+
+marker = os.path.join(os.environ['CLAUDE_CONFIG_DIR'], 'authenticated')
+if sys.argv[1:] == ['auth', 'login', '--claudeai']:
+    print(
+        'Open https://claude.com/cai/oauth/authorize?code=true&client_id=synthetic',
+        flush=True,
+    )
+    code = sys.stdin.readline().strip()
+    if code != 'synthetic-browser-code':
+        raise SystemExit(3)
+    print(f'received {code}', flush=True)
+    with open(marker, 'w', encoding='utf-8') as handle:
+        handle.write('ready')
+    raise SystemExit(0)
+if sys.argv[1:] == ['auth', 'status', '--json']:
+    raise SystemExit(0 if os.path.exists(marker) else 1)
+if sys.argv[1:] == ['auth', 'logout']:
+    raise SystemExit(0)
+raise SystemExit(2)
+""",
+        encoding="utf-8",
+    )
+    cli.chmod(0o700)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", str(cli))
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    monkeypatch.setattr(provider_accounts_module.sys, "platform", "linux")
+    store = ControlPlaneStore(str(tmp_path / "runtime.db"))
+    account = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="claude",
+        label="Personal Claude",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://auto",
+    )
+    setup = ProviderSetupManager(store=store, home_root=tmp_path / "provider-homes")
+
+    try:
+        started = setup.start(
+            account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+        )
+        deadline = time.time() + 5
+        while not started.get("input_required") and time.time() < deadline:
+            time.sleep(0.03)
+            started = setup.status(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+                verify=False,
+            )
+
+        assert started["input_required"] is True
+        assert started["setup_url"].startswith("https://claude.com/cai/oauth/authorize?")
+        with pytest.raises(ControlPlaneError, match="not found"):
+            setup.submit_input(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="other-user",
+                value="synthetic-browser-code",
+            )
+
+        real_write = provider_accounts_module.os.write
+        real_verify = setup._verify
+        write_started = threading.Event()
+        allow_write = threading.Event()
+        verify_started = threading.Event()
+        allow_verify = threading.Event()
+
+        def write_after_fast_provider_exit(file_descriptor, payload):
+            assert file_descriptor != setup._sessions[account["account_id"]].master_fd
+            write_started.set()
+            assert allow_write.wait(timeout=2)
+            written = real_write(file_descriptor, payload)
+            setup._sessions[account["account_id"]].process.wait(timeout=2)
+            return written
+
+        def verify_after_concurrent_status(**kwargs):
+            verify_started.set()
+            assert allow_verify.wait(timeout=2)
+            return real_verify(**kwargs)
+
+        monkeypatch.setattr(provider_accounts_module.os, "write", write_after_fast_provider_exit)
+        monkeypatch.setattr(setup, "_verify", verify_after_concurrent_status)
+        submission_results = []
+        submission_errors = []
+
+        def submit_code():
+            try:
+                submission_results.append(
+                    setup.submit_input(
+                        account_id=account["account_id"],
+                        tenant_id="tenant-a",
+                        owner_id="user-a",
+                        value="synthetic-browser-code",
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - asserted below
+                submission_errors.append(exc)
+
+        submission_thread = threading.Thread(target=submit_code)
+        submission_thread.start()
+        assert write_started.wait(timeout=2)
+        status_results = []
+
+        def read_status_while_writing():
+            status_results.append(
+                setup.status(
+                    account_id=account["account_id"],
+                    tenant_id="tenant-a",
+                    owner_id="user-a",
+                    verify=False,
+                )
+            )
+
+        status_thread = threading.Thread(target=read_status_while_writing)
+        status_thread.start()
+        status_thread.join(timeout=0.5)
+        status_completed_without_write = not status_thread.is_alive()
+        allow_write.set()
+        assert verify_started.wait(timeout=2)
+        finalizing_status_results = []
+
+        def read_status_while_finalizing():
+            finalizing_status_results.append(
+                setup.status(
+                    account_id=account["account_id"],
+                    tenant_id="tenant-a",
+                    owner_id="user-a",
+                    verify=True,
+                )
+            )
+
+        finalizing_status_thread = threading.Thread(
+            target=read_status_while_finalizing
+        )
+        finalizing_status_thread.start()
+        finalizing_status_thread.join(timeout=0.5)
+        status_completed_while_finalizing = not finalizing_status_thread.is_alive()
+        allow_verify.set()
+        submission_thread.join(timeout=3)
+        status_thread.join(timeout=3)
+        finalizing_status_thread.join(timeout=3)
+        assert status_completed_without_write
+        assert status_completed_while_finalizing
+        assert not submission_thread.is_alive()
+        assert not status_thread.is_alive()
+        assert not finalizing_status_thread.is_alive()
+        assert submission_errors == []
+        status_while_writing = status_results[0]
+        assert status_while_writing["input_required"] is False
+        assert "synthetic-browser-code" not in json.dumps(status_while_writing)
+        assert finalizing_status_results[0]["status"] == "connecting"
+        assert finalizing_status_results[0]["input_submitted"] is True
+        assert "synthetic-browser-code" not in json.dumps(finalizing_status_results[0])
+        submitted = submission_results[0]
+        assert "synthetic-browser-code" not in json.dumps(submitted)
+        with pytest.raises(ControlPlaneConflict, match="not waiting|already submitted"):
+            setup.submit_input(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+                value="synthetic-browser-code",
+            )
+
+        settled = submitted
+        deadline = time.time() + 5
+        while not settled["complete"] and time.time() < deadline:
+            time.sleep(0.03)
+            settled = setup.status(
+                account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+            )
+
+        assert settled["status"] == "ready"
+        assert "synthetic-browser-code" not in json.dumps(settled)
+        reused = setup.status(
+            account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+        )
+        assert reused["status"] == "ready"
+        assert "synthetic-browser-code" not in json.dumps(reused)
+        assert b"synthetic-browser-code" not in (tmp_path / "runtime.db").read_bytes()
+        for stored_path in (tmp_path / "provider-homes").rglob("*"):
+            if stored_path.is_file():
+                assert b"synthetic-browser-code" not in stored_path.read_bytes()
+
+        restarted = setup.start(
+            account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+        )
+        deadline = time.time() + 5
+        while not restarted.get("input_required") and time.time() < deadline:
+            time.sleep(0.03)
+            restarted = setup.status(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+                verify=False,
+            )
+        assert restarted["input_required"] is True
+
+        def fail_provider_input_write(file_descriptor, payload):
+            _ = file_descriptor, payload
+            raise OSError("synthetic closed provider input")
+
+        monkeypatch.setattr(
+            provider_accounts_module.os, "write", fail_provider_input_write
+        )
+        with pytest.raises(ControlPlaneConflict, match="no longer waiting"):
+            setup.submit_input(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+                value="synthetic-browser-code",
+            )
+        assert account["account_id"] not in setup._sessions
+        assert store.active_provider_lease(account["account_id"], "provider-setup") is None
+        failed_account = store.get_provider_account(
+            account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+        )
+        assert failed_account["status"] == "action_required"
+    finally:
+        setup.shutdown()
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "synthetic\nsecond-line", "x" * 1025],
+)
+def test_provider_setup_input_rejects_empty_control_and_oversized_values(value):
+    with pytest.raises(ControlPlaneError, match="authentication code"):
+        ProviderSetupManager._setup_input_bytes(value)
+
+
 def test_provider_account_home_creation_rejects_symlink_components(tmp_path):
     root = tmp_path / "accounts"
     manager = ProviderAccountHomeManager(root)
@@ -661,6 +901,7 @@ Follow these steps to sign in with ChatGPT using device code authorization:
         "setup_url": "https://auth.openai.com/codex/device",
         "setup_code": "TEST-CODE1",
         "help_url": "https://chatgpt.com/#settings/Security",
+        "input_required": False,
     }
 
     malicious = _provider_setup_guidance(
@@ -679,6 +920,7 @@ Follow these steps to sign in with ChatGPT using device code authorization:
         "setup_url": "https://claude.ai/oauth/authorize?code=true",
         "setup_code": "",
         "help_url": "",
+        "input_required": True,
     }
 
     native_claude = _provider_setup_guidance(
@@ -696,7 +938,14 @@ Follow these steps to sign in with ChatGPT using device code authorization:
         ),
         "setup_code": "",
         "help_url": "",
+        "input_required": True,
     }
+
+    claude_without_browser_code = _provider_setup_guidance(
+        "claude",
+        "Open https://claude.ai/oauth/authorize?client_id=synthetic to continue",
+    )
+    assert claude_without_browser_code["input_required"] is False
 
     unreviewed_claude_path = _provider_setup_guidance(
         "claude",

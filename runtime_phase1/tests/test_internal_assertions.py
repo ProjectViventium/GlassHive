@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from jwt.algorithms import RSAAlgorithm
 
 from workers_projects_runtime.api import create_app
+from workers_projects_runtime import provider_accounts as provider_accounts_module
 from workers_projects_runtime.auth import (
     GlassHiveAuthError,
     InternalAssertionVerifier,
@@ -252,6 +253,95 @@ raise SystemExit(2)
             headers=fresh_assertion_headers(private_key),
         )
     assert settled.json()["status"] == "ready"
+
+
+def test_claude_setup_input_route_is_owner_scoped_and_never_returns_the_code(
+    tmp_path, monkeypatch, assertion_keys
+):
+    private_key, jwks = assertion_keys
+    configure_signed_assertions(monkeypatch, jwks)
+    cli = tmp_path / "synthetic-claude"
+    cli.write_text(
+        """#!/usr/bin/env python3
+import os
+import sys
+marker = os.path.join(os.environ['CLAUDE_CONFIG_DIR'], 'authenticated')
+if sys.argv[1:] == ['auth', 'login', '--claudeai']:
+    print('Open https://claude.com/cai/oauth/authorize?code=true&client_id=synthetic', flush=True)
+    if sys.stdin.readline().strip() != 'synthetic-browser-code':
+        raise SystemExit(3)
+    open(marker, 'w', encoding='utf-8').write('ready')
+    raise SystemExit(0)
+if sys.argv[1:] == ['auth', 'status', '--json']:
+    raise SystemExit(0 if os.path.exists(marker) else 1)
+raise SystemExit(2)
+""",
+        encoding="utf-8",
+    )
+    cli.chmod(0o700)
+    monkeypatch.setattr(provider_accounts_module.sys, "platform", "linux")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", str(cli))
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    with TestClient(
+        create_app(db_path=str(tmp_path / "runtime.db"), runtime_backend="stub")
+    ) as client:
+        account_response = client.post(
+            "/v1/provider-accounts",
+            headers=fresh_assertion_headers(private_key),
+            json={
+                "provider": "claude",
+                "label": "Personal Claude",
+                "auth_method": "subscription",
+                "platform_support": "supported",
+                "secret_locator": "native-home://auto",
+            },
+        )
+        assert account_response.status_code == 201, account_response.text
+        account_id = account_response.json()["account_id"]
+        setup = client.post(
+            f"/v1/provider-accounts/{account_id}/setup",
+            headers=fresh_assertion_headers(private_key),
+        )
+        deadline = time.time() + 5
+        while not setup.json().get("input_required") and time.time() < deadline:
+            time.sleep(0.03)
+            setup = client.get(
+                f"/v1/provider-accounts/{account_id}/setup",
+                headers=fresh_assertion_headers(private_key),
+            )
+
+        forbidden = client.post(
+            f"/v1/provider-accounts/{account_id}/setup/input",
+            headers=fresh_assertion_headers(private_key, subject="other-user"),
+            json={"value": "synthetic-browser-code"},
+        )
+        rejected_control_input = client.post(
+            f"/v1/provider-accounts/{account_id}/setup/input",
+            headers=fresh_assertion_headers(private_key),
+            json={"value": "synthetic-first-line\nsynthetic-second-line"},
+        )
+        submitted = client.post(
+            f"/v1/provider-accounts/{account_id}/setup/input",
+            headers=fresh_assertion_headers(private_key),
+            json={"value": "synthetic-browser-code"},
+        )
+
+        assert forbidden.status_code == 400
+        assert "synthetic-browser-code" not in forbidden.text
+        assert rejected_control_input.status_code == 400
+        assert "synthetic-first-line" not in rejected_control_input.text
+        assert submitted.status_code == 200, submitted.text
+        assert "synthetic-browser-code" not in submitted.text
+        settled = submitted
+        deadline = time.time() + 5
+        while not settled.json()["complete"] and time.time() < deadline:
+            time.sleep(0.03)
+            settled = client.get(
+                f"/v1/provider-accounts/{account_id}/setup",
+                headers=fresh_assertion_headers(private_key),
+            )
+        assert settled.json()["status"] == "ready"
+        assert "synthetic-browser-code" not in settled.text
 
 
 def test_provider_account_api_ignores_client_claims_about_platform_support(

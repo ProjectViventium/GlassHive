@@ -175,6 +175,15 @@ class RuntimeClient:
             "GET", f"/v1/provider-accounts/{quote(account_id, safe='')}/setup"
         )
 
+    def submit_provider_account_setup_input(
+        self, account_id: str, value: str
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/v1/provider-accounts/{quote(account_id, safe='')}/setup/input",
+            json_body={"value": value},
+        )
+
     def cancel_provider_account_setup(self, account_id: str) -> dict[str, Any]:
         return self._request(
             "POST",
