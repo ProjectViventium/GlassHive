@@ -681,6 +681,47 @@ Follow these steps to sign in with ChatGPT using device code authorization:
         "help_url": "",
     }
 
+    native_claude = _provider_setup_guidance(
+        "claude",
+        (
+            "Opening browser to sign in...\n"
+            "If the browser didn't open, visit: "
+            "https://claude.com/cai/oauth/authorize?code=true&client_id=synthetic"
+        ),
+    )
+    assert native_claude == {
+        "provider": "claude",
+        "setup_url": (
+            "https://claude.com/cai/oauth/authorize?code=true&client_id=synthetic"
+        ),
+        "setup_code": "",
+        "help_url": "",
+    }
+
+    unreviewed_claude_path = _provider_setup_guidance(
+        "claude",
+        "Open https://claude.com/unreviewed/path?continue=true",
+    )
+    assert unreviewed_claude_path["setup_url"] == ""
+
+
+def test_provider_setup_output_keeps_the_visible_url_but_removes_terminal_hyperlink_controls():
+    manager = ProviderSetupManager.__new__(ProviderSetupManager)
+    manager._lock = threading.RLock()
+    session = type("SetupSession", (), {"output": ""})()
+    setup_url = "https://claude.com/cai/oauth/authorize?code=true&client_id=synthetic"
+
+    manager._append_output(
+        session,
+        (
+            "If the browser didn't open, visit: "
+            f"\x1b]8;;{setup_url}\x1b\\{setup_url}\x1b]8;;\x1b\\\n"
+        ).encode(),
+    )
+
+    assert session.output == f"If the browser didn't open, visit: {setup_url}\n"
+    assert _provider_setup_guidance("claude", session.output)["setup_url"] == setup_url
+
 
 def test_provider_disconnect_preserves_private_home_when_native_logout_fails(tmp_path, monkeypatch):
     store = ControlPlaneStore(str(tmp_path / "runtime.db"))

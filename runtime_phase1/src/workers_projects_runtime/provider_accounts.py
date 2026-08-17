@@ -31,7 +31,9 @@ from .inference_broker import (
 
 
 SAFE_ACCOUNT_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
-ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+ANSI_ESCAPE = re.compile(
+    r"\x1B(?:\][^\x07]*?(?:\x07|\x1B\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])"
+)
 MAX_SETUP_OUTPUT_CHARS = 32_000
 PROVIDER_VERIFY_HEARTBEAT_INTERVAL_SECONDS = 10.0
 PROVIDER_SETUP_ENV_ALLOWLIST = {
@@ -89,7 +91,11 @@ def _provider_setup_guidance(provider: str, output: str) -> dict[str, str]:
                 setup_url = candidate
                 break
         elif normalized_provider in {"claude", "anthropic"}:
-            if hostname in {"claude.ai", "console.anthropic.com"}:
+            is_native_claude_login = (
+                hostname == "claude.com"
+                and parsed.path.rstrip("/") == "/cai/oauth/authorize"
+            )
+            if hostname in {"claude.ai", "console.anthropic.com"} or is_native_claude_login:
                 setup_url = candidate
                 break
 
