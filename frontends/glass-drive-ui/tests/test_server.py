@@ -5254,9 +5254,61 @@ def test_provider_account_bff_generates_opaque_locator_and_honest_platform_statu
     assert "token" not in json.dumps(request_payload).lower()
 
 
-def test_control_plane_never_advertises_unimplemented_claude_secret_or_consumer_auth(
+def test_control_plane_advertises_only_the_enabled_native_claude_subscription(
     monkeypatch,
 ):
+    monkeypatch.setattr(server_module.sys, "platform", "linux")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.get("/api/control-plane")
+    created = client.post(
+        "/api/provider-accounts",
+        json={
+            "provider": "claude",
+            "label": "Personal Claude",
+            "auth_method": "subscription",
+            "make_default": False,
+        },
+    )
+
+    assert response.status_code == 200
+    claude = next(
+        option
+        for option in response.json()["provider_options"]
+        if option["provider"] == "claude"
+    )
+    assert "api_key" not in claude["methods"]
+    assert claude["methods"] == ["subscription"]
+    assert claude["subscription_support"] == "supported"
+    assert claude["api_key_support"] == "fixed_anthropic_broker_not_implemented"
+    assert "not copied" in claude["api_key_support_note"]
+    assert created.status_code == 200
+    assert runtime.provider_account_requests[-1]["platform_support"] == "supported"
+
+
+def test_control_plane_keeps_disabled_claude_subscription_out_of_the_picker(monkeypatch):
+    monkeypatch.setattr(server_module.sys, "platform", "linux")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.delenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", raising=False)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get("/api/control-plane")
+
+    assert response.status_code == 200
+    claude = next(
+        option
+        for option in response.json()["provider_options"]
+        if option["provider"] == "claude"
+    )
+    assert claude["methods"] == []
+    assert claude["subscription_support"] == "provider_permission_required"
+
+
+def test_control_plane_keeps_claude_subscription_out_of_the_macos_picker(monkeypatch):
+    monkeypatch.setattr(server_module.sys, "platform", "darwin")
     monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
     monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
     client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
@@ -5269,11 +5321,8 @@ def test_control_plane_never_advertises_unimplemented_claude_secret_or_consumer_
         for option in response.json()["provider_options"]
         if option["provider"] == "claude"
     )
-    assert "api_key" not in claude["methods"]
-    assert "subscription" not in claude["methods"]
-    assert claude["api_key_support"] == "fixed_anthropic_broker_not_implemented"
-    assert claude["experimental_consumer_auth"] == "not_accepted_hosted_path"
-    assert "not copied" in claude["api_key_support_note"]
+    assert claude["methods"] == []
+    assert claude["subscription_support"] == "unsupported_macos_host"
 
 
 def test_provider_account_bff_registers_only_opaque_broker_metadata(monkeypatch):
@@ -5565,6 +5614,28 @@ def test_connections_ui_keeps_primary_account_setup_short_and_actionable():
     assert "availableProviderOptions" in script
     assert "if (!addAccount?.open)" in script
     assert "defaultToggle.checked = accounts.length === 0" in script
+
+
+def test_provider_account_name_is_prefilled_but_preserves_a_custom_name():
+    module = (Path(server_module.STATIC_DIR) / "control-plane.js").as_uri()
+    script = (
+        f"import {{ providerAccountLabelTransition }} from {json.dumps(module)};"
+        "const initial = providerAccountLabelTransition({provider: 'codex', value: '', autoLabel: ''});"
+        "const changed = providerAccountLabelTransition({provider: 'claude', value: initial.value, autoLabel: initial.autoLabel});"
+        "const custom = providerAccountLabelTransition({provider: 'codex', value: 'Research account', autoLabel: changed.autoLabel});"
+        "if (initial.value !== 'Personal Codex') process.exit(1);"
+        "if (changed.value !== 'Personal Claude') process.exit(2);"
+        "if (custom.value !== 'Research account') process.exit(3);"
+    )
+
+    result = subprocess.run(
+        ["node", "--input-type=module", "--eval", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_launch_ui_uses_the_sole_ready_personal_account_without_silent_fallback():

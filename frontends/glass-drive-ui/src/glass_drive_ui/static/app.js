@@ -1,4 +1,4 @@
-import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260813a';
+import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260817a';
 import { credentialPolicyTransition, preferredProviderAccountId, shouldResumeOnWorkspaceOpen, workspaceLifecycleControl } from './launch-policy.js?v=20260811m';
 import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811m';
 import { compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery } from './workspace-overview.js?v=20260811m';
@@ -12,7 +12,7 @@ const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'terminating', '
 const MAX_VIEW_ONLY_PREVIEWS = 3;
 const ACTIVE_TILE_REFRESH_MS = 7000;
 const RETAINED_TILE_REFRESH_MS = 60000;
-const GLASSHIVE_UI_REV = '20260813a';
+const GLASSHIVE_UI_REV = '20260817a';
 const CAPABILITY_REVIEW_KEY = 'glasshive.capability-review';
 let workspaceRefreshInFlight = false;
 let csrfToken = '';

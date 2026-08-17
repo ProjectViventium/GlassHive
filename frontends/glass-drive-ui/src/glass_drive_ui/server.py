@@ -2655,16 +2655,14 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             if _truthy_env("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS")
             else "proof_required"
         )
-        claude_subscription_support = (
-            "isolated_substrate_required"
-            if not isolation_ready
-            else "unsupported_macos_host"
-            if sys.platform == "darwin"
-            else "provider_permission_required"
-        )
-        claude_experimental_consumer_auth = _truthy_env(
-            "GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH"
-        )
+        if not isolation_ready:
+            claude_subscription_support = "isolated_substrate_required"
+        elif sys.platform == "darwin":
+            claude_subscription_support = "unsupported_macos_host"
+        elif _truthy_env("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH"):
+            claude_subscription_support = "supported"
+        else:
+            claude_subscription_support = "provider_permission_required"
         inference_broker_support = (
             "supported"
             if all(
@@ -2705,11 +2703,6 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                         "LibreChat may store a user-scoped Anthropic key, but GlassHive does not "
                         "yet have a fixed Anthropic Messages broker adapter. The key is not copied "
                         "into a worker or workspace."
-                    ),
-                    "experimental_consumer_auth": (
-                        "not_accepted_hosted_path"
-                        if claude_experimental_consumer_auth
-                        else "disabled"
                     ),
                 },
             ],

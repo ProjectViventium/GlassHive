@@ -26,6 +26,22 @@ const PROVIDER_METHOD_LABELS = {
 };
 const CAPABILITY_REVIEW_KEY = 'glasshive.capability-review';
 
+export function providerAccountLabelTransition({ provider, value, autoLabel }) {
+  const normalizedProvider = String(provider || '').trim().toLowerCase();
+  const providerName = normalizedProvider === 'claude'
+    ? 'Claude'
+    : (PROVIDER_LABELS[normalizedProvider] || 'AI');
+  const nextAutoLabel = `Personal ${providerName}`;
+  const currentValue = String(value || '');
+  const previousAutoLabel = String(autoLabel || '');
+  return {
+    value: !currentValue.trim() || currentValue === previousAutoLabel
+      ? nextAutoLabel
+      : currentValue,
+    autoLabel: nextAutoLabel,
+  };
+}
+
 let api = null;
 let controlPlane = null;
 let connectAi = null;
@@ -1503,6 +1519,16 @@ function renderProviderOptionControls() {
     return element;
   }));
   methodSelect.value = selectedProvider.methods.includes(currentMethod) ? currentMethod : selectedProvider.methods[0];
+  const labelInput = document.getElementById('provider-account-label');
+  if (labelInput) {
+    const label = providerAccountLabelTransition({
+      provider: providerSelect.value,
+      value: labelInput.value,
+      autoLabel: labelInput.dataset.autoLabel,
+    });
+    labelInput.value = label.value;
+    labelInput.dataset.autoLabel = label.autoLabel;
+  }
   addAccount.hidden = Boolean(activeSetupAccount);
   if (defaultToggle) {
     const accounts = controlPlane?.provider_accounts || [];
