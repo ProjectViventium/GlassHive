@@ -649,6 +649,7 @@ def test_stale_workspace_duplicate_recovers_only_proven_completion_and_fails_clo
 
 def test_capability_grants_and_provider_disconnect_have_complete_api_lifecycle(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS", "true")
+    monkeypatch.setenv("WPR_CODEX_BIN", "/usr/bin/true")
     database = tmp_path / "runtime.db"
     client = TestClient(create_app(db_path=str(database), runtime_backend="stub"))
     project = client.post(

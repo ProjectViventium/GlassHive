@@ -336,9 +336,13 @@ class FakeRuntimeClient:
             "readiness": "deployment_managed",
             "status": "Work AI is ready.",
         }
+        self.health_response = {
+            "status": "ok",
+            "provider_setup_support": {"codex": "supported", "claude": "supported"},
+        }
 
     def health(self):
-        return {"status": "ok"}
+        return dict(self.health_response)
 
     def provider_readiness(self, profile: str):
         return {**self.provider_readiness_response, "profile": profile}
@@ -5289,6 +5293,28 @@ def test_control_plane_advertises_only_the_enabled_native_claude_subscription(
     assert runtime.provider_account_requests[-1]["platform_support"] == "supported"
 
 
+def test_control_plane_hides_native_claude_when_the_runtime_setup_cli_is_missing(
+    monkeypatch,
+):
+    monkeypatch.setattr(server_module.sys, "platform", "linux")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    runtime = FakeRuntimeClient()
+    runtime.health_response["provider_setup_support"]["claude"] = "setup_cli_required"
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.get("/api/control-plane")
+
+    assert response.status_code == 200
+    claude = next(
+        option
+        for option in response.json()["provider_options"]
+        if option["provider"] == "claude"
+    )
+    assert claude["methods"] == []
+    assert claude["subscription_support"] == "setup_cli_required"
+
+
 def test_control_plane_keeps_disabled_claude_subscription_out_of_the_picker(monkeypatch):
     monkeypatch.setattr(server_module.sys, "platform", "linux")
     monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
@@ -5433,6 +5459,30 @@ def test_provider_account_setup_bff_is_user_scoped_through_signed_runtime_client
         {"action": "status", "account_id": "acct_public_safe"},
         {"action": "cancel", "account_id": "acct_public_safe"},
     ]
+
+
+def test_provider_account_setup_bff_preserves_actionable_runtime_error():
+    class SetupUnavailableRuntime(FakeRuntimeClient):
+        def start_provider_account_setup(self, account_id: str):
+            response = httpx.Response(
+                409,
+                request=httpx.Request(
+                    "POST", f"http://runtime.test/v1/provider-accounts/{account_id}/setup"
+                ),
+                json={"detail": "Claude setup is not installed on this GlassHive deployment"},
+            )
+            raise httpx.HTTPStatusError(
+                "setup unavailable", request=response.request, response=response
+            )
+
+    client = TestClient(create_app(runtime_client=SetupUnavailableRuntime()))
+
+    response = client.post("/api/provider-accounts/acct_public_safe/setup")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Claude setup is not installed on this GlassHive deployment"
+    }
 
 
 def test_provider_disconnect_and_workspace_capability_revoke_are_user_scoped():

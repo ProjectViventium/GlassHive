@@ -2640,6 +2640,9 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     @app.get("/api/control-plane")
     def control_plane_bootstrap(request: Request) -> dict[str, object]:
         active_client = _client_for_request(request)
+        runtime_provider_setup_support = dict(
+            (active_client.health() or {}).get("provider_setup_support") or {}
+        )
         recurrence_owner = str(
             os.environ.get("GLASSHIVE_RECURRING_SCHEDULE_OWNER") or "glasshive_native"
         ).strip().lower()
@@ -2655,6 +2658,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             if _truthy_env("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS")
             else "proof_required"
         )
+        if codex_subscription_support == "supported":
+            codex_subscription_support = str(
+                runtime_provider_setup_support.get("codex") or "setup_cli_required"
+            )
         if not isolation_ready:
             claude_subscription_support = "isolated_substrate_required"
         elif sys.platform == "darwin":
@@ -2663,6 +2670,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             claude_subscription_support = "supported"
         else:
             claude_subscription_support = "provider_permission_required"
+        if claude_subscription_support == "supported":
+            claude_subscription_support = str(
+                runtime_provider_setup_support.get("claude") or "setup_cli_required"
+            )
         inference_broker_support = (
             "supported"
             if all(
@@ -3231,40 +3242,75 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             if auth_method == "subscription"
             else "broker://librechat-openai"
         )
-        return _client_for_request(request).create_provider_account(
-            {
-                "provider": provider,
-                "label": payload.label,
-                "auth_method": auth_method,
-                "platform_support": platform_support,
-                "secret_locator": locator,
-                "make_default": payload.make_default,
-            }
-        )
+        try:
+            return _client_for_request(request).create_provider_account(
+                {
+                    "provider": provider,
+                    "label": payload.label,
+                    "auth_method": auth_method,
+                    "platform_support": platform_support,
+                    "secret_locator": locator,
+                    "make_default": payload.make_default,
+                }
+            )
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not create this account connection"
+            ) from exc
 
     @app.post("/api/provider-accounts/{account_id}/setup")
     def start_provider_account_setup(request: Request, account_id: str) -> dict[str, Any]:
-        return _client_for_request(request).start_provider_account_setup(account_id)
+        try:
+            return _client_for_request(request).start_provider_account_setup(account_id)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not start this account connection"
+            ) from exc
 
     @app.get("/api/provider-accounts/{account_id}/setup")
     def provider_account_setup_status(request: Request, account_id: str) -> dict[str, Any]:
-        return _client_for_request(request).provider_account_setup_status(account_id)
+        try:
+            return _client_for_request(request).provider_account_setup_status(account_id)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not check this account connection"
+            ) from exc
 
     @app.post("/api/provider-accounts/{account_id}/setup/cancel")
     def cancel_provider_account_setup(request: Request, account_id: str) -> dict[str, Any]:
-        return _client_for_request(request).cancel_provider_account_setup(account_id)
+        try:
+            return _client_for_request(request).cancel_provider_account_setup(account_id)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not cancel this account connection"
+            ) from exc
 
     @app.post("/api/provider-accounts/{account_id}/verify")
     def verify_provider_account(request: Request, account_id: str) -> dict[str, Any]:
-        return _client_for_request(request).verify_provider_account(account_id)
+        try:
+            return _client_for_request(request).verify_provider_account(account_id)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not verify this account connection"
+            ) from exc
 
     @app.post("/api/provider-accounts/{account_id}/disconnect")
     def disconnect_provider_account(request: Request, account_id: str) -> dict[str, Any]:
-        return _client_for_request(request).disconnect_provider_account(account_id)
+        try:
+            return _client_for_request(request).disconnect_provider_account(account_id)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not disconnect this account"
+            ) from exc
 
     @app.delete("/api/provider-accounts/{account_id}")
     def forget_provider_account(request: Request, account_id: str) -> dict[str, Any]:
-        return _client_for_request(request).forget_provider_account(account_id)
+        try:
+            return _client_for_request(request).forget_provider_account(account_id)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not forget this account"
+            ) from exc
 
     @app.get("/api/workspaces/{worker_id}/capability-grants")
     def list_workspace_capability_grants(request: Request, worker_id: str) -> dict[str, Any]:

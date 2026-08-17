@@ -115,6 +115,34 @@ def _env_enabled(name: str) -> bool:
     return str(os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
+def provider_setup_binary(provider: str) -> str | None:
+    """Resolve the native setup CLI from the same canonical worker settings used at runtime."""
+
+    normalized = str(provider or "").strip().lower()
+    if normalized in {"codex", "openai"}:
+        executable = "codex"
+        env_names = ("WPR_CODEX_BIN", "WPR_CODEX_CLI_PATH")
+    elif normalized in {"claude", "anthropic"}:
+        executable = "claude"
+        env_names = ("WPR_CLAUDE_CODE_BIN", "WPR_CLAUDE_CODE_PATH")
+    else:
+        return None
+    configured = [str(os.environ.get(name) or "").strip() for name in env_names]
+    configured = [value for value in configured if value]
+    for value in configured:
+        candidate = Path(value).expanduser()
+        if candidate.is_absolute():
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+            continue
+        if resolved := shutil.which(value):
+            return resolved
+    # An explicit but invalid binary is deployment drift; do not silently select another CLI.
+    if configured:
+        return None
+    return shutil.which(executable)
+
+
 def provider_platform_support(
     *,
     provider: str,
@@ -155,13 +183,11 @@ def provider_platform_support(
             return "unsupported_macos_host"
         if not _env_enabled("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH"):
             return "provider_permission_required"
-        return "supported"
+        return "supported" if provider_setup_binary(normalized_provider) else "setup_cli_required"
     if normalized_provider in {"codex", "openai"}:
-        return (
-            "supported"
-            if _env_enabled("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS")
-            else "proof_required"
-        )
+        if not _env_enabled("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS"):
+            return "proof_required"
+        return "supported" if provider_setup_binary(normalized_provider) else "setup_cli_required"
     return "proof_required"
 
 
@@ -375,9 +401,7 @@ class ProviderSetupManager:
         self.reconcile_provider_account_binding(account_home)
 
     def _binary(self, provider: str) -> str:
-        env_name = "WPR_CODEX_CLI_PATH" if provider in {"codex", "openai"} else "WPR_CLAUDE_CODE_PATH"
-        configured = str(os.environ.get(env_name) or "").strip()
-        binary = configured or shutil.which("codex" if provider in {"codex", "openai"} else "claude")
+        binary = provider_setup_binary(provider)
         if not binary:
             raise ControlPlaneError(f"{provider.title()} CLI is not installed in this GlassHive runtime")
         return binary

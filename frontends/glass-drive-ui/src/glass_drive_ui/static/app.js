@@ -1,4 +1,4 @@
-import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260817a';
+import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260817b';
 import { credentialPolicyTransition, preferredProviderAccountId, shouldResumeOnWorkspaceOpen, workspaceLifecycleControl } from './launch-policy.js?v=20260811m';
 import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811m';
 import { compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery } from './workspace-overview.js?v=20260811m';

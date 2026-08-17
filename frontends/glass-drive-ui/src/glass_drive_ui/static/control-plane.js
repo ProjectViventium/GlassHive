@@ -9,6 +9,7 @@ const SUPPORT_COPY = {
   supported: 'Ready to connect',
   proof_required: 'Available when this deployment enables isolated Codex subscription homes',
   provider_permission_required: 'Requires an approved hosted Claude authentication agreement',
+  setup_cli_required: 'Account setup is not installed on this GlassHive deployment',
   unsupported_macos_host: 'Claude subscription isolation is not available for multi-user macOS host workers',
   isolated_substrate_required: 'This multi-user deployment has not enabled a dedicated worker isolation substrate. Use the managed connected-accounts route below.',
   secret_store_required: 'Requires this deployment\'s secure secret store',

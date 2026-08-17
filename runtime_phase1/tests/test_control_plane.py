@@ -449,6 +449,9 @@ def test_provider_account_homes_are_private_and_platform_policy_is_explicit(tmp_
 def test_multi_user_subscription_support_requires_reviewed_container_isolation(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
     monkeypatch.setenv("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS", "true")
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.delenv("WPR_CODEX_BIN", raising=False)
+    monkeypatch.delenv("WPR_CODEX_CLI_PATH", raising=False)
 
     assert provider_platform_support(
         provider="codex", auth_method="subscription", platform_name="linux"
@@ -459,7 +462,38 @@ def test_multi_user_subscription_support_requires_reviewed_container_isolation(m
     )
     assert provider_platform_support(
         provider="codex", auth_method="subscription", platform_name="linux"
+    ) == "setup_cli_required"
+
+    monkeypatch.setenv("WPR_CODEX_BIN", "/usr/bin/true")
+    assert provider_platform_support(
+        provider="codex", auth_method="subscription", platform_name="linux"
     ) == "supported"
+
+
+def test_native_provider_setup_support_requires_and_uses_the_canonical_claude_binary(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    monkeypatch.setenv("PATH", "")
+
+    assert provider_platform_support(
+        provider="claude", auth_method="subscription", platform_name="linux"
+    ) == "setup_cli_required"
+
+    cli = tmp_path / "claude"
+    cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli.chmod(0o700)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", str(cli))
+
+    assert provider_platform_support(
+        provider="claude", auth_method="subscription", platform_name="linux"
+    ) == "supported"
+    setup = ProviderSetupManager(
+        store=ControlPlaneStore(str(tmp_path / "runtime.db")),
+        home_root=tmp_path / "provider-homes",
+    )
+    assert setup._binary("claude") == str(cli)
 
 
 def test_provider_account_home_creation_rejects_symlink_components(tmp_path):

@@ -556,6 +556,7 @@ def test_control_plane_routes_are_user_scoped_and_confirmation_is_human_bound(
     private_key, jwks = assertion_keys
     configure_signed_assertions(monkeypatch, jwks)
     monkeypatch.setenv("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS", "true")
+    monkeypatch.setenv("WPR_CODEX_BIN", "/usr/bin/true")
     app = create_app(db_path=str(tmp_path / "runtime.db"), runtime_backend="stub")
     client = TestClient(app)
     created = client.post(

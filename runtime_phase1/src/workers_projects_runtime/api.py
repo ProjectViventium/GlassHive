@@ -1885,6 +1885,14 @@ def create_app(
             "runtime_backend": visible_runtime_backend,
             "default_worker_profile": default_profile,
             "allowed_worker_profiles": allowed_worker_profiles(),
+            "provider_setup_support": {
+                "codex": provider_platform_support(
+                    provider="codex", auth_method="subscription"
+                ),
+                "claude": provider_platform_support(
+                    provider="claude", auth_method="subscription"
+                ),
+            },
         }
         if not auth_settings.enterprise:
             payload["metrics"] = store.metrics()
