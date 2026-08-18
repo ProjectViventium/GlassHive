@@ -5,6 +5,7 @@ import logging
 import os
 import sqlite3
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +65,8 @@ _CLAUDE_CONFLICTING_ENV = {
     "AWS_SESSION_TOKEN",
     "AWS_BEARER_TOKEN_BEDROCK",
 }
+_PROVIDER_CLEANUP_ATTEMPTS = 2
+_PROVIDER_CLEANUP_RETRY_DELAY_SECONDS = 0.2
 
 
 def _usable_provider_value(name: str) -> str:
@@ -942,10 +945,29 @@ class MissionProviderAccountBinder:
                     return
                 assert release_binding is not None
                 try:
-                    release_binding(bound_worker)
-                    homes.tighten_permissions(account_home=account_home)
+                    # Cleanup APIs use the same exception families for transient
+                    # post-container races and structural failures.  One complete
+                    # replay is safe and idempotent; a repeated failure still
+                    # quarantines the account and fails closed.
+                    for attempt in range(_PROVIDER_CLEANUP_ATTEMPTS):
+                        try:
+                            release_binding(bound_worker)
+                            homes.tighten_permissions(account_home=account_home)
+                            break
+                        except Exception:
+                            if attempt + 1 >= _PROVIDER_CLEANUP_ATTEMPTS:
+                                raise
+                            logger.warning(
+                                "Retrying transient provider credential cleanup",
+                                extra={"worker_id": worker_id, "runtime": runtime_name},
+                            )
+                            time.sleep(_PROVIDER_CLEANUP_RETRY_DELAY_SECONDS)
                 except BaseException as exc:
                     binding_release_errors.append(exc)
+                    logger.exception(
+                        "Provider credential cleanup failed; quarantining account",
+                        extra={"worker_id": worker_id, "runtime": runtime_name},
+                    )
                     try:
                         assert self.store is not None
                         self.store.update_provider_account_status(

@@ -349,6 +349,96 @@ def test_cleanup_failure_quarantines_account_but_releases_exclusive_lease(tmp_pa
     assert store.active_provider_lease(account["account_id"], "codex-cli:mission") is None
 
 
+def test_transient_cleanup_failure_retries_before_quarantining_account(
+    tmp_path,
+    monkeypatch,
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path), provider_account_db_path=str(database)
+    )
+    recorder = RecordingRuntime()
+    release_attempts = 0
+
+    def transient_cleanup(_worker):
+        nonlocal release_attempts
+        release_attempts += 1
+        if release_attempts == 1:
+            raise PermissionError("synthetic transient mount release")
+
+    recorder.release_callback = transient_cleanup
+    runtime.codex = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = _worker(account["account_id"])
+    worker["execution_mode"] = "docker"
+
+    assert runtime.run_task(
+        worker,
+        "complete before transient cleanup",
+        run_id="run_transient_cleanup",
+    ) == "synthetic result"
+
+    updated = store.get_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )
+    assert release_attempts == 2
+    assert updated["status"] == "ready"
+    assert updated["recovery_code"] == ""
+    assert store.active_provider_lease(account["account_id"], "codex-cli:mission") is None
+
+
+def test_transient_home_tightening_failure_retries_full_idempotent_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path), provider_account_db_path=str(database)
+    )
+    recorder = RecordingRuntime()
+    cleanup_events: list[str] = []
+    tighten_attempts = 0
+
+    recorder.release_callback = lambda _worker: cleanup_events.append("release")
+
+    def transient_tighten(_manager, *, account_home):
+        nonlocal tighten_attempts
+        tighten_attempts += 1
+        cleanup_events.append(f"tighten:{tighten_attempts}")
+        if tighten_attempts == 1:
+            raise ControlPlaneError("synthetic transient account-home debris")
+
+    monkeypatch.setattr(
+        ProviderAccountHomeManager,
+        "tighten_permissions",
+        transient_tighten,
+    )
+    runtime.codex = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = _worker(account["account_id"])
+    worker["execution_mode"] = "docker"
+
+    assert runtime.run_task(
+        worker,
+        "complete before transient account-home cleanup",
+        run_id="run_transient_home_cleanup",
+    ) == "synthetic result"
+
+    updated = store.get_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )
+    assert cleanup_events == ["release", "tighten:1", "release", "tighten:2"]
+    assert updated["status"] == "ready"
+    assert updated["recovery_code"] == ""
+    assert store.active_provider_lease(account["account_id"], "codex-cli:mission") is None
+
+
 def test_lease_heartbeat_loss_stops_docker_binding_and_fails_mission(tmp_path, monkeypatch):
     database = tmp_path / "runtime.db"
     store = ControlPlaneStore(str(database))

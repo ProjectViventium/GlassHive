@@ -8,6 +8,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -2756,14 +2757,56 @@ screen -ls | awk -v target="$target" '
                 except Exception:
                     logger.exception("Failed to monitor an interactive provider session")
                 try:
+                    # Removing the credential-bearing container is the authoritative
+                    # stop.  Host signals only reap the detached docker-exec client;
+                    # they do not stop the native process inside the container.
                     on_exit()
                 except Exception:
                     logger.exception("Failed to close an interactive provider session")
                 if timed_out:
                     try:
-                        process.wait(timeout=15)
-                    except subprocess.TimeoutExpired:
-                        process.terminate()
+                        try:
+                            process.wait(timeout=15)
+                            return
+                        except subprocess.TimeoutExpired:
+                            pass
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            return
+                        except (AttributeError, OSError):
+                            try:
+                                process.terminate()
+                            except ProcessLookupError:
+                                return
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                return
+                            except (AttributeError, OSError):
+                                try:
+                                    process.kill()
+                                except ProcessLookupError:
+                                    return
+                            try:
+                                process.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                logger.error(
+                                    "Detached interactive provider client did not stop after cleanup",
+                                    extra={"pid": process.pid},
+                                )
+                    finally:
+                        if cleanup_path is not None:
+                            try:
+                                cleanup_path.unlink(missing_ok=True)
+                            except OSError:
+                                logger.warning(
+                                    "Failed to remove a detached provider client environment file",
+                                    extra={"pid": process.pid},
+                                )
 
             Thread(
                 target=wait_for_exit,

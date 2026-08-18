@@ -108,7 +108,10 @@ credential-bearing container before releasing the account; new missions fail bef
 the setup window is open, including attempts to switch that workspace to another account or deployment
 route. Service startup recovers any unreleased interactive session by removing its exact container
 before releasing even an expired lease. Browser, file, and shell actions never acquire provider
-credentials. Desktop actions during a mission retain the exact active run/lease proof.
+credentials. At a bounded timeout, the authoritative container-removal and sealing path stops the
+credential-bearing native CLI; one transient cleanup failure is retried through that same idempotent
+path before the account is quarantined, and the detached host-side Docker client is reaped afterward.
+Desktop actions during a mission retain the exact active run/lease proof.
 
 For Codex, GlassHive temporarily overlays the selected subscription authentication while preserving
 any separate workspace-local login in host-private state that is not mounted into the leased container,

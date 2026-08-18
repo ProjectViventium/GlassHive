@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import shlex
 import stat
 import subprocess
@@ -1410,40 +1411,179 @@ def test_docker_exec_monitors_visible_provider_session_until_window_closes(
     assert callback_called.wait(2)
 
 
-def test_docker_exec_timeout_closes_provider_session_before_forcing_process_exit(
+def test_docker_exec_timeout_releases_provider_before_reaping_detached_client(
     tmp_path, monkeypatch
 ):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     callback_called = Event()
-    waits: list[float | None] = []
+    events: list[str] = []
 
     class FakePopen:
+        pid = 4242
+
         def __init__(self, _command, *, stdout=None, stderr=None, **kwargs):
-            self.terminated = False
+            self.wait_count = 0
 
         def wait(self, timeout=None):
-            waits.append(timeout)
-            if len(waits) == 1:
+            self.wait_count += 1
+            events.append(f"wait:{timeout}")
+            if self.wait_count == 1:
                 raise subprocess.TimeoutExpired("synthetic interactive session", timeout)
             return 0
 
-        def terminate(self):
-            self.terminated = True
-
     monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda pid, sent_signal: events.append(
+            f"signal:{pid}:{signal.Signals(sent_signal).name}"
+        ),
+    )
+
+    def close_session():
+        events.append("on_exit")
+        callback_called.set()
 
     result = manager._docker_exec(
         "wpr-test",
         ["xterm", "-e", "claude"],
         env={"HOME": "/workspace/.wpr-home"},
         fire_and_forget=True,
-        on_exit=callback_called.set,
+        on_exit=close_session,
         max_runtime_seconds=30,
     )
 
     assert result.returncode == 0
     assert callback_called.wait(2)
-    assert waits == [30, 15]
+    assert events == ["wait:30", "on_exit", "wait:15"]
+
+
+def test_docker_exec_timeout_escalates_stubborn_detached_client_after_cleanup(
+    tmp_path, monkeypatch
+):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    callback_called = Event()
+    events: list[str] = []
+
+    class FakePopen:
+        pid = 4242
+
+        def __init__(self, _command, *, stdout=None, stderr=None, **kwargs):
+            self.wait_count = 0
+
+        def wait(self, timeout=None):
+            self.wait_count += 1
+            events.append(f"wait:{timeout}")
+            if self.wait_count < 4:
+                raise subprocess.TimeoutExpired("synthetic interactive session", timeout)
+            return 0
+
+        def terminate(self):
+            events.append("terminate")
+
+        def kill(self):
+            events.append("kill")
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda pid, sent_signal: events.append(
+            f"signal:{pid}:{signal.Signals(sent_signal).name}"
+        ),
+    )
+
+    def close_session():
+        events.append("on_exit")
+        callback_called.set()
+
+    result = manager._docker_exec(
+        "wpr-test",
+        ["xterm", "-e", "claude"],
+        env={"HOME": "/workspace/.wpr-home"},
+        fire_and_forget=True,
+        on_exit=close_session,
+        max_runtime_seconds=30,
+    )
+
+    assert result.returncode == 0
+    assert callback_called.wait(2)
+    assert events == [
+        "wait:30",
+        "on_exit",
+        "wait:15",
+        "signal:4242:SIGTERM",
+        "wait:5",
+        "signal:4242:SIGKILL",
+        "wait:5",
+    ]
+    assert list((manager.runtime_root / ".docker-exec-env").glob("*.env")) == []
+
+
+def test_docker_exec_timeout_falls_back_when_process_group_signals_fail(
+    tmp_path, monkeypatch
+):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    callback_called = Event()
+    events: list[str] = []
+
+    class FakePopen:
+        pid = 4242
+
+        def __init__(self, _command, *, stdout=None, stderr=None, **kwargs):
+            self.wait_count = 0
+
+        def wait(self, timeout=None):
+            self.wait_count += 1
+            events.append(f"wait:{timeout}")
+            if self.wait_count < 4:
+                raise subprocess.TimeoutExpired("synthetic interactive session", timeout)
+            return 0
+
+        def terminate(self):
+            events.append("terminate")
+
+        def kill(self):
+            events.append("kill")
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+    def fail_group_signal(_pid, sent_signal):
+        events.append(f"signal_failed:{signal.Signals(sent_signal).name}")
+        raise OSError("synthetic host process-group failure")
+
+    monkeypatch.setattr(os, "killpg", fail_group_signal)
+
+    def close_session():
+        events.append("on_exit")
+        callback_called.set()
+
+    result = manager._docker_exec(
+        "wpr-test",
+        ["xterm", "-e", "claude"],
+        env={"HOME": "/workspace/.wpr-home"},
+        fire_and_forget=True,
+        on_exit=close_session,
+        max_runtime_seconds=30,
+    )
+
+    assert result.returncode == 0
+    assert callback_called.wait(2)
+    deadline = time.monotonic() + 2
+    while len(events) < 9 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert events == [
+        "wait:30",
+        "on_exit",
+        "wait:15",
+        "signal_failed:SIGTERM",
+        "terminate",
+        "wait:5",
+        "signal_failed:SIGKILL",
+        "kill",
+        "wait:5",
+    ]
+    assert list((manager.runtime_root / ".docker-exec-env").glob("*.env")) == []
 
 
 def test_docker_exec_spawn_failure_is_reported_and_cleans_private_env(
