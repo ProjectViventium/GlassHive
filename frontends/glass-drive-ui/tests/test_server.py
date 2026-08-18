@@ -2125,7 +2125,7 @@ def test_launcher_workspace_hive_static_controls():
     assert 'id="workspace-status-link"' in desktop_html
     assert "showWorkspaceLink: true" in desktop_js
     assert "Open workspace status and files" in desktop_html
-    assert "styles.css?v=20260811m" in watch_html
+    assert "styles.css?v=20260818a" in watch_html
     assert "}, 5000);" not in desktop_js
     assert 'id="project-files"' in index_html
     assert 'id="schedule-text"' in index_html
@@ -2200,6 +2200,33 @@ def test_open_completed_workspace_never_resumes_compute_implicitly():
     assert "rawWorkspaceState(workspace)" not in open_workspace
     assert "Boolean(workspace?.compute_released_at)" not in open_workspace
     assert "'/action/resume'" in open_workspace
+
+
+def test_watch_footer_composer_keeps_instruction_wide_and_send_compact():
+    styles = (Path(server_module.STATIC_DIR) / "styles.css").read_text(encoding="utf-8")
+
+    def rule_body(selector: str) -> str:
+        start = styles.index(f"{selector} {{")
+        return styles[start : styles.index("}", start)]
+
+    textarea_rule = rule_body(".steer-form textarea")
+    send_rule = rule_body(".steer-form #send-button")
+
+    assert "grid-column: 2;" in textarea_rule
+    assert "min-width: 0;" in textarea_rule
+    assert "grid-column: 3;" in send_rule
+    assert "width: auto;" in send_rule
+    assert "min-width: 96px;" in send_rule
+    assert ".steer-form #send-button { grid-column: 1 / -1; width: 100%; }" not in styles
+
+
+def test_main_frame_is_visible_without_waiting_for_a_compositor_animation():
+    styles = (Path(server_module.STATIC_DIR) / "styles.css").read_text(encoding="utf-8")
+    start = styles.index(".composer-frame {")
+    composer_rule = styles[start : styles.index("}", start)]
+
+    assert "animation:" not in composer_rule
+    assert "@keyframes float-up" not in styles
 
 
 def test_workspace_open_resume_policy_uses_the_user_visible_state():

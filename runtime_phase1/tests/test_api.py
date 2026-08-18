@@ -6813,6 +6813,24 @@ def test_deliverable_detection_prefers_user_file_over_incidental_external_url(tm
     assert "example.com" not in json.dumps(payload)
 
 
+def test_incidental_external_url_is_not_a_deliverable(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    worker = {
+        "worker_id": "wrk_1",
+        "workspace_dir": str(workspace),
+        "execution_mode": "docker",
+    }
+
+    payload = deliverable_payload(
+        worker,
+        {"state": "completed"},
+        "The official service endpoint is https://mcp.example.test/v1/mcp.",
+    )
+
+    assert payload is None
+
+
 def test_deliverable_detection_ignores_glasshive_scaffold_files(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -9806,6 +9824,50 @@ class UrlOnlyDesktopRuntime(DesktopStubRuntime):
                 "Local preview: http://localhost:5173/private-preview",
                 "External preview: https://example.com/public-preview",
             ]
+        )
+
+
+class ExternalUrlOnlyDesktopRuntime(DesktopStubRuntime):
+    def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None) -> str:
+        return "The official service endpoint is https://mcp.example.test/v1/mcp."
+
+
+def test_completed_external_url_mention_is_not_delivered_or_auto_opened(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime = ExternalUrlOnlyDesktopRuntime(tmp_path / "desktop")
+    app = create_app(str(db_path), runtime_backend="stub", runtime=runtime)
+
+    with TestClient(app) as client:
+        project = client.post(
+            "/v1/projects",
+            json={"owner_id": "demo-owner", "title": "Connector check", "goal": "Read only."},
+        ).json()
+        worker = client.post(
+            f"/v1/projects/{project['project_id']}/workers",
+            json={
+                "owner_id": "demo-owner",
+                "name": "Connector worker",
+                "role": "operator",
+                "profile": "claude-code",
+                "execution_mode": "docker",
+            },
+        ).json()
+        run = client.post(
+            f"/v1/workers/{worker['worker_id']}/assign",
+            json={"instruction": "Inspect the official connector."},
+        ).json()
+
+        completed = wait_for_run(client, run["run_id"])
+        assert completed["state"] == "completed"
+        assert runtime.last_desktop_action is None
+        service = app.state.service
+        refreshed_worker = service.require_worker(worker["worker_id"])
+        assert service._completion_deliverable(
+            refreshed_worker, completed, completed["output_text"]
+        ) is None
+        assert not any(
+            event["event_type"] == "deliverable.opened"
+            for event in service.store.list_events(worker["worker_id"])
         )
 
 
