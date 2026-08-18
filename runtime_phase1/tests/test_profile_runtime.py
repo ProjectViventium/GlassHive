@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -4942,6 +4943,176 @@ def test_docker_claude_command_enables_chrome_and_appends_completion_contract(tm
     stdin_text = runtime._command_stdin_text(worker, "Make the page red.", runtime._runtime_info(worker))
     assert stdin_text and stdin_text.startswith("Make the page red.")
     assert "FINAL REPORT:" in stdin_text
+
+
+def test_docker_claude_stale_resume_replays_same_instruction_as_fresh_task(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(tmp_path / "fake-claude")
+    runtime.sandbox.home_mount = str(tmp_path / "container-home")
+    worker = {
+        "worker_id": "wrk_claude_stale_resume",
+        "name": "Reusable Claude Worker",
+        "profile": "claude-code",
+        "model": "claude-test",
+        "_active_run_id": "run_claude_stale_resume",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_session_key(
+        worker["worker_id"],
+        "11111111-1111-4111-8111-111111111111",
+    )
+    instruction_path = (
+        Path(runtime.sandbox.home_mount)
+        / ".glasshive-runs"
+        / worker["_active_run_id"]
+        / "instruction.stdin"
+    )
+    instruction_path.parent.mkdir(parents=True)
+    instruction_path.write_text("Read the saved connector proof.\n")
+    calls_path = tmp_path / "claude-calls.log"
+    Path(runtime.binary).write_text(
+        "#!/bin/sh\n"
+        "payload=$(cat)\n"
+        "printf '%s|%s\\n' \"$*\" \"$payload\" >> \"$FAKE_CLAUDE_CALLS\"\n"
+        "case \" $* \" in\n"
+        "  *' --resume '*)\n"
+        "    printf '%s\\n' 'No conversation found with session ID: 11111111-1111-4111-8111-111111111111' >&2\n"
+        "    printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true}'\n"
+        "    exit 1\n"
+        "    ;;\n"
+        "esac\n"
+        "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"22222222-2222-4222-8222-222222222222\",\"result\":\"FINAL REPORT:\\nRecovered.\"}'\n"
+    )
+    Path(runtime.binary).chmod(0o755)
+    monkeypatch.setenv("FAKE_CLAUDE_CALLS", str(calls_path))
+
+    command, _env = runtime._build_command(
+        worker,
+        "Read the saved connector proof.",
+        runtime._runtime_info(worker),
+    )
+    completed = subprocess.run(command, capture_output=True, text=True, env=os.environ.copy())
+
+    assert completed.returncode == 0
+    assert "22222222-2222-4222-8222-222222222222" in completed.stdout
+    assert "No conversation found" not in completed.stderr
+    calls = calls_path.read_text().splitlines()
+    assert len(calls) == 2
+    assert "--resume 11111111-1111-4111-8111-111111111111" in calls[0]
+    assert "--resume" not in calls[1]
+    assert all("Read the saved connector proof." in call for call in calls)
+
+
+def test_docker_claude_resume_does_not_retry_unrelated_failure(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(tmp_path / "fake-claude")
+    runtime.sandbox.home_mount = str(tmp_path / "container-home")
+    worker = {
+        "worker_id": "wrk_claude_failed_resume",
+        "name": "Reusable Claude Worker",
+        "profile": "claude-code",
+        "model": "claude-test",
+        "_active_run_id": "run_claude_failed_resume",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_session_key(
+        worker["worker_id"],
+        "33333333-3333-4333-8333-333333333333",
+    )
+    instruction_path = (
+        Path(runtime.sandbox.home_mount)
+        / ".glasshive-runs"
+        / worker["_active_run_id"]
+        / "instruction.stdin"
+    )
+    instruction_path.parent.mkdir(parents=True)
+    instruction_path.write_text("Continue the saved task.\n")
+    calls_path = tmp_path / "claude-calls.log"
+    Path(runtime.binary).write_text(
+        "#!/bin/sh\n"
+        "cat >/dev/null\n"
+        "printf '%s\\n' \"$*\" >> \"$FAKE_CLAUDE_CALLS\"\n"
+        "printf '%s\\n' 'MCP output quoted: No conversation found with session ID: unrelated' >&2\n"
+        "printf '%s\\n' 'Provider is temporarily unavailable' >&2\n"
+        "exit 41\n"
+    )
+    Path(runtime.binary).chmod(0o755)
+    monkeypatch.setenv("FAKE_CLAUDE_CALLS", str(calls_path))
+
+    command, _env = runtime._build_command(
+        worker,
+        "Continue the saved task.",
+        runtime._runtime_info(worker),
+    )
+    completed = subprocess.run(command, capture_output=True, text=True, env=os.environ.copy())
+
+    assert completed.returncode == 41
+    assert "Provider is temporarily unavailable" in completed.stderr
+    calls = calls_path.read_text().splitlines()
+    assert len(calls) == 1
+    assert "--resume 33333333-3333-4333-8333-333333333333" in calls[0]
+
+
+def test_docker_claude_interrupted_resume_flushes_partial_transcript(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(tmp_path / "fake-claude")
+    runtime.sandbox.home_mount = str(tmp_path / "container-home")
+    worker = {
+        "worker_id": "wrk_claude_interrupted_resume",
+        "name": "Reusable Claude Worker",
+        "profile": "claude-code",
+        "model": "claude-test",
+        "_active_run_id": "run_claude_interrupted_resume",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_session_key(
+        worker["worker_id"],
+        "44444444-4444-4444-8444-444444444444",
+    )
+    instruction_path = (
+        Path(runtime.sandbox.home_mount)
+        / ".glasshive-runs"
+        / worker["_active_run_id"]
+        / "instruction.stdin"
+    )
+    instruction_path.parent.mkdir(parents=True)
+    instruction_path.write_text("Continue the saved task.\n")
+    ready_path = tmp_path / "claude-ready"
+    Path(runtime.binary).write_text(
+        "#!/bin/sh\n"
+        "cat >/dev/null\n"
+        "printf '%s\\n' '{\"type\":\"assistant\",\"text\":\"PARTIAL-PROGRESS-LINE\"}'\n"
+        "touch \"$FAKE_CLAUDE_READY\"\n"
+        "sleep 30\n"
+    )
+    Path(runtime.binary).chmod(0o755)
+    monkeypatch.setenv("FAKE_CLAUDE_READY", str(ready_path))
+
+    command, _env = runtime._build_command(
+        worker,
+        "Continue the saved task.",
+        runtime._runtime_info(worker),
+    )
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=os.environ.copy(),
+        start_new_session=True,
+    )
+    for _ in range(100):
+        if ready_path.exists():
+            break
+        time.sleep(0.02)
+    assert ready_path.exists()
+    os.killpg(process.pid, signal.SIGTERM)
+    stdout, _stderr = process.communicate(timeout=5)
+
+    assert process.returncode == 143
+    assert "PARTIAL-PROGRESS-LINE" in stdout
+    assert not (instruction_path.parent / "claude-resume.stdout").exists()
+    assert not (instruction_path.parent / "claude-resume.stderr").exists()
 
 
 def test_docker_claude_chrome_can_be_explicitly_disabled(tmp_path, monkeypatch):

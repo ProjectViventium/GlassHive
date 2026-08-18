@@ -84,6 +84,7 @@ logger = logging.getLogger(__name__)
 _CODEX_MCP_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 _HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
 _CODEX_STALE_THREAD_ERROR = "thread/resume failed: no rollout found for thread id"
+_CLAUDE_STALE_SESSION_ERROR = "No conversation found with session ID:"
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off", "none", "disabled"}
 _CODEX_BROKER_CONFLICTING_ENV = {
     "CODEX_API_KEY",
@@ -4250,6 +4251,65 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         self._preflight_workspace_effort_support(worker)
         return super().run_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
 
+    def _resume_with_fresh_fallback(
+        self,
+        worker: dict,
+        *,
+        resume_command: list[str],
+        fresh_command: list[str],
+    ) -> list[str]:
+        """Retry only Claude's explicit missing-session result as a fresh task."""
+
+        run_id = str(worker.get("_active_run_id") or "").strip()
+        if not run_id:
+            return resume_command
+        run_root = self._container_run_root(run_id)
+        instruction_path = f"{run_root}/instruction.stdin"
+        resume_stdout_path = f"{run_root}/claude-resume.stdout"
+        resume_stderr_path = f"{run_root}/claude-resume.stderr"
+        resume_invocation = shlex.join(resume_command)
+        fresh_invocation = shlex.join(fresh_command)
+        script = "\n".join(
+            [
+                "set -o pipefail",
+                f"resume_stdout={shlex.quote(resume_stdout_path)}",
+                f"resume_stderr={shlex.quote(resume_stderr_path)}",
+                'rm -f -- "$resume_stdout" "$resume_stderr"',
+                (
+                    "flush_partial() { status=$?; trap - EXIT HUP INT TERM; "
+                    '[ ! -s "$resume_stdout" ] || cat -- "$resume_stdout"; '
+                    '[ ! -s "$resume_stderr" ] || cat -- "$resume_stderr" >&2; '
+                    'rm -f -- "$resume_stdout" "$resume_stderr"; exit "$status"; }'
+                ),
+                'signal_exit() { trap - HUP INT TERM; exit "$1"; }',
+                "trap flush_partial EXIT",
+                "trap 'signal_exit 129' HUP",
+                "trap 'signal_exit 130' INT",
+                "trap 'signal_exit 143' TERM",
+                (
+                    f"if {resume_invocation} < {shlex.quote(instruction_path)} "
+                    '> "$resume_stdout" 2> "$resume_stderr"; then'
+                ),
+                "  trap - EXIT HUP INT TERM",
+                '  cat -- "$resume_stdout"',
+                '  cat -- "$resume_stderr" >&2',
+                '  rm -f -- "$resume_stdout" "$resume_stderr"',
+                "  exit 0",
+                "else status=$?; fi",
+                f"if grep -Eq -- {shlex.quote('^' + _CLAUDE_STALE_SESSION_ERROR + ' ')} \"$resume_stderr\"; then",
+                '  rm -f -- "$resume_stdout" "$resume_stderr"',
+                "  trap - EXIT HUP INT TERM",
+                f"  exec {fresh_invocation} < {shlex.quote(instruction_path)}",
+                "fi",
+                "trap - EXIT HUP INT TERM",
+                'cat -- "$resume_stdout"',
+                'cat -- "$resume_stderr" >&2',
+                'rm -f -- "$resume_stdout" "$resume_stderr"',
+                'exit "$status"',
+            ]
+        )
+        return ["bash", "-c", script]
+
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_key = self._read_session_key(worker["worker_id"])
         model = self._provider_model_for_worker(worker)
@@ -4276,7 +4336,12 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                 extra={"worker_id": str(worker.get("worker_id") or ""), "effort": effort},
             )
         if session_key and not session_key.startswith("claude-worker:"):
-            command.extend(["--resume", session_key])
+            resume_command = [*command, "--resume", session_key]
+            command = self._resume_with_fresh_fallback(
+                worker,
+                resume_command=resume_command,
+                fresh_command=command,
+            )
         env = self._container_env(
             "ANTHROPIC_API_KEY",
             "CLAUDE_CODE_OAUTH_TOKEN",
