@@ -100,8 +100,13 @@ indirection instead.
 Workspace-native tool and account setup stays inside the selected persistent workstation. The
 Workspaces `Set up tools` action opens that profile's installed AI harness through the generic desktop
 action contract; it does not add connector-specific frontend flows or copy connector credentials into
-the controlling MCP client. The harness owns its supported tools, sign-in, and persisted per-workspace
-state.
+the controlling MCP client. An idle setup action also does not project the user's mission-scoped AI
+subscription credential: the native harness uses its isolated, persisted workspace state for manual
+tool/account sign-in. Desktop actions during a mission retain the exact active run/lease proof. The
+harness owns its supported tools, sign-in, and persisted per-workspace state. For Codex, GlassHive
+temporarily overlays the mission-selected subscription authentication while preserving any separate
+workspace-local login in host-private state that is not mounted into the mission container, then
+restores the workspace login before idle tool setup or reuse.
 
 For generated file delivery, `signed_download_url`/`default_url` is the default chat-facing artifact
 link and should be labeled `Download file`. The MCP payload should also preserve `signed_open_url`

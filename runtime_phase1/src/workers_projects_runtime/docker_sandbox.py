@@ -7,6 +7,7 @@ import re
 import secrets
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -662,6 +663,12 @@ class DockerSandboxManager:
             raise RuntimeError(
                 "Worker sandbox isolation does not match this mission; pause the worker so GlassHive can recreate it safely"
             )
+        if runtime_name == "codex-cli":
+            private_dir = paths["worker_root"] / ".private"
+            if self._provider_account_mount(worker) is None:
+                self._restore_workspace_codex_auth(paths["home_dir"], private_dir)
+            else:
+                self._prepare_workspace_codex_auth_overlay(paths["home_dir"], private_dir)
         if sandbox is None:
             fast_sandbox = self.fast_sandbox_from_worker(worker)
             if fast_sandbox is not None:
@@ -1725,6 +1732,150 @@ screen -ls | awk -v target="$target" '
             if mount[1] == self._provider_account_mount_target
         )
         return actual != (() if expected is None else (expected,))
+
+    @staticmethod
+    def _require_private_codex_overlay_dir(private_dir: Path) -> None:
+        if os.path.lexists(private_dir):
+            metadata = os.lstat(private_dir)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                raise RuntimeError("Workspace private authentication state is unsafe")
+            return
+        private_dir.mkdir(mode=0o700)
+        if os.name != "nt":
+            private_dir.chmod(0o700)
+
+    def _prepare_workspace_codex_auth_overlay(
+        self,
+        home_dir: Path,
+        private_dir: Path,
+    ) -> None:
+        """Hide any workspace login outside all mission container mounts."""
+
+        codex_home = home_dir / ".codex"
+        if not os.path.lexists(codex_home):
+            return
+        if codex_home.is_symlink() or not codex_home.is_dir():
+            raise RuntimeError("Workspace Codex home is not a safe managed directory")
+        self._require_private_codex_overlay_dir(private_dir)
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        codex_home_fd = os.open(codex_home, directory_flags)
+        private_fd = os.open(private_dir, directory_flags)
+        try:
+            backup_name = "codex-workspace-auth.json"
+            try:
+                auth = os.stat("auth.json", dir_fd=codex_home_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                auth = None
+            try:
+                backup = os.stat(backup_name, dir_fd=private_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                backup = None
+            if auth is not None and stat.S_ISREG(auth.st_mode):
+                mode = stat.S_IMODE(auth.st_mode)
+                if (
+                    auth.st_nlink != 1
+                    or auth.st_size <= 0
+                    or auth.st_size > 16 * 1024 * 1024
+                    or mode & 0o077
+                    or backup is not None
+                ):
+                    raise RuntimeError("Workspace Codex authentication cannot be safely preserved")
+                os.rename(
+                    "auth.json",
+                    backup_name,
+                    src_dir_fd=codex_home_fd,
+                    dst_dir_fd=private_fd,
+                )
+                os.fsync(codex_home_fd)
+                os.fsync(private_fd)
+            elif auth is not None:
+                expected_target = "/workspace/.provider-account/codex/auth.json"
+                if (
+                    not stat.S_ISLNK(auth.st_mode)
+                    or os.readlink("auth.json", dir_fd=codex_home_fd) != expected_target
+                ):
+                    raise RuntimeError("Workspace Codex authentication has an unsafe type")
+            if backup is not None:
+                mode = stat.S_IMODE(backup.st_mode)
+                if (
+                    not stat.S_ISREG(backup.st_mode)
+                    or backup.st_nlink != 1
+                    or backup.st_size <= 0
+                    or backup.st_size > 16 * 1024 * 1024
+                    or mode & 0o077
+                ):
+                    raise RuntimeError("Workspace Codex authentication backup is unsafe")
+        finally:
+            os.close(private_fd)
+            os.close(codex_home_fd)
+
+    def _restore_workspace_codex_auth(
+        self,
+        home_dir: Path,
+        private_dir: Path,
+        *,
+        expected_target: str = "/workspace/.provider-account/codex/auth.json",
+    ) -> None:
+        """Remove the mission overlay and restore any workspace-local Codex login."""
+
+        codex_home = home_dir / ".codex"
+        if not os.path.lexists(codex_home):
+            return
+        if codex_home.is_symlink() or not codex_home.is_dir():
+            raise RuntimeError("Workspace Codex home is not a safe managed directory")
+        if not os.path.lexists(private_dir):
+            private_dir.mkdir(mode=0o700)
+            if os.name != "nt":
+                private_dir.chmod(0o700)
+        self._require_private_codex_overlay_dir(private_dir)
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        codex_home_fd = os.open(codex_home, directory_flags)
+        private_fd = os.open(private_dir, directory_flags)
+        try:
+            backup_name = "codex-workspace-auth.json"
+            try:
+                auth = os.stat("auth.json", dir_fd=codex_home_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                auth = None
+            if auth is not None and stat.S_ISLNK(auth.st_mode):
+                if os.readlink("auth.json", dir_fd=codex_home_fd) != expected_target:
+                    raise RuntimeError("Workspace Codex auth link selects an unexpected account path")
+                os.unlink("auth.json", dir_fd=codex_home_fd)
+                auth = None
+            elif auth is not None and not stat.S_ISREG(auth.st_mode):
+                raise RuntimeError("Workspace Codex authentication has an unsafe type")
+            try:
+                backup = os.stat(backup_name, dir_fd=private_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                backup = None
+            if backup is not None:
+                if auth is not None:
+                    raise RuntimeError("Workspace Codex authentication restore is ambiguous")
+                mode = stat.S_IMODE(backup.st_mode)
+                if (
+                    not stat.S_ISREG(backup.st_mode)
+                    or backup.st_nlink != 1
+                    or backup.st_size <= 0
+                    or backup.st_size > 16 * 1024 * 1024
+                    or mode & 0o077
+                ):
+                    raise RuntimeError("Workspace Codex authentication backup is unsafe")
+                os.rename(
+                    backup_name,
+                    "auth.json",
+                    src_dir_fd=private_fd,
+                    dst_dir_fd=codex_home_fd,
+                )
+            os.fsync(codex_home_fd)
+            os.fsync(private_fd)
+        finally:
+            os.close(private_fd)
+            os.close(codex_home_fd)
 
     def _grant_provider_account_access(
         self,

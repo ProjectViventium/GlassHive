@@ -357,6 +357,78 @@ def test_codex_provider_auth_link_keeps_workspace_config_and_uses_live_account_a
     assert stat.S_IMODE(workspace_codex.stat().st_mode) == 0o750
 
 
+def test_codex_provider_auth_overlay_restores_workspace_login_for_idle_reuse(tmp_path):
+    provider_root = tmp_path / "provider"
+    provider_home = provider_root / "codex"
+    provider_home.mkdir(parents=True)
+    provider_auth = provider_home / "auth.json"
+    provider_auth.write_text("synthetic mission credential")
+    provider_auth.chmod(0o600)
+    workspace_home = tmp_path / "workspace-home"
+    workspace_codex = workspace_home / ".codex"
+    workspace_codex.mkdir(parents=True)
+    workspace_auth = workspace_codex / "auth.json"
+    workspace_auth.write_text("synthetic workspace credential")
+    workspace_auth.chmod(0o600)
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    private_dir = tmp_path / "worker-private"
+
+    manager._prepare_workspace_codex_auth_overlay(  # type: ignore[attr-defined]
+        workspace_home,
+        private_dir,
+    )
+
+    mission = _run_codex_provider_auth_link(provider_root, workspace_home)
+
+    assert mission.returncode == 0
+    assert workspace_auth.is_symlink()
+    assert workspace_auth.readlink() == provider_auth
+    private_backup = private_dir / "codex-workspace-auth.json"
+    assert private_backup.read_text() == "synthetic workspace credential"
+    assert private_backup.parent != workspace_home
+    assert not os.path.lexists(workspace_codex / ".glasshive-workspace-auth.json")
+
+    manager._restore_workspace_codex_auth(  # type: ignore[attr-defined]
+        workspace_home,
+        private_dir,
+        expected_target=str(provider_auth),
+    )
+
+    assert workspace_auth.is_file()
+    assert not workspace_auth.is_symlink()
+    assert workspace_auth.read_text() == "synthetic workspace credential"
+    assert not private_backup.exists()
+
+
+def test_codex_provider_auth_overlay_leaves_idle_workspace_ready_for_manual_login(tmp_path):
+    provider_root = tmp_path / "provider"
+    provider_home = provider_root / "codex"
+    provider_home.mkdir(parents=True)
+    provider_auth = provider_home / "auth.json"
+    provider_auth.write_text("synthetic mission credential")
+    provider_auth.chmod(0o600)
+    workspace_home = tmp_path / "workspace-home"
+    workspace_home.mkdir()
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    private_dir = tmp_path / "worker-private"
+    manager._prepare_workspace_codex_auth_overlay(  # type: ignore[attr-defined]
+        workspace_home,
+        private_dir,
+    )
+
+    mission = _run_codex_provider_auth_link(provider_root, workspace_home)
+    assert mission.returncode == 0
+
+    manager._restore_workspace_codex_auth(  # type: ignore[attr-defined]
+        workspace_home,
+        private_dir,
+        expected_target=str(provider_auth),
+    )
+
+    assert not (workspace_home / ".codex" / "auth.json").exists()
+    assert not (private_dir / "codex-workspace-auth.json").exists()
+
+
 def test_codex_provider_auth_link_preserves_host_managed_workspace_home_contract():
     assert "os.fchown(codex_home_fd" not in _CODEX_PROVIDER_AUTH_LINK_SCRIPT
     assert "os.fchmod(codex_home_fd" not in _CODEX_PROVIDER_AUTH_LINK_SCRIPT
@@ -386,7 +458,7 @@ def test_codex_provider_auth_link_rejects_unsafe_account_auth(tmp_path, unsafe_k
     assert not (workspace_home / ".codex" / "auth.json").exists()
 
 
-@pytest.mark.parametrize("unsafe_kind", ["regular", "wrong_link"])
+@pytest.mark.parametrize("unsafe_kind", ["wrong_link", "fifo"])
 def test_codex_provider_auth_link_never_replaces_workspace_auth_state(
     tmp_path,
     unsafe_kind,
@@ -401,19 +473,19 @@ def test_codex_provider_auth_link_never_replaces_workspace_auth_state(
     workspace_codex = workspace_home / ".codex"
     workspace_codex.mkdir(parents=True)
     workspace_auth = workspace_codex / "auth.json"
-    if unsafe_kind == "regular":
-        workspace_auth.write_text("must stay")
-    else:
+    if unsafe_kind == "wrong_link":
         workspace_auth.symlink_to(tmp_path / "wrong-account" / "auth.json")
+    else:
+        os.mkfifo(workspace_auth)
 
     result = _run_codex_provider_auth_link(provider_root, workspace_home)
 
     assert result.returncode != 0
-    if unsafe_kind == "regular":
-        assert workspace_auth.read_text() == "must stay"
-    else:
+    if unsafe_kind == "wrong_link":
         assert workspace_auth.is_symlink()
         assert workspace_auth.readlink() == tmp_path / "wrong-account" / "auth.json"
+    else:
+        assert stat.S_ISFIFO(workspace_auth.stat().st_mode)
 
 
 def test_bound_claude_account_does_not_apply_codex_runtime_metadata_contract(tmp_path):
@@ -872,6 +944,30 @@ def test_fast_sandbox_does_not_treat_projected_paths_as_container_evidence(tmp_p
     }
 
     assert manager.fast_sandbox_from_worker(worker) is None
+
+
+def test_fast_sandbox_rejects_stale_provider_mount_for_idle_workspace(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    sandbox = SandboxInfo(
+        container_name="wpr-wrk-idle",
+        container_id="container-idle",
+        state="running",
+        workspace_dir=str(tmp_path / "workspace"),
+        home_dir=str(tmp_path / "home"),
+        pid=4242,
+        image=manager.image,
+        networks=(manager._network_name_for_container("wpr-wrk-idle"),),
+        mounts=((str(tmp_path / "provider-account"), "/workspace/.provider-account"),),
+    )
+    manager.inspect = lambda worker_id: sandbox  # type: ignore[method-assign]
+
+    assert manager.fast_sandbox_from_worker(
+        {
+            "worker_id": "wrk_idle",
+            "container_id": "container-idle",
+            "state": "ready",
+        }
+    ) is None
 
 
 def test_ensure_ready_creates_container_when_only_projected_paths_exist(tmp_path):

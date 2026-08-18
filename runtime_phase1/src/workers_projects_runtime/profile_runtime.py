@@ -1705,7 +1705,8 @@ class ProfiledWorkerRuntime:
         run_id: str | None = None,
     ) -> dict[str, object]:
         runtime = self._runtime_for_worker(worker)
-        if mission_provider_account_selection(worker) is not None:
+        clean_run_id = str(run_id or "").strip()
+        if mission_provider_account_selection(worker) is not None and clean_run_id:
             with self.provider_account_binder.project_active_route(
                 worker,
                 runtime_name=str(
@@ -1713,7 +1714,7 @@ class ProfiledWorkerRuntime:
                     or worker.get("profile")
                     or ""
                 ).strip(),
-                run_id=str(run_id or "").strip(),
+                run_id=clean_run_id,
             ) as projected_worker:
                 if hasattr(runtime, "desktop_action"):
                     return runtime.desktop_action(
@@ -1725,6 +1726,9 @@ class ProfiledWorkerRuntime:
                 raise RuntimeErrorBase(
                     f"Desktop actions are not supported for profile {worker.get('profile') or 'unknown'}"
                 )
+        # A user-opened idle workstation is an isolated setup surface, not a provider mission.
+        # Never project the connected subscription home without an exact active run/lease. The
+        # native harness keeps any manual tool/account sign-in in this workspace's persisted state.
         if hasattr(runtime, "desktop_action"):
             return runtime.desktop_action(
                 worker,

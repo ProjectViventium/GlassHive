@@ -452,6 +452,43 @@ def test_desktop_action_projects_the_exact_active_mission_provider_binding(tmp_p
     ) is None
 
 
+@pytest.mark.parametrize(
+    ("provider", "profile", "runtime_attr", "action"),
+    (
+        ("codex", "codex-cli", "codex", "codex"),
+        ("claude", "claude-code", "claude", "claude"),
+    ),
+)
+def test_idle_personal_workspace_desktop_action_uses_isolated_workspace_sign_in(
+    tmp_path, monkeypatch, provider, profile, runtime_attr, action
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider=provider)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = {
+        **_worker(account["account_id"], profile=profile),
+        "execution_mode": "docker",
+    }
+    recorder = RecordingRuntime()
+    setattr(runtime, runtime_attr, recorder)
+
+    launched = runtime.desktop_action(worker, action)
+
+    assert launched["status"] == "launched"
+    assert recorder.worker is not None
+    assert "_glasshive_provider_account_bound" not in recorder.worker
+    assert "_glasshive_provider_account_mount_host" not in recorder.worker
+    assert store.active_provider_lease(
+        account["account_id"], f"{profile}:mission"
+    ) is None
+
+
 def test_mission_cleanup_waits_for_a_borrowed_desktop_action_projection(
     tmp_path, monkeypatch
 ):
