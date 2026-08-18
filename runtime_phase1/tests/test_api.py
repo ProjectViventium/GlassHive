@@ -6640,6 +6640,16 @@ def test_artifact_surfaces_reject_browser_runtime_scratch_paths(tmp_path, monkey
     )
     persistent_extension.parent.mkdir(parents=True, exist_ok=True)
     persistent_extension.write_text("{}", encoding="utf-8")
+    browser_profile_state = (
+        workspace
+        / "work-services"
+        / "browser-profile"
+        / "ActorSafetyLists"
+        / "1.0"
+        / "listdata.json"
+    )
+    browser_profile_state.parent.mkdir(parents=True, exist_ok=True)
+    browser_profile_state.write_text("{}", encoding="utf-8")
     upload_metadata = workspace / "uploads" / "source.txt.metadata.json"
     upload_metadata.parent.mkdir(parents=True, exist_ok=True)
     upload_metadata.write_text("{}", encoding="utf-8")
@@ -6647,6 +6657,7 @@ def test_artifact_surfaces_reject_browser_runtime_scratch_paths(tmp_path, monkey
     assert not is_user_deliverable_relative_path(extension_index.relative_to(workspace))
     assert not is_user_deliverable_relative_path(copied_cookie_store.relative_to(workspace))
     assert not is_user_deliverable_relative_path(persistent_extension.relative_to(workspace))
+    assert not is_user_deliverable_relative_path(browser_profile_state.relative_to(workspace))
     assert not is_user_deliverable_relative_path(upload_metadata.relative_to(workspace))
 
     live = client.get(f"/v1/workers/{worker['worker_id']}/live")
@@ -6663,6 +6674,7 @@ def test_artifact_surfaces_reject_browser_runtime_scratch_paths(tmp_path, monkey
     assert extension_index.relative_to(workspace).as_posix() not in listed_paths
     assert copied_cookie_store.relative_to(workspace).as_posix() not in listed_paths
     assert persistent_extension.relative_to(workspace).as_posix() not in listed_paths
+    assert browser_profile_state.relative_to(workspace).as_posix() not in listed_paths
     assert upload_metadata.relative_to(workspace).as_posix() not in listed_paths
 
     opened = client.get(
@@ -6685,6 +6697,20 @@ def test_artifact_surfaces_reject_browser_runtime_scratch_paths(tmp_path, monkey
     )
     assert persistent_download.status_code == 400
     assert persistent_download.json()["detail"] == "Artifact path is not downloadable"
+
+    browser_profile_open = client.get(
+        f"/v1/workers/{worker['worker_id']}/artifacts/open",
+        params={"path": browser_profile_state.relative_to(workspace).as_posix()},
+    )
+    assert browser_profile_open.status_code == 400
+    assert browser_profile_open.json()["detail"] == "Artifact path is not downloadable"
+
+    browser_profile_download = client.get(
+        f"/v1/workers/{worker['worker_id']}/artifacts/download",
+        params={"path": browser_profile_state.relative_to(workspace).as_posix()},
+    )
+    assert browser_profile_download.status_code == 400
+    assert browser_profile_download.json()["detail"] == "Artifact path is not downloadable"
 
 
 def test_worker_artifact_listing_pages_complete_large_workspace(tmp_path):
@@ -10439,7 +10465,13 @@ def test_worker_metadata_favorite_round_trips(tmp_path):
     ).json()
     worker = client.post(
         f"/v1/projects/{project['project_id']}/workers",
-        json={"owner_id": "demo-owner", "name": "Marketing Sandbox", "role": "operator", "profile": "codex-cli"},
+        json={
+            "owner_id": "demo-owner",
+            "name": "Marketing Sandbox",
+            "role": "operator",
+            "profile": "codex-cli",
+            "workspace_kind": "ephemeral",
+        },
     ).json()
 
     updated = client.patch(
@@ -10450,8 +10482,10 @@ def test_worker_metadata_favorite_round_trips(tmp_path):
     assert updated.status_code == 200
     assert updated.json()["favorite"] is True
     assert updated.json()["name"] == "Marketing Sandbox"
+    assert updated.json()["workspace_kind"] == "named"
     fetched = client.get(f"/v1/workers/{worker['worker_id']}").json()
     assert fetched["favorite"] is True
+    assert fetched["workspace_kind"] == "named"
 
 
 def test_async_worker_creation_parks_without_starting_compute(tmp_path):

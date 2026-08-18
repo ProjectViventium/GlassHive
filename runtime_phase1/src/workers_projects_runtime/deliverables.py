@@ -46,6 +46,7 @@ NON_DELIVERABLE_DIR_NAMES = {
     ".venv",
     "__pycache__",
     "chrome-user-data",
+    "browser-profile",
     "chromium-user-data",
     "glasshive-run",
     "glasshive-host-tools",

@@ -3968,6 +3968,7 @@ def create_mcp_server(
         )
         title = clean_description.splitlines()[0].strip()[:120] or "GlassHive workspace"
         delegate_alias = workspace_alias if reuse_existing_workspace else None
+        resolved_catalog_item: dict[str, Any] | None = None
         if reuse_existing_workspace:
             supplied_alias = str(delegate_alias or "").strip()
             lookup_name = supplied_alias or title
@@ -4005,7 +4006,8 @@ def create_mcp_server(
                     "use workspace_list once and retry with its workspace_alias"
                 )
             if len(direct_alias_matches) == 1:
-                resolved_catalog_alias = str(direct_alias_matches[0]["alias"]).strip()
+                resolved_catalog_item = direct_alias_matches[0]
+                resolved_catalog_alias = str(resolved_catalog_item["alias"]).strip()
             else:
                 exact_name_matches = [
                     item
@@ -4019,13 +4021,24 @@ def create_mcp_server(
                         "use workspace_list once and retry with its workspace_alias"
                     )
                 if len(exact_name_matches) == 1:
-                    resolved_catalog_alias = str(exact_name_matches[0]["alias"]).strip()
+                    resolved_catalog_item = exact_name_matches[0]
+                    resolved_catalog_alias = str(resolved_catalog_item["alias"]).strip()
             if not resolved_catalog_alias:
                 raise ValueError(
                     f"Could not resolve exactly one saved workspace matching {lookup_name!r}; "
                     "use workspace_list once and retry with its workspace_alias"
                 )
             delegate_alias = resolved_catalog_alias
+        effective_profile = profile
+        effective_execution_mode = execution_mode
+        if resolved_catalog_item is not None:
+            if not str(profile or "").strip():
+                effective_profile = str(resolved_catalog_item.get("profile") or "").strip()
+            if execution_mode is None:
+                inherited_execution_mode = str(
+                    resolved_catalog_item.get("execution_mode") or ""
+                ).strip()
+                effective_execution_mode = inherited_execution_mode or None
         return worker_delegate_once(
             title=title,
             instruction="\n".join(brief_sections),
@@ -4033,8 +4046,8 @@ def create_mcp_server(
             alias=delegate_alias,
             reuse_existing_workspace=reuse_existing_workspace,
             favorite=favorite,
-            profile=profile,
-            execution_mode=execution_mode,
+            profile=effective_profile,
+            execution_mode=effective_execution_mode,
             bootstrap_bundle_json=bootstrap_bundle_json,
             uploaded_files=uploaded_files,
             effort=effort,

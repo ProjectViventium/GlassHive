@@ -2735,6 +2735,10 @@ class WorkersProjectsService:
         updates: dict[str, object] = {}
         if favorite is not None:
             updates["favorite"] = 1 if favorite else 0
+            if favorite and workspace_kind is None and normalize_workspace_kind(
+                worker.get("workspace_kind")
+            ) == "ephemeral":
+                updates["workspace_kind"] = "named"
         if name is not None:
             clean_name = str(name or "").strip()
             if not clean_name:

@@ -4796,6 +4796,70 @@ def test_workspace_launch_reuses_existing_workspace_alias_across_projects(monkey
     assert api.find_or_resume_payloads[-1]["alias"] == "marketing-sandbox"
 
 
+def test_workspace_launch_inherits_saved_claude_profile_when_reuse_omits_profile(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+
+    class ExistingClaudeWorkspaceApi(TrackingApiClient):
+        def workspace_catalog(self, **kwargs):
+            return {
+                "items": [
+                    {
+                        "worker_id": "wrk_claude",
+                        "project_id": "prj_claude",
+                        "name": "Claude work services",
+                        "alias": "claude-work-services",
+                        "profile": "claude-code",
+                        "execution_mode": "docker",
+                        "state": "ready",
+                    }
+                ],
+                "next_cursor": None,
+            }
+
+        def list_projects(self, owner_id: str | None = None):
+            return [
+                {
+                    "project_id": "prj_claude",
+                    "owner_id": "demo-owner",
+                    "title": "Claude work services",
+                }
+            ]
+
+        def list_workers(self, project_id: str):
+            return [
+                {
+                    "worker_id": "wrk_claude",
+                    "project_id": project_id,
+                    "owner_id": "demo-owner",
+                    "name": "Claude work services",
+                    "profile": "claude-code",
+                    "execution_mode": "docker",
+                    "alias": "claude-work-services",
+                    "state": "ready",
+                }
+            ]
+
+    api = ExistingClaudeWorkspaceApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            result = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Claude work services\nCreate a short proof file.",
+                    "workspace_alias": "Claude work services",
+                    "reuse_existing_workspace": True,
+                },
+            )
+            assert _tool_json(result)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+
+    assert api.find_or_resume_payloads[-1]["profile"] == "claude-code"
+    assert api.find_or_resume_payloads[-1]["execution_mode"] == "docker"
+
+
 def test_workspace_launch_cannot_replace_existing_workspace_provider_policy(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
 
