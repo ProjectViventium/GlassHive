@@ -128,6 +128,40 @@ def test_claude_workspace_onboarding_marker_preserves_native_state(tmp_path):
     assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
 
 
+def test_claude_workspace_onboarding_accepts_container_root_owned_bind_home(tmp_path):
+    workspace_home = tmp_path / "root-owned-bind-home"
+    workspace_home.mkdir(mode=0o700)
+    wrapper = f"""
+import pathlib
+import types
+import sys
+
+workspace = pathlib.Path(sys.argv[1])
+real_lstat = pathlib.Path.lstat
+
+def docker_bind_lstat(path):
+    metadata = real_lstat(path)
+    if path == workspace:
+        return types.SimpleNamespace(st_mode=metadata.st_mode, st_uid=0)
+    return metadata
+
+pathlib.Path.lstat = docker_bind_lstat
+exec({_CLAUDE_WORKSPACE_ONBOARDING_SCRIPT!r})
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", wrapper, str(workspace_home)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads((workspace_home / ".claude.json").read_text(encoding="utf-8")) == {
+        "hasCompletedOnboarding": True,
+    }
+
+
 def test_safe_docker_exec_env_preserves_bedrock_run_credentials_only():
     env = _safe_docker_exec_env(
         {

@@ -120,7 +120,7 @@ from pathlib import Path
 workspace_home = Path(sys.argv[1])
 workspace_home.mkdir(mode=0o700, parents=True, exist_ok=True)
 directory_stat = workspace_home.lstat()
-if not stat.S_ISDIR(directory_stat.st_mode) or directory_stat.st_uid != os.geteuid():
+if not stat.S_ISDIR(directory_stat.st_mode) or directory_stat.st_uid not in {0, os.geteuid()}:
     raise RuntimeError("unsafe Claude workspace configuration directory")
 target = workspace_home / ".claude.json"
 flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
