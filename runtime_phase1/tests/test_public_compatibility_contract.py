@@ -77,6 +77,7 @@ def test_connect_skill_skips_setup_when_connected_and_never_lists_the_catalog():
     assert "Do not install that capability in the controlling AI client" in compact_skill
     assert "Set `favorite=true`" in compact_skill
     assert "repeat only `workspace_wait`" in compact_skill
+    assert "pass its returned `run_id` and `worker_id`" in compact_skill
     assert "same personal AI account selected for that worker" in compact_skill
     assert "do not substitute the controlling client's own apps" in compact_skill
     assert "start a new task" not in compact_skill

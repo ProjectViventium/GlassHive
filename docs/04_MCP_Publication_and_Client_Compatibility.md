@@ -90,9 +90,18 @@ View / Steer short link when available. When the MCP host supplies stable conver
 GlassHive remembers the launch there and keeps raw project/worker/run ids diagnostic-only. A native
 client without stable conversation context instead receives one minimal `follow_up_context` containing
 the exact ids needed by `workspace_wait`/`workspace_status`; this avoids a workspace-list discovery
-call without widening the catalog or diagnostic payload. MCP outputs must not expose raw
+call without widening the catalog or diagnostic payload. When `follow_up_context` is returned, its
+`run_id` and `worker_id` are the primary continuation contract and clients must pass them to each
+bounded wait/status call. Recent-conversation resolution is a fallback only when the launch returned
+no follow-up context and the host preserves stable conversation metadata. MCP outputs must not expose raw
 `gh_token` URLs or opaque signed-link tokens; they should expose `/r/{ref}` and `/v1/link-refs/{ref}`
 indirection instead.
+
+Workspace-native tool and account setup stays inside the selected persistent workstation. The
+Workspaces `Set up tools` action opens that profile's installed AI harness through the generic desktop
+action contract; it does not add connector-specific frontend flows or copy connector credentials into
+the controlling MCP client. The harness owns its supported tools, sign-in, and persisted per-workspace
+state.
 
 For generated file delivery, `signed_download_url`/`default_url` is the default chat-facing artifact
 link and should be labeled `Download file`. The MCP payload should also preserve `signed_open_url`

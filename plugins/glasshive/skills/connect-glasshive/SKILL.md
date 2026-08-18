@@ -51,7 +51,9 @@ accounts, Connections, Library, or the tool catalog unless the user separately a
 surfaces. Use a short, natural workspace name on the first line and preserve the complete request
 in the remaining description/context. Set `favorite=true` when the user asked to favorite or pin
 the reusable workspace. If the workspace is still running and the user asked you to
-wait, repeat only `workspace_wait`; do not explore other tools while it works.
+wait, repeat only `workspace_wait`; when `workspace_launch` returns `follow_up_context`, pass its
+returned `run_id` and `worker_id` to every wait call. Omit those ids only when the launch returned
+no follow-up context. Do not explore other tools while it works.
 
 When the user names GlassHive or a saved GlassHive workspace, do not substitute the controlling
 client's own apps for the workspace. Send the requested outcome to that workspace.

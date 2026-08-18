@@ -1,5 +1,5 @@
 import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260817c';
-import { credentialPolicyTransition, preferredProviderAccountId, shouldResumeOnWorkspaceOpen, workspaceLifecycleControl } from './launch-policy.js?v=20260811m';
+import { credentialPolicyTransition, preferredProviderAccountId, shouldResumeOnWorkspaceOpen, workspaceLifecycleControl, workspaceSetupAction } from './launch-policy.js?v=20260817n';
 import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811m';
 import { compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery } from './workspace-overview.js?v=20260811m';
 
@@ -1018,6 +1018,15 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   });
   actions.appendChild(watch);
 
+  const setupTools = createButton('Set up tools');
+  setupTools.title = 'Open this workspace’s native AI so you can add or reconnect its tools and accounts.';
+  setupTools.setAttribute('aria-label', `Set up tools in ${workspaceTileTitle(workspace)}`);
+  setupTools.disabled = ['terminating', 'termination_failed', 'terminated'].includes(state);
+  setupTools.addEventListener('click', async () => {
+    await openWorkspaceTools(workspace, setupTools);
+  });
+  actions.appendChild(setupTools);
+
   const duplicate = createButton('Duplicate');
   duplicate.addEventListener('click', () => duplicateSavedWorkspace(workspace, duplicate, refreshBootstrap));
   moreActions.appendChild(duplicate);
@@ -1181,6 +1190,28 @@ async function openWorkspaceSurface(workspace, button) {
       if (button) button.textContent = 'Resuming…';
       await postJson(workerApiUrl(workerId, '/action/resume'));
     }
+    window.location.href = String(workspace?.workspace_url || workspace?.watch_url || '#');
+  } catch (error) {
+    const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);
+    const output = tile?.querySelector('[data-worker-output]');
+    if (output) output.textContent = error.message;
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
+}
+
+async function openWorkspaceTools(workspace, button) {
+  const workerId = String(workspace?.worker_id || '');
+  const action = workspaceSetupAction(workspace?.profile);
+  const originalText = button?.textContent || '';
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Opening…';
+  }
+  try {
+    await postJson(workerApiUrl(workerId, `/action/${encodeURIComponent(action)}`));
     window.location.href = String(workspace?.workspace_url || workspace?.watch_url || '#');
   } catch (error) {
     const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);

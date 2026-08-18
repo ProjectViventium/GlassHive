@@ -52,6 +52,14 @@ export function shouldResumeOnWorkspaceOpen({ workspaceKind, renderedState, fall
     && WORKSPACE_OPEN_RESUME_STATES.has(displayedState);
 }
 
+export function workspaceSetupAction(profile) {
+  const normalized = String(profile || '').trim().toLowerCase();
+  if (normalized === 'codex-cli') return 'codex';
+  if (normalized === 'claude-code') return 'claude';
+  if (normalized.startsWith('openclaw')) return 'openclaw';
+  return 'terminal';
+}
+
 export function workspaceLifecycleControl(state) {
   const normalized = String(state || '').trim().toLowerCase();
   const action = WORKSPACE_LIFECYCLE_RESUME_STATES.has(normalized) ? 'resume' : 'pause';

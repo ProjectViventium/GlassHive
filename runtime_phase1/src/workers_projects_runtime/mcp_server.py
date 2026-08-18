@@ -5339,8 +5339,10 @@ def create_mcp_server(
             "Standalone non-blocking status/result check for GlassHive. Use this after workspace_launch, "
             "worker_delegate_once, or worker_run when the user asks whether the work is done, wants the "
             "latest result, or needs a quick status check. Do not call it immediately after launch "
-            "unless the user asked for status/diagnostics. If a same-conversation "
-            "follow-up call omits ids, GlassHive resolves the most recent launch scoped "
+            "unless the user asked for status/diagnostics. When workspace_launch returns "
+            "follow_up_context, pass its run_id and worker_id here. Omit ids only when no "
+            "follow_up_context was returned and the host preserves stable conversation context; "
+            "GlassHive then resolves the most recent launch scoped "
             "to the authenticated user/conversation. This does not require LibreChat or host-app "
             "callback wiring. Returns run state, worker state, output/error text, and View / Steer "
             "link data when available."
@@ -5349,8 +5351,8 @@ def create_mcp_server(
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def workspace_status(
-        run_id: Annotated[str | None, Field(description="Optional run id from diagnostics or a prior explicit status result. Omit after a same-conversation launch when scoped recent dispatch is available.")] = None,
-        worker_id: Annotated[str | None, Field(description="Optional worker id for live state and View / Steer link. Omit after a same-conversation launch when scoped recent dispatch is available.")] = None,
+        run_id: Annotated[str | None, Field(description="Run id from workspace_launch follow_up_context when returned. Omit only when the launch returned no follow_up_context and scoped recent dispatch is available.")] = None,
+        worker_id: Annotated[str | None, Field(description="Worker id from workspace_launch follow_up_context when returned. Omit only when the launch returned no follow_up_context and scoped recent dispatch is available.")] = None,
         include_live: Annotated[bool, Field(description="Include worker live details when worker_id is available.")] = True,
         include_diagnostics: Annotated[bool, Field(description="Include raw run/workspace ids and live diagnostic snapshots.")] = False,
     ) -> dict[str, Any]:
@@ -5379,9 +5381,11 @@ def create_mcp_server(
             "WPR_MCP_BLOCKING_WAIT_DEFAULT_SEC capped by WPR_MCP_BLOCKING_WAIT_MAX_SEC. The default is "
             "intentionally bounded below common chat/proxy request timeouts; if this tool returns "
             "status=still_running and the user asked you to wait, immediately call workspace_wait again "
-            "in the same conversation instead of leaving the user with a stale spinner. If a "
-            "same-conversation follow-up call omits ids, GlassHive resolves the most "
-            "recent launch scoped to the authenticated user/conversation. This does not require "
+            "in the same conversation instead of leaving the user with a stale spinner. If the "
+            "launch result includes follow_up_context, pass its returned run_id and worker_id to every "
+            "workspace_wait call. Omit ids only when no follow_up_context was returned and the host "
+            "preserves stable conversation context; GlassHive then resolves the most recent launch "
+            "scoped to the authenticated user/conversation. This does not require "
             "LibreChat or host-app callback wiring. Omit poll_interval_seconds for normal work; "
             "do not invent polling values unless the user/operator gave a concrete override. "
             "GlassHive uses the configured efficient polling cadence, keeps early checks responsive, "
@@ -5392,8 +5396,8 @@ def create_mcp_server(
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     async def workspace_wait(
-        run_id: Annotated[str | None, Field(description="Optional run id from diagnostics or a prior explicit status result. Omit after a same-conversation launch when scoped recent dispatch is available.")] = None,
-        worker_id: Annotated[str | None, Field(description="Optional worker id for live state and View / Steer link.")] = None,
+        run_id: Annotated[str | None, Field(description="Run id from workspace_launch follow_up_context when returned. Omit only when the launch returned no follow_up_context and scoped recent dispatch is available.")] = None,
+        worker_id: Annotated[str | None, Field(description="Worker id from workspace_launch follow_up_context when returned. Omit only when the launch returned no follow_up_context and scoped recent dispatch is available.")] = None,
         timeout_seconds: Annotated[float | None, Field(description="Maximum seconds to block before returning timeout status. Omit to use the configured GlassHive completion wait default.")] = None,
         poll_interval_seconds: Annotated[float | None, Field(description="Optional polling interval in seconds. Omit for the configured efficient default.")] = None,
         include_live: Annotated[bool, Field(description="Include worker live details in the final response when available.")] = True,

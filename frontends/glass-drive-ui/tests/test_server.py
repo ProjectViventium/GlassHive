@@ -2237,6 +2237,41 @@ def test_workspace_open_resume_policy_uses_the_user_visible_state():
     }
 
 
+def test_workspace_native_tool_setup_uses_the_selected_profile_without_connector_wiring():
+    policy_module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ workspaceSetupAction }} from {json.dumps(policy_module)};"
+                "process.stdout.write(JSON.stringify({"
+                "codex:workspaceSetupAction('codex-cli'),"
+                "claude:workspaceSetupAction('claude-code'),"
+                "openclaw:workspaceSetupAction('openclaw-general'),"
+                "unknown:workspaceSetupAction('custom-worker')"
+                "}));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "codex": "codex",
+        "claude": "claude",
+        "openclaw": "openclaw",
+        "unknown": "terminal",
+    }
+
+    app_js = (Path(server_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
+    assert "Set up tools" in app_js
+    assert "workspaceSetupAction(workspace?.profile)" in app_js
+    assert "workerApiUrl(workerId, `/action/${encodeURIComponent(action)}`)" in app_js
+    assert "workspace?.workspace_url || workspace?.watch_url" in app_js
+
+
 def test_failed_workspace_keeps_the_recommended_pause_recovery_visible():
     policy_module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
     result = subprocess.run(

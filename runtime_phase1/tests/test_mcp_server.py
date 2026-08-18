@@ -5642,6 +5642,7 @@ def test_tool_descriptions_advertise_mcp_owned_usage_contract(monkeypatch):
 
             wait_description = tools["workspace_wait"]["description"]
             assert "first surface the View / Steer link" in wait_description
+            assert "pass its returned run_id and worker_id" in wait_description
             assert "Omit poll_interval_seconds for normal work" in wait_description
             assert "backs off toward the configured cap" in wait_description
 
