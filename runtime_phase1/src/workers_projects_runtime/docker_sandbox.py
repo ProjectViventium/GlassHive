@@ -25,6 +25,7 @@ from .codex_plugins import (
     OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH,
     OPENAI_PLUGIN_MARKETPLACE_ORIGIN,
 )
+from .mission_provider_accounts import apply_bound_provider_account_environment
 from .openclaw_release import (
     OPENCLAW_RUNTIME_FAST_URI_VERSION,
     OPENCLAW_RUNTIME_LOCK_SHA256,
@@ -1266,6 +1267,12 @@ screen -ls | awk -v target="$target" '
         merged_env = {
             **self._desktop_env(),
         }
+        if resolved_worker.get("_glasshive_provider_account_bound"):
+            apply_bound_provider_account_environment(
+                resolved_worker,
+                merged_env,
+                runtime_name=runtime_name,
+            )
         result = self._docker_exec(
             sandbox.container_name,
             command,

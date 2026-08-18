@@ -1540,6 +1540,79 @@ def test_desktop_action_revalidates_projected_worker_without_container_evidence(
     assert calls == ["ensure", "wpr-wrk-test:True:True:bash"]
 
 
+@pytest.mark.parametrize(
+    ("runtime_name", "action", "selector", "selector_value", "absent_selector"),
+    (
+        (
+            "claude-code",
+            "claude",
+            "CLAUDE_CONFIG_DIR",
+            "/workspace/.provider-account/claude",
+            "CODEX_HOME",
+        ),
+        (
+            "codex-cli",
+            "codex",
+            "CODEX_HOME",
+            "/workspace/.wpr-home/.codex",
+            "CLAUDE_CONFIG_DIR",
+        ),
+    ),
+)
+def test_desktop_action_projects_only_the_validated_personal_provider_home(
+    tmp_path,
+    runtime_name,
+    action,
+    selector,
+    selector_value,
+    absent_selector,
+):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    captured_env: dict[str, str] = {}
+    sandbox = SandboxInfo(
+        container_name="wpr-wrk-test",
+        container_id="container123",
+        state="running",
+        workspace_dir=str(tmp_path / "workspace"),
+        home_dir=str(tmp_path / "home"),
+        pid=1234,
+        image="img",
+        novnc_port=None,
+    )
+    manager.ensure_ready = lambda *args, **kwargs: sandbox  # type: ignore[method-assign]
+
+    def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
+        captured_env.update(dict(env or {}))
+        return subprocess.CompletedProcess(["docker"], returncode=0, stdout="", stderr="")
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+    worker = {
+        "worker_id": "wrk_test",
+        "state": "running",
+        "bootstrap_bundle": {
+            "provider_account": {
+                "policy": "personal_required",
+                "account_id": "acct_claude",
+            }
+        },
+        "_glasshive_provider_account_bound": True,
+        "_glasshive_provider_account_env": {
+            selector: selector_value,
+        },
+    }
+
+    launched = manager.desktop_action(
+        "wrk_test",
+        runtime_name,
+        action,
+        worker=worker,
+    )
+
+    assert launched["status"] == "launched"
+    assert captured_env[selector] == selector_value
+    assert absent_selector not in captured_env
+
+
 def test_ensure_ready_skips_image_probe_for_existing_container(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     calls: list[str] = []
