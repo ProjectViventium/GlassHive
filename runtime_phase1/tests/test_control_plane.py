@@ -517,6 +517,8 @@ if sys.argv[1:] == ['auth', 'login', '--claudeai']:
     print(f'received {code}', flush=True)
     with open(marker, 'w', encoding='utf-8') as handle:
         handle.write('ready')
+    with open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'], '.claude.json'), 'w', encoding='utf-8') as handle:
+        handle.write('{"oauthAccount":{"provider":"synthetic"}}')
     raise SystemExit(0)
 if sys.argv[1:] == ['auth', 'status', '--json']:
     raise SystemExit(0 if os.path.exists(marker) else 1)
@@ -679,6 +681,12 @@ raise SystemExit(2)
 
         assert settled["status"] == "ready"
         assert "synthetic-browser-code" not in json.dumps(settled)
+        claude_home = next((tmp_path / "provider-homes").rglob("claude"))
+        claude_state = json.loads((claude_home / ".claude.json").read_text())
+        assert claude_state == {
+            "hasCompletedOnboarding": True,
+            "oauthAccount": {"provider": "synthetic"},
+        }
         reused = setup.status(
             account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
         )

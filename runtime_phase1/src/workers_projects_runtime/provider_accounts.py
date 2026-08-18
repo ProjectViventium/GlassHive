@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import pty
 import re
@@ -10,6 +11,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -281,6 +283,59 @@ class ProviderAccountHomeManager:
             self._private(target)
             return {"CLAUDE_CONFIG_DIR": str(target)}
         raise ControlPlaneError("Unsupported provider account home")
+
+    def prepare_interactive_home(self, *, provider: str, account_home: Path) -> None:
+        """Make a verified Claude login immediately reusable by its interactive CLI."""
+
+        if provider not in {"claude", "anthropic"}:
+            return
+        config_dir = account_home / "claude"
+        config_path = config_dir / ".claude.json"
+        try:
+            metadata = config_path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or metadata.st_size > 1_048_576
+            ):
+                raise ControlPlaneError("Claude account state is not a safe managed file")
+            state = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ControlPlaneError("Claude account state is unavailable") from exc
+        if not isinstance(state, dict):
+            raise ControlPlaneError("Claude account state is invalid")
+        if state.get("hasCompletedOnboarding") is True:
+            return
+        state["hasCompletedOnboarding"] = True
+        serialized = json.dumps(state, indent=2, sort_keys=True) + "\n"
+        temp_fd, temp_name = tempfile.mkstemp(
+            dir=config_dir,
+            prefix=".glasshive-claude-onboarding-",
+        )
+        try:
+            os.fchmod(temp_fd, 0o600)
+            with os.fdopen(temp_fd, "w", encoding="utf-8", closefd=True) as handle:
+                temp_fd = -1
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, config_path)
+            directory_fd = os.open(
+                config_dir,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temp_fd >= 0:
+                os.close(temp_fd)
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
 
     def tighten_permissions(self, *, account_home: Path) -> None:
         """Validate and privatize credential state through no-follow directory descriptors."""
@@ -937,6 +992,10 @@ class ProviderSetupManager:
             )
             require_verification_lease()
             if authenticated:
+                self.homes.prepare_interactive_home(
+                    provider=provider,
+                    account_home=account_home,
+                )
                 # Provider status commands may recreate private cache wrappers
                 # after the pre-verification seal. Reconcile again while the
                 # exclusive verify lease is still held, then perform the final
