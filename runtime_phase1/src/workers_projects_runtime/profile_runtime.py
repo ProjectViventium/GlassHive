@@ -68,6 +68,7 @@ from .openclaw_runtime import (
     runtime_start_boundary,
 )
 from .openclaw_release import reviewed_openclaw_env
+from .provider_accounts import ProviderAccountHomeManager
 from .runtime_requirements import host_runtime_requirement_issue
 from .run_evidence import (
     build_constraint_ledger,
@@ -1053,6 +1054,57 @@ class ProfiledWorkerRuntime:
 
         self.codex.reconcile_provider_account_binding(account_home)
 
+    def recover_interactive_provider_sessions(self) -> None:
+        """Remove credential-bearing setup containers orphaned by a service restart."""
+
+        store = self.provider_account_binder.store
+        if store is None:
+            return
+        homes = ProviderAccountHomeManager(self.provider_account_binder.home_root)
+        supported = {
+            "codex-cli": {"codex", "openai"},
+            "claude-code": {"claude", "anthropic"},
+        }
+        for lease in store.unreleased_interactive_provider_leases():
+            lane = str(lease.get("lane") or "")
+            profile = lane.removesuffix(":interactive")
+            provider = store.get_provider_account(
+                account_id=str(lease.get("account_id") or ""),
+                tenant_id=str(lease.get("tenant_id") or ""),
+                owner_id=str(lease.get("owner_id") or ""),
+            )
+            if (
+                profile not in supported
+                or provider is None
+                or str(provider.get("provider") or "").strip().lower()
+                not in supported[profile]
+            ):
+                raise RuntimeErrorBase(
+                    "Interactive provider session recovery has inconsistent account metadata"
+                )
+            account_home = homes.account_home_path(
+                tenant_id=str(lease.get("tenant_id") or ""),
+                owner_id=str(lease.get("owner_id") or ""),
+                account_id=str(lease.get("account_id") or ""),
+            )
+            runtime = self._runtime_for_profile(profile, "docker")
+            runtime.release_provider_account_binding(
+                {
+                    "worker_id": str(lease.get("worker_id") or ""),
+                    "tenant_id": str(lease.get("tenant_id") or ""),
+                    "owner_id": str(lease.get("owner_id") or ""),
+                    "profile": profile,
+                    "execution_mode": "docker",
+                    "_active_run_id": str(lease.get("run_id") or ""),
+                    "_glasshive_provider_account_mount_host": str(account_home),
+                }
+            )
+            store.release_provider_lease(
+                lease_id=str(lease.get("lease_id") or ""),
+                tenant_id=str(lease.get("tenant_id") or ""),
+                owner_id=str(lease.get("owner_id") or ""),
+            )
+
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).ensure_worker_ready(worker)
 
@@ -1726,9 +1778,40 @@ class ProfiledWorkerRuntime:
                 raise RuntimeErrorBase(
                     f"Desktop actions are not supported for profile {worker.get('profile') or 'unknown'}"
                 )
-        # A user-opened idle workstation is an isolated setup surface, not a provider mission.
-        # Never project the connected subscription home without an exact active run/lease. The
-        # native harness keeps any manual tool/account sign-in in this workspace's persisted state.
+        runtime_name = str(
+            getattr(runtime, "runtime_name", "")
+            or worker.get("profile")
+            or ""
+        ).strip()
+        expected_action = {
+            "codex-cli": "codex",
+            "claude-code": "claude",
+        }.get(runtime_name)
+        selection = mission_provider_account_selection(worker)
+        if (
+            not clean_run_id
+            and expected_action == str(action or "").strip().lower()
+            and selection is not None
+            and str(worker.get("execution_mode") or "docker").strip().lower() == "docker"
+        ):
+            selected_account = self.provider_account_binder.selected_account_record(
+                worker,
+                selection,
+            )
+            if (
+                selected_account is None
+                or str(selected_account.get("auth_method") or "").strip().lower()
+                == "subscription"
+            ):
+                return self._launch_interactive_provider_session(
+                    runtime,
+                    worker,
+                    action,
+                    url=url,
+                    runtime_name=runtime_name,
+                )
+        # Browser, files, and shell actions never need provider credentials. Keep them on the
+        # reusable workspace home without holding or exposing a personal-account lease.
         if hasattr(runtime, "desktop_action"):
             return runtime.desktop_action(
                 worker,
@@ -1737,6 +1820,72 @@ class ProfiledWorkerRuntime:
                 run_id=run_id,
             )
         raise RuntimeErrorBase(f"Desktop actions are not supported for profile {worker.get('profile') or 'unknown'}")
+
+    @staticmethod
+    def _interactive_provider_session_timeout() -> float:
+        raw = str(
+            os.environ.get("GLASSHIVE_INTERACTIVE_PROVIDER_SESSION_MAX_SECONDS")
+            or "3600"
+        ).strip()
+        try:
+            seconds = float(raw)
+        except ValueError:
+            seconds = 3600.0
+        return max(300.0, min(seconds, 4 * 60 * 60.0))
+
+    def _launch_interactive_provider_session(
+        self,
+        runtime,
+        worker: dict,
+        action: str,
+        *,
+        url: str | None,
+        runtime_name: str,
+    ) -> dict[str, object]:
+        """Borrow only the selected account auth while the visible native CLI is open."""
+
+        session_id = f"interactive_{secrets.token_hex(16)}"
+        session_timeout = self._interactive_provider_session_timeout()
+        binding = self.provider_account_binder.bind(
+            worker,
+            runtime_name=runtime_name,
+            run_id=session_id,
+            timeout_sec=session_timeout,
+            lease_purpose="interactive",
+            allow_preferred_fallback=False,
+            release_binding=getattr(runtime, "release_provider_account_binding", None),
+            abort_binding=lambda bound_worker: runtime.terminate_worker(bound_worker),
+            reconcile_binding=getattr(runtime, "reconcile_provider_account_binding", None),
+        )
+        bound_worker = binding.__enter__()
+        close_lock = Lock()
+        closed = Event()
+
+        def close_binding() -> None:
+            if closed.is_set():
+                return
+            with close_lock:
+                if closed.is_set():
+                    return
+                try:
+                    binding.__exit__(None, None, None)
+                finally:
+                    closed.set()
+
+        try:
+            return runtime.desktop_action(
+                bound_worker,
+                action,
+                url=url,
+                run_id=None,
+                on_exit=close_binding,
+                max_runtime_seconds=session_timeout,
+            )
+        except BaseException as exc:
+            if not closed.is_set():
+                binding.__exit__(type(exc), exc, exc.__traceback__)
+                closed.set()
+            raise
 
 
 class BaseCliWorkerRuntime:
@@ -2383,8 +2532,18 @@ class BaseCliWorkerRuntime:
         *,
         url: str | None = None,
         run_id: str | None = None,
+        on_exit: Callable[[], None] | None = None,
+        max_runtime_seconds: float | None = None,
     ) -> dict[str, object]:
         session_name = self._session_name_for_run_id(run_id) if action == "terminal" and run_id else None
+        session_options: dict[str, object] = {}
+        if on_exit is not None:
+            session_options.update(
+                {
+                    "on_exit": on_exit,
+                    "max_runtime_seconds": max_runtime_seconds,
+                }
+            )
         launched = self.sandbox.desktop_action(
             worker["worker_id"],
             self.runtime_name,
@@ -2392,6 +2551,7 @@ class BaseCliWorkerRuntime:
             url=url,
             session_name=session_name,
             worker=worker,
+            **session_options,
         )
         notes = {
             "terminal": (

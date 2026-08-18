@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 import uuid
 import weakref
 from collections.abc import Iterator
@@ -25,7 +26,7 @@ from .schema_version import (
 from .state_permissions import ensure_state_directory, secure_state_file
 
 
-RUNTIME_STORE_SCHEMA_VERSION = 5
+RUNTIME_STORE_SCHEMA_VERSION = 6
 
 
 class SchedulePrincipalAuthorityStoreError(ValueError):
@@ -34,6 +35,14 @@ class SchedulePrincipalAuthorityStoreError(ValueError):
 
 class WorkerClosedStoreError(ValueError):
     """A run reservation lost the race with permanent workspace closure."""
+
+
+class ProviderAccountBusyStoreError(ValueError):
+    """A run reservation lost the race with interactive provider-account use."""
+
+    def __init__(self, message: str, *, interactive: bool) -> None:
+        super().__init__(message)
+        self.interactive = interactive
 
 
 def _workspace_tags_json(values: list[str] | tuple[str, ...] | None) -> str:
@@ -99,6 +108,29 @@ class Store:
         except BaseException:
             self.close()
             raise
+
+    @staticmethod
+    def _interactive_provider_setup_active(
+        conn: sqlite3.Connection,
+        worker_id: str,
+    ) -> bool:
+        table = conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'provider_account_leases'
+            """
+        ).fetchone()
+        if table is None:
+            return False
+        return conn.execute(
+            """
+            SELECT 1 FROM provider_account_leases
+            WHERE worker_id = ? AND released_at IS NULL AND expires_at > ?
+              AND lane LIKE '%:interactive'
+            LIMIT 1
+            """,
+            (worker_id, time.time()),
+        ).fetchone() is not None
 
     def _secure_state_files(self) -> None:
         if os.name == "nt":
@@ -278,6 +310,15 @@ class Store:
                     FOREIGN KEY(worker_id) REFERENCES workers(worker_id),
                     FOREIGN KEY(project_id) REFERENCES projects(project_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS provider_account_run_fences (
+                    run_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_provider_account_run_fences_account
+                    ON provider_account_run_fences(account_id, run_id);
 
                 CREATE TABLE IF NOT EXISTS events (
                     event_id TEXT PRIMARY KEY,
@@ -2384,6 +2425,8 @@ class Store:
         state: str = "queued",
         *,
         resume_paused: bool = False,
+        provider_account_fence: tuple[str, str, bool] | None = None,
+        bootstrap_bundle_json: str | None = None,
     ) -> dict[str, Any]:
         run_id = f"run_{uuid.uuid4().hex[:10]}"
         queued_at = utc_now()
@@ -2433,6 +2476,29 @@ class Store:
                 (worker_id,),
             ).fetchone() is not None:
                 raise RuntimeError("Workspace is being garbage-collected")
+            if self._interactive_provider_setup_active(conn, worker_id):
+                raise ProviderAccountBusyStoreError(
+                    "Workspace AI setup is already active",
+                    interactive=True,
+                )
+            if provider_account_fence is not None:
+                account_id, mission_lane, allow_mission_fallback = provider_account_fence
+                active_lease = conn.execute(
+                    """
+                    SELECT lane, worker_id FROM provider_account_leases
+                    WHERE account_id = ? AND released_at IS NULL AND expires_at > ?
+                      AND NOT (worker_id = ? AND lane = ?)
+                    LIMIT 1
+                    """,
+                    (account_id, time.time(), worker_id, mission_lane),
+                ).fetchone()
+                if active_lease is not None:
+                    interactive = str(active_lease["lane"] or "").endswith(":interactive")
+                    if interactive or not allow_mission_fallback:
+                        raise ProviderAccountBusyStoreError(
+                            "Provider account setup or work is already active",
+                            interactive=interactive,
+                        )
             data["tenant_id"] = str(worker["tenant_id"] or "local")
             conn.execute(
                 """
@@ -2452,6 +2518,19 @@ class Store:
                 """,
                 data,
             )
+            if provider_account_fence is not None:
+                conn.execute(
+                    """
+                    INSERT INTO provider_account_run_fences (run_id, account_id, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (run_id, provider_account_fence[0], queued_at),
+                )
+            if bootstrap_bundle_json is not None:
+                conn.execute(
+                    "UPDATE workers SET bootstrap_bundle_json = ? WHERE worker_id = ?",
+                    (bootstrap_bundle_json, worker_id),
+                )
             conn.execute(
                 "UPDATE workers SET last_run_id = ?, updated_at = ? WHERE worker_id = ?",
                 (run_id, queued_at, worker_id),
@@ -2464,6 +2543,7 @@ class Store:
         *,
         runtime_bundle: dict[str, Any] | None = None,
         require_principal_authority: bool = False,
+        provider_account_fence: tuple[str, str, bool] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Atomically reserve and link one stable run to one scheduled dispatch.
 
@@ -2549,6 +2629,39 @@ class Store:
                     conn.execute("ROLLBACK")
                     raise RuntimeError("Stable scheduled run id is bound to another request")
             else:
+                if self._interactive_provider_setup_active(
+                    conn,
+                    str(schedule["worker_id"]),
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ProviderAccountBusyStoreError(
+                        "Workspace AI setup is already active",
+                        interactive=True,
+                    )
+                if provider_account_fence is not None:
+                    account_id, mission_lane, allow_mission_fallback = provider_account_fence
+                    active_lease = conn.execute(
+                        """
+                        SELECT lane, worker_id FROM provider_account_leases
+                        WHERE account_id = ? AND released_at IS NULL AND expires_at > ?
+                          AND NOT (worker_id = ? AND lane = ?)
+                        LIMIT 1
+                        """,
+                        (
+                            account_id,
+                            time.time(),
+                            str(schedule["worker_id"]),
+                            mission_lane,
+                        ),
+                    ).fetchone()
+                    if active_lease is not None:
+                        interactive = str(active_lease["lane"] or "").endswith(":interactive")
+                        if interactive or not allow_mission_fallback:
+                            conn.execute("ROLLBACK")
+                            raise ProviderAccountBusyStoreError(
+                                "Provider account setup or work is already active",
+                                interactive=interactive,
+                            )
                 conn.execute(
                     """
                     INSERT INTO runs (
@@ -2569,6 +2682,14 @@ class Store:
                         runtime_bundle_json,
                     ),
                 )
+                if provider_account_fence is not None:
+                    conn.execute(
+                        """
+                        INSERT INTO provider_account_run_fences (run_id, account_id, created_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (run_id, provider_account_fence[0], queued_at),
+                    )
 
             linked = conn.execute(
                 """

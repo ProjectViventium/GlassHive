@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -13,7 +14,8 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
+from typing import Callable
 from urllib.error import URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -34,6 +36,9 @@ from .openclaw_release import (
     reviewed_openclaw_env,
     stage_reviewed_openclaw_lock,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_iso() -> str:
@@ -1318,6 +1323,8 @@ screen -ls | awk -v target="$target" '
         url: str | None = None,
         session_name: str | None = None,
         worker: dict | None = None,
+        on_exit: Callable[[], None] | None = None,
+        max_runtime_seconds: float | None = None,
     ) -> dict[str, object]:
         resolved_worker = worker or {"worker_id": worker_id}
         sandbox = self.fast_sandbox_from_worker(resolved_worker) or self.ensure_ready(
@@ -1338,13 +1345,22 @@ screen -ls | awk -v target="$target" '
                 merged_env,
                 runtime_name=runtime_name,
             )
+        exec_options: dict[str, object] = {}
+        if on_exit is not None:
+            exec_options.update(
+                {
+                    "on_exit": on_exit,
+                    "max_runtime_seconds": max_runtime_seconds,
+                }
+            )
         result = self._docker_exec(
             sandbox.container_name,
             command,
             env=merged_env,
             cwd=self.workspace_mount,
-            detach=True,
+            detach=on_exit is None,
             fire_and_forget=True,
+            **exec_options,
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()[-1200:]
@@ -2591,6 +2607,8 @@ screen -ls | awk -v target="$target" '
         detach: bool = False,
         fire_and_forget: bool = False,
         user: str | None = None,
+        on_exit: Callable[[], None] | None = None,
+        max_runtime_seconds: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         args = ["exec"]
         if detach:
@@ -2628,12 +2646,22 @@ screen -ls | awk -v target="$target" '
             timeout_sec = float(raw_timeout) if raw_timeout else None
         except ValueError:
             timeout_sec = None
-        if detach and fire_and_forget:
+        if fire_and_forget:
             full_command = ["docker", *args]
-            spawned = self._spawn_detached_docker_exec(full_command, cleanup_path=env_file)
+            spawned = self._spawn_detached_docker_exec(
+                full_command,
+                cleanup_path=env_file,
+                on_exit=on_exit,
+                max_runtime_seconds=max_runtime_seconds,
+            )
             if not spawned and env_file is not None:
                 env_file.unlink(missing_ok=True)
-            return subprocess.CompletedProcess(full_command, returncode=0, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                full_command,
+                returncode=0 if spawned else 1,
+                stdout="",
+                stderr="" if spawned else "Docker exec could not start",
+            )
         try:
             return self._docker(args, check=False, capture_output=True, timeout_sec=timeout_sec)
         finally:
@@ -2691,6 +2719,8 @@ screen -ls | awk -v target="$target" '
         full_command: list[str],
         *,
         cleanup_path: Path | None = None,
+        on_exit: Callable[[], None] | None = None,
+        max_runtime_seconds: float | None = None,
     ) -> bool:
         # Start a tiny shell trampoline instead of invoking the Docker CLI inside
         # the request path. Docker Desktop can take seconds to accept an
@@ -2704,9 +2734,38 @@ screen -ls | awk -v target="$target" '
             )
         launch = ["sh", "-lc", f"{cleanup}sleep 0.1; {shlex.join(full_command)}"]
         try:
-            subprocess.Popen(launch, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            process = subprocess.Popen(
+                launch,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
         except OSError:
             return False
+        if on_exit is not None:
+            def wait_for_exit() -> None:
+                timed_out = False
+                try:
+                    process.wait(timeout=max_runtime_seconds)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                except Exception:
+                    logger.exception("Failed to monitor an interactive provider session")
+                try:
+                    on_exit()
+                except Exception:
+                    logger.exception("Failed to close an interactive provider session")
+                if timed_out:
+                    try:
+                        process.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        process.terminate()
+
+            Thread(
+                target=wait_for_exit,
+                name="glasshive-interactive-provider-session",
+                daemon=True,
+            ).start()
         return True
 
     def _ensure_container_writable_paths(self, container_name: str, container_paths: list[str]) -> None:

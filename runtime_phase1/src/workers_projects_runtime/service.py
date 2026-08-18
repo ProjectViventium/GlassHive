@@ -85,7 +85,12 @@ from .signed_links import (
     signed_link_ref_url,
     sign_link_token,
 )
-from .store import SchedulePrincipalAuthorityStoreError, Store, WorkerClosedStoreError
+from .store import (
+    ProviderAccountBusyStoreError,
+    SchedulePrincipalAuthorityStoreError,
+    Store,
+    WorkerClosedStoreError,
+)
 from .workspace_continuation import continuation_instruction
 
 
@@ -693,6 +698,14 @@ class WorkersProjectsService:
         self._background_consumers_enabled = _background_consumers_enabled()
         if reconcile_on_startup is None:
             reconcile_on_startup = _reconcile_on_startup_enabled()
+        if self._background_consumers_enabled:
+            recover_interactive = getattr(
+                self.runtime,
+                "recover_interactive_provider_sessions",
+                None,
+            )
+            if callable(recover_interactive):
+                recover_interactive()
         if self._background_consumers_enabled and reconcile_on_startup:
             self.reconcile_all_workers()
         if self._background_consumers_enabled:
@@ -1102,7 +1115,12 @@ class WorkersProjectsService:
             )
 
     def _ensure_dispatch_provider_ready(self, worker: dict) -> None:
-        if not self._uses_deployment_provider_route(worker):
+        if self._selected_account_has_interactive_lease(worker):
+            raise ControlPlaneConflict(
+                "Finish or close the open AI setup window before starting new work."
+            )
+        uses_deployment_route = self._uses_deployment_provider_route(worker)
+        if not uses_deployment_route:
             return
         readiness, _status = deployment_provider_readiness(
             str(worker.get("profile") or "")
@@ -1112,6 +1130,55 @@ class WorkersProjectsService:
                 "Work AI is not set up for this workspace. Ask an administrator to finish "
                 "provider setup or connect a personal account in Connections."
             )
+    def _provider_dispatch_fence(self, worker: dict) -> tuple[str, str, bool] | None:
+        if self.control_plane_store is None:
+            return None
+        selection = mission_provider_account_selection(worker)
+        if selection is None:
+            return None
+        fallback_ready = bool(
+            selection.policy == "personal_preferred"
+            and deployment_provider_readiness(str(worker.get("profile") or ""))[0]
+            == "deployment_managed"
+        )
+        return (
+            selection.account_id,
+            f"{str(worker.get('profile') or '').strip()}:mission",
+            fallback_ready,
+        )
+
+    @staticmethod
+    def _provider_account_busy_conflict(
+        exc: ProviderAccountBusyStoreError,
+    ) -> ControlPlaneConflict:
+        if exc.interactive:
+            return ControlPlaneConflict(
+                "Finish or close the open AI setup window before starting new work."
+            )
+        return ControlPlaneConflict(
+            "The selected personal AI account is already in use. Wait for that work to finish."
+        )
+
+    def _selected_account_has_interactive_lease(self, worker: dict) -> bool:
+        bundle = self._bootstrap_bundle_for(worker) or {}
+        raw = bundle.get("provider_account")
+        selection = raw if isinstance(raw, dict) else {}
+        account_id = str(selection.get("account_id") or "").strip()
+        if not account_id or self.control_plane_store is None:
+            return False
+        account = self.control_plane_store.get_provider_account(
+            account_id=account_id,
+            tenant_id=str(worker.get("tenant_id") or "local"),
+            owner_id=str(worker.get("owner_id") or ""),
+        )
+        if account is None:
+            return False
+        lease = self.control_plane_store.active_provider_account_lease(account_id)
+        return bool(
+            lease
+            and str(lease.get("lane") or "")
+            == f"{str(worker.get('profile') or '').strip()}:interactive"
+        )
 
     def _uses_deployment_provider_route(self, worker: dict) -> bool:
         bundle = self._bootstrap_bundle_for(worker) or {}
@@ -4011,6 +4078,7 @@ class WorkersProjectsService:
                 separators=(",", ":"),
             )
         self._ensure_dispatch_provider_ready(effective_worker)
+        provider_account_fence = self._provider_dispatch_fence(effective_worker)
         self._ensure_runtime_available(
             str(worker.get("profile") or ""),
             str(worker.get("execution_mode") or "docker"),
@@ -4022,7 +4090,10 @@ class WorkersProjectsService:
                 schedule_id,
                 runtime_bundle=runtime_bundle,
                 require_principal_authority=multi_user_security_enabled(),
+                provider_account_fence=provider_account_fence,
             )
+        except ProviderAccountBusyStoreError as exc:
+            raise self._provider_account_busy_conflict(exc) from exc
         except SchedulePrincipalAuthorityStoreError as exc:
             raise SchedulePrincipalAuthorityError(str(exc)) from exc
         except WorkerClosedStoreError as exc:
@@ -4507,16 +4578,12 @@ class WorkersProjectsService:
             )
             effective_worker["bootstrap_bundle_json"] = effective_bundle_json
         self._ensure_dispatch_provider_ready(effective_worker)
+        provider_account_fence = self._provider_dispatch_fence(effective_worker)
         self._ensure_runtime_available(
             str(worker.get("profile") or ""),
             str(worker.get("execution_mode") or "docker"),
         )
         worker = self._refresh_worker_model_for_profile(worker)
-        if runtime_bundle is not None:
-            worker = self.store.update_worker(
-                worker_id,
-                bootstrap_bundle_json=effective_bundle_json,
-            ) or worker
         resumed = worker["state"] == "paused"
         try:
             run = self.store.create_run(
@@ -4525,9 +4592,17 @@ class WorkersProjectsService:
                 instruction,
                 state="queued",
                 resume_paused=True,
+                provider_account_fence=provider_account_fence,
+                bootstrap_bundle_json=(
+                    effective_bundle_json if runtime_bundle is not None else None
+                ),
             )
+        except ProviderAccountBusyStoreError as exc:
+            raise self._provider_account_busy_conflict(exc) from exc
         except WorkerClosedStoreError as exc:
             raise ControlPlaneConflict(str(exc)) from exc
+        if runtime_bundle is not None:
+            worker = self.store.get_worker(worker_id) or worker
         if resumed:
             self.store.add_event(
                 worker["project_id"],

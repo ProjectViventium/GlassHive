@@ -212,6 +212,16 @@ GlassHive prepares only those structured `CODEX_HOME` paths inside the selected 
 exclusive mission lease is held. It removes the credential-bearing container and tightens the entire
 credential tree back to service ownership and private modes before releasing the lease.
 
+The same isolation contract applies to the visible native `Set up tools` window. The exact selected
+account receives a distinct short, heartbeated interactive lease; the attached Docker exec is monitored
+until the window closes, with a bounded maximum lifetime. Cleanup removes the whole credential-bearing
+container before releasing the lease. Missions are rejected before run creation while that interactive
+lease is active even if the run changes provider route; queued or running work for that workspace also
+blocks setup. On service startup, every unreleased supported interactive lease is reconciled by removing
+the exact credential-bearing container and repairing the account home before the lease is released.
+Expired leases are included so process loss cannot leave an untracked credential mount. Non-harness
+browser/file/shell actions do not acquire the lease.
+
 Provider-account setup, verification, and missions acquire the same owner-scoped exclusive lease
 before touching the account home. In `per_worker_container` mode they first remove stale mounts and
 run a bounded, network-disabled rootless repair container. That container rejects links, hard links,

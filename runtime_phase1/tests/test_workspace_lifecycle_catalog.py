@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 import json
 import shutil
 import time
@@ -43,6 +43,29 @@ class PersistentFixtureRuntime(StubRuntime):
 
     def managed_worker_root(self, worker: dict) -> Path:
         return self.root / str(worker["worker_id"])
+
+
+def test_service_recovers_interactive_provider_sessions_even_without_general_reconcile(
+    tmp_path,
+):
+    class RecoveryFixtureRuntime(PersistentFixtureRuntime):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.recovery_calls = 0
+
+        def recover_interactive_provider_sessions(self) -> None:
+            self.recovery_calls += 1
+
+    runtime = RecoveryFixtureRuntime(tmp_path / "managed-runtime")
+    service = WorkersProjectsService(
+        Store(str(tmp_path / "runtime.db")),
+        runtime,
+        reconcile_on_startup=False,
+    )
+    try:
+        assert runtime.recovery_calls == 1
+    finally:
+        service.shutdown()
 
 
 def _project(store: Store, *, title: str = "Synthetic workspace") -> dict:
@@ -781,6 +804,360 @@ def test_busy_preferred_account_requires_ready_deployment_fallback_before_dispat
         )["items"][0]
         assert own_lease_item["provider_readiness"]["readiness"] == "ready"
         assert "fallback" not in own_lease_item["provider_readiness"]
+    finally:
+        service.shutdown()
+
+
+def test_interactive_personal_account_session_blocks_dispatch_before_run_creation(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    database = tmp_path / "runtime.db"
+    store = Store(str(database))
+    control = ControlPlaneStore(str(database))
+    account = control.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="claude",
+        label="Synthetic interactive account",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://synthetic-interactive",
+        status="ready",
+    )
+    service = WorkersProjectsService(
+        store,
+        PersistentFixtureRuntime(tmp_path / "managed-runtime"),
+        control_plane_store=control,
+        reconcile_on_startup=False,
+    )
+    service._ensure_worker_processor = lambda _worker_id: None  # type: ignore[method-assign]
+    try:
+        project = _project(store, title="Interactive setup")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            name="Claude setup",
+            role="main",
+            profile="claude-code",
+            backend="claude-code",
+            workspace_kind="named",
+            bootstrap_bundle={
+                "provider_account": {
+                    "policy": "personal_preferred",
+                    "account_id": account["account_id"],
+                }
+            },
+        )
+        control.acquire_provider_lease(
+            account_id=account["account_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            lane="claude-code:interactive",
+            worker_id=worker["worker_id"],
+            run_id="interactive_synthetic",
+            ttl_seconds=180,
+        )
+
+        with pytest.raises(ControlPlaneConflict, match="open AI setup window"):
+            service.assign_run(worker["worker_id"], "Do not queue while setup is open")
+
+        assert store.list_runs_for_worker(worker["worker_id"]) == []
+    finally:
+        service.shutdown()
+
+
+def test_interactive_setup_and_dispatch_are_atomically_mutually_exclusive(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    database = tmp_path / "runtime.db"
+    store = Store(str(database))
+    control = ControlPlaneStore(str(database))
+    account = control.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="claude",
+        label="Synthetic concurrent account",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://synthetic-concurrent",
+        status="ready",
+    )
+    service = WorkersProjectsService(
+        store,
+        PersistentFixtureRuntime(tmp_path / "managed-runtime"),
+        control_plane_store=control,
+        reconcile_on_startup=False,
+    )
+    service._ensure_worker_processor = lambda _worker_id: None  # type: ignore[method-assign]
+    try:
+        project = _project(store, title="Concurrent setup")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            name="Claude concurrent setup",
+            role="main",
+            profile="claude-code",
+            backend="claude-code",
+            workspace_kind="named",
+            bootstrap_bundle={
+                "provider_account": {
+                    "policy": "personal_required",
+                    "account_id": account["account_id"],
+                }
+            },
+        )
+
+        dispatch_reached_store = Event()
+        allow_dispatch_transaction = Event()
+        original_create_run = store.create_run
+
+        def delayed_create_run(*args, **kwargs):
+            dispatch_reached_store.set()
+            assert allow_dispatch_transaction.wait(2)
+            return original_create_run(*args, **kwargs)
+
+        store.create_run = delayed_create_run  # type: ignore[method-assign]
+        dispatch_errors: list[BaseException] = []
+
+        def dispatch() -> None:
+            try:
+                service.assign_run(worker["worker_id"], "Race setup against dispatch")
+            except BaseException as exc:
+                dispatch_errors.append(exc)
+
+        dispatch_thread = Thread(target=dispatch)
+        dispatch_thread.start()
+        assert dispatch_reached_store.wait(2)
+        interactive_lease = control.acquire_provider_lease(
+            account_id=account["account_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            lane="claude-code:interactive",
+            worker_id=worker["worker_id"],
+            run_id="interactive_wins",
+            ttl_seconds=180,
+        )
+        allow_dispatch_transaction.set()
+        dispatch_thread.join(2)
+
+        assert not dispatch_thread.is_alive()
+        assert len(dispatch_errors) == 1
+        assert isinstance(dispatch_errors[0], ControlPlaneConflict)
+        assert store.list_runs_for_worker(worker["worker_id"]) == []
+
+        control.release_provider_lease(
+            lease_id=interactive_lease["lease_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+        )
+        store.create_run = original_create_run  # type: ignore[method-assign]
+        queued = service.assign_run(worker["worker_id"], "Dispatch wins")
+        assert queued["state"] == "queued"
+        with pytest.raises(ControlPlaneConflict, match="work is starting or running"):
+            control.acquire_provider_lease(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+                lane="claude-code:interactive",
+                worker_id=worker["worker_id"],
+                run_id="interactive_loses",
+                ttl_seconds=180,
+            )
+    finally:
+        service.shutdown()
+
+
+def test_interactive_setup_fences_the_workspace_across_route_changes(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-deployment-route")
+    database = tmp_path / "runtime.db"
+    store = Store(str(database))
+    control = ControlPlaneStore(str(database))
+    account = control.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="codex",
+        label="Synthetic setup account",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://synthetic-route-change",
+        status="ready",
+    )
+    service = WorkersProjectsService(
+        store,
+        PersistentFixtureRuntime(tmp_path / "managed-runtime"),
+        control_plane_store=control,
+        reconcile_on_startup=False,
+    )
+    service._ensure_worker_processor = lambda _worker_id: None  # type: ignore[method-assign]
+    try:
+        project = _project(store, title="Route-changing setup")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            name="Codex route-changing setup",
+            role="main",
+            profile="codex-cli",
+            backend="codex-cli",
+            workspace_kind="named",
+            bootstrap_bundle={
+                "provider_account": {
+                    "policy": "personal_required",
+                    "account_id": account["account_id"],
+                }
+            },
+        )
+        interactive = control.acquire_provider_lease(
+            account_id=account["account_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            lane="codex-cli:interactive",
+            worker_id=worker["worker_id"],
+            run_id="interactive_route_change",
+            ttl_seconds=180,
+        )
+
+        with pytest.raises(ControlPlaneConflict, match="open AI setup window"):
+            service.assign_run(
+                worker["worker_id"],
+                "Do not replace the open setup workspace",
+                runtime_bundle={
+                    "provider_account": {"policy": "legacy", "account_id": ""}
+                },
+            )
+        assert store.list_runs_for_worker(worker["worker_id"]) == []
+
+        control.release_provider_lease(
+            lease_id=interactive["lease_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+        )
+        queued = service.assign_run(
+            worker["worker_id"],
+            "Deployment work wins",
+            runtime_bundle={
+                "provider_account": {"policy": "legacy", "account_id": ""}
+            },
+        )
+        assert queued["state"] == "queued"
+        with pytest.raises(ControlPlaneConflict, match="work is starting or running"):
+            control.acquire_provider_lease(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+                lane="codex-cli:interactive",
+                worker_id=worker["worker_id"],
+                run_id="interactive_after_deployment_run",
+                ttl_seconds=180,
+            )
+    finally:
+        service.shutdown()
+
+
+def test_preferred_account_mission_race_uses_ready_deployment_fallback(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-deployment-fallback")
+    database = tmp_path / "runtime.db"
+    store = Store(str(database))
+    control = ControlPlaneStore(str(database))
+    account = control.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="codex",
+        label="Synthetic preferred account",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://synthetic-preferred-race",
+        status="ready",
+    )
+    service = WorkersProjectsService(
+        store,
+        PersistentFixtureRuntime(tmp_path / "managed-runtime"),
+        control_plane_store=control,
+        reconcile_on_startup=False,
+    )
+    service._ensure_worker_processor = lambda _worker_id: None  # type: ignore[method-assign]
+    try:
+        project = _project(store, title="Preferred fallback race")
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            name="Codex preferred fallback",
+            role="main",
+            profile="codex-cli",
+            backend="codex-cli",
+            workspace_kind="named",
+            bootstrap_bundle={
+                "provider_account": {
+                    "policy": "personal_preferred",
+                    "account_id": account["account_id"],
+                }
+            },
+        )
+        dispatch_reached_store = Event()
+        allow_dispatch_transaction = Event()
+        original_create_run = store.create_run
+
+        def delayed_create_run(*args, **kwargs):
+            dispatch_reached_store.set()
+            assert allow_dispatch_transaction.wait(2)
+            return original_create_run(*args, **kwargs)
+
+        store.create_run = delayed_create_run  # type: ignore[method-assign]
+        results: list[dict] = []
+        errors: list[BaseException] = []
+
+        def dispatch() -> None:
+            try:
+                results.append(service.assign_run(worker["worker_id"], "Use safe fallback"))
+            except BaseException as exc:
+                errors.append(exc)
+
+        dispatch_thread = Thread(target=dispatch)
+        dispatch_thread.start()
+        assert dispatch_reached_store.wait(2)
+        busy_lease = control.acquire_provider_lease(
+            account_id=account["account_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+            lane="codex-cli:mission",
+            worker_id="worker_using_personal_account",
+            run_id="run_using_personal_account",
+            ttl_seconds=180,
+        )
+        allow_dispatch_transaction.set()
+        dispatch_thread.join(2)
+
+        assert not dispatch_thread.is_alive()
+        assert errors == []
+        assert len(results) == 1
+        assert results[0]["state"] == "queued"
+
+        control.release_provider_lease(
+            lease_id=busy_lease["lease_id"],
+            tenant_id="tenant-a",
+            owner_id="user-a",
+        )
+        with pytest.raises(ControlPlaneConflict, match="work is starting or running"):
+            control.acquire_provider_lease(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+                lane="codex-cli:interactive",
+                worker_id=worker["worker_id"],
+                run_id="interactive_after_fallback",
+                ttl_seconds=180,
+            )
     finally:
         service.shutdown()
 

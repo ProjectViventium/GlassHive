@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -1312,6 +1313,105 @@ def test_docker_exec_detach_uses_popen_without_waiting(tmp_path, monkeypatch):
     assert "--env-file" in calls[0][2]
     assert "HOME=/workspace/.wpr-home" not in calls[0][2]
     assert "wpr-test bash -lc 'sleep 60'" in calls[0][2]
+
+
+def test_docker_exec_monitors_visible_provider_session_until_window_closes(
+    tmp_path, monkeypatch
+):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[list[str]] = []
+    allow_exit = Event()
+    callback_called = Event()
+
+    class FakePopen:
+        def __init__(self, command, *, stdout=None, stderr=None, **kwargs):
+            calls.append(command)
+
+        def wait(self, timeout=None):
+            assert timeout == 30
+            assert allow_exit.wait(2)
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+    result = manager._docker_exec(
+        "wpr-test",
+        ["xterm", "-e", "claude"],
+        env={"HOME": "/workspace/.wpr-home"},
+        cwd="/workspace/project",
+        fire_and_forget=True,
+        on_exit=callback_called.set,
+        max_runtime_seconds=30,
+    )
+
+    assert result.returncode == 0
+    assert len(calls) == 1
+    assert "docker exec -u seluser" in calls[0][2]
+    assert "docker exec -d" not in calls[0][2]
+    assert not callback_called.is_set()
+
+    allow_exit.set()
+    assert callback_called.wait(2)
+
+
+def test_docker_exec_timeout_closes_provider_session_before_forcing_process_exit(
+    tmp_path, monkeypatch
+):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    callback_called = Event()
+    waits: list[float | None] = []
+
+    class FakePopen:
+        def __init__(self, _command, *, stdout=None, stderr=None, **kwargs):
+            self.terminated = False
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            if len(waits) == 1:
+                raise subprocess.TimeoutExpired("synthetic interactive session", timeout)
+            return 0
+
+        def terminate(self):
+            self.terminated = True
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+    result = manager._docker_exec(
+        "wpr-test",
+        ["xterm", "-e", "claude"],
+        env={"HOME": "/workspace/.wpr-home"},
+        fire_and_forget=True,
+        on_exit=callback_called.set,
+        max_runtime_seconds=30,
+    )
+
+    assert result.returncode == 0
+    assert callback_called.wait(2)
+    assert waits == [30, 15]
+
+
+def test_docker_exec_spawn_failure_is_reported_and_cleans_private_env(
+    tmp_path, monkeypatch
+):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+
+    def fail_to_spawn(*_args, **_kwargs):
+        raise OSError("synthetic spawn failure")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_to_spawn)
+
+    result = manager._docker_exec(
+        "wpr-test",
+        ["xterm", "-e", "claude"],
+        env={"HOME": "/workspace/.wpr-home"},
+        fire_and_forget=True,
+        on_exit=lambda: None,
+        max_runtime_seconds=30,
+    )
+
+    assert result.returncode == 1
+    assert result.stderr == "Docker exec could not start"
+    assert list((manager.runtime_root / ".docker-exec-env").glob("*.env")) == []
 
 
 def test_docker_exec_detach_confirms_docker_accepts_command(tmp_path):

@@ -711,10 +711,14 @@ class MissionProviderAccountBinder:
         runtime_name: str,
         run_id: str,
         timeout_sec: float | None,
+        lease_purpose: str = "mission",
+        allow_preferred_fallback: bool = True,
         release_binding: Callable[[dict], None] | None = None,
         abort_binding: Callable[[dict], None] | None = None,
         reconcile_binding: Callable[[Path], None] | None = None,
     ) -> Iterator[dict]:
+        if lease_purpose not in {"mission", "interactive"}:
+            raise RuntimeErrorBase("Provider account lease purpose is invalid")
         selection = mission_provider_account_selection(worker)
         if selection is None:
             yield worker
@@ -739,7 +743,10 @@ class MissionProviderAccountBinder:
                 "Personal subscription workers are disabled in multi-user deployments until "
                 "GlassHive can place each account and worker behind a dedicated OS or container boundary"
             )
-        preferred = selection.policy == "personal_preferred"
+        preferred = (
+            selection.policy == "personal_preferred"
+            and allow_preferred_fallback
+        )
         if self.store is None:
             if preferred:
                 yield self._preferred_fallback(worker, runtime_name)
@@ -821,7 +828,7 @@ class MissionProviderAccountBinder:
                 account_id=selection.account_id,
                 tenant_id=tenant_id,
                 owner_id=owner_id,
-                lane=f"{runtime_name}:mission",
+                lane=f"{runtime_name}:{lease_purpose}",
                 worker_id=worker_id,
                 run_id=run_id,
                 ttl_seconds=lease_ttl_seconds,

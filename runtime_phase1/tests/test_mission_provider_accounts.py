@@ -31,6 +31,7 @@ class RecordingRuntime:
         self.released_workers: list[str] = []
         self.reconciled_homes: list[Path] = []
         self.release_callback = None
+        self.desktop_exit_callback = None
         self.ensure_calls = 0
         self.ensured_workers: list[dict] = []
 
@@ -73,8 +74,11 @@ class RecordingRuntime:
         *,
         url: str | None = None,
         run_id: str | None = None,
+        on_exit=None,
+        max_runtime_seconds: float | None = None,
     ) -> dict[str, object]:
         self.worker = dict(worker)
+        self.desktop_exit_callback = on_exit
         return {
             "status": "launched",
             "action": action,
@@ -161,6 +165,51 @@ def test_multi_user_docker_mission_projects_only_the_selected_account_home(
         account["account_id"], "codex-cli:mission"
     ) is None
     assert runtime.codex.released_workers == ["wrk_personal"]  # type: ignore[attr-defined]
+
+
+def test_startup_recovery_removes_orphaned_interactive_provider_binding(tmp_path):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    recorder = RecordingRuntime()
+    lease_during_cleanup: list[bool] = []
+    recorder.release_callback = lambda _worker: lease_during_cleanup.append(
+        any(
+            row["account_id"] == account["account_id"]
+            for row in store.unreleased_interactive_provider_leases()
+        )
+    )
+    runtime.codex = recorder  # type: ignore[assignment]
+    lease = store.acquire_provider_lease(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        lane="codex-cli:interactive",
+        worker_id="wrk_interrupted_setup",
+        run_id="interactive_interrupted_setup",
+        ttl_seconds=180,
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE provider_account_leases SET expires_at = ? WHERE lease_id = ?",
+            (time.time() - 1, lease["lease_id"]),
+        )
+
+    runtime.recover_interactive_provider_sessions()
+
+    assert recorder.released_workers == ["wrk_interrupted_setup"]
+    assert lease_during_cleanup == [True]
+    assert store.active_provider_account_lease(account["account_id"]) is None
+    with store._connect() as conn:
+        recovered = conn.execute(
+            "SELECT released_at FROM provider_account_leases WHERE lease_id = ?",
+            (lease["lease_id"],),
+        ).fetchone()
+    assert recovered is not None and recovered["released_at"] is not None
 
 
 def test_provider_bound_preflight_can_recreate_a_stale_task_sandbox(
@@ -492,7 +541,7 @@ def test_claude_mission_keeps_workspace_tools_and_leases_only_secure_storage(
         ("claude", "claude-code", "claude", "claude"),
     ),
 )
-def test_idle_personal_workspace_desktop_action_uses_isolated_workspace_sign_in(
+def test_idle_personal_workspace_native_setup_borrows_account_until_window_closes(
     tmp_path, monkeypatch, provider, profile, runtime_attr, action
 ):
     database = tmp_path / "runtime.db"
@@ -504,6 +553,8 @@ def test_idle_personal_workspace_desktop_action_uses_isolated_workspace_sign_in(
     )
     monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
     monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    if provider == "claude":
+        monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
     worker = {
         **_worker(account["account_id"], profile=profile),
         "execution_mode": "docker",
@@ -515,11 +566,146 @@ def test_idle_personal_workspace_desktop_action_uses_isolated_workspace_sign_in(
 
     assert launched["status"] == "launched"
     assert recorder.worker is not None
-    assert "_glasshive_provider_account_bound" not in recorder.worker
-    assert "_glasshive_provider_account_mount_host" not in recorder.worker
+    assert recorder.worker["_glasshive_provider_account_bound"] is True
+    assert recorder.worker["_glasshive_provider_account_mount_host"]
+    assert callable(recorder.desktop_exit_callback)
+    lease = store.active_provider_lease(account["account_id"], f"{profile}:interactive")
+    assert lease is not None
+    assert lease["worker_id"] == worker["worker_id"]
+    assert str(lease["run_id"]).startswith("interactive_")
+
+    recorder.desktop_exit_callback()
+    recorder.desktop_exit_callback()
+
     assert store.active_provider_lease(
-        account["account_id"], f"{profile}:mission"
+        account["account_id"], f"{profile}:interactive"
     ) is None
+    assert recorder.released_workers == [worker["worker_id"]]
+
+
+def test_idle_non_harness_desktop_action_stays_unbound(tmp_path, monkeypatch):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="claude")
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = {
+        **_worker(
+            account["account_id"],
+            profile="claude-code",
+            policy="personal_preferred",
+        ),
+        "execution_mode": "docker",
+    }
+    recorder = RecordingRuntime()
+    runtime.claude = recorder  # type: ignore[assignment]
+
+    launched = runtime.desktop_action(worker, "browser", url="about:blank")
+
+    assert launched["status"] == "launched"
+    assert recorder.worker is not None
+    assert "_glasshive_provider_account_bound" not in recorder.worker
+    assert recorder.desktop_exit_callback is None
+    assert store.active_provider_account_lease(account["account_id"]) is None
+
+
+def test_idle_api_key_workspace_setup_does_not_mount_a_subscription_home(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="codex", auth_method="api_key")
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = {
+        **_worker(account["account_id"], profile="codex-cli"),
+        "execution_mode": "docker",
+    }
+    recorder = RecordingRuntime()
+    runtime.codex = recorder  # type: ignore[assignment]
+
+    launched = runtime.desktop_action(worker, "codex")
+
+    assert launched["status"] == "launched"
+    assert recorder.worker is not None
+    assert "_glasshive_provider_account_bound" not in recorder.worker
+    assert store.active_provider_account_lease(account["account_id"]) is None
+
+
+def test_idle_native_setup_busy_account_fails_before_launch(tmp_path, monkeypatch):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="claude")
+    store.acquire_provider_lease(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        lane="claude-code:mission",
+        worker_id="wrk_other",
+        run_id="run_other",
+        ttl_seconds=180,
+    )
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    worker = {
+        **_worker(
+            account["account_id"],
+            profile="claude-code",
+            policy="personal_preferred",
+        ),
+        "execution_mode": "docker",
+    }
+    recorder = RecordingRuntime()
+    runtime.claude = recorder  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeErrorBase, match="already in use"):
+        runtime.desktop_action(worker, "claude")
+
+    assert recorder.worker is None
+
+
+def test_idle_native_setup_launch_failure_releases_account(tmp_path, monkeypatch):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="claude")
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    worker = {
+        **_worker(account["account_id"], profile="claude-code"),
+        "execution_mode": "docker",
+    }
+
+    class FailingRuntime(RecordingRuntime):
+        def desktop_action(self, worker, action, **kwargs):
+            self.worker = dict(worker)
+            raise RuntimeErrorBase("synthetic launch failed")
+
+    recorder = FailingRuntime()
+    runtime.claude = recorder  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeErrorBase, match="synthetic launch failed"):
+        runtime.desktop_action(worker, "claude")
+
+    assert recorder.released_workers == [worker["worker_id"]]
+    assert store.active_provider_account_lease(account["account_id"]) is None
 
 
 def test_mission_cleanup_waits_for_a_borrowed_desktop_action_projection(
