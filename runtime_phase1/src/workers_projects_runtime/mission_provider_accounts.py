@@ -30,8 +30,10 @@ _PROFILE_PROVIDERS = {
     "claude-code": {"claude", "anthropic"},
 }
 _EXPECTED_HOME_KEYS = {
-    "codex-cli": "CODEX_HOME",
-    "claude-code": "CLAUDE_CONFIG_DIR",
+    "codex-cli": frozenset({"CODEX_HOME"}),
+    "claude-code": frozenset(
+        {"CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"}
+    ),
 }
 _CONTAINER_ACCOUNT_MOUNT = "/workspace/.provider-account"
 _DEFAULT_CONTAINER_WORKSPACE_HOME = "/workspace/.wpr-home"
@@ -55,6 +57,7 @@ _CLAUDE_CONFLICTING_ENV = {
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
     "CLAUDE_CODE_OAUTH_SCOPES",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "CLAUDE_CODE_USE_BEDROCK",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
@@ -268,8 +271,10 @@ def apply_bound_provider_account_environment(
         raise RuntimeErrorBase(
             "Mission provider account selection was not validated by the GlassHive control plane"
         )
-    expected_key = _EXPECTED_HOME_KEYS.get(runtime_name)
-    if expected_key is None:
+    expected_keys = _EXPECTED_HOME_KEYS.get(runtime_name)
+    if runtime_name == "claude-code" and str(worker.get("execution_mode") or "host") == "docker":
+        expected_keys = frozenset({"CLAUDE_SECURESTORAGE_CONFIG_DIR"})
+    if expected_keys is None:
         raise RuntimeErrorBase(
             "Personal provider accounts are supported only for Codex and Claude mission workers"
         )
@@ -277,11 +282,12 @@ def apply_bound_provider_account_environment(
     if not isinstance(raw_environment, dict):
         raise RuntimeErrorBase("Mission provider account binding is missing its private provider home")
     keys = {str(key) for key in raw_environment}
-    if keys != {expected_key}:
+    if keys != expected_keys:
         raise RuntimeErrorBase("Mission provider account binding contains an invalid provider home")
-    account_home = str(raw_environment.get(expected_key) or "").strip()
-    if not account_home or not Path(account_home).is_absolute():
-        raise RuntimeErrorBase("Mission provider account binding contains an invalid provider home")
+    for expected_key in expected_keys:
+        account_home = str(raw_environment.get(expected_key) or "").strip()
+        if not account_home or not Path(account_home).is_absolute():
+            raise RuntimeErrorBase("Mission provider account binding contains an invalid provider home")
 
     conflicting = (
         _CODEX_CONFLICTING_ENV
@@ -290,7 +296,7 @@ def apply_bound_provider_account_environment(
     )
     for key in conflicting:
         env.pop(key, None)
-    env[expected_key] = account_home
+    env.update({str(key): str(value) for key, value in raw_environment.items()})
     return env
 
 
@@ -869,6 +875,9 @@ class MissionProviderAccountBinder:
                         or _DEFAULT_CONTAINER_WORKSPACE_HOME
                     ).rstrip("/")
                     environment["CODEX_HOME"] = f"{workspace_home}/.codex"
+                if "CLAUDE_CONFIG_DIR" in environment:
+                    secure_storage_home = environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"]
+                    environment = {"CLAUDE_SECURESTORAGE_CONFIG_DIR": secure_storage_home}
         except BaseException as exc:
             if execution_mode == "docker":
                 try:

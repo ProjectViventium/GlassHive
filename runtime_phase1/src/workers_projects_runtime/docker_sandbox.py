@@ -53,7 +53,7 @@ SAFE_DOCKER_EXEC_ENV_KEYS = {
     # These selectors point only at control-plane-validated provider/workspace
     # homes. Without them the CLIs silently fall back to process-global state.
     "CODEX_HOME",
-    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     # Provider keys are run-scoped: the worker launch script unsets them before
     # handing control to the post-run interactive shell.
     "OPENAI_API_KEY",
@@ -103,6 +103,71 @@ SAFE_DOCKER_EXEC_ENV_KEYS = {
     "XDG_CONFIG_HOME",
 }
 VNC_PASSWORD_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~!@#$%^&*+=?"
+
+
+_CLAUDE_WORKSPACE_ONBOARDING_SCRIPT = r'''import json
+import os
+import secrets
+import stat
+import sys
+from pathlib import Path
+
+workspace_home = Path(sys.argv[1])
+workspace_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+directory_stat = workspace_home.lstat()
+if not stat.S_ISDIR(directory_stat.st_mode) or directory_stat.st_uid != os.geteuid():
+    raise RuntimeError("unsafe Claude workspace configuration directory")
+target = workspace_home / ".claude.json"
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+state = {}
+try:
+    descriptor = os.open(target, flags)
+except FileNotFoundError:
+    descriptor = -1
+if descriptor >= 0:
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_size > 1_048_576
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise RuntimeError("unsafe Claude workspace configuration file")
+        raw = os.read(descriptor, metadata.st_size)
+        state = json.loads(raw.decode("utf-8")) if raw else {}
+    finally:
+        os.close(descriptor)
+if not isinstance(state, dict):
+    raise RuntimeError("invalid Claude workspace configuration")
+if state.get("hasCompletedOnboarding") is True:
+    raise SystemExit(0)
+state["hasCompletedOnboarding"] = True
+payload = (json.dumps(state, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+temporary = workspace_home / (".glasshive-onboarding-" + secrets.token_hex(12))
+temporary_descriptor = os.open(
+    temporary,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
+try:
+    view = memoryview(payload)
+    while view:
+        written = os.write(temporary_descriptor, view)
+        if written <= 0:
+            raise OSError("short write")
+        view = view[written:]
+    os.fsync(temporary_descriptor)
+finally:
+    os.close(temporary_descriptor)
+os.replace(temporary, target)
+directory_descriptor = os.open(workspace_home, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(directory_descriptor)
+finally:
+    os.close(directory_descriptor)
+'''
 
 
 def _provider_account_seal_script(mount_target: str) -> str:
@@ -1896,15 +1961,19 @@ screen -ls | awk -v target="$target" '
             return
         mount_target = Path(mount[1])
         raw_environment = worker.get("_glasshive_provider_account_env")
-        if not isinstance(raw_environment, dict) or len(raw_environment) != 1:
+        if not isinstance(raw_environment, dict) or not raw_environment:
             raise RuntimeError("Provider account mount is missing its private runtime home")
-        runtime_env_name, runtime_home_value = next(iter(raw_environment.items()))
+        is_codex_home = set(raw_environment) == {"CODEX_HOME"}
+        is_claude_home = set(raw_environment) == {"CLAUDE_SECURESTORAGE_CONFIG_DIR"}
+        if not is_codex_home and not is_claude_home:
+            raise RuntimeError("Provider account mount contains invalid runtime selectors")
+        runtime_env_name = "CODEX_HOME" if is_codex_home else "CLAUDE_SECURESTORAGE_CONFIG_DIR"
+        runtime_home_value = raw_environment[runtime_env_name]
         runtime_home = Path(str(runtime_home_value or "").strip())
         quoted_mount = shlex.quote(str(mount_target))
         quoted_home = shlex.quote(str(runtime_home))
         container_user_name = self.user.split(":", 1)[0] or self.user
         container_user = shlex.quote(container_user_name)
-        is_codex_home = str(runtime_env_name) == "CODEX_HOME"
         if is_codex_home:
             expected_codex_home = Path(self.home_mount) / ".codex"
             if runtime_home != expected_codex_home:
@@ -1949,9 +2018,19 @@ screen -ls | awk -v target="$target" '
                 raise RuntimeError("Provider account runtime home is outside its private mount") from exc
             if runtime_home == mount_target:
                 raise RuntimeError("Provider account runtime home must select one provider directory")
+            prepared = self._docker_exec(
+                container_name,
+                ["python3", "-c", _CLAUDE_WORKSPACE_ONBOARDING_SCRIPT, self.home_mount],
+                cwd=self.workspace_mount,
+                user=self.user,
+            )
+            if prepared.returncode != 0:
+                raise RuntimeError("The Claude workspace contains unsafe native configuration state")
             grant_script = (
                 "set -e; "
                 "command -v setfacl >/dev/null 2>&1; "
+                "claude_path=$(readlink -f \"$(command -v claude)\"); "
+                "grep -Fq CLAUDE_SECURESTORAGE_CONFIG_DIR \"$claude_path\"; "
                 f"test -d {quoted_mount}; test -d {quoted_home}; "
                 f"setfacl -R -m u:{container_user}:rwX {quoted_mount}; "
                 f"find {quoted_mount} -type d -exec setfacl -m d:u:{container_user}:rwX {{}} +"

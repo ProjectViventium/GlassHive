@@ -264,6 +264,7 @@ def test_claude_setup_input_route_is_owner_scoped_and_never_returns_the_code(
     cli.write_text(
         """#!/usr/bin/env python3
 import os
+import json
 import sys
 marker = os.path.join(os.environ['CLAUDE_CONFIG_DIR'], 'authenticated')
 if sys.argv[1:] == ['auth', 'login', '--claudeai']:
@@ -271,6 +272,8 @@ if sys.argv[1:] == ['auth', 'login', '--claudeai']:
     if sys.stdin.readline().strip() != 'synthetic-browser-code':
         raise SystemExit(3)
     open(marker, 'w', encoding='utf-8').write('ready')
+    with open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'], '.claude.json'), 'w', encoding='utf-8') as handle:
+        json.dump({'theme': 'dark'}, handle)
     raise SystemExit(0)
 if sys.argv[1:] == ['auth', 'status', '--json']:
     raise SystemExit(0 if os.path.exists(marker) else 1)

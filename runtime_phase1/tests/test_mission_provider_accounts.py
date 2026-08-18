@@ -452,6 +452,39 @@ def test_desktop_action_projects_the_exact_active_mission_provider_binding(tmp_p
     ) is None
 
 
+def test_claude_mission_keeps_workspace_tools_and_leases_only_secure_storage(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="claude")
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    worker = _worker(account["account_id"], profile="claude-code")
+    worker["execution_mode"] = "docker"
+
+    with runtime.provider_account_binder.bind(
+        worker,
+        runtime_name="claude-code",
+        run_id="run_personal",
+        timeout_sec=60,
+        release_binding=lambda _worker: None,
+        reconcile_binding=lambda _home: None,
+    ) as bound:
+        assert bound["_glasshive_provider_account_env"] == {
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/workspace/.provider-account/claude",
+        }
+
+    assert store.active_provider_lease(
+        account["account_id"], "claude-code:mission"
+    ) is None
+
+
 @pytest.mark.parametrize(
     ("provider", "profile", "runtime_attr", "action"),
     (
@@ -1400,11 +1433,13 @@ def test_host_command_builders_apply_only_the_bound_native_provider_home(tmp_pat
     }
     claude_worker["bootstrap_bundle_json"] = json.dumps(claude_bundle)
     claude_worker["_glasshive_provider_account_env"] = {
-        "CLAUDE_CONFIG_DIR": str(claude_home)
+        "CLAUDE_CONFIG_DIR": str(claude_home),
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR": str(claude_home),
     }
     claude_worker["_glasshive_provider_account_bound"] = True
     _, claude_env = claude._build_command(claude_worker, "mission", info)
     assert claude_env["CLAUDE_CONFIG_DIR"] == str(claude_home)
+    assert claude_env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == str(claude_home)
     assert claude_env["CLAUDE_CONFIG_DIR"] != str(tmp_path / "global-claude")
     assert "ANTHROPIC_API_KEY" not in claude_env
     assert "ANTHROPIC_BASE_URL" not in claude_env

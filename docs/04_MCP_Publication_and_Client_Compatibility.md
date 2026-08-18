@@ -108,6 +108,14 @@ temporarily overlays the mission-selected subscription authentication while pres
 workspace-local login in host-private state that is not mounted into the mission container, then
 restores the workspace login before idle tool setup or reuse.
 
+Claude keeps its native user-scope MCP, plugin, trust, and onboarding state under the workspace's
+persistent `HOME`; GlassHive does not replace that state with an account-global config directory.
+During a personal Claude mission, only Claude's native secure-storage directory is projected from the
+selected account home while the exact provider lease is held. The credential-bearing container is
+removed before the lease is released. This lets a connector added once through the workspace-native
+harness remain visible on later missions without copying its authorization into GlassHive or another
+workspace.
+
 For generated file delivery, `signed_download_url`/`default_url` is the default chat-facing artifact
 link and should be labeled `Download file`. The MCP payload should also preserve `signed_open_url`
 or a View / Steer workspace link so the user can inspect previews and all workspace deliveries

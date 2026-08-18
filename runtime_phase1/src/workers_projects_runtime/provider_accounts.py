@@ -281,7 +281,10 @@ class ProviderAccountHomeManager:
             target = account_home / "claude"
             target.mkdir(parents=True, exist_ok=True)
             self._private(target)
-            return {"CLAUDE_CONFIG_DIR": str(target)}
+            return {
+                "CLAUDE_CONFIG_DIR": str(target),
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR": str(target),
+            }
         raise ControlPlaneError("Unsupported provider account home")
 
     def prepare_interactive_home(self, *, provider: str, account_home: Path) -> None:

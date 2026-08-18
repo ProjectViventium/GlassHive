@@ -20,6 +20,7 @@ from workers_projects_runtime.docker_sandbox import (
     DockerSandboxManager,
     SandboxInfo,
     VNC_PASSWORD_ALPHABET,
+    _CLAUDE_WORKSPACE_ONBOARDING_SCRIPT,
     _CODEX_PROVIDER_AUTH_LINK_SCRIPT,
     _ai_worker_browser_extension_check_script,
     _ai_worker_browser_native_host_bootstrap_script,
@@ -92,14 +93,38 @@ def test_safe_docker_exec_env_preserves_bound_provider_home_selectors():
     env = _safe_docker_exec_env(
         {
             "CODEX_HOME": "/workspace/.wpr-home/.codex",
-            "CLAUDE_CONFIG_DIR": "/workspace/.provider-account/claude",
+            "CLAUDE_CONFIG_DIR": "/workspace/.wpr-home/.claude",
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/workspace/.provider-account/claude",
             "UNRELATED_SECRET": "must-not-pass",
         }
     )
 
     assert env["CODEX_HOME"] == "/workspace/.wpr-home/.codex"
-    assert env["CLAUDE_CONFIG_DIR"] == "/workspace/.provider-account/claude"
+    assert env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == "/workspace/.provider-account/claude"
+    assert "CLAUDE_CONFIG_DIR" not in env
     assert "UNRELATED_SECRET" not in env
+
+
+def test_claude_workspace_onboarding_marker_preserves_native_state(tmp_path):
+    workspace_home = tmp_path / "home"
+    workspace_home.mkdir(mode=0o700)
+    state_path = workspace_home / ".claude.json"
+    state_path.write_text('{"theme":"dark"}\n', encoding="utf-8")
+    state_path.chmod(0o600)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _CLAUDE_WORKSPACE_ONBOARDING_SCRIPT, str(workspace_home)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "hasCompletedOnboarding": True,
+        "theme": "dark",
+    }
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
 
 
 def test_safe_docker_exec_env_preserves_bedrock_run_credentials_only():
@@ -515,15 +540,18 @@ def test_bound_claude_account_does_not_apply_codex_runtime_metadata_contract(tmp
             "_glasshive_provider_account_mount_host": str(account_home),
             "_glasshive_provider_account_mount_target": "/workspace/.provider-account",
             "_glasshive_provider_account_env": {
-                "CLAUDE_CONFIG_DIR": "/workspace/.provider-account/claude"
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/workspace/.provider-account/claude",
             },
         },
     )
 
-    grant_script = calls[0][1][-1]
+    assert calls[0][0] == manager.user
+    assert calls[0][1][:2] == ["python3", "-c"]
+    grant_script = calls[1][1][-1]
     assert "installation_id" not in grant_script
     assert "/tmp/arg0" not in grant_script
-    assert len(calls) == 2
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" in grant_script
+    assert len(calls) == 3
 
 
 def test_bound_codex_account_requires_the_exact_persistent_workspace_home(tmp_path):
@@ -1541,21 +1569,21 @@ def test_desktop_action_revalidates_projected_worker_without_container_evidence(
 
 
 @pytest.mark.parametrize(
-    ("runtime_name", "action", "selector", "selector_value", "absent_selector"),
+    ("runtime_name", "action", "provider_environment", "absent_selectors"),
     (
         (
             "claude-code",
             "claude",
-            "CLAUDE_CONFIG_DIR",
-            "/workspace/.provider-account/claude",
-            "CODEX_HOME",
+            {
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/workspace/.provider-account/claude",
+            },
+            {"CODEX_HOME", "CLAUDE_CONFIG_DIR"},
         ),
         (
             "codex-cli",
             "codex",
-            "CODEX_HOME",
-            "/workspace/.wpr-home/.codex",
-            "CLAUDE_CONFIG_DIR",
+            {"CODEX_HOME": "/workspace/.wpr-home/.codex"},
+            {"CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"},
         ),
     ),
 )
@@ -1563,9 +1591,8 @@ def test_desktop_action_projects_only_the_validated_personal_provider_home(
     tmp_path,
     runtime_name,
     action,
-    selector,
-    selector_value,
-    absent_selector,
+    provider_environment,
+    absent_selectors,
 ):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     captured_env: dict[str, str] = {}
@@ -1589,6 +1616,7 @@ def test_desktop_action_projects_only_the_validated_personal_provider_home(
     worker = {
         "worker_id": "wrk_test",
         "state": "running",
+        "execution_mode": "docker",
         "bootstrap_bundle": {
             "provider_account": {
                 "policy": "personal_required",
@@ -1596,9 +1624,7 @@ def test_desktop_action_projects_only_the_validated_personal_provider_home(
             }
         },
         "_glasshive_provider_account_bound": True,
-        "_glasshive_provider_account_env": {
-            selector: selector_value,
-        },
+        "_glasshive_provider_account_env": provider_environment,
     }
 
     launched = manager.desktop_action(
@@ -1609,8 +1635,9 @@ def test_desktop_action_projects_only_the_validated_personal_provider_home(
     )
 
     assert launched["status"] == "launched"
-    assert captured_env[selector] == selector_value
-    assert absent_selector not in captured_env
+    for selector, selector_value in provider_environment.items():
+        assert captured_env[selector] == selector_value
+    assert absent_selectors.isdisjoint(captured_env)
 
 
 def test_ensure_ready_skips_image_probe_for_existing_container(tmp_path):

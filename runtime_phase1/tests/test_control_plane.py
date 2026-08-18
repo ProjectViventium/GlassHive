@@ -421,6 +421,13 @@ def test_provider_account_homes_are_private_and_platform_policy_is_explicit(tmp_
     assert environment == {"CODEX_HOME": str(codex_home / "codex")}
     assert os.stat(codex_home).st_mode & 0o077 == 0
     assert os.stat(codex_home / "codex").st_mode & 0o077 == 0
+    claude_environment = manager.runtime_environment(
+        provider="claude", account_home=codex_home
+    )
+    assert claude_environment == {
+        "CLAUDE_CONFIG_DIR": str(codex_home / "claude"),
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR": str(codex_home / "claude"),
+    }
     for unsafe_account_id in (".", ".."):
         with pytest.raises(ControlPlaneError, match="account id is invalid"):
             manager.account_home_path(
