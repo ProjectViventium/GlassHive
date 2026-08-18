@@ -5875,6 +5875,45 @@ def test_openclaw_desktop_action_does_not_start_gateway(tmp_path):
     assert fake.desktop_actions[0]["url"] == "about:blank"
 
 
+@pytest.mark.parametrize("runtime_class", [CodexCliRuntime, ClaudeCodeRuntime])
+def test_provider_binding_cleanup_removes_container_when_stale_session_stop_fails(
+    tmp_path,
+    runtime_class,
+):
+    class FakeSandbox:
+        def __init__(self) -> None:
+            self.terminated: list[str] = []
+            self.repaired: list[Path] = []
+
+        def terminate(self, worker_id: str):
+            self.terminated.append(worker_id)
+
+        def repair_provider_account_access(self, account_home: Path) -> None:
+            self.repaired.append(Path(account_home))
+
+    runtime = runtime_class(base_dir=str(tmp_path / "data"))
+    fake = FakeSandbox()
+    runtime.sandbox = fake
+    runtime._stop_active_process = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("synthetic stale completed-run metadata")
+    )
+    cleared: list[str] = []
+    runtime._clear_active_session = cleared.append
+    account_home = tmp_path / "provider-account"
+    account_home.mkdir()
+
+    runtime.release_provider_account_binding(
+        {
+            "worker_id": "wrk_stale_session_cleanup",
+            "_glasshive_provider_account_mount_host": str(account_home),
+        }
+    )
+
+    assert fake.terminated == ["wrk_stale_session_cleanup"]
+    assert fake.repaired == [account_home]
+    assert cleared == ["wrk_stale_session_cleanup"]
+
+
 def test_openclaw_projects_openai_compatible_provider_without_storing_secret(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_BASE_URL", "https://models.example.test/openai/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret-test-value")

@@ -2372,8 +2372,22 @@ class BaseCliWorkerRuntime:
         worker_id = str(worker.get("worker_id") or "").strip()
         if not worker_id:
             raise RuntimeErrorBase("Provider credential cleanup requires a worker id")
-        self._stop_active_process(worker_id, worker=worker, run_id=str(worker.get("_active_run_id") or "") or None)
+        try:
+            self._stop_active_process(
+                worker_id,
+                worker=worker,
+                run_id=str(worker.get("_active_run_id") or "") or None,
+            )
+        except Exception:
+            # Completed-run metadata can outlive its screen process.  A stale
+            # graceful-stop failure must never prevent removal of the whole
+            # credential-bearing container, which is the authoritative fence.
+            logger.warning(
+                "Provider-bound worker process cleanup was stale; removing its sandbox",
+                extra={"worker_id": worker_id, "runtime": self.runtime_name},
+            )
         self.sandbox.terminate(worker_id)
+        self._clear_active_session(worker_id)
         raw_account_home = str(worker.get("_glasshive_provider_account_mount_host") or "").strip()
         if not raw_account_home:
             raise RuntimeErrorBase("Provider credential cleanup requires its private account home")
