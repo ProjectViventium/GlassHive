@@ -162,6 +162,28 @@ exec({_CLAUDE_WORKSPACE_ONBOARDING_SCRIPT!r})
     }
 
 
+def test_claude_workspace_onboarding_tightens_acl_mask_mode(tmp_path):
+    workspace_home = tmp_path / "acl-prepared-home"
+    workspace_home.mkdir(mode=0o700)
+    state_path = workspace_home / ".claude.json"
+    state_path.write_text('{"nativeState":"preserved"}\n', encoding="utf-8")
+    state_path.chmod(0o670)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _CLAUDE_WORKSPACE_ONBOARDING_SCRIPT, str(workspace_home)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "hasCompletedOnboarding": True,
+        "nativeState": "preserved",
+    }
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+
+
 def test_safe_docker_exec_env_preserves_bedrock_run_credentials_only():
     env = _safe_docker_exec_env(
         {

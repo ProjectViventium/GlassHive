@@ -137,8 +137,12 @@ if descriptor >= 0:
             or metadata.st_uid != os.geteuid()
             or metadata.st_nlink != 1
             or metadata.st_size > 1_048_576
-            or stat.S_IMODE(metadata.st_mode) & 0o077
         ):
+            raise RuntimeError("unsafe Claude workspace configuration file")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            os.fchmod(descriptor, 0o600)
+            metadata = os.fstat(descriptor)
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
             raise RuntimeError("unsafe Claude workspace configuration file")
         raw = os.read(descriptor, metadata.st_size)
         state = json.loads(raw.decode("utf-8")) if raw else {}
