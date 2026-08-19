@@ -67,6 +67,8 @@ def compact_provider_failure_diagnostic(
         ),
         None,
     )
+    if failure_class != "provider_auth_missing":
+        provider_error = None
 
     reason: str | None = None
     operation: str | None = None

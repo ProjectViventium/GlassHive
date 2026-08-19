@@ -3317,6 +3317,7 @@ def test_claude_failed_stream_never_promotes_transcript_content_to_public_error_
                         "subtype": "error",
                         "is_error": True,
                         "error_status": 529,
+                        "error": "authentication_failed",
                         "result": "API Error: 529 Overloaded",
                     }
                 ),
