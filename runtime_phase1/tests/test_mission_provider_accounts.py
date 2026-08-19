@@ -187,15 +187,23 @@ def test_expired_personal_claude_session_requires_reconnect_and_releases_lease(
 
     def fail_with_expired_session(_worker, _instruction, _timeout_sec, _run_id):
         failure = classify_cli_failure(
-            stdout=json.dumps(
-                {
-                    "type": "result",
-                    "is_error": True,
-                    "error": "authentication_failed",
-                    "result": (
-                        "Failed to authenticate: OAuth session expired and could not be refreshed"
+            stdout="\n".join(
+                (
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "error": "authentication_failed",
+                        }
                     ),
-                }
+                    json.dumps(
+                        {
+                            "type": "result",
+                            "subtype": "success",
+                            "is_error": True,
+                            "api_error_status": None,
+                        }
+                    ),
+                )
             ),
             stderr="",
             runtime_name="claude-code",

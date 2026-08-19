@@ -365,6 +365,7 @@ def _has_structured_authentication_failed(*texts: str) -> bool:
     """Recognize the native provider result code, never echoed worker transcript text."""
 
     for text in texts:
+        previous_auth_failure = False
         for line in str(text or "").splitlines():
             raw = line.strip()
             if not raw.startswith("{"):
@@ -373,11 +374,20 @@ def _has_structured_authentication_failed(*texts: str) -> bool:
                 item = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            if not isinstance(item, dict) or item.get("is_error") is not True:
+            if not isinstance(item, dict):
                 continue
-            for key in ("error", "error_code", "api_error_status"):
-                if str(item.get(key) or "").strip().lower() == "authentication_failed":
-                    return True
+            exact_auth_failure = any(
+                str(item.get(key) or "").strip().lower() == "authentication_failed"
+                for key in ("error", "error_code", "api_error_status")
+            )
+            if item.get("is_error") is True and (
+                exact_auth_failure
+                or (previous_auth_failure and item.get("type") == "result")
+            ):
+                return True
+            previous_auth_failure = (
+                item.get("type") == "assistant" and exact_auth_failure
+            )
     return False
 
 

@@ -5672,6 +5672,103 @@ def test_cli_failure_classifies_expired_claude_oauth_session():
     assert "provider credentials" in failure.user_message
 
 
+def test_cli_failure_classifies_split_expired_claude_oauth_session():
+    failure = classify_cli_failure(
+        stdout="\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "error": "authentication_failed",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": True,
+                        "api_error_status": None,
+                    }
+                ),
+            )
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_auth_missing"
+    assert failure.personal_account_reconnect is True
+
+
+def test_cli_failure_ignores_non_event_noise_between_native_auth_events():
+    failure = classify_cli_failure(
+        stdout="\n".join(
+            (
+                json.dumps({"type": "assistant", "error": "authentication_failed"}),
+                "",
+                "native process note",
+                json.dumps({"type": "result", "is_error": True}),
+            )
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_auth_missing"
+    assert failure.personal_account_reconnect is True
+
+
+def test_cli_failure_does_not_join_nonadjacent_authentication_events():
+    failure = classify_cli_failure(
+        stdout="\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "error": "authentication_failed",
+                    }
+                ),
+                json.dumps({"type": "assistant", "message": "ordinary worker output"}),
+                json.dumps({"type": "result", "is_error": True}),
+            )
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.personal_account_reconnect is False
+
+
+def test_cli_failure_requires_native_result_after_authentication_event():
+    failure = classify_cli_failure(
+        stdout="\n".join(
+            (
+                json.dumps({"type": "assistant", "error": "authentication_failed"}),
+                json.dumps({"type": "tool", "is_error": True}),
+            )
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.personal_account_reconnect is False
+
+
+def test_cli_failure_does_not_join_authentication_events_across_streams():
+    failure = classify_cli_failure(
+        stdout=json.dumps({"type": "assistant", "error": "authentication_failed"}),
+        stderr=json.dumps({"type": "result", "is_error": True}),
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.personal_account_reconnect is False
+
+
 def test_cli_failure_does_not_treat_worker_transcript_as_provider_auth_failure():
     failure = classify_cli_failure(
         stdout=json.dumps(
