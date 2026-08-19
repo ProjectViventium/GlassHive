@@ -39,7 +39,11 @@ from .bootstrap import (
     resolve_bootstrap_source_path,
 )
 from .docker_sandbox import DockerSandboxManager
-from .failure_classification import classify_cli_failure, classify_runtime_error
+from .failure_classification import (
+    FailureClassification,
+    classify_cli_failure,
+    classify_runtime_error,
+)
 from .capability_broker import (
     GlassHiveCapabilityBroker,
     worker_with_ephemeral_capability_bundle,
@@ -51,6 +55,7 @@ from .inference_broker import (
 )
 from .mission_provider_accounts import (
     MissionProviderAccountBinder,
+    MissionProviderAccountSelection,
     apply_bound_provider_account_environment,
     deployment_provider_readiness,
     mission_provider_account_selection,
@@ -85,6 +90,7 @@ _CODEX_MCP_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 _HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
 _CODEX_STALE_THREAD_ERROR = "thread/resume failed: no rollout found for thread id"
 _CLAUDE_STALE_SESSION_ERROR = "No conversation found with session ID:"
+_PERSONAL_ACCOUNT_RECONNECT_MARKER = "_glasshive_personal_account_reconnect_required"
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off", "none", "disabled"}
 _CODEX_BROKER_CONFLICTING_ENV = {
     "CODEX_API_KEY",
@@ -183,6 +189,23 @@ _TELEMETRY_TOKEN_PATTERNS = {
     ),
     "run_id": re.compile(r"^(?:run[_-]?|r)[A-Za-z0-9_-]{0,120}$"),
 }
+
+
+def _private_cli_failure_classification(
+    classification: FailureClassification,
+    *,
+    exit_code: int,
+) -> FailureClassification:
+    """Carry machine-readable failure truth without carrying the worker transcript."""
+
+    return FailureClassification(
+        failure_class=classification.failure_class,
+        retryable=classification.retryable,
+        user_message=classification.user_message,
+        recommended_recovery=classification.recommended_recovery,
+        diagnostic_summary=f"class={classification.failure_class}; exit_code={exit_code}",
+        personal_account_reconnect=classification.personal_account_reconnect,
+    )
 
 
 def _safe_run_telemetry(value: object, *, run_id: str | None = None) -> dict[str, object]:
@@ -1187,6 +1210,8 @@ class ProfiledWorkerRuntime:
         timeout_sec: float | None,
         run_id: str,
         account_id: str,
+        selection: MissionProviderAccountSelection,
+        reconnect_personal_account: bool,
     ) -> str:
         """Run with a selected account and persist only telemetry the harness observed."""
 
@@ -1201,6 +1226,34 @@ class ProfiledWorkerRuntime:
             )
             succeeded = True
             return result
+        except RuntimeErrorBase as exc:
+            classification = getattr(exc, "failure_classification", None)
+            if (
+                reconnect_personal_account
+                and isinstance(classification, FailureClassification)
+                and classification.personal_account_reconnect
+            ):
+                personal_reconnect = self._personal_account_reconnect_failure(
+                    runtime=runtime,
+                    worker=worker,
+                )
+                exc.failure_classification = personal_reconnect  # type: ignore[attr-defined]
+                try:
+                    self.provider_account_binder.update_selected_account_status(
+                        worker,
+                        selection,
+                        status="action_required",
+                        reconnect_reason=(
+                            "Connected AI account sign-in expired. Reconnect this account in Connections."
+                        ),
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not mark an expired connected AI account for reconnection",
+                        exc_info=True,
+                        extra={"worker_id": worker.get("worker_id"), "run_id": run_id},
+                    )
+            raise
         finally:
             usage: dict[str, object] = {}
             reader = getattr(runtime, "run_usage", None)
@@ -1241,6 +1294,76 @@ class ProfiledWorkerRuntime:
                         exc_info=True,
                         extra={"worker_id": worker.get("worker_id"), "run_id": run_id},
                     )
+
+    @staticmethod
+    def _personal_account_reconnect_failure(
+        *,
+        runtime: WorkerRuntime,
+        worker: dict,
+    ) -> FailureClassification:
+        runtime_name = str(
+            getattr(runtime, "runtime_name", "")
+            or worker.get("profile")
+            or "worker"
+        ).strip()
+        return FailureClassification(
+            failure_class="provider_auth_missing",
+            retryable=False,
+            user_message="The selected connected AI account must be reconnected.",
+            recommended_recovery=(
+                "Open Connections, reconnect the selected account, then continue the same workspace."
+            ),
+            diagnostic_summary=f"class=provider_auth_missing; runtime={runtime_name}",
+        )
+
+    def _personalize_completed_provider_auth_failure(
+        self,
+        *,
+        runtime: WorkerRuntime,
+        worker: dict,
+        recovered: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        if not recovered:
+            return recovered
+        candidate = dict(recovered)
+        reconnect_required = bool(candidate.pop(_PERSONAL_ACCOUNT_RECONNECT_MARKER, False))
+        if not reconnect_required:
+            return candidate
+        try:
+            selection = mission_provider_account_selection(worker)
+            if selection is None or not selection.account_id:
+                return candidate
+            account = self.provider_account_binder.selected_account_record(worker, selection)
+            if (
+                account is None
+                or str(account.get("auth_method") or "").strip().lower()
+                != "subscription"
+            ):
+                return candidate
+            self.provider_account_binder.update_selected_account_status(
+                worker,
+                selection,
+                status="action_required",
+                reconnect_reason=(
+                    "Connected AI account sign-in expired. Reconnect this account in Connections."
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Could not mark a recovered expired connected AI account for reconnection",
+                exc_info=True,
+                extra={"worker_id": worker.get("worker_id")},
+            )
+            return candidate
+        personal = self._personal_account_reconnect_failure(
+            runtime=runtime,
+            worker=worker,
+        )
+        return {
+            **candidate,
+            "error_text": personal.user_message,
+            **personal.as_store_fields(),
+        }
 
     def _run_unbound_selected_account_route(
         self,
@@ -1363,6 +1486,8 @@ class ProfiledWorkerRuntime:
                         account_id=str(
                             account.get("account_id") or selection.account_id
                         ),
+                        selection=selection,
+                        reconnect_personal_account=False,
                     )
             except InferenceBrokerError as exc:
                 unavailable_codes = {
@@ -1488,6 +1613,8 @@ class ProfiledWorkerRuntime:
                     timeout_sec=timeout_sec,
                     run_id=effective_run_id,
                     account_id=selection.account_id,
+                    selection=selection,
+                    reconnect_personal_account=True,
                 )
             return self._run_unbound_selected_account_route(
                 runtime=runtime,
@@ -1735,18 +1862,28 @@ class ProfiledWorkerRuntime:
         runtime = self._runtime_for_worker(worker)
         if hasattr(runtime, "collect_completed_run"):
             try:
-                return runtime.collect_completed_run(worker, run_id=run_id, instruction=instruction)
+                recovered = runtime.collect_completed_run(
+                    worker,
+                    run_id=run_id,
+                    instruction=instruction,
+                )
             except TypeError as exc:
                 if "instruction" in str(exc):
                     try:
-                        return runtime.collect_completed_run(worker, run_id=run_id)
+                        recovered = runtime.collect_completed_run(worker, run_id=run_id)
                     except TypeError as run_id_exc:
                         if "run_id" not in str(run_id_exc):
                             raise
-                        return runtime.collect_completed_run(worker)
-                if "run_id" not in str(exc):
+                        recovered = runtime.collect_completed_run(worker)
+                elif "run_id" not in str(exc):
                     raise
-                return runtime.collect_completed_run(worker)
+                else:
+                    recovered = runtime.collect_completed_run(worker)
+            return self._personalize_completed_provider_auth_failure(
+                runtime=runtime,
+                worker=worker,
+                recovered=recovered,
+            )
         return None
 
     def desktop_action(
@@ -2656,6 +2793,8 @@ class BaseCliWorkerRuntime:
                 exit_code=exit_code,
             )
             failure_fields = classification.as_store_fields()
+            if classification.personal_account_reconnect:
+                failure_fields[_PERSONAL_ACCOUNT_RECONNECT_MARKER] = True
             if self.runtime_name == "claude-code":
                 # stream-json stdout is the full model/tool transcript. It remains in the
                 # operator-private run files, but must never become a durable/public job error.
@@ -3045,13 +3184,13 @@ class BaseCliWorkerRuntime:
             raise
 
         if exit_code != 0:
+            classification = classify_cli_failure(
+                stdout=stdout,
+                stderr=stderr,
+                runtime_name=self.runtime_name,
+                exit_code=exit_code,
+            )
             if self.runtime_name == "claude-code":
-                classification = classify_cli_failure(
-                    stdout=stdout,
-                    stderr=stderr,
-                    runtime_name=self.runtime_name,
-                    exit_code=exit_code,
-                )
                 detail = classification.user_message
             else:
                 detail = (stderr or stdout or "").strip()[-2000:]
@@ -3090,7 +3229,15 @@ class BaseCliWorkerRuntime:
                 stop_reason="process_exit",
                 evidence_path=evidence_path,
             )
-            raise RuntimeErrorBase(f"{self.runtime_name} exited with code {exit_code}: {detail}")
+            private_classification = _private_cli_failure_classification(
+                classification,
+                exit_code=exit_code,
+            )
+            error = RuntimeErrorBase(
+                f"{self.runtime_name} exited with code {exit_code}: {detail}"
+            )
+            error.failure_classification = private_classification  # type: ignore[attr-defined]
+            raise error
 
         session_key, output = self._parse_output(worker_for_run, stdout, stderr, info)
         if session_key:

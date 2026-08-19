@@ -13,6 +13,7 @@ class FailureClassification:
     user_message: str
     recommended_recovery: str
     diagnostic_summary: str
+    personal_account_reconnect: bool = False
 
     def as_store_fields(self) -> dict[str, Any]:
         return {
@@ -42,6 +43,10 @@ def classify_cli_failure(
     diagnostic_source = "\n".join(evidence) if evidence else stderr or stdout
     diagnostic_summary = _redact_failure_text(diagnostic_source.strip(), max_chars=1200)
     lowered = diagnostic_summary.lower()
+    structured_authentication_failed = _has_structured_authentication_failed(
+        stdout,
+        stderr,
+    )
 
     if "content_filter" in lowered or "content filter" in lowered:
         return FailureClassification(
@@ -101,7 +106,10 @@ def classify_cli_failure(
             ),
             diagnostic_summary=diagnostic_summary,
         )
-    if _looks_like_provider_auth_failure(lowered):
+    if _looks_like_provider_auth_failure(
+        lowered,
+        structured_authentication_failed=structured_authentication_failed,
+    ):
         return FailureClassification(
             failure_class="provider_auth_missing",
             retryable=False,
@@ -111,6 +119,7 @@ def classify_cli_failure(
                 "then use workspace_continue to resume the same workspace."
             ),
             diagnostic_summary=diagnostic_summary,
+            personal_account_reconnect=structured_authentication_failed,
         )
     if "response.failed" in lowered or "turn.failed" in lowered:
         return FailureClassification(
@@ -203,6 +212,9 @@ def classify_runtime_error(
     runtime_name: str,
 ) -> FailureClassification:
     """Classify runtime/control-plane failures without inspecting the user's task text."""
+    embedded = getattr(exc, "failure_classification", None)
+    if isinstance(embedded, FailureClassification):
+        return embedded
     message = _redact_failure_text(str(exc or "").strip(), max_chars=1200)
     lowered = message.lower()
     runtime_label = str(getattr(exc, "runtime_name", "") or runtime_name or "worker").strip()
@@ -347,6 +359,26 @@ def _collect_structured_failure_evidence(text: str) -> list[str]:
         if isinstance(item, dict):
             evidence.extend(_extract_failure_strings(item))
     return evidence
+
+
+def _has_structured_authentication_failed(*texts: str) -> bool:
+    """Recognize the native provider result code, never echoed worker transcript text."""
+
+    for text in texts:
+        for line in str(text or "").splitlines():
+            raw = line.strip()
+            if not raw.startswith("{"):
+                continue
+            try:
+                item = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(item, dict) or item.get("is_error") is not True:
+                continue
+            for key in ("error", "error_code", "api_error_status"):
+                if str(item.get(key) or "").strip().lower() == "authentication_failed":
+                    return True
+    return False
 
 
 def _extract_failure_strings(value: Any, *, path: str = "", failure_context: bool = False) -> list[str]:
@@ -505,10 +537,15 @@ def _looks_like_rate_limit_failure(lowered: str) -> bool:
     )
 
 
-def _looks_like_provider_auth_failure(lowered: str) -> bool:
+def _looks_like_provider_auth_failure(
+    lowered: str,
+    *,
+    structured_authentication_failed: bool = False,
+) -> bool:
     return (
         "unauthorized" in lowered
         or "forbidden" in lowered
+        or structured_authentication_failed
         or "invalid api key" in lowered
         or "not logged in" in lowered
         or "please run /login" in lowered

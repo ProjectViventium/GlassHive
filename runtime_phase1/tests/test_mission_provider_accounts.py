@@ -11,6 +11,7 @@ import pytest
 
 from workers_projects_runtime.control_plane import ControlPlaneError, ControlPlaneStore
 from workers_projects_runtime.api import _build_runtime
+from workers_projects_runtime.failure_classification import classify_cli_failure
 from workers_projects_runtime.mission_provider_accounts import (
     MissionProviderAccountBinder,
     deployment_provider_readiness,
@@ -34,6 +35,7 @@ class RecordingRuntime:
         self.desktop_exit_callback = None
         self.ensure_calls = 0
         self.ensured_workers: list[dict] = []
+        self.completed_run: dict[str, object] | None = None
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         self.ensure_calls += 1
@@ -88,6 +90,15 @@ class RecordingRuntime:
 
     def reconcile_provider_account_binding(self, account_home: Path) -> None:
         self.reconciled_homes.append(Path(account_home))
+
+    def collect_completed_run(
+        self,
+        _worker: dict,
+        run_id: str | None = None,
+        instruction: str | None = None,
+    ) -> dict[str, object] | None:
+        del run_id, instruction
+        return dict(self.completed_run) if self.completed_run is not None else None
 
 
 def _account(
@@ -165,6 +176,228 @@ def test_multi_user_docker_mission_projects_only_the_selected_account_home(
         account["account_id"], "codex-cli:mission"
     ) is None
     assert runtime.codex.released_workers == ["wrk_personal"]  # type: ignore[attr-defined]
+
+
+def test_expired_personal_claude_session_requires_reconnect_and_releases_lease(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="claude")
+
+    def fail_with_expired_session(_worker, _instruction, _timeout_sec, _run_id):
+        failure = classify_cli_failure(
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "is_error": True,
+                    "error": "authentication_failed",
+                    "result": (
+                        "Failed to authenticate: OAuth session expired and could not be refreshed"
+                    ),
+                }
+            ),
+            stderr="",
+            runtime_name="claude-code",
+            exit_code=1,
+        )
+        error = RuntimeErrorBase("claude-code exited with code 1")
+        error.failure_classification = failure  # type: ignore[attr-defined]
+        raise error
+
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    recorder = RecordingRuntime(fail_with_expired_session)
+    runtime.claude = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    worker = _worker(account["account_id"], profile="claude-code")
+    worker["execution_mode"] = "docker"
+
+    with pytest.raises(RuntimeErrorBase) as failed:
+        runtime.run_task(worker, "reuse the saved workspace", run_id="run_expired_claude")
+
+    assert getattr(failed.value, "failure_classification", None) is not None, str(
+        failed.value
+    )
+    updated = store.get_provider_account(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+    assert updated is not None
+    assert updated["status"] == "action_required"
+    assert updated["recovery_code"] == ""
+    assert "Reconnect" in updated["reconnect_reason"]
+    assert (
+        failed.value.failure_classification.recommended_recovery  # type: ignore[attr-defined]
+        == "Open Connections, reconnect the selected account, then continue the same workspace."
+    )
+    assert (
+        failed.value.failure_classification.diagnostic_summary  # type: ignore[attr-defined]
+        == "class=provider_auth_missing; runtime=claude-code"
+    )
+    assert store.active_provider_lease(
+        account["account_id"], "claude-code:mission"
+    ) is None
+    assert recorder.released_workers == ["wrk_personal"]
+
+
+def test_completed_personal_claude_auth_failure_keeps_connections_recovery(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="claude")
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    recorder = RecordingRuntime()
+    recorder.completed_run = {
+        "state": "failed",
+        "output_text": "",
+        "error_text": "claude-code exited with code 1",
+        "failure_class": "provider_auth_missing",
+        "failure_retryable": 0,
+        "failure_user_message": "The worker could not use provider credentials.",
+        "failure_recommended_recovery": "Fix the CLI login.",
+        "failure_diagnostic_summary": "class=provider_auth_missing; exit_code=1",
+        "_glasshive_personal_account_reconnect_required": True,
+    }
+    runtime.claude = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    worker = _worker(account["account_id"], profile="claude-code")
+    worker["execution_mode"] = "docker"
+
+    recovered = runtime.collect_completed_run(
+        worker,
+        run_id="run_expired_claude",
+        instruction="reuse the saved workspace",
+    )
+
+    assert recovered is not None
+    assert recovered["failure_user_message"] == (
+        "The selected connected AI account must be reconnected."
+    )
+    assert recovered["failure_recommended_recovery"] == (
+        "Open Connections, reconnect the selected account, then continue the same workspace."
+    )
+    assert recovered["failure_diagnostic_summary"] == (
+        "class=provider_auth_missing; runtime=claude-code"
+    )
+    assert recovered["error_text"] == (
+        "The selected connected AI account must be reconnected."
+    )
+    updated = store.get_provider_account(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+    assert updated is not None
+    assert updated["status"] == "action_required"
+    assert "Reconnect" in updated["reconnect_reason"]
+
+
+def test_broker_auth_failure_does_not_claim_personal_subscription_expired(tmp_path):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="codex", auth_method="api_key")
+
+    class FakeInferenceBroker:
+        @contextmanager
+        def bind_run(self, **_kwargs):
+            yield {"adapter": "synthetic-broker"}
+
+    def fail_broker_route(_worker, _instruction, _timeout_sec, _run_id):
+        failure = classify_cli_failure(
+            stdout="",
+            stderr="HTTP status 401 Unauthorized",
+            runtime_name="codex-cli",
+            exit_code=1,
+        )
+        error = RuntimeErrorBase("codex-cli exited with code 1")
+        error.failure_classification = failure  # type: ignore[attr-defined]
+        raise error
+
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    runtime.host_codex = RecordingRuntime(fail_broker_route)  # type: ignore[assignment]
+    runtime.inference_broker = FakeInferenceBroker()  # type: ignore[assignment]
+    worker = {**_worker(account["account_id"]), "model": "gpt-synthetic"}
+
+    with pytest.raises(RuntimeErrorBase) as failed:
+        runtime.run_task(worker, "broker mission", run_id="run_broker_auth")
+
+    updated = store.get_provider_account(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+    assert updated is not None
+    assert updated["status"] == "ready"
+    assert (
+        failed.value.failure_classification.recommended_recovery  # type: ignore[attr-defined]
+        != "Open Connections, reconnect the selected account, then continue the same workspace."
+    )
+
+
+def test_worker_tool_401_does_not_disable_selected_personal_subscription(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="claude")
+
+    def fail_with_incidental_401(_worker, _instruction, _timeout_sec, _run_id):
+        failure = classify_cli_failure(
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "is_error": True,
+                    "error": "tool_failed",
+                    "result": "A worker tool returned HTTP status 401 Unauthorized.",
+                }
+            ),
+            stderr="",
+            runtime_name="claude-code",
+            exit_code=1,
+        )
+        error = RuntimeErrorBase("claude-code exited with code 1")
+        error.failure_classification = failure  # type: ignore[attr-defined]
+        raise error
+
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    recorder = RecordingRuntime(fail_with_incidental_401)
+    runtime.claude = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    worker = _worker(account["account_id"], profile="claude-code")
+    worker["execution_mode"] = "docker"
+
+    with pytest.raises(RuntimeErrorBase):
+        runtime.run_task(worker, "debug a worker tool", run_id="run_tool_401")
+
+    updated = store.get_provider_account(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+    assert updated is not None
+    assert updated["status"] == "ready"
+    assert store.active_provider_lease(
+        account["account_id"], "claude-code:mission"
+    ) is None
+    assert recorder.released_workers == ["wrk_personal"]
 
 
 def test_startup_recovery_removes_orphaned_interactive_provider_binding(tmp_path):

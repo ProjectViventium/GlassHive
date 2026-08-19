@@ -5651,6 +5651,102 @@ def test_cli_failure_classifies_not_logged_in_provider_session():
     assert "CLI login" in failure.recommended_recovery
 
 
+def test_cli_failure_classifies_expired_claude_oauth_session():
+    failure = classify_cli_failure(
+        stdout=json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "error": "authentication_failed",
+                "result": "Failed to authenticate: OAuth session expired and could not be refreshed",
+            }
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_auth_missing"
+    assert failure.retryable is False
+    assert "provider credentials" in failure.user_message
+
+
+def test_cli_failure_does_not_treat_worker_transcript_as_provider_auth_failure():
+    failure = classify_cli_failure(
+        stdout=json.dumps(
+            {
+                "type": "result",
+                "is_error": True,
+                "error": "tool_failed",
+                "result": (
+                    "A test failed while comparing the literal value "
+                    "authentication_failed; the provider session was not involved."
+                ),
+            }
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "unknown"
+
+
+def test_runtime_error_preserves_private_cli_failure_classification():
+    embedded = classify_cli_failure(
+        stdout=json.dumps(
+            {
+                "type": "result",
+                "is_error": True,
+                "error": "authentication_failed",
+                "result": "Failed to authenticate",
+            }
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+    private = profile_runtime_module._private_cli_failure_classification(
+        embedded,
+        exit_code=1,
+    )
+    error = RuntimeErrorBase("claude-code exited with code 1")
+    error.failure_classification = private  # type: ignore[attr-defined]
+
+    classified = classify_runtime_error(error, runtime_name="claude-code")
+
+    assert classified is private
+    assert classified.failure_class == "provider_auth_missing"
+    assert classified.diagnostic_summary == "class=provider_auth_missing; exit_code=1"
+
+
+def test_private_cli_failure_classification_drops_provider_transcript():
+    classification = classify_cli_failure(
+        stdout=json.dumps(
+            {
+                "type": "result",
+                "is_error": True,
+                "error": "authentication_failed",
+                "result": "Sensitive synthetic mission content must not leave the run files.",
+            }
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    private = profile_runtime_module._private_cli_failure_classification(
+        classification,
+        exit_code=1,
+    )
+
+    assert private.failure_class == "provider_auth_missing"
+    assert private.personal_account_reconnect is True
+    assert private.diagnostic_summary == "class=provider_auth_missing; exit_code=1"
+    assert "Sensitive synthetic mission content" not in private.diagnostic_summary
+
+
 def test_runtime_error_classifies_missing_executable_substrate():
     failure = classify_runtime_error(
         RuntimeErrorBase(
