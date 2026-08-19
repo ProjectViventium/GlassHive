@@ -1040,6 +1040,66 @@ def test_provider_disconnect_removes_private_home_when_native_logout_fails(tmp_p
     assert store.active_provider_lease(account["account_id"], "provider-disconnect") is None
 
 
+def test_provider_disconnect_without_native_home_does_not_claim_provider_logout(tmp_path):
+    store = ControlPlaneStore(str(tmp_path / "runtime.db"))
+    account = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="claude",
+        label="Personal Claude",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://auto",
+        status="ready",
+    )
+    setup = ProviderSetupManager(store=store, home_root=tmp_path / "provider-homes")
+
+    result = setup.disconnect(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+
+    assert result["status"] == "disconnected"
+    assert result["provider_logout_confirmed"] is None
+    assert result["message"] == "Removed from GlassHive. No local provider session was present."
+
+
+def test_provider_disconnect_unlinks_final_home_symlink_without_following_target(tmp_path):
+    store = ControlPlaneStore(str(tmp_path / "runtime.db"))
+    account = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="claude",
+        label="Personal Claude",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://auto",
+        status="ready",
+    )
+    setup = ProviderSetupManager(store=store, home_root=tmp_path / "provider-homes")
+    account_home = setup.homes.account_home_path(
+        tenant_id="tenant-a", owner_id="user-a", account_id=account["account_id"]
+    )
+    account_home.parent.mkdir(parents=True)
+    outside = tmp_path / "outside-provider-home"
+    outside.mkdir()
+    marker = outside / "must-remain.txt"
+    marker.write_text("outside", encoding="utf-8")
+    account_home.symlink_to(outside, target_is_directory=True)
+
+    result = setup.disconnect(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+
+    assert result["status"] == "disconnected"
+    assert not account_home.exists()
+    assert not account_home.is_symlink()
+    assert marker.read_text(encoding="utf-8") == "outside"
+
+
 def test_provider_forget_removes_owner_scoped_active_and_revoked_grant_rows(tmp_path):
     database = tmp_path / "runtime.db"
     store = ControlPlaneStore(str(database))

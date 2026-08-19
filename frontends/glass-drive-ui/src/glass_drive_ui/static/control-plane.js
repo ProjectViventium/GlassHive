@@ -236,11 +236,7 @@ async function removeProviderAccount(account, button) {
   try {
     const result = await removeProviderAccountRequest(api, accountId);
     await loadControlPlane();
-    setProviderStatus(
-      result?.provider_logout_confirmed === false
-        ? String(result.message || 'Removed from GlassHive. Provider sign-out could not be confirmed.')
-        : `${label} removed.`,
-    );
+    setProviderStatus(String(result?.message || `${label} removed.`));
   } catch (error) {
     try {
       await loadControlPlane();
@@ -248,6 +244,8 @@ async function removeProviderAccount(account, button) {
       // Keep the original removal error visible.
     }
     setProviderStatus(error.message);
+    button.disabled = false;
+    button.textContent = 'Remove';
   }
 }
 

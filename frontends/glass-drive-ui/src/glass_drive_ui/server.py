@@ -3317,7 +3317,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             return _client_for_request(request).disconnect_provider_account(account_id)
         except httpx.HTTPStatusError as exc:
             raise _runtime_http_exception(
-                exc, "GlassHive could not disconnect this account"
+                exc, "GlassHive could not remove this account"
             ) from exc
 
     @app.delete("/api/provider-accounts/{account_id}")
@@ -3326,7 +3326,7 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             return _client_for_request(request).forget_provider_account(account_id)
         except httpx.HTTPStatusError as exc:
             raise _runtime_http_exception(
-                exc, "GlassHive could not forget this account"
+                exc, "GlassHive could not remove this account"
             ) from exc
 
     @app.get("/api/workspaces/{worker_id}/capability-grants")

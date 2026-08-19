@@ -5655,7 +5655,7 @@ def test_control_plane_ui_exposes_safe_disconnect_and_capability_remove_paths():
 
     assert "removeProviderAccount" in script
     assert "Removing…" in script
-    assert "Provider sign-out could not be confirmed" in script
+    assert "result?.message || `${label} removed.`" in script
     assert "Reconnect" in script
     assert "Test connection" in script
     assert "Check connection" in script
@@ -5766,6 +5766,22 @@ def test_connections_recovery_is_verify_first_and_external_client_failure_is_opt
     assert "if (connectResponse?.ok)" in script
     assert "External AI client setup is temporarily unavailable." in script
     assert "if (!connectResponse.ok) throw" not in script
+    removal = script[
+        script.index("async function removeProviderAccount") : script.index(
+            "function renderProviderAccounts"
+        )
+    ]
+    removal_error = removal.index("setProviderStatus(error.message);")
+    assert removal.index("button.disabled = false;", removal_error) > removal_error
+    assert removal.index("button.textContent = 'Remove';", removal_error) > removal_error
+
+
+def test_provider_account_errors_match_the_single_remove_action():
+    script = Path(server_module.__file__).read_text(encoding="utf-8")
+
+    assert 'exc, "GlassHive could not remove this account"' in script
+    assert 'exc, "GlassHive could not disconnect this account"' not in script
+    assert 'exc, "GlassHive could not forget this account"' not in script
 
 
 def test_connections_ui_keeps_primary_account_setup_short_and_actionable():

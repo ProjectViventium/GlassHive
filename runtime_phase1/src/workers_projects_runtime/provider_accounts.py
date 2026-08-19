@@ -264,7 +264,14 @@ class ProviderAccountHomeManager:
         if not account_home.exists() and not account_home.is_symlink():
             return
         if account_home.is_symlink():
-            raise ControlPlaneError("Provider account home is not a safe managed directory")
+            resolved_root = self.root.resolve(strict=True)
+            resolved_parent = account_home.parent.resolve(strict=True)
+            if resolved_root != resolved_parent and resolved_root not in resolved_parent.parents:
+                raise ControlPlaneError(
+                    "Provider account home is outside the managed credential root"
+                )
+            account_home.unlink()
+            return
         resolved_root = self.root.resolve(strict=True)
         resolved_home = account_home.resolve(strict=True)
         if resolved_root not in resolved_home.parents:
@@ -1120,7 +1127,7 @@ class ProviderSetupManager:
                 "error",
             ),
         )
-        provider_logout_confirmed = True
+        provider_logout_confirmed: bool | None = None
         try:
             self.store.update_provider_account_status(
                 account_id=account_id,
@@ -1195,14 +1202,16 @@ class ProviderSetupManager:
             raise ControlPlaneError(
                 "GlassHive could not remove its private account data. Retry Remove."
             ) from exc
+        if provider_logout_confirmed is True:
+            message = "Removed from GlassHive."
+        elif provider_logout_confirmed is False:
+            message = "Removed from GlassHive. Provider sign-out could not be confirmed."
+        else:
+            message = "Removed from GlassHive. No local provider session was present."
         return {
             "account_id": account_id,
             "status": str(updated.get("status") or "disconnected"),
             "complete": True,
             "provider_logout_confirmed": provider_logout_confirmed,
-            "message": (
-                "Removed from GlassHive."
-                if provider_logout_confirmed
-                else "Removed from GlassHive. Provider sign-out could not be confirmed."
-            ),
+            "message": message,
         }
