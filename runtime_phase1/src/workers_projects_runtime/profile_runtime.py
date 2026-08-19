@@ -35,7 +35,11 @@ from .bootstrap import (
     resolve_bootstrap_source_path,
 )
 from .docker_sandbox import DockerSandboxManager
-from .failure_classification import classify_cli_failure, classify_runtime_error
+from .failure_classification import (
+    classify_cli_failure,
+    classify_runtime_error,
+    compact_provider_failure_diagnostic,
+)
 from .openclaw_runtime import (
     RuntimeErrorBase,
     RuntimeDependencyMissingError,
@@ -1631,10 +1635,14 @@ class BaseCliWorkerRuntime:
             failure_fields = classification.as_store_fields()
             if self.runtime_name == "claude-code":
                 # stream-json stdout is the full model/tool transcript. It remains in the
-                # operator-private run files, but must never become a durable/public job error.
+                # operator-private run files. Persist only a bounded enum/status fingerprint;
+                # never promote free-form transcript or provider response text.
                 detail = classification.user_message
-                failure_fields["failure_diagnostic_summary"] = (
-                    f"class={classification.failure_class}; exit_code={exit_code}"
+                failure_fields["failure_diagnostic_summary"] = compact_provider_failure_diagnostic(
+                    stdout=stdout,
+                    stderr=stderr,
+                    classification=classification,
+                    exit_code=exit_code,
                 )
             else:
                 detail = _redact_text((stderr or stdout or "").strip(), max_chars=2000)

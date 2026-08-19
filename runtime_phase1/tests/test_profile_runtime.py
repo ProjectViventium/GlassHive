@@ -3335,7 +3335,293 @@ def test_claude_failed_stream_never_promotes_transcript_content_to_public_error_
     assert sensitive not in recovered["error_text"]
     assert sensitive not in recovered["failure_diagnostic_summary"]
     assert "Overloaded" not in recovered["failure_diagnostic_summary"]
+    assert recovered["failure_diagnostic_summary"] == (
+        "class=provider_response_failed; status=529; exit_code=1"
+    )
     assert recovered["telemetry"]["api_retry_statuses"] == []
+
+
+def test_claude_failed_stream_preserves_bounded_explicit_deny_diagnosis_without_private_text(
+    tmp_path,
+):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_failed_claude_explicit_deny",
+        "name": "Invoice Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_failed_claude_explicit_deny"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    private_invoice_text = "INVOICE 123456 PRIVATE CUSTOMER LINE"
+    secret_arn = "arn:aws:iam::123456789012:policy/private-deny-policy"
+    (run_root / "stdout.log").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [{"type": "text", "text": private_invoice_text}]
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "api_retry",
+                        "attempt": 10,
+                        "max_retries": 10,
+                        "error_status": 403,
+                        "error": "authentication_failed",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": True,
+                        "api_error_status": 403,
+                        "result": (
+                            "Failed to authenticate. API Error: 403 User is not authorized to "
+                            "perform bedrock:InvokeModelWithResponseStream on an "
+                            "application-inference-profile with an explicit deny in an "
+                            f"identity-based policy: {secret_arn}"
+                        ),
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    (run_root / "stderr.log").write_text("")
+    (run_root / "exit_code").write_text("1")
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+
+    assert recovered is not None
+    assert recovered["failure_diagnostic_summary"] == (
+        "class=provider_auth_missing; reason=identity_policy_explicit_deny; status=403; "
+        "operation=bedrock_invoke_stream; provider_error=authentication_failed; exit_code=1"
+    )
+    assert len(recovered["failure_diagnostic_summary"]) <= 256
+    assert private_invoice_text not in recovered["failure_diagnostic_summary"]
+    assert secret_arn not in recovered["failure_diagnostic_summary"]
+    assert "private-deny-policy" not in recovered["failure_diagnostic_summary"]
+
+
+@pytest.mark.parametrize(
+    ("result_text", "expected_reason"),
+    [
+        ("Not logged in. Please run /login.", "cli_login_missing"),
+        ("Invalid API key supplied.", "invalid_api_key"),
+        ("The provider credentials expired.", "credentials_expired"),
+    ],
+)
+def test_claude_failed_stream_keeps_only_predefined_auth_reason(tmp_path, result_text, expected_reason):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": f"wrk_failed_claude_{expected_reason}",
+        "name": "Invoice Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = f"run_failed_claude_{expected_reason}"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "error",
+                "is_error": True,
+                "api_error_status": 401,
+                "result": result_text,
+            }
+        )
+        + "\n"
+    )
+    (run_root / "stderr.log").write_text("")
+    (run_root / "exit_code").write_text("1")
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+
+    assert recovered is not None
+    assert f"reason={expected_reason}" in recovered["failure_diagnostic_summary"]
+    assert result_text not in recovered["failure_diagnostic_summary"]
+    assert len(recovered["failure_diagnostic_summary"]) <= 256
+
+
+def test_claude_failed_stream_does_not_infer_explicit_deny_from_assistant_text(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_failed_claude_untrusted_lookalike",
+        "name": "Invoice Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_failed_claude_untrusted_lookalike"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "status_code": 403,
+                                        "error": (
+                                            "The invoice source says explicit deny in an identity-based "
+                                            "policy and bedrock:InvokeModelWithResponseStream."
+                                        ),
+                                    }
+                                ]
+                            },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error",
+                        "is_error": True,
+                        "api_error_status": 403,
+                        "result": "Forbidden",
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    (run_root / "stderr.log").write_text("")
+    (run_root / "exit_code").write_text("1")
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+
+    assert recovered is not None
+    assert "reason=provider_auth_rejected" in recovered["failure_diagnostic_summary"]
+    assert "identity_policy_explicit_deny" not in recovered["failure_diagnostic_summary"]
+    assert "bedrock_invoke_stream" not in recovered["failure_diagnostic_summary"]
+
+
+def test_claude_failed_stream_ignores_top_level_tool_result_lookalike(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_failed_claude_top_level_tool_result",
+        "name": "Invoice Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_failed_claude_top_level_tool_result"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error",
+                        "is_error": True,
+                        "api_error_status": 403,
+                        "result": "Forbidden",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_result",
+                        "is_error": True,
+                        "error_status": 403,
+                        "error": (
+                            "explicit deny in an identity-based policy for "
+                            "bedrock:InvokeModelWithResponseStream"
+                        ),
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    (run_root / "stderr.log").write_text("")
+    (run_root / "exit_code").write_text("1")
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+
+    assert recovered is not None
+    assert recovered["failure_diagnostic_summary"] == (
+        "class=provider_auth_missing; reason=provider_auth_rejected; status=403; exit_code=1"
+    )
+
+
+def test_claude_failed_stream_uses_only_provider_record_status_and_error(tmp_path):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_failed_claude_provider_record_only",
+        "name": "Invoice Worker",
+        "profile": "claude-code",
+        "model": "claude-opus-test",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_failed_claude_provider_record_only"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "tool_result",
+                        "is_error": True,
+                        "status_code": 404,
+                        "error": "invalid_api_key",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "api_retry",
+                        "error_status": 403,
+                        "error": "authentication_failed",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error",
+                        "is_error": True,
+                        "api_error_status": 403,
+                        "result": "Forbidden",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "status_code": 500,
+                        "error": "token_expired",
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    (run_root / "stderr.log").write_text("")
+    (run_root / "exit_code").write_text("1")
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+
+    assert recovered is not None
+    assert recovered["failure_diagnostic_summary"] == (
+        "class=provider_auth_missing; reason=provider_auth_rejected; status=403; "
+        "provider_error=authentication_failed; exit_code=1"
+    )
 
 
 def test_claude_run_telemetry_is_recorded_and_read_back(tmp_path):

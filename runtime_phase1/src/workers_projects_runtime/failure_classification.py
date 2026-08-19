@@ -28,6 +28,91 @@ def has_structured_failure_evidence(*texts: str) -> bool:
     return any(_collect_structured_failure_evidence(text or "") for text in texts)
 
 
+def compact_provider_failure_diagnostic(
+    *,
+    stdout: str,
+    stderr: str,
+    classification: FailureClassification,
+    exit_code: int | None,
+) -> str:
+    """Return a content-free provider fingerprint for durable operator evidence."""
+    failure_class = str(classification.failure_class or "unknown").strip().lower()
+    if not re.fullmatch(r"[a-z0-9_]{1,64}", failure_class):
+        failure_class = "unknown"
+
+    records = [
+        record
+        for text in (stdout or "", stderr or "")
+        for record in _structured_failure_records(text)
+    ]
+    statuses = [
+        status
+        for record in records
+        for key in ("error_status", "api_error_status")
+        for status in [_safe_http_status(record.get(key))]
+        if status is not None
+    ]
+    status = statuses[-1] if statuses else None
+    failure_text = " ".join(
+        text.casefold()
+        for record in records
+        for text in _failure_record_text(record)
+    )
+    provider_error = next(
+        (
+            normalized
+            for record in reversed(records)
+            for normalized in [_provider_record_error(record)]
+            if normalized
+        ),
+        None,
+    )
+
+    reason: str | None = None
+    operation: str | None = None
+    if failure_class == "provider_auth_missing":
+        if (
+            status == 403
+            and "explicit deny" in failure_text
+            and "identity-based policy" in failure_text
+        ):
+            reason = "identity_policy_explicit_deny"
+            if "bedrock:invokemodelwithresponsestream" in failure_text:
+                operation = "bedrock_invoke_stream"
+        elif "not logged in" in failure_text or "please run /login" in failure_text:
+            reason = "cli_login_missing"
+        elif "invalid api key" in failure_text:
+            reason = "invalid_api_key"
+        elif (
+            "credential" in failure_text or "token" in failure_text
+        ) and "expired" in failure_text:
+            reason = "credentials_expired"
+        else:
+            reason = "provider_auth_rejected"
+
+    parts = [f"class={failure_class}"]
+    if reason:
+        parts.append(f"reason={reason}")
+    if status is not None:
+        parts.append(f"status={status}")
+    if operation:
+        parts.append(f"operation={operation}")
+    if provider_error:
+        parts.append(f"provider_error={provider_error}")
+    safe_exit_code = _safe_exit_code(exit_code)
+    if safe_exit_code is not None:
+        parts.append(f"exit_code={safe_exit_code}")
+    summary = "; ".join(parts)
+    if len(summary) <= 256:
+        return summary
+    fallback = [f"class={failure_class}"]
+    if status is not None:
+        fallback.append(f"status={status}")
+    if safe_exit_code is not None:
+        fallback.append(f"exit_code={safe_exit_code}")
+    return "; ".join(fallback)[:256]
+
+
 def classify_cli_failure(
     *,
     stdout: str,
@@ -346,6 +431,103 @@ def _collect_structured_failure_evidence(text: str) -> list[str]:
         if isinstance(item, dict):
             evidence.extend(_extract_failure_strings(item))
     return evidence
+
+
+def _structured_failure_records(text: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw or not raw.startswith("{"):
+            continue
+        try:
+            item = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        # Claude stream-json may contain arbitrary top-level tool output as well
+        # as nested transcript/source content. Only known provider event shapes
+        # with a provider status are eligible for a durable fingerprint.
+        if isinstance(item, dict) and _is_provider_failure_record(item):
+            records.append(item)
+    return records
+
+
+def _is_provider_failure_record(record: dict[str, Any]) -> bool:
+    event_type = str(record.get("type") or "").strip().lower()
+    has_status = any(
+        _safe_http_status(record.get(key)) is not None
+        for key in ("error_status", "api_error_status")
+    )
+    if not has_status:
+        return False
+    if event_type == "result":
+        return record.get("is_error") is True
+    return event_type == "system" and str(record.get("subtype") or "").lower() == "api_retry"
+
+
+def _safe_http_status(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        status = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return status if 100 <= status <= 599 else None
+
+
+def _safe_exit_code(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        exit_code = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return exit_code if -999 <= exit_code <= 999 else None
+
+
+_SAFE_PROVIDER_ERRORS = frozenset(
+    {
+        "authentication_failed",
+        "invalid_api_key",
+        "not_logged_in",
+        "token_expired",
+    }
+)
+
+
+def _safe_provider_error(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower().replace("-", " ").replace(" ", "_")
+    return normalized if normalized in _SAFE_PROVIDER_ERRORS else None
+
+
+def _provider_record_error(record: dict[str, Any]) -> str | None:
+    for key in ("error", "error_code"):
+        value = record.get(key)
+        direct = _safe_provider_error(value)
+        if direct:
+            return direct
+        if isinstance(value, dict):
+            for child_key in ("type", "code"):
+                direct = _safe_provider_error(value.get(child_key))
+                if direct:
+                    return direct
+    return None
+
+
+def _failure_record_text(value: Any, *, key: str = "") -> list[str]:
+    results: list[str] = []
+    if isinstance(value, dict):
+        for child_key in ("detail", "error", "error_code", "message", "result"):
+            child = value.get(child_key)
+            if isinstance(child, str):
+                results.append(child)
+            elif isinstance(child, dict):
+                for direct_key in ("type", "code", "message", "detail"):
+                    direct_value = child.get(direct_key)
+                    if isinstance(direct_value, str):
+                        results.append(direct_value)
+    return results
 
 
 def _extract_failure_strings(value: Any, *, path: str = "", failure_context: bool = False) -> list[str]:
