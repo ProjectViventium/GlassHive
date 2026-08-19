@@ -824,7 +824,10 @@ raise SystemExit(2)
     reconciled: list[Path] = []
 
     def reconcile_under_lease(account_home: Path) -> None:
-        assert store.active_provider_lease(account["account_id"], "provider-setup") is not None
+        assert (
+            store.active_provider_lease(account["account_id"], "provider-setup") is not None
+            or store.active_provider_lease(account["account_id"], "provider-disconnect") is not None
+        )
         reconciled.append(account_home)
 
     setup = ProviderSetupManager(
@@ -987,7 +990,7 @@ def test_provider_setup_output_keeps_the_visible_url_but_removes_terminal_hyperl
     assert _provider_setup_guidance("claude", session.output)["setup_url"] == setup_url
 
 
-def test_provider_disconnect_preserves_private_home_when_native_logout_fails(tmp_path, monkeypatch):
+def test_provider_disconnect_removes_private_home_when_native_logout_fails(tmp_path, monkeypatch):
     store = ControlPlaneStore(str(tmp_path / "runtime.db"))
     account = store.create_provider_account(
         tenant_id="tenant-a",
@@ -999,7 +1002,12 @@ def test_provider_disconnect_preserves_private_home_when_native_logout_fails(tmp
         secret_locator="native-home://auto",
         status="ready",
     )
-    setup = ProviderSetupManager(store=store, home_root=tmp_path / "provider-homes")
+    reconciled = []
+    setup = ProviderSetupManager(
+        store=store,
+        home_root=tmp_path / "provider-homes",
+        reconcile_provider_account_binding=lambda path: reconciled.append(path),
+    )
     account_home = setup.homes.ensure_home(
         tenant_id="tenant-a",
         owner_id="user-a",
@@ -1007,25 +1015,117 @@ def test_provider_disconnect_preserves_private_home_when_native_logout_fails(tmp
         provider="codex",
     )
     monkeypatch.setenv("WPR_CODEX_CLI_PATH", "/synthetic/codex")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
     monkeypatch.setattr(
         subprocess,
         "run",
         lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0], returncode=9),
     )
 
-    with pytest.raises(ControlPlaneError, match="private account home was preserved"):
+    result = setup.disconnect(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+
+    assert result["status"] == "disconnected"
+    assert result["provider_logout_confirmed"] is False
+    assert reconciled == [account_home]
+    assert not account_home.exists()
+    updated = store.get_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )
+    assert updated is not None
+    assert updated["status"] == "disconnected"
+    assert store.active_provider_lease(account["account_id"], "provider-disconnect") is None
+
+
+def test_provider_forget_removes_owner_scoped_active_and_revoked_grant_rows(tmp_path):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="claude",
+        label="Personal Claude",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://auto",
+        status="action_required",
+    )
+    store.disconnect_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )
+    with sqlite3.connect(database) as conn:
+        for grant_id, revoked_at in (("grant_active", None), ("grant_revoked", 1.0)):
+            conn.execute(
+                """
+                INSERT INTO workspace_capability_grants
+                    (grant_id, tenant_id, owner_id, worker_id, account_id, scopes_json,
+                     prior_bootstrap_bundle_json, applied_bootstrap_bundle_json,
+                     installation_plan_json, probe_json, created_at, revoked_at)
+                VALUES (?, ?, ?, ?, ?, '[]', '{}', '{}', '[]', '{}', ?, ?)
+                """,
+                (grant_id, "tenant-a", "user-a", "worker-a", account["account_id"], 1.0, revoked_at),
+            )
+
+    assert store.forget_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )["status"] == "forgotten"
+    with sqlite3.connect(database) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM workspace_capability_grants WHERE account_id = ?",
+            (account["account_id"],),
+        ).fetchone()[0] == 0
+
+
+def test_provider_disconnect_cleanup_failure_is_actionable_and_releases_lease(
+    tmp_path, monkeypatch
+):
+    store = ControlPlaneStore(str(tmp_path / "runtime.db"))
+    account = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="claude",
+        label="Personal Claude",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://auto",
+        status="action_required",
+    )
+    setup = ProviderSetupManager(store=store, home_root=tmp_path / "provider-homes")
+    setup.homes.ensure_home(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        account_id=account["account_id"],
+        provider="claude",
+    )
+    monkeypatch.setenv("WPR_CLAUDE_CODE_PATH", "/synthetic/claude")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0], returncode=0),
+    )
+    monkeypatch.setattr(
+        setup.homes,
+        "remove_home",
+        lambda **_kwargs: (_ for _ in ()).throw(ControlPlaneError("synthetic cleanup failure")),
+    )
+
+    with pytest.raises(ControlPlaneError, match="could not remove its private account data"):
         setup.disconnect(
             account_id=account["account_id"],
             tenant_id="tenant-a",
             owner_id="user-a",
         )
 
-    assert account_home.exists()
     updated = store.get_provider_account(
         account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
     )
     assert updated is not None
     assert updated["status"] == "action_required"
+    assert updated["recovery_code"] == "credential_cleanup_failed"
+    assert updated["reconnect_reason"] == "Could not remove private account data. Retry Remove."
     assert store.active_provider_lease(account["account_id"], "provider-disconnect") is None
 
 

@@ -1120,79 +1120,89 @@ class ProviderSetupManager:
                 "error",
             ),
         )
-        self.store.update_provider_account_status(
-            account_id=account_id,
-            tenant_id=tenant_id,
-            owner_id=owner_id,
-            status="action_required",
-            reconnect_reason="Disconnect in progress",
-        )
-
-        provider = str(account.get("provider") or "").strip().lower()
-        account_home = self.homes.account_home_path(
-            tenant_id=tenant_id,
-            owner_id=owner_id,
-            account_id=account_id,
-        )
-        if account_home.exists() and not account_home.is_symlink():
-            environment = self._environment(provider=provider, account_home=account_home)
-            binary_name = "codex" if provider in {"codex", "openai"} else "claude"
-            binary_env = "WPR_CODEX_CLI_PATH" if binary_name == "codex" else "WPR_CLAUDE_CODE_PATH"
-            binary = str(os.environ.get(binary_env) or "").strip() or shutil.which(binary_name)
-            if not binary:
-                self.store.release_provider_lease(
-                    lease_id=str(disconnect_lease["lease_id"]),
-                    tenant_id=tenant_id,
-                    owner_id=owner_id,
-                )
-                raise ControlPlaneError(
-                    "Provider logout is unavailable; the private account home was preserved"
-                )
-            logout_command = (
-                [binary, "logout"]
-                if binary_name == "codex"
-                else [binary, "auth", "logout"]
+        provider_logout_confirmed = True
+        try:
+            self.store.update_provider_account_status(
+                account_id=account_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                status="action_required",
+                reconnect_reason="Disconnect in progress",
             )
+            provider = str(account.get("provider") or "").strip().lower()
+            account_home = self.homes.account_home_path(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                account_id=account_id,
+            )
+            self._reconcile_if_isolated(account_home)
+            if account_home.exists() and not account_home.is_symlink():
+                environment = self._environment(provider=provider, account_home=account_home)
+                binary_name = "codex" if provider in {"codex", "openai"} else "claude"
+                binary_env = (
+                    "WPR_CODEX_CLI_PATH"
+                    if binary_name == "codex"
+                    else "WPR_CLAUDE_CODE_PATH"
+                )
+                binary = str(os.environ.get(binary_env) or "").strip() or shutil.which(binary_name)
+                if not binary:
+                    provider_logout_confirmed = False
+                else:
+                    logout_command = (
+                        [binary, "logout"]
+                        if binary_name == "codex"
+                        else [binary, "auth", "logout"]
+                    )
+                    try:
+                        logout_result = subprocess.run(
+                            logout_command,
+                            cwd=str(account_home),
+                            env=environment,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=12,
+                            check=False,
+                        )
+                        provider_logout_confirmed = logout_result.returncode == 0
+                    except (OSError, subprocess.TimeoutExpired):
+                        provider_logout_confirmed = False
+            self.homes.remove_home(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                account_id=account_id,
+            )
+            updated = self.store.disconnect_provider_account(
+                account_id=account_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+        except Exception as exc:
             try:
-                logout_result = subprocess.run(
-                    logout_command,
-                    cwd=str(account_home),
-                    env=environment,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=12,
-                    check=False,
+                self.store.update_provider_account_status(
+                    account_id=account_id,
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                    status="action_required",
+                    reconnect_reason="Could not remove private account data. Retry Remove.",
+                    recovery_code="credential_cleanup_failed",
                 )
-            except (OSError, subprocess.TimeoutExpired) as exc:
+            finally:
                 self.store.release_provider_lease(
                     lease_id=str(disconnect_lease["lease_id"]),
                     tenant_id=tenant_id,
                     owner_id=owner_id,
                 )
-                raise ControlPlaneError(
-                    "Provider logout failed; the private account home was preserved"
-                ) from exc
-            if logout_result.returncode != 0:
-                self.store.release_provider_lease(
-                    lease_id=str(disconnect_lease["lease_id"]),
-                    tenant_id=tenant_id,
-                    owner_id=owner_id,
-                )
-                raise ControlPlaneError(
-                    "Provider logout failed; the private account home was preserved"
-                )
-        self.homes.remove_home(
-            tenant_id=tenant_id,
-            owner_id=owner_id,
-            account_id=account_id,
-        )
-        updated = self.store.disconnect_provider_account(
-            account_id=account_id,
-            tenant_id=tenant_id,
-            owner_id=owner_id,
-        )
+            raise ControlPlaneError(
+                "GlassHive could not remove its private account data. Retry Remove."
+            ) from exc
         return {
             "account_id": account_id,
             "status": str(updated.get("status") or "disconnected"),
             "complete": True,
+            "provider_logout_confirmed": provider_logout_confirmed,
+            "message": (
+                "Removed from GlassHive."
+                if provider_logout_confirmed
+                else "Removed from GlassHive. Provider sign-out could not be confirmed."
+            ),
         }

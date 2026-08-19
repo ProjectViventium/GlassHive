@@ -751,6 +751,13 @@ class ControlPlaneStore:
                 raise ControlPlaneConflict("Provider account is still in use")
             conn.execute(
                 """
+                DELETE FROM workspace_capability_grants
+                WHERE account_id = ? AND tenant_id = ? AND owner_id = ?
+                """,
+                (account_id, tenant_id, owner_id),
+            )
+            conn.execute(
+                """
                 DELETE FROM provider_accounts
                 WHERE account_id = ? AND tenant_id = ? AND owner_id = ?
                 """,

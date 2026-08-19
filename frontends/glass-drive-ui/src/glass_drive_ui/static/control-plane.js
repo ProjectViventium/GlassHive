@@ -217,6 +217,40 @@ async function verifyProviderAccount(account, button) {
   }
 }
 
+export async function removeProviderAccountRequest(requestApi, accountId) {
+  const result = await requestApi.postJson(`/api/provider-accounts/${accountId}/disconnect`);
+  await requestApi.deleteJson(`/api/provider-accounts/${accountId}`);
+  return result;
+}
+
+async function removeProviderAccount(account, button) {
+  const accountId = encodeURIComponent(String(account.account_id || ''));
+  const label = String(account.label || account.provider || 'this account');
+  const brokerBacked = ['api_key', 'enterprise_route'].includes(String(account.auth_method || ''));
+  const question = brokerBacked
+    ? `Remove ${label} from GlassHive? This does not delete the key or route in connected accounts.`
+    : `Remove ${label} from GlassHive and delete its isolated credentials? GlassHive will also try to sign out at the provider.`;
+  if (!window.confirm(question)) return;
+  button.disabled = true;
+  button.textContent = 'Removing…';
+  try {
+    const result = await removeProviderAccountRequest(api, accountId);
+    await loadControlPlane();
+    setProviderStatus(
+      result?.provider_logout_confirmed === false
+        ? String(result.message || 'Removed from GlassHive. Provider sign-out could not be confirmed.')
+        : `${label} removed.`,
+    );
+  } catch (error) {
+    try {
+      await loadControlPlane();
+    } catch (_reloadError) {
+      // Keep the original removal error visible.
+    }
+    setProviderStatus(error.message);
+  }
+}
+
 function renderProviderAccounts() {
   const list = document.getElementById('provider-account-list');
   if (!list || !controlPlane) return;
@@ -308,44 +342,10 @@ function renderProviderAccounts() {
       signInAgain.addEventListener('click', () => reconnectProviderAccount(account, signInAgain));
       moreActions.append(signInAgain);
     }
-    if (account.status !== 'disconnected') {
-      const disconnect = node('button', 'text-button', 'Disconnect');
-      disconnect.type = 'button';
-      disconnect.addEventListener('click', async () => {
-        const question = brokerBacked
-          ? `Remove ${String(account.label || account.provider || 'this account')} from GlassHive? This does not delete the key or route in connected accounts.`
-          : `Disconnect ${String(account.label || account.provider || 'this account')} and remove its isolated credentials?`;
-        if (!window.confirm(question)) return;
-        disconnect.disabled = true;
-        disconnect.textContent = 'Disconnecting…';
-        try {
-          await api.postJson(`/api/provider-accounts/${encodeURIComponent(String(account.account_id || ''))}/disconnect`);
-          await loadControlPlane();
-        } catch (error) {
-          disconnect.textContent = error.message;
-          disconnect.disabled = false;
-        }
-      });
-      moreActions.append(disconnect);
-    }
-    if (account.status === 'disconnected') {
-      const forget = node('button', 'text-button danger-text-button', 'Forget');
-      forget.type = 'button';
-      forget.addEventListener('click', async () => {
-        if (!window.confirm(`Forget ${String(account.label || account.provider || 'this account')} from GlassHive? Its disconnected metadata will be removed.`)) return;
-        forget.disabled = true;
-        forget.textContent = 'Forgetting…';
-        try {
-          await api.deleteJson(`/api/provider-accounts/${encodeURIComponent(String(account.account_id || ''))}`);
-          await loadControlPlane();
-        } catch (error) {
-          setProviderStatus(error.message);
-          forget.disabled = false;
-          forget.textContent = 'Forget';
-        }
-      });
-      moreActions.append(forget);
-    }
+    const remove = node('button', 'text-button danger-text-button', 'Remove');
+    remove.type = 'button';
+    remove.addEventListener('click', () => removeProviderAccount(account, remove));
+    moreActions.append(remove);
     if (moreActions.childElementCount) {
       more.append(moreSummary, moreActions);
       actions.append(more);

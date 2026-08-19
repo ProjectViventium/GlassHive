@@ -5653,14 +5653,17 @@ def test_provider_verify_and_forget_are_user_scoped_through_the_runtime_client()
 def test_control_plane_ui_exposes_safe_disconnect_and_capability_remove_paths():
     script = (Path(server_module.STATIC_DIR) / "control-plane.js").read_text(encoding="utf-8")
 
-    assert "Disconnecting…" in script
+    assert "removeProviderAccount" in script
+    assert "Removing…" in script
+    assert "Provider sign-out could not be confirmed" in script
     assert "Reconnect" in script
     assert "Test connection" in script
     assert "Check connection" in script
     assert "Sign in again" in script
     assert "credential_cleanup_failed" in script
     assert "subscriptionRouteAvailable(account)" in script
-    assert "Forget" in script
+    assert "'Remove'" in script
+    assert "'Forget'" not in script
     assert "last_verified_at" in script
     assert "last_used_at" in script
     assert "observed_runs" in script
@@ -5685,6 +5688,67 @@ def test_control_plane_ui_exposes_safe_disconnect_and_capability_remove_paths():
     assert 'id="confirm-dependencies"' in confirm_page
     assert "library_plan_snapshot" in confirm_script
     assert "librarySnapshot.content_hash" in confirm_script
+
+
+def test_provider_account_remove_disconnects_before_delete_and_stops_on_cleanup_failure():
+    module = (Path(server_module.STATIC_DIR) / "control-plane.js").as_uri()
+    script = f"""
+      import {{ removeProviderAccountRequest }} from {json.dumps(module)};
+      const events = [];
+      const ok = {{
+        postJson: async (url) => {{ events.push(['post', url]); return {{provider_logout_confirmed: false}}; }},
+        deleteJson: async (url) => {{ events.push(['delete', url]); }},
+      }};
+      const result = await removeProviderAccountRequest(ok, 'acct_test');
+      if (result.provider_logout_confirmed !== false) process.exit(1);
+      if (JSON.stringify(events) !== JSON.stringify([
+        ['post', '/api/provider-accounts/acct_test/disconnect'],
+        ['delete', '/api/provider-accounts/acct_test'],
+      ])) process.exit(2);
+      const failed = [];
+      try {{
+        await removeProviderAccountRequest({{
+          postJson: async (url) => {{ failed.push(['post', url]); throw new Error('cleanup failed'); }},
+          deleteJson: async (url) => {{ failed.push(['delete', url]); }},
+        }}, 'acct_retry');
+        process.exit(3);
+      }} catch (error) {{
+        if (error.message !== 'cleanup failed') process.exit(4);
+      }}
+      if (JSON.stringify(failed) !== JSON.stringify([
+        ['post', '/api/provider-accounts/acct_retry/disconnect'],
+      ])) process.exit(5);
+      const retryEvents = [];
+      let deleteAttempts = 0;
+      const retryApi = {{
+        postJson: async (url) => {{ retryEvents.push(['post', url]); return {{}}; }},
+        deleteJson: async (url) => {{
+          retryEvents.push(['delete', url]);
+          deleteAttempts += 1;
+          if (deleteAttempts === 1) throw new Error('delete failed');
+        }},
+      }};
+      try {{
+        await removeProviderAccountRequest(retryApi, 'acct_delete_retry');
+        process.exit(6);
+      }} catch (error) {{
+        if (error.message !== 'delete failed') process.exit(7);
+      }}
+      await removeProviderAccountRequest(retryApi, 'acct_delete_retry');
+      if (JSON.stringify(retryEvents) !== JSON.stringify([
+        ['post', '/api/provider-accounts/acct_delete_retry/disconnect'],
+        ['delete', '/api/provider-accounts/acct_delete_retry'],
+        ['post', '/api/provider-accounts/acct_delete_retry/disconnect'],
+        ['delete', '/api/provider-accounts/acct_delete_retry'],
+      ])) process.exit(8);
+    """
+    result = subprocess.run(
+        ["node", "--input-type=module", "--eval", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_connections_recovery_is_verify_first_and_external_client_failure_is_optional():
