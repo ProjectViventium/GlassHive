@@ -7,6 +7,7 @@ import mimetypes
 import os
 import hmac
 import re
+import sqlite3
 import stat
 import time
 from hashlib import sha256
@@ -1872,6 +1873,13 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict[str, object]:
+        try:
+            store.health_check()
+        except sqlite3.Error as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="GlassHive data store is unavailable",
+            ) from exc
         default_profile = _configured_default_worker_profile()
         visible_runtime_backend = resolved_runtime_backend
         if resolved_runtime_backend == "openclaw":

@@ -192,6 +192,20 @@ class Store:
             elif conn is not None:
                 conn.close()
 
+    def health_check(self) -> None:
+        """Prove the application database can serve a real schema read."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT version
+                FROM glasshive_schema_versions
+                WHERE component = 'runtime_store'
+                """
+            ).fetchone()
+            if row is None or int(row[0]) < 1:
+                raise sqlite3.DatabaseError("GlassHive runtime schema is unavailable")
+
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")

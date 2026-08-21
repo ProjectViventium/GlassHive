@@ -1862,6 +1862,20 @@ def test_public_callback_message_redacts_glasshive_ids():
     assert redacted.count("[glasshive-id]") == 3
 
 
+def test_health_fails_closed_when_the_runtime_database_cannot_be_read(tmp_path, monkeypatch):
+    app = create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime())
+
+    def unavailable() -> None:
+        raise sqlite3.DatabaseError("private database failure details")
+
+    monkeypatch.setattr(app.state.store, "health_check", unavailable)
+    response = TestClient(app).get("/health")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "GlassHive data store is unavailable"}
+    assert "private database failure details" not in response.text
+
+
 def test_project_worker_lifecycle_with_stub_runtime(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_RELEASE_ID", "release-public-safe")
     monkeypatch.setenv("GLASSHIVE_PARENT_REVISION", "a" * 40)

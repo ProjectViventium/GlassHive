@@ -62,6 +62,9 @@ Calm dark glass over a bright signal core, like a modern appliance or Tesla cont
     pages. Those routes remain available only as compatible operator diagnostics.
 15. The launch composer may expose the initial watch surface only as an advanced control. The primary project box must remain the same three-field experience.
 16. If project launch fails after a worker was created, the UI/runtime must record that launch as an explicit failure instead of leaving a healthy-looking but runless worker behind.
+16a. Runtime health must perform a real read from the application database. A process that is alive
+    but cannot read workspace state returns a bounded `503` and must not pass rollout acceptance.
+    Database exception text remains private.
 17. The main controls must be simple and obvious:
    - pause
    - resume/play
