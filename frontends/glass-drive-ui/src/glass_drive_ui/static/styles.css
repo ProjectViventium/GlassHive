@@ -1562,6 +1562,11 @@ button, input, textarea, select { font: inherit; }
   font-size: 0.82rem;
   line-height: 1.55;
 }
+.worker-account-summary {
+  color: var(--queue);
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
 textarea, select, input[type="text"], input[type="file"], .steer-form textarea, .workspace-steer textarea {
   width: 100%;
   border: 1px solid rgba(255,255,255,0.1);
@@ -1590,7 +1595,7 @@ input[type="file"]::file-selector-button {
 }
 textarea { resize: vertical; min-height: 78px; }
 .project-field-main textarea { min-height: 118px; }
-.worker-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: end; }
+.worker-row { display: block; }
 .primary-button, .secondary-button, .watch-controls button, .steer-form button, .workspace-steer button, .more-menu button, .result-toggle, .result-close {
   border: 0;
   border-radius: 999px;
@@ -1849,6 +1854,23 @@ textarea { resize: vertical; min-height: 78px; }
   font-weight: 700;
   padding: 2px 10px 0;
 }
+.latest-output-human {
+  margin: 0 0 14px;
+  color: var(--text);
+  font-size: 0.95rem;
+  line-height: 1.55;
+}
+.result-technical {
+  border-top: 1px solid rgba(255,255,255,0.08);
+  padding-top: 12px;
+}
+.result-technical summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+.result-technical[open] summary { margin-bottom: 12px; }
 #latest-output-full {
   margin: 0;
   color: var(--text);

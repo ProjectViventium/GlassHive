@@ -49,6 +49,14 @@
                 <textarea id="context" name="context" rows="3" placeholder="Optional background, links, constraints, files, or access notes."></textarea>
               </label>
             </div>
+            <div class="worker-row">
+              <label class="worker-picker">
+                <span>Worker</span>
+                <select id="workspace-option" name="workspace_option"></select>
+                <small id="workspace-help" class="field-help"></small>
+                <small id="worker-account-summary" class="worker-account-summary" aria-live="polite"></small>
+              </label>
+            </div>
             <details class="advanced-panel">
               <summary>Advanced</summary>
               <div class="advanced-grid">
@@ -57,11 +65,6 @@
                   <select id="workspace-type" name="workspace_type"></select>
                   <small id="workspace-type-help">Runs on managed GlassHive workspace compute.</small>
                   <input id="launch-surface" name="launch_surface" type="hidden" value="desktop" />
-                </label>
-                <label class="advanced-field">
-                  <span>Default Worker</span>
-                  <select id="default-worker-profile" name="default_worker_profile"></select>
-                  <small>Saved per user. MCP launches use this when no worker is specified.</small>
                 </label>
                 <label class="advanced-field">
                   <span>Worker account</span>
@@ -125,16 +128,9 @@
                 <small id="preferences-status" aria-live="polite"></small>
               </div>
             </details>
-            <div class="worker-row">
-              <label class="worker-picker">
-                <span>Workspace</span>
-                <select id="workspace-option" name="workspace_option"></select>
-                <small id="workspace-help" class="field-help"></small>
-              </label>
-              <div class="launch-actions">
-                <button id="launch-button" type="submit" class="primary-button" value="launch">Run Project</button>
-                <button id="schedule-button" type="submit" class="secondary-button" value="schedule">Schedule</button>
-              </div>
+            <div class="launch-actions">
+              <button id="launch-button" type="submit" class="primary-button" value="launch">Run Project</button>
+              <button id="schedule-button" type="submit" class="secondary-button" value="schedule">Schedule</button>
             </div>
             <p id="launch-status" class="launch-status" aria-live="polite"></p>
           </form>
@@ -156,7 +152,7 @@
                   <option value="named">Saved workspaces</option>
                   <option value="ephemeral">One-off runs</option>
                   <option value="legacy">Legacy workspaces</option>
-                  <option value="named,ephemeral,legacy">All workspaces</option>
+                  <option value="named,ephemeral,legacy" selected>All workspaces</option>
                 </select>
               </label>
               <label class="workspace-search workspace-tag-search">
@@ -563,6 +559,6 @@
         </div>
       </form>
     </dialog>
-    <script src="/static/app.js?v=20260817d" type="module"></script>
+    <script src="/static/app.js?v=20260821a" type="module"></script>
   </body>
 </html>

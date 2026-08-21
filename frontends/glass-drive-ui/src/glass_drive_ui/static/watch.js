@@ -1,4 +1,5 @@
-import { workspaceLifecycleControl } from './launch-policy.js?v=20260811m';
+import { workspaceLifecycleControl } from './launch-policy.js?v=20260821a';
+import { workspaceProgressModel } from './delivery-presenter.js?v=20260821a';
 
 const params = new URLSearchParams(window.location.search);
 const workerId = window.location.pathname.split('/').filter(Boolean).at(-1);
@@ -28,6 +29,9 @@ const title = document.getElementById('watch-title');
 const subtitle = document.getElementById('watch-subtitle');
 const latestOutputInline = document.getElementById('latest-output-inline');
 const latestOutputFull = document.getElementById('latest-output-full');
+const latestOutputHuman = document.getElementById('latest-output-human');
+const latestOutputTechnical = document.getElementById('latest-output-technical');
+const resultTechnical = document.getElementById('result-technical');
 const resultActions = document.getElementById('result-actions');
 const artifactList = document.getElementById('artifact-list');
 const statusLabel = document.getElementById('status-label');
@@ -395,106 +399,45 @@ function liveProgressText(data) {
   return `...\n${redacted.slice(-2400)}`;
 }
 
-function summarizeLiveProgress(text) {
-  const lines = String(text || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const line = lines[lines.length - 1] || '';
-  if (!line) return '';
-  return line.length <= 180 ? line : `${line.slice(0, 177)}...`;
-}
-
 function summarizeOutput(data) {
   const runState = String(data.latest_run?.state || '').trim();
   const raw = String(data.latest_output || '').trim();
   const deliverable = data.deliverable || null;
-  const latestInstruction = String(data.latest_run?.instruction || '').trim();
+  const progressText = liveProgressText(data);
+  const progress = workspaceProgressModel({
+    runState,
+    workerState: data.worker?.close_state || data.worker?.state || '',
+    hasDeliverable: Boolean(deliverable),
+  });
   currentRunState = runState;
-
-  if (runState === 'queued') {
-    const isSteer = latestInstruction.startsWith('Operator steer instruction');
-    const isMessage = latestInstruction.startsWith('Operator message for the current worker session');
-    return {
-      label: isSteer ? 'Steer handoff' : isMessage ? 'Queued follow-up' : 'Queued next step',
-      panelTitle: isSteer ? 'Steer handoff' : isMessage ? 'Queued follow-up' : 'Queued next step',
-      summary: isSteer
-        ? 'GlassHive is redirecting the workspace to your latest steer instruction.'
-        : isMessage
-          ? 'Current work keeps running. Your queued follow-up will start next.'
-        : 'The workspace has another instruction queued and is preparing the next step.',
-      full: isSteer
-        ? 'Your steer instruction has been accepted. GlassHive will interrupt the current run when needed and continue from the same workspace state.'
-        : isMessage
-          ? 'Your follow-up was queued successfully. GlassHive will keep the current run going, then apply this queued instruction from the same workspace state.'
-        : 'A follow-up instruction is queued for this workspace and will start next.',
-    };
-  }
-
-  if (runState === 'running') {
-    if (deliverable && deliverable.preferred_surface === 'desktop' && deliverable.browser_url) {
-      const label = String(deliverable.label || deliverable.workspace_path || deliverable.browser_url || 'Preview');
-      const full = [
-        `Preview available while the workspace continues verification · ${label}`,
-        deliverable.browser_url ? `Browser target: ${deliverable.browser_url}` : '',
-        raw || '',
-      ].filter(Boolean).join('\n\n');
-      return {
-        label: 'Live preview',
-        panelTitle: 'Live preview',
-        summary: `Preview available · ${label}`,
-        full,
-      };
-    }
-    const summary = activeSurface === 'desktop'
-      ? 'Workspace is actively executing. You are watching the live desktop for this run.'
-      : 'Workspace is actively executing. You are attached to the exact live session for this run.';
-    const progressText = liveProgressText(data);
-    const progressSummary = summarizeLiveProgress(progressText);
-    const full = raw || (activeSurface === 'desktop'
-      ? 'Workspace is actively executing. You are watching the live desktop. Switch to Watch exact live session from the menu if you want the raw terminal session.'
-      : 'Workspace is actively executing. Open the current view or steer the workspace from the ribbon controls if you need to intervene.');
-    return {
-      label: 'Live status',
-      panelTitle: 'Live session details',
-      summary: progressSummary ? `Live progress: ${progressSummary}` : summary,
-      full: raw || progressText || full,
-    };
-  }
 
   if (deliverable && runState === 'completed') {
     const label = String(deliverable.label || deliverable.workspace_path || deliverable.browser_url || 'Delivered result');
     const deliverableLabel = deliverable.kind === 'file' ? 'Delivered file ready' : 'Delivered page ready';
-    const full = [
-      `${deliverableLabel} · ${label}`,
-      deliverable.browser_url ? `Browser target: ${deliverable.browser_url}` : '',
-      raw,
-    ].filter(Boolean).join('\n\n');
     return {
+      ...progress,
       label: 'Latest result',
       panelTitle: 'Delivered result',
-      summary: `${deliverableLabel} · ${label}`,
-      full,
+      summary: `Work complete · ${deliverableLabel} · ${label}`,
+      result: raw,
+      technical: progressText,
     };
   }
 
-  if (!raw) {
-    const idle = data.worker?.state === 'ready' && !data.worker?.close_state ? 'Workspace is ready for the next instruction.' : 'No run output yet.';
+  if (runState === 'completed') {
     return {
-      label: 'Workspace status',
-      panelTitle: 'Workspace status',
-      summary: idle,
-      full: idle,
+      ...progress,
+      label: 'Latest result',
+      panelTitle: 'Latest result',
+      result: raw,
+      technical: progressText,
     };
   }
 
-  const firstBlock = raw.split(/\n\s*\n|\n/)[0].trim();
-  const summary = firstBlock.length <= 180 ? firstBlock : `${firstBlock.slice(0, 177)}...`;
   return {
-    label: runState === 'completed' ? 'Latest result' : 'Workspace status',
-    panelTitle: runState === 'completed' ? 'Latest result' : 'Workspace output',
-    summary,
-    full: raw,
+    ...progress,
+    result: '',
+    technical: [raw, progressText].filter((value, index, values) => value && values.indexOf(value) === index).join('\n\n'),
   };
 }
 
@@ -637,15 +580,18 @@ function renderOutput(data) {
   statusLabel.textContent = output.label;
   resultPanelTitle.textContent = output.panelTitle;
   latestOutputInline.textContent = output.summary;
-  latestOutputFull.textContent = output.full;
+  latestOutputHuman.textContent = output.summary;
+  latestOutputFull.textContent = output.result || '';
+  latestOutputFull.hidden = !output.result;
+  latestOutputTechnical.textContent = output.technical || '';
+  resultTechnical.hidden = !output.technical;
+  if (!output.technical) resultTechnical.open = false;
   syncResultActions(data.deliverable || null);
   syncArtifactList(data.artifacts?.items || []);
   currentSummary = output.summary;
-  currentFullOutput = output.full;
-  resultToggle.hidden = !output.full.trim();
-  if (!output.full.trim()) {
-    closeResultPanel();
-  }
+  currentFullOutput = [output.summary, output.result, output.technical].filter(Boolean).join('\n\n');
+  resultToggle.hidden = !currentFullOutput.trim();
+  if (!currentFullOutput.trim()) closeResultPanel();
 }
 
 async function postAction(action, payload) {
@@ -687,12 +633,23 @@ async function submitFooterInstruction(mode) {
       latestOutputInline.textContent = 'GlassHive is redirecting the workspace now.';
       latestOutputFull.textContent = `Steer instruction accepted.\n\nGlassHive will pivot the workspace to this direction immediately:\n\n${message}`;
     }
+    latestOutputHuman.textContent = latestOutputInline.textContent;
+    latestOutputFull.hidden = false;
+    latestOutputTechnical.textContent = '';
+    resultTechnical.hidden = true;
+    resultTechnical.open = false;
     currentSummary = latestOutputInline.textContent;
-    currentFullOutput = latestOutputFull.textContent;
+    currentFullOutput = [currentSummary, latestOutputFull.textContent].join('\n\n');
     resultToggle.hidden = false;
   } catch (error) {
+    latestOutputHuman.textContent = 'GlassHive could not complete that action. Review the details and try again.';
     latestOutputInline.textContent = error.message;
-    latestOutputFull.textContent = error.message;
+    latestOutputFull.textContent = '';
+    latestOutputFull.hidden = true;
+    latestOutputTechnical.textContent = error.message;
+    resultTechnical.hidden = false;
+    currentSummary = latestOutputHuman.textContent;
+    currentFullOutput = [currentSummary, error.message].join('\n\n');
     openResultPanel();
   }
 }
@@ -847,8 +804,14 @@ for (const button of document.querySelectorAll('[data-action]')) {
       await refresh();
     } catch (error) {
       statusLabel.textContent = 'Workspace status';
-      latestOutputInline.textContent = error.message;
-      latestOutputFull.textContent = error.message;
+      latestOutputInline.textContent = 'GlassHive could not complete that action.';
+      latestOutputHuman.textContent = 'GlassHive could not complete that action. Review the details and try again.';
+      latestOutputFull.textContent = '';
+      latestOutputFull.hidden = true;
+      latestOutputTechnical.textContent = error.message;
+      resultTechnical.hidden = false;
+      currentSummary = latestOutputHuman.textContent;
+      currentFullOutput = [currentSummary, error.message].join('\n\n');
       openResultPanel();
     }
   });

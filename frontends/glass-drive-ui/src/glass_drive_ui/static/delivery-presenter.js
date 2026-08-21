@@ -46,6 +46,81 @@ function referencePaths(value) {
   return [...new Set(paths)];
 }
 
+export function workspaceProgressModel({ runState, workerState, hasDeliverable = false }) {
+  const run = String(runState || '').trim().toLowerCase();
+  const worker = String(workerState || '').trim().toLowerCase();
+  if (['created', 'starting', 'resuming'].includes(run) || (!run && ['created', 'starting', 'resuming'].includes(worker))) {
+    return {
+      label: 'Starting',
+      panelTitle: 'Starting workspace',
+      summary: 'GlassHive is preparing the worker. Next: work starts automatically.',
+    };
+  }
+  if (run === 'queued') {
+    return {
+      label: 'Queued',
+      panelTitle: 'Queued work',
+      summary: 'This step is queued. Next: GlassHive starts it automatically.',
+    };
+  }
+  if (run === 'running') {
+    if (hasDeliverable) {
+      return {
+        label: 'Live preview',
+        panelTitle: 'Live preview',
+        summary: 'A preview is ready while the worker finishes. You can watch it live or send a follow-up.',
+      };
+    }
+    return {
+      label: 'Working',
+      panelTitle: 'Work in progress',
+      summary: 'The worker is working on your project. You can watch it live or send a follow-up.',
+    };
+  }
+  if (run === 'completed') {
+    return {
+      label: 'Complete',
+      panelTitle: hasDeliverable ? 'Delivered result' : 'Work complete',
+      summary: 'Work complete. Open the result or send a follow-up.',
+    };
+  }
+  if (run === 'failed') {
+    return {
+      label: 'Needs attention',
+      panelTitle: 'Run needs attention',
+      summary: 'The run stopped before completion. Open technical details, then send a corrected follow-up.',
+    };
+  }
+  if (run === 'cancelled') {
+    return {
+      label: 'Cancelled',
+      panelTitle: 'Run cancelled',
+      summary: 'This run was cancelled. Send a new instruction when you are ready.',
+    };
+  }
+  if (run === 'interrupted') {
+    return {
+      label: 'Interrupted',
+      panelTitle: 'Run interrupted',
+      summary: 'This run was interrupted. Send a follow-up to continue in the same workspace.',
+    };
+  }
+  if (['paused', 'idle', 'idle_terminated', 'stopped', 'ready'].includes(worker)) {
+    return {
+      label: worker === 'paused' ? 'Paused' : 'Ready',
+      panelTitle: worker === 'paused' ? 'Workspace paused' : 'Workspace ready',
+      summary: worker === 'paused'
+        ? 'The workspace is paused. Resume it to continue from the same state.'
+        : 'The workspace is ready for the next instruction.',
+    };
+  }
+  return {
+    label: 'Workspace status',
+    panelTitle: 'Workspace status',
+    summary: 'GlassHive is checking the workspace. The status updates automatically.',
+  };
+}
+
 export function workspaceDeliveryModel(data) {
   const state = String(data?.latest_run?.state || '').trim().toLowerCase();
   const summary = boundedSummary(data?.latest_output);

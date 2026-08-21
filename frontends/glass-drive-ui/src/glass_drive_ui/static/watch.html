@@ -51,7 +51,12 @@
         </div>
         <div id="result-actions" class="result-actions" hidden></div>
         <div id="artifact-list" class="artifact-list" hidden></div>
-        <pre id="latest-output-full">No run output yet.</pre>
+        <p id="latest-output-human" class="latest-output-human">GlassHive is checking the workspace.</p>
+        <pre id="latest-output-full" hidden></pre>
+        <details id="result-technical" class="result-technical" hidden>
+          <summary>Technical details</summary>
+          <pre id="latest-output-technical"></pre>
+        </details>
       </section>
       <aside id="more-menu" class="more-menu" role="menu" hidden>
         <button id="open-project-workspace-menu" role="menuitem" type="button">Back to workspaces</button>
@@ -107,6 +112,6 @@
         </div>
       </footer>
     </div>
-    <script src="/static/watch.js?v=20260811m" type="module"></script>
+    <script src="/static/watch.js?v=20260821a" type="module"></script>
   </body>
 </html>

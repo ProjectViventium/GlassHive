@@ -1572,6 +1572,41 @@ def test_preference_endpoint_proxies_saved_defaults():
     assert response.json()["default_worker_profile"] == "codex-cli"
 
 
+def test_effort_only_preference_save_preserves_the_existing_default_worker_on_refresh():
+    class PreferenceRuntime(FakeRuntimeClient):
+        def __init__(self):
+            super().__init__()
+            self.preferences = {
+                "tenant_id": "local",
+                "owner_id": "demo-owner",
+                "default_worker_profile": "claude-code",
+                "codex_reasoning_effort": "",
+                "claude_effort": "",
+                "openclaw_effort": "",
+                "updated_at": "",
+            }
+
+        def get_preferences(self):
+            return dict(self.preferences)
+
+        def update_preferences(self, payload: dict):
+            self.preference_requests.append(payload)
+            self.preferences.update(payload)
+            return dict(self.preferences)
+
+    runtime = PreferenceRuntime()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.patch("/api/preferences", json={"claude_effort": "max"})
+    refreshed = client.get("/api/bootstrap")
+
+    assert response.status_code == 200, response.text
+    assert runtime.preference_requests == [{"claude_effort": "max"}]
+    assert response.json()["default_worker_profile"] == "claude-code"
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["default_workspace_option"] == "new:claude-code"
+
+
 def test_bootstrap_fails_loud_for_default_worker_profile_outside_allowlist(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "openclaw-general")
     monkeypatch.setenv("GLASSHIVE_DEFAULT_WORKER_PROFILE", "claude-code")
@@ -1954,7 +1989,6 @@ def test_launcher_workspace_hive_static_controls():
     assert "workerApiUrl(workerId, `/action/${encodeURIComponent(action)}`)" in app_js
     assert "workerApiUrl(workerId, '/metadata')" in app_js
     assert "appendUrlPath" in app_js
-    assert "deployment_default_workspace_option" in app_js
     assert "dataset.watchVisible !== 'false'" in app_js
     assert "dataset.viewportVisible === 'true'" in app_js
     assert "new IntersectionObserver" in app_js
@@ -2164,11 +2198,12 @@ def test_launcher_workspace_hive_static_controls():
     assert "function syncArtifactList(items)" in watch_js
     assert "function liveProgressText(data)" in watch_js
     assert "consolePayload.stdout || consolePayload.stderr" in watch_js
-    assert "Live progress:" in watch_js
+    assert "workspaceProgressModel" in watch_js
+    assert "Live progress:" not in watch_js
     assert "gh_token|gh_sig|token|signature|sig" in watch_js
     assert "data.artifacts?.items || []" in watch_js
     assert "Workspace files" in watch_js
-    assert "watch.js?v=20260811m" in watch_html
+    assert "watch.js?v=20260821a" in watch_html
     assert ".artifact-row" in styles_css
     assert "artifact-list-more" in watch_js
     assert ".artifact-list-more" in styles_css
@@ -5899,6 +5934,117 @@ def test_launch_ui_uses_the_sole_ready_personal_account_without_silent_fallback(
             "forcedLegacy": False,
         },
     }
+
+
+def test_run_project_ui_puts_the_worker_and_effective_account_before_advanced_options():
+    static_dir = Path(server_module.STATIC_DIR)
+    page = (static_dir / "index.html").read_text(encoding="utf-8")
+    script = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    worker_index = page.index('id="workspace-option"')
+    advanced_index = page.index('<details class="advanced-panel">')
+    launch_index = page.index('id="launch-button"')
+
+    assert '<span>Worker</span>' in page
+    assert 'id="worker-account-summary"' in page
+    assert worker_index < advanced_index < launch_index
+    assert 'id="default-worker-profile"' not in page
+    assert '>Default Worker<' not in page
+    assert '<option value="named,ephemeral,legacy" selected>All workspaces</option>' in page
+    assert "workspaceKindFilter?.value || 'named,ephemeral,legacy'" in script
+    assert "workerAccountSummary" in script
+    assert "providerAccount?.addEventListener('change'" in script
+
+    save_start = script.index("savePreferences?.addEventListener")
+    save_end = script.index("form.addEventListener('submit'", save_start)
+    assert "default_worker_profile" not in script[save_start:save_end]
+
+
+def test_effective_worker_account_summary_uses_existing_profile_policy_and_account_data():
+    module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ workerAccountSummary }} from {json.dumps(module)};"
+                "const data={provider_accounts:["
+                "{account_id:'acct-claude',provider:'claude',label:'Personal Claude',status:'ready',is_default:true}],"
+                "existing_workspaces:[{worker_id:'wrk-saved',profile:'claude-code',"
+                "provider_readiness:{policy:'personal_required',account_id:'acct-claude',label:'Personal Claude',readiness:'ready'}},"
+                "{worker_id:'wrk-fallback',profile:'claude-code',provider_readiness:"
+                "{policy:'personal_preferred',fallback:true,readiness:'deployment_managed'}}]};"
+                "const personal=workerAccountSummary({workspaceValue:'new:claude-code',accountId:'acct-claude',"
+                "policy:'personal_required',data});"
+                "const fallback=workerAccountSummary({workspaceValue:'new:claude-code',accountId:'acct-claude',"
+                "policy:'personal_preferred',data});"
+                "const deployment=workerAccountSummary({workspaceValue:'new:claude-code',accountId:'',policy:'legacy',data});"
+                "const unavailable=workerAccountSummary({workspaceValue:'new:claude-code',accountId:'',"
+                "policy:'personal_required',data:{bootstrap_sections:{provider_accounts:'unavailable'}}});"
+                "const saved=workerAccountSummary({workspaceValue:'open:wrk-saved',accountId:'',policy:'',data});"
+                "const duplicate=workerAccountSummary({workspaceValue:'duplicate:wrk-saved',accountId:'',policy:'',data});"
+                "const duplicateFallback=workerAccountSummary({workspaceValue:'duplicate:wrk-fallback',accountId:'',policy:'',data});"
+                "process.stdout.write(JSON.stringify({personal,fallback,deployment,unavailable,saved,duplicate,duplicateFallback}));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout) == {
+        "personal": "Claude Code · Personal Claude",
+        "fallback": "Claude Code · Personal Claude · Organization fallback allowed",
+        "deployment": "Claude Code · Organization account",
+        "unavailable": "Claude Code · Account status unavailable",
+        "saved": "Claude Code · Personal Claude",
+        "duplicate": "Claude Code · Personal Claude · Reapproval required after copy",
+        "duplicateFallback": "Claude Code · Organization account",
+    }
+
+
+def test_watch_status_uses_structured_human_progress_and_collapses_raw_output():
+    static_dir = Path(server_module.STATIC_DIR)
+    module = (static_dir / "delivery-presenter.js").as_uri()
+    page = (static_dir / "watch.html").read_text(encoding="utf-8")
+    script = (static_dir / "watch.js").read_text(encoding="utf-8")
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ workspaceProgressModel }} from {json.dumps(module)};"
+                "const states=['starting','queued','running','completed','failed'];"
+                "const models=states.map(runState=>workspaceProgressModel({runState,workerState:'ready',"
+                "hasDeliverable:runState==='completed'}));"
+                "models.push(workspaceProgressModel({runState:'running',workerState:'running',hasDeliverable:true}));"
+                "process.stdout.write(JSON.stringify(models));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    models = json.loads(result.stdout)
+
+    assert models[0]["summary"] == "GlassHive is preparing the worker. Next: work starts automatically."
+    assert models[1]["summary"] == "This step is queued. Next: GlassHive starts it automatically."
+    assert models[2]["summary"] == "The worker is working on your project. You can watch it live or send a follow-up."
+    assert models[3]["summary"] == "Work complete. Open the result or send a follow-up."
+    assert models[4]["summary"] == "The run stopped before completion. Open technical details, then send a corrected follow-up."
+    assert models[5] == {
+        "label": "Live preview",
+        "panelTitle": "Live preview",
+        "summary": "A preview is ready while the worker finishes. You can watch it live or send a follow-up.",
+    }
+    assert 'id="latest-output-human"' in page
+    assert '<details id="result-technical"' in page
+    assert '>Technical details<' in page
+    assert "summarizeLiveProgress" not in script
+    assert "latestInstruction.startsWith" not in script
+    assert "label: 'Latest result'" in script
 
 
 def test_workspace_delivery_model_exposes_completed_output_without_stale_failure_actions():

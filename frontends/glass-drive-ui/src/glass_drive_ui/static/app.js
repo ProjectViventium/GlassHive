@@ -1,6 +1,6 @@
 import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260817c';
-import { credentialPolicyTransition, preferredProviderAccountId, shouldResumeOnWorkspaceOpen, workspaceLifecycleControl, workspaceSetupAction } from './launch-policy.js?v=20260817n';
-import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811m';
+import { credentialPolicyTransition, preferredProviderAccountId, shouldResumeOnWorkspaceOpen, workerAccountSummary, workspaceLifecycleControl, workspaceSetupAction } from './launch-policy.js?v=20260821a';
+import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260821a';
 import { compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery } from './workspace-overview.js?v=20260811m';
 
 const ACTIVE_STATES = new Set(['created', 'starting', 'queued', 'running', 'resuming']);
@@ -319,28 +319,18 @@ function renderLaunchProviderAccounts(accountSelect, policySelect, help, data, w
   }
 }
 
-function renderDefaultWorkerOptions(select, data) {
-  if (!select) return;
-  const current = String(data?.user_preferences?.default_worker_profile || '');
-  const options = [];
-  const deploymentDefault = document.createElement('option');
-  deploymentDefault.value = '';
-  deploymentDefault.textContent = 'Deployment default';
-  options.push(deploymentDefault);
-  for (const item of data.new_workspace_options || []) {
-    const option = document.createElement('option');
-    const profile = String(item.profile || String(item.value || '').split(':', 2)[1] || '');
-    option.value = profile;
-    option.textContent = String(item.label || profile || 'Worker');
-    options.push(option);
-  }
-  select.replaceChildren(...options);
-  select.value = Array.from(select.options).some((option) => option.value === current) ? current : '';
+function syncWorkerAccountSummary(summary, data, workspaceValue, accountSelect, policySelect) {
+  if (!summary) return;
+  summary.textContent = `Runs with ${workerAccountSummary({
+    workspaceValue,
+    accountId: accountSelect?.value || '',
+    policy: policySelect?.value || '',
+    data,
+  })}`;
 }
 
 function syncPreferenceControls(data, controls) {
   const prefs = data?.user_preferences || {};
-  renderDefaultWorkerOptions(controls.defaultWorker, data);
   if (controls.codexEffort) controls.codexEffort.value = String(prefs.codex_reasoning_effort || '');
   if (controls.claudeEffort) controls.claudeEffort.value = String(prefs.claude_effort || '');
   if (controls.openclawEffort) controls.openclawEffort.value = String(prefs.openclaw_effort || '');
@@ -1524,13 +1514,13 @@ async function main() {
   const providerAccount = document.getElementById('provider-account-selection');
   const providerAccountPolicy = document.getElementById('provider-account-policy');
   const providerAccountHelp = document.getElementById('provider-account-help');
+  const workerAccountSummaryNode = document.getElementById('worker-account-summary');
   const status = document.getElementById('launch-status');
   const button = document.getElementById('launch-button');
   const scheduleButton = document.getElementById('schedule-button');
   const scheduleText = document.getElementById('schedule-text');
   const fileInput = document.getElementById('project-files');
   const fileHelp = document.getElementById('file-help');
-  const defaultWorker = document.getElementById('default-worker-profile');
   const codexEffort = document.getElementById('codex-effort');
   const claudeEffort = document.getElementById('claude-effort');
   const openclawEffort = document.getElementById('openclaw-effort');
@@ -1597,7 +1587,7 @@ async function main() {
     if (workspaceLoadMore) workspaceLoadMore.disabled = true;
     try {
       const payload = await fetchCatalogPage({
-        kind: String(workspaceKindFilter?.value || 'named'),
+        kind: String(workspaceKindFilter?.value || 'named,ephemeral,legacy'),
         search: String(workspaceSearch?.value || '').trim(),
         tags: String(workspaceTagFilter?.value || '').trim(),
         cursor: append ? String(catalogState.nextCursor || '') : '',
@@ -1642,9 +1632,16 @@ async function main() {
       bootstrap,
       select.value,
     );
-    syncPreferenceControls(bootstrap, { defaultWorker, codexEffort, claudeEffort, openclawEffort });
+    syncWorkerAccountSummary(
+      workerAccountSummaryNode,
+      bootstrap,
+      select.value,
+      providerAccount,
+      providerAccountPolicy,
+    );
+    syncPreferenceControls(bootstrap, { codexEffort, claudeEffort, openclawEffort });
     if (
-      String(workspaceKindFilter?.value || 'named') === 'named'
+      String(workspaceKindFilter?.value || 'named,ephemeral,legacy') === 'named'
       && !String(workspaceSearch?.value || '').trim()
       && !String(workspaceTagFilter?.value || '').trim()
     ) {
@@ -1803,6 +1800,13 @@ async function main() {
       bootstrap,
       select.value,
     );
+    syncWorkerAccountSummary(
+      workerAccountSummaryNode,
+      bootstrap,
+      select.value,
+      providerAccount,
+      providerAccountPolicy,
+    );
   });
 
   providerAccountPolicy?.addEventListener('change', () => {
@@ -1813,6 +1817,24 @@ async function main() {
       providerAccountHelp,
       bootstrap,
       select.value,
+    );
+    syncWorkerAccountSummary(
+      workerAccountSummaryNode,
+      bootstrap,
+      select.value,
+      providerAccount,
+      providerAccountPolicy,
+    );
+  });
+
+  providerAccount?.addEventListener('change', () => {
+    if (!bootstrap) return;
+    syncWorkerAccountSummary(
+      workerAccountSummaryNode,
+      bootstrap,
+      select.value,
+      providerAccount,
+      providerAccountPolicy,
     );
   });
 
@@ -1961,15 +1983,11 @@ async function main() {
     if (preferencesStatus) preferencesStatus.textContent = 'Saving defaults...';
     try {
       const updated = await patchJson('/api/preferences', {
-        default_worker_profile: defaultWorker?.value || '',
         codex_reasoning_effort: codexEffort?.value || '',
         claude_effort: claudeEffort?.value || '',
         openclaw_effort: openclawEffort?.value || '',
       });
       bootstrap.user_preferences = updated;
-      bootstrap.default_workspace_option = updated.default_worker_profile
-        ? `new:${updated.default_worker_profile}`
-        : String(bootstrap.deployment_default_workspace_option || 'new:codex-cli');
       renderWorkspaceOptions(select, bootstrap, select.value);
       syncWorkspaceUI(select, bootstrap, button, help);
       if (preferencesStatus) preferencesStatus.textContent = 'Defaults saved.';

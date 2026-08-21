@@ -23,6 +23,55 @@ export function credentialPolicyTransition({
   return { value: personalPolicy, savedPersonalPolicy: '', forcedLegacy: false };
 }
 
+function workerProfileLabel(profile) {
+  return {
+    'codex-cli': 'Codex',
+    'claude-code': 'Claude Code',
+    'openclaw-general': 'OpenClaw',
+  }[profile] || profile || 'Worker';
+}
+
+export function workerAccountSummary({ workspaceValue, accountId, policy, data }) {
+  const value = String(workspaceValue || '');
+  if (value.startsWith('open:') || value.startsWith('duplicate:')) {
+    const duplicate = value.startsWith('duplicate:');
+    const workerId = value.split(':', 2)[1] || '';
+    const workspace = (data?.existing_workspaces || []).find(
+      (item) => String(item?.worker_id || '') === workerId,
+    );
+    const profile = workerProfileLabel(String(workspace?.profile || ''));
+    const readiness = workspace?.provider_readiness || {};
+    let route = `${profile} · Saved workspace account`;
+    if (readiness.readiness === 'unavailable') route = `${profile} · Account status unavailable`;
+    else if (readiness.fallback || readiness.policy === 'legacy') route = `${profile} · Organization account`;
+    else if (readiness.label) route = `${profile} · ${String(readiness.label)}`;
+    else if (readiness.readiness === 'action_required') route = `${profile} · Account needs attention`;
+    return duplicate && String(readiness.account_id || '')
+      ? `${route} · Reapproval required after copy`
+      : route;
+  }
+
+  const profileId = value.startsWith('new:') ? value.split(':', 2)[1] || '' : '';
+  const profile = workerProfileLabel(profileId);
+  if (policy === 'legacy') return `${profile} · Organization account`;
+  if (data?.bootstrap_sections && data.bootstrap_sections.provider_accounts !== 'ready') {
+    return `${profile} · Account status unavailable`;
+  }
+
+  const account = (data?.provider_accounts || []).find(
+    (item) => String(item?.account_id || '') === String(accountId || ''),
+  );
+  if (!account) {
+    return policy === 'personal_preferred'
+      ? `${profile} · Organization account · No ready personal account`
+      : `${profile} · Personal account required`;
+  }
+  const label = String(account.label || account.provider || 'Personal account');
+  return policy === 'personal_preferred'
+    ? `${profile} · ${label} · Organization fallback allowed`
+    : `${profile} · ${label}`;
+}
+
 const WORKSPACE_OPEN_RESUME_STATES = new Set(['paused', 'idle', 'idle_terminated', 'stopped']);
 const WORKSPACE_LIFECYCLE_RESUME_STATES = new Set([
   'ready',
