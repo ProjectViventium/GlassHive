@@ -14,6 +14,10 @@ class CreateProviderAccountRequest(BaseModel):
     make_default: bool = False
 
 
+class ProviderSetupInputRequest(BaseModel):
+    value: str
+
+
 class CreatePendingChangeRequest(BaseModel):
     change_type: Literal[
         "workspace_grant",

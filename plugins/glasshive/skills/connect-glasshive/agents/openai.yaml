@@ -1,0 +1,4 @@
+interface:
+  display_name: "Connect GlassHive"
+  short_description: "Connect an AI client to a GlassHive account"
+  default_prompt: "Use $connect-glasshive to connect this AI client to my GlassHive account."

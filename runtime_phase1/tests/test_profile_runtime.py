@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -3391,6 +3392,70 @@ def test_workspace_claude_command_passes_configured_api_timeout(tmp_path, monkey
     assert env["API_TIMEOUT_MS"] == "900000"
 
 
+def test_hosted_codex_command_env_exposes_only_its_selected_provider_route(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://openai.example.test/v1")
+    monkeypatch.setenv("PORTKEY_API_KEY", "synthetic-portkey")
+    monkeypatch.setenv("PORTKEY_BASE_URL", "https://portkey.example.test/v1")
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_hosted_codex_route",
+        "name": "Hosted Codex Worker",
+        "profile": "codex-cli",
+        "execution_mode": "docker",
+        "model": "gpt-test",
+    }
+
+    _command, openai_env = runtime._build_command(
+        worker, "do the work", runtime._runtime_info(worker)
+    )
+    assert openai_env["OPENAI_API_KEY"] == "synthetic-openai"
+    assert "PORTKEY_API_KEY" not in openai_env
+
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://selected.example.test/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_ENV_KEY", "PORTKEY_API_KEY")
+    _command, portkey_env = runtime._build_command(
+        worker, "do the work", runtime._runtime_info(worker)
+    )
+    assert portkey_env["PORTKEY_API_KEY"] == "synthetic-portkey"
+    assert "OPENAI_API_KEY" not in portkey_env
+
+
+def test_legacy_enterprise_flag_scopes_codex_and_openclaw_live_provider_env(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("GLASSHIVE_SECURITY_MODE", raising=False)
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://openai.example.test/v1")
+    monkeypatch.setenv("PORTKEY_API_KEY", "must-not-enter-openai-route")
+    monkeypatch.setenv("PORTKEY_BASE_URL", "https://portkey.example.test/v1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-enter-openclaw")
+
+    codex = CodexCliRuntime(base_dir=str(tmp_path / "codex"))
+    worker = {
+        "worker_id": "wrk_legacy_enterprise_codex",
+        "name": "Legacy Enterprise Codex Worker",
+        "profile": "codex-cli",
+        "execution_mode": "docker",
+        "model": "gpt-test",
+    }
+    _command, codex_env = codex._build_command(
+        worker, "do the work", codex._runtime_info(worker)
+    )
+    assert codex_env["OPENAI_API_KEY"] == "synthetic-openai"
+    assert "PORTKEY_API_KEY" not in codex_env
+
+    openclaw = OpenClawWorkstationRuntime(base_dir=str(tmp_path / "openclaw"))
+    openclaw_env = openclaw._sandbox_env()
+    assert openclaw_env["OPENAI_API_KEY"] == "synthetic-openai"
+    assert "PORTKEY_API_KEY" not in openclaw_env
+    assert "ANTHROPIC_API_KEY" not in openclaw_env
+
+
 def test_claude_usage_parser_preserves_input_output_and_cache_tokens(tmp_path):
     runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
     stdout = json.dumps(
@@ -4758,6 +4823,108 @@ def test_docker_codex_command_appends_completion_contract(tmp_path):
     assert "FINAL REPORT:" in stdin_text
 
 
+def test_docker_codex_stale_resume_replays_same_instruction_as_fresh_task(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(tmp_path / "fake-codex")
+    runtime.sandbox.home_mount = str(tmp_path / "container-home")
+    worker = {
+        "worker_id": "wrk_stale_resume",
+        "name": "Reusable Codex Worker",
+        "profile": "codex-cli",
+        "model": "gpt-test",
+        "_active_run_id": "run_stale_resume",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_session_key(worker["worker_id"], "thread_missing")
+    instruction_path = (
+        Path(runtime.sandbox.home_mount)
+        / ".glasshive-runs"
+        / worker["_active_run_id"]
+        / "instruction.stdin"
+    )
+    instruction_path.parent.mkdir(parents=True)
+    instruction_path.write_text("Install the official native plugins.\n")
+    calls_path = tmp_path / "calls.log"
+    runtime.binary = str(tmp_path / "fake-codex")
+    Path(runtime.binary).write_text(
+        "#!/bin/sh\n"
+        "payload=$(cat)\n"
+        "printf '%s|%s\\n' \"$*\" \"$payload\" >> \"$FAKE_CODEX_CALLS\"\n"
+        "case \" $* \" in\n"
+        "  *' exec resume '*)\n"
+        "    printf '%s\\n' 'Error: thread/resume: thread/resume failed: no rollout found for thread id thread_missing' >&2\n"
+        "    exit 1\n"
+        "    ;;\n"
+        "esac\n"
+        "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread_fresh\"}'\n"
+        "printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"FINAL REPORT:\\nRecovered.\"}}'\n"
+    )
+    Path(runtime.binary).chmod(0o755)
+    monkeypatch.setenv("FAKE_CODEX_CALLS", str(calls_path))
+
+    command, _env = runtime._build_command(
+        worker,
+        "Install the official native plugins.",
+        runtime._runtime_info(worker),
+    )
+    completed = subprocess.run(command, capture_output=True, text=True, env=os.environ.copy())
+
+    assert completed.returncode == 0
+    assert "thread_fresh" in completed.stdout
+    assert "no rollout found" not in completed.stderr
+    calls = calls_path.read_text().splitlines()
+    assert len(calls) == 2
+    assert "exec resume" in calls[0]
+    assert "exec --json" in calls[1]
+    assert all("Install the official native plugins." in call for call in calls)
+
+
+def test_docker_codex_resume_does_not_retry_unrelated_failure(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(tmp_path / "fake-codex")
+    runtime.sandbox.home_mount = str(tmp_path / "container-home")
+    worker = {
+        "worker_id": "wrk_failed_resume",
+        "name": "Reusable Codex Worker",
+        "profile": "codex-cli",
+        "model": "gpt-test",
+        "_active_run_id": "run_failed_resume",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_session_key(worker["worker_id"], "thread_current")
+    instruction_path = (
+        Path(runtime.sandbox.home_mount)
+        / ".glasshive-runs"
+        / worker["_active_run_id"]
+        / "instruction.stdin"
+    )
+    instruction_path.parent.mkdir(parents=True)
+    instruction_path.write_text("Continue the task.\n")
+    calls_path = tmp_path / "calls.log"
+    Path(runtime.binary).write_text(
+        "#!/bin/sh\n"
+        "cat >/dev/null\n"
+        "printf '%s\\n' \"$*\" >> \"$FAKE_CODEX_CALLS\"\n"
+        "printf '%s\\n' 'Error: provider is temporarily unavailable' >&2\n"
+        "exit 41\n"
+    )
+    Path(runtime.binary).chmod(0o755)
+    monkeypatch.setenv("FAKE_CODEX_CALLS", str(calls_path))
+
+    command, _env = runtime._build_command(
+        worker,
+        "Continue the task.",
+        runtime._runtime_info(worker),
+    )
+    completed = subprocess.run(command, capture_output=True, text=True, env=os.environ.copy())
+
+    assert completed.returncode == 41
+    assert "provider is temporarily unavailable" in completed.stderr
+    calls = calls_path.read_text().splitlines()
+    assert len(calls) == 1
+    assert "exec resume" in calls[0]
+
+
 def test_docker_claude_command_enables_chrome_and_appends_completion_contract(tmp_path, monkeypatch):
     runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.delenv("WPR_CLAUDE_CODE_ENABLE_CHROME", raising=False)
@@ -4776,6 +4943,176 @@ def test_docker_claude_command_enables_chrome_and_appends_completion_contract(tm
     stdin_text = runtime._command_stdin_text(worker, "Make the page red.", runtime._runtime_info(worker))
     assert stdin_text and stdin_text.startswith("Make the page red.")
     assert "FINAL REPORT:" in stdin_text
+
+
+def test_docker_claude_stale_resume_replays_same_instruction_as_fresh_task(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(tmp_path / "fake-claude")
+    runtime.sandbox.home_mount = str(tmp_path / "container-home")
+    worker = {
+        "worker_id": "wrk_claude_stale_resume",
+        "name": "Reusable Claude Worker",
+        "profile": "claude-code",
+        "model": "claude-test",
+        "_active_run_id": "run_claude_stale_resume",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_session_key(
+        worker["worker_id"],
+        "11111111-1111-4111-8111-111111111111",
+    )
+    instruction_path = (
+        Path(runtime.sandbox.home_mount)
+        / ".glasshive-runs"
+        / worker["_active_run_id"]
+        / "instruction.stdin"
+    )
+    instruction_path.parent.mkdir(parents=True)
+    instruction_path.write_text("Read the saved connector proof.\n")
+    calls_path = tmp_path / "claude-calls.log"
+    Path(runtime.binary).write_text(
+        "#!/bin/sh\n"
+        "payload=$(cat)\n"
+        "printf '%s|%s\\n' \"$*\" \"$payload\" >> \"$FAKE_CLAUDE_CALLS\"\n"
+        "case \" $* \" in\n"
+        "  *' --resume '*)\n"
+        "    printf '%s\\n' 'No conversation found with session ID: 11111111-1111-4111-8111-111111111111' >&2\n"
+        "    printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true}'\n"
+        "    exit 1\n"
+        "    ;;\n"
+        "esac\n"
+        "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"22222222-2222-4222-8222-222222222222\",\"result\":\"FINAL REPORT:\\nRecovered.\"}'\n"
+    )
+    Path(runtime.binary).chmod(0o755)
+    monkeypatch.setenv("FAKE_CLAUDE_CALLS", str(calls_path))
+
+    command, _env = runtime._build_command(
+        worker,
+        "Read the saved connector proof.",
+        runtime._runtime_info(worker),
+    )
+    completed = subprocess.run(command, capture_output=True, text=True, env=os.environ.copy())
+
+    assert completed.returncode == 0
+    assert "22222222-2222-4222-8222-222222222222" in completed.stdout
+    assert "No conversation found" not in completed.stderr
+    calls = calls_path.read_text().splitlines()
+    assert len(calls) == 2
+    assert "--resume 11111111-1111-4111-8111-111111111111" in calls[0]
+    assert "--resume" not in calls[1]
+    assert all("Read the saved connector proof." in call for call in calls)
+
+
+def test_docker_claude_resume_does_not_retry_unrelated_failure(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(tmp_path / "fake-claude")
+    runtime.sandbox.home_mount = str(tmp_path / "container-home")
+    worker = {
+        "worker_id": "wrk_claude_failed_resume",
+        "name": "Reusable Claude Worker",
+        "profile": "claude-code",
+        "model": "claude-test",
+        "_active_run_id": "run_claude_failed_resume",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_session_key(
+        worker["worker_id"],
+        "33333333-3333-4333-8333-333333333333",
+    )
+    instruction_path = (
+        Path(runtime.sandbox.home_mount)
+        / ".glasshive-runs"
+        / worker["_active_run_id"]
+        / "instruction.stdin"
+    )
+    instruction_path.parent.mkdir(parents=True)
+    instruction_path.write_text("Continue the saved task.\n")
+    calls_path = tmp_path / "claude-calls.log"
+    Path(runtime.binary).write_text(
+        "#!/bin/sh\n"
+        "cat >/dev/null\n"
+        "printf '%s\\n' \"$*\" >> \"$FAKE_CLAUDE_CALLS\"\n"
+        "printf '%s\\n' 'MCP output quoted: No conversation found with session ID: unrelated' >&2\n"
+        "printf '%s\\n' 'Provider is temporarily unavailable' >&2\n"
+        "exit 41\n"
+    )
+    Path(runtime.binary).chmod(0o755)
+    monkeypatch.setenv("FAKE_CLAUDE_CALLS", str(calls_path))
+
+    command, _env = runtime._build_command(
+        worker,
+        "Continue the saved task.",
+        runtime._runtime_info(worker),
+    )
+    completed = subprocess.run(command, capture_output=True, text=True, env=os.environ.copy())
+
+    assert completed.returncode == 41
+    assert "Provider is temporarily unavailable" in completed.stderr
+    calls = calls_path.read_text().splitlines()
+    assert len(calls) == 1
+    assert "--resume 33333333-3333-4333-8333-333333333333" in calls[0]
+
+
+def test_docker_claude_interrupted_resume_flushes_partial_transcript(tmp_path, monkeypatch):
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = str(tmp_path / "fake-claude")
+    runtime.sandbox.home_mount = str(tmp_path / "container-home")
+    worker = {
+        "worker_id": "wrk_claude_interrupted_resume",
+        "name": "Reusable Claude Worker",
+        "profile": "claude-code",
+        "model": "claude-test",
+        "_active_run_id": "run_claude_interrupted_resume",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_session_key(
+        worker["worker_id"],
+        "44444444-4444-4444-8444-444444444444",
+    )
+    instruction_path = (
+        Path(runtime.sandbox.home_mount)
+        / ".glasshive-runs"
+        / worker["_active_run_id"]
+        / "instruction.stdin"
+    )
+    instruction_path.parent.mkdir(parents=True)
+    instruction_path.write_text("Continue the saved task.\n")
+    ready_path = tmp_path / "claude-ready"
+    Path(runtime.binary).write_text(
+        "#!/bin/sh\n"
+        "cat >/dev/null\n"
+        "printf '%s\\n' '{\"type\":\"assistant\",\"text\":\"PARTIAL-PROGRESS-LINE\"}'\n"
+        "touch \"$FAKE_CLAUDE_READY\"\n"
+        "sleep 30\n"
+    )
+    Path(runtime.binary).chmod(0o755)
+    monkeypatch.setenv("FAKE_CLAUDE_READY", str(ready_path))
+
+    command, _env = runtime._build_command(
+        worker,
+        "Continue the saved task.",
+        runtime._runtime_info(worker),
+    )
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=os.environ.copy(),
+        start_new_session=True,
+    )
+    for _ in range(100):
+        if ready_path.exists():
+            break
+        time.sleep(0.02)
+    assert ready_path.exists()
+    os.killpg(process.pid, signal.SIGTERM)
+    stdout, _stderr = process.communicate(timeout=5)
+
+    assert process.returncode == 143
+    assert "PARTIAL-PROGRESS-LINE" in stdout
+    assert not (instruction_path.parent / "claude-resume.stdout").exists()
+    assert not (instruction_path.parent / "claude-resume.stderr").exists()
 
 
 def test_docker_claude_chrome_can_be_explicitly_disabled(tmp_path, monkeypatch):
@@ -4837,7 +5174,7 @@ def test_bound_docker_codex_subscription_does_not_use_deployment_provider(tmp_pa
         ),
         "_glasshive_provider_account_bound": True,
         "_glasshive_provider_account_env": {
-            "CODEX_HOME": "/workspace/.provider-account/codex",
+            "CODEX_HOME": "/workspace/.wpr-home/.codex",
         },
     }
     runtime._ensure_dirs(worker["worker_id"])
@@ -4853,7 +5190,7 @@ def test_bound_docker_codex_subscription_does_not_use_deployment_provider(tmp_pa
     joined = "\n".join(command)
     assert 'model_provider="glasshive_openai_compatible"' not in joined
     assert "deployment-gateway.example.test" not in joined
-    assert env["CODEX_HOME"] == "/workspace/.provider-account/codex"
+    assert env["CODEX_HOME"] == "/workspace/.wpr-home/.codex"
     assert "OPENAI_API_KEY" not in env
     assert "OPENAI_BASE_URL" not in env
 
@@ -5314,6 +5651,199 @@ def test_cli_failure_classifies_not_logged_in_provider_session():
     assert "CLI login" in failure.recommended_recovery
 
 
+def test_cli_failure_classifies_expired_claude_oauth_session():
+    failure = classify_cli_failure(
+        stdout=json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "error": "authentication_failed",
+                "result": "Failed to authenticate: OAuth session expired and could not be refreshed",
+            }
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_auth_missing"
+    assert failure.retryable is False
+    assert "provider credentials" in failure.user_message
+
+
+def test_cli_failure_classifies_split_expired_claude_oauth_session():
+    failure = classify_cli_failure(
+        stdout="\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "error": "authentication_failed",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": True,
+                        "api_error_status": None,
+                    }
+                ),
+            )
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_auth_missing"
+    assert failure.personal_account_reconnect is True
+
+
+def test_cli_failure_ignores_non_event_noise_between_native_auth_events():
+    failure = classify_cli_failure(
+        stdout="\n".join(
+            (
+                json.dumps({"type": "assistant", "error": "authentication_failed"}),
+                "",
+                "native process note",
+                json.dumps({"type": "result", "is_error": True}),
+            )
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_auth_missing"
+    assert failure.personal_account_reconnect is True
+
+
+def test_cli_failure_does_not_join_nonadjacent_authentication_events():
+    failure = classify_cli_failure(
+        stdout="\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "error": "authentication_failed",
+                    }
+                ),
+                json.dumps({"type": "assistant", "message": "ordinary worker output"}),
+                json.dumps({"type": "result", "is_error": True}),
+            )
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.personal_account_reconnect is False
+
+
+def test_cli_failure_requires_native_result_after_authentication_event():
+    failure = classify_cli_failure(
+        stdout="\n".join(
+            (
+                json.dumps({"type": "assistant", "error": "authentication_failed"}),
+                json.dumps({"type": "tool", "is_error": True}),
+            )
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.personal_account_reconnect is False
+
+
+def test_cli_failure_does_not_join_authentication_events_across_streams():
+    failure = classify_cli_failure(
+        stdout=json.dumps({"type": "assistant", "error": "authentication_failed"}),
+        stderr=json.dumps({"type": "result", "is_error": True}),
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.personal_account_reconnect is False
+
+
+def test_cli_failure_does_not_treat_worker_transcript_as_provider_auth_failure():
+    failure = classify_cli_failure(
+        stdout=json.dumps(
+            {
+                "type": "result",
+                "is_error": True,
+                "error": "tool_failed",
+                "result": (
+                    "A test failed while comparing the literal value "
+                    "authentication_failed; the provider session was not involved."
+                ),
+            }
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "unknown"
+
+
+def test_runtime_error_preserves_private_cli_failure_classification():
+    embedded = classify_cli_failure(
+        stdout=json.dumps(
+            {
+                "type": "result",
+                "is_error": True,
+                "error": "authentication_failed",
+                "result": "Failed to authenticate",
+            }
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+    private = profile_runtime_module._private_cli_failure_classification(
+        embedded,
+        exit_code=1,
+    )
+    error = RuntimeErrorBase("claude-code exited with code 1")
+    error.failure_classification = private  # type: ignore[attr-defined]
+
+    classified = classify_runtime_error(error, runtime_name="claude-code")
+
+    assert classified is private
+    assert classified.failure_class == "provider_auth_missing"
+    assert classified.diagnostic_summary == "class=provider_auth_missing; exit_code=1"
+
+
+def test_private_cli_failure_classification_drops_provider_transcript():
+    classification = classify_cli_failure(
+        stdout=json.dumps(
+            {
+                "type": "result",
+                "is_error": True,
+                "error": "authentication_failed",
+                "result": "Sensitive synthetic mission content must not leave the run files.",
+            }
+        ),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    private = profile_runtime_module._private_cli_failure_classification(
+        classification,
+        exit_code=1,
+    )
+
+    assert private.failure_class == "provider_auth_missing"
+    assert private.personal_account_reconnect is True
+    assert private.diagnostic_summary == "class=provider_auth_missing; exit_code=1"
+    assert "Sensitive synthetic mission content" not in private.diagnostic_summary
+
+
 def test_runtime_error_classifies_missing_executable_substrate():
     failure = classify_runtime_error(
         RuntimeErrorBase(
@@ -5465,6 +5995,30 @@ def test_openclaw_can_scope_session_key_per_run(tmp_path, monkeypatch):
 
     assert command[command.index("--session-id") + 1] == "wpr-worker-wrk_openclaw-run_abc123"
     assert env
+
+
+def test_hosted_openclaw_command_env_exposes_only_its_selected_provider_route(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://openai.example.test/v1")
+    monkeypatch.setenv("PORTKEY_API_KEY", "synthetic-portkey")
+    monkeypatch.setenv("PORTKEY_BASE_URL", "https://portkey.example.test/v1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-enter-openclaw")
+    runtime = OpenClawWorkstationRuntime(base_dir=str(tmp_path / "data"))
+
+    openai_env = runtime._sandbox_env()
+    assert openai_env["OPENAI_API_KEY"] == "synthetic-openai"
+    assert "PORTKEY_API_KEY" not in openai_env
+    assert "ANTHROPIC_API_KEY" not in openai_env
+
+    monkeypatch.setenv("WPR_OPENCLAW_BASE_URL", "https://selected.example.test/v1")
+    monkeypatch.setenv("WPR_OPENCLAW_ENV_KEY", "PORTKEY_API_KEY")
+    portkey_env = runtime._sandbox_env()
+    assert portkey_env["PORTKEY_API_KEY"] == "synthetic-portkey"
+    assert "OPENAI_API_KEY" not in portkey_env
+    assert "ANTHROPIC_API_KEY" not in portkey_env
 
 
 def test_openclaw_neutralizes_default_onboarding_bootstrap_for_task_runs(tmp_path):
@@ -5683,6 +6237,45 @@ def test_openclaw_desktop_action_does_not_start_gateway(tmp_path):
     assert fake.ensure_calls == []
     assert fake.desktop_actions[0]["action"] == "browser"
     assert fake.desktop_actions[0]["url"] == "about:blank"
+
+
+@pytest.mark.parametrize("runtime_class", [CodexCliRuntime, ClaudeCodeRuntime])
+def test_provider_binding_cleanup_removes_container_when_stale_session_stop_fails(
+    tmp_path,
+    runtime_class,
+):
+    class FakeSandbox:
+        def __init__(self) -> None:
+            self.terminated: list[str] = []
+            self.repaired: list[Path] = []
+
+        def terminate(self, worker_id: str):
+            self.terminated.append(worker_id)
+
+        def repair_provider_account_access(self, account_home: Path) -> None:
+            self.repaired.append(Path(account_home))
+
+    runtime = runtime_class(base_dir=str(tmp_path / "data"))
+    fake = FakeSandbox()
+    runtime.sandbox = fake
+    runtime._stop_active_process = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("synthetic stale completed-run metadata")
+    )
+    cleared: list[str] = []
+    runtime._clear_active_session = cleared.append
+    account_home = tmp_path / "provider-account"
+    account_home.mkdir()
+
+    runtime.release_provider_account_binding(
+        {
+            "worker_id": "wrk_stale_session_cleanup",
+            "_glasshive_provider_account_mount_host": str(account_home),
+        }
+    )
+
+    assert fake.terminated == ["wrk_stale_session_cleanup"]
+    assert fake.repaired == [account_home]
+    assert cleared == ["wrk_stale_session_cleanup"]
 
 
 def test_openclaw_projects_openai_compatible_provider_without_storing_secret(tmp_path, monkeypatch):

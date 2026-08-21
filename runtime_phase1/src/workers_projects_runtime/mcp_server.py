@@ -28,8 +28,9 @@ from pydantic import Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .auth import AuthContext, multi_user_security_enabled, scoped_alias
+from .auth import AuthContext, multi_user_security_enabled, normalize_identity_segment, scoped_alias
 from .bootstrap import (
     BOOTSTRAP_SOURCE_TOKEN_KEY,
     GLASSHIVE_CAPABILITY_BROKER_TOKEN_ENV,
@@ -39,6 +40,7 @@ from .deliverables import is_user_deliverable_relative_path
 from .operator_urls import operator_base_url, surface_aware_watch_url, surface_can_open_operator_url
 from .mcp_oauth import McpOAuthConfigurationError, oauth_from_env
 from .mcp_internal_assertions import McpInternalAssertionError, signed_runtime_assertion
+from .models import CLOSED_WORKER_STATES
 from .release_provenance import release_provenance
 from .runtime_requirements import host_runtime_requirement_issue
 from .runtime_env import load_viventium_runtime_env
@@ -634,14 +636,6 @@ def _mcp_transport_security_settings(host: str, port: int) -> TransportSecurityS
     )
 
 
-def _host_worker_mentions() -> tuple[str, str, str]:
-    return (
-        os.environ.get("WPR_HOST_MENTION_CODEX", "@codex").strip() or "@codex",
-        os.environ.get("WPR_HOST_MENTION_CLAUDE", "@claude").strip() or "@claude",
-        os.environ.get("WPR_HOST_MENTION_OPENCLAW", "@openclaw").strip() or "@openclaw",
-    )
-
-
 def _worker_execution_instruction() -> str:
     if _host_workers_enabled():
         if _default_execution_mode() == "host":
@@ -661,143 +655,16 @@ def _worker_execution_instruction() -> str:
     )
 
 
-def _worker_surface_summary() -> str:
-    if _host_workers_enabled():
-        return (
-            "persistent projects, resumable workers, host-native workers for browser and desktop action, "
-            "local files/projects, installed CLIs, workstation sandboxes, and live operator takeover"
-        )
-    return (
-        "persistent projects, resumable workers, Docker/workstation sandboxes, generated artifacts, "
-        "sandboxed browser/desktop action, and live operator takeover"
-    )
-
-
-def _worker_surface_routing_guidance() -> str:
-    if _host_workers_enabled():
-        return (
-            "Use it when the user asks the host assistant to act in a real browser, desktop app, local file, "
-            "local project, installed tool, or current computer session; the user does not need to say "
-            "GlassHive, Codex, Computer Use, or local machine. Do not answer from memory or inference when "
-            "real browser/desktop/local state must be inspected or changed. "
-        )
-    return (
-        "Use it for advanced long-running workspace, file, code, research, artifact, sandboxed browser, "
-        "or sandboxed desktop work; host-native access to the user's real computer/session is disabled in "
-        "this deployment, so do not imply real local-browser, desktop-app, local-file, installed-CLI, or OS "
-        "control unless the host explicitly exposes a separate capability. "
-    )
-
-
 def glasshive_workers_server_instructions() -> str:
-    codex_mention, claude_mention, openclaw_mention = _host_worker_mentions()
     return (
-        f"GlassHive owns {_worker_surface_summary()}. "
-        "GlassHive workers are general intelligent workers; less is more. Give them faithful goals, "
-        "constraints, files, MCP/tool capability context, and user-visible success conditions, then trust "
-        "the worker to choose the path. The host assistant must not invent tool results, claim MCP access "
-        "was used without returned evidence, or turn its own orchestration preferences into worker goals. "
-        "Pass MCP/tool availability as context, not as a made-up success criterion. "
-        "Data in and data out must be exact: pass real file/upload references, broker grants/capabilities, "
-        "and retrieved context when available, and report unavailable data as a blocker instead of filling gaps. "
-        "When reporting exact filenames, paths, markers, IDs, or exact content in Markdown, wrap them in "
-        "backticks or escape Markdown-sensitive characters so underscores and other literals survive rendering. "
-        f"{_worker_surface_routing_guidance()}"
-        "Call the exact GlassHive tool id exposed by the host application. Some hosts namespace MCP "
-        "tools, so action names like workspace_launch may be displayed as suffixed callable ids such "
-        "as workspace_launch_mcp_glasshive-workers-projects; use the callable id, not a bare action "
-        "name that is not in the available tool list. If a needed GlassHive capability is not "
-        "currently available in the callable tool list, call `tool_search` with a non-empty "
-        "capability query and the server scope—for example, `query=<needed capability>` and "
-        "`mcp_server=glasshive-workers-projects`—select the exact returned callable id, and invoke "
-        "it in the same invocation; do not claim GlassHive is unavailable until scoped discovery "
-        "returns no matching capability or an explicit server error. "
-        f"{_worker_capability_summary()}\n\n"
-        "For connected-account facts or actions, MCP/tools are preferred when they can satisfy the task, "
-        "and broker capability belongs in context as an available option, not as an invented project goal. "
-        "Do not make tool choice a workspace success criterion unless the user explicitly asked for that. "
-        "Do not invent project goals, success criteria, provider lists, output schemas, artifacts, ranking "
-        "rules, or workflow steps that the user did not specify. For vague user adjectives like urgent "
-        "or important, pass the adjective through instead of defining a rubric unless the user defines it. "
-        "Do not add memory-derived priorities, active-thread/contact/deal lists, or guessed urgency rubrics to description, success_criteria, "
-        "or context unless the user explicitly asked to use memory/prior context; trust the GlassHive worker to find the "
-        "best path from the user's request and available context. If the user did not specify acceptance "
-        "criteria, use a minimal criterion such as: Satisfy the user's request as stated, preserving explicit "
-        "constraints. Put extra background in context, not as hard gates. Browser or computer use remains "
-        "available when MCP/tools are missing, unavailable, auth-blocked, explicitly required, or genuinely "
-        "the better visual/manual QA route.\n\n"
-        "If GlassHive injects `glasshive-user-capabilities` and another host connector also exposes the "
-        "same connected account, describe the brokered capability as the preferred scoped option; "
-        "non-broker host connectors are fallback after broker omission, unavailability, auth block, "
-        "or explicit user request. "
-        f"{_worker_execution_instruction()} "
-        "Use Docker/workstation mode for isolated sandbox, disposable browser, risky untrusted "
-        "browsing, explicit sandbox requests, or when the user says sandboxed workspace, sandbox, "
-        "Codex Workspace, or workstation. In those cases set execution_mode='docker' even if this "
-        "deployment's default execution mode is host.\n\n"
-        f"For configured mentions {codex_mention}, {claude_mention}, and {openclaw_mention}, create "
-        "or resume a worker with the matching profile semantics; prefer codex-cli for available "
-        "browser/desktop/file/code execution, claude-code when Claude is explicitly requested, "
-        "and openclaw-general only when installed or explicitly requested. Current request upload "
-        "metadata is projected through neutral GlassHive/LibreChat headers when the host supplies "
-        "it. Some standalone LibreChat builds do not expose upload metadata to MCP headers; when "
-        "attached-file text is visible in the current model context, pass it through uploaded_files "
-        "on workspace_launch or worker_delegate_once so GlassHive can materialize it under uploads/ "
-        "before the worker starts. Do not tell the worker to pass the file through again; tell it "
-        "to read the workspace-relative uploads/<filename> file directly. "
-        "If only file names/references are visible, still pass those names/references and the "
-        "requested outcome so the worker can report a real blocker instead of pretending it read "
-        "content. Preserve existing file references in bootstrap_bundle_json. If the user refers "
-        "to an attached or uploaded file and your model context cannot read the file body directly, "
-        "still call workspace_launch or worker_delegate_once; do not refuse solely because your own "
-        "model context lacks file contents.\n\nFor fresh one-off "
-        "workspace/browser/desktop/file/code tasks, prefer workspace_launch, whose fields mirror the "
-        "documented GlassHive UI: description, optional success_criteria, and optional context. "
-        "Use success_criteria for explicit user requirements only; if the user gave no distinct acceptance "
-        "criteria, omit it or keep it minimal instead of manufacturing a plan for the worker. "
-        "Connected-account read authorization comes from the host-signed broker grant when reviewed "
-        "host policy projects content-read scope; connected_account_content_intent is only a compatibility "
-        "hint for hosts that want an extra missing-broker warning, not a required authorization switch. "
-        "When the user asks to make a worker or effort the default, use workspace_preferences_set; "
-        "when profile or effort is omitted, workspace_launch and worker_delegate_once honor the "
-        "authenticated user's saved defaults before falling back to deployment defaults.\n\n"
-        f"{HIGH_EFFORT_SELECTION_GUIDANCE} "
-        "Use xhigh/max for deep research or hard, ambiguous work. Do not shorten, summarize, paraphrase, or water down the user's "
-        "request before handing it to GlassHive. Preserve the full user request, success criteria, "
-        "constraints, examples, links, file references, exclusions, and available background in "
-        "workspace_launch description/success_criteria/context or worker_delegate_once instruction. "
-        "Use the context field for the full picture when the description would otherwise become a "
-        "thin summary.\n\n"
-        f"{HOST_SIDE_ORCHESTRATION_GUIDANCE} "
-        "worker_delegate_once is the lower-level one-call fallback when the caller already has a "
-        "precise instruction/title. These high-level tools create or resume the "
-        "project/worker, include optional callback/upload context, queue the run in one call, and "
-        "return a compact View / Steer link plus result_tools for later status/result questions. "
-        "GlassHive must work standalone: callbacks are an optional host-app delivery enhancement, "
-        "not a requirement.\n\nAfter workspace_launch or worker_delegate_once, write one short "
-        "outcome-focused acknowledgement in the assistant's own voice and include the View / Steer "
-        "link when present on web/browser surfaces. If callback_ready=false, say the work is running "
-        "and can be checked with the standalone MCP status tools. If the user asks whether it is "
-        "done or what happened in the same conversation, call workspace_status for a non-blocking "
-        "check or workspace_wait for a blocking wait before answering. Request diagnostics only "
-        "when raw project/worker/run ids are explicitly needed. When the user asks to wait for the "
-        "result, use the returned completion_wait_timeout_seconds so ordinary long-running work is "
-        "not mistaken for failure just because a short poll expired; if the same-conversation wait "
-        "call omits ids GlassHive will "
-        "resolve the most recent launch scoped to the authenticated user/conversation; do not ask "
-        "the user to confirm waiting when they already asked you to wait. When you launch and then "
-        "wait in the same turn, surface the View / Steer link before entering the long wait whenever "
-        "the chat protocol allows assistant text before a tool call; always include it in the final "
-        "answer. If status/wait "
-        "returns a retryable failure and the user wants to continue, call workspace_continue so the "
-        "same worker resumes from its current workspace files/state instead of relaunching from "
-        "scratch. If a launch returns status='blocked' with failure_class such as "
-        "runtime_dependency_missing, do not claim that a worker is running; explain the blocker and "
-        "recover by choosing an available profile or sandbox mode only when that does not contradict "
-        "the user's explicit choice. After lower-level worker_run, queued only means accepted; do not "
-        "report it as done. Preserve the user's success condition and response-format constraints in "
-        "worker instructions. User-facing responses should not expose raw worker/run/provider/queue "
-        "plumbing outside the View / Steer link unless diagnostics were requested."
+        "Use the one GlassHive tool whose action matches the user's request. Make one call when one "
+        "call can complete it; never enumerate or summarize the tool catalog unless the user asks. "
+        "For a fresh delegated task, use workspace_launch. When the user gives an exact saved workspace "
+        "name, launch it directly without listing first; workspace_launch resolves the human name. "
+        "Check or wait only when the user asks. "
+        "Preserve the user's goal, constraints, files, and context without inventing plans, success "
+        "criteria, tool results, or extra workflow. Use the exact callable tool id shown by the host. "
+        f"{_worker_capability_summary()} {_worker_execution_instruction()}"
     )
 
 
@@ -902,19 +769,29 @@ def _require_enterprise_payload_scope(
         raise PermissionError(f"GlassHive {label} is not owned by the authenticated user")
 
 
-def _request_scoped_alias(alias: str) -> str:
+def _request_alias_input(alias: str) -> tuple[AuthContext | None, str]:
     clean_alias = alias.strip()
     if not clean_alias or not _enterprise_mode_enabled():
-        return clean_alias
-    headers = _request_headers()
-    _require_enterprise_mcp_service_auth(headers)
-    _require_enterprise_mcp_identity_assertion(headers)
-    tenant_id = (
-        _header_value(headers, HEADER_TENANT_ID)
-        or _configured_enterprise_tenant_id()
+        return None, clean_alias
+    tenant_id, user_id = _enterprise_request_scope()
+    ctx = AuthContext(tenant_id=tenant_id, user_id=user_id, enterprise=True)
+    prefix = (
+        f"{normalize_identity_segment(tenant_id, 'tenant')}--"
+        f"{normalize_identity_segment(user_id, 'user')}--"
     )
-    user_id = _header_value(headers, HEADER_USER_ID) or DEFAULT_OWNER_ID
-    return scoped_alias(AuthContext(tenant_id=tenant_id, user_id=user_id, enterprise=True), clean_alias)
+    if clean_alias.startswith(prefix):
+        clean_alias = clean_alias[len(prefix) :]
+    return ctx, clean_alias
+
+
+def _request_unscoped_alias(alias: str) -> str:
+    _, clean_alias = _request_alias_input(alias)
+    return clean_alias
+
+
+def _request_scoped_alias(alias: str) -> str:
+    ctx, clean_alias = _request_alias_input(alias)
+    return scoped_alias(ctx, clean_alias) if ctx is not None else clean_alias
 
 
 def _sanitize_context_value(value: str | None) -> str:
@@ -989,6 +866,58 @@ class McpHttpAuthMiddleware(BaseHTTPMiddleware):
 # Backward-compatible import name for deployments/tests that referenced the former enterprise-only
 # middleware. HTTP service authentication now applies in both local and enterprise deployments.
 EnterpriseMcpHttpAuthMiddleware = McpHttpAuthMiddleware
+
+
+class McpOAuthScopeChallengeMiddleware:
+    def __init__(self, app: ASGIApp, *, path: str, required_scopes: list[str]) -> None:
+        self.app = app
+        self.path = path
+        self.required_scope = " ".join(required_scopes)
+        if any(
+            character in {'"', "\\"} or ord(character) < 0x21 or ord(character) > 0x7E
+            for character in self.required_scope
+            if character != " "
+        ):
+            raise McpOAuthConfigurationError("MCP OAuth scopes cannot be represented in a challenge")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def send_with_scope(message: Message) -> None:
+            if (
+                message["type"] == "http.response.start"
+                and message.get("status") == 401
+                and scope.get("path") == self.path
+                and self.required_scope
+            ):
+                headers = list(message.get("headers", []))
+                for index, (name, value) in enumerate(headers):
+                    if name.lower() != b"www-authenticate":
+                        continue
+                    challenge = value.decode("latin-1")
+                    if challenge.lower().startswith("bearer ") and not re.search(
+                        r"(?:^|,)\s*scope=", challenge, flags=re.IGNORECASE
+                    ):
+                        headers[index] = (
+                            name,
+                            f'{challenge}, scope="{self.required_scope}"'.encode("latin-1"),
+                        )
+                    break
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_scope)
+
+
+class GlassHiveFastMCP(FastMCP):
+    def streamable_http_app(self):
+        app = super().streamable_http_app()
+        auth = self.settings.auth
+        if auth and auth.required_scopes:
+            app.add_middleware(
+                McpOAuthScopeChallengeMiddleware,
+                path=self.settings.streamable_http_path,
+                required_scopes=auth.required_scopes,
+            )
+        return app
 
 
 def _require_enterprise_mcp_transport(transport: str) -> None:
@@ -1632,6 +1561,7 @@ def _dispatch_follow_up_context(
     run: dict[str, Any],
     request_surface: str | None,
     expose_diagnostics: bool = False,
+    explicit_follow_up_required: bool = False,
 ) -> dict[str, Any]:
     worker_id = str(worker.get("worker_id") or "").strip()
     run_id = str(run.get("run_id") or "").strip()
@@ -1659,7 +1589,7 @@ def _dispatch_follow_up_context(
     }
     if view_steer_url:
         payload["view_steer_url"] = view_steer_url
-    if expose_diagnostics:
+    if expose_diagnostics or explicit_follow_up_required:
         payload["follow_up_context"] = {
             "project_id": project_id,
             "worker_id": worker_id,
@@ -2580,7 +2510,7 @@ class WorkersProjectsApiClient:
             if not project_id:
                 continue
             for worker in self.list_workers(project_id):
-                if str(worker.get("state") or "") in {"terminating", "termination_failed", "terminated"}:
+                if str(worker.get("state") or "") in CLOSED_WORKER_STATES:
                     continue
                 if execution_mode and worker.get("execution_mode") and worker.get("execution_mode") != execution_mode:
                     continue
@@ -2846,7 +2776,7 @@ def create_mcp_server(
         )
     recent_dispatches: dict[tuple[str, str, str, str, str], RecentDispatchContext] = {}
     recent_dispatches_lock = threading.RLock()
-    server = FastMCP(
+    server = GlassHiveFastMCP(
         name="glass-hive",
         instructions=glasshive_workers_server_instructions(),
         host=host,
@@ -3126,7 +3056,10 @@ def create_mcp_server(
         title="Find My Workspaces",
         description=(
             "List, search, and rediscover the authenticated user's persisted GlassHive workspaces by "
-            "human name, tag, favorite state, or workspace kind. Returns an opaque next_cursor for pagination."
+            "human name, tag, favorite state, or workspace kind. Use when the user asks to browse/list, "
+            "or when a workspace name is missing or ambiguous. Do not call this before workspace_launch "
+            "when the user already supplied one exact saved human name; workspace_launch resolves it. "
+            "Returns an opaque next_cursor for pagination."
         ),
         structured_output=True,
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
@@ -3137,7 +3070,7 @@ def create_mcp_server(
         tags: list[str] | None = None,
         favorite: bool | None = None,
         cursor: str | None = None,
-        limit: Annotated[int, Field(ge=1, le=100)] = 25,
+        limit: int = 25,
     ) -> dict[str, Any]:
         return client.workspace_catalog(
             search=search,
@@ -3145,7 +3078,7 @@ def create_mcp_server(
             tags=tags,
             favorite=favorite,
             cursor=cursor,
-            limit=limit,
+            limit=max(1, min(int(limit), 100)),
         )
 
     @server.tool(
@@ -3576,6 +3509,15 @@ def create_mcp_server(
                 )
             ),
         ] = False,
+        favorite: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Set true when the user explicitly asks to favorite or pin this reusable workspace. "
+                    "GlassHive applies it before the run is queued."
+                )
+            ),
+        ] = False,
         profile: ProfileParam = "",
         backend: BackendParam = None,
         execution_mode: ExecutionModeParam = None,
@@ -3638,7 +3580,9 @@ def create_mcp_server(
                 f"User-visible success condition:\n{explicit_goal}"
             )
         worker_instruction = _with_worker_host_side_orchestration_rule(worker_instruction_body)
-        reusable_alias = (alias or _slugify_alias(resolved_profile, clean_title)).strip()
+        reusable_alias = _request_unscoped_alias(
+            alias or _slugify_alias(resolved_profile, clean_title)
+        )
         resolved_alias = reusable_alias if reuse_existing_workspace else _fresh_worker_alias(reusable_alias)
         blocked = _runtime_dependency_blocked_payload(
             profile=resolved_profile,
@@ -3730,6 +3674,11 @@ def create_mcp_server(
                 alias=reusable_alias,
                 execution_mode=resolved_execution_mode,
             )
+            if existing_workspace is None:
+                raise ValueError(
+                    f"Could not resolve existing workspace alias {reusable_alias!r} for "
+                    f"execution_mode={resolved_execution_mode!r}; no workspace was created"
+                )
         if existing_workspace and provider_selection is not None:
             raise ValueError(
                 "Existing workspaces keep their saved provider account policy"
@@ -3778,6 +3727,12 @@ def create_mcp_server(
         if not worker_id:
             raise ValueError("GlassHive worker create/resume did not return worker_id")
 
+        if favorite:
+            worker = {
+                **worker,
+                **client.update_workspace(worker_id, {"favorite": True}),
+            }
+
         try:
             run = client.assign_run(
                 worker_id,
@@ -3800,6 +3755,12 @@ def create_mcp_server(
             run=run,
             request_surface=request_surface,
             expose_diagnostics=expose_diagnostics,
+            explicit_follow_up_required=not bool(
+                _recent_dispatch_scope_keys(
+                    owner_id=str(worker.get("owner_id") or ""),
+                    for_remember=True,
+                )
+            ),
         )
         _remember_recent_dispatch_context(
             worker=worker,
@@ -3847,6 +3808,7 @@ def create_mcp_server(
         description=(
             "Primary user-facing GlassHive launch tool. Use this for ordinary LibreChat requests that need a resumable workspace, browser/desktop work, local files, generated artifacts, or a long-running worker. "
             "Its inputs intentionally mirror the documented GlassHive UI: description, optional success_criteria, and optional context. "
+            "Use a short natural workspace name on the first line of description; keep the full request on following lines or in context. "
             "Do not shorten, summarize, paraphrase, or water down the user's request. Use description for the outcome, success_criteria for hard gates, and context for the full available background, constraints, examples, links, file references, exclusions, and any original wording that matters. "
             "For connected-account facts or actions, include broker/tool availability as context and let the GlassHive worker choose how to satisfy the user's goal; do not turn tool choice into a success criterion unless the user explicitly asked for that. Browser or computer UI inspection remains available when MCP/tools are missing, unavailable, auth-blocked, explicitly required, or genuinely the better visual/manual QA route. "
             "The host assistant must not fabricate MCP/tool results or force a downloadable artifact; only pass real data/capabilities and let the worker decide whether a file, chat answer, browser action, or other output is appropriate. "
@@ -3854,8 +3816,8 @@ def create_mcp_server(
             "If the user did not specify acceptance criteria, omit success_criteria or use only the minimal value 'Satisfy the user's request as stated, preserving explicit constraints.' Do not invent provider lists, output schemas, artifacts, ranking rules, workflow steps, memory-derived priorities, active-thread/contact/deal lists, or guessed urgency rubrics. For vague user adjectives like urgent or important, pass the adjective through instead of defining a rubric unless the user defines it. "
             "Connected-account read authorization comes from the host-signed broker grant when reviewed host policy projects content-read scope; connected_account_content_intent is only a compatibility hint for missing-broker warnings, not a required authorization switch. The flag alone does not unlock content reads or writes. "
             f"{HOST_SIDE_ORCHESTRATION_GUIDANCE} "
-            "Do not chain project_create, worker_create, and worker_run for routine tasks. Do not expose project/worker/run IDs unless expose_diagnostics is true. "
-        "Returns a clean non-blocking dispatch result with view_steer_url and result_tools; raw ids are hidden unless expose_diagnostics is true. "
+            "Do not chain project_create, worker_create, and worker_run for routine tasks. Raw IDs stay hidden when the host supplies stable conversation context; a minimal follow_up_context is returned when an external client does not, so status/wait needs no discovery call. "
+        "Returns a clean non-blocking dispatch result with view_steer_url and result_tools. "
         "For ordinary fresh launches, create a fresh workspace even if the host suggests a convenient alias. "
         "Reuse a stable alias only when the user explicitly asks to resume/reuse an existing workspace and "
         "reuse_existing_workspace is true; otherwise stale worker history can slow or distort one-off work. "
@@ -3874,7 +3836,15 @@ def create_mcp_server(
         structured_output=True,
     )
     def workspace_launch(
-        description: Annotated[str, Field(description="Describe your project or task in the user's own outcome language.")],
+        description: Annotated[
+            str,
+            Field(
+                description=(
+                    "Describe the project in the user's own outcome language. Use a short, natural workspace "
+                    "name on the first line and preserve the complete request on following lines or in context."
+                )
+            ),
+        ],
         success_criteria: Annotated[
             str | None,
             Field(
@@ -3902,11 +3872,31 @@ def create_mcp_server(
         ] = None,
         workspace_alias: Annotated[
             str | None,
-            Field(description="Optional stable workspace alias. Honored only when reuse_existing_workspace is true; omit for a new one-off workspace."),
+            Field(
+                description=(
+                    "Optional stable workspace alias or exact saved human name. Honored only when "
+                    "reuse_existing_workspace is true; omit for a new one-off workspace."
+                )
+            ),
         ] = None,
         reuse_existing_workspace: Annotated[
             bool,
-            Field(description="Set true only when the user explicitly asked to resume/reuse the named workspace_alias. Leave false for fresh one-off tasks."),
+            Field(
+                description=(
+                    "Set true only when the user explicitly asked to resume/reuse the named workspace. "
+                    "When workspace_alias is omitted, GlassHive resolves one exact saved workspace name "
+                    "from the first description line; zero or multiple exact matches fail without creating anything. "
+                    "Leave false for fresh one-off tasks."
+                )
+            ),
+        ] = False,
+        favorite: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Set true when the user explicitly asks to favorite or pin this reusable workspace."
+                )
+            ),
         ] = False,
         profile: ProfileParam = "",
         execution_mode: ExecutionModeParam = None,
@@ -3978,14 +3968,86 @@ def create_mcp_server(
         )
         title = clean_description.splitlines()[0].strip()[:120] or "GlassHive workspace"
         delegate_alias = workspace_alias if reuse_existing_workspace else None
+        resolved_catalog_item: dict[str, Any] | None = None
+        if reuse_existing_workspace:
+            supplied_alias = str(delegate_alias or "").strip()
+            lookup_name = supplied_alias or title
+            supplied_unscoped_alias = (
+                _request_unscoped_alias(supplied_alias) if supplied_alias else ""
+            )
+            resolved_catalog_alias = ""
+            catalog = client.workspace_catalog(
+                search=lookup_name,
+                kind="",
+                limit=100,
+            )
+            items = catalog.get("items") if isinstance(catalog, dict) else None
+            next_cursor = catalog.get("next_cursor") if isinstance(catalog, dict) else None
+            active_items = [
+                item
+                for item in (items if isinstance(items, list) else [])
+                if isinstance(item, dict)
+                and str(item.get("state") or "").strip().lower()
+                not in CLOSED_WORKER_STATES
+                and str(item.get("alias") or "").strip()
+            ]
+            direct_alias_matches = [
+                item
+                for item in active_items
+                if supplied_unscoped_alias
+                and _request_unscoped_alias(
+                    str(item.get("alias") or "").strip()
+                )
+                == supplied_unscoped_alias
+            ]
+            if direct_alias_matches and (len(direct_alias_matches) != 1 or next_cursor):
+                raise ValueError(
+                    f"Could not resolve exactly one saved workspace matching {lookup_name!r}; "
+                    "use workspace_list once and retry with its workspace_alias"
+                )
+            if len(direct_alias_matches) == 1:
+                resolved_catalog_item = direct_alias_matches[0]
+                resolved_catalog_alias = str(resolved_catalog_item["alias"]).strip()
+            else:
+                exact_name_matches = [
+                    item
+                    for item in active_items
+                    if str(item.get("name") or "").strip().casefold()
+                    == lookup_name.casefold()
+                ]
+                if exact_name_matches and (len(exact_name_matches) != 1 or next_cursor):
+                    raise ValueError(
+                        f"Could not resolve exactly one saved workspace matching {lookup_name!r}; "
+                        "use workspace_list once and retry with its workspace_alias"
+                    )
+                if len(exact_name_matches) == 1:
+                    resolved_catalog_item = exact_name_matches[0]
+                    resolved_catalog_alias = str(resolved_catalog_item["alias"]).strip()
+            if not resolved_catalog_alias:
+                raise ValueError(
+                    f"Could not resolve exactly one saved workspace matching {lookup_name!r}; "
+                    "use workspace_list once and retry with its workspace_alias"
+                )
+            delegate_alias = resolved_catalog_alias
+        effective_profile = profile
+        effective_execution_mode = execution_mode
+        if resolved_catalog_item is not None:
+            if not str(profile or "").strip():
+                effective_profile = str(resolved_catalog_item.get("profile") or "").strip()
+            if execution_mode is None:
+                inherited_execution_mode = str(
+                    resolved_catalog_item.get("execution_mode") or ""
+                ).strip()
+                effective_execution_mode = inherited_execution_mode or None
         return worker_delegate_once(
             title=title,
             instruction="\n".join(brief_sections),
             goal=clean_success_criteria,
             alias=delegate_alias,
             reuse_existing_workspace=reuse_existing_workspace,
-            profile=profile,
-            execution_mode=execution_mode,
+            favorite=favorite,
+            profile=effective_profile,
+            execution_mode=effective_execution_mode,
             bootstrap_bundle_json=bootstrap_bundle_json,
             uploaded_files=uploaded_files,
             effort=effort,
@@ -4148,7 +4210,9 @@ def create_mcp_server(
                 profile=resolved_profile,
                 execution_mode=resolved_execution_mode,
                 effort=resolved_effort,
-                alias=(workspace_alias or _slugify_alias(resolved_profile, title)).strip(),
+                alias=_request_unscoped_alias(
+                    workspace_alias or _slugify_alias(resolved_profile, title)
+                ),
             )
         bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json) or {}
         bundle.setdefault(
@@ -4193,7 +4257,9 @@ def create_mcp_server(
                 ),
             }
 
-        resolved_alias = (workspace_alias or _slugify_alias(resolved_profile, title)).strip()
+        resolved_alias = _request_unscoped_alias(
+            workspace_alias or _slugify_alias(resolved_profile, title)
+        )
         existing_workspace = None
         if workspace_alias:
             existing_workspace = client.find_worker_by_alias_across_projects(
@@ -5273,8 +5339,10 @@ def create_mcp_server(
             "Standalone non-blocking status/result check for GlassHive. Use this after workspace_launch, "
             "worker_delegate_once, or worker_run when the user asks whether the work is done, wants the "
             "latest result, or needs a quick status check. Do not call it immediately after launch "
-            "unless the user asked for status/diagnostics. If a same-conversation "
-            "follow-up call omits ids, GlassHive resolves the most recent launch scoped "
+            "unless the user asked for status/diagnostics. When workspace_launch returns "
+            "follow_up_context, pass its run_id and worker_id here. Omit ids only when no "
+            "follow_up_context was returned and the host preserves stable conversation context; "
+            "GlassHive then resolves the most recent launch scoped "
             "to the authenticated user/conversation. This does not require LibreChat or host-app "
             "callback wiring. Returns run state, worker state, output/error text, and View / Steer "
             "link data when available."
@@ -5283,8 +5351,8 @@ def create_mcp_server(
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     def workspace_status(
-        run_id: Annotated[str | None, Field(description="Optional run id from diagnostics or a prior explicit status result. Omit after a same-conversation launch when scoped recent dispatch is available.")] = None,
-        worker_id: Annotated[str | None, Field(description="Optional worker id for live state and View / Steer link. Omit after a same-conversation launch when scoped recent dispatch is available.")] = None,
+        run_id: Annotated[str | None, Field(description="Run id from workspace_launch follow_up_context when returned. Omit only when the launch returned no follow_up_context and scoped recent dispatch is available.")] = None,
+        worker_id: Annotated[str | None, Field(description="Worker id from workspace_launch follow_up_context when returned. Omit only when the launch returned no follow_up_context and scoped recent dispatch is available.")] = None,
         include_live: Annotated[bool, Field(description="Include worker live details when worker_id is available.")] = True,
         include_diagnostics: Annotated[bool, Field(description="Include raw run/workspace ids and live diagnostic snapshots.")] = False,
     ) -> dict[str, Any]:
@@ -5313,9 +5381,11 @@ def create_mcp_server(
             "WPR_MCP_BLOCKING_WAIT_DEFAULT_SEC capped by WPR_MCP_BLOCKING_WAIT_MAX_SEC. The default is "
             "intentionally bounded below common chat/proxy request timeouts; if this tool returns "
             "status=still_running and the user asked you to wait, immediately call workspace_wait again "
-            "in the same conversation instead of leaving the user with a stale spinner. If a "
-            "same-conversation follow-up call omits ids, GlassHive resolves the most "
-            "recent launch scoped to the authenticated user/conversation. This does not require "
+            "in the same conversation instead of leaving the user with a stale spinner. If the "
+            "launch result includes follow_up_context, pass its returned run_id and worker_id to every "
+            "workspace_wait call. Omit ids only when no follow_up_context was returned and the host "
+            "preserves stable conversation context; GlassHive then resolves the most recent launch "
+            "scoped to the authenticated user/conversation. This does not require "
             "LibreChat or host-app callback wiring. Omit poll_interval_seconds for normal work; "
             "do not invent polling values unless the user/operator gave a concrete override. "
             "GlassHive uses the configured efficient polling cadence, keeps early checks responsive, "
@@ -5326,8 +5396,8 @@ def create_mcp_server(
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
     )
     async def workspace_wait(
-        run_id: Annotated[str | None, Field(description="Optional run id from diagnostics or a prior explicit status result. Omit after a same-conversation launch when scoped recent dispatch is available.")] = None,
-        worker_id: Annotated[str | None, Field(description="Optional worker id for live state and View / Steer link.")] = None,
+        run_id: Annotated[str | None, Field(description="Run id from workspace_launch follow_up_context when returned. Omit only when the launch returned no follow_up_context and scoped recent dispatch is available.")] = None,
+        worker_id: Annotated[str | None, Field(description="Worker id from workspace_launch follow_up_context when returned. Omit only when the launch returned no follow_up_context and scoped recent dispatch is available.")] = None,
         timeout_seconds: Annotated[float | None, Field(description="Maximum seconds to block before returning timeout status. Omit to use the configured GlassHive completion wait default.")] = None,
         poll_interval_seconds: Annotated[float | None, Field(description="Optional polling interval in seconds. Omit for the configured efficient default.")] = None,
         include_live: Annotated[bool, Field(description="Include worker live details in the final response when available.")] = True,
@@ -5693,6 +5763,12 @@ def create_mcp_server(
             project_id=str(worker.get("project_id") or previous_run.get("project_id") or ""),
             run=new_run,
             request_surface=request_surface,
+            explicit_follow_up_required=not bool(
+                _recent_dispatch_scope_keys(
+                    owner_id=str(worker.get("owner_id") or ""),
+                    for_remember=True,
+                )
+            ),
         )
         _remember_recent_dispatch_context(
             worker=worker,

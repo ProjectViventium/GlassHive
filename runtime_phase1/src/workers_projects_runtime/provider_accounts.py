@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import pty
 import re
@@ -10,12 +11,14 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
+import termios
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import fcntl
 
@@ -31,8 +34,11 @@ from .inference_broker import (
 
 
 SAFE_ACCOUNT_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
-ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+ANSI_ESCAPE = re.compile(
+    r"\x1B(?:\][^\x07]*?(?:\x07|\x1B\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])"
+)
 MAX_SETUP_OUTPUT_CHARS = 32_000
+MAX_SETUP_INPUT_BYTES = 1_024
 PROVIDER_VERIFY_HEARTBEAT_INTERVAL_SECONDS = 10.0
 PROVIDER_SETUP_ENV_ALLOWLIST = {
     "ALL_PROXY",
@@ -66,7 +72,7 @@ _CODEX_DEVICE_CODE = re.compile(
 _CODEX_SECURITY_SETTINGS_URL = "https://chatgpt.com/#settings/Security"
 
 
-def _provider_setup_guidance(provider: str, output: str) -> dict[str, str]:
+def _provider_setup_guidance(provider: str, output: str) -> dict[str, str | bool]:
     """Extract bounded, clickable guidance without trusting arbitrary CLI output as a URL."""
 
     normalized_provider = str(provider or "").strip().lower()
@@ -89,7 +95,11 @@ def _provider_setup_guidance(provider: str, output: str) -> dict[str, str]:
                 setup_url = candidate
                 break
         elif normalized_provider in {"claude", "anthropic"}:
-            if hostname in {"claude.ai", "console.anthropic.com"}:
+            is_native_claude_login = (
+                hostname == "claude.com"
+                and parsed.path.rstrip("/") == "/cai/oauth/authorize"
+            )
+            if hostname in {"claude.ai", "console.anthropic.com"} or is_native_claude_login:
                 setup_url = candidate
                 break
 
@@ -98,6 +108,11 @@ def _provider_setup_guidance(provider: str, output: str) -> dict[str, str]:
         code_match = _CODEX_DEVICE_CODE.search(str(output or ""))
         if code_match:
             setup_code = code_match.group(1).upper()
+
+    input_required = False
+    if setup_url and normalized_provider in {"claude", "anthropic"}:
+        code_values = parse_qs(urlsplit(setup_url).query).get("code", [])
+        input_required = any(str(value).lower() == "true" for value in code_values)
 
     return {
         "provider": canonical_provider,
@@ -108,11 +123,40 @@ def _provider_setup_guidance(provider: str, output: str) -> dict[str, str]:
             if normalized_provider in {"codex", "openai"}
             else ""
         ),
+        "input_required": input_required,
     }
 
 
 def _env_enabled(name: str) -> bool:
     return str(os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def provider_setup_binary(provider: str) -> str | None:
+    """Resolve the native setup CLI from the same canonical worker settings used at runtime."""
+
+    normalized = str(provider or "").strip().lower()
+    if normalized in {"codex", "openai"}:
+        executable = "codex"
+        env_names = ("WPR_CODEX_BIN", "WPR_CODEX_CLI_PATH")
+    elif normalized in {"claude", "anthropic"}:
+        executable = "claude"
+        env_names = ("WPR_CLAUDE_CODE_BIN", "WPR_CLAUDE_CODE_PATH")
+    else:
+        return None
+    configured = [str(os.environ.get(name) or "").strip() for name in env_names]
+    configured = [value for value in configured if value]
+    for value in configured:
+        candidate = Path(value).expanduser()
+        if candidate.is_absolute():
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+            continue
+        if resolved := shutil.which(value):
+            return resolved
+    # An explicit but invalid binary is deployment drift; do not silently select another CLI.
+    if configured:
+        return None
+    return shutil.which(executable)
 
 
 def provider_platform_support(
@@ -155,13 +199,11 @@ def provider_platform_support(
             return "unsupported_macos_host"
         if not _env_enabled("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH"):
             return "provider_permission_required"
-        return "supported"
+        return "supported" if provider_setup_binary(normalized_provider) else "setup_cli_required"
     if normalized_provider in {"codex", "openai"}:
-        return (
-            "supported"
-            if _env_enabled("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS")
-            else "proof_required"
-        )
+        if not _env_enabled("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS"):
+            return "proof_required"
+        return "supported" if provider_setup_binary(normalized_provider) else "setup_cli_required"
     return "proof_required"
 
 
@@ -222,7 +264,14 @@ class ProviderAccountHomeManager:
         if not account_home.exists() and not account_home.is_symlink():
             return
         if account_home.is_symlink():
-            raise ControlPlaneError("Provider account home is not a safe managed directory")
+            resolved_root = self.root.resolve(strict=True)
+            resolved_parent = account_home.parent.resolve(strict=True)
+            if resolved_root != resolved_parent and resolved_root not in resolved_parent.parents:
+                raise ControlPlaneError(
+                    "Provider account home is outside the managed credential root"
+                )
+            account_home.unlink()
+            return
         resolved_root = self.root.resolve(strict=True)
         resolved_home = account_home.resolve(strict=True)
         if resolved_root not in resolved_home.parents:
@@ -239,8 +288,64 @@ class ProviderAccountHomeManager:
             target = account_home / "claude"
             target.mkdir(parents=True, exist_ok=True)
             self._private(target)
-            return {"CLAUDE_CONFIG_DIR": str(target)}
+            return {
+                "CLAUDE_CONFIG_DIR": str(target),
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR": str(target),
+            }
         raise ControlPlaneError("Unsupported provider account home")
+
+    def prepare_interactive_home(self, *, provider: str, account_home: Path) -> None:
+        """Make a verified Claude login immediately reusable by its interactive CLI."""
+
+        if provider not in {"claude", "anthropic"}:
+            return
+        config_dir = account_home / "claude"
+        config_path = config_dir / ".claude.json"
+        try:
+            metadata = config_path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or metadata.st_size > 1_048_576
+            ):
+                raise ControlPlaneError("Claude account state is not a safe managed file")
+            state = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ControlPlaneError("Claude account state is unavailable") from exc
+        if not isinstance(state, dict):
+            raise ControlPlaneError("Claude account state is invalid")
+        if state.get("hasCompletedOnboarding") is True:
+            return
+        state["hasCompletedOnboarding"] = True
+        serialized = json.dumps(state, indent=2, sort_keys=True) + "\n"
+        temp_fd, temp_name = tempfile.mkstemp(
+            dir=config_dir,
+            prefix=".glasshive-claude-onboarding-",
+        )
+        try:
+            os.fchmod(temp_fd, 0o600)
+            with os.fdopen(temp_fd, "w", encoding="utf-8", closefd=True) as handle:
+                temp_fd = -1
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, config_path)
+            directory_fd = os.open(
+                config_dir,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temp_fd >= 0:
+                os.close(temp_fd)
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
 
     def tighten_permissions(self, *, account_home: Path) -> None:
         """Validate and privatize credential state through no-follow directory descriptors."""
@@ -340,6 +445,8 @@ class _SetupSession:
     output: str = ""
     started_at: float = field(default_factory=time.time)
     reader_done: bool = False
+    input_submitted: bool = False
+    finalizing: bool = False
 
 
 class ProviderSetupManager:
@@ -375,9 +482,7 @@ class ProviderSetupManager:
         self.reconcile_provider_account_binding(account_home)
 
     def _binary(self, provider: str) -> str:
-        env_name = "WPR_CODEX_CLI_PATH" if provider in {"codex", "openai"} else "WPR_CLAUDE_CODE_PATH"
-        configured = str(os.environ.get(env_name) or "").strip()
-        binary = configured or shutil.which("codex" if provider in {"codex", "openai"} else "claude")
+        binary = provider_setup_binary(provider)
         if not binary:
             raise ControlPlaneError(f"{provider.title()} CLI is not installed in this GlassHive runtime")
         return binary
@@ -520,6 +625,11 @@ class ProviderSetupManager:
                 raise
             master_fd, slave_fd = pty.openpty()
             try:
+                terminal_attributes = termios.tcgetattr(slave_fd)
+                terminal_attributes[3] &= ~(
+                    termios.ECHO | getattr(termios, "ECHONL", 0)
+                )
+                termios.tcsetattr(slave_fd, termios.TCSANOW, terminal_attributes)
                 process = subprocess.Popen(
                     setup_command,
                     stdin=slave_fd,
@@ -577,6 +687,89 @@ class ProviderSetupManager:
             self._release_session(session)
             raise
         return self.status(account_id=account_id, tenant_id=tenant_id, owner_id=owner_id, verify=False)
+
+    @staticmethod
+    def _setup_input_bytes(value: str) -> bytes:
+        normalized = str(value or "").strip()
+        if len(normalized) > MAX_SETUP_INPUT_BYTES:
+            raise ControlPlaneError("The authentication code is too long")
+        if not normalized or any(
+            not 0x21 <= ord(character) <= 0x7E for character in normalized
+        ):
+            raise ControlPlaneError("Enter the authentication code shown by the provider")
+        encoded = normalized.encode("ascii")
+        # A physical Enter key arrives as CR in raw terminal UIs such as Ink;
+        # canonical line discipline maps it to NL for ordinary readline clients.
+        return encoded + b"\r"
+
+    def submit_input(
+        self,
+        *,
+        account_id: str,
+        tenant_id: str,
+        owner_id: str,
+        value: str,
+    ) -> dict[str, object]:
+        account = self._account(
+            account_id=account_id, tenant_id=tenant_id, owner_id=owner_id
+        )
+        payload = self._setup_input_bytes(value)
+        with self._lock:
+            session = self._sessions.get(account_id)
+            if (
+                session is None
+                or session.tenant_id != tenant_id
+                or session.owner_id != owner_id
+                or session.process.poll() is not None
+            ):
+                raise ControlPlaneConflict("Provider account setup is not waiting for input")
+            if str(account.get("provider") or "").strip().lower() not in {"claude", "anthropic"}:
+                raise ControlPlaneConflict("This provider sign-in does not accept browser input")
+            if session.input_submitted:
+                raise ControlPlaneConflict("The authentication code was already submitted")
+            guidance = _provider_setup_guidance(session.provider, session.output)
+            if not guidance.get("input_required"):
+                raise ControlPlaneConflict("Provider account setup is not waiting for input")
+            try:
+                write_fd = os.dup(session.master_fd)
+            except OSError as exc:
+                raise ControlPlaneConflict(
+                    "Provider account setup is no longer waiting for input"
+                ) from exc
+            # Reserve the one submission before releasing the process-wide lock.
+            # The duplicate pins this exact PTY even if Cancel/Restart closes and
+            # recycles the session's original descriptor before the write completes.
+            session.input_submitted = True
+            session.output = ""
+        written = 0
+        try:
+            while written < len(payload):
+                count = os.write(write_fd, payload[written:])
+                if count <= 0:
+                    raise OSError("provider input closed")
+                written += count
+        except OSError as exc:
+            owns_cleanup = False
+            with self._lock:
+                if self._sessions.get(account_id) is session:
+                    self._terminate_session_process(session)
+                    self._sessions.pop(account_id, None)
+                    owns_cleanup = True
+            if owns_cleanup:
+                self._release_session(session)
+                self.store.update_provider_account_status(
+                    account_id=account_id,
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                    status="action_required",
+                    reconnect_reason="Provider sign-in input could not be delivered; restart sign-in",
+                )
+            raise ControlPlaneConflict(
+                "Provider account setup is no longer waiting for input"
+            ) from exc
+        finally:
+            os.close(write_fd)
+        return self.status(account_id=account_id, tenant_id=tenant_id, owner_id=owner_id)
 
     def _verify(self, *, provider: str, environment: dict[str, str], account_home: Path) -> bool:
         _, status_command = self._commands(provider)
@@ -699,19 +892,44 @@ class ProviderSetupManager:
             owner_id=owner_id,
             account_id=account_id,
         )
+        finalization_in_progress = False
         with self._lock:
             session = self._sessions.get(account_id)
             if session is not None and (session.tenant_id != tenant_id or session.owner_id != owner_id):
                 raise ControlPlaneError("Provider account not found for this user")
             return_code = session.process.poll() if session is not None else None
-            output = session.output if session is not None else ""
+            if session is None or session.input_submitted:
+                output = ""
+            else:
+                output = session.output
+            if session is not None and return_code is not None:
+                if session.finalizing:
+                    finalization_in_progress = True
+                else:
+                    session.finalizing = True
         if session is not None and return_code is None:
+            guidance = _provider_setup_guidance(provider, output)
+            if session.input_submitted:
+                guidance["input_required"] = False
             return {
                 "account_id": account_id,
                 "status": "connecting",
                 "instructions": output,
                 "complete": False,
-                **_provider_setup_guidance(provider, output),
+                "input_submitted": session.input_submitted,
+                **guidance,
+            }
+        if session is not None and finalization_in_progress:
+            guidance = _provider_setup_guidance(provider, output)
+            if session.input_submitted:
+                guidance["input_required"] = False
+            return {
+                "account_id": account_id,
+                "status": "connecting",
+                "instructions": output,
+                "complete": False,
+                "input_submitted": session.input_submitted,
+                **guidance,
             }
         verification_lease: dict[str, Any] | None = None
         verification_lease_stop = threading.Event()
@@ -784,6 +1002,10 @@ class ProviderSetupManager:
             )
             require_verification_lease()
             if authenticated:
+                self.homes.prepare_interactive_home(
+                    provider=provider,
+                    account_home=account_home,
+                )
                 # Provider status commands may recreate private cache wrappers
                 # after the pre-verification seal. Reconcile again while the
                 # exclusive verify lease is still held, then perform the final
@@ -828,9 +1050,13 @@ class ProviderSetupManager:
             raise
         finally:
             if session is not None:
+                owns_session = False
                 with self._lock:
-                    self._sessions.pop(account_id, None)
-                self._release_session(session)
+                    if self._sessions.get(account_id) is session:
+                        self._sessions.pop(account_id, None)
+                        owns_session = True
+                if owns_session:
+                    self._release_session(session)
             elif verification_lease is not None:
                 verification_lease_stop.set()
                 if verification_lease_thread is not None:
@@ -901,79 +1127,91 @@ class ProviderSetupManager:
                 "error",
             ),
         )
-        self.store.update_provider_account_status(
-            account_id=account_id,
-            tenant_id=tenant_id,
-            owner_id=owner_id,
-            status="action_required",
-            reconnect_reason="Disconnect in progress",
-        )
-
-        provider = str(account.get("provider") or "").strip().lower()
-        account_home = self.homes.account_home_path(
-            tenant_id=tenant_id,
-            owner_id=owner_id,
-            account_id=account_id,
-        )
-        if account_home.exists() and not account_home.is_symlink():
-            environment = self._environment(provider=provider, account_home=account_home)
-            binary_name = "codex" if provider in {"codex", "openai"} else "claude"
-            binary_env = "WPR_CODEX_CLI_PATH" if binary_name == "codex" else "WPR_CLAUDE_CODE_PATH"
-            binary = str(os.environ.get(binary_env) or "").strip() or shutil.which(binary_name)
-            if not binary:
-                self.store.release_provider_lease(
-                    lease_id=str(disconnect_lease["lease_id"]),
-                    tenant_id=tenant_id,
-                    owner_id=owner_id,
-                )
-                raise ControlPlaneError(
-                    "Provider logout is unavailable; the private account home was preserved"
-                )
-            logout_command = (
-                [binary, "logout"]
-                if binary_name == "codex"
-                else [binary, "auth", "logout"]
+        provider_logout_confirmed: bool | None = None
+        try:
+            self.store.update_provider_account_status(
+                account_id=account_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                status="action_required",
+                reconnect_reason="Disconnect in progress",
             )
+            provider = str(account.get("provider") or "").strip().lower()
+            account_home = self.homes.account_home_path(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                account_id=account_id,
+            )
+            self._reconcile_if_isolated(account_home)
+            if account_home.exists() and not account_home.is_symlink():
+                environment = self._environment(provider=provider, account_home=account_home)
+                binary_name = "codex" if provider in {"codex", "openai"} else "claude"
+                binary_env = (
+                    "WPR_CODEX_CLI_PATH"
+                    if binary_name == "codex"
+                    else "WPR_CLAUDE_CODE_PATH"
+                )
+                binary = str(os.environ.get(binary_env) or "").strip() or shutil.which(binary_name)
+                if not binary:
+                    provider_logout_confirmed = False
+                else:
+                    logout_command = (
+                        [binary, "logout"]
+                        if binary_name == "codex"
+                        else [binary, "auth", "logout"]
+                    )
+                    try:
+                        logout_result = subprocess.run(
+                            logout_command,
+                            cwd=str(account_home),
+                            env=environment,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=12,
+                            check=False,
+                        )
+                        provider_logout_confirmed = logout_result.returncode == 0
+                    except (OSError, subprocess.TimeoutExpired):
+                        provider_logout_confirmed = False
+            self.homes.remove_home(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                account_id=account_id,
+            )
+            updated = self.store.disconnect_provider_account(
+                account_id=account_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            )
+        except Exception as exc:
             try:
-                logout_result = subprocess.run(
-                    logout_command,
-                    cwd=str(account_home),
-                    env=environment,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=12,
-                    check=False,
+                self.store.update_provider_account_status(
+                    account_id=account_id,
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                    status="action_required",
+                    reconnect_reason="Could not remove private account data. Retry Remove.",
+                    recovery_code="credential_cleanup_failed",
                 )
-            except (OSError, subprocess.TimeoutExpired) as exc:
+            finally:
                 self.store.release_provider_lease(
                     lease_id=str(disconnect_lease["lease_id"]),
                     tenant_id=tenant_id,
                     owner_id=owner_id,
                 )
-                raise ControlPlaneError(
-                    "Provider logout failed; the private account home was preserved"
-                ) from exc
-            if logout_result.returncode != 0:
-                self.store.release_provider_lease(
-                    lease_id=str(disconnect_lease["lease_id"]),
-                    tenant_id=tenant_id,
-                    owner_id=owner_id,
-                )
-                raise ControlPlaneError(
-                    "Provider logout failed; the private account home was preserved"
-                )
-        self.homes.remove_home(
-            tenant_id=tenant_id,
-            owner_id=owner_id,
-            account_id=account_id,
-        )
-        updated = self.store.disconnect_provider_account(
-            account_id=account_id,
-            tenant_id=tenant_id,
-            owner_id=owner_id,
-        )
+            raise ControlPlaneError(
+                "GlassHive could not remove its private account data. Retry Remove."
+            ) from exc
+        if provider_logout_confirmed is True:
+            message = "Removed from GlassHive."
+        elif provider_logout_confirmed is False:
+            message = "Removed from GlassHive. Provider sign-out could not be confirmed."
+        else:
+            message = "Removed from GlassHive. No local provider session was present."
         return {
             "account_id": account_id,
             "status": str(updated.get("status") or "disconnected"),
             "complete": True,
+            "provider_logout_confirmed": provider_logout_confirmed,
+            "message": message,
         }

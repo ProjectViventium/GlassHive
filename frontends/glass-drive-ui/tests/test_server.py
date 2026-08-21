@@ -332,9 +332,20 @@ class FakeRuntimeClient:
         self.activity_requests = []
         self.schedule_authority_requests = []
         self.schedule_authority_error = None
+        self.provider_readiness_response = {
+            "readiness": "deployment_managed",
+            "status": "Work AI is ready.",
+        }
+        self.health_response = {
+            "status": "ok",
+            "provider_setup_support": {"codex": "supported", "claude": "supported"},
+        }
 
     def health(self):
-        return {"status": "ok"}
+        return dict(self.health_response)
+
+    def provider_readiness(self, profile: str):
+        return {**self.provider_readiness_response, "profile": profile}
 
     def with_headers(self, headers: dict[str, str]):
         self.header_contexts.append(headers)
@@ -389,6 +400,16 @@ class FakeRuntimeClient:
     def cancel_provider_account_setup(self, account_id: str):
         self.provider_setup_requests.append({"action": "cancel", "account_id": account_id})
         return {"account_id": account_id, "status": "action_required", "complete": True}
+
+    def submit_provider_account_setup_input(self, account_id: str, value: str):
+        self.provider_setup_requests.append({"action": "input", "account_id": account_id})
+        return {
+            "account_id": account_id,
+            "status": "connecting",
+            "instructions": "",
+            "complete": False,
+            "input_required": False,
+        }
 
     def disconnect_provider_account(self, account_id: str):
         self.provider_disconnect_requests.append(account_id)
@@ -940,6 +961,32 @@ def test_bootstrap_and_launch_flow():
     assert launch.json()['watch_url'].startswith('/watch/wrk_new')
     assert 'surface=desktop' in launch.json()['watch_url']
     assert fake.create_worker_requests[-1]['start_synchronously'] is False
+
+
+def test_new_workspace_launch_blocks_missing_work_ai_before_any_workspace_mutation():
+    fake = FakeRuntimeClient()
+    fake.provider_readiness_response = {
+        "readiness": "action_required",
+        "status": "Work AI is not set up.",
+    }
+    client = TestClient(create_app(runtime_client=fake))
+
+    response = client.post('/api/launch', json={
+        'description': 'Create a synthetic provider readiness report',
+        'success_criteria': 'Return the report',
+        'context': '',
+        'workspace_option': 'new:codex-cli',
+    })
+
+    assert response.status_code == 409
+    assert response.json()['detail'] == (
+        'Work AI is not set up. Ask an administrator to finish provider setup '
+        'or connect a personal account in Connections.'
+    )
+    assert fake.create_project_requests == []
+    assert fake.create_worker_requests == []
+    assert fake.assign_requests == []
+    assert fake.launch_failures == []
 
 
 def test_bootstrap_labels_degraded_personal_sections_instead_of_claiming_empty_state():
@@ -1992,7 +2039,8 @@ def test_launcher_workspace_hive_static_controls():
     assert "if (workspaceCatalogStatus) workspaceCatalogStatus.textContent = '';" in app_js
     assert "cursor: append ? String(catalogState.nextCursor || '') : ''" in app_js
     assert "workspace.provider_readiness" in app_js
-    assert "deployment account fallback" in app_js
+    assert "Work AI is not set up. Ask an administrator." in app_js
+    assert "Work AI: organization fallback" in app_js
     assert "function updateWorkspaceMeta" in app_js
     assert "meta.dataset.catalogDetails" in app_js
     assert "updateWorkspaceMeta(meta, data?.worker?.profile, state);" in app_js
@@ -2077,7 +2125,7 @@ def test_launcher_workspace_hive_static_controls():
     assert 'id="workspace-status-link"' in desktop_html
     assert "showWorkspaceLink: true" in desktop_js
     assert "Open workspace status and files" in desktop_html
-    assert "styles.css?v=20260811m" in watch_html
+    assert "styles.css?v=20260818a" in watch_html
     assert "}, 5000);" not in desktop_js
     assert 'id="project-files"' in index_html
     assert 'id="schedule-text"' in index_html
@@ -2154,6 +2202,33 @@ def test_open_completed_workspace_never_resumes_compute_implicitly():
     assert "'/action/resume'" in open_workspace
 
 
+def test_watch_footer_composer_keeps_instruction_wide_and_send_compact():
+    styles = (Path(server_module.STATIC_DIR) / "styles.css").read_text(encoding="utf-8")
+
+    def rule_body(selector: str) -> str:
+        start = styles.index(f"{selector} {{")
+        return styles[start : styles.index("}", start)]
+
+    textarea_rule = rule_body(".steer-form textarea")
+    send_rule = rule_body(".steer-form #send-button")
+
+    assert "grid-column: 2;" in textarea_rule
+    assert "min-width: 0;" in textarea_rule
+    assert "grid-column: 3;" in send_rule
+    assert "width: auto;" in send_rule
+    assert "min-width: 96px;" in send_rule
+    assert ".steer-form #send-button { grid-column: 1 / -1; width: 100%; }" not in styles
+
+
+def test_main_frame_is_visible_without_waiting_for_a_compositor_animation():
+    styles = (Path(server_module.STATIC_DIR) / "styles.css").read_text(encoding="utf-8")
+    start = styles.index(".composer-frame {")
+    composer_rule = styles[start : styles.index("}", start)]
+
+    assert "animation:" not in composer_rule
+    assert "@keyframes float-up" not in styles
+
+
 def test_workspace_open_resume_policy_uses_the_user_visible_state():
     policy_module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
     result = subprocess.run(
@@ -2187,6 +2262,41 @@ def test_workspace_open_resume_policy_uses_the_user_visible_state():
         "fallbackPaused": True,
         "oneOffPaused": False,
     }
+
+
+def test_workspace_native_tool_setup_uses_the_selected_profile_without_connector_wiring():
+    policy_module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ workspaceSetupAction }} from {json.dumps(policy_module)};"
+                "process.stdout.write(JSON.stringify({"
+                "codex:workspaceSetupAction('codex-cli'),"
+                "claude:workspaceSetupAction('claude-code'),"
+                "openclaw:workspaceSetupAction('openclaw-general'),"
+                "unknown:workspaceSetupAction('custom-worker')"
+                "}));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "codex": "codex",
+        "claude": "claude",
+        "openclaw": "openclaw",
+        "unknown": "terminal",
+    }
+
+    app_js = (Path(server_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
+    assert "Set up tools" in app_js
+    assert "workspaceSetupAction(workspace?.profile)" in app_js
+    assert "workerApiUrl(workerId, `/action/${encodeURIComponent(action)}`)" in app_js
+    assert "workspace?.workspace_url || workspace?.watch_url" in app_js
 
 
 def test_failed_workspace_keeps_the_recommended_pause_recovery_visible():
@@ -4920,7 +5030,7 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_SCOPES", "user_impersonation")
     monkeypatch.setenv(
         "GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES",
-        "api://00000000-0000-4000-8000-000000000123/user_impersonation",
+        "https://glasshive.example.test/mcp/access_as_user",
     )
     monkeypatch.setenv(
         "GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS",
@@ -4956,7 +5066,15 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert "--oauth-resource" not in payload["clients"]["codex"]["add_command"]
     assert payload["clients"]["codex"]["login_command"] == (
         "codex mcp login -c mcp_oauth_callback_port=49153 "
-        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' glasshive-d0c2dae3d5cd"
+        "-c 'mcp_oauth_callback_url=\"http://127.0.0.1:49153/callback\"' "
+        "glasshive-d0c2dae3d5cd"
+    )
+    assert payload["clients"]["codex"]["config_toml"] == (
+        "[mcp_servers.glasshive-d0c2dae3d5cd]\n"
+        'url = "https://glasshive.example.test/mcp"\n'
+        'scopes = ["https://glasshive.example.test/mcp/access_as_user", "offline_access"]\n\n'
+        "[mcp_servers.glasshive-d0c2dae3d5cd.oauth]\n"
+        'client_id = "registered-codex-client"'
     )
     assert payload["clients"]["codex"]["callback_uri"] == (
         "http://127.0.0.1:49153/callback/0MLa49XNV_Yw"
@@ -4973,10 +5091,39 @@ def test_connect_ai_returns_official_client_commands_when_oauth_is_configured(tm
     assert payload["configuration_status"] == "ready"
     assert payload["documentation_url"].endswith("/glasshive-client-registration")
     assert payload["source"]["license"] == "FSL-1.1-ALv2"
-    assert payload["clients"]["codex"]["add_command"] in payload["guided_prompt"]
-    assert payload["clients"]["codex"]["login_command"] in payload["guided_prompt"]
-    assert payload["clients"]["claude"]["add_command"] in payload["guided_prompt"]
-    assert payload["clients"]["claude"]["login_note"] in payload["guided_prompt"]
+    codex_prompt = payload["clients"]["codex"]["setup_prompt"]
+    claude_prompt = payload["clients"]["claude"]["setup_prompt"]
+    assert payload["clients"]["codex"]["config_toml"] in codex_prompt
+    assert payload["clients"]["codex"]["login_command"] in codex_prompt
+    assert "Persist these scopes" in codex_prompt
+    assert "can renew the login" in codex_prompt
+    assert "If GlassHive tools already work" in codex_prompt
+    assert "codex plugin marketplace add ProjectViventium/GlassHive" in codex_prompt
+    assert "codex plugin add glasshive@project-glasshive" in codex_prompt
+    assert "claude plugin" not in codex_prompt
+    assert "unscoped" not in codex_prompt
+    assert "interrupt" not in codex_prompt
+    assert "start a new Codex task" not in codex_prompt
+    assert "Restart the Codex/ChatGPT desktop app once" in codex_prompt
+    assert "Complete the native browser sign-in" in codex_prompt
+    assert "Claude" not in codex_prompt
+    assert "workspace_list once" in codex_prompt
+    assert "Never enumerate or summarize the tool catalog" in codex_prompt
+    assert payload["clients"]["claude"]["add_command"] in claude_prompt
+    assert payload["clients"]["claude"]["login_note"] in claude_prompt
+    assert "claude plugin marketplace add ProjectViventium/GlassHive" in claude_prompt
+    assert "claude plugin install glasshive@glasshive --scope user --yes" in claude_prompt
+    assert "codex plugin" not in claude_prompt
+    assert "Codex" not in claude_prompt
+    assert "workspace_list once" in claude_prompt
+    assert "Never enumerate or summarize the tool catalog" in claude_prompt
+    assert "If you are Codex, follow only the Codex section." in payload["guided_prompt"]
+    assert "If you are Claude Code, follow only the Claude Code section." in payload["guided_prompt"]
+    assert codex_prompt in payload["guided_prompt"]
+    assert claude_prompt in payload["guided_prompt"]
+    assert "list the GlassHive tools" not in payload["guided_prompt"]
+    assert "Do not build OAuth URLs" in payload["guided_prompt"]
+    assert "custom callback" not in payload["guided_prompt"]
     assert "administrator" not in payload["guided_prompt"].lower()
     control_plane_script = (
         server_module.STATIC_DIR / "control-plane.js"
@@ -5020,9 +5167,10 @@ def test_connect_ai_advertises_only_clients_with_a_complete_deployment_contract(
 
     assert payload["supported_clients"] == ["codex"]
     assert set(payload["clients"]) == {"codex"}
-    assert payload["clients"]["codex"]["add_command"] in payload["guided_prompt"]
+    assert payload["clients"]["codex"]["setup_prompt"] in payload["guided_prompt"]
+    assert payload["clients"]["codex"]["config_toml"] in payload["guided_prompt"]
     assert payload["clients"]["codex"]["login_command"] in payload["guided_prompt"]
-    assert "For Claude Code" not in payload["guided_prompt"]
+    assert "If you are Claude Code" not in payload["guided_prompt"]
 
 
 def test_external_ai_primary_ui_is_url_first_and_callbacks_are_admin_details():
@@ -5037,6 +5185,9 @@ def test_external_ai_primary_ui_is_url_first_and_callbacks_are_admin_details():
     assert 'id="connect-ai-registration-details"' in page
     assert "Copy server address" in page
     assert "Recommended" in page
+    assert "Connect this AI" in page
+    assert "Paste once. Your AI follows only its own setup." in page
+    assert "Copy connect instruction" in page
     assert "Do not open this address" in script
     assert "connectAi.mcp_url" in script
     assert "connectAi.server_name" in script
@@ -5045,6 +5196,7 @@ def test_external_ai_primary_ui_is_url_first_and_callbacks_are_admin_details():
     assert "manualTab.tabIndex = manual ? 0 : -1" in script
     assert "if (canSetup && clients.codex)" in script
     assert "if (canSetup && clients.claude)" in script
+    assert "String(clients.codex.config_toml || '')" in script
     assert "ChatGPT or Codex" not in script
     assert "connect-ai-supported-summary" in page
     assert "connect-ai-auto-copy" in page
@@ -5178,9 +5330,83 @@ def test_provider_account_bff_generates_opaque_locator_and_honest_platform_statu
     assert "token" not in json.dumps(request_payload).lower()
 
 
-def test_control_plane_never_advertises_unimplemented_claude_secret_or_consumer_auth(
+def test_control_plane_advertises_only_the_enabled_native_claude_subscription(
     monkeypatch,
 ):
+    monkeypatch.setattr(server_module.sys, "platform", "linux")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.get("/api/control-plane")
+    created = client.post(
+        "/api/provider-accounts",
+        json={
+            "provider": "claude",
+            "label": "Personal Claude",
+            "auth_method": "subscription",
+            "make_default": False,
+        },
+    )
+
+    assert response.status_code == 200
+    claude = next(
+        option
+        for option in response.json()["provider_options"]
+        if option["provider"] == "claude"
+    )
+    assert "api_key" not in claude["methods"]
+    assert claude["methods"] == ["subscription"]
+    assert claude["subscription_support"] == "supported"
+    assert claude["api_key_support"] == "fixed_anthropic_broker_not_implemented"
+    assert "not copied" in claude["api_key_support_note"]
+    assert created.status_code == 200
+    assert runtime.provider_account_requests[-1]["platform_support"] == "supported"
+
+
+def test_control_plane_hides_native_claude_when_the_runtime_setup_cli_is_missing(
+    monkeypatch,
+):
+    monkeypatch.setattr(server_module.sys, "platform", "linux")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    runtime = FakeRuntimeClient()
+    runtime.health_response["provider_setup_support"]["claude"] = "setup_cli_required"
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.get("/api/control-plane")
+
+    assert response.status_code == 200
+    claude = next(
+        option
+        for option in response.json()["provider_options"]
+        if option["provider"] == "claude"
+    )
+    assert claude["methods"] == []
+    assert claude["subscription_support"] == "setup_cli_required"
+
+
+def test_control_plane_keeps_disabled_claude_subscription_out_of_the_picker(monkeypatch):
+    monkeypatch.setattr(server_module.sys, "platform", "linux")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.delenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", raising=False)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get("/api/control-plane")
+
+    assert response.status_code == 200
+    claude = next(
+        option
+        for option in response.json()["provider_options"]
+        if option["provider"] == "claude"
+    )
+    assert claude["methods"] == []
+    assert claude["subscription_support"] == "provider_permission_required"
+
+
+def test_control_plane_keeps_claude_subscription_out_of_the_macos_picker(monkeypatch):
+    monkeypatch.setattr(server_module.sys, "platform", "darwin")
     monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
     monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
     client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
@@ -5193,11 +5419,8 @@ def test_control_plane_never_advertises_unimplemented_claude_secret_or_consumer_
         for option in response.json()["provider_options"]
         if option["provider"] == "claude"
     )
-    assert "api_key" not in claude["methods"]
-    assert "subscription" not in claude["methods"]
-    assert claude["api_key_support"] == "fixed_anthropic_broker_not_implemented"
-    assert claude["experimental_consumer_auth"] == "not_accepted_hosted_path"
-    assert "not copied" in claude["api_key_support_note"]
+    assert claude["methods"] == []
+    assert claude["subscription_support"] == "unsupported_macos_host"
 
 
 def test_provider_account_bff_registers_only_opaque_broker_metadata(monkeypatch):
@@ -5296,18 +5519,49 @@ def test_provider_account_setup_bff_is_user_scoped_through_signed_runtime_client
     client = TestClient(create_app(runtime_client=runtime))
 
     started = client.post("/api/provider-accounts/acct_public_safe/setup")
+    submitted = client.post(
+        "/api/provider-accounts/acct_public_safe/setup/input",
+        json={"value": "synthetic-browser-code"},
+    )
     status = client.get("/api/provider-accounts/acct_public_safe/setup")
     cancelled = client.post("/api/provider-accounts/acct_public_safe/setup/cancel")
 
     assert started.status_code == 200
     assert started.json()["status"] == "connecting"
+    assert submitted.status_code == 200
+    assert "synthetic-browser-code" not in submitted.text
     assert status.json()["status"] == "ready"
     assert cancelled.json()["status"] == "action_required"
     assert runtime.provider_setup_requests == [
         {"action": "start", "account_id": "acct_public_safe"},
+        {"action": "input", "account_id": "acct_public_safe"},
         {"action": "status", "account_id": "acct_public_safe"},
         {"action": "cancel", "account_id": "acct_public_safe"},
     ]
+
+
+def test_provider_account_setup_bff_preserves_actionable_runtime_error():
+    class SetupUnavailableRuntime(FakeRuntimeClient):
+        def start_provider_account_setup(self, account_id: str):
+            response = httpx.Response(
+                409,
+                request=httpx.Request(
+                    "POST", f"http://runtime.test/v1/provider-accounts/{account_id}/setup"
+                ),
+                json={"detail": "Claude setup is not installed on this GlassHive deployment"},
+            )
+            raise httpx.HTTPStatusError(
+                "setup unavailable", request=response.request, response=response
+            )
+
+    client = TestClient(create_app(runtime_client=SetupUnavailableRuntime()))
+
+    response = client.post("/api/provider-accounts/acct_public_safe/setup")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Claude setup is not installed on this GlassHive deployment"
+    }
 
 
 def test_provider_disconnect_and_workspace_capability_revoke_are_user_scoped():
@@ -5399,14 +5653,17 @@ def test_provider_verify_and_forget_are_user_scoped_through_the_runtime_client()
 def test_control_plane_ui_exposes_safe_disconnect_and_capability_remove_paths():
     script = (Path(server_module.STATIC_DIR) / "control-plane.js").read_text(encoding="utf-8")
 
-    assert "Disconnecting…" in script
+    assert "removeProviderAccount" in script
+    assert "Removing…" in script
+    assert "result?.message || `${label} removed.`" in script
     assert "Reconnect" in script
     assert "Test connection" in script
     assert "Check connection" in script
     assert "Sign in again" in script
     assert "credential_cleanup_failed" in script
     assert "subscriptionRouteAvailable(account)" in script
-    assert "Forget" in script
+    assert "'Remove'" in script
+    assert "'Forget'" not in script
     assert "last_verified_at" in script
     assert "last_used_at" in script
     assert "observed_runs" in script
@@ -5433,6 +5690,67 @@ def test_control_plane_ui_exposes_safe_disconnect_and_capability_remove_paths():
     assert "librarySnapshot.content_hash" in confirm_script
 
 
+def test_provider_account_remove_disconnects_before_delete_and_stops_on_cleanup_failure():
+    module = (Path(server_module.STATIC_DIR) / "control-plane.js").as_uri()
+    script = f"""
+      import {{ removeProviderAccountRequest }} from {json.dumps(module)};
+      const events = [];
+      const ok = {{
+        postJson: async (url) => {{ events.push(['post', url]); return {{provider_logout_confirmed: false}}; }},
+        deleteJson: async (url) => {{ events.push(['delete', url]); }},
+      }};
+      const result = await removeProviderAccountRequest(ok, 'acct_test');
+      if (result.provider_logout_confirmed !== false) process.exit(1);
+      if (JSON.stringify(events) !== JSON.stringify([
+        ['post', '/api/provider-accounts/acct_test/disconnect'],
+        ['delete', '/api/provider-accounts/acct_test'],
+      ])) process.exit(2);
+      const failed = [];
+      try {{
+        await removeProviderAccountRequest({{
+          postJson: async (url) => {{ failed.push(['post', url]); throw new Error('cleanup failed'); }},
+          deleteJson: async (url) => {{ failed.push(['delete', url]); }},
+        }}, 'acct_retry');
+        process.exit(3);
+      }} catch (error) {{
+        if (error.message !== 'cleanup failed') process.exit(4);
+      }}
+      if (JSON.stringify(failed) !== JSON.stringify([
+        ['post', '/api/provider-accounts/acct_retry/disconnect'],
+      ])) process.exit(5);
+      const retryEvents = [];
+      let deleteAttempts = 0;
+      const retryApi = {{
+        postJson: async (url) => {{ retryEvents.push(['post', url]); return {{}}; }},
+        deleteJson: async (url) => {{
+          retryEvents.push(['delete', url]);
+          deleteAttempts += 1;
+          if (deleteAttempts === 1) throw new Error('delete failed');
+        }},
+      }};
+      try {{
+        await removeProviderAccountRequest(retryApi, 'acct_delete_retry');
+        process.exit(6);
+      }} catch (error) {{
+        if (error.message !== 'delete failed') process.exit(7);
+      }}
+      await removeProviderAccountRequest(retryApi, 'acct_delete_retry');
+      if (JSON.stringify(retryEvents) !== JSON.stringify([
+        ['post', '/api/provider-accounts/acct_delete_retry/disconnect'],
+        ['delete', '/api/provider-accounts/acct_delete_retry'],
+        ['post', '/api/provider-accounts/acct_delete_retry/disconnect'],
+        ['delete', '/api/provider-accounts/acct_delete_retry'],
+      ])) process.exit(8);
+    """
+    result = subprocess.run(
+        ["node", "--input-type=module", "--eval", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_connections_recovery_is_verify_first_and_external_client_failure_is_optional():
     script = (Path(server_module.STATIC_DIR) / "control-plane.js").read_text(encoding="utf-8")
 
@@ -5448,6 +5766,22 @@ def test_connections_recovery_is_verify_first_and_external_client_failure_is_opt
     assert "if (connectResponse?.ok)" in script
     assert "External AI client setup is temporarily unavailable." in script
     assert "if (!connectResponse.ok) throw" not in script
+    removal = script[
+        script.index("async function removeProviderAccount") : script.index(
+            "function renderProviderAccounts"
+        )
+    ]
+    removal_error = removal.index("setProviderStatus(error.message);")
+    assert removal.index("button.disabled = false;", removal_error) > removal_error
+    assert removal.index("button.textContent = 'Remove';", removal_error) > removal_error
+
+
+def test_provider_account_errors_match_the_single_remove_action():
+    script = Path(server_module.__file__).read_text(encoding="utf-8")
+
+    assert 'exc, "GlassHive could not remove this account"' in script
+    assert 'exc, "GlassHive could not disconnect this account"' not in script
+    assert 'exc, "GlassHive could not forget this account"' not in script
 
 
 def test_connections_ui_keeps_primary_account_setup_short_and_actionable():
@@ -5462,6 +5796,12 @@ def test_connections_ui_keeps_primary_account_setup_short_and_actionable():
     assert 'id="provider-setup-link"' in page
     assert 'id="provider-setup-code"' in page
     assert 'id="copy-provider-setup-code"' in page
+    assert 'id="provider-setup-input-form"' in page
+    assert 'id="provider-setup-input"' in page
+    assert 'type="password"' in page
+    assert 'autocomplete="one-time-code"' in page
+    assert 'maxlength="1024"' in page
+    assert 'id="submit-provider-setup-input"' in page
     assert 'id="restart-provider-setup"' in page
     assert 'id="provider-setup-state"' not in page
     assert '<pre id="provider-setup-instructions"' not in page
@@ -5474,6 +5814,11 @@ def test_connections_ui_keeps_primary_account_setup_short_and_actionable():
     assert "copyText" in script
     assert "Open ${providerName} sign-in" in script
     assert "Copy code" in page
+    assert "Finish connecting" in page
+    assert "/setup/input" in script
+    assert "setupInput.value = '';" in script
+    assert "&& !inputSubmitted" in script
+    assert "inputSubmitted ? 'Finishing sign-in…'" in script
     assert "Open ChatGPT security settings" in script
     assert "Having trouble?" in page
     assert "technical.dataset.autoOpened = 'true'" in script
@@ -5489,6 +5834,28 @@ def test_connections_ui_keeps_primary_account_setup_short_and_actionable():
     assert "availableProviderOptions" in script
     assert "if (!addAccount?.open)" in script
     assert "defaultToggle.checked = accounts.length === 0" in script
+
+
+def test_provider_account_name_is_prefilled_but_preserves_a_custom_name():
+    module = (Path(server_module.STATIC_DIR) / "control-plane.js").as_uri()
+    script = (
+        f"import {{ providerAccountLabelTransition }} from {json.dumps(module)};"
+        "const initial = providerAccountLabelTransition({provider: 'codex', value: '', autoLabel: ''});"
+        "const changed = providerAccountLabelTransition({provider: 'claude', value: initial.value, autoLabel: initial.autoLabel});"
+        "const custom = providerAccountLabelTransition({provider: 'codex', value: 'Research account', autoLabel: changed.autoLabel});"
+        "if (initial.value !== 'Personal Codex') process.exit(1);"
+        "if (changed.value !== 'Personal Claude') process.exit(2);"
+        "if (custom.value !== 'Research account') process.exit(3);"
+    )
+
+    result = subprocess.run(
+        ["node", "--input-type=module", "--eval", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_launch_ui_uses_the_sole_ready_personal_account_without_silent_fallback():

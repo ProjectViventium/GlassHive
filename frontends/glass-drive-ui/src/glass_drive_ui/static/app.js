@@ -1,5 +1,5 @@
-import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260811m';
-import { credentialPolicyTransition, preferredProviderAccountId, shouldResumeOnWorkspaceOpen, workspaceLifecycleControl } from './launch-policy.js?v=20260811m';
+import { initializeControlPlane, refreshControlPlane, renderActivity } from './control-plane.js?v=20260817c';
+import { credentialPolicyTransition, preferredProviderAccountId, shouldResumeOnWorkspaceOpen, workspaceLifecycleControl, workspaceSetupAction } from './launch-policy.js?v=20260817n';
 import { workspaceDeliveryModel } from './delivery-presenter.js?v=20260811m';
 import { compareWorkspacePriority, previewWorkerIds, shouldHydrateWorkspaceDelivery } from './workspace-overview.js?v=20260811m';
 
@@ -12,7 +12,7 @@ const DISABLED_CONTROL_STATES = new Set(['created', 'starting', 'terminating', '
 const MAX_VIEW_ONLY_PREVIEWS = 3;
 const ACTIVE_TILE_REFRESH_MS = 7000;
 const RETAINED_TILE_REFRESH_MS = 60000;
-const GLASSHIVE_UI_REV = '20260811m';
+const GLASSHIVE_UI_REV = '20260817b';
 const CAPABILITY_REVIEW_KEY = 'glasshive.capability-review';
 let workspaceRefreshInFlight = false;
 let csrfToken = '';
@@ -899,16 +899,20 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
   const metaParts = [workspaceProfileLabel(workspace.profile), displayStateLabel(state)];
   const providerReadiness = workspace.provider_readiness || {};
   if (providerReadiness.readiness === 'action_required') {
-    const accountLabel = String(providerReadiness.label || selectedAccount?.label || 'saved personal account');
-    metaParts.push(`${accountLabel}: reconnect required`);
+    if (providerReadiness.status === 'deployment_provider_unavailable') {
+      metaParts.push('Work AI is not set up. Ask an administrator.');
+    } else {
+      const accountLabel = String(providerReadiness.label || selectedAccount?.label || 'saved personal account');
+      metaParts.push(`${accountLabel}: reconnect required`);
+    }
   } else if (providerReadiness.readiness === 'ready') {
     metaParts.push(`${String(providerReadiness.label || selectedAccount?.label || 'personal account')}: ready`);
   } else if (providerReadiness.readiness === 'deployment_managed') {
     metaParts.push(providerReadiness.policy === 'personal_preferred'
-      ? 'deployment account fallback'
-      : 'deployment account');
+      ? 'Work AI: organization fallback'
+      : 'Work AI: managed by your organization');
   } else if (currentPolicy === 'legacy') {
-    metaParts.push('deployment account');
+    metaParts.push('Work AI: managed by your organization');
   } else if (selectedAccount) {
     const accountLabel = String(selectedAccount.label || selectedAccount.provider || 'personal account');
     metaParts.push(`${accountLabel}: ${String(selectedAccount.status || 'unknown').replaceAll('_', ' ')}`);
@@ -1013,6 +1017,15 @@ function renderWorkspaceTile(workspace, refreshBootstrap, draftMessage = '', vie
     await openWorkspaceSurface(workspace, watch);
   });
   actions.appendChild(watch);
+
+  const setupTools = createButton('Set up tools');
+  setupTools.title = 'Open this workspace’s native AI so you can add or reconnect its tools and accounts.';
+  setupTools.setAttribute('aria-label', `Set up tools in ${workspaceTileTitle(workspace)}`);
+  setupTools.disabled = ['terminating', 'termination_failed', 'terminated'].includes(state);
+  setupTools.addEventListener('click', async () => {
+    await openWorkspaceTools(workspace, setupTools);
+  });
+  actions.appendChild(setupTools);
 
   const duplicate = createButton('Duplicate');
   duplicate.addEventListener('click', () => duplicateSavedWorkspace(workspace, duplicate, refreshBootstrap));
@@ -1177,6 +1190,28 @@ async function openWorkspaceSurface(workspace, button) {
       if (button) button.textContent = 'Resuming…';
       await postJson(workerApiUrl(workerId, '/action/resume'));
     }
+    window.location.href = String(workspace?.workspace_url || workspace?.watch_url || '#');
+  } catch (error) {
+    const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);
+    const output = tile?.querySelector('[data-worker-output]');
+    if (output) output.textContent = error.message;
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
+}
+
+async function openWorkspaceTools(workspace, button) {
+  const workerId = String(workspace?.worker_id || '');
+  const action = workspaceSetupAction(workspace?.profile);
+  const originalText = button?.textContent || '';
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Opening…';
+  }
+  try {
+    await postJson(workerApiUrl(workerId, `/action/${encodeURIComponent(action)}`));
     window.location.href = String(workspace?.workspace_url || workspace?.watch_url || '#');
   } catch (error) {
     const tile = Array.from(document.querySelectorAll('.workspace-tile')).find((item) => item.dataset.workerId === workerId);

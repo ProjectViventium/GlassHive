@@ -1,0 +1,12 @@
+{
+  "name": "glasshive",
+  "version": "0.1.1",
+  "description": "Control GlassHive workspaces from Claude Code.",
+  "author": {
+    "name": "Project Viventium"
+  },
+  "homepage": "https://github.com/ProjectViventium/GlassHive",
+  "repository": "https://github.com/ProjectViventium/GlassHive",
+  "license": "FSL-1.1-ALv2",
+  "keywords": ["glasshive", "workspace", "mcp", "claude"]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "glasshive",
+  "owner": {
+    "name": "Project Viventium"
+  },
+  "description": "The official GlassHive plugin marketplace.",
+  "plugins": [
+    {
+      "name": "glasshive",
+      "source": "./plugins/glasshive",
+      "description": "Control GlassHive workspaces from Claude Code.",
+      "category": "productivity"
+    }
+  ]
+}

@@ -23,6 +23,7 @@ from threading import Event, Lock, Thread
 from typing import Callable
 
 from .agent_builder_control import conversation_output_schema
+from .auth import multi_user_security_enabled
 from .bootstrap import (
     GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
     GLASSHIVE_NATIVE_CAPABILITY_INVENTORY,
@@ -38,7 +39,11 @@ from .bootstrap import (
     resolve_bootstrap_source_path,
 )
 from .docker_sandbox import DockerSandboxManager
-from .failure_classification import classify_cli_failure, classify_runtime_error
+from .failure_classification import (
+    FailureClassification,
+    classify_cli_failure,
+    classify_runtime_error,
+)
 from .capability_broker import (
     GlassHiveCapabilityBroker,
     worker_with_ephemeral_capability_bundle,
@@ -50,7 +55,9 @@ from .inference_broker import (
 )
 from .mission_provider_accounts import (
     MissionProviderAccountBinder,
+    MissionProviderAccountSelection,
     apply_bound_provider_account_environment,
+    deployment_provider_readiness,
     mission_provider_account_selection,
 )
 from .openclaw_runtime import (
@@ -66,6 +73,7 @@ from .openclaw_runtime import (
     runtime_start_boundary,
 )
 from .openclaw_release import reviewed_openclaw_env
+from .provider_accounts import ProviderAccountHomeManager
 from .runtime_requirements import host_runtime_requirement_issue
 from .run_evidence import (
     build_constraint_ledger,
@@ -80,6 +88,9 @@ logger = logging.getLogger(__name__)
 
 _CODEX_MCP_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 _HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
+_CODEX_STALE_THREAD_ERROR = "thread/resume failed: no rollout found for thread id"
+_CLAUDE_STALE_SESSION_ERROR = "No conversation found with session ID:"
+_PERSONAL_ACCOUNT_RECONNECT_MARKER = "_glasshive_personal_account_reconnect_required"
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off", "none", "disabled"}
 _CODEX_BROKER_CONFLICTING_ENV = {
     "CODEX_API_KEY",
@@ -178,6 +189,23 @@ _TELEMETRY_TOKEN_PATTERNS = {
     ),
     "run_id": re.compile(r"^(?:run[_-]?|r)[A-Za-z0-9_-]{0,120}$"),
 }
+
+
+def _private_cli_failure_classification(
+    classification: FailureClassification,
+    *,
+    exit_code: int,
+) -> FailureClassification:
+    """Carry machine-readable failure truth without carrying the worker transcript."""
+
+    return FailureClassification(
+        failure_class=classification.failure_class,
+        retryable=classification.retryable,
+        user_message=classification.user_message,
+        recommended_recovery=classification.recommended_recovery,
+        diagnostic_summary=f"class={classification.failure_class}; exit_code={exit_code}",
+        personal_account_reconnect=classification.personal_account_reconnect,
+    )
 
 
 def _safe_run_telemetry(value: object, *, run_id: str | None = None) -> dict[str, object]:
@@ -1050,6 +1078,57 @@ class ProfiledWorkerRuntime:
 
         self.codex.reconcile_provider_account_binding(account_home)
 
+    def recover_interactive_provider_sessions(self) -> None:
+        """Remove credential-bearing setup containers orphaned by a service restart."""
+
+        store = self.provider_account_binder.store
+        if store is None:
+            return
+        homes = ProviderAccountHomeManager(self.provider_account_binder.home_root)
+        supported = {
+            "codex-cli": {"codex", "openai"},
+            "claude-code": {"claude", "anthropic"},
+        }
+        for lease in store.unreleased_interactive_provider_leases():
+            lane = str(lease.get("lane") or "")
+            profile = lane.removesuffix(":interactive")
+            provider = store.get_provider_account(
+                account_id=str(lease.get("account_id") or ""),
+                tenant_id=str(lease.get("tenant_id") or ""),
+                owner_id=str(lease.get("owner_id") or ""),
+            )
+            if (
+                profile not in supported
+                or provider is None
+                or str(provider.get("provider") or "").strip().lower()
+                not in supported[profile]
+            ):
+                raise RuntimeErrorBase(
+                    "Interactive provider session recovery has inconsistent account metadata"
+                )
+            account_home = homes.account_home_path(
+                tenant_id=str(lease.get("tenant_id") or ""),
+                owner_id=str(lease.get("owner_id") or ""),
+                account_id=str(lease.get("account_id") or ""),
+            )
+            runtime = self._runtime_for_profile(profile, "docker")
+            runtime.release_provider_account_binding(
+                {
+                    "worker_id": str(lease.get("worker_id") or ""),
+                    "tenant_id": str(lease.get("tenant_id") or ""),
+                    "owner_id": str(lease.get("owner_id") or ""),
+                    "profile": profile,
+                    "execution_mode": "docker",
+                    "_active_run_id": str(lease.get("run_id") or ""),
+                    "_glasshive_provider_account_mount_host": str(account_home),
+                }
+            )
+            store.release_provider_lease(
+                lease_id=str(lease.get("lease_id") or ""),
+                tenant_id=str(lease.get("tenant_id") or ""),
+                owner_id=str(lease.get("owner_id") or ""),
+            )
+
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         return self._runtime_for_worker(worker).ensure_worker_ready(worker)
 
@@ -1131,6 +1210,8 @@ class ProfiledWorkerRuntime:
         timeout_sec: float | None,
         run_id: str,
         account_id: str,
+        selection: MissionProviderAccountSelection,
+        reconnect_personal_account: bool,
     ) -> str:
         """Run with a selected account and persist only telemetry the harness observed."""
 
@@ -1145,6 +1226,34 @@ class ProfiledWorkerRuntime:
             )
             succeeded = True
             return result
+        except RuntimeErrorBase as exc:
+            classification = getattr(exc, "failure_classification", None)
+            if (
+                reconnect_personal_account
+                and isinstance(classification, FailureClassification)
+                and classification.personal_account_reconnect
+            ):
+                personal_reconnect = self._personal_account_reconnect_failure(
+                    runtime=runtime,
+                    worker=worker,
+                )
+                exc.failure_classification = personal_reconnect  # type: ignore[attr-defined]
+                try:
+                    self.provider_account_binder.update_selected_account_status(
+                        worker,
+                        selection,
+                        status="action_required",
+                        reconnect_reason=(
+                            "Connected AI account sign-in expired. Reconnect this account in Connections."
+                        ),
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not mark an expired connected AI account for reconnection",
+                        exc_info=True,
+                        extra={"worker_id": worker.get("worker_id"), "run_id": run_id},
+                    )
+            raise
         finally:
             usage: dict[str, object] = {}
             reader = getattr(runtime, "run_usage", None)
@@ -1185,6 +1294,76 @@ class ProfiledWorkerRuntime:
                         exc_info=True,
                         extra={"worker_id": worker.get("worker_id"), "run_id": run_id},
                     )
+
+    @staticmethod
+    def _personal_account_reconnect_failure(
+        *,
+        runtime: WorkerRuntime,
+        worker: dict,
+    ) -> FailureClassification:
+        runtime_name = str(
+            getattr(runtime, "runtime_name", "")
+            or worker.get("profile")
+            or "worker"
+        ).strip()
+        return FailureClassification(
+            failure_class="provider_auth_missing",
+            retryable=False,
+            user_message="The selected connected AI account must be reconnected.",
+            recommended_recovery=(
+                "Open Connections, reconnect the selected account, then continue the same workspace."
+            ),
+            diagnostic_summary=f"class=provider_auth_missing; runtime={runtime_name}",
+        )
+
+    def _personalize_completed_provider_auth_failure(
+        self,
+        *,
+        runtime: WorkerRuntime,
+        worker: dict,
+        recovered: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        if not recovered:
+            return recovered
+        candidate = dict(recovered)
+        reconnect_required = bool(candidate.pop(_PERSONAL_ACCOUNT_RECONNECT_MARKER, False))
+        if not reconnect_required:
+            return candidate
+        try:
+            selection = mission_provider_account_selection(worker)
+            if selection is None or not selection.account_id:
+                return candidate
+            account = self.provider_account_binder.selected_account_record(worker, selection)
+            if (
+                account is None
+                or str(account.get("auth_method") or "").strip().lower()
+                != "subscription"
+            ):
+                return candidate
+            self.provider_account_binder.update_selected_account_status(
+                worker,
+                selection,
+                status="action_required",
+                reconnect_reason=(
+                    "Connected AI account sign-in expired. Reconnect this account in Connections."
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Could not mark a recovered expired connected AI account for reconnection",
+                exc_info=True,
+                extra={"worker_id": worker.get("worker_id")},
+            )
+            return candidate
+        personal = self._personal_account_reconnect_failure(
+            runtime=runtime,
+            worker=worker,
+        )
+        return {
+            **candidate,
+            "error_text": personal.user_message,
+            **personal.as_store_fields(),
+        }
 
     def _run_unbound_selected_account_route(
         self,
@@ -1237,6 +1416,12 @@ class ProfiledWorkerRuntime:
             )
         if status not in {"ready", "action_required", "unavailable", "error"}:
             if preferred:
+                readiness, _status = deployment_provider_readiness(runtime_name)
+                if readiness != "deployment_managed":
+                    raise RuntimeErrorBase(
+                        "Work AI is not set up for this workspace. Reconnect the personal account "
+                        "or ask an administrator to finish provider setup."
+                    )
                 fallback_worker = {
                     **worker,
                     "_glasshive_provider_account_preferred_fallback": True,
@@ -1301,6 +1486,8 @@ class ProfiledWorkerRuntime:
                         account_id=str(
                             account.get("account_id") or selection.account_id
                         ),
+                        selection=selection,
+                        reconnect_personal_account=False,
                     )
             except InferenceBrokerError as exc:
                 unavailable_codes = {
@@ -1322,6 +1509,12 @@ class ProfiledWorkerRuntime:
                 # worker already completed. Never run the user's mission twice as a fallback.
                 if mission_dispatched or not preferred:
                     raise
+                readiness, _status = deployment_provider_readiness(runtime_name)
+                if readiness != "deployment_managed":
+                    raise RuntimeErrorBase(
+                        "Work AI is not set up for this workspace. Reconnect the personal account "
+                        "or ask an administrator to finish provider setup."
+                    ) from exc
                 fallback_worker = {
                     **routed_worker,
                     "_glasshive_provider_account_preferred_fallback": True,
@@ -1402,7 +1595,12 @@ class ProfiledWorkerRuntime:
             ),
         ) as bound_worker:
             if bound_worker.get("_glasshive_provider_account_bound"):
-                runtime.ensure_worker_ready(bound_worker)
+                bound_task_worker = {
+                    **bound_worker,
+                    "_active_run_id": effective_run_id,
+                    "_glasshive_task_run": True,
+                }
+                runtime.ensure_worker_ready(bound_task_worker)
                 self.provider_account_binder.mark_active_route_ready(
                     bound_worker,
                     runtime_name=runtime_name,
@@ -1415,6 +1613,8 @@ class ProfiledWorkerRuntime:
                     timeout_sec=timeout_sec,
                     run_id=effective_run_id,
                     account_id=selection.account_id,
+                    selection=selection,
+                    reconnect_personal_account=True,
                 )
             return self._run_unbound_selected_account_route(
                 runtime=runtime,
@@ -1662,18 +1862,28 @@ class ProfiledWorkerRuntime:
         runtime = self._runtime_for_worker(worker)
         if hasattr(runtime, "collect_completed_run"):
             try:
-                return runtime.collect_completed_run(worker, run_id=run_id, instruction=instruction)
+                recovered = runtime.collect_completed_run(
+                    worker,
+                    run_id=run_id,
+                    instruction=instruction,
+                )
             except TypeError as exc:
                 if "instruction" in str(exc):
                     try:
-                        return runtime.collect_completed_run(worker, run_id=run_id)
+                        recovered = runtime.collect_completed_run(worker, run_id=run_id)
                     except TypeError as run_id_exc:
                         if "run_id" not in str(run_id_exc):
                             raise
-                        return runtime.collect_completed_run(worker)
-                if "run_id" not in str(exc):
+                        recovered = runtime.collect_completed_run(worker)
+                elif "run_id" not in str(exc):
                     raise
-                return runtime.collect_completed_run(worker)
+                else:
+                    recovered = runtime.collect_completed_run(worker)
+            return self._personalize_completed_provider_auth_failure(
+                runtime=runtime,
+                worker=worker,
+                recovered=recovered,
+            )
         return None
 
     def desktop_action(
@@ -1685,7 +1895,8 @@ class ProfiledWorkerRuntime:
         run_id: str | None = None,
     ) -> dict[str, object]:
         runtime = self._runtime_for_worker(worker)
-        if mission_provider_account_selection(worker) is not None:
+        clean_run_id = str(run_id or "").strip()
+        if mission_provider_account_selection(worker) is not None and clean_run_id:
             with self.provider_account_binder.project_active_route(
                 worker,
                 runtime_name=str(
@@ -1693,7 +1904,7 @@ class ProfiledWorkerRuntime:
                     or worker.get("profile")
                     or ""
                 ).strip(),
-                run_id=str(run_id or "").strip(),
+                run_id=clean_run_id,
             ) as projected_worker:
                 if hasattr(runtime, "desktop_action"):
                     return runtime.desktop_action(
@@ -1705,6 +1916,40 @@ class ProfiledWorkerRuntime:
                 raise RuntimeErrorBase(
                     f"Desktop actions are not supported for profile {worker.get('profile') or 'unknown'}"
                 )
+        runtime_name = str(
+            getattr(runtime, "runtime_name", "")
+            or worker.get("profile")
+            or ""
+        ).strip()
+        expected_action = {
+            "codex-cli": "codex",
+            "claude-code": "claude",
+        }.get(runtime_name)
+        selection = mission_provider_account_selection(worker)
+        if (
+            not clean_run_id
+            and expected_action == str(action or "").strip().lower()
+            and selection is not None
+            and str(worker.get("execution_mode") or "docker").strip().lower() == "docker"
+        ):
+            selected_account = self.provider_account_binder.selected_account_record(
+                worker,
+                selection,
+            )
+            if (
+                selected_account is None
+                or str(selected_account.get("auth_method") or "").strip().lower()
+                == "subscription"
+            ):
+                return self._launch_interactive_provider_session(
+                    runtime,
+                    worker,
+                    action,
+                    url=url,
+                    runtime_name=runtime_name,
+                )
+        # Browser, files, and shell actions never need provider credentials. Keep them on the
+        # reusable workspace home without holding or exposing a personal-account lease.
         if hasattr(runtime, "desktop_action"):
             return runtime.desktop_action(
                 worker,
@@ -1713,6 +1958,72 @@ class ProfiledWorkerRuntime:
                 run_id=run_id,
             )
         raise RuntimeErrorBase(f"Desktop actions are not supported for profile {worker.get('profile') or 'unknown'}")
+
+    @staticmethod
+    def _interactive_provider_session_timeout() -> float:
+        raw = str(
+            os.environ.get("GLASSHIVE_INTERACTIVE_PROVIDER_SESSION_MAX_SECONDS")
+            or "3600"
+        ).strip()
+        try:
+            seconds = float(raw)
+        except ValueError:
+            seconds = 3600.0
+        return max(300.0, min(seconds, 4 * 60 * 60.0))
+
+    def _launch_interactive_provider_session(
+        self,
+        runtime,
+        worker: dict,
+        action: str,
+        *,
+        url: str | None,
+        runtime_name: str,
+    ) -> dict[str, object]:
+        """Borrow only the selected account auth while the visible native CLI is open."""
+
+        session_id = f"interactive_{secrets.token_hex(16)}"
+        session_timeout = self._interactive_provider_session_timeout()
+        binding = self.provider_account_binder.bind(
+            worker,
+            runtime_name=runtime_name,
+            run_id=session_id,
+            timeout_sec=session_timeout,
+            lease_purpose="interactive",
+            allow_preferred_fallback=False,
+            release_binding=getattr(runtime, "release_provider_account_binding", None),
+            abort_binding=lambda bound_worker: runtime.terminate_worker(bound_worker),
+            reconcile_binding=getattr(runtime, "reconcile_provider_account_binding", None),
+        )
+        bound_worker = binding.__enter__()
+        close_lock = Lock()
+        closed = Event()
+
+        def close_binding() -> None:
+            if closed.is_set():
+                return
+            with close_lock:
+                if closed.is_set():
+                    return
+                try:
+                    binding.__exit__(None, None, None)
+                finally:
+                    closed.set()
+
+        try:
+            return runtime.desktop_action(
+                bound_worker,
+                action,
+                url=url,
+                run_id=None,
+                on_exit=close_binding,
+                max_runtime_seconds=session_timeout,
+            )
+        except BaseException as exc:
+            if not closed.is_set():
+                binding.__exit__(type(exc), exc, exc.__traceback__)
+                closed.set()
+            raise
 
 
 class BaseCliWorkerRuntime:
@@ -2199,8 +2510,22 @@ class BaseCliWorkerRuntime:
         worker_id = str(worker.get("worker_id") or "").strip()
         if not worker_id:
             raise RuntimeErrorBase("Provider credential cleanup requires a worker id")
-        self._stop_active_process(worker_id, worker=worker, run_id=str(worker.get("_active_run_id") or "") or None)
+        try:
+            self._stop_active_process(
+                worker_id,
+                worker=worker,
+                run_id=str(worker.get("_active_run_id") or "") or None,
+            )
+        except Exception:
+            # Completed-run metadata can outlive its screen process.  A stale
+            # graceful-stop failure must never prevent removal of the whole
+            # credential-bearing container, which is the authoritative fence.
+            logger.warning(
+                "Provider-bound worker process cleanup was stale; removing its sandbox",
+                extra={"worker_id": worker_id, "runtime": self.runtime_name},
+            )
         self.sandbox.terminate(worker_id)
+        self._clear_active_session(worker_id)
         raw_account_home = str(worker.get("_glasshive_provider_account_mount_host") or "").strip()
         if not raw_account_home:
             raise RuntimeErrorBase("Provider credential cleanup requires its private account home")
@@ -2359,8 +2684,18 @@ class BaseCliWorkerRuntime:
         *,
         url: str | None = None,
         run_id: str | None = None,
+        on_exit: Callable[[], None] | None = None,
+        max_runtime_seconds: float | None = None,
     ) -> dict[str, object]:
         session_name = self._session_name_for_run_id(run_id) if action == "terminal" and run_id else None
+        session_options: dict[str, object] = {}
+        if on_exit is not None:
+            session_options.update(
+                {
+                    "on_exit": on_exit,
+                    "max_runtime_seconds": max_runtime_seconds,
+                }
+            )
         launched = self.sandbox.desktop_action(
             worker["worker_id"],
             self.runtime_name,
@@ -2368,6 +2703,7 @@ class BaseCliWorkerRuntime:
             url=url,
             session_name=session_name,
             worker=worker,
+            **session_options,
         )
         notes = {
             "terminal": (
@@ -2457,6 +2793,8 @@ class BaseCliWorkerRuntime:
                 exit_code=exit_code,
             )
             failure_fields = classification.as_store_fields()
+            if classification.personal_account_reconnect:
+                failure_fields[_PERSONAL_ACCOUNT_RECONNECT_MARKER] = True
             if self.runtime_name == "claude-code":
                 # stream-json stdout is the full model/tool transcript. It remains in the
                 # operator-private run files, but must never become a durable/public job error.
@@ -2547,7 +2885,11 @@ class BaseCliWorkerRuntime:
             "_glasshive_task_run": True,
         }
         info = self.ensure_worker_ready(worker_for_run)
-        refresh_runtime_env_for_worker(self._home_dir(worker_for_run["worker_id"]), worker_for_run)
+        refresh_runtime_env_for_worker(
+            self._home_dir(worker_for_run["worker_id"]),
+            worker_for_run,
+            self.runtime_name,
+        )
         workspace = Path(str(info.workspace_dir or self._workspace_dir(worker_for_run["worker_id"])))
         refresh_project_runtime_files_for_worker(
             self._home_dir(worker_for_run["worker_id"]),
@@ -2842,13 +3184,13 @@ class BaseCliWorkerRuntime:
             raise
 
         if exit_code != 0:
+            classification = classify_cli_failure(
+                stdout=stdout,
+                stderr=stderr,
+                runtime_name=self.runtime_name,
+                exit_code=exit_code,
+            )
             if self.runtime_name == "claude-code":
-                classification = classify_cli_failure(
-                    stdout=stdout,
-                    stderr=stderr,
-                    runtime_name=self.runtime_name,
-                    exit_code=exit_code,
-                )
                 detail = classification.user_message
             else:
                 detail = (stderr or stdout or "").strip()[-2000:]
@@ -2887,7 +3229,15 @@ class BaseCliWorkerRuntime:
                 stop_reason="process_exit",
                 evidence_path=evidence_path,
             )
-            raise RuntimeErrorBase(f"{self.runtime_name} exited with code {exit_code}: {detail}")
+            private_classification = _private_cli_failure_classification(
+                classification,
+                exit_code=exit_code,
+            )
+            error = RuntimeErrorBase(
+                f"{self.runtime_name} exited with code {exit_code}: {detail}"
+            )
+            error.failure_classification = private_classification  # type: ignore[attr-defined]
+            raise error
 
         session_key, output = self._parse_output(worker_for_run, stdout, stderr, info)
         if session_key:
@@ -3255,7 +3605,16 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
             logger.warning("OpenClaw gateway did not become ready for %s: %s", worker.get("worker_id"), detail)
 
     def _sandbox_env(self) -> dict[str, str]:
-        env = reviewed_openclaw_env(self._container_env(*_PROVIDER_ENV_KEYS))
+        provider_keys = list(_PROVIDER_ENV_KEYS)
+        if multi_user_security_enabled():
+            selected_key = self._compatible_provider_env_key()
+            if selected_key == "PORTKEY_API_KEY":
+                provider_keys = [key for key in provider_keys if key.startswith("PORTKEY_")]
+            elif selected_key == "OPENAI_API_KEY":
+                provider_keys = [key for key in provider_keys if key.startswith("OPENAI_")]
+            else:
+                provider_keys = []
+        env = reviewed_openclaw_env(self._container_env(*provider_keys))
         env["HOME"] = self.sandbox.home_mount
         env["TERM"] = self.sandbox.term_value
         env["DISPLAY"] = self.sandbox.display_value
@@ -3559,7 +3918,15 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         configured = os.environ.get("WPR_CODEX_CLI_ENV_KEY", "").strip()
         if configured:
             return configured
-        if os.environ.get("PORTKEY_BASE_URL", "").strip() and not os.environ.get("OPENAI_BASE_URL", "").strip():
+        if os.environ.get("PORTKEY_BASE_URL", "").strip() and not any(
+            os.environ.get(name, "").strip()
+            for name in (
+                "WPR_CODEX_CLI_BASE_URL",
+                "OPENAI_BASE_URL",
+                "OPENAI_API_BASE",
+                "OPENAI_REVERSE_PROXY",
+            )
+        ):
             return "PORTKEY_API_KEY"
         return "OPENAI_API_KEY"
 
@@ -3717,10 +4084,14 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         if include_reasoning_effort:
             self._append_codex_reasoning_effort_config(command, worker)
 
-    def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
-        existing_session = self._read_session_key(worker["worker_id"])
-        model = self._codex_model_for_worker(worker, "WPR_MODEL_CODEX_CLI")
-        is_resume = bool(existing_session and not existing_session.startswith("codex-worker:"))
+    def _codex_exec_command(
+        self,
+        worker: dict,
+        *,
+        model: str,
+        session_key: str | None = None,
+    ) -> list[str]:
+        is_resume = bool(session_key)
         dangerous_mode = os.environ.get("WPR_CODEX_DANGEROUS", "1").strip().lower() in {"1", "true", "yes", "on"}
         if is_resume:
             command = [self.binary, "exec", "resume"]
@@ -3747,9 +4118,62 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         elif not is_resume:
             command.append("--full-auto")
         if is_resume:
-            command.append(existing_session)
+            command.append(str(session_key))
         command.append("-")
-        env = self._container_env(
+        return command
+
+    def _codex_resume_with_fresh_fallback(
+        self,
+        worker: dict,
+        *,
+        resume_command: list[str],
+        fresh_command: list[str],
+    ) -> list[str]:
+        run_id = str(worker.get("_active_run_id") or "").strip()
+        if not run_id:
+            return resume_command
+        run_root = self._container_run_root(run_id)
+        instruction_path = f"{run_root}/instruction.stdin"
+        resume_error_path = f"{run_root}/codex-resume.stderr"
+        resume_invocation = shlex.join(resume_command)
+        fresh_invocation = shlex.join(fresh_command)
+        script = "\n".join(
+            [
+                "set -o pipefail",
+                f"resume_error={shlex.quote(resume_error_path)}",
+                'rm -f -- "$resume_error"',
+                'trap \'rm -f -- "$resume_error"\' EXIT',
+                (
+                    f"if {resume_invocation} < {shlex.quote(instruction_path)} "
+                    '2> "$resume_error"; then exit 0; else status=$?; fi'
+                ),
+                f"if grep -Fq -- {shlex.quote(_CODEX_STALE_THREAD_ERROR)} \"$resume_error\"; then",
+                '  rm -f -- "$resume_error"',
+                "  trap - EXIT",
+                f"  exec {fresh_invocation} < {shlex.quote(instruction_path)}",
+                "fi",
+                'cat -- "$resume_error" >&2',
+                'exit "$status"',
+            ]
+        )
+        return ["bash", "-c", script]
+
+    def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
+        existing_session = self._read_session_key(worker["worker_id"])
+        model = self._codex_model_for_worker(worker, "WPR_MODEL_CODEX_CLI")
+        is_resume = bool(existing_session and not existing_session.startswith("codex-worker:"))
+        command = self._codex_exec_command(
+            worker,
+            model=model,
+            session_key=existing_session if is_resume else None,
+        )
+        if is_resume:
+            command = self._codex_resume_with_fresh_fallback(
+                worker,
+                resume_command=command,
+                fresh_command=self._codex_exec_command(worker, model=model),
+            )
+        provider_keys = [
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "OPENAI_API_BASE",
@@ -3758,6 +4182,17 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             "PORTKEY_BASE_URL",
             "PORTKEY_VIRTUAL_KEY",
             "PORTKEY_CONFIG",
+        ]
+        if multi_user_security_enabled():
+            selected_key = self._compatible_provider_env_key(worker)
+            if selected_key == "PORTKEY_API_KEY":
+                provider_keys = [key for key in provider_keys if key.startswith("PORTKEY_")]
+            elif selected_key == "OPENAI_API_KEY":
+                provider_keys = [key for key in provider_keys if key.startswith("OPENAI_")]
+            else:
+                provider_keys = []
+        env = self._container_env(
+            *provider_keys,
             "HTTPS_PROXY",
             "HTTP_PROXY",
             "NO_PROXY",
@@ -3963,6 +4398,65 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         self._preflight_workspace_effort_support(worker)
         return super().run_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
 
+    def _resume_with_fresh_fallback(
+        self,
+        worker: dict,
+        *,
+        resume_command: list[str],
+        fresh_command: list[str],
+    ) -> list[str]:
+        """Retry only Claude's explicit missing-session result as a fresh task."""
+
+        run_id = str(worker.get("_active_run_id") or "").strip()
+        if not run_id:
+            return resume_command
+        run_root = self._container_run_root(run_id)
+        instruction_path = f"{run_root}/instruction.stdin"
+        resume_stdout_path = f"{run_root}/claude-resume.stdout"
+        resume_stderr_path = f"{run_root}/claude-resume.stderr"
+        resume_invocation = shlex.join(resume_command)
+        fresh_invocation = shlex.join(fresh_command)
+        script = "\n".join(
+            [
+                "set -o pipefail",
+                f"resume_stdout={shlex.quote(resume_stdout_path)}",
+                f"resume_stderr={shlex.quote(resume_stderr_path)}",
+                'rm -f -- "$resume_stdout" "$resume_stderr"',
+                (
+                    "flush_partial() { status=$?; trap - EXIT HUP INT TERM; "
+                    '[ ! -s "$resume_stdout" ] || cat -- "$resume_stdout"; '
+                    '[ ! -s "$resume_stderr" ] || cat -- "$resume_stderr" >&2; '
+                    'rm -f -- "$resume_stdout" "$resume_stderr"; exit "$status"; }'
+                ),
+                'signal_exit() { trap - HUP INT TERM; exit "$1"; }',
+                "trap flush_partial EXIT",
+                "trap 'signal_exit 129' HUP",
+                "trap 'signal_exit 130' INT",
+                "trap 'signal_exit 143' TERM",
+                (
+                    f"if {resume_invocation} < {shlex.quote(instruction_path)} "
+                    '> "$resume_stdout" 2> "$resume_stderr"; then'
+                ),
+                "  trap - EXIT HUP INT TERM",
+                '  cat -- "$resume_stdout"',
+                '  cat -- "$resume_stderr" >&2',
+                '  rm -f -- "$resume_stdout" "$resume_stderr"',
+                "  exit 0",
+                "else status=$?; fi",
+                f"if grep -Eq -- {shlex.quote('^' + _CLAUDE_STALE_SESSION_ERROR + ' ')} \"$resume_stderr\"; then",
+                '  rm -f -- "$resume_stdout" "$resume_stderr"',
+                "  trap - EXIT HUP INT TERM",
+                f"  exec {fresh_invocation} < {shlex.quote(instruction_path)}",
+                "fi",
+                "trap - EXIT HUP INT TERM",
+                'cat -- "$resume_stdout"',
+                'cat -- "$resume_stderr" >&2',
+                'rm -f -- "$resume_stdout" "$resume_stderr"',
+                'exit "$status"',
+            ]
+        )
+        return ["bash", "-c", script]
+
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         session_key = self._read_session_key(worker["worker_id"])
         model = self._provider_model_for_worker(worker)
@@ -3989,7 +4483,12 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                 extra={"worker_id": str(worker.get("worker_id") or ""), "effort": effort},
             )
         if session_key and not session_key.startswith("claude-worker:"):
-            command.extend(["--resume", session_key])
+            resume_command = [*command, "--resume", session_key]
+            command = self._resume_with_fresh_fallback(
+                worker,
+                resume_command=resume_command,
+                fresh_command=command,
+            )
         env = self._container_env(
             "ANTHROPIC_API_KEY",
             "CLAUDE_CODE_OAUTH_TOKEN",

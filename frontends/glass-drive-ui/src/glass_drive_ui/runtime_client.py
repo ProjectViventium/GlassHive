@@ -78,6 +78,12 @@ class RuntimeClient:
     def get_preferences(self) -> dict[str, Any]:
         return self._request("GET", "/v1/preferences")
 
+    def provider_readiness(self, profile: str) -> dict[str, str]:
+        return self._request(
+            "GET",
+            f"/v1/provider-readiness/{quote(str(profile or '').strip(), safe='')}",
+        )
+
     def update_preferences(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("PATCH", "/v1/preferences", json_body=payload)
 
@@ -167,6 +173,15 @@ class RuntimeClient:
     def provider_account_setup_status(self, account_id: str) -> dict[str, Any]:
         return self._request(
             "GET", f"/v1/provider-accounts/{quote(account_id, safe='')}/setup"
+        )
+
+    def submit_provider_account_setup_input(
+        self, account_id: str, value: str
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/v1/provider-accounts/{quote(account_id, safe='')}/setup/input",
+            json_body={"value": value},
         )
 
     def cancel_provider_account_setup(self, account_id: str) -> dict[str, Any]:

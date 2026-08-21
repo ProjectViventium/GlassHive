@@ -9,6 +9,7 @@ const SUPPORT_COPY = {
   supported: 'Ready to connect',
   proof_required: 'Available when this deployment enables isolated Codex subscription homes',
   provider_permission_required: 'Requires an approved hosted Claude authentication agreement',
+  setup_cli_required: 'Account setup is not installed on this GlassHive deployment',
   unsupported_macos_host: 'Claude subscription isolation is not available for multi-user macOS host workers',
   isolated_substrate_required: 'This multi-user deployment has not enabled a dedicated worker isolation substrate. Use the managed connected-accounts route below.',
   secret_store_required: 'Requires this deployment\'s secure secret store',
@@ -25,6 +26,22 @@ const PROVIDER_METHOD_LABELS = {
   enterprise_route: 'Enterprise route',
 };
 const CAPABILITY_REVIEW_KEY = 'glasshive.capability-review';
+
+export function providerAccountLabelTransition({ provider, value, autoLabel }) {
+  const normalizedProvider = String(provider || '').trim().toLowerCase();
+  const providerName = normalizedProvider === 'claude'
+    ? 'Claude'
+    : (PROVIDER_LABELS[normalizedProvider] || 'AI');
+  const nextAutoLabel = `Personal ${providerName}`;
+  const currentValue = String(value || '');
+  const previousAutoLabel = String(autoLabel || '');
+  return {
+    value: !currentValue.trim() || currentValue === previousAutoLabel
+      ? nextAutoLabel
+      : currentValue,
+    autoLabel: nextAutoLabel,
+  };
+}
 
 let api = null;
 let controlPlane = null;
@@ -200,6 +217,38 @@ async function verifyProviderAccount(account, button) {
   }
 }
 
+export async function removeProviderAccountRequest(requestApi, accountId) {
+  const result = await requestApi.postJson(`/api/provider-accounts/${accountId}/disconnect`);
+  await requestApi.deleteJson(`/api/provider-accounts/${accountId}`);
+  return result;
+}
+
+async function removeProviderAccount(account, button) {
+  const accountId = encodeURIComponent(String(account.account_id || ''));
+  const label = String(account.label || account.provider || 'this account');
+  const brokerBacked = ['api_key', 'enterprise_route'].includes(String(account.auth_method || ''));
+  const question = brokerBacked
+    ? `Remove ${label} from GlassHive? This does not delete the key or route in connected accounts.`
+    : `Remove ${label} from GlassHive and delete its isolated credentials? GlassHive will also try to sign out at the provider.`;
+  if (!window.confirm(question)) return;
+  button.disabled = true;
+  button.textContent = 'Removing…';
+  try {
+    const result = await removeProviderAccountRequest(api, accountId);
+    await loadControlPlane();
+    setProviderStatus(String(result?.message || `${label} removed.`));
+  } catch (error) {
+    try {
+      await loadControlPlane();
+    } catch (_reloadError) {
+      // Keep the original removal error visible.
+    }
+    setProviderStatus(error.message);
+    button.disabled = false;
+    button.textContent = 'Remove';
+  }
+}
+
 function renderProviderAccounts() {
   const list = document.getElementById('provider-account-list');
   if (!list || !controlPlane) return;
@@ -291,44 +340,10 @@ function renderProviderAccounts() {
       signInAgain.addEventListener('click', () => reconnectProviderAccount(account, signInAgain));
       moreActions.append(signInAgain);
     }
-    if (account.status !== 'disconnected') {
-      const disconnect = node('button', 'text-button', 'Disconnect');
-      disconnect.type = 'button';
-      disconnect.addEventListener('click', async () => {
-        const question = brokerBacked
-          ? `Remove ${String(account.label || account.provider || 'this account')} from GlassHive? This does not delete the key or route in connected accounts.`
-          : `Disconnect ${String(account.label || account.provider || 'this account')} and remove its isolated credentials?`;
-        if (!window.confirm(question)) return;
-        disconnect.disabled = true;
-        disconnect.textContent = 'Disconnecting…';
-        try {
-          await api.postJson(`/api/provider-accounts/${encodeURIComponent(String(account.account_id || ''))}/disconnect`);
-          await loadControlPlane();
-        } catch (error) {
-          disconnect.textContent = error.message;
-          disconnect.disabled = false;
-        }
-      });
-      moreActions.append(disconnect);
-    }
-    if (account.status === 'disconnected') {
-      const forget = node('button', 'text-button danger-text-button', 'Forget');
-      forget.type = 'button';
-      forget.addEventListener('click', async () => {
-        if (!window.confirm(`Forget ${String(account.label || account.provider || 'this account')} from GlassHive? Its disconnected metadata will be removed.`)) return;
-        forget.disabled = true;
-        forget.textContent = 'Forgetting…';
-        try {
-          await api.deleteJson(`/api/provider-accounts/${encodeURIComponent(String(account.account_id || ''))}`);
-          await loadControlPlane();
-        } catch (error) {
-          setProviderStatus(error.message);
-          forget.disabled = false;
-          forget.textContent = 'Forget';
-        }
-      });
-      moreActions.append(forget);
-    }
+    const remove = node('button', 'text-button danger-text-button', 'Remove');
+    remove.type = 'button';
+    remove.addEventListener('click', () => removeProviderAccount(account, remove));
+    moreActions.append(remove);
     if (moreActions.childElementCount) {
       more.append(moreSummary, moreActions);
       actions.append(more);
@@ -450,7 +465,7 @@ function renderConnectAi() {
     ? `${supportedNames[0]} or ${supportedNames[1]}`
     : supportedNames[0] || 'a supported AI app';
   if (supportedSummary) supportedSummary.textContent = `Control your workspaces from ${supportedText}.`;
-  if (automaticCopy) automaticCopy.textContent = `Copy this once and paste it into ${supportedText}.`;
+  if (automaticCopy) automaticCopy.textContent = `Paste this once into ${supportedText}. It will follow only its own setup.`;
   const mcpUrl = String(connectAi.mcp_url || '');
   const guidedPrompt = String(connectAi.guided_prompt || '');
   if (serverUrl) serverUrl.textContent = mcpUrl;
@@ -485,7 +500,7 @@ function renderConnectAi() {
 
   const rows = canSetup ? [
     ...(clients.codex ? [
-      commandRow('Codex · 1. Add server', String(clients.codex.add_command || '')),
+      commandRow('Codex · 1. Configure server', String(clients.codex.config_toml || '')),
       commandRow('Codex · 2. Sign in', String(clients.codex.login_command || '')),
     ] : []),
     ...(clients.claude ? [
@@ -1503,6 +1518,16 @@ function renderProviderOptionControls() {
     return element;
   }));
   methodSelect.value = selectedProvider.methods.includes(currentMethod) ? currentMethod : selectedProvider.methods[0];
+  const labelInput = document.getElementById('provider-account-label');
+  if (labelInput) {
+    const label = providerAccountLabelTransition({
+      provider: providerSelect.value,
+      value: labelInput.value,
+      autoLabel: labelInput.dataset.autoLabel,
+    });
+    labelInput.value = label.value;
+    labelInput.dataset.autoLabel = label.autoLabel;
+  }
   addAccount.hidden = Boolean(activeSetupAccount);
   if (defaultToggle) {
     const accounts = controlPlane?.provider_accounts || [];
@@ -1518,17 +1543,22 @@ function showSetup(payload) {
   const setupLink = document.getElementById('provider-setup-link');
   const setupCode = document.getElementById('provider-setup-code');
   const setupCodeRow = document.getElementById('provider-setup-code-row');
+  const setupInputForm = document.getElementById('provider-setup-input-form');
+  const setupInput = document.getElementById('provider-setup-input');
   const setupHelp = document.getElementById('provider-setup-help');
   const technical = document.getElementById('provider-setup-technical');
   const restart = document.getElementById('restart-provider-setup');
   const provider = String(payload.provider || 'codex');
   const setupUrl = String(payload.setup_url || '');
   const code = String(payload.setup_code || '');
+  const inputRequired = Boolean(payload.input_required) && !payload.complete;
+  const inputSubmitted = Boolean(payload.input_submitted) && !payload.complete;
   const helpUrl = String(payload.help_url || '');
   const rawInstructions = String(payload.instructions || payload.message || '').trim();
-  const waitingForGuidance = !payload.complete && !rawInstructions;
+  const waitingForGuidance = !payload.complete && !rawInstructions && !inputSubmitted;
   const needsFallback = !payload.complete
     && !waitingForGuidance
+    && !inputSubmitted
     && (!setupUrl || (provider === 'codex' && !code));
   const accountId = String(payload.account_id || activeSetupAccount || '');
   const accountRow = [...document.querySelectorAll('.connection-row')]
@@ -1539,7 +1569,8 @@ function showSetup(payload) {
   const accountRecovery = accountRow?.querySelector('.connection-recovery');
   const addAccount = document.getElementById('add-provider-account');
   const externalClients = document.getElementById('connect-ai-advanced');
-  if (instructions) instructions.textContent = rawInstructions || 'Preparing sign-in…';
+  if (instructions) instructions.textContent = rawInstructions
+    || (inputSubmitted ? 'Finishing sign-in…' : 'Preparing sign-in…');
   if (panel) panel.hidden = Boolean(payload.complete);
   if (setupLink) {
     setupLink.href = setupUrl || '#';
@@ -1549,6 +1580,8 @@ function showSetup(payload) {
   }
   if (setupCode) setupCode.textContent = code;
   if (setupCodeRow) setupCodeRow.hidden = !code;
+  if (setupInputForm) setupInputForm.hidden = !inputRequired;
+  if (payload.complete && setupInput) setupInput.value = '';
   if (setupHelp) {
     setupHelp.href = helpUrl || '#';
     setupHelp.textContent = 'Open ChatGPT security settings';
@@ -1558,7 +1591,13 @@ function showSetup(payload) {
     ? 'Use the provider instructions below.'
     : waitingForGuidance
       ? 'Starting secure sign-in…'
-      : (provider === 'codex' ? 'Open sign-in, then enter the code.' : 'Open sign-in to continue.');
+      : (provider === 'codex'
+        ? 'Open sign-in, then enter the code.'
+        : inputRequired
+          ? 'Open sign-in, then paste the code here.'
+          : inputSubmitted
+            ? 'Finishing secure sign-in…'
+            : 'Open sign-in to continue.');
   if (technical && needsFallback) {
     technical.open = true;
     technical.dataset.autoOpened = 'true';
@@ -1581,6 +1620,42 @@ function showSetup(payload) {
     : payload.complete
       ? String(payload.message || 'Sign-in was not completed. Try again.')
       : (needsFallback ? 'Sign-in details changed. Follow the technical details below.' : ''));
+}
+
+async function submitProviderSetupInput(event) {
+  event.preventDefault();
+  if (!activeSetupAccount) return;
+  const setupInput = document.getElementById('provider-setup-input');
+  const button = document.getElementById('submit-provider-setup-input');
+  const value = String(setupInput?.value || '').trim();
+  if (!value) {
+    setupInput?.focus();
+    return;
+  }
+  button.disabled = true;
+  button.textContent = 'Finishing…';
+  setupInput.value = '';
+  try {
+    const payload = await api.postJson(
+      `/api/provider-accounts/${encodeURIComponent(activeSetupAccount)}/setup/input`,
+      { value },
+    );
+    showSetup(payload);
+    if (payload.complete) {
+      activeSetupAccount = '';
+      stopSetupPolling();
+      await loadControlPlane();
+      showSetup(payload);
+    } else if (!setupPollTimer) {
+      setupPollTimer = window.setTimeout(pollSetup, 500);
+    }
+  } catch (error) {
+    setProviderStatus(error.message);
+    setupInput?.focus();
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Finish connecting';
+  }
 }
 
 async function cancelActiveSetup({ reload = true } = {}) {
@@ -1816,6 +1891,10 @@ export function initializeControlPlane(dependencies) {
     const codeNode = document.getElementById('provider-setup-code');
     copyText(codeNode?.textContent || '', event.currentTarget, codeNode);
   });
+  document.getElementById('provider-setup-input-form')?.addEventListener(
+    'submit',
+    submitProviderSetupInput,
+  );
   document.getElementById('restart-provider-setup')?.addEventListener('click', (event) => {
     restartActiveSetup(event.currentTarget);
   });

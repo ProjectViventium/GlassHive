@@ -61,6 +61,101 @@ def _golden() -> dict[str, Any]:
     return json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
 
 
+def test_connect_skill_skips_setup_when_connected_and_never_lists_the_catalog():
+    skill = (
+        Path(__file__).parents[2] / "skills" / "connect-glasshive" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    compact_skill = " ".join(skill.split())
+
+    assert "If GlassHive is already connected" in compact_skill
+    assert "call only the one tool needed for the user's request" in compact_skill
+    assert "Never enumerate or summarize the tool catalog" in compact_skill
+    assert "Do not inspect config files, run shell checks" in compact_skill
+    assert "only during first setup or reconnect verification" in compact_skill
+    assert "persistent `scopes` value" in compact_skill
+    assert "inside a GlassHive workspace" in compact_skill
+    assert "Do not install that capability in the controlling AI client" in compact_skill
+    assert "Set `favorite=true`" in compact_skill
+    assert "repeat only `workspace_wait`" in compact_skill
+    assert "pass its returned `run_id` and `worker_id`" in compact_skill
+    assert "same personal AI account selected for that worker" in compact_skill
+    assert "do not substitute the controlling client's own apps" in compact_skill
+    assert "start a new task" not in compact_skill
+
+
+def test_agent_plugins_package_the_one_canonical_connect_skill_without_a_second_mcp_contract():
+    root = Path(__file__).parents[2]
+    canonical_skill = root / "skills" / "connect-glasshive"
+    plugin_root = root / "plugins" / "glasshive"
+    packaged_skill = plugin_root / "skills" / "connect-glasshive"
+    codex_manifest = json.loads(
+        (plugin_root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+    codex_marketplace = json.loads(
+        (root / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8")
+    )
+    claude_manifest = json.loads(
+        (plugin_root / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+    claude_marketplace = json.loads(
+        (root / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
+    )
+
+    assert codex_manifest["name"] == "glasshive"
+    assert codex_manifest["skills"] == "./skills/"
+    assert "mcpServers" not in codex_manifest
+    assert codex_manifest["interface"]["defaultPrompt"] == [
+        "List my GlassHive workspaces",
+        "Start a GlassHive workspace for this goal",
+        "Show my GlassHive schedules",
+    ]
+    assert codex_marketplace == {
+        "name": "project-glasshive",
+        "interface": {"displayName": "GlassHive"},
+        "plugins": [
+            {
+                "name": "glasshive",
+                "source": {"source": "local", "path": "./plugins/glasshive"},
+                "policy": {
+                    "installation": "AVAILABLE",
+                    "authentication": "ON_INSTALL",
+                },
+                "category": "Productivity",
+            }
+        ],
+    }
+    assert codex_marketplace["name"] != codex_manifest["name"]
+    assert claude_manifest == {
+        "name": "glasshive",
+        "version": "0.1.1",
+        "description": "Control GlassHive workspaces from Claude Code.",
+        "author": {"name": "Project Viventium"},
+        "homepage": "https://github.com/ProjectViventium/GlassHive",
+        "repository": "https://github.com/ProjectViventium/GlassHive",
+        "license": "FSL-1.1-ALv2",
+        "keywords": ["glasshive", "workspace", "mcp", "claude"],
+    }
+    assert claude_marketplace == {
+        "name": "glasshive",
+        "owner": {"name": "Project Viventium"},
+        "description": "The official GlassHive plugin marketplace.",
+        "plugins": [
+            {
+                "name": "glasshive",
+                "source": "./plugins/glasshive",
+                "description": "Control GlassHive workspaces from Claude Code.",
+                "category": "productivity",
+            }
+        ],
+    }
+    assert (packaged_skill / "SKILL.md").read_bytes() == (
+        canonical_skill / "SKILL.md"
+    ).read_bytes()
+    assert (packaged_skill / "agents" / "openai.yaml").read_bytes() == (
+        canonical_skill / "agents" / "openai.yaml"
+    ).read_bytes()
+
+
 def _media_schemas(content: dict[str, Any] | None) -> dict[str, Any]:
     return {
         media_type: {

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .auth import multi_user_security_enabled
+from .codex_plugins import provision_codex_official_marketplace
 
 
 JsonDict = dict[str, Any]
@@ -98,6 +99,7 @@ DEFAULT_ENTERPRISE_WORKER_ENV_KEYS = {
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_API_BASE",
+    "OPENAI_REVERSE_PROXY",
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_USE_BEDROCK",
@@ -145,6 +147,18 @@ RUN_BOUND_PROVIDER_ENV_KEYS = {
     "PORTKEY_CONFIG",
     "WPR_CLAUDE_CODE_USE_API_KEY",
 }
+CODEX_DEPLOYMENT_PROVIDER_ENV_KEYS = {
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "OPENAI_REVERSE_PROXY",
+    "PORTKEY_API_KEY",
+    "PORTKEY_BASE_URL",
+    "PORTKEY_PROVIDER",
+    "PORTKEY_VIRTUAL_KEY",
+    "PORTKEY_CONFIG",
+}
+CLAUDE_DEPLOYMENT_PROVIDER_ENV_KEYS = RUN_BOUND_PROVIDER_ENV_KEYS - CODEX_DEPLOYMENT_PROVIDER_ENV_KEYS
 DEFAULT_SECRET_ENV_MARKERS = (
     "ACCESS_KEY",
     "API_KEY",
@@ -359,7 +373,9 @@ def bootstrap_bundle_for(worker: dict[str, Any]) -> JsonDict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def bootstrap_env_for(worker: dict[str, Any]) -> dict[str, str]:
+def bootstrap_env_for(
+    worker: dict[str, Any], runtime_name: str | None = None
+) -> dict[str, str]:
     bundle = bootstrap_bundle_for(worker)
     raw = bundle.get("env")
     enterprise = _enterprise_mode_enabled()
@@ -382,6 +398,76 @@ def bootstrap_env_for(worker: dict[str, Any]) -> dict[str, str]:
             value = os.environ.get(key)
             if value and key not in env:
                 env[key] = value
+    if enterprise:
+        selected_runtime = str(
+            runtime_name or worker.get("profile") or worker.get("runtime") or ""
+        ).strip().lower()
+        if selected_runtime == "codex-cli" or selected_runtime == "openclaw-codex":
+            selected_key = str(os.environ.get("WPR_CODEX_CLI_ENV_KEY") or "").strip()
+            explicit_base = str(os.environ.get("WPR_CODEX_CLI_BASE_URL") or "").strip()
+            if not selected_key:
+                selected_key = (
+                    "PORTKEY_API_KEY"
+                    if os.environ.get("PORTKEY_BASE_URL", "").strip()
+                    and not explicit_base
+                    and not any(
+                        os.environ.get(name, "").strip()
+                        for name in (
+                            "OPENAI_BASE_URL",
+                            "OPENAI_API_BASE",
+                            "OPENAI_REVERSE_PROXY",
+                        )
+                    )
+                    else "OPENAI_API_KEY"
+                )
+            if selected_key not in {"OPENAI_API_KEY", "PORTKEY_API_KEY"}:
+                profile_provider_keys = set()
+            else:
+                profile_provider_keys = {
+                key
+                for key in CODEX_DEPLOYMENT_PROVIDER_ENV_KEYS
+                if key.startswith("PORTKEY_")
+            } if selected_key == "PORTKEY_API_KEY" else {
+                key
+                for key in CODEX_DEPLOYMENT_PROVIDER_ENV_KEYS
+                if not key.startswith("PORTKEY_")
+            }
+        elif selected_runtime.startswith("openclaw"):
+            selected_key = str(os.environ.get("WPR_OPENCLAW_ENV_KEY") or "").strip()
+            explicit_base = str(os.environ.get("WPR_OPENCLAW_BASE_URL") or "").strip()
+            if not selected_key:
+                selected_key = (
+                    "PORTKEY_API_KEY"
+                    if os.environ.get("PORTKEY_BASE_URL", "").strip()
+                    and not explicit_base
+                    and not any(
+                        os.environ.get(name, "").strip()
+                        for name in (
+                            "OPENAI_BASE_URL",
+                            "OPENAI_API_BASE",
+                            "OPENAI_REVERSE_PROXY",
+                        )
+                    )
+                    else "OPENAI_API_KEY"
+                )
+            if selected_key not in {"OPENAI_API_KEY", "PORTKEY_API_KEY"}:
+                profile_provider_keys = set()
+            else:
+                profile_provider_keys = {
+                key
+                for key in CODEX_DEPLOYMENT_PROVIDER_ENV_KEYS
+                if key.startswith("PORTKEY_")
+            } if selected_key == "PORTKEY_API_KEY" else {
+                key
+                for key in CODEX_DEPLOYMENT_PROVIDER_ENV_KEYS
+                if not key.startswith("PORTKEY_")
+            }
+        elif selected_runtime == "claude-code":
+            profile_provider_keys = CLAUDE_DEPLOYMENT_PROVIDER_ENV_KEYS
+        else:
+            profile_provider_keys = set()
+        for key in RUN_BOUND_PROVIDER_ENV_KEYS - profile_provider_keys:
+            env.pop(key, None)
     if worker.get("_glasshive_provider_account_bound") or worker.get(
         "_glasshive_inference_broker_bound"
     ):
@@ -413,6 +499,16 @@ def apply_bootstrap(
     bundle = bootstrap_bundle_for(worker)
 
     if (
+        runtime_name == "codex-cli"
+        and str(worker.get("execution_mode") or "") == "docker"
+        and (
+            not _enterprise_mode_enabled()
+            or bool(worker.get("_glasshive_provider_account_bound"))
+        )
+    ):
+        provision_codex_official_marketplace(home_dir)
+
+    if (
         profile not in {"clean-room", "none"}
         and not _enterprise_mode_enabled()
         and not worker.get("_glasshive_provider_account_bound")
@@ -428,16 +524,18 @@ def apply_bootstrap(
         if profile in {"host-login", "full-local", "codex-host", "claude-host"}:
             copy_file(Path.home() / ".gitconfig", home_dir / ".gitconfig")
 
-    _write_runtime_env(home_dir, bootstrap_env_for(worker))
+    _write_runtime_env(home_dir, bootstrap_env_for(worker, runtime_name))
     _write_project_files(home_dir, workspace_dir, bundle, worker, copy_file, copy_tree)
     _write_claude_project_files(workspace_dir, bundle)
     _write_codex_config(home_dir, bundle)
     _write_manifest(home_dir, profile, bundle)
 
 
-def refresh_runtime_env_for_worker(home_dir: Path, worker: dict[str, Any]) -> None:
+def refresh_runtime_env_for_worker(
+    home_dir: Path, worker: dict[str, Any], runtime_name: str | None = None
+) -> None:
     """Refresh per-run environment projection without rewriting project files."""
-    _write_runtime_env(home_dir, bootstrap_env_for(worker))
+    _write_runtime_env(home_dir, bootstrap_env_for(worker, runtime_name))
 
 
 def refresh_project_runtime_files_for_worker(home_dir: Path, workspace_dir: Path, worker: dict[str, Any]) -> None:

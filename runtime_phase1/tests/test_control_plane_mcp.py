@@ -156,7 +156,11 @@ def test_control_plane_mcp_tools_are_additive_and_require_browser_confirmation(m
             assert duplicate_schema["properties"]["idempotency_key"]["minLength"] == 8
             assert duplicate_schema["properties"]["idempotency_key"]["maxLength"] == 128
 
+            workspace_list_schema = tools["workspace_list"].inputSchema["properties"]["limit"]
+            assert "maximum" not in workspace_list_schema
+
             listed = await client.call_tool("workspace_list", {"search": "research", "tags": ["quarterly"]})
+            listed_with_large_limit = await client.call_tool("workspace_list", {"limit": 200})
             renamed = await client.call_tool(
                 "workspace_rename", {"worker_id": "wrk_public_safe", "name": "Quarterly research"}
             )
@@ -244,6 +248,7 @@ def test_control_plane_mcp_tools_are_additive_and_require_browser_confirmation(m
             )
 
             assert _json(listed)["items"][0]["name"] == "Research desk"
+            assert _json(listed_with_large_limit)["items"][0]["name"] == "Research desk"
             assert _json(renamed)["name"] == "Quarterly research"
             assert _json(duplicated)["workspace"]["worker_id"] == "wrk_copy"
             assert _json(templates)[0]["template_id"] == "wst_public_safe"
@@ -274,6 +279,8 @@ def test_control_plane_mcp_tools_are_additive_and_require_browser_confirmation(m
             assert _json(forgotten)["status"] == "forgotten"
 
     asyncio.run(scenario())
+    list_calls = [call for call in api.calls if call[0] == "list"]
+    assert list_calls[1][1]["limit"] == 100
     prepare_calls = [call for call in api.calls if call[0] == "prepare"]
     assert prepare_calls[0][1]["payload"] == {
         "library_id": "lib_public_safe",

@@ -37,6 +37,9 @@ def _configure_enterprise_mcp_oauth(monkeypatch):
 
 
 class FakeApiClient:
+    def workspace_catalog(self, **kwargs):
+        return {"items": [], "next_cursor": None}
+
     def list_projects(self, owner_id: str | None = None):
         items = [
             {"project_id": "prj_123", "owner_id": "demo-owner", "title": "Inbox Zero", "goal": "Triage open loops"},
@@ -251,6 +254,9 @@ class FakeApiClient:
     def lifecycle(self, worker_id: str, action: str):
         return {"worker_id": worker_id, "state": "ready", "action": action}
 
+    def update_workspace(self, worker_id: str, payload: dict):
+        return {"worker_id": worker_id, **payload}
+
     def desktop_action(self, worker_id: str, action: str, url: str | None = None):
         return {"worker_id": worker_id, "action": action, "url": url, "view_url": "http://127.0.0.1:62310/?autoconnect=1"}
 
@@ -273,6 +279,7 @@ class TrackingApiClient(FakeApiClient):
         self.assign_run_payloads: list[dict] = []
         self.schedule_run_payloads: list[dict] = []
         self.sent_messages: list[dict] = []
+        self.update_workspace_payloads: list[dict] = []
 
     def list_projects(self, owner_id: str | None = None):
         self.calls.append("list_projects")
@@ -305,6 +312,11 @@ class TrackingApiClient(FakeApiClient):
         self.calls.append("send_message")
         self.sent_messages.append({"worker_id": worker_id, "message": message})
         return super().send_message(worker_id, message)
+
+    def update_workspace(self, worker_id: str, payload: dict):
+        self.calls.append("update_workspace")
+        self.update_workspace_payloads.append({"worker_id": worker_id, **payload})
+        return super().update_workspace(worker_id, payload)
 
     def schedule_run(self, worker_id: str, instruction: str, *, run_at: str | None = None, schedule_text: str | None = None, delay_seconds: int | None = None, bootstrap_bundle: dict | None = None):
         self.schedule_run_payloads.append(
@@ -1175,51 +1187,21 @@ def test_server_instructions_advertise_mcp_owned_usage_contract(monkeypatch):
     instructions = server.instructions.lower()
 
     for phrase in [
-        "persistent projects",
-        "resumable workers",
-        "workstation sandboxes",
-        "host-native workers",
-        "less is more",
-        "must not invent tool results",
-        "data in and data out must be exact",
-        "markdown-sensitive characters",
-        "real browser",
+        "one glasshive tool",
+        "make one call when one call can complete it",
+        "never enumerate or summarize the tool catalog",
+        "check or wait only when the user asks",
+        "without inventing plans, success criteria, tool results, or extra workflow",
+        "exact callable tool id shown by the host",
+        "real chrome/browser",
         "desktop",
-        "local files/projects",
+        "local projects",
         "installed clis",
         "workspace_launch",
-        "tool_search",
-        "query=<needed capability>",
-        "mcp_server=glasshive-workers-projects",
-        "same invocation",
-        "needed glasshive capability is not currently available",
-        "description, optional success_criteria, and optional context",
-        "worker_delegate_once",
-        "callbacks are an optional host-app delivery enhancement",
-        "neutral glasshive/librechat headers",
-        "do not refuse solely because your own model context lacks file contents",
-        "workspace_status",
-        "workspace_wait",
-        "omits ids",
-        "workspace_continue",
-        "sandboxed workspace",
-        "codex workspace",
-        "execution_mode='docker'",
-        "runtime_dependency_missing",
-        "high/xhigh",
-        "deep research",
-        "do not shorten",
-        "full picture",
-        "pass mcp/tool availability as context",
-        "view / steer",
-        "result_tools",
-        "own voice",
-        "should not expose raw worker/run/provider/queue plumbing",
-        "@codex",
-        "@claude",
-        "@openclaw",
     ]:
         assert phrase in instructions
+    assert "tool_search" not in instructions
+    assert len(server.instructions) < 1_000
 
 
 def test_server_instructions_reflect_disabled_host_workers(monkeypatch):
@@ -2953,6 +2935,69 @@ def test_enterprise_launch_without_conversation_id_is_not_remembered(monkeypatch
     asyncio.run(scenario())
 
 
+def test_enterprise_launch_without_conversation_id_returns_explicit_follow_up_ids(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-token")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    monkeypatch.setattr(mcp_server, "DEFAULT_MCP_API_TOKEN", "service-token")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-GlassHive-Service-Token": "service-token",
+            "X-GlassHive-Tenant-Id": "tenant-alpha",
+            "X-GlassHive-User-Id": "user-a",
+            "X-GlassHive-Surface": "codex",
+        },
+    )
+    api_client = RememberedDispatchApiClient(tenant_id="tenant-alpha")
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            launched = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Standalone enterprise marker.",
+                    "success_criteria": "The marker exists.",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                },
+            )
+            launch_payload = _tool_json(launched)
+            assert launch_payload["status"] == "dispatched"
+            assert launch_payload["follow_up_context"] == {
+                "project_id": "prj_new",
+                "worker_id": "wrk_resumed",
+                "run_id": "run_assign",
+                "run_state": "completed",
+                "status_tool": "workspace_status",
+                "blocking_wait_tool": "workspace_wait",
+                "completion_wait_timeout_seconds": 45,
+                "live_tool": "worker_live",
+                "takeover_tool": "worker_takeover",
+                "artifact_tool": "workspace_artifacts",
+                "artifact_download_tool": "workspace_artifact_download",
+            }
+            assert "submitted_instruction" not in launch_payload
+            assert "delegation_audit" not in launch_payload
+
+            waited = await client.call_tool(
+                "workspace_wait",
+                {
+                    "run_id": launch_payload["follow_up_context"]["run_id"],
+                    "worker_id": launch_payload["follow_up_context"]["worker_id"],
+                    "timeout_seconds": 0,
+                    "poll_interval_seconds": 0.01,
+                },
+            )
+            assert _tool_json(waited)["status"] == "completed"
+
+    asyncio.run(scenario())
+
+
 def test_enterprise_diagnostic_payloads_are_suppressed_without_opt_in(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     _configure_enterprise_mcp_oauth(monkeypatch)
@@ -4208,6 +4253,33 @@ def test_workspace_launch_uses_documented_ui_fields_without_low_level_chain(monk
     assert "do not invent extra gates" in minimal_instruction
 
 
+def test_workspace_launch_can_favorite_the_created_workspace_in_the_same_call(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    api = TrackingApiClient()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            result = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Personal research workspace\nKeep this workspace reusable.",
+                    "favorite": True,
+                    "provider_account_policy": "personal_required",
+                    "require_callback": False,
+                },
+            )
+            assert _tool_json(result)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+
+    assert api.update_workspace_payloads == [
+        {"worker_id": "wrk_resumed", "favorite": True}
+    ]
+    assert api.calls.index("update_workspace") < api.calls.index("assign_run")
+    assert api.find_or_resume_payloads[0]["name"] == "Personal research workspace"
+
+
 def test_workspace_launch_returns_structured_quota_block_with_reuse_options(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
 
@@ -4663,6 +4735,20 @@ def test_workspace_launch_reuses_existing_workspace_alias_across_projects(monkey
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
 
     class ExistingAliasApi(TrackingApiClient):
+        def workspace_catalog(self, **kwargs):
+            return {
+                "items": [
+                    {
+                        "worker_id": "wrk_existing",
+                        "project_id": "prj_existing",
+                        "name": "Marketing sandbox",
+                        "alias": "marketing-sandbox",
+                        "state": "paused",
+                    }
+                ],
+                "next_cursor": None,
+            }
+
         def list_projects(self, owner_id: str | None = None):
             self.calls.append("list_projects")
             return [{"project_id": "prj_existing", "owner_id": "demo-owner", "title": "Marketing sandbox"}]
@@ -4710,10 +4796,88 @@ def test_workspace_launch_reuses_existing_workspace_alias_across_projects(monkey
     assert api.find_or_resume_payloads[-1]["alias"] == "marketing-sandbox"
 
 
+def test_workspace_launch_inherits_saved_claude_profile_when_reuse_omits_profile(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+
+    class ExistingClaudeWorkspaceApi(TrackingApiClient):
+        def workspace_catalog(self, **kwargs):
+            return {
+                "items": [
+                    {
+                        "worker_id": "wrk_claude",
+                        "project_id": "prj_claude",
+                        "name": "Claude work services",
+                        "alias": "claude-work-services",
+                        "profile": "claude-code",
+                        "execution_mode": "docker",
+                        "state": "ready",
+                    }
+                ],
+                "next_cursor": None,
+            }
+
+        def list_projects(self, owner_id: str | None = None):
+            return [
+                {
+                    "project_id": "prj_claude",
+                    "owner_id": "demo-owner",
+                    "title": "Claude work services",
+                }
+            ]
+
+        def list_workers(self, project_id: str):
+            return [
+                {
+                    "worker_id": "wrk_claude",
+                    "project_id": project_id,
+                    "owner_id": "demo-owner",
+                    "name": "Claude work services",
+                    "profile": "claude-code",
+                    "execution_mode": "docker",
+                    "alias": "claude-work-services",
+                    "state": "ready",
+                }
+            ]
+
+    api = ExistingClaudeWorkspaceApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            result = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Claude work services\nCreate a short proof file.",
+                    "workspace_alias": "Claude work services",
+                    "reuse_existing_workspace": True,
+                },
+            )
+            assert _tool_json(result)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+
+    assert api.find_or_resume_payloads[-1]["profile"] == "claude-code"
+    assert api.find_or_resume_payloads[-1]["execution_mode"] == "docker"
+
+
 def test_workspace_launch_cannot_replace_existing_workspace_provider_policy(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
 
     class ExistingAliasApi(TrackingApiClient):
+        def workspace_catalog(self, **kwargs):
+            return {
+                "items": [
+                    {
+                        "worker_id": "wrk_existing",
+                        "project_id": "prj_existing",
+                        "name": "Research",
+                        "alias": "research",
+                        "state": "paused",
+                    }
+                ],
+                "next_cursor": None,
+            }
+
         def list_projects(self, owner_id: str | None = None):
             return [{"project_id": "prj_existing", "owner_id": "demo-owner", "title": "Research"}]
 
@@ -4867,7 +5031,7 @@ def test_worker_delegate_once_reuses_alias_when_explicit(monkeypatch):
     assert worker_payload["alias"] == "marketing-sandbox"
 
 
-def test_workspace_launch_reuses_enterprise_scoped_workspace_alias(monkeypatch):
+def test_workspace_launch_reuses_enterprise_catalog_alias_without_scoping_twice(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     _configure_enterprise_mcp_oauth(monkeypatch)
@@ -4887,6 +5051,20 @@ def test_workspace_launch_reuses_enterprise_scoped_workspace_alias(monkeypatch):
     )
 
     class ExistingEnterpriseAliasApi(TrackingApiClient):
+        def workspace_catalog(self, **kwargs):
+            return {
+                "items": [
+                    {
+                        "worker_id": "wrk_existing",
+                        "project_id": "prj_existing",
+                        "name": "Marketing sandbox",
+                        "alias": "tenant-alpha--user-a--marketing-sandbox",
+                        "state": "paused",
+                    }
+                ],
+                "next_cursor": None,
+            }
+
         def list_projects(self, owner_id: str | None = None):
             self.calls.append("list_projects")
             return [{"project_id": "prj_existing", "owner_id": "user-a", "title": "Marketing sandbox"}]
@@ -4918,7 +5096,7 @@ def test_workspace_launch_reuses_enterprise_scoped_workspace_alias(monkeypatch):
                 {
                     "description": "Tell JohnDoe to use my Marketing sandbox for the next task.",
                     "success_criteria": "The enterprise-scoped workspace alias is reused.",
-                    "workspace_alias": "marketing-sandbox",
+                    "workspace_alias": "tenant-alpha--user-a--marketing-sandbox",
                     "reuse_existing_workspace": True,
                     "profile": "codex-cli",
                     "require_callback": False,
@@ -4934,28 +5112,423 @@ def test_workspace_launch_reuses_enterprise_scoped_workspace_alias(monkeypatch):
     assert api.find_or_resume_payloads[-1]["alias"] == "marketing-sandbox"
 
 
+@pytest.mark.parametrize(
+    ("workspace_alias", "description", "expected_searches"),
+    [
+        (
+            None,
+            "Microsoft work hub\nRead connected accounts without changing anything.",
+            ("Microsoft work hub",),
+        ),
+        (
+            "Microsoft work hub",
+            "Microsoft work hub check\nRead connected accounts without changing anything.",
+            ("Microsoft work hub",),
+        ),
+        (
+            "microsoft-work-hub",
+            "Microsoft work hub\nRead connected accounts without changing anything.",
+            ("microsoft-work-hub",),
+        ),
+    ],
+)
+def test_workspace_launch_resolves_exact_saved_name_for_human_reuse_inputs(
+    monkeypatch,
+    workspace_alias,
+    description,
+    expected_searches,
+):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    _configure_enterprise_mcp_oauth(monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
+    monkeypatch.setenv("WPR_API_TOKEN", "service-token")
+    monkeypatch.setenv("GLASSHIVE_MCP_API_KEY", "service-token")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-WPR-Token": "service-token",
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "user-a",
+            "X-Viventium-User-Role": "member",
+        },
+    )
+
+    search_calls = []
+
+    class ExactNameCatalogApi(TrackingApiClient):
+        def workspace_catalog(self, **kwargs):
+            search_calls.append(kwargs["search"])
+            if kwargs["search"] not in {"Microsoft work hub", "microsoft-work-hub"}:
+                return {"items": [], "next_cursor": None}
+            return {
+                "items": [
+                    {
+                        "worker_id": "wrk_existing",
+                        "project_id": "prj_existing",
+                        "name": "Microsoft work hub",
+                        "alias": "tenant-alpha--user-a--microsoft-work-hub",
+                        "state": "paused",
+                    },
+                    {
+                        "worker_id": "wrk_old_test",
+                        "project_id": "prj_old_test",
+                        "name": "Microsoft work hub",
+                        "alias": "tenant-alpha--user-a--old-test",
+                        "state": "terminated",
+                    },
+                ],
+                "next_cursor": None,
+            }
+
+        def list_projects(self, owner_id: str | None = None):
+            self.calls.append("list_projects")
+            return [{"project_id": "prj_existing", "owner_id": "user-a", "title": "Microsoft work hub"}]
+
+        def list_workers(self, project_id: str):
+            self.calls.append("list_workers")
+            return [
+                {
+                    "worker_id": "wrk_existing",
+                    "project_id": project_id,
+                    "owner_id": "user-a",
+                    "name": "Microsoft work hub",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                    "alias": "tenant-alpha--user-a--microsoft-work-hub",
+                    "state": "paused",
+                }
+            ]
+
+    api = ExactNameCatalogApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            result = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": description,
+                    "reuse_existing_workspace": True,
+                    "profile": "codex-cli",
+                    "require_callback": False,
+                    **({"workspace_alias": workspace_alias} if workspace_alias else {}),
+                },
+            )
+            assert _tool_json(result)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+
+    assert "create_project" not in api.calls
+    assert api.find_or_resume_payloads[-1]["project_id"] == "prj_existing"
+    assert api.find_or_resume_payloads[-1]["alias"] == "microsoft-work-hub"
+    assert search_calls == list(expected_searches)
+
+
+def test_workspace_launch_explicit_alias_wins_over_colliding_description_title(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+
+    class CollidingCatalogApi(TrackingApiClient):
+        def workspace_catalog(self, **kwargs):
+            rows = {
+                "microsoft-work-hub": {
+                    "worker_id": "wrk_microsoft",
+                    "project_id": "prj_microsoft",
+                    "name": "Microsoft work hub",
+                    "alias": "microsoft-work-hub",
+                    "state": "paused",
+                },
+                "Weekly report": {
+                    "worker_id": "wrk_weekly",
+                    "project_id": "prj_weekly",
+                    "name": "Weekly report",
+                    "alias": "weekly-report",
+                    "state": "paused",
+                },
+            }
+            item = rows.get(kwargs["search"])
+            return {"items": [item] if item else [], "next_cursor": None}
+
+        def list_projects(self, owner_id: str | None = None):
+            self.calls.append("list_projects")
+            return [
+                {"project_id": "prj_microsoft", "owner_id": "demo-owner", "title": "Microsoft work hub"},
+                {"project_id": "prj_weekly", "owner_id": "demo-owner", "title": "Weekly report"},
+            ]
+
+        def list_workers(self, project_id: str):
+            self.calls.append("list_workers")
+            aliases = {
+                "prj_microsoft": "microsoft-work-hub",
+                "prj_weekly": "weekly-report",
+            }
+            return [
+                {
+                    "worker_id": f"wrk_{project_id}",
+                    "project_id": project_id,
+                    "owner_id": "demo-owner",
+                    "name": "Existing workspace",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                    "alias": aliases[project_id],
+                    "state": "paused",
+                }
+            ]
+
+    api = CollidingCatalogApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            result = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Weekly report\nRead connected accounts without changing anything.",
+                    "workspace_alias": "microsoft-work-hub",
+                    "reuse_existing_workspace": True,
+                    "profile": "codex-cli",
+                },
+            )
+            assert _tool_json(result)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+
+    assert "create_project" not in api.calls
+    assert api.find_or_resume_payloads[-1]["project_id"] == "prj_microsoft"
+    assert api.find_or_resume_payloads[-1]["alias"] == "microsoft-work-hub"
+
+
+@pytest.mark.parametrize("state", ["terminating", "termination_failed", "terminated"])
+def test_workspace_launch_reuse_rejects_every_closed_workspace_state(monkeypatch, state):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+
+    class ClosedCatalogApi(TrackingApiClient):
+        def workspace_catalog(self, **kwargs):
+            return {
+                "items": [
+                    {
+                        "worker_id": "wrk_closed",
+                        "project_id": "prj_closed",
+                        "name": "Microsoft work hub",
+                        "alias": "microsoft-work-hub",
+                        "state": state,
+                    }
+                ],
+                "next_cursor": None,
+            }
+
+    api = ClosedCatalogApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="Could not resolve exactly one saved workspace"):
+                await client.call_tool(
+                    "workspace_launch",
+                    {
+                        "description": "Microsoft work hub\nRead connected accounts without changing anything.",
+                        "reuse_existing_workspace": True,
+                        "profile": "codex-cli",
+                    },
+                )
+
+    asyncio.run(scenario())
+
+    assert "create_project" not in api.calls
+    assert "assign_run" not in api.calls
+
+
+def test_workspace_launch_reuses_legacy_workspace_by_exact_alias(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+
+    class LegacyCatalogApi(TrackingApiClient):
+        def workspace_catalog(self, **kwargs):
+            assert kwargs["kind"] == ""
+            return {
+                "items": [
+                    {
+                        "worker_id": "wrk_legacy",
+                        "project_id": "prj_legacy",
+                        "name": "Legacy work hub",
+                        "alias": "legacy-work-hub",
+                        "workspace_kind": "legacy",
+                        "execution_mode": "docker",
+                        "state": "paused",
+                    }
+                ],
+                "next_cursor": None,
+            }
+
+        def list_projects(self, owner_id: str | None = None):
+            self.calls.append("list_projects")
+            return [{"project_id": "prj_legacy", "owner_id": "demo-owner", "title": "Legacy work hub"}]
+
+        def list_workers(self, project_id: str):
+            self.calls.append("list_workers")
+            return [
+                {
+                    "worker_id": "wrk_legacy",
+                    "project_id": project_id,
+                    "owner_id": "demo-owner",
+                    "name": "Legacy work hub",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                    "alias": "legacy-work-hub",
+                    "workspace_kind": "legacy",
+                    "state": "paused",
+                }
+            ]
+
+    api = LegacyCatalogApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            result = await client.call_tool(
+                "workspace_launch",
+                {
+                    "description": "Legacy work hub\nRead connected accounts without changing anything.",
+                    "workspace_alias": "legacy-work-hub",
+                    "reuse_existing_workspace": True,
+                    "profile": "codex-cli",
+                },
+            )
+            assert _tool_json(result)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+
+    assert "create_project" not in api.calls
+    assert api.find_or_resume_payloads[-1]["project_id"] == "prj_legacy"
+    assert api.find_or_resume_payloads[-1]["alias"] == "legacy-work-hub"
+
+
+def test_workspace_launch_reuse_rejects_execution_mode_mismatch_without_creation(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+
+    class MismatchedModeCatalogApi(TrackingApiClient):
+        def workspace_catalog(self, **kwargs):
+            return {
+                "items": [
+                    {
+                        "worker_id": "wrk_workstation",
+                        "project_id": "prj_workstation",
+                        "name": "Microsoft work hub",
+                        "alias": "microsoft-work-hub",
+                        "execution_mode": "workstation",
+                        "state": "paused",
+                    }
+                ],
+                "next_cursor": None,
+            }
+
+    api = MismatchedModeCatalogApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="Could not resolve existing workspace alias"):
+                await client.call_tool(
+                    "workspace_launch",
+                    {
+                        "description": "Microsoft work hub\nRead connected accounts without changing anything.",
+                        "workspace_alias": "microsoft-work-hub",
+                        "reuse_existing_workspace": True,
+                        "profile": "codex-cli",
+                        "execution_mode": "docker",
+                    },
+                )
+
+    asyncio.run(scenario())
+
+    assert "create_project" not in api.calls
+    assert "assign_run" not in api.calls
+
+
+def test_workspace_launch_reuse_rejects_unknown_explicit_alias_without_creation(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+
+    class MissingAliasCatalogApi(TrackingApiClient):
+        def workspace_catalog(self, **kwargs):
+            return {"items": [], "next_cursor": None}
+
+    api = MissingAliasCatalogApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="Could not resolve exactly one saved workspace"):
+                await client.call_tool(
+                    "workspace_launch",
+                    {
+                        "description": "Unrelated title\nRead connected accounts without changing anything.",
+                        "workspace_alias": "missing-workspace",
+                        "reuse_existing_workspace": True,
+                        "profile": "codex-cli",
+                    },
+                )
+
+    asyncio.run(scenario())
+
+    assert "create_project" not in api.calls
+    assert "assign_run" not in api.calls
+
+
+@pytest.mark.parametrize("match_count", [0, 2])
+def test_workspace_launch_without_alias_fails_closed_on_missing_or_ambiguous_name(
+    monkeypatch,
+    match_count,
+):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+
+    class AmbiguousCatalogApi(TrackingApiClient):
+        def workspace_catalog(self, **kwargs):
+            return {
+                "items": [
+                    {
+                        "worker_id": f"wrk_{index}",
+                        "project_id": f"prj_{index}",
+                        "name": "Microsoft work hub",
+                        "alias": f"microsoft-work-hub-{index}",
+                    }
+                    for index in range(match_count)
+                ],
+                "next_cursor": None,
+            }
+
+    api = AmbiguousCatalogApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="Could not resolve exactly one saved workspace"):
+                await client.call_tool(
+                    "workspace_launch",
+                    {
+                        "description": "Microsoft work hub\nRead connected accounts without changing anything.",
+                        "reuse_existing_workspace": True,
+                        "profile": "codex-cli",
+                    },
+                )
+
+    asyncio.run(scenario())
+
+    assert "create_project" not in api.calls
+    assert "assign_run" not in api.calls
+
+
 def test_tool_descriptions_advertise_mcp_owned_usage_contract(monkeypatch):
     monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "host")
     server = create_mcp_server(api_client=FakeApiClient())
     instructions = mcp_server.glasshive_workers_server_instructions()
-    assert "exact GlassHive tool id exposed by the host application" in instructions
-    assert "workspace_launch_mcp_glasshive-workers-projects" in instructions
-    assert "not in the available tool list" in instructions
-    assert "Preserve host-side GlassHive orchestration requirements as context" in instructions
-    assert "not by the worker running inside the workspace" in instructions
-    assert "MCP/tools are preferred when they can satisfy the task" in instructions
-    assert "Do not make tool choice a workspace success criterion" in instructions
-    assert "Do not invent project goals, success criteria" in instructions
-    assert "memory-derived priorities" in instructions
-    assert "For vague user adjectives like urgent or important, pass the adjective through" in instructions
-    assert "trust the GlassHive worker to find the best path" in instructions
-    assert "Satisfy the user's request as stated, preserving explicit constraints" in instructions
-    assert "success_criteria as broker/tool evidence gates" not in instructions
-    assert "preferred scoped option" in instructions
-    assert "non-broker host connectors are fallback after" in instructions
-    assert "Connected-account read authorization comes from the host-signed broker grant" in instructions
-    assert "compatibility hint for hosts that want an extra missing-broker warning" in instructions
-    assert "not a required authorization switch" in instructions
+    assert "Use the one GlassHive tool" in instructions
+    assert "Make one call when one call can complete it" in instructions
+    assert "never enumerate or summarize the tool catalog" in instructions
+    assert "launch it directly without listing first" in instructions
+    assert "without inventing plans, success criteria, tool results, or extra workflow" in instructions
+    assert "Use the exact callable tool id shown by the host" in instructions
+    assert len(instructions) < 1_000
 
     public_action_tools = {
         "projects_list",
@@ -5002,6 +5575,8 @@ def test_tool_descriptions_advertise_mcp_owned_usage_contract(monkeypatch):
 
             delegate_description = tools["worker_delegate_once"]["description"]
             workspace_description = tools["workspace_launch"]["description"]
+            workspace_list_description = tools["workspace_list"]["description"]
+            assert "do not call this before workspace_launch" in workspace_list_description.lower()
             assert "description" in workspace_description
             assert "success_criteria" in workspace_description
             assert "optional context" in workspace_description
@@ -5067,6 +5642,7 @@ def test_tool_descriptions_advertise_mcp_owned_usage_contract(monkeypatch):
 
             wait_description = tools["workspace_wait"]["description"]
             assert "first surface the View / Steer link" in wait_description
+            assert "pass its returned run_id and worker_id" in wait_description
             assert "Omit poll_interval_seconds for normal work" in wait_description
             assert "backs off toward the configured cap" in wait_description
 

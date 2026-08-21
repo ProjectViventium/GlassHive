@@ -437,6 +437,10 @@ class ProviderAccountRequest(BaseModel):
     make_default: bool = False
 
 
+class ProviderSetupInputRequest(BaseModel):
+    value: str
+
+
 class PendingChangeRequest(BaseModel):
     change_type: str = Field(min_length=1, max_length=120)
     target_id: str = Field(min_length=1, max_length=200)
@@ -2640,6 +2644,9 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     @app.get("/api/control-plane")
     def control_plane_bootstrap(request: Request) -> dict[str, object]:
         active_client = _client_for_request(request)
+        runtime_provider_setup_support = dict(
+            (active_client.health() or {}).get("provider_setup_support") or {}
+        )
         recurrence_owner = str(
             os.environ.get("GLASSHIVE_RECURRING_SCHEDULE_OWNER") or "glasshive_native"
         ).strip().lower()
@@ -2655,16 +2662,22 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             if _truthy_env("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS")
             else "proof_required"
         )
-        claude_subscription_support = (
-            "isolated_substrate_required"
-            if not isolation_ready
-            else "unsupported_macos_host"
-            if sys.platform == "darwin"
-            else "provider_permission_required"
-        )
-        claude_experimental_consumer_auth = _truthy_env(
-            "GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH"
-        )
+        if codex_subscription_support == "supported":
+            codex_subscription_support = str(
+                runtime_provider_setup_support.get("codex") or "setup_cli_required"
+            )
+        if not isolation_ready:
+            claude_subscription_support = "isolated_substrate_required"
+        elif sys.platform == "darwin":
+            claude_subscription_support = "unsupported_macos_host"
+        elif _truthy_env("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH"):
+            claude_subscription_support = "supported"
+        else:
+            claude_subscription_support = "provider_permission_required"
+        if claude_subscription_support == "supported":
+            claude_subscription_support = str(
+                runtime_provider_setup_support.get("claude") or "setup_cli_required"
+            )
         inference_broker_support = (
             "supported"
             if all(
@@ -2705,11 +2718,6 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                         "LibreChat may store a user-scoped Anthropic key, but GlassHive does not "
                         "yet have a fixed Anthropic Messages broker adapter. The key is not copied "
                         "into a worker or workspace."
-                    ),
-                    "experimental_consumer_auth": (
-                        "not_accepted_hosted_path"
-                        if claude_experimental_consumer_auth
-                        else "disabled"
                     ),
                 },
             ],
@@ -2778,6 +2786,9 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         required_scopes = str(
             os.environ.get("GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES") or ""
         ).strip()
+        required_scope_values = [
+            value for value in re.split(r"[,\s]+", required_scopes) if value
+        ]
         raw_allowed_client_ids = str(
             os.environ.get("GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS") or ""
         ).strip()
@@ -2785,7 +2796,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             value for value in re.split(r"[,\s]+", raw_allowed_client_ids) if value
         }
         registration_policy_ready = not multi_user or bool(
-            token_audiences and token_scopes and required_scopes and allowed_client_ids
+            token_audiences
+            and token_scopes
+            and required_scope_values
+            and allowed_client_ids
         )
 
         def client_is_allowed(client_id: str) -> bool:
@@ -2840,6 +2854,21 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             and 1024 <= codex_callback_port_number <= 65535
             and codex_resource_matches
         ):
+            codex_scope_values = list(required_scope_values)
+            if "offline_access" not in codex_scope_values:
+                codex_scope_values.append("offline_access")
+            codex_config_toml = "\n".join(
+                (
+                    f"[mcp_servers.{server_name}]",
+                    f"url = {json.dumps(mcp_url)}",
+                    "scopes = ["
+                    + ", ".join(json.dumps(scope) for scope in codex_scope_values)
+                    + "]",
+                    "",
+                    f"[mcp_servers.{server_name}.oauth]",
+                    f"client_id = {json.dumps(codex_client_id)}",
+                )
+            )
             codex_callback_url_override = shlex.quote(
                 'mcp_oauth_callback_url='
                 f'"http://127.0.0.1:{codex_callback_port_number}/callback"'
@@ -2855,44 +2884,69 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 "login_command": (
                     "codex mcp login "
                     f"-c mcp_oauth_callback_port={codex_callback_port_number} "
-                    f"-c {codex_callback_url_override} {server_name}"
+                    f"-c {codex_callback_url_override} "
+                    f"{server_name}"
                 ),
+                "config_toml": codex_config_toml,
                 "callback_port": codex_callback_port_number,
                 "callback_uri": codex_callback_uri,
             }
         documentation_url = str(
             os.environ.get("GLASSHIVE_MCP_DOCUMENTATION_URL") or ""
         ).strip()
-        guided_steps: list[str] = []
+        guided_steps = [
+            "Connect the AI app you are using to GlassHive. Follow only the matching section; do not configure another client."
+        ]
         codex_client = clients.get("codex")
         if isinstance(codex_client, dict):
-            guided_steps.extend(
-                [
-                    "For Codex, run these exact commands:",
-                    str(codex_client["add_command"]),
+            codex_setup_prompt = "\n".join(
+                (
+                    "You are Codex. Connect this Codex client to GlassHive.",
+                    "If GlassHive tools already work, do not change setup; make only the requested tool call.",
+                    "Otherwise install the official GlassHive skill once:",
+                    "codex plugin marketplace add ProjectViventium/GlassHive",
+                    "codex plugin add glasshive@project-glasshive",
+                    "Then add or update this server in your native Codex MCP config, preserving unrelated settings. Persist these scopes so Reconnect uses the right OAuth resource and can renew the login:",
+                    str(codex_client["config_toml"]),
+                    "Restart the Codex/ChatGPT desktop app once so it reloads the MCP config.",
+                    "Then use native sign-in:",
                     str(codex_client["login_command"]),
-                ]
+                    "Complete the native browser sign-in. Do not build OAuth URLs, inspect tokens, or configure another client.",
+                    "When connected, call workspace_list once to verify. Never enumerate or summarize the tool catalog.",
+                )
+            )
+            codex_client["setup_prompt"] = codex_setup_prompt
+            guided_steps.extend(
+                ("", "If you are Codex, follow only the Codex section.", codex_setup_prompt)
             )
         claude_client = clients.get("claude")
         if isinstance(claude_client, dict):
-            guided_steps.extend(
-                [
-                    "For Claude Code, run this exact command:",
+            claude_setup_prompt = "\n".join(
+                (
+                    "You are Claude Code. Connect this Claude Code client to GlassHive.",
+                    "Install the official GlassHive skill once if it is not already installed:",
+                    "claude plugin marketplace add ProjectViventium/GlassHive",
+                    "claude plugin install glasshive@glasshive --scope user --yes",
+                    f"Check `claude mcp get {server_name}`. If it already exists, do not add a duplicate. Otherwise run:",
                     str(claude_client["add_command"]),
                     str(claude_client.get("login_note") or "Open /mcp and finish sign-in."),
-                ]
+                    "Use only Claude Code's native browser sign-in. Do not build OAuth URLs, inspect tokens, or configure another client.",
+                    "When connected, call workspace_list once to verify. Never enumerate or summarize the tool catalog.",
+                )
             )
-        guided_steps.append(
-            "Complete the sign-in I approve, then list the GlassHive tools and confirm my workspace list is available."
-        )
+            claude_client["setup_prompt"] = claude_setup_prompt
+            guided_steps.extend(
+                (
+                    "",
+                    "If you are Claude Code, follow only the Claude Code section.",
+                    claude_setup_prompt,
+                )
+            )
         return {
             "mcp_url": mcp_url,
             "server_name": server_name,
             "supported_clients": sorted(clients),
-            "guided_prompt": (
-                "Connect this AI app to my self-hosted GlassHive using the exact deployment setup below.\n\n"
-                + "\n".join(guided_steps)
-            ),
+            "guided_prompt": "\n".join(guided_steps),
             "clients": clients,
             "configuration_status": "ready" if clients else "action_required",
             "configuration_note": (
@@ -3192,40 +3246,88 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             if auth_method == "subscription"
             else "broker://librechat-openai"
         )
-        return _client_for_request(request).create_provider_account(
-            {
-                "provider": provider,
-                "label": payload.label,
-                "auth_method": auth_method,
-                "platform_support": platform_support,
-                "secret_locator": locator,
-                "make_default": payload.make_default,
-            }
-        )
+        try:
+            return _client_for_request(request).create_provider_account(
+                {
+                    "provider": provider,
+                    "label": payload.label,
+                    "auth_method": auth_method,
+                    "platform_support": platform_support,
+                    "secret_locator": locator,
+                    "make_default": payload.make_default,
+                }
+            )
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not create this account connection"
+            ) from exc
 
     @app.post("/api/provider-accounts/{account_id}/setup")
     def start_provider_account_setup(request: Request, account_id: str) -> dict[str, Any]:
-        return _client_for_request(request).start_provider_account_setup(account_id)
+        try:
+            return _client_for_request(request).start_provider_account_setup(account_id)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not start this account connection"
+            ) from exc
 
     @app.get("/api/provider-accounts/{account_id}/setup")
     def provider_account_setup_status(request: Request, account_id: str) -> dict[str, Any]:
-        return _client_for_request(request).provider_account_setup_status(account_id)
+        try:
+            return _client_for_request(request).provider_account_setup_status(account_id)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not check this account connection"
+            ) from exc
+
+    @app.post("/api/provider-accounts/{account_id}/setup/input")
+    def submit_provider_account_setup_input(
+        request: Request, account_id: str, payload: ProviderSetupInputRequest
+    ) -> dict[str, Any]:
+        try:
+            return _client_for_request(request).submit_provider_account_setup_input(
+                account_id, payload.value
+            )
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not finish this account connection"
+            ) from exc
 
     @app.post("/api/provider-accounts/{account_id}/setup/cancel")
     def cancel_provider_account_setup(request: Request, account_id: str) -> dict[str, Any]:
-        return _client_for_request(request).cancel_provider_account_setup(account_id)
+        try:
+            return _client_for_request(request).cancel_provider_account_setup(account_id)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not cancel this account connection"
+            ) from exc
 
     @app.post("/api/provider-accounts/{account_id}/verify")
     def verify_provider_account(request: Request, account_id: str) -> dict[str, Any]:
-        return _client_for_request(request).verify_provider_account(account_id)
+        try:
+            return _client_for_request(request).verify_provider_account(account_id)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not verify this account connection"
+            ) from exc
 
     @app.post("/api/provider-accounts/{account_id}/disconnect")
     def disconnect_provider_account(request: Request, account_id: str) -> dict[str, Any]:
-        return _client_for_request(request).disconnect_provider_account(account_id)
+        try:
+            return _client_for_request(request).disconnect_provider_account(account_id)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not remove this account"
+            ) from exc
 
     @app.delete("/api/provider-accounts/{account_id}")
     def forget_provider_account(request: Request, account_id: str) -> dict[str, Any]:
-        return _client_for_request(request).forget_provider_account(account_id)
+        try:
+            return _client_for_request(request).forget_provider_account(account_id)
+        except httpx.HTTPStatusError as exc:
+            raise _runtime_http_exception(
+                exc, "GlassHive could not remove this account"
+            ) from exc
 
     @app.get("/api/workspaces/{worker_id}/capability-grants")
     def list_workspace_capability_grants(request: Request, worker_id: str) -> dict[str, Any]:
@@ -3489,6 +3591,25 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                     bootstrap_bundle,
                     provider_account_selection,
                 )
+                selected_policy = str(
+                    (provider_account_selection or {}).get("policy") or "legacy"
+                ).strip().lower()
+                selected_account_id = str(
+                    (provider_account_selection or {}).get("account_id") or ""
+                ).strip()
+                uses_deployment_provider = selected_policy == "legacy" or (
+                    selected_policy == "personal_preferred" and not selected_account_id
+                )
+                if uses_deployment_provider:
+                    readiness = active_client.provider_readiness(profile)
+                    if str(readiness.get("readiness") or "") != "deployment_managed":
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Work AI is not set up. Ask an administrator to finish provider "
+                                "setup or connect a personal account in Connections."
+                            ),
+                        )
                 project = active_client.create_project(owner_id, build_project_title(payload.description), payload.description.strip(), profile)
                 project_id = str(project["project_id"])
                 worker = active_client.create_worker(
@@ -3516,6 +3637,8 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
                 scheduled = active_client.schedule_run(str(worker_id), brief, schedule_text=schedule_text)
             else:
                 run = active_client.assign_run(str(worker_id), brief)
+        except HTTPException:
+            raise
         except httpx.HTTPStatusError as exc:
             reason = _runtime_status_detail(exc, _format_launch_error(exc))
             if created_new_worker and worker_id:

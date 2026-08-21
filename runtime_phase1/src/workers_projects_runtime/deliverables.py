@@ -46,6 +46,7 @@ NON_DELIVERABLE_DIR_NAMES = {
     ".venv",
     "__pycache__",
     "chrome-user-data",
+    "browser-profile",
     "chromium-user-data",
     "glasshive-run",
     "glasshive-host-tools",
@@ -289,7 +290,6 @@ def deliverable_payload(
         preferred_html = html_candidates[0]
 
     urls = [url for url in extract_urls(latest_output, stdout_text, stderr_text) if is_deliverable_url(url)]
-    external_url = next((url for url in urls if not LOCALHOST_URL_PATTERN.search(url)), None)
     local_url = next((url for url in urls if LOCALHOST_URL_PATTERN.search(url)), None)
 
     if preferred_html is not None:
@@ -329,7 +329,7 @@ def deliverable_payload(
             "workspace_path": rel.as_posix(),
         }
 
-    if local_url or external_url:
+    if local_url:
         if execution_mode == "host":
             return {
                 "kind": "webpage",
@@ -340,13 +340,12 @@ def deliverable_payload(
                 "workspace_path": None,
                 "browser_url_available": False,
             }
-        browser_url = local_url or external_url
         return {
             "kind": "webpage",
             "state": "ready" if latest_run else "available",
             "source": "run_url",
-            "label": browser_url,
-            "browser_url": browser_url,
+            "label": local_url,
+            "browser_url": local_url,
             "preferred_surface": "desktop",
             "workspace_path": None,
         }

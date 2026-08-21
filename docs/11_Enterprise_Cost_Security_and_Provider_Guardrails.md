@@ -199,16 +199,31 @@ This route does not imply or advertise Claude consumer OAuth or Codex/ChatGPT su
 
 Multi-user native subscription missions fail closed unless the deployment declares the reviewed
 `per_worker_container` isolation mode. In that mode GlassHive mounts only the selected account home
-at `/workspace/.provider-account`, points Codex or Claude at its provider-specific child directory,
-and removes conflicting deployment gateway/key environment variables. Rootless Docker maps the
-container's non-root worker to a subordinate host uid, so a correct bind mount of the host-owned
-`0700`/`0600` tree is not sufficient by itself. The reviewed workstation image includes POSIX ACL
-support; startup grants and then verifies access for only the container worker user. There is no
-world-writable fallback. Current Codex also requires its non-secret `installation_id` metadata to be
-worker-owned at mode `0644` and its recreatable `tmp/arg0` directory to be worker-mutable. GlassHive
-prepares only those structured `CODEX_HOME` paths inside the selected container while the exclusive
-mission lease is held. It removes the credential-bearing container and tightens the entire credential
-tree back to service ownership and private modes before releasing the lease.
+at `/workspace/.provider-account` and removes conflicting deployment gateway/key environment
+variables. Codex keeps its workspace-local home and overlays only the selected account's native
+authentication. Claude keeps its workspace `HOME` and native user-scope MCP/plugin/trust state, while
+only the selected account's `CLAUDE_SECURESTORAGE_CONFIG_DIR` is projected during the lease. Rootless
+Docker maps the container's non-root worker to a subordinate host uid, so a correct bind mount of the
+host-owned `0700`/`0600` tree is not sufficient by itself. The reviewed workstation image includes
+POSIX ACL support; startup grants and then verifies access for only the container worker user. There
+is no world-writable fallback. Current Codex also requires its non-secret `installation_id` metadata
+to be worker-owned at mode `0644` and its recreatable `tmp/arg0` directory to be worker-mutable.
+GlassHive prepares only those structured `CODEX_HOME` paths inside the selected container while the
+exclusive mission lease is held. It removes the credential-bearing container and tightens the entire
+credential tree back to service ownership and private modes before releasing the lease.
+
+The same isolation contract applies to the visible native `Set up tools` window. The exact selected
+account receives a distinct short, heartbeated interactive lease; the attached Docker exec is monitored
+until the window closes, with a bounded maximum lifetime. Cleanup removes the whole credential-bearing
+container before releasing the lease. At the maximum lifetime, that authoritative remove/seal path gets
+one bounded retry for a transient teardown race, while a repeated failure still quarantines the account;
+the detached host-side Docker client is reaped after credential cleanup. Missions are rejected
+before run creation while that interactive lease is active even if the run changes provider route;
+queued or running work for that workspace also blocks setup. On service startup, every unreleased
+supported interactive lease is reconciled by removing the exact credential-bearing container and
+repairing the account home before the lease is released. Expired leases are included so process loss
+cannot leave an untracked credential mount. Non-harness browser/file/shell actions do not acquire the
+lease.
 
 Provider-account setup, verification, and missions acquire the same owner-scoped exclusive lease
 before touching the account home. In `per_worker_container` mode they first remove stale mounts and

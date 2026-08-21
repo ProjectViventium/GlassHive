@@ -751,6 +751,13 @@ class ControlPlaneStore:
                 raise ControlPlaneConflict("Provider account is still in use")
             conn.execute(
                 """
+                DELETE FROM workspace_capability_grants
+                WHERE account_id = ? AND tenant_id = ? AND owner_id = ?
+                """,
+                (account_id, tenant_id, owner_id),
+            )
+            conn.execute(
+                """
                 DELETE FROM provider_accounts
                 WHERE account_id = ? AND tenant_id = ? AND owner_id = ?
                 """,
@@ -785,6 +792,7 @@ class ControlPlaneStore:
         if normalized_recovery is not None and normalized_recovery not in PROVIDER_ACCOUNT_RECOVERY_CODES:
             raise ControlPlaneError("Provider lease recovery code is invalid")
         lease_id = _id("lease")
+        normalized_lane = str(lane or "default")[:80]
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             account = conn.execute(
@@ -793,6 +801,48 @@ class ControlPlaneStore:
             ).fetchone()
             if account is None:
                 raise ControlPlaneError("Provider account not found for this user")
+            if normalized_lane.endswith(":interactive"):
+                runs_table = conn.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'runs'
+                    """
+                ).fetchone()
+                if runs_table is not None:
+                    workspace_run = conn.execute(
+                        """
+                        SELECT 1 FROM runs
+                        WHERE worker_id = ? AND state IN ('queued', 'running')
+                        LIMIT 1
+                        """,
+                        (worker_id,),
+                    ).fetchone()
+                    if workspace_run is not None:
+                        raise ControlPlaneConflict(
+                            "Provider account work is starting or running"
+                        )
+                fence_table = conn.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'provider_account_run_fences'
+                    """
+                ).fetchone()
+                if fence_table is not None:
+                    active_run = conn.execute(
+                        """
+                        SELECT 1
+                        FROM provider_account_run_fences AS fences
+                        JOIN runs ON runs.run_id = fences.run_id
+                        WHERE fences.account_id = ?
+                          AND runs.state IN ('queued', 'running')
+                        LIMIT 1
+                        """,
+                        (account_id,),
+                    ).fetchone()
+                    if active_run is not None:
+                        raise ControlPlaneConflict(
+                            "Provider account work is starting or running"
+                        )
             active = conn.execute(
                 """
                 SELECT lease_id FROM provider_account_leases
@@ -819,7 +869,7 @@ class ControlPlaneStore:
                     account_id,
                     tenant_id,
                     owner_id,
-                    str(lane or "default")[:80],
+                    normalized_lane,
                     worker_id,
                     run_id,
                     timestamp,
@@ -926,6 +976,37 @@ class ControlPlaneStore:
                 (account_id, lane, timestamp),
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def active_provider_account_lease(
+        self, account_id: str, *, now: float | None = None
+    ) -> dict[str, Any] | None:
+        """Return the current lease that would block any new use of this account."""
+
+        timestamp = float(now if now is not None else time.time())
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM provider_account_leases
+                WHERE account_id = ? AND released_at IS NULL AND expires_at > ?
+                ORDER BY acquired_at DESC LIMIT 1
+                """,
+                (account_id, timestamp),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def unreleased_interactive_provider_leases(self) -> list[dict[str, Any]]:
+        """Return setup leases that require credential-container cleanup after restart."""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM provider_account_leases
+                WHERE released_at IS NULL
+                  AND lane IN ('codex-cli:interactive', 'claude-code:interactive')
+                ORDER BY acquired_at, lease_id
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def heartbeat_provider_lease(
         self,

@@ -3,22 +3,27 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import shlex
 import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
+from threading import Event
 
 import pytest
 
 from workers_projects_runtime.docker_sandbox import (
     AI_WORKER_APT_SNAPSHOT,
+    AI_WORKER_CLAUDE_CODE_NPM_SPEC,
+    AI_WORKER_CODEX_NPM_SPEC,
     AI_WORKER_PYTHON_LOCK_PATH,
     DockerSandboxManager,
     SandboxInfo,
     VNC_PASSWORD_ALPHABET,
-    _CODEX_PROVIDER_RUNTIME_METADATA_SCRIPT,
+    _CLAUDE_WORKSPACE_ONBOARDING_SCRIPT,
+    _CODEX_PROVIDER_AUTH_LINK_SCRIPT,
     _ai_worker_browser_extension_check_script,
     _ai_worker_browser_native_host_bootstrap_script,
     _provider_account_seal_script,
@@ -34,6 +39,42 @@ from workers_projects_runtime.openclaw_release import (
     OPENCLAW_RUNTIME_LOCK_SHA256,
     OPENCLAW_RUNTIME_VERSION,
 )
+from workers_projects_runtime.codex_plugins import (
+    OPENAI_PLUGIN_MARKETPLACE_COMMIT,
+    OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH,
+    OPENAI_PLUGIN_MARKETPLACE_ORIGIN,
+)
+
+
+def test_worker_codex_uses_the_current_reviewed_stable_release():
+    assert AI_WORKER_CODEX_NPM_SPEC == "@openai/codex@0.147.0"
+
+
+def test_worker_claude_uses_the_current_reviewed_stable_release():
+    assert AI_WORKER_CLAUDE_CODE_NPM_SPEC == "@anthropic-ai/claude-code@2.1.233"
+
+
+def test_bootstrap_copy_never_follows_an_existing_destination_symlink(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path / "workers"))
+    source = tmp_path / "source-auth.json"
+    destination = tmp_path / "home" / ".codex" / "auth.json"
+    source.write_text("host credential")
+    destination.parent.mkdir(parents=True)
+    destination.symlink_to("/workspace/.provider-account/codex/auth.json")
+
+    manager._copy_file(source, destination)  # type: ignore[attr-defined]
+
+    assert destination.is_symlink()
+    assert destination.readlink() == Path("/workspace/.provider-account/codex/auth.json")
+
+
+def test_running_task_sandbox_recreate_requires_transient_task_marker():
+    assert DockerSandboxManager._worker_state_allows_substrate_recreate(
+        {"state": "running", "_glasshive_task_run": True}
+    )
+    assert not DockerSandboxManager._worker_state_allows_substrate_recreate(
+        {"state": "running"}
+    )
 
 
 def test_safe_docker_exec_env_preserves_claude_headless_oauth_only():
@@ -53,15 +94,95 @@ def test_safe_docker_exec_env_preserves_claude_headless_oauth_only():
 def test_safe_docker_exec_env_preserves_bound_provider_home_selectors():
     env = _safe_docker_exec_env(
         {
-            "CODEX_HOME": "/workspace/.provider-account/codex",
-            "CLAUDE_CONFIG_DIR": "/workspace/.provider-account/claude",
+            "CODEX_HOME": "/workspace/.wpr-home/.codex",
+            "CLAUDE_CONFIG_DIR": "/workspace/.wpr-home/.claude",
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/workspace/.provider-account/claude",
             "UNRELATED_SECRET": "must-not-pass",
         }
     )
 
-    assert env["CODEX_HOME"] == "/workspace/.provider-account/codex"
-    assert env["CLAUDE_CONFIG_DIR"] == "/workspace/.provider-account/claude"
+    assert env["CODEX_HOME"] == "/workspace/.wpr-home/.codex"
+    assert env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == "/workspace/.provider-account/claude"
+    assert "CLAUDE_CONFIG_DIR" not in env
     assert "UNRELATED_SECRET" not in env
+
+
+def test_claude_workspace_onboarding_marker_preserves_native_state(tmp_path):
+    workspace_home = tmp_path / "home"
+    workspace_home.mkdir(mode=0o700)
+    state_path = workspace_home / ".claude.json"
+    state_path.write_text('{"theme":"dark"}\n', encoding="utf-8")
+    state_path.chmod(0o600)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _CLAUDE_WORKSPACE_ONBOARDING_SCRIPT, str(workspace_home)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "hasCompletedOnboarding": True,
+        "theme": "dark",
+    }
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+
+
+def test_claude_workspace_onboarding_accepts_container_root_owned_bind_home(tmp_path):
+    workspace_home = tmp_path / "root-owned-bind-home"
+    workspace_home.mkdir(mode=0o700)
+    wrapper = f"""
+import pathlib
+import types
+import sys
+
+workspace = pathlib.Path(sys.argv[1])
+real_lstat = pathlib.Path.lstat
+
+def docker_bind_lstat(path):
+    metadata = real_lstat(path)
+    if path == workspace:
+        return types.SimpleNamespace(st_mode=metadata.st_mode, st_uid=0)
+    return metadata
+
+pathlib.Path.lstat = docker_bind_lstat
+exec({_CLAUDE_WORKSPACE_ONBOARDING_SCRIPT!r})
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", wrapper, str(workspace_home)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads((workspace_home / ".claude.json").read_text(encoding="utf-8")) == {
+        "hasCompletedOnboarding": True,
+    }
+
+
+def test_claude_workspace_onboarding_tightens_acl_mask_mode(tmp_path):
+    workspace_home = tmp_path / "acl-prepared-home"
+    workspace_home.mkdir(mode=0o700)
+    state_path = workspace_home / ".claude.json"
+    state_path.write_text('{"nativeState":"preserved"}\n', encoding="utf-8")
+    state_path.chmod(0o670)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _CLAUDE_WORKSPACE_ONBOARDING_SCRIPT, str(workspace_home)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "hasCompletedOnboarding": True,
+        "nativeState": "preserved",
+    }
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
 
 
 def test_safe_docker_exec_env_preserves_bedrock_run_credentials_only():
@@ -206,6 +327,7 @@ def test_bound_provider_account_mount_grants_and_verifies_only_worker_user_acces
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     account_home = tmp_path / "provider-accounts" / "acct-safe"
     (account_home / "codex").mkdir(parents=True)
+    (account_home / "codex" / "auth.json").write_text("synthetic auth")
     calls: list[tuple[str | None, list[str]]] = []
 
     def fake_docker_exec(
@@ -227,7 +349,7 @@ def test_bound_provider_account_mount_grants_and_verifies_only_worker_user_acces
         "_glasshive_provider_account_mount_host": str(account_home),
         "_glasshive_provider_account_mount_target": "/workspace/.provider-account",
         "_glasshive_provider_account_env": {
-            "CODEX_HOME": "/workspace/.provider-account/codex"
+            "CODEX_HOME": "/workspace/.wpr-home/.codex"
         },
     }
 
@@ -235,31 +357,218 @@ def test_bound_provider_account_mount_grants_and_verifies_only_worker_user_acces
 
     assert len(calls) == 3
     assert calls[0][0] == "root"
-    grant_script = calls[0][1][-1]
-    assert "command -v setfacl" in grant_script
-    assert "setfacl -R -m u:seluser:rwX" in grant_script
-    assert "installation_id" not in grant_script
-    assert calls[1][0] == "root"
-    assert calls[1][1][:2] == ["python3", "-c"]
-    assert calls[1][1][2] == _CODEX_PROVIDER_RUNTIME_METADATA_SCRIPT
-    assert calls[1][1][3:] == [
+    assert calls[0][1][:2] == ["python3", "-c"]
+    assert calls[0][1][2] == _CODEX_PROVIDER_AUTH_LINK_SCRIPT
+    assert calls[0][1][3:] == [
         "/workspace/.provider-account",
         "codex",
+        "/workspace/.wpr-home",
         "seluser",
     ]
-    assert "os.O_NOFOLLOW" in calls[1][1][2]
-    assert "metadata.st_nlink != 1" in calls[1][1][2]
-    assert "os.fchown(installation_fd" in calls[1][1][2]
-    assert "os.fchmod(installation_fd, 0o644)" in calls[1][1][2]
-    assert "os.fchown(arg0_fd" in calls[1][1][2]
-    assert "os.fchmod(arg0_fd, 0o700)" in calls[1][1][2]
-    assert "delete" not in calls[1][1][2]
+    assert "os.O_NOFOLLOW" in calls[0][1][2]
+    assert "metadata.st_nlink != 1" in calls[0][1][2]
+    assert "os.symlink" in calls[0][1][2]
+    assert calls[1][0] == "root"
+    grant_script = calls[1][1][-1]
+    assert "command -v setfacl" in grant_script
+    assert "setfacl -m u:seluser:x /workspace/.provider-account" in grant_script
+    assert "setfacl -m u:seluser:rw /workspace/.provider-account/codex/auth.json" in grant_script
+    assert "setfacl -R" not in grant_script
     assert calls[2][0] == "seluser"
     verify_script = calls[2][1][-1]
-    assert "test -r /workspace/.provider-account/codex" in verify_script
-    assert "test -w /workspace/.provider-account/codex" in verify_script
-    assert "test -O /workspace/.provider-account/codex/installation_id" in verify_script
-    assert "stat -c %a /workspace/.provider-account/codex/installation_id" in verify_script
+    assert "test -r /workspace/.wpr-home/.codex" in verify_script
+    assert "test -w /workspace/.wpr-home/.codex" in verify_script
+    assert "readlink /workspace/.wpr-home/.codex/auth.json" in verify_script
+    assert "/workspace/.provider-account/codex/auth.json" in verify_script
+
+
+def _run_codex_provider_auth_link(
+    provider_root: Path,
+    workspace_home: Path,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _CODEX_PROVIDER_AUTH_LINK_SCRIPT,
+            str(provider_root),
+            "codex",
+            str(workspace_home),
+            f"{os.getuid()}:{os.getgid()}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def test_codex_provider_auth_link_keeps_workspace_config_and_uses_live_account_auth(tmp_path):
+    provider_root = tmp_path / "provider"
+    provider_home = provider_root / "codex"
+    provider_home.mkdir(parents=True)
+    provider_auth = provider_home / "auth.json"
+    provider_auth.write_text("synthetic live credential")
+    provider_auth.chmod(0o600)
+    workspace_home = tmp_path / "workspace-home"
+    workspace_codex = workspace_home / ".codex"
+    workspace_codex.mkdir(parents=True)
+    workspace_config = workspace_codex / "config.toml"
+    workspace_config.write_text("[features]\nplugins = true\n")
+    plugin_marker = workspace_codex / "plugins" / "installed.marker"
+    plugin_marker.parent.mkdir()
+    plugin_marker.write_text("persistent")
+    workspace_codex.chmod(0o750)
+    original_owner = (workspace_codex.stat().st_uid, workspace_codex.stat().st_gid)
+
+    first = _run_codex_provider_auth_link(provider_root, workspace_home)
+    auth_link = workspace_codex / "auth.json"
+    # Codex's file backend refreshes auth with an in-place truncate/write. The
+    # live link must update the selected account file, never copy it into the
+    # reusable workspace.
+    auth_link.write_text("synthetic refreshed credential")
+    second = _run_codex_provider_auth_link(provider_root, workspace_home)
+
+    assert first.returncode == second.returncode == 0
+    assert auth_link.is_symlink()
+    assert auth_link.readlink() == provider_auth
+    assert auth_link.read_text() == "synthetic refreshed credential"
+    assert provider_auth.read_text() == "synthetic refreshed credential"
+    assert workspace_config.read_text() == "[features]\nplugins = true\n"
+    assert plugin_marker.read_text() == "persistent"
+    assert (workspace_codex.stat().st_uid, workspace_codex.stat().st_gid) == original_owner
+    assert stat.S_IMODE(workspace_codex.stat().st_mode) == 0o750
+
+
+def test_codex_provider_auth_overlay_restores_workspace_login_for_idle_reuse(tmp_path):
+    provider_root = tmp_path / "provider"
+    provider_home = provider_root / "codex"
+    provider_home.mkdir(parents=True)
+    provider_auth = provider_home / "auth.json"
+    provider_auth.write_text("synthetic mission credential")
+    provider_auth.chmod(0o600)
+    workspace_home = tmp_path / "workspace-home"
+    workspace_codex = workspace_home / ".codex"
+    workspace_codex.mkdir(parents=True)
+    workspace_auth = workspace_codex / "auth.json"
+    workspace_auth.write_text("synthetic workspace credential")
+    workspace_auth.chmod(0o600)
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    private_dir = tmp_path / "worker-private"
+
+    manager._prepare_workspace_codex_auth_overlay(  # type: ignore[attr-defined]
+        workspace_home,
+        private_dir,
+    )
+
+    mission = _run_codex_provider_auth_link(provider_root, workspace_home)
+
+    assert mission.returncode == 0
+    assert workspace_auth.is_symlink()
+    assert workspace_auth.readlink() == provider_auth
+    private_backup = private_dir / "codex-workspace-auth.json"
+    assert private_backup.read_text() == "synthetic workspace credential"
+    assert private_backup.parent != workspace_home
+    assert not os.path.lexists(workspace_codex / ".glasshive-workspace-auth.json")
+
+    manager._restore_workspace_codex_auth(  # type: ignore[attr-defined]
+        workspace_home,
+        private_dir,
+        expected_target=str(provider_auth),
+    )
+
+    assert workspace_auth.is_file()
+    assert not workspace_auth.is_symlink()
+    assert workspace_auth.read_text() == "synthetic workspace credential"
+    assert not private_backup.exists()
+
+
+def test_codex_provider_auth_overlay_leaves_idle_workspace_ready_for_manual_login(tmp_path):
+    provider_root = tmp_path / "provider"
+    provider_home = provider_root / "codex"
+    provider_home.mkdir(parents=True)
+    provider_auth = provider_home / "auth.json"
+    provider_auth.write_text("synthetic mission credential")
+    provider_auth.chmod(0o600)
+    workspace_home = tmp_path / "workspace-home"
+    workspace_home.mkdir()
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    private_dir = tmp_path / "worker-private"
+    manager._prepare_workspace_codex_auth_overlay(  # type: ignore[attr-defined]
+        workspace_home,
+        private_dir,
+    )
+
+    mission = _run_codex_provider_auth_link(provider_root, workspace_home)
+    assert mission.returncode == 0
+
+    manager._restore_workspace_codex_auth(  # type: ignore[attr-defined]
+        workspace_home,
+        private_dir,
+        expected_target=str(provider_auth),
+    )
+
+    assert not (workspace_home / ".codex" / "auth.json").exists()
+    assert not (private_dir / "codex-workspace-auth.json").exists()
+
+
+def test_codex_provider_auth_link_preserves_host_managed_workspace_home_contract():
+    assert "os.fchown(codex_home_fd" not in _CODEX_PROVIDER_AUTH_LINK_SCRIPT
+    assert "os.fchmod(codex_home_fd" not in _CODEX_PROVIDER_AUTH_LINK_SCRIPT
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "hardlink", "fifo"])
+def test_codex_provider_auth_link_rejects_unsafe_account_auth(tmp_path, unsafe_kind):
+    provider_root = tmp_path / "provider"
+    provider_home = provider_root / "codex"
+    provider_home.mkdir(parents=True)
+    provider_auth = provider_home / "auth.json"
+    external = tmp_path / "external"
+    external.write_text("unchanged")
+    if unsafe_kind == "symlink":
+        provider_auth.symlink_to(external)
+    elif unsafe_kind == "hardlink":
+        os.link(external, provider_auth)
+    else:
+        os.mkfifo(provider_auth)
+    workspace_home = tmp_path / "workspace-home"
+    workspace_home.mkdir()
+
+    result = _run_codex_provider_auth_link(provider_root, workspace_home)
+
+    assert result.returncode != 0
+    assert external.read_text() == "unchanged"
+    assert not (workspace_home / ".codex" / "auth.json").exists()
+
+
+@pytest.mark.parametrize("unsafe_kind", ["wrong_link", "fifo"])
+def test_codex_provider_auth_link_never_replaces_workspace_auth_state(
+    tmp_path,
+    unsafe_kind,
+):
+    provider_root = tmp_path / "provider"
+    provider_home = provider_root / "codex"
+    provider_home.mkdir(parents=True)
+    provider_auth = provider_home / "auth.json"
+    provider_auth.write_text("synthetic live credential")
+    provider_auth.chmod(0o600)
+    workspace_home = tmp_path / "workspace-home"
+    workspace_codex = workspace_home / ".codex"
+    workspace_codex.mkdir(parents=True)
+    workspace_auth = workspace_codex / "auth.json"
+    if unsafe_kind == "wrong_link":
+        workspace_auth.symlink_to(tmp_path / "wrong-account" / "auth.json")
+    else:
+        os.mkfifo(workspace_auth)
+
+    result = _run_codex_provider_auth_link(provider_root, workspace_home)
+
+    assert result.returncode != 0
+    if unsafe_kind == "wrong_link":
+        assert workspace_auth.is_symlink()
+        assert workspace_auth.readlink() == tmp_path / "wrong-account" / "auth.json"
+    else:
+        assert stat.S_ISFIFO(workspace_auth.stat().st_mode)
 
 
 def test_bound_claude_account_does_not_apply_codex_runtime_metadata_contract(tmp_path):
@@ -289,74 +598,26 @@ def test_bound_claude_account_does_not_apply_codex_runtime_metadata_contract(tmp
             "_glasshive_provider_account_mount_host": str(account_home),
             "_glasshive_provider_account_mount_target": "/workspace/.provider-account",
             "_glasshive_provider_account_env": {
-                "CLAUDE_CONFIG_DIR": "/workspace/.provider-account/claude"
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/workspace/.provider-account/claude",
             },
         },
     )
 
-    grant_script = calls[0][1][-1]
+    assert calls[0][0] == manager.user
+    assert calls[0][1][:2] == ["python3", "-c"]
+    grant_script = calls[1][1][-1]
     assert "installation_id" not in grant_script
     assert "/tmp/arg0" not in grant_script
-    assert len(calls) == 2
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" in grant_script
+    assert len(calls) == 3
 
 
-def _run_codex_runtime_metadata_prep(root: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            _CODEX_PROVIDER_RUNTIME_METADATA_SCRIPT,
-            str(root),
-            "codex",
-            f"{os.getuid()}:{os.getgid()}",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-
-
-def test_codex_runtime_metadata_prep_is_repeatable_and_preserves_arg0_helpers(tmp_path):
-    codex_home = tmp_path / "codex"
-    arg0_root = codex_home / "tmp" / "arg0"
-    arg0_root.mkdir(parents=True)
-    helper = arg0_root / "active-helper"
-    helper.write_text("still active")
-    installation_id = codex_home / "installation_id"
-    installation_id.write_text("00000000-0000-4000-8000-000000000001")
-    installation_id.chmod(0o600)
-    arg0_root.chmod(0o700)
-
-    first = _run_codex_runtime_metadata_prep(tmp_path)
-    # The next readiness pass applies the recursive named rw ACL first. Its
-    # mask appears in the group mode bits until the metadata helper restores
-    # Codex's required exact 0644 mode.
-    installation_id.chmod(0o664)
-    second = _run_codex_runtime_metadata_prep(tmp_path)
-
-    assert first.returncode == second.returncode == 0
-    assert stat.S_IMODE(installation_id.stat().st_mode) == 0o644
-    assert installation_id.stat().st_uid == os.getuid()
-    assert stat.S_IMODE(arg0_root.stat().st_mode) == 0o700
-    assert arg0_root.stat().st_uid == os.getuid()
-    assert helper.read_text() == "still active"
-
-
-def test_codex_runtime_metadata_prep_allows_missing_optional_metadata(tmp_path):
-    (tmp_path / "codex").mkdir()
-
-    result = _run_codex_runtime_metadata_prep(tmp_path)
-
-    assert result.returncode == 0
-
-
-def test_bound_codex_account_requires_the_exact_private_codex_home(tmp_path):
+def test_bound_codex_account_requires_the_exact_persistent_workspace_home(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     account_home = tmp_path / "provider-accounts" / "acct-safe"
     (account_home / "other").mkdir(parents=True)
 
-    with pytest.raises(RuntimeError, match="exact private directory"):
+    with pytest.raises(RuntimeError, match="exact persistent workspace home"):
         manager._grant_provider_account_access(  # type: ignore[attr-defined]
             "wpr-test",
             {
@@ -370,7 +631,7 @@ def test_bound_codex_account_requires_the_exact_private_codex_home(tmp_path):
         )
 
 
-def test_bound_codex_account_fails_closed_when_runtime_metadata_cannot_be_prepared(tmp_path):
+def test_bound_codex_account_fails_closed_when_auth_link_cannot_be_prepared(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     account_home = tmp_path / "provider-accounts" / "acct-safe"
     (account_home / "codex").mkdir(parents=True)
@@ -393,7 +654,7 @@ def test_bound_codex_account_fails_closed_when_runtime_metadata_cannot_be_prepar
 
     manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
 
-    with pytest.raises(RuntimeError, match="unsafe runtime metadata"):
+    with pytest.raises(RuntimeError, match="unsafe authentication state"):
         manager._grant_provider_account_access(  # type: ignore[attr-defined]
             "wpr-test",
             {
@@ -401,49 +662,13 @@ def test_bound_codex_account_fails_closed_when_runtime_metadata_cannot_be_prepar
                 "_glasshive_provider_account_mount_host": str(account_home),
                 "_glasshive_provider_account_mount_target": "/workspace/.provider-account",
                 "_glasshive_provider_account_env": {
-                    "CODEX_HOME": "/workspace/.provider-account/codex"
+                    "CODEX_HOME": "/workspace/.wpr-home/.codex"
                 },
             },
         )
 
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert calls[0][0] == "root"
-    assert calls[1][0] == "root"
-
-
-@pytest.mark.parametrize("unsafe_kind", ["symlink", "hardlink", "fifo"])
-def test_codex_runtime_metadata_prep_rejects_unsafe_installation_id(tmp_path, unsafe_kind):
-    codex_home = tmp_path / "codex"
-    codex_home.mkdir()
-    installation_id = codex_home / "installation_id"
-    external = tmp_path / "external"
-    external.write_text("unchanged")
-    if unsafe_kind == "symlink":
-        installation_id.symlink_to(external)
-    elif unsafe_kind == "hardlink":
-        os.link(external, installation_id)
-    else:
-        os.mkfifo(installation_id)
-
-    result = _run_codex_runtime_metadata_prep(tmp_path)
-
-    assert result.returncode != 0
-    assert external.read_text() == "unchanged"
-
-
-def test_codex_runtime_metadata_prep_rejects_arg0_symlink_without_touching_target(tmp_path):
-    tmp_root = tmp_path / "codex" / "tmp"
-    tmp_root.mkdir(parents=True)
-    external = tmp_path / "external-arg0"
-    external.mkdir()
-    marker = external / "marker"
-    marker.write_text("unchanged")
-    (tmp_root / "arg0").symlink_to(external, target_is_directory=True)
-
-    result = _run_codex_runtime_metadata_prep(tmp_path)
-
-    assert result.returncode != 0
-    assert marker.read_text() == "unchanged"
 
 
 def test_provider_account_mount_requires_private_binder_marker(tmp_path):
@@ -807,6 +1032,30 @@ def test_fast_sandbox_does_not_treat_projected_paths_as_container_evidence(tmp_p
     assert manager.fast_sandbox_from_worker(worker) is None
 
 
+def test_fast_sandbox_rejects_stale_provider_mount_for_idle_workspace(tmp_path):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    sandbox = SandboxInfo(
+        container_name="wpr-wrk-idle",
+        container_id="container-idle",
+        state="running",
+        workspace_dir=str(tmp_path / "workspace"),
+        home_dir=str(tmp_path / "home"),
+        pid=4242,
+        image=manager.image,
+        networks=(manager._network_name_for_container("wpr-wrk-idle"),),
+        mounts=((str(tmp_path / "provider-account"), "/workspace/.provider-account"),),
+    )
+    manager.inspect = lambda worker_id: sandbox  # type: ignore[method-assign]
+
+    assert manager.fast_sandbox_from_worker(
+        {
+            "worker_id": "wrk_idle",
+            "container_id": "container-idle",
+            "state": "ready",
+        }
+    ) is None
+
+
 def test_ensure_ready_creates_container_when_only_projected_paths_exist(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     created: list[str] = []
@@ -1123,6 +1372,244 @@ def test_docker_exec_detach_uses_popen_without_waiting(tmp_path, monkeypatch):
     assert "wpr-test bash -lc 'sleep 60'" in calls[0][2]
 
 
+def test_docker_exec_monitors_visible_provider_session_until_window_closes(
+    tmp_path, monkeypatch
+):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[list[str]] = []
+    allow_exit = Event()
+    callback_called = Event()
+
+    class FakePopen:
+        def __init__(self, command, *, stdout=None, stderr=None, **kwargs):
+            calls.append(command)
+
+        def wait(self, timeout=None):
+            assert timeout == 30
+            assert allow_exit.wait(2)
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+    result = manager._docker_exec(
+        "wpr-test",
+        ["xterm", "-e", "claude"],
+        env={"HOME": "/workspace/.wpr-home"},
+        cwd="/workspace/project",
+        fire_and_forget=True,
+        on_exit=callback_called.set,
+        max_runtime_seconds=30,
+    )
+
+    assert result.returncode == 0
+    assert len(calls) == 1
+    assert "docker exec -u seluser" in calls[0][2]
+    assert "docker exec -d" not in calls[0][2]
+    assert not callback_called.is_set()
+
+    allow_exit.set()
+    assert callback_called.wait(2)
+
+
+def test_docker_exec_timeout_releases_provider_before_reaping_detached_client(
+    tmp_path, monkeypatch
+):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    callback_called = Event()
+    events: list[str] = []
+
+    class FakePopen:
+        pid = 4242
+
+        def __init__(self, _command, *, stdout=None, stderr=None, **kwargs):
+            self.wait_count = 0
+
+        def wait(self, timeout=None):
+            self.wait_count += 1
+            events.append(f"wait:{timeout}")
+            if self.wait_count == 1:
+                raise subprocess.TimeoutExpired("synthetic interactive session", timeout)
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda pid, sent_signal: events.append(
+            f"signal:{pid}:{signal.Signals(sent_signal).name}"
+        ),
+    )
+
+    def close_session():
+        events.append("on_exit")
+        callback_called.set()
+
+    result = manager._docker_exec(
+        "wpr-test",
+        ["xterm", "-e", "claude"],
+        env={"HOME": "/workspace/.wpr-home"},
+        fire_and_forget=True,
+        on_exit=close_session,
+        max_runtime_seconds=30,
+    )
+
+    assert result.returncode == 0
+    assert callback_called.wait(2)
+    assert events == ["wait:30", "on_exit", "wait:15"]
+
+
+def test_docker_exec_timeout_escalates_stubborn_detached_client_after_cleanup(
+    tmp_path, monkeypatch
+):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    callback_called = Event()
+    events: list[str] = []
+
+    class FakePopen:
+        pid = 4242
+
+        def __init__(self, _command, *, stdout=None, stderr=None, **kwargs):
+            self.wait_count = 0
+
+        def wait(self, timeout=None):
+            self.wait_count += 1
+            events.append(f"wait:{timeout}")
+            if self.wait_count < 4:
+                raise subprocess.TimeoutExpired("synthetic interactive session", timeout)
+            return 0
+
+        def terminate(self):
+            events.append("terminate")
+
+        def kill(self):
+            events.append("kill")
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda pid, sent_signal: events.append(
+            f"signal:{pid}:{signal.Signals(sent_signal).name}"
+        ),
+    )
+
+    def close_session():
+        events.append("on_exit")
+        callback_called.set()
+
+    result = manager._docker_exec(
+        "wpr-test",
+        ["xterm", "-e", "claude"],
+        env={"HOME": "/workspace/.wpr-home"},
+        fire_and_forget=True,
+        on_exit=close_session,
+        max_runtime_seconds=30,
+    )
+
+    assert result.returncode == 0
+    assert callback_called.wait(2)
+    assert events == [
+        "wait:30",
+        "on_exit",
+        "wait:15",
+        "signal:4242:SIGTERM",
+        "wait:5",
+        "signal:4242:SIGKILL",
+        "wait:5",
+    ]
+    assert list((manager.runtime_root / ".docker-exec-env").glob("*.env")) == []
+
+
+def test_docker_exec_timeout_falls_back_when_process_group_signals_fail(
+    tmp_path, monkeypatch
+):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    callback_called = Event()
+    events: list[str] = []
+
+    class FakePopen:
+        pid = 4242
+
+        def __init__(self, _command, *, stdout=None, stderr=None, **kwargs):
+            self.wait_count = 0
+
+        def wait(self, timeout=None):
+            self.wait_count += 1
+            events.append(f"wait:{timeout}")
+            if self.wait_count < 4:
+                raise subprocess.TimeoutExpired("synthetic interactive session", timeout)
+            return 0
+
+        def terminate(self):
+            events.append("terminate")
+
+        def kill(self):
+            events.append("kill")
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+    def fail_group_signal(_pid, sent_signal):
+        events.append(f"signal_failed:{signal.Signals(sent_signal).name}")
+        raise OSError("synthetic host process-group failure")
+
+    monkeypatch.setattr(os, "killpg", fail_group_signal)
+
+    def close_session():
+        events.append("on_exit")
+        callback_called.set()
+
+    result = manager._docker_exec(
+        "wpr-test",
+        ["xterm", "-e", "claude"],
+        env={"HOME": "/workspace/.wpr-home"},
+        fire_and_forget=True,
+        on_exit=close_session,
+        max_runtime_seconds=30,
+    )
+
+    assert result.returncode == 0
+    assert callback_called.wait(2)
+    deadline = time.monotonic() + 2
+    while len(events) < 9 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert events == [
+        "wait:30",
+        "on_exit",
+        "wait:15",
+        "signal_failed:SIGTERM",
+        "terminate",
+        "wait:5",
+        "signal_failed:SIGKILL",
+        "kill",
+        "wait:5",
+    ]
+    assert list((manager.runtime_root / ".docker-exec-env").glob("*.env")) == []
+
+
+def test_docker_exec_spawn_failure_is_reported_and_cleans_private_env(
+    tmp_path, monkeypatch
+):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+
+    def fail_to_spawn(*_args, **_kwargs):
+        raise OSError("synthetic spawn failure")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_to_spawn)
+
+    result = manager._docker_exec(
+        "wpr-test",
+        ["xterm", "-e", "claude"],
+        env={"HOME": "/workspace/.wpr-home"},
+        fire_and_forget=True,
+        on_exit=lambda: None,
+        max_runtime_seconds=30,
+    )
+
+    assert result.returncode == 1
+    assert result.stderr == "Docker exec could not start"
+    assert list((manager.runtime_root / ".docker-exec-env").glob("*.env")) == []
+
+
 def test_docker_exec_detach_confirms_docker_accepts_command(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     calls: list[tuple[list[str], dict[str, object]]] = []
@@ -1377,6 +1864,78 @@ def test_desktop_action_revalidates_projected_worker_without_container_evidence(
     assert calls == ["ensure", "wpr-wrk-test:True:True:bash"]
 
 
+@pytest.mark.parametrize(
+    ("runtime_name", "action", "provider_environment", "absent_selectors"),
+    (
+        (
+            "claude-code",
+            "claude",
+            {
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/workspace/.provider-account/claude",
+            },
+            {"CODEX_HOME", "CLAUDE_CONFIG_DIR"},
+        ),
+        (
+            "codex-cli",
+            "codex",
+            {"CODEX_HOME": "/workspace/.wpr-home/.codex"},
+            {"CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"},
+        ),
+    ),
+)
+def test_desktop_action_projects_only_the_validated_personal_provider_home(
+    tmp_path,
+    runtime_name,
+    action,
+    provider_environment,
+    absent_selectors,
+):
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    captured_env: dict[str, str] = {}
+    sandbox = SandboxInfo(
+        container_name="wpr-wrk-test",
+        container_id="container123",
+        state="running",
+        workspace_dir=str(tmp_path / "workspace"),
+        home_dir=str(tmp_path / "home"),
+        pid=1234,
+        image="img",
+        novnc_port=None,
+    )
+    manager.ensure_ready = lambda *args, **kwargs: sandbox  # type: ignore[method-assign]
+
+    def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
+        captured_env.update(dict(env or {}))
+        return subprocess.CompletedProcess(["docker"], returncode=0, stdout="", stderr="")
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+    worker = {
+        "worker_id": "wrk_test",
+        "state": "running",
+        "execution_mode": "docker",
+        "bootstrap_bundle": {
+            "provider_account": {
+                "policy": "personal_required",
+                "account_id": "acct_claude",
+            }
+        },
+        "_glasshive_provider_account_bound": True,
+        "_glasshive_provider_account_env": provider_environment,
+    }
+
+    launched = manager.desktop_action(
+        "wrk_test",
+        runtime_name,
+        action,
+        worker=worker,
+    )
+
+    assert launched["status"] == "launched"
+    for selector, selector_value in provider_environment.items():
+        assert captured_env[selector] == selector_value
+    assert absent_selectors.isdisjoint(captured_env)
+
+
 def test_ensure_ready_skips_image_probe_for_existing_container(tmp_path):
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     calls: list[str] = []
@@ -1563,17 +2122,21 @@ def test_ensure_image_defaults_to_no_forced_ai_worker_browser_extensions(tmp_pat
     manager._ensure_image()
 
     dockerfile = (manager.build_root / "Dockerfile").read_text()
-    assert manager.image.endswith(":phase1-node22-docs8-openclaw2026.7.1-5")
+    assert manager.image.endswith(":phase1-node22-docs8-openclaw2026.7.1-6")
     assert "FROM selenium/standalone-chromium:4.46.0-20260707@sha256:" in dockerfile
     assert "com.glasshive.workstation.provenance=reviewed-v1" in dockerfile
     assert "com.glasshive.workstation.provider-account-acl=required-v1" in dockerfile
     assert AI_WORKER_APT_SNAPSHOT == "20260801T000000Z"
     assert f"com.glasshive.workstation.apt-snapshot={AI_WORKER_APT_SNAPSHOT}" in dockerfile
+    assert f"com.glasshive.workstation.openai-plugins-commit={OPENAI_PLUGIN_MARKETPLACE_COMMIT}" in dockerfile
+    assert OPENAI_PLUGIN_MARKETPLACE_ORIGIN in dockerfile
+    assert OPENAI_PLUGIN_MARKETPLACE_IMAGE_PATH in dockerfile
+    assert f"rev-parse HEAD)\" = {OPENAI_PLUGIN_MARKETPLACE_COMMIT}" in dockerfile
     assert f"snapshot.ubuntu.com/ubuntu/{AI_WORKER_APT_SNAPSHOT}" in dockerfile
     assert "nodejs_22.23.2-1nodesource1_${arch}.deb" in dockerfile
     assert "sha256sum -c -" in dockerfile
-    assert "@openai/codex@0.146.1" in dockerfile
-    assert "@anthropic-ai/claude-code@2.1.223" in dockerfile
+    assert "@openai/codex@0.147.0" in dockerfile
+    assert "@anthropic-ai/claude-code@2.1.233" in dockerfile
     assert "--cache /tmp/glasshive-npm-cache" in dockerfile
     assert "rm -rf /tmp/glasshive-npm-cache /root/.npm /home/seluser/.npm" in dockerfile
     assert "/etc/chromium/policies/managed/glasshive-ai-worker-extensions.json" in dockerfile

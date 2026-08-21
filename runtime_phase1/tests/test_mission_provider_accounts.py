@@ -11,7 +11,11 @@ import pytest
 
 from workers_projects_runtime.control_plane import ControlPlaneError, ControlPlaneStore
 from workers_projects_runtime.api import _build_runtime
-from workers_projects_runtime.mission_provider_accounts import MissionProviderAccountBinder
+from workers_projects_runtime.failure_classification import classify_cli_failure
+from workers_projects_runtime.mission_provider_accounts import (
+    MissionProviderAccountBinder,
+    deployment_provider_readiness,
+)
 from workers_projects_runtime.openclaw_runtime import RuntimeErrorBase, RuntimeInfo
 from workers_projects_runtime.provider_accounts import ProviderAccountHomeManager
 from workers_projects_runtime.profile_runtime import (
@@ -28,10 +32,14 @@ class RecordingRuntime:
         self.released_workers: list[str] = []
         self.reconciled_homes: list[Path] = []
         self.release_callback = None
+        self.desktop_exit_callback = None
         self.ensure_calls = 0
+        self.ensured_workers: list[dict] = []
+        self.completed_run: dict[str, object] | None = None
 
     def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
         self.ensure_calls += 1
+        self.ensured_workers.append(dict(worker))
         return RuntimeInfo(
             runtime=str(worker.get("profile") or "synthetic"),
             model="synthetic",
@@ -68,8 +76,11 @@ class RecordingRuntime:
         *,
         url: str | None = None,
         run_id: str | None = None,
+        on_exit=None,
+        max_runtime_seconds: float | None = None,
     ) -> dict[str, object]:
         self.worker = dict(worker)
+        self.desktop_exit_callback = on_exit
         return {
             "status": "launched",
             "action": action,
@@ -79,6 +90,15 @@ class RecordingRuntime:
 
     def reconcile_provider_account_binding(self, account_home: Path) -> None:
         self.reconciled_homes.append(Path(account_home))
+
+    def collect_completed_run(
+        self,
+        _worker: dict,
+        run_id: str | None = None,
+        instruction: str | None = None,
+    ) -> dict[str, object] | None:
+        del run_id, instruction
+        return dict(self.completed_run) if self.completed_run is not None else None
 
 
 def _account(
@@ -143,7 +163,7 @@ def test_multi_user_docker_mission_projects_only_the_selected_account_home(
 
     bound = observed["worker"]
     assert bound["_glasshive_provider_account_env"] == {  # type: ignore[index]
-        "CODEX_HOME": "/workspace/.provider-account/codex"
+        "CODEX_HOME": "/workspace/.wpr-home/.codex"
     }
     mount_home = Path(  # type: ignore[index]
         bound["_glasshive_provider_account_mount_host"]
@@ -156,6 +176,313 @@ def test_multi_user_docker_mission_projects_only_the_selected_account_home(
         account["account_id"], "codex-cli:mission"
     ) is None
     assert runtime.codex.released_workers == ["wrk_personal"]  # type: ignore[attr-defined]
+
+
+def test_expired_personal_claude_session_requires_reconnect_and_releases_lease(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="claude")
+
+    def fail_with_expired_session(_worker, _instruction, _timeout_sec, _run_id):
+        failure = classify_cli_failure(
+            stdout="\n".join(
+                (
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "error": "authentication_failed",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "result",
+                            "subtype": "success",
+                            "is_error": True,
+                            "api_error_status": None,
+                        }
+                    ),
+                )
+            ),
+            stderr="",
+            runtime_name="claude-code",
+            exit_code=1,
+        )
+        error = RuntimeErrorBase("claude-code exited with code 1")
+        error.failure_classification = failure  # type: ignore[attr-defined]
+        raise error
+
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    recorder = RecordingRuntime(fail_with_expired_session)
+    runtime.claude = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    worker = _worker(account["account_id"], profile="claude-code")
+    worker["execution_mode"] = "docker"
+
+    with pytest.raises(RuntimeErrorBase) as failed:
+        runtime.run_task(worker, "reuse the saved workspace", run_id="run_expired_claude")
+
+    assert getattr(failed.value, "failure_classification", None) is not None, str(
+        failed.value
+    )
+    updated = store.get_provider_account(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+    assert updated is not None
+    assert updated["status"] == "action_required"
+    assert updated["recovery_code"] == ""
+    assert "Reconnect" in updated["reconnect_reason"]
+    assert (
+        failed.value.failure_classification.recommended_recovery  # type: ignore[attr-defined]
+        == "Open Connections, reconnect the selected account, then continue the same workspace."
+    )
+    assert (
+        failed.value.failure_classification.diagnostic_summary  # type: ignore[attr-defined]
+        == "class=provider_auth_missing; runtime=claude-code"
+    )
+    assert store.active_provider_lease(
+        account["account_id"], "claude-code:mission"
+    ) is None
+    assert recorder.released_workers == ["wrk_personal"]
+
+
+def test_completed_personal_claude_auth_failure_keeps_connections_recovery(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="claude")
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    recorder = RecordingRuntime()
+    recorder.completed_run = {
+        "state": "failed",
+        "output_text": "",
+        "error_text": "claude-code exited with code 1",
+        "failure_class": "provider_auth_missing",
+        "failure_retryable": 0,
+        "failure_user_message": "The worker could not use provider credentials.",
+        "failure_recommended_recovery": "Fix the CLI login.",
+        "failure_diagnostic_summary": "class=provider_auth_missing; exit_code=1",
+        "_glasshive_personal_account_reconnect_required": True,
+    }
+    runtime.claude = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    worker = _worker(account["account_id"], profile="claude-code")
+    worker["execution_mode"] = "docker"
+
+    recovered = runtime.collect_completed_run(
+        worker,
+        run_id="run_expired_claude",
+        instruction="reuse the saved workspace",
+    )
+
+    assert recovered is not None
+    assert recovered["failure_user_message"] == (
+        "The selected connected AI account must be reconnected."
+    )
+    assert recovered["failure_recommended_recovery"] == (
+        "Open Connections, reconnect the selected account, then continue the same workspace."
+    )
+    assert recovered["failure_diagnostic_summary"] == (
+        "class=provider_auth_missing; runtime=claude-code"
+    )
+    assert recovered["error_text"] == (
+        "The selected connected AI account must be reconnected."
+    )
+    updated = store.get_provider_account(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+    assert updated is not None
+    assert updated["status"] == "action_required"
+    assert "Reconnect" in updated["reconnect_reason"]
+
+
+def test_broker_auth_failure_does_not_claim_personal_subscription_expired(tmp_path):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="codex", auth_method="api_key")
+
+    class FakeInferenceBroker:
+        @contextmanager
+        def bind_run(self, **_kwargs):
+            yield {"adapter": "synthetic-broker"}
+
+    def fail_broker_route(_worker, _instruction, _timeout_sec, _run_id):
+        failure = classify_cli_failure(
+            stdout="",
+            stderr="HTTP status 401 Unauthorized",
+            runtime_name="codex-cli",
+            exit_code=1,
+        )
+        error = RuntimeErrorBase("codex-cli exited with code 1")
+        error.failure_classification = failure  # type: ignore[attr-defined]
+        raise error
+
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    runtime.host_codex = RecordingRuntime(fail_broker_route)  # type: ignore[assignment]
+    runtime.inference_broker = FakeInferenceBroker()  # type: ignore[assignment]
+    worker = {**_worker(account["account_id"]), "model": "gpt-synthetic"}
+
+    with pytest.raises(RuntimeErrorBase) as failed:
+        runtime.run_task(worker, "broker mission", run_id="run_broker_auth")
+
+    updated = store.get_provider_account(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+    assert updated is not None
+    assert updated["status"] == "ready"
+    assert (
+        failed.value.failure_classification.recommended_recovery  # type: ignore[attr-defined]
+        != "Open Connections, reconnect the selected account, then continue the same workspace."
+    )
+
+
+def test_worker_tool_401_does_not_disable_selected_personal_subscription(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="claude")
+
+    def fail_with_incidental_401(_worker, _instruction, _timeout_sec, _run_id):
+        failure = classify_cli_failure(
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "is_error": True,
+                    "error": "tool_failed",
+                    "result": "A worker tool returned HTTP status 401 Unauthorized.",
+                }
+            ),
+            stderr="",
+            runtime_name="claude-code",
+            exit_code=1,
+        )
+        error = RuntimeErrorBase("claude-code exited with code 1")
+        error.failure_classification = failure  # type: ignore[attr-defined]
+        raise error
+
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    recorder = RecordingRuntime(fail_with_incidental_401)
+    runtime.claude = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    worker = _worker(account["account_id"], profile="claude-code")
+    worker["execution_mode"] = "docker"
+
+    with pytest.raises(RuntimeErrorBase):
+        runtime.run_task(worker, "debug a worker tool", run_id="run_tool_401")
+
+    updated = store.get_provider_account(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+    assert updated is not None
+    assert updated["status"] == "ready"
+    assert store.active_provider_lease(
+        account["account_id"], "claude-code:mission"
+    ) is None
+    assert recorder.released_workers == ["wrk_personal"]
+
+
+def test_startup_recovery_removes_orphaned_interactive_provider_binding(tmp_path):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    recorder = RecordingRuntime()
+    lease_during_cleanup: list[bool] = []
+    recorder.release_callback = lambda _worker: lease_during_cleanup.append(
+        any(
+            row["account_id"] == account["account_id"]
+            for row in store.unreleased_interactive_provider_leases()
+        )
+    )
+    runtime.codex = recorder  # type: ignore[assignment]
+    lease = store.acquire_provider_lease(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        lane="codex-cli:interactive",
+        worker_id="wrk_interrupted_setup",
+        run_id="interactive_interrupted_setup",
+        ttl_seconds=180,
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE provider_account_leases SET expires_at = ? WHERE lease_id = ?",
+            (time.time() - 1, lease["lease_id"]),
+        )
+
+    runtime.recover_interactive_provider_sessions()
+
+    assert recorder.released_workers == ["wrk_interrupted_setup"]
+    assert lease_during_cleanup == [True]
+    assert store.active_provider_account_lease(account["account_id"]) is None
+    with store._connect() as conn:
+        recovered = conn.execute(
+            "SELECT released_at FROM provider_account_leases WHERE lease_id = ?",
+            (lease["lease_id"],),
+        ).fetchone()
+    assert recovered is not None and recovered["released_at"] is not None
+
+
+def test_provider_bound_preflight_can_recreate_a_stale_task_sandbox(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    recorder = RecordingRuntime()
+    runtime.codex = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = {
+        **_worker(account["account_id"]),
+        "execution_mode": "docker",
+        "state": "running",
+    }
+
+    runtime.run_task(worker, "resume the saved workspace", run_id="run_recreate")
+
+    assert recorder.ensured_workers
+    assert recorder.ensured_workers[0]["_glasshive_task_run"] is True
+    assert recorder.ensured_workers[0]["_active_run_id"] == "run_recreate"
+    assert recorder.worker is not None
+    assert "_glasshive_task_run" not in recorder.worker
+    assert "_active_run_id" not in recorder.worker
+    assert "_glasshive_task_run" not in worker
+    assert "_active_run_id" not in worker
 
 
 def test_docker_provider_mount_is_removed_before_lease_release(tmp_path, monkeypatch):
@@ -260,6 +587,96 @@ def test_cleanup_failure_quarantines_account_but_releases_exclusive_lease(tmp_pa
     )
     assert updated["status"] == "action_required"
     assert updated["recovery_code"] == "credential_cleanup_failed"
+    assert store.active_provider_lease(account["account_id"], "codex-cli:mission") is None
+
+
+def test_transient_cleanup_failure_retries_before_quarantining_account(
+    tmp_path,
+    monkeypatch,
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path), provider_account_db_path=str(database)
+    )
+    recorder = RecordingRuntime()
+    release_attempts = 0
+
+    def transient_cleanup(_worker):
+        nonlocal release_attempts
+        release_attempts += 1
+        if release_attempts == 1:
+            raise PermissionError("synthetic transient mount release")
+
+    recorder.release_callback = transient_cleanup
+    runtime.codex = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = _worker(account["account_id"])
+    worker["execution_mode"] = "docker"
+
+    assert runtime.run_task(
+        worker,
+        "complete before transient cleanup",
+        run_id="run_transient_cleanup",
+    ) == "synthetic result"
+
+    updated = store.get_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )
+    assert release_attempts == 2
+    assert updated["status"] == "ready"
+    assert updated["recovery_code"] == ""
+    assert store.active_provider_lease(account["account_id"], "codex-cli:mission") is None
+
+
+def test_transient_home_tightening_failure_retries_full_idempotent_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path), provider_account_db_path=str(database)
+    )
+    recorder = RecordingRuntime()
+    cleanup_events: list[str] = []
+    tighten_attempts = 0
+
+    recorder.release_callback = lambda _worker: cleanup_events.append("release")
+
+    def transient_tighten(_manager, *, account_home):
+        nonlocal tighten_attempts
+        tighten_attempts += 1
+        cleanup_events.append(f"tighten:{tighten_attempts}")
+        if tighten_attempts == 1:
+            raise ControlPlaneError("synthetic transient account-home debris")
+
+    monkeypatch.setattr(
+        ProviderAccountHomeManager,
+        "tighten_permissions",
+        transient_tighten,
+    )
+    runtime.codex = recorder  # type: ignore[assignment]
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = _worker(account["account_id"])
+    worker["execution_mode"] = "docker"
+
+    assert runtime.run_task(
+        worker,
+        "complete before transient account-home cleanup",
+        run_id="run_transient_home_cleanup",
+    ) == "synthetic result"
+
+    updated = store.get_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )
+    assert cleanup_events == ["release", "tighten:1", "release", "tighten:2"]
+    assert updated["status"] == "ready"
+    assert updated["recovery_code"] == ""
     assert store.active_provider_lease(account["account_id"], "codex-cli:mission") is None
 
 
@@ -402,7 +819,7 @@ def test_desktop_action_projects_the_exact_active_mission_provider_binding(tmp_p
         assert recorder.worker is not None
         assert recorder.worker["_glasshive_provider_account_bound"] is True
         assert recorder.worker["_glasshive_provider_account_env"] == {
-            "CODEX_HOME": "/workspace/.provider-account/codex"
+            "CODEX_HOME": "/workspace/.wpr-home/.codex"
         }
         assert recorder.worker["_glasshive_provider_account_mount_host"] == str(
             account_home.resolve(strict=True)
@@ -413,6 +830,213 @@ def test_desktop_action_projects_the_exact_active_mission_provider_binding(tmp_p
     assert store.active_provider_lease(
         account["account_id"], "codex-cli:mission"
     ) is None
+
+
+def test_claude_mission_keeps_workspace_tools_and_leases_only_secure_storage(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="claude")
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    worker = _worker(account["account_id"], profile="claude-code")
+    worker["execution_mode"] = "docker"
+
+    with runtime.provider_account_binder.bind(
+        worker,
+        runtime_name="claude-code",
+        run_id="run_personal",
+        timeout_sec=60,
+        release_binding=lambda _worker: None,
+        reconcile_binding=lambda _home: None,
+    ) as bound:
+        assert bound["_glasshive_provider_account_env"] == {
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/workspace/.provider-account/claude",
+        }
+
+    assert store.active_provider_lease(
+        account["account_id"], "claude-code:mission"
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("provider", "profile", "runtime_attr", "action"),
+    (
+        ("codex", "codex-cli", "codex", "codex"),
+        ("claude", "claude-code", "claude", "claude"),
+    ),
+)
+def test_idle_personal_workspace_native_setup_borrows_account_until_window_closes(
+    tmp_path, monkeypatch, provider, profile, runtime_attr, action
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider=provider)
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    if provider == "claude":
+        monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    worker = {
+        **_worker(account["account_id"], profile=profile),
+        "execution_mode": "docker",
+    }
+    recorder = RecordingRuntime()
+    setattr(runtime, runtime_attr, recorder)
+
+    launched = runtime.desktop_action(worker, action)
+
+    assert launched["status"] == "launched"
+    assert recorder.worker is not None
+    assert recorder.worker["_glasshive_provider_account_bound"] is True
+    assert recorder.worker["_glasshive_provider_account_mount_host"]
+    assert callable(recorder.desktop_exit_callback)
+    lease = store.active_provider_lease(account["account_id"], f"{profile}:interactive")
+    assert lease is not None
+    assert lease["worker_id"] == worker["worker_id"]
+    assert str(lease["run_id"]).startswith("interactive_")
+
+    recorder.desktop_exit_callback()
+    recorder.desktop_exit_callback()
+
+    assert store.active_provider_lease(
+        account["account_id"], f"{profile}:interactive"
+    ) is None
+    assert recorder.released_workers == [worker["worker_id"]]
+
+
+def test_idle_non_harness_desktop_action_stays_unbound(tmp_path, monkeypatch):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="claude")
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = {
+        **_worker(
+            account["account_id"],
+            profile="claude-code",
+            policy="personal_preferred",
+        ),
+        "execution_mode": "docker",
+    }
+    recorder = RecordingRuntime()
+    runtime.claude = recorder  # type: ignore[assignment]
+
+    launched = runtime.desktop_action(worker, "browser", url="about:blank")
+
+    assert launched["status"] == "launched"
+    assert recorder.worker is not None
+    assert "_glasshive_provider_account_bound" not in recorder.worker
+    assert recorder.desktop_exit_callback is None
+    assert store.active_provider_account_lease(account["account_id"]) is None
+
+
+def test_idle_api_key_workspace_setup_does_not_mount_a_subscription_home(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="codex", auth_method="api_key")
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    worker = {
+        **_worker(account["account_id"], profile="codex-cli"),
+        "execution_mode": "docker",
+    }
+    recorder = RecordingRuntime()
+    runtime.codex = recorder  # type: ignore[assignment]
+
+    launched = runtime.desktop_action(worker, "codex")
+
+    assert launched["status"] == "launched"
+    assert recorder.worker is not None
+    assert "_glasshive_provider_account_bound" not in recorder.worker
+    assert store.active_provider_account_lease(account["account_id"]) is None
+
+
+def test_idle_native_setup_busy_account_fails_before_launch(tmp_path, monkeypatch):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="claude")
+    store.acquire_provider_lease(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        lane="claude-code:mission",
+        worker_id="wrk_other",
+        run_id="run_other",
+        ttl_seconds=180,
+    )
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    worker = {
+        **_worker(
+            account["account_id"],
+            profile="claude-code",
+            policy="personal_preferred",
+        ),
+        "execution_mode": "docker",
+    }
+    recorder = RecordingRuntime()
+    runtime.claude = recorder  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeErrorBase, match="already in use"):
+        runtime.desktop_action(worker, "claude")
+
+    assert recorder.worker is None
+
+
+def test_idle_native_setup_launch_failure_releases_account(tmp_path, monkeypatch):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = _account(store, provider="claude")
+    runtime = ProfiledWorkerRuntime(
+        base_dir=str(tmp_path),
+        provider_account_db_path=str(database),
+    )
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    worker = {
+        **_worker(account["account_id"], profile="claude-code"),
+        "execution_mode": "docker",
+    }
+
+    class FailingRuntime(RecordingRuntime):
+        def desktop_action(self, worker, action, **kwargs):
+            self.worker = dict(worker)
+            raise RuntimeErrorBase("synthetic launch failed")
+
+    recorder = FailingRuntime()
+    runtime.claude = recorder  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeErrorBase, match="synthetic launch failed"):
+        runtime.desktop_action(worker, "claude")
+
+    assert recorder.released_workers == [worker["worker_id"]]
+    assert store.active_provider_account_lease(account["account_id"]) is None
 
 
 def test_mission_cleanup_waits_for_a_borrowed_desktop_action_projection(
@@ -1326,14 +1950,99 @@ def test_host_command_builders_apply_only_the_bound_native_provider_home(tmp_pat
     }
     claude_worker["bootstrap_bundle_json"] = json.dumps(claude_bundle)
     claude_worker["_glasshive_provider_account_env"] = {
-        "CLAUDE_CONFIG_DIR": str(claude_home)
+        "CLAUDE_CONFIG_DIR": str(claude_home),
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR": str(claude_home),
     }
     claude_worker["_glasshive_provider_account_bound"] = True
     _, claude_env = claude._build_command(claude_worker, "mission", info)
     assert claude_env["CLAUDE_CONFIG_DIR"] == str(claude_home)
+    assert claude_env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == str(claude_home)
     assert claude_env["CLAUDE_CONFIG_DIR"] != str(tmp_path / "global-claude")
     assert "ANTHROPIC_API_KEY" not in claude_env
     assert "ANTHROPIC_BASE_URL" not in claude_env
+
+
+def test_deployment_provider_readiness_is_profile_aware_and_route_complete(monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    provider_names = {
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "OPENAI_REVERSE_PROXY",
+        "PORTKEY_API_KEY",
+        "PORTKEY_BASE_URL",
+        "WPR_CODEX_CLI_BASE_URL",
+        "WPR_CODEX_CLI_ENV_KEY",
+        "WPR_OPENCLAW_BASE_URL",
+        "WPR_OPENCLAW_ENV_KEY",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "WPR_CLAUDE_CODE_USE_API_KEY",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "AWS_REGION",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+    }
+    for name in provider_names:
+        monkeypatch.delenv(name, raising=False)
+
+    for profile in ("codex-cli", "openclaw-general", "claude-code", "unknown"):
+        assert deployment_provider_readiness(profile)[0] == "action_required"
+
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-standard-openai-key")
+    assert deployment_provider_readiness("codex-cli")[0] == "deployment_managed"
+    assert deployment_provider_readiness("openclaw-general")[0] == "deployment_managed"
+    assert deployment_provider_readiness("claude-code")[0] == "action_required"
+    monkeypatch.delenv("OPENAI_API_KEY")
+
+    monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://selected.example.test/v1")
+    monkeypatch.setenv("WPR_CODEX_CLI_ENV_KEY", "PORTKEY_API_KEY")
+    monkeypatch.setenv("PORTKEY_API_KEY", "synthetic-portkey")
+    assert deployment_provider_readiness("codex-cli")[0] == "deployment_managed"
+    assert deployment_provider_readiness("openclaw-general")[0] == "action_required"
+    monkeypatch.setenv("WPR_OPENCLAW_BASE_URL", "https://selected.example.test/v1")
+    monkeypatch.setenv("WPR_OPENCLAW_ENV_KEY", "PORTKEY_API_KEY")
+    assert deployment_provider_readiness("openclaw-general")[0] == "deployment_managed"
+    monkeypatch.setenv("WPR_OPENCLAW_ENV_KEY", "PATH")
+    assert deployment_provider_readiness("openclaw-general")[0] == "action_required"
+    monkeypatch.delenv("WPR_CODEX_CLI_BASE_URL")
+    monkeypatch.delenv("WPR_CODEX_CLI_ENV_KEY")
+    monkeypatch.delenv("WPR_OPENCLAW_BASE_URL")
+    monkeypatch.delenv("WPR_OPENCLAW_ENV_KEY")
+    monkeypatch.delenv("PORTKEY_API_KEY")
+
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-claude-oauth")
+    assert deployment_provider_readiness("claude-code")[0] == "deployment_managed"
+    assert deployment_provider_readiness("codex-cli")[0] == "action_required"
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "true")
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "synthetic-bedrock-bearer")
+    assert deployment_provider_readiness("claude-code")[0] == "action_required"
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    assert deployment_provider_readiness("claude-code")[0] == "deployment_managed"
+
+
+def test_legacy_enterprise_flag_uses_the_same_fail_closed_provider_readiness(monkeypatch):
+    monkeypatch.delenv("GLASSHIVE_SECURITY_MODE", raising=False)
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    for name in (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "OPENAI_REVERSE_PROXY",
+        "PORTKEY_API_KEY",
+        "PORTKEY_BASE_URL",
+        "WPR_CODEX_CLI_BASE_URL",
+        "WPR_CODEX_CLI_ENV_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert deployment_provider_readiness("codex-cli")[0] == "action_required"
+
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-standard-openai-key")
+    assert deployment_provider_readiness("codex-cli")[0] == "deployment_managed"
 
 
 def test_bound_codex_mission_never_copies_process_global_auth_into_worker_state(tmp_path, monkeypatch):

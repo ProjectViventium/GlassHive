@@ -31,6 +31,7 @@ TOKEN_AUDIENCE = "11111111-2222-3333-4444-555555555555"
 TENANT = "tenant-public-safe"
 AUTHORIZATION_SCOPE = f"api://{TOKEN_AUDIENCE}/user_impersonation"
 TOKEN_SCOPE = "user_impersonation"
+CANONICAL_AUTHORIZATION_SCOPE = f"{RESOURCE}/{TOKEN_SCOPE}"
 
 
 class FakeResponse:
@@ -627,7 +628,10 @@ def test_mcp_canonical_closed_enrollment_rejects_unknown_subject(
     monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ISSUER", ISSUER)
     monkeypatch.setenv("GLASSHIVE_OIDC_ISSUER", ISSUER)
     monkeypatch.setenv("GLASSHIVE_MCP_PUBLIC_URL", RESOURCE)
-    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES", AUTHORIZATION_SCOPE)
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES",
+        CANONICAL_AUTHORIZATION_SCOPE,
+    )
     monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_SCOPES", TOKEN_SCOPE)
     monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES", TOKEN_AUDIENCE)
     monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_TENANT_ID", TENANT)
@@ -697,7 +701,10 @@ def test_entra_v2_request_scope_is_distinct_from_access_token_scope(
     monkeypatch.setenv("GLASSHIVE_OIDC_ISSUER", ISSUER)
     monkeypatch.setenv("GLASSHIVE_MCP_PUBLIC_URL", RESOURCE)
     monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES", TOKEN_AUDIENCE)
-    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES", AUTHORIZATION_SCOPE)
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES",
+        CANONICAL_AUTHORIZATION_SCOPE,
+    )
     monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_SCOPES", TOKEN_SCOPE)
     monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS", "mcp-public-client")
     monkeypatch.setenv("GLASSHIVE_OIDC_PRINCIPAL_CLAIM", "oid")
@@ -716,16 +723,90 @@ def test_entra_v2_request_scope_is_distinct_from_access_token_scope(
             token(
                 private_key,
                 oid="00000000-1111-2222-3333-444444444444",
-                scp=AUTHORIZATION_SCOPE,
+                scp=CANONICAL_AUTHORIZATION_SCOPE,
             )
         )
     )
 
-    assert list(settings.required_scopes) == [AUTHORIZATION_SCOPE]
+    assert list(settings.required_scopes) == [CANONICAL_AUTHORIZATION_SCOPE]
     assert verifier.token_scopes == (TOKEN_SCOPE,)
     assert accepted is not None
     assert TOKEN_SCOPE in accepted.scopes
+    assert CANONICAL_AUTHORIZATION_SCOPE in accepted.scopes
     assert rejected_full_uri_claim is None
+
+
+def test_entra_v2_authorization_scope_projection_requires_validated_token_alias(
+    tmp_path,
+    monkeypatch,
+):
+    state_path = tmp_path / "auth.sqlite3"
+    create_auth_state(state_path)
+    monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", TENANT)
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ISSUER", ISSUER)
+    monkeypatch.setenv("GLASSHIVE_OIDC_ISSUER", ISSUER)
+    monkeypatch.setenv("GLASSHIVE_MCP_PUBLIC_URL", RESOURCE)
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES", TOKEN_AUDIENCE)
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES",
+        f"{CANONICAL_AUTHORIZATION_SCOPE} {RESOURCE}/admin",
+    )
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_TOKEN_SCOPES", TOKEN_SCOPE)
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ALLOWED_CLIENT_IDS", "mcp-public-client")
+    monkeypatch.setenv("GLASSHIVE_OIDC_PRINCIPAL_CLAIM", "oid")
+    monkeypatch.setenv("GLASSHIVE_PRINCIPAL_ID_FORMAT", "hashed_issuer_subject")
+    monkeypatch.setenv("GLASSHIVE_AUTH_STATE_PATH", str(state_path))
+
+    with pytest.raises(
+        McpOAuthConfigurationError,
+        match="authorization scope must map",
+    ):
+        oauth_from_env()
+
+    monkeypatch.setenv(
+        "GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES",
+        f"{CANONICAL_AUTHORIZATION_SCOPE} {RESOURCE}/team/{TOKEN_SCOPE}",
+    )
+    with pytest.raises(
+        McpOAuthConfigurationError,
+        match="authorization scope must map",
+    ):
+        oauth_from_env()
+
+
+def test_generic_oidc_exact_uri_scope_requires_no_alias_projection(
+    monkeypatch,
+    signing_material,
+):
+    private_key, public_jwk = signing_material
+    exact_uri_scope = f"{RESOURCE}/read"
+
+    def fake_get(url, **kwargs):
+        if url == f"{ISSUER}/.well-known/openid-configuration":
+            return FakeResponse({"issuer": ISSUER, "jwks_uri": f"{ISSUER}/jwks"})
+        if url == f"{ISSUER}/jwks":
+            return FakeResponse({"keys": [public_jwk]})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(oauth_module.httpx, "get", fake_get)
+    verifier = OidcJwtTokenVerifier(
+        issuer=ISSUER,
+        audience=TOKEN_AUDIENCE,
+        resource=RESOURCE,
+        token_scopes=(exact_uri_scope,),
+        authorization_scopes=(exact_uri_scope,),
+        deployment_tenant_id=TENANT,
+        token_tenant_id=TENANT,
+    )
+
+    access = asyncio.run(
+        verifier.verify_token(token(private_key, scp=exact_uri_scope))
+    )
+
+    assert access is not None
+    assert access.scopes == [exact_uri_scope]
+    assert verifier.authorization_scope_aliases == {}
 
 
 def test_legacy_enterprise_flag_does_not_opt_into_canonical_mcp_enrollment(tmp_path, monkeypatch):
@@ -928,7 +1009,8 @@ def test_fastmcp_oauth_publishes_rfc9728_metadata_and_challenge(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_COMPONENT_REVISION", "b" * 40)
     monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_ISSUER", ISSUER)
     monkeypatch.setenv("GLASSHIVE_MCP_PUBLIC_URL", RESOURCE)
-    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES", "glasshive:access")
+    required_scope = f"{RESOURCE}/access_as_user"
+    monkeypatch.setenv("GLASSHIVE_MCP_OAUTH_REQUIRED_SCOPES", required_scope)
     server = create_mcp_server(api_client=object())
     app = server.streamable_http_app()
     client = TestClient(app)
@@ -946,9 +1028,10 @@ def test_fastmcp_oauth_publishes_rfc9728_metadata_and_challenge(monkeypatch):
     }
     assert metadata.json()["resource"] == RESOURCE
     assert [value.rstrip("/") for value in metadata.json()["authorization_servers"]] == [ISSUER]
-    assert metadata.json()["scopes_supported"] == ["glasshive:access"]
+    assert metadata.json()["scopes_supported"] == [required_scope]
     assert unauthorized.status_code == 401
     assert "resource_metadata=" in unauthorized.headers["www-authenticate"]
+    assert f'scope="{required_scope}"' in unauthorized.headers["www-authenticate"]
 
 
 def test_oauth_mcp_front_door_mints_narrow_signed_runtime_assertion(tmp_path, monkeypatch, signing_material):

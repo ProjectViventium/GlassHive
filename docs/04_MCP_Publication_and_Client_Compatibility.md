@@ -86,10 +86,44 @@ standalone/plain LibreChat deployments must still work without them by using:
 
 Default `workspace_launch`, `workspace_wait`, and `workspace_status` payloads are intentionally
 compact. They return user-actionable state, result tools, output text, artifact short links, and a
-View / Steer short link when available; raw project/worker/run ids and live diagnostic snapshots are
-returned only when the caller explicitly requests diagnostics. MCP outputs must not expose raw
+View / Steer short link when available. When the MCP host supplies stable conversation context,
+GlassHive remembers the launch there and keeps raw project/worker/run ids diagnostic-only. A native
+client without stable conversation context instead receives one minimal `follow_up_context` containing
+the exact ids needed by `workspace_wait`/`workspace_status`; this avoids a workspace-list discovery
+call without widening the catalog or diagnostic payload. When `follow_up_context` is returned, its
+`run_id` and `worker_id` are the primary continuation contract and clients must pass them to each
+bounded wait/status call. Recent-conversation resolution is a fallback only when the launch returned
+no follow-up context and the host preserves stable conversation metadata. MCP outputs must not expose raw
 `gh_token` URLs or opaque signed-link tokens; they should expose `/r/{ref}` and `/v1/link-refs/{ref}`
 indirection instead.
+
+Workspace-native tool and account setup stays inside the selected persistent workstation. The
+Workspaces `Set up tools` action opens that profile's installed AI harness through the generic desktop
+action contract; it does not add connector-specific frontend flows or copy connector credentials into
+the controlling MCP client. When the workspace selects a ready personal Codex or Claude account, that
+exact native setup window holds an exclusive interactive lease and borrows only the selected account's
+authentication. The workspace remains the owner of tools, plugins, trust, and other native state.
+Closing the window, reaching the bounded session limit, or losing the lease removes the
+credential-bearing container before releasing the account; new missions fail before run creation while
+the setup window is open, including attempts to switch that workspace to another account or deployment
+route. Service startup recovers any unreleased interactive session by removing its exact container
+before releasing even an expired lease. Browser, file, and shell actions never acquire provider
+credentials. At a bounded timeout, the authoritative container-removal and sealing path stops the
+credential-bearing native CLI; one transient cleanup failure is retried through that same idempotent
+path before the account is quarantined, and the detached host-side Docker client is reaped afterward.
+Desktop actions during a mission retain the exact active run/lease proof.
+
+For Codex, GlassHive temporarily overlays the selected subscription authentication while preserving
+any separate workspace-local login in host-private state that is not mounted into the leased container,
+then restores the workspace login after the interactive or mission lease ends.
+
+Claude keeps its native user-scope MCP, plugin, trust, and onboarding state under the workspace's
+persistent `HOME`; GlassHive does not replace that state with an account-global config directory.
+During a personal Claude setup window or mission, only Claude's native secure-storage directory is
+projected from the selected account home while the exact provider lease is held. The credential-bearing
+container is removed before the lease is released. This lets a connector added once through the
+workspace-native harness remain visible on later missions without copying its authorization into
+GlassHive or another workspace.
 
 For generated file delivery, `signed_download_url`/`default_url` is the default chat-facing artifact
 link and should be labeled `Download file`. The MCP payload should also preserve `signed_open_url`
@@ -124,8 +158,9 @@ must not fall back to pasting whole generated files into chat or writing its own
 code path when GlassHive has already produced a signed artifact link.
 
 `workspace_launch` is intentionally non-blocking. If the user asks to "wait", the model should call
-`workspace_wait` with the returned completion wait timeout or rely on same-conversation scoped
-recent-dispatch resolution. If the requested run is older than the worker's latest run,
+`workspace_wait` with the returned completion wait timeout and ids, when present, or rely on
+same-conversation scoped recent-dispatch resolution. It must not enumerate workspaces to rediscover
+the launch. If the requested run is older than the worker's latest run,
 diagnostic status/wait responses preserve both the requested run outcome and the latest effective
 run so an operator can explain the lineage without exposing raw ids in normal user-facing payloads.
 Blocking waits should stay below common chat/Redis/proxy idle windows. When a bounded wait reaches
@@ -141,6 +176,13 @@ Fresh `workspace_launch` calls must not accidentally resume stale workspaces. A 
 fresh one-off project/worker for the new request. Use explicit reuse only when the user asked to
 resume or reuse that existing workspace. Deliberate operator-level reuse remains available through
 `worker_find_or_resume`, `workspace_continue`, and explicit lifecycle tools.
+When the user asks for a reusable favorite workspace, the same `workspace_launch` call sets
+`favorite=true` before queueing the run; no catalog/update tool chain is required. The first line of
+`description` is the short human workspace name, while following lines and `context` preserve the
+complete request. Capability setup requested inside that workspace stays in the launched worker:
+the controlling AI must not install the capability into itself or wander through account, Library,
+connection, or tool catalogs. If the run is still active and the user asked to wait, it repeats only
+`workspace_wait`.
 An explicitly closed workspace is permanently closed from the moment teardown begins. That includes
 `terminating`, `termination_failed` (compute teardown needs retry/operator attention), and
 `terminated`: run, message, pause, interrupt, resume, desktop/terminal, account-switch, and schedule
@@ -203,12 +245,53 @@ Prefer remote HTTP MCP with auth in front of the server when not loopback-only.
 The designed Glass Drive **Use GlassHive from another AI app** panel is the source of truth for a
 deployment's public HTTPS MCP URL and the exact clients that deployment has completely registered.
 It must not advertise Codex, Claude Code, ChatGPT, or another client unless the live endpoint returns
-that client's complete allowlisted contract. The primary `Automatic` path copies one self-contained
-instruction containing the exact deployment-generated add/sign-in command for every returned client;
-the receiving AI does not have to guess configuration from a URL it cannot contextualize. The user
-completes sign-in in the browser profile opened by the
+that client's complete allowlisted contract. The primary `Automatic` path copies one short
+self-selecting instruction: Codex follows only the Codex section and Claude Code follows only the
+Claude Code section. Each section contains that client's exact deployment-generated add/sign-in
+command, tells an existing matching registration to be reused, and ends with one `workspace_list`
+verification instead of a full tool-catalog dump. The receiving AI does not configure another
+client or guess configuration from a URL it cannot contextualize. If GlassHive is already connected,
+the companion skill skips setup and calls only the one tool needed for the user's request. The user completes sign-in in the
+browser profile opened by the
 client, or copies the client-provided authorization URL into the browser profile they intend to use.
-The browser does not claim it can edit local client configuration itself.
+The browser does not claim it can edit local client configuration itself. The clients' native OAuth
+flows are authoritative: the receiving AI must not construct OAuth URLs, run a custom callback
+listener, inspect tokens, or fall back to static credentials.
+
+GlassHive includes the exact required API scope in both protected-resource metadata and the initial
+`WWW-Authenticate` challenge. Current Codex releases can still fall back to generic OpenID scopes on
+an ordinary Reconnect unless the MCP server's native config persists its `scopes` values. For Entra,
+that config contains both the canonical GlassHive API scope and `offline_access`: the API scope binds
+the authorization to the MCP resource, while `offline_access` asks Entra for the refresh token needed
+to renew an expired access token. The generated Codex setup includes those values once and tells the
+user to restart Codex/ChatGPT once after changing the config; later Add/Reconnect actions use the same
+resource and renewable login without a hand-built authorization URL. Claude Code continues to use its
+native remote-HTTP add and `/mcp` sign-in flow.
+
+MCP is the capability boundary. The companion skill is a concise workflow guide that tells the AI
+which GlassHive tool to call; the native packages are distribution only, not another integration
+layer. One plugin directory at `plugins/glasshive/` contains the shared skill plus native Codex and
+Claude manifests. It deliberately contains no MCP server definition because the deployment-specific
+URL, client registration, and scopes come from the signed-in Glass Drive panel. This follows the
+official Codex model of packaging skills and MCP integrations as plugins, and Claude Code's native
+plugin plus remote-HTTP MCP and `/mcp` authentication flow.
+Shared server instructions stay short because clients may present them alongside every tool. They
+say to make one matching call when one call can finish the request and never narrate the catalog;
+action-specific parameters and safety details stay with the action that owns them.
+
+The same public repository is the marketplace for both clients. A user pastes the Automatic
+instruction once; the current client installs only its own package and then applies the exact live
+MCP setup. The equivalent native package commands are:
+
+```text
+codex plugin marketplace add ProjectViventium/GlassHive
+codex plugin add glasshive@project-glasshive
+claude plugin marketplace add ProjectViventium/GlassHive
+claude plugin install glasshive@glasshive --scope user --yes
+```
+
+Existing exact installations are reused. Installation never triggers tool-catalog enumeration, and
+ordinary use calls only the operation needed for the user's outcome.
 
 The generated command may carry a public client id and fixed callback flags as opaque setup
 arguments. GlassHive still validates that the configured Codex resource exactly equals the canonical
@@ -239,9 +322,12 @@ and base callback URL so an ambient user-level `mcp_oauth_callback_url` cannot r
 registration to a different host or path.
 
 The public HTTPS MCP URL is the RFC 8707 resource sent by Codex and returned in protected-resource
-metadata. It is not implicitly the JWT `aud`. Entra v2 access tokens normally use the API app's
-client-id GUID as `aud`, while delegated scopes use the authorization server's full recognized value
-such as `api://<api-app-client-id>/user_impersonation`. Multi-user MCP therefore requires explicit
+metadata. For Entra, register that exact canonical URL as an additional Application ID URI on the
+resource application and request its delegated scope as
+`<canonical-mcp-url>/access_as_user`. Keep the existing `api://<api-app-client-id>` identifier
+when another consumer still uses it. The public URL is not implicitly the JWT `aud`: Entra v2 access
+tokens normally use the API app's client-id GUID as `aud`, and the `scp` claim contains only the
+short delegated permission value. Multi-user MCP therefore requires explicit
 `GLASSHIVE_MCP_OAUTH_TOKEN_AUDIENCES` independently of `GLASSHIVE_MCP_PUBLIC_URL` and validates
 issuer, one of those exact token audiences, non-conflicting tenant claims, stable subject, required
 scopes, and one explicitly
@@ -251,7 +337,9 @@ client claim names with `GLASSHIVE_MCP_OAUTH_CLIENT_ID_CLAIMS`; rotate registrat
 old and new IDs only for the bounded rollout window. Entra does not provide MCP dynamic client
 registration, so Connect AI emits no client command until the deployment config also supplies the
 same pre-registered Codex/Claude client ID, each fixed callback port, explicit token audiences and
-scopes, and the canonical Codex public resource. Resource drift, missing verifier policy, or a client
+scopes, and the canonical Codex public resource. An Entra request scope whose resource prefix differs
+from that canonical URL is invalid deployment configuration: the authorization server can reject it
+before issuing a token even when the client and callback are correct. Resource drift, missing verifier policy, or a client
 ID outside the allowlist remains `action_required` and produces no copyable command. When enrollment
 is enabled, a first fully verified MCP login enrolls the same hashed
 issuer/subject principal used by Glass Drive, while a locally disabled principal is rejected on the

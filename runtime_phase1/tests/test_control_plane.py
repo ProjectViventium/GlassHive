@@ -169,6 +169,13 @@ def test_provider_account_lease_is_durable_exclusive_and_recovers_after_expiry(t
             now=now + 1,
         )
 
+    active = restarted_store.active_provider_account_lease(
+        account["account_id"], now=now + 1
+    )
+    assert active is not None
+    assert active["lease_id"] == first["lease_id"]
+    assert active["worker_id"] == "wrk_a"
+
     with pytest.raises(ControlPlaneConflict, match="already in use"):
         restarted_store.acquire_provider_lease(
             account_id=account["account_id"],
@@ -200,6 +207,9 @@ def test_provider_account_lease_is_durable_exclusive_and_recovers_after_expiry(t
         now=now + 62,
     )
     assert restarted_store.active_provider_lease(account["account_id"], "default", now=now + 63) is None
+    assert restarted_store.active_provider_account_lease(
+        account["account_id"], now=now + 63
+    ) is None
 
 
 def test_provider_account_lease_heartbeat_extends_only_an_active_owner_scoped_lease(tmp_path):
@@ -411,6 +421,13 @@ def test_provider_account_homes_are_private_and_platform_policy_is_explicit(tmp_
     assert environment == {"CODEX_HOME": str(codex_home / "codex")}
     assert os.stat(codex_home).st_mode & 0o077 == 0
     assert os.stat(codex_home / "codex").st_mode & 0o077 == 0
+    claude_environment = manager.runtime_environment(
+        provider="claude", account_home=codex_home
+    )
+    assert claude_environment == {
+        "CLAUDE_CONFIG_DIR": str(codex_home / "claude"),
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR": str(codex_home / "claude"),
+    }
     for unsafe_account_id in (".", ".."):
         with pytest.raises(ControlPlaneError, match="account id is invalid"):
             manager.account_home_path(
@@ -439,6 +456,9 @@ def test_provider_account_homes_are_private_and_platform_policy_is_explicit(tmp_
 def test_multi_user_subscription_support_requires_reviewed_container_isolation(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_SECURITY_MODE", "multi_user")
     monkeypatch.setenv("GLASSHIVE_ENABLE_CODEX_PERSONAL_ACCOUNTS", "true")
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.delenv("WPR_CODEX_BIN", raising=False)
+    monkeypatch.delenv("WPR_CODEX_CLI_PATH", raising=False)
 
     assert provider_platform_support(
         provider="codex", auth_method="subscription", platform_name="linux"
@@ -449,7 +469,286 @@ def test_multi_user_subscription_support_requires_reviewed_container_isolation(m
     )
     assert provider_platform_support(
         provider="codex", auth_method="subscription", platform_name="linux"
+    ) == "setup_cli_required"
+
+    monkeypatch.setenv("WPR_CODEX_BIN", "/usr/bin/true")
+    assert provider_platform_support(
+        provider="codex", auth_method="subscription", platform_name="linux"
     ) == "supported"
+
+
+def test_native_provider_setup_support_requires_and_uses_the_canonical_claude_binary(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    monkeypatch.setenv("PATH", "")
+
+    assert provider_platform_support(
+        provider="claude", auth_method="subscription", platform_name="linux"
+    ) == "setup_cli_required"
+
+    cli = tmp_path / "claude"
+    cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cli.chmod(0o700)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", str(cli))
+
+    assert provider_platform_support(
+        provider="claude", auth_method="subscription", platform_name="linux"
+    ) == "supported"
+    setup = ProviderSetupManager(
+        store=ControlPlaneStore(str(tmp_path / "runtime.db")),
+        home_root=tmp_path / "provider-homes",
+    )
+    assert setup._binary("claude") == str(cli)
+
+
+def test_claude_setup_accepts_browser_code_once_without_echo_and_reuses_native_home(
+    tmp_path, monkeypatch
+):
+    cli = tmp_path / "synthetic-claude"
+    cli.write_text(
+        """#!/usr/bin/env python3
+import os
+import sys
+
+marker = os.path.join(os.environ['CLAUDE_CONFIG_DIR'], 'authenticated')
+if sys.argv[1:] == ['auth', 'login', '--claudeai']:
+    print(
+        'Open https://claude.com/cai/oauth/authorize?code=true&client_id=synthetic',
+        flush=True,
+    )
+    code = sys.stdin.readline().strip()
+    if code != 'synthetic-browser-code':
+        raise SystemExit(3)
+    print(f'received {code}', flush=True)
+    with open(marker, 'w', encoding='utf-8') as handle:
+        handle.write('ready')
+    with open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'], '.claude.json'), 'w', encoding='utf-8') as handle:
+        handle.write('{"oauthAccount":{"provider":"synthetic"}}')
+    raise SystemExit(0)
+if sys.argv[1:] == ['auth', 'status', '--json']:
+    raise SystemExit(0 if os.path.exists(marker) else 1)
+if sys.argv[1:] == ['auth', 'logout']:
+    raise SystemExit(0)
+raise SystemExit(2)
+""",
+        encoding="utf-8",
+    )
+    cli.chmod(0o700)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_BIN", str(cli))
+    monkeypatch.setenv("GLASSHIVE_ENABLE_HOSTED_CLAUDE_CONSUMER_AUTH", "true")
+    monkeypatch.setattr(provider_accounts_module.sys, "platform", "linux")
+    store = ControlPlaneStore(str(tmp_path / "runtime.db"))
+    account = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="claude",
+        label="Personal Claude",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://auto",
+    )
+    setup = ProviderSetupManager(store=store, home_root=tmp_path / "provider-homes")
+
+    try:
+        started = setup.start(
+            account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+        )
+        deadline = time.time() + 5
+        while not started.get("input_required") and time.time() < deadline:
+            time.sleep(0.03)
+            started = setup.status(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+                verify=False,
+            )
+
+        assert started["input_required"] is True
+        assert started["setup_url"].startswith("https://claude.com/cai/oauth/authorize?")
+        with pytest.raises(ControlPlaneError, match="not found"):
+            setup.submit_input(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="other-user",
+                value="synthetic-browser-code",
+            )
+
+        real_write = provider_accounts_module.os.write
+        real_verify = setup._verify
+        write_started = threading.Event()
+        allow_write = threading.Event()
+        verify_started = threading.Event()
+        allow_verify = threading.Event()
+
+        def write_after_fast_provider_exit(file_descriptor, payload):
+            assert file_descriptor != setup._sessions[account["account_id"]].master_fd
+            write_started.set()
+            assert allow_write.wait(timeout=2)
+            written = real_write(file_descriptor, payload)
+            setup._sessions[account["account_id"]].process.wait(timeout=2)
+            return written
+
+        def verify_after_concurrent_status(**kwargs):
+            verify_started.set()
+            assert allow_verify.wait(timeout=2)
+            return real_verify(**kwargs)
+
+        monkeypatch.setattr(provider_accounts_module.os, "write", write_after_fast_provider_exit)
+        monkeypatch.setattr(setup, "_verify", verify_after_concurrent_status)
+        submission_results = []
+        submission_errors = []
+
+        def submit_code():
+            try:
+                submission_results.append(
+                    setup.submit_input(
+                        account_id=account["account_id"],
+                        tenant_id="tenant-a",
+                        owner_id="user-a",
+                        value="synthetic-browser-code",
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - asserted below
+                submission_errors.append(exc)
+
+        submission_thread = threading.Thread(target=submit_code)
+        submission_thread.start()
+        assert write_started.wait(timeout=2)
+        status_results = []
+
+        def read_status_while_writing():
+            status_results.append(
+                setup.status(
+                    account_id=account["account_id"],
+                    tenant_id="tenant-a",
+                    owner_id="user-a",
+                    verify=False,
+                )
+            )
+
+        status_thread = threading.Thread(target=read_status_while_writing)
+        status_thread.start()
+        status_thread.join(timeout=0.5)
+        status_completed_without_write = not status_thread.is_alive()
+        allow_write.set()
+        assert verify_started.wait(timeout=2)
+        finalizing_status_results = []
+
+        def read_status_while_finalizing():
+            finalizing_status_results.append(
+                setup.status(
+                    account_id=account["account_id"],
+                    tenant_id="tenant-a",
+                    owner_id="user-a",
+                    verify=True,
+                )
+            )
+
+        finalizing_status_thread = threading.Thread(
+            target=read_status_while_finalizing
+        )
+        finalizing_status_thread.start()
+        finalizing_status_thread.join(timeout=0.5)
+        status_completed_while_finalizing = not finalizing_status_thread.is_alive()
+        allow_verify.set()
+        submission_thread.join(timeout=3)
+        status_thread.join(timeout=3)
+        finalizing_status_thread.join(timeout=3)
+        assert status_completed_without_write
+        assert status_completed_while_finalizing
+        assert not submission_thread.is_alive()
+        assert not status_thread.is_alive()
+        assert not finalizing_status_thread.is_alive()
+        assert submission_errors == []
+        status_while_writing = status_results[0]
+        assert status_while_writing["input_required"] is False
+        assert "synthetic-browser-code" not in json.dumps(status_while_writing)
+        assert finalizing_status_results[0]["status"] == "connecting"
+        assert finalizing_status_results[0]["input_submitted"] is True
+        assert "synthetic-browser-code" not in json.dumps(finalizing_status_results[0])
+        submitted = submission_results[0]
+        assert "synthetic-browser-code" not in json.dumps(submitted)
+        with pytest.raises(ControlPlaneConflict, match="not waiting|already submitted"):
+            setup.submit_input(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+                value="synthetic-browser-code",
+            )
+
+        settled = submitted
+        deadline = time.time() + 5
+        while not settled["complete"] and time.time() < deadline:
+            time.sleep(0.03)
+            settled = setup.status(
+                account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+            )
+
+        assert settled["status"] == "ready"
+        assert "synthetic-browser-code" not in json.dumps(settled)
+        claude_home = next((tmp_path / "provider-homes").rglob("claude"))
+        claude_state = json.loads((claude_home / ".claude.json").read_text())
+        assert claude_state == {
+            "hasCompletedOnboarding": True,
+            "oauthAccount": {"provider": "synthetic"},
+        }
+        reused = setup.status(
+            account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+        )
+        assert reused["status"] == "ready"
+        assert "synthetic-browser-code" not in json.dumps(reused)
+        assert b"synthetic-browser-code" not in (tmp_path / "runtime.db").read_bytes()
+        for stored_path in (tmp_path / "provider-homes").rglob("*"):
+            if stored_path.is_file():
+                assert b"synthetic-browser-code" not in stored_path.read_bytes()
+
+        restarted = setup.start(
+            account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+        )
+        deadline = time.time() + 5
+        while not restarted.get("input_required") and time.time() < deadline:
+            time.sleep(0.03)
+            restarted = setup.status(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+                verify=False,
+            )
+        assert restarted["input_required"] is True
+
+        def fail_provider_input_write(file_descriptor, payload):
+            _ = file_descriptor, payload
+            raise OSError("synthetic closed provider input")
+
+        monkeypatch.setattr(
+            provider_accounts_module.os, "write", fail_provider_input_write
+        )
+        with pytest.raises(ControlPlaneConflict, match="no longer waiting"):
+            setup.submit_input(
+                account_id=account["account_id"],
+                tenant_id="tenant-a",
+                owner_id="user-a",
+                value="synthetic-browser-code",
+            )
+        assert account["account_id"] not in setup._sessions
+        assert store.active_provider_lease(account["account_id"], "provider-setup") is None
+        failed_account = store.get_provider_account(
+            account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+        )
+        assert failed_account["status"] == "action_required"
+    finally:
+        setup.shutdown()
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "synthetic\nsecond-line", "x" * 1025],
+)
+def test_provider_setup_input_rejects_empty_control_and_oversized_values(value):
+    with pytest.raises(ControlPlaneError, match="authentication code"):
+        ProviderSetupManager._setup_input_bytes(value)
 
 
 def test_provider_account_home_creation_rejects_symlink_components(tmp_path):
@@ -525,7 +824,10 @@ raise SystemExit(2)
     reconciled: list[Path] = []
 
     def reconcile_under_lease(account_home: Path) -> None:
-        assert store.active_provider_lease(account["account_id"], "provider-setup") is not None
+        assert (
+            store.active_provider_lease(account["account_id"], "provider-setup") is not None
+            or store.active_provider_lease(account["account_id"], "provider-disconnect") is not None
+        )
         reconciled.append(account_home)
 
     setup = ProviderSetupManager(
@@ -617,6 +919,7 @@ Follow these steps to sign in with ChatGPT using device code authorization:
         "setup_url": "https://auth.openai.com/codex/device",
         "setup_code": "TEST-CODE1",
         "help_url": "https://chatgpt.com/#settings/Security",
+        "input_required": False,
     }
 
     malicious = _provider_setup_guidance(
@@ -635,10 +938,59 @@ Follow these steps to sign in with ChatGPT using device code authorization:
         "setup_url": "https://claude.ai/oauth/authorize?code=true",
         "setup_code": "",
         "help_url": "",
+        "input_required": True,
     }
 
+    native_claude = _provider_setup_guidance(
+        "claude",
+        (
+            "Opening browser to sign in...\n"
+            "If the browser didn't open, visit: "
+            "https://claude.com/cai/oauth/authorize?code=true&client_id=synthetic"
+        ),
+    )
+    assert native_claude == {
+        "provider": "claude",
+        "setup_url": (
+            "https://claude.com/cai/oauth/authorize?code=true&client_id=synthetic"
+        ),
+        "setup_code": "",
+        "help_url": "",
+        "input_required": True,
+    }
 
-def test_provider_disconnect_preserves_private_home_when_native_logout_fails(tmp_path, monkeypatch):
+    claude_without_browser_code = _provider_setup_guidance(
+        "claude",
+        "Open https://claude.ai/oauth/authorize?client_id=synthetic to continue",
+    )
+    assert claude_without_browser_code["input_required"] is False
+
+    unreviewed_claude_path = _provider_setup_guidance(
+        "claude",
+        "Open https://claude.com/unreviewed/path?continue=true",
+    )
+    assert unreviewed_claude_path["setup_url"] == ""
+
+
+def test_provider_setup_output_keeps_the_visible_url_but_removes_terminal_hyperlink_controls():
+    manager = ProviderSetupManager.__new__(ProviderSetupManager)
+    manager._lock = threading.RLock()
+    session = type("SetupSession", (), {"output": ""})()
+    setup_url = "https://claude.com/cai/oauth/authorize?code=true&client_id=synthetic"
+
+    manager._append_output(
+        session,
+        (
+            "If the browser didn't open, visit: "
+            f"\x1b]8;;{setup_url}\x1b\\{setup_url}\x1b]8;;\x1b\\\n"
+        ).encode(),
+    )
+
+    assert session.output == f"If the browser didn't open, visit: {setup_url}\n"
+    assert _provider_setup_guidance("claude", session.output)["setup_url"] == setup_url
+
+
+def test_provider_disconnect_removes_private_home_when_native_logout_fails(tmp_path, monkeypatch):
     store = ControlPlaneStore(str(tmp_path / "runtime.db"))
     account = store.create_provider_account(
         tenant_id="tenant-a",
@@ -650,7 +1002,12 @@ def test_provider_disconnect_preserves_private_home_when_native_logout_fails(tmp
         secret_locator="native-home://auto",
         status="ready",
     )
-    setup = ProviderSetupManager(store=store, home_root=tmp_path / "provider-homes")
+    reconciled = []
+    setup = ProviderSetupManager(
+        store=store,
+        home_root=tmp_path / "provider-homes",
+        reconcile_provider_account_binding=lambda path: reconciled.append(path),
+    )
     account_home = setup.homes.ensure_home(
         tenant_id="tenant-a",
         owner_id="user-a",
@@ -658,25 +1015,177 @@ def test_provider_disconnect_preserves_private_home_when_native_logout_fails(tmp
         provider="codex",
     )
     monkeypatch.setenv("WPR_CODEX_CLI_PATH", "/synthetic/codex")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION", "per_worker_container")
     monkeypatch.setattr(
         subprocess,
         "run",
         lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0], returncode=9),
     )
 
-    with pytest.raises(ControlPlaneError, match="private account home was preserved"):
+    result = setup.disconnect(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+
+    assert result["status"] == "disconnected"
+    assert result["provider_logout_confirmed"] is False
+    assert reconciled == [account_home]
+    assert not account_home.exists()
+    updated = store.get_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )
+    assert updated is not None
+    assert updated["status"] == "disconnected"
+    assert store.active_provider_lease(account["account_id"], "provider-disconnect") is None
+
+
+def test_provider_disconnect_without_native_home_does_not_claim_provider_logout(tmp_path):
+    store = ControlPlaneStore(str(tmp_path / "runtime.db"))
+    account = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="claude",
+        label="Personal Claude",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://auto",
+        status="ready",
+    )
+    setup = ProviderSetupManager(store=store, home_root=tmp_path / "provider-homes")
+
+    result = setup.disconnect(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+
+    assert result["status"] == "disconnected"
+    assert result["provider_logout_confirmed"] is None
+    assert result["message"] == "Removed from GlassHive. No local provider session was present."
+
+
+def test_provider_disconnect_unlinks_final_home_symlink_without_following_target(tmp_path):
+    store = ControlPlaneStore(str(tmp_path / "runtime.db"))
+    account = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="claude",
+        label="Personal Claude",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://auto",
+        status="ready",
+    )
+    setup = ProviderSetupManager(store=store, home_root=tmp_path / "provider-homes")
+    account_home = setup.homes.account_home_path(
+        tenant_id="tenant-a", owner_id="user-a", account_id=account["account_id"]
+    )
+    account_home.parent.mkdir(parents=True)
+    outside = tmp_path / "outside-provider-home"
+    outside.mkdir()
+    marker = outside / "must-remain.txt"
+    marker.write_text("outside", encoding="utf-8")
+    account_home.symlink_to(outside, target_is_directory=True)
+
+    result = setup.disconnect(
+        account_id=account["account_id"],
+        tenant_id="tenant-a",
+        owner_id="user-a",
+    )
+
+    assert result["status"] == "disconnected"
+    assert not account_home.exists()
+    assert not account_home.is_symlink()
+    assert marker.read_text(encoding="utf-8") == "outside"
+
+
+def test_provider_forget_removes_owner_scoped_active_and_revoked_grant_rows(tmp_path):
+    database = tmp_path / "runtime.db"
+    store = ControlPlaneStore(str(database))
+    account = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="claude",
+        label="Personal Claude",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://auto",
+        status="action_required",
+    )
+    store.disconnect_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )
+    with sqlite3.connect(database) as conn:
+        for grant_id, revoked_at in (("grant_active", None), ("grant_revoked", 1.0)):
+            conn.execute(
+                """
+                INSERT INTO workspace_capability_grants
+                    (grant_id, tenant_id, owner_id, worker_id, account_id, scopes_json,
+                     prior_bootstrap_bundle_json, applied_bootstrap_bundle_json,
+                     installation_plan_json, probe_json, created_at, revoked_at)
+                VALUES (?, ?, ?, ?, ?, '[]', '{}', '{}', '[]', '{}', ?, ?)
+                """,
+                (grant_id, "tenant-a", "user-a", "worker-a", account["account_id"], 1.0, revoked_at),
+            )
+
+    assert store.forget_provider_account(
+        account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
+    )["status"] == "forgotten"
+    with sqlite3.connect(database) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM workspace_capability_grants WHERE account_id = ?",
+            (account["account_id"],),
+        ).fetchone()[0] == 0
+
+
+def test_provider_disconnect_cleanup_failure_is_actionable_and_releases_lease(
+    tmp_path, monkeypatch
+):
+    store = ControlPlaneStore(str(tmp_path / "runtime.db"))
+    account = store.create_provider_account(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        provider="claude",
+        label="Personal Claude",
+        auth_method="subscription",
+        platform_support="supported",
+        secret_locator="native-home://auto",
+        status="action_required",
+    )
+    setup = ProviderSetupManager(store=store, home_root=tmp_path / "provider-homes")
+    setup.homes.ensure_home(
+        tenant_id="tenant-a",
+        owner_id="user-a",
+        account_id=account["account_id"],
+        provider="claude",
+    )
+    monkeypatch.setenv("WPR_CLAUDE_CODE_PATH", "/synthetic/claude")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0], returncode=0),
+    )
+    monkeypatch.setattr(
+        setup.homes,
+        "remove_home",
+        lambda **_kwargs: (_ for _ in ()).throw(ControlPlaneError("synthetic cleanup failure")),
+    )
+
+    with pytest.raises(ControlPlaneError, match="could not remove its private account data"):
         setup.disconnect(
             account_id=account["account_id"],
             tenant_id="tenant-a",
             owner_id="user-a",
         )
 
-    assert account_home.exists()
     updated = store.get_provider_account(
         account_id=account["account_id"], tenant_id="tenant-a", owner_id="user-a"
     )
     assert updated is not None
     assert updated["status"] == "action_required"
+    assert updated["recovery_code"] == "credential_cleanup_failed"
+    assert updated["reconnect_reason"] == "Could not remove private account data. Retry Remove."
     assert store.active_provider_lease(account["account_id"], "provider-disconnect") is None
 
 
