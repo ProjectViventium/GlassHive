@@ -33,6 +33,8 @@ Implemented today:
 - standalone FastAPI control plane
 - SQLite persistence for projects, workers, runs, and events
 - workstation-backed worker profiles for `codex-cli`, `claude-code`, and `openclaw-general`
+- user-scoped personal Codex and Claude accounts with isolated native credential leases
+- private, human-named, favorite workspaces with native tool and connector reuse
 - browser desktop view via noVNC
 - terminal takeover via websocket bridge
 - worker lifecycle controls: `pause`, `resume`, `interrupt`, `terminate`
@@ -73,6 +75,9 @@ Start here:
 6. [`docs/06_References.md`](./docs/06_References.md)
 7. [`docs/07_Minimal_Unified_Operator_UI.md`](./docs/07_Minimal_Unified_Operator_UI.md)
 8. [`docs/08_Repository_Structure_and_Publication_Boundaries.md`](./docs/08_Repository_Structure_and_Publication_Boundaries.md)
+9. [`docs/12_Ultimate_Phase_1_Release_Notes.md`](./docs/12_Ultimate_Phase_1_Release_Notes.md)
+
+See [`CHANGELOG.md`](./CHANGELOG.md) for the current release summary.
 
 Historical research and phase-1 planning docs from the earlier standalone package live under [`research/`](./research) for continuity.
 
