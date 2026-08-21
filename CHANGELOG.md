@@ -28,8 +28,9 @@
 
 ### Verified scope
 
-The installed Ultimate Phase 1 path passed personal Codex and Claude work, native connected-service
-reuse, favorite-workspace refresh and reuse, and control of the same workspace from fresh Codex and
-Claude MCP clients. See [the release notes](docs/12_Ultimate_Phase_1_Release_Notes.md). Broader
-two-owner, confirmed-write, clean-install, and full restore testing remains outside this accepted
-scope.
+Across the accepted installed runs, Ultimate Phase 1 passed personal Codex and Claude work, native
+connected-service reuse, favorite-workspace refresh and reuse, and control of the same workspace
+from fresh Codex and Claude MCP clients. The current Codex rerun was provider-quota blocked and was
+not counted as fresh proof; the earlier accepted installed Codex lane remains the evidence. See
+[the release notes](docs/12_Ultimate_Phase_1_Release_Notes.md). Broader two-owner, confirmed-write,
+clean-install, and full restore testing remains outside this accepted scope.

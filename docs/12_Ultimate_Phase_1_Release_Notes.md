@@ -41,7 +41,7 @@ An authenticated user can:
 
 ## Accepted evidence
 
-The installed acceptance run proved:
+Across the accepted installed runs, the evidence proved:
 
 - personal Codex and Claude account readiness and missions;
 - native connected-service reads without connector-specific GlassHive wiring;
@@ -50,6 +50,10 @@ The installed acceptance run proved:
 - fresh isolated Codex and Claude MCP clients reused the same workspace with one launch and one
   bounded wait; and
 - removal of a stale personal connection completed and remained removed after refresh.
+
+The current Codex rerun was blocked by the provider account's usage limit. It was not counted as
+fresh current-run proof; the earlier accepted installed Codex mission and connected-service reuse
+remain the evidence for that lane.
 
 The product owner re-tested the installed flow and accepted this scope on 2026-08-21.
 
