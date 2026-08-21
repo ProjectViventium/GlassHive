@@ -109,7 +109,6 @@ button, input, textarea, select { font: inherit; }
   border-radius: 24px;
   background: linear-gradient(180deg, rgba(15, 18, 24, 0.86) 0%, rgba(7, 10, 15, 0.92) 100%);
   box-shadow: var(--shadow);
-  backdrop-filter: blur(22px);
 }
 .composer-frame[data-active-view="workspaces"] {
   width: min(1600px, calc(100vw - 48px));

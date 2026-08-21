@@ -2261,6 +2261,7 @@ def test_main_frame_is_visible_without_waiting_for_a_compositor_animation():
     composer_rule = styles[start : styles.index("}", start)]
 
     assert "animation:" not in composer_rule
+    assert "backdrop-filter:" not in composer_rule
     assert "@keyframes float-up" not in styles
 
 
