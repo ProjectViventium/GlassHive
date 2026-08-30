@@ -93,6 +93,95 @@ from .store import (
 )
 from .workspace_continuation import continuation_instruction
 
+import fcntl
+
+import math
+
+import signal
+
+import subprocess
+
+import sys
+
+from dataclasses import dataclass
+
+from threading import Condition, Event, Lock, Thread
+
+from typing import Any
+
+from urllib.parse import quote, urlencode, urlparse
+
+from .broker_admission import (
+    BrokerAdmissionError,
+    admit_capability_grant,
+    prepare_scheduled_provider_authorization,
+    preflight_provider_authorization,
+    revoke_capability_grant,
+)
+
+from .failure_classification import classify_runtime_error, is_user_resumable_failure
+
+from .local_qa_control import (
+    AUTHORITY_KEYS as LOCAL_QA_AUTHORITY_KEYS,
+    CANDIDATE_DIGEST_ENV as LOCAL_QA_CANDIDATE_DIGEST_ENV,
+    COMPONENT_ARTIFACT_DIGEST_ENV as LOCAL_QA_COMPONENT_DIGEST_ENV,
+    RUN_SCOPED_FAULTS as LOCAL_QA_RUN_SCOPED_FAULTS,
+    LocalQAControlPlane,
+    LocalQAFaultDirective,
+)
+
+from .models import (
+    normalize_worker_resource_class,
+    utc_now,
+    worker_resource_memory_bytes,
+)
+
+from .native_team import NativeTeamProjection
+
+from .openclaw_runtime import (
+    HostCapacityError,
+    ProviderRateLimitError,
+    RuntimeErrorBase,
+    RuntimeInfo,
+    RunStartupRejectedError,
+    WorkerInterruptedError,
+    WorkerPausedError,
+    WorkerRuntime,
+    WorkerTerminatedError,
+)
+
+from .run_states import TERMINAL_RUN_STATES
+
+from .signed_links import (
+    append_signed_query,
+    create_signed_link_ref,
+    is_worker_signed_link_revoked,
+    revoke_signed_link_refs_for_worker,
+    sign_link_params,
+    signed_link_ref_url,
+    sign_link_token,
+)
+
+from .store import (
+    CallbackIntentGenerationConflictError,
+    canonical_parallel_clean_room_bootstrap,
+    is_parallel_clean_room_bootstrap,
+    DelegationIdempotencyConflictError,
+    HostRunLeaseCapacityError,
+    IsolatedParallelAdmissionConflictError,
+    STEER_REPLACEMENT_SUPPRESSED_ERROR,
+    Store,
+    WorkAdmissionError,
+    work_artifact_observation,
+)
+
+from .workspace_continuation import (
+    build_workspace_continuation_context,
+    continuation_instruction,
+)
+
+from .worker_isolation_audit import capture_worker_isolation_audit
+
 
 logger = logging.getLogger(__name__)
 TERMINAL_CALLBACK_MESSAGE_LIMIT = 4000
@@ -377,6 +466,698 @@ def _duplicate_bootstrap_bundle(bundle: dict | None) -> dict | None:
     return {"project_definition": project_definition}
 
 
+WORK_TRACE_SCHEMA_DIGEST = (
+    "sha256:ba9b15e022a451c62be0c0f30a02d6615bea83e868b2ffdd349beff75002e790"
+)
+
+WORK_TRACE_PRODUCER_SOURCE_IDENTITY = "workers_projects_runtime.api:get_active_work"
+
+WORK_TRACE_EMITTED_KEY_SET_DIGEST = (
+    "sha256:3a109b0f41a08755252a050e444dd6780e7bf95aec194ad95628e4e7a5c3a253"
+)
+
+def work_trace_emitted_key_set_digest(value: object) -> str:
+    paths: set[str] = set()
+
+    def visit(current: object, prefix: str) -> None:
+        if isinstance(current, list):
+            for item in current:
+                visit(item, f"{prefix}[]")
+            return
+        if not isinstance(current, dict):
+            return
+        for key in sorted(str(item) for item in current):
+            path = f"{prefix}.{key}" if prefix else key
+            paths.add(path)
+            visit(current[key], path)
+
+    visit(value, "")
+    encoded = json.dumps(sorted(paths), separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+WORKER_PROMPT_LAYER_CONTRACT_VERSION = 1
+
+WORKER_PROMPT_LAYER_PRODUCER_SCOPE = "glasshive.worker_prompt_registry"
+
+WORKER_PROMPT_LAYER_REGISTRY = frozenset(
+    {
+        "agents_md",
+        "claude_md",
+        "codex_md",
+        "developer_instructions",
+        "glasshive_worker_project_contract",
+        "harness_prompt",
+        "mcp_server_instructions",
+        "project_definition",
+        "run_instruction",
+        "system_instructions",
+        "tool_schemas",
+        "viventium_feeling_state",
+    }
+)
+
+def worker_prompt_layer_actual_producers() -> tuple[object, ...]:
+    """Enumerate the real prompt-producing code boundary independently."""
+
+    from .bootstrap import (
+        canonicalize_viventium_feeling_projection,
+        glasshive_project_agents_md,
+        glasshive_project_claude_md,
+        glasshive_project_codex_md,
+        merge_glasshive_worker_instructions,
+    )
+    from .mcp_server import create_mcp_server, glasshive_workers_server_instructions
+    from .profile_runtime import (
+        HostNativeCliMixin,
+        _apply_codex_developer_instructions,
+        _instruction_with_completion_contract,
+    )
+
+    return (
+        canonicalize_viventium_feeling_projection,
+        glasshive_project_agents_md,
+        glasshive_project_claude_md,
+        glasshive_project_codex_md,
+        merge_glasshive_worker_instructions,
+        glasshive_workers_server_instructions,
+        create_mcp_server,
+        _apply_codex_developer_instructions,
+        _instruction_with_completion_contract,
+        HostNativeCliMixin._host_project_definition,
+        HostNativeCliMixin._host_harness_prompt,
+    )
+
+def _worker_prompt_producer_ref(producer: object) -> str:
+    declared = str(
+        getattr(producer, "__glasshive_worker_prompt_producer_ref__", "") or ""
+    )
+    if declared:
+        return declared
+    return f"{getattr(producer, '__module__', '')}.{getattr(producer, '__qualname__', '')}"
+
+def worker_prompt_layer_producer_bindings() -> dict[str, tuple[str, ...]]:
+    """Read declarations from the independently enumerated producer boundary."""
+
+    from .bootstrap import WORKER_PROMPT_LAYER_DECLARATION_ATTRIBUTE
+
+    bindings: dict[str, tuple[str, ...]] = {}
+    for producer in worker_prompt_layer_actual_producers():
+        producer_ref = _worker_prompt_producer_ref(producer)
+        declared = getattr(producer, WORKER_PROMPT_LAYER_DECLARATION_ATTRIBUTE, None)
+        if (
+            isinstance(declared, tuple)
+            and len(declared) == 2
+            and declared[0] == producer_ref
+            and isinstance(declared[1], tuple)
+            and all(isinstance(name, str) and name for name in declared[1])
+        ):
+            bindings[producer_ref] = tuple(declared[1])
+    return dict(sorted(bindings.items()))
+
+def worker_prompt_layer_registration_errors() -> tuple[str, ...]:
+    from .bootstrap import WORKER_PROMPT_LAYER_PRODUCER_BINDINGS
+
+    bindings = worker_prompt_layer_producer_bindings()
+    actual_refs = {
+        _worker_prompt_producer_ref(producer)
+        for producer in worker_prompt_layer_actual_producers()
+    }
+    bound_refs = set(bindings)
+    registered_refs = set(WORKER_PROMPT_LAYER_PRODUCER_BINDINGS)
+    errors: list[str] = []
+    mismatched_refs = {
+        producer_ref
+        for producer_ref in actual_refs & bound_refs & registered_refs
+        if tuple(WORKER_PROMPT_LAYER_PRODUCER_BINDINGS[producer_ref])
+        != bindings[producer_ref]
+    }
+    if actual_refs - bound_refs or actual_refs - registered_refs or mismatched_refs:
+        errors.append("unregistered_prompt_producer")
+    if registered_refs - actual_refs:
+        errors.extend(
+            name
+            for producer_ref in sorted(registered_refs - actual_refs)
+            for name in WORKER_PROMPT_LAYER_PRODUCER_BINDINGS[producer_ref]
+        )
+    return tuple(sorted(set(errors)))
+
+def worker_prompt_layer_producer_names() -> tuple[str, ...]:
+    bindings = worker_prompt_layer_producer_bindings()
+    return tuple(
+        sorted(
+            {
+                str(layer_name).strip()
+                for layer_names in bindings.values()
+                for layer_name in layer_names
+            }
+        )
+    )
+
+class _WorkerPromptLayerProducerNames:
+    """Read-only compatibility view backed by actual producer registrations."""
+
+    def __iter__(self):
+        return iter(worker_prompt_layer_producer_names())
+
+WORKER_PROMPT_LAYER_PRODUCERS = _WorkerPromptLayerProducerNames()
+
+def worker_prompt_layer_integrity_snapshot(
+    *, include_producer_scope: bool = False
+) -> dict[str, object]:
+    produced = set(worker_prompt_layer_producer_names())
+    unknown = sorted(
+        {
+            *(name for name in produced if name not in WORKER_PROMPT_LAYER_REGISTRY),
+            *worker_prompt_layer_registration_errors(),
+        }
+    )[:128]
+    snapshot: dict[str, object] = {
+        "contractVersion": WORKER_PROMPT_LAYER_CONTRACT_VERSION,
+        "unknownLayerNames": unknown,
+    }
+    if include_producer_scope:
+        snapshot["producerScope"] = WORKER_PROMPT_LAYER_PRODUCER_SCOPE
+        return {
+            "contractVersion": snapshot["contractVersion"],
+            "producerScope": snapshot["producerScope"],
+            "unknownLayerNames": snapshot["unknownLayerNames"],
+        }
+    return snapshot
+
+def valid_worker_prompt_layer_capability(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    unknown = value.get("unknownLayerNames")
+    return bool(
+        set(value)
+        == {"contractVersion", "producerScope", "unknownLayerNames"}
+        and value.get("contractVersion") == WORKER_PROMPT_LAYER_CONTRACT_VERSION
+        and value.get("producerScope") == WORKER_PROMPT_LAYER_PRODUCER_SCOPE
+        and isinstance(unknown, list)
+        and not unknown
+    )
+
+class _WorkerLifecycleGuard:
+    """One idempotently releasable cross-process worker lifecycle flock."""
+
+    def __init__(self, handle) -> None:
+        self._handle = handle
+        self._released = False
+        self._release_lock = Lock()
+
+    def release(self) -> None:
+        with self._release_lock:
+            if self._released:
+                return
+            self._released = True
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+            self._handle.close()
+
+class ParallelExecutionIsolationError(RuntimeError):
+    """Automatic conversation-orchestrated missions may not enter the host lane."""
+
+    def __init__(self, message: str, *, reason_code: str = "") -> None:
+        super().__init__(message)
+        self.reason_code = str(reason_code or "").strip()
+
+PARALLEL_CLEAN_ROOM_EXECUTION_POLICY = "parallel-clean-room-v1"
+
+PARALLEL_CLEAN_ROOM_BOOTSTRAP_PROFILE = "clean-room"
+
+PROMPT_WORKBENCH_SCHEDULED_BOOTSTRAP_PROFILE = "prompt-workbench-scheduled-v1"
+
+PROMPT_WORKBENCH_SCHEDULED_AUTHORITY_KIND = "prompt_workbench_scheduled"
+
+PROMPT_WORKBENCH_SCHEDULED_AUTHORITY_REQUEST = (
+    "viventium_execution_authority_request"
+)
+
+PROMPT_WORKBENCH_SCHEDULED_ALIAS_NAMESPACE = "prompt-workbench-scheduled"
+
+PARALLEL_CLEAN_ROOM_BROKER_NAME = "glasshive-user-capabilities"
+
+PARALLEL_CLEAN_ROOM_BROKER_TOKEN_ENV = "GLASSHIVE_CAPABILITY_BROKER_TOKEN"
+
+PARALLEL_CLEAN_ROOM_EFFORT_ENV_VALUES = {
+    "WPR_CODEX_CLI_REASONING_EFFORT": {
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    },
+    "WPR_CLAUDE_CODE_EFFORT": {"default", "max"},
+}
+
+PARALLEL_CLEAN_ROOM_FORBIDDEN_BUNDLE_KEYS = {
+    "anthropicapikey",
+    "apikey",
+    "authtoken",
+    "bearertoken",
+    "claudecodeoauthtoken",
+    "claudesettingslocal",
+    "credential",
+    "credentials",
+    "credentialspath",
+    "openaiapikey",
+    "providerapikey",
+    "providerauth",
+    "providercredentials",
+    "providerenv",
+    "providerheaders",
+    "providertoken",
+    "providertokens",
+}
+
+PARALLEL_CLEAN_ROOM_REJECTION_CODES = {
+    "host bootstrap profiles are not allowed": "host_profile",
+    "bootstrap bundle is invalid": "bundle_invalid",
+    "execution policy is server-owned": "caller_execution_policy",
+    "caller provider credentials are not allowed": "caller_provider_credentials",
+    "caller bootstrap environment is not allowed": "caller_environment",
+    "files must be a workspace-scoped list": "files_not_workspace_list",
+    "every file must be workspace-scoped": "file_not_workspace_scoped",
+    "home-scoped files are not allowed": "home_scoped_file",
+    "workspace file path is invalid": "workspace_path_invalid",
+    "workspace provider or credential config files are not allowed": "workspace_authority_file",
+    "capability broker metadata is invalid": "broker_metadata_invalid",
+    "caller broker credentials are not allowed": "caller_broker_credentials",
+    "caller MCP config is not allowed": "caller_mcp_config",
+    "caller Claude MCP config is not allowed": "caller_claude_mcp_config",
+    "caller Codex MCP config is not allowed": "caller_codex_mcp_config",
+}
+
+def _parallel_clean_room_rejected(reason: str) -> ParallelExecutionIsolationError:
+    return ParallelExecutionIsolationError(
+        f"Automatic Parallel work rejected unsafe bootstrap authority: {reason}.",
+        reason_code=PARALLEL_CLEAN_ROOM_REJECTION_CODES.get(reason, "bundle_invalid"),
+    )
+
+def _canonical_authority_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+def _validate_parallel_clean_room_files(bundle: dict) -> None:
+    raw_files = bundle.get("files")
+    if raw_files is None:
+        return
+    if not isinstance(raw_files, list):
+        raise _parallel_clean_room_rejected("files must be a workspace-scoped list")
+    for entry in raw_files:
+        if not isinstance(entry, dict):
+            raise _parallel_clean_room_rejected("every file must be workspace-scoped")
+        scope = str(entry.get("scope") or "workspace").strip().lower()
+        if scope != "workspace":
+            raise _parallel_clean_room_rejected("home-scoped files are not allowed")
+        raw_path = str(entry.get("path") or "").strip()
+        if not raw_path:
+            filename = str(entry.get("filename") or entry.get("file_id") or "").strip()
+            raw_path = f"uploads/{filename}" if filename else ""
+        relative = Path(raw_path.lstrip("/"))
+        if not raw_path or relative.is_absolute() or ".." in relative.parts:
+            raise _parallel_clean_room_rejected("workspace file path is invalid")
+        normalized_path = relative.as_posix().lower()
+        first_part = relative.parts[0].lower() if relative.parts else ""
+        if (
+            first_part in {".claude", ".codex", ".glasshive", ".git", ".ssh"}
+            or normalized_path
+            in {
+                ".mcp.json",
+                ".netrc",
+                ".npmrc",
+                ".pypirc",
+                ".gitconfig",
+                ".git-credentials",
+                ".config/gh/hosts.yml",
+                ".config/glab-cli/config.yml",
+            }
+            or normalized_path == ".env"
+            or normalized_path.startswith(".env.")
+        ):
+            raise _parallel_clean_room_rejected(
+                "workspace provider or credential config files are not allowed"
+            )
+
+def _contains_parallel_forbidden_authority_key(value: object) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if _canonical_authority_key(key) in PARALLEL_CLEAN_ROOM_FORBIDDEN_BUNDLE_KEYS:
+                return True
+            if _contains_parallel_forbidden_authority_key(nested):
+                return True
+    elif isinstance(value, list):
+        return any(_contains_parallel_forbidden_authority_key(item) for item in value)
+    return False
+
+def _parallel_clean_room_broker_url(bundle: dict) -> str:
+    broker = bundle.get("glasshive_capability_broker")
+    if broker is None:
+        return ""
+    if not isinstance(broker, dict):
+        raise _parallel_clean_room_rejected("capability broker metadata is invalid")
+    broker_url = str(broker.get("url") or "").strip()
+    parsed = urlparse(broker_url)
+    if (
+        str(broker.get("name") or "").strip() != PARALLEL_CLEAN_ROOM_BROKER_NAME
+        or broker.get("version") != 1
+        or isinstance(broker.get("version"), bool)
+        or str(broker.get("status") or "").strip() != "pending_admission"
+        or parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise _parallel_clean_room_rejected("capability broker metadata is invalid")
+    forbidden_broker_keys = {
+        "authorization",
+        "bearer",
+        "bearertoken",
+        "grant",
+        "granttoken",
+        "password",
+        "secret",
+        "token",
+    }
+    if any(
+        _canonical_authority_key(key) in forbidden_broker_keys
+        for key in broker
+    ):
+        raise _parallel_clean_room_rejected("caller broker credentials are not allowed")
+    return broker_url
+
+def _validate_parallel_clean_room_mcp(bundle: dict) -> None:
+    project_mcp = bundle.get("claude_project_mcp")
+    codex_config = bundle.get("codex_config_append")
+    if project_mcp is None and codex_config is None:
+        return
+    broker_url = _parallel_clean_room_broker_url(bundle)
+    if not broker_url:
+        raise _parallel_clean_room_rejected("caller MCP config is not allowed")
+    expected_server = {
+        "type": "http",
+        "transport": "http",
+        "url": broker_url,
+        "headers": {
+            "Authorization": f"Bearer ${{{PARALLEL_CLEAN_ROOM_BROKER_TOKEN_ENV}}}"
+        },
+    }
+    if project_mcp is not None and project_mcp != {
+        PARALLEL_CLEAN_ROOM_BROKER_NAME: expected_server
+    }:
+        raise _parallel_clean_room_rejected("caller Claude MCP config is not allowed")
+    expected_codex_config = "\n".join(
+        (
+            f"[mcp_servers.{PARALLEL_CLEAN_ROOM_BROKER_NAME}]",
+            f"url = {json.dumps(broker_url, ensure_ascii=False)}",
+            f"bearer_token_env_var = {json.dumps(PARALLEL_CLEAN_ROOM_BROKER_TOKEN_ENV)}",
+        )
+    )
+    if codex_config is not None and (
+        not isinstance(codex_config, str)
+        or codex_config.strip() != expected_codex_config
+    ):
+        raise _parallel_clean_room_rejected("caller Codex MCP config is not allowed")
+
+def _validate_parallel_clean_room_environment(bundle: dict) -> None:
+    """Allow only bounded, nonsecret worker quality preferences from trusted Core."""
+
+    env = bundle.get("env")
+    if env is None:
+        return
+    if not isinstance(env, dict):
+        raise _parallel_clean_room_rejected("caller bootstrap environment is not allowed")
+    for raw_key, raw_value in env.items():
+        key = str(raw_key or "")
+        value = str(raw_value or "")
+        allowed_values = PARALLEL_CLEAN_ROOM_EFFORT_ENV_VALUES.get(key)
+        if allowed_values is None or value not in allowed_values:
+            raise _parallel_clean_room_rejected("caller bootstrap environment is not allowed")
+
+def derive_parallel_clean_room_bootstrap(
+    bootstrap_profile: str | None,
+    bootstrap_bundle: dict | None,
+) -> tuple[str, dict]:
+    """Validate Core's automatic launch envelope and add immutable host policy."""
+
+    requested_profile = str(bootstrap_profile or "").strip()
+    if requested_profile and requested_profile != PARALLEL_CLEAN_ROOM_BOOTSTRAP_PROFILE:
+        raise _parallel_clean_room_rejected("host bootstrap profiles are not allowed")
+    if not isinstance(bootstrap_bundle, dict):
+        raise _parallel_clean_room_rejected("bootstrap bundle is invalid")
+    if "execution_policy" in bootstrap_bundle:
+        raise _parallel_clean_room_rejected("execution policy is server-owned")
+    if _contains_parallel_forbidden_authority_key(bootstrap_bundle):
+        raise _parallel_clean_room_rejected("caller provider credentials are not allowed")
+    _validate_parallel_clean_room_environment(bootstrap_bundle)
+    _validate_parallel_clean_room_files(bootstrap_bundle)
+    if bootstrap_bundle.get("glasshive_capability_broker") is not None:
+        _parallel_clean_room_broker_url(bootstrap_bundle)
+    _validate_parallel_clean_room_mcp(bootstrap_bundle)
+    canonical_bundle = canonical_parallel_clean_room_bootstrap(bootstrap_bundle)
+    return (
+        PARALLEL_CLEAN_ROOM_BOOTSTRAP_PROFILE,
+        {
+            **canonical_bundle,
+            "execution_policy": PARALLEL_CLEAN_ROOM_EXECUTION_POLICY,
+        },
+    )
+
+@dataclass(frozen=True)
+class HostResourceUsage:
+    child_processes: int
+    threads: int
+    available_memory_bytes: int
+    available_disk_bytes: int = 2**63 - 1
+    process_probe_ok: bool = True
+    memory_probe_ok: bool = True
+    disk_probe_ok: bool = True
+
+class _DurablePreflightProbeLease:
+    """Own and abort the exact subprocess protected by a preflight lease."""
+
+    def __init__(self) -> None:
+        self._lost = Event()
+        self._process_lock = Lock()
+        self._process: subprocess.Popen | None = None
+
+    @property
+    def lost(self) -> bool:
+        return self._lost.is_set()
+
+    @staticmethod
+    def _kill_process_group(process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except OSError:
+            try:
+                process.kill()
+            except OSError:
+                return
+
+    def mark_lost(self) -> None:
+        self._lost.set()
+        with self._process_lock:
+            process = self._process
+        if process is not None:
+            self._kill_process_group(process)
+
+    def run_subprocess(self, command, **kwargs) -> subprocess.CompletedProcess:
+        """Run one process group that cannot outlive reservation ownership."""
+
+        if self.lost:
+            raise HostCapacityError(
+                "CLI preflight reservation ownership was lost before process start.",
+                capacity_class="preflight_reservation",
+            )
+        options = dict(kwargs)
+        check = bool(options.pop("check", False))
+        timeout = options.pop("timeout", None)
+        input_value = options.pop("input", None)
+        capture_output = bool(options.pop("capture_output", False))
+        if capture_output:
+            if options.get("stdout") is not None or options.get("stderr") is not None:
+                raise ValueError("stdout and stderr may not be used with capture_output")
+            options["stdout"] = subprocess.PIPE
+            options["stderr"] = subprocess.PIPE
+        options["start_new_session"] = True
+        process = subprocess.Popen(command, **options)
+        with self._process_lock:
+            self._process = process
+            lost_before_registration = self.lost
+        if lost_before_registration:
+            self._kill_process_group(process)
+        try:
+            try:
+                stdout, stderr = process.communicate(input=input_value, timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                self._kill_process_group(process)
+                stdout, stderr = process.communicate()
+                exc.output = stdout
+                exc.stderr = stderr
+                raise
+            if self.lost:
+                raise HostCapacityError(
+                    "CLI preflight reservation ownership was lost during the external probe.",
+                    capacity_class="preflight_reservation",
+                )
+            completed = subprocess.CompletedProcess(
+                command,
+                process.returncode,
+                stdout,
+                stderr,
+            )
+            if check:
+                completed.check_returncode()
+            return completed
+        finally:
+            with self._process_lock:
+                if self._process is process:
+                    self._process = None
+
+def host_resource_usage(active_leases: list[dict]) -> HostResourceUsage:
+    """Measure only leased Viventium process trees plus global memory headroom."""
+
+    pids = {
+        int(lease.get("pid") or 0)
+        for lease in active_leases
+        if int(lease.get("pid") or 0) > 0
+    }
+    descendants: set[int] = set()
+    threads = 0
+    process_probe_ok = True
+    if pids:
+        try:
+            completed = subprocess.run(
+                ["ps", "-axo", "pid=,ppid="],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            completed = None
+        rows: list[tuple[int, int]] = []
+        if completed and completed.returncode == 0:
+            for line in completed.stdout.splitlines():
+                parts = line.split()
+                if len(parts) != 2:
+                    continue
+                try:
+                    rows.append(tuple(int(part) for part in parts))
+                except ValueError:
+                    continue
+            descendants = set(pids)
+            changed = True
+            while changed:
+                changed = False
+                for pid, parent_pid in rows:
+                    if parent_pid in descendants and pid not in descendants:
+                        descendants.add(pid)
+                        changed = True
+            process_ids = ",".join(str(pid) for pid in sorted(descendants))
+            try:
+                if sys.platform == "darwin":
+                    thread_probe = subprocess.run(
+                        ["ps", "-M", "-p", process_ids],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                        timeout=2,
+                    )
+                    thread_rows = [
+                        line
+                        for line in thread_probe.stdout.splitlines()[1:]
+                        if line.strip()
+                    ]
+                    threads = len(thread_rows)
+                else:
+                    thread_probe = subprocess.run(
+                        ["ps", "-o", "nlwp=", "-p", process_ids],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                        timeout=2,
+                    )
+                    threads = sum(
+                        max(0, int(line.strip()))
+                        for line in thread_probe.stdout.splitlines()
+                        if line.strip()
+                    )
+                if thread_probe.returncode != 0 or threads < len(descendants):
+                    process_probe_ok = False
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                process_probe_ok = False
+        else:
+            process_probe_ok = False
+    available_memory = 0
+    memory_probe_ok = True
+    try:
+        completed = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+        if completed.returncode != 0:
+            raise ValueError("memory size probe failed")
+        total_memory = int(completed.stdout.strip())
+        vm_stat = subprocess.run(
+            ["vm_stat"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+        if vm_stat.returncode != 0:
+            raise ValueError("memory headroom probe failed")
+        page_match = re.search(r"page size of (\d+) bytes", vm_stat.stdout)
+        page_size = int(page_match.group(1)) if page_match else 4096
+        free_pages = 0
+        for name in ("Pages free", "Pages inactive", "Pages speculative"):
+            match = re.search(rf"^{re.escape(name)}:\s+([0-9.]+)\.", vm_stat.stdout, re.MULTILINE)
+            if match:
+                free_pages += int(match.group(1))
+        available_memory = free_pages * page_size
+        if not available_memory:
+            available_memory = total_memory
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        memory_probe_ok = False
+        available_memory = 0
+    available_disk = 0
+    disk_probe_ok = True
+    try:
+        disk_root = Path(
+            os.environ.get("WPR_HOST_RUNTIME_DIR", "").strip()
+            or os.environ.get("WPR_HOST_WORKSPACE_ROOT", "").strip()
+            or os.getcwd()
+        ).expanduser()
+        while not disk_root.exists() and disk_root != disk_root.parent:
+            disk_root = disk_root.parent
+        available_disk = int(shutil.disk_usage(disk_root).free)
+    except (OSError, ValueError):
+        disk_probe_ok = False
+        available_disk = 0
+    return HostResourceUsage(
+        child_processes=len(descendants),
+        threads=threads,
+        available_memory_bytes=available_memory,
+        available_disk_bytes=available_disk,
+        process_probe_ok=process_probe_ok,
+        memory_probe_ok=memory_probe_ok,
+        disk_probe_ok=disk_probe_ok,
+    )
+
 def _bounded_int_env(name: str, default: int, *, min_value: int, max_value: int) -> int:
     try:
         value = int(str(os.environ.get(name, "")).strip())
@@ -384,6 +1165,34 @@ def _bounded_int_env(name: str, default: int, *, min_value: int, max_value: int)
         return default
     return max(min_value, min(value, max_value))
 
+
+def _configured_worker_resource_memory_bytes(resource_class: object) -> int:
+    return worker_resource_memory_bytes(
+        normalize_worker_resource_class(resource_class),
+        standard_memory_mib=_bounded_int_env(
+            "WPR_DOCKER_MEMORY_RESERVATION_MB",
+            3072,
+            min_value=1,
+            max_value=1048576,
+        ),
+    )
+
+def _worker_resource_memory_reservation(worker: dict | None) -> int:
+    resource_class = normalize_worker_resource_class(
+        (worker or {}).get("resource_class") or "standard"
+    )
+    raw_memory = (worker or {}).get("resource_memory_bytes")
+    if raw_memory in {None, ""}:
+        return _configured_worker_resource_memory_bytes(resource_class)
+    if isinstance(raw_memory, bool) or int(raw_memory) <= 0:
+        raise ValueError("Worker resource memory must be a positive byte count")
+    memory_bytes = int(raw_memory)
+    if (
+        resource_class == "light"
+        and memory_bytes != worker_resource_memory_bytes("light")
+    ):
+        raise ValueError("Light worker memory must use the trusted server value")
+    return memory_bytes
 
 def _bounded_float_env(name: str, default: float, *, min_value: float, max_value: float) -> float:
     try:
@@ -464,6 +1273,11 @@ def _recurring_schedule_owner() -> str:
         return DELEGATED_RECURRENCE_OWNER
     return configured_owner or NATIVE_RECURRENCE_OWNER
 
+
+def isolated_parallel_policy_enabled() -> bool:
+    """Whether same-UID host missions are excluded while Parallel Main is available."""
+
+    return _env_truthy("VIVENTIUM_GLASSHIVE_ISOLATED_PARALLEL_POLICY")
 
 class HostWorkersDisabledError(RuntimeError):
     pass
@@ -624,9 +1438,16 @@ def _merge_file_entries(existing: object, incoming: object) -> object:
 def merge_bootstrap_bundle(existing: dict | None, incoming: dict | None) -> dict | None:
     if incoming is None:
         return existing
-    if existing is None:
-        return dict(incoming)
-    merged = dict(existing)
+    existing_bundle = existing or {}
+    merged = dict(existing_bundle)
+    if (
+        "execution_policy" in existing_bundle
+        and "execution_policy" in incoming
+        and incoming["execution_policy"] != existing_bundle["execution_policy"]
+    ):
+        raise ParallelExecutionIsolationError(
+            "The server-owned worker execution policy is immutable."
+        )
     for key, value in incoming.items():
         current = merged.get(key)
         if key == "files":
@@ -635,6 +1456,10 @@ def merge_bootstrap_bundle(existing: dict | None, incoming: dict | None) -> dict
             merged[key] = merge_bootstrap_bundle(current, value) or {}
         else:
             merged[key] = value
+    if is_parallel_clean_room_bootstrap(
+        None, existing_bundle
+    ) or is_parallel_clean_room_bootstrap(None, merged):
+        return canonical_parallel_clean_room_bootstrap(merged)
     return merged
 
 
@@ -664,11 +1489,42 @@ class WorkersProjectsService:
         reconcile_on_startup: bool | None = None,
         control_plane_store: ControlPlaneStore | None = None,
         scheduling_owner_client: ViventiumSchedulingOwnerClient | None = None,
+        local_qa_control_plane: LocalQAControlPlane | None = None,
+        start_background_consumers: bool = True,
     ) -> None:
         self.store = store
         self.runtime = runtime
         self.control_plane_store = control_plane_store
         self.scheduling_owner_client = scheduling_owner_client or ViventiumSchedulingOwnerClient()
+        self._local_qa_control_plane = local_qa_control_plane
+        if self._local_qa_control_plane is None:
+            qa_keys = (
+                *LOCAL_QA_AUTHORITY_KEYS,
+                LOCAL_QA_CANDIDATE_DIGEST_ENV,
+                LOCAL_QA_COMPONENT_DIGEST_ENV,
+            )
+            qa_values = [str(os.environ.get(key, "") or "").strip() for key in qa_keys]
+            if all(qa_values):
+                try:
+                    self._local_qa_control_plane = LocalQAControlPlane(store.db_path)
+                except Exception:
+                    logger.warning(
+                        "GlassHive local-QA authority was rejected; fault controls remain inactive"
+                    )
+        self._configured_host_capacity = {
+            "conversation_limit": _bounded_int_env(
+                "WPR_HOST_CONVERSATION_SLOTS_PER_CLI", 2, min_value=1, max_value=64
+            ),
+            "mission_limit": _bounded_int_env(
+                "WPR_HOST_MISSION_SLOTS_PER_CLI", 3, min_value=1, max_value=64
+            ),
+            "account_mission_limit": _bounded_int_env(
+                "WPR_HOST_ACCOUNT_ACTIVE_LIMIT", 4, min_value=1, max_value=256
+            ),
+            "tenant_mission_limit": _bounded_int_env(
+                "WPR_HOST_TENANT_ACTIVE_LIMIT", 12, min_value=1, max_value=1024
+            ),
+        }
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="wpr-runner")
         # Interactive provider turns have a separate dispatch lane so autonomous mission workers
         # cannot occupy every service thread before a conversation reaches the host CLI's own
@@ -677,7 +1533,7 @@ class WorkersProjectsService:
             1,
             min(
                 max_workers,
-                int(os.environ.get("GLASSHIVE_CONVERSATION_EXECUTOR_WORKERS", "2") or "2"),
+                self._configured_host_capacity["account_mission_limit"],
             ),
         )
         self.conversation_executor = ThreadPoolExecutor(
@@ -685,6 +1541,7 @@ class WorkersProjectsService:
             thread_name_prefix="wpr-conversation",
         )
         self._shutdown_event = Event()
+        self._scheduler_wake_event = Event()
         self._processors_lock = Lock()
         self._active_processors: set[str] = set()
         self._processor_generations: dict[str, int] = {}
@@ -692,13 +1549,51 @@ class WorkersProjectsService:
         self._worker_create_lock = Lock()
         self._deliverable_promotions_lock = Lock()
         self._deliverable_promotions: set[str] = set()
+        self._pending_run_starts_lock = Lock()
+        self._pending_run_starts: dict[str, dict[str, object]] = {}
+        self._run_local_bundles_lock = Condition()
+        self._run_local_bundles: dict[str, dict] = {}
+        self._run_local_grant_waiters: set[str] = set()
+        self._executor_id = f"executor-{os.getpid()}-{uuid.uuid4().hex}"
+        observer_setter = getattr(self.runtime, "set_host_process_observer", None)
+        if callable(observer_setter):
+            observer_setter(self._observe_host_process)
+        start_observer_setter = getattr(self.runtime, "set_run_start_observer", None)
+        self._run_start_observer_supported = callable(start_observer_setter)
+        if callable(start_observer_setter):
+            start_observer_setter(self._observe_run_start)
+        native_observer_setter = getattr(self.runtime, "set_native_event_observer", None)
+        if callable(native_observer_setter):
+            native_observer_setter(self._observe_native_event)
+        liveness_observer_setter = getattr(
+            self.runtime, "set_provider_liveness_observer", None
+        )
+        if callable(liveness_observer_setter):
+            liveness_observer_setter(self._observe_provider_liveness)
+        self._startup_recovery_cutoff = utc_now()
+        self._startup_recovery_thread: Thread | None = None
         self._callback_retry_thread: Thread | None = None
         self._idle_reaper_thread: Thread | None = None
         self._scheduler_thread: Thread | None = None
+        self._host_lease_heartbeat_thread: Thread | None = None
+        self._isolated_readiness_thread: Thread | None = None
+        self._background_consumer_lifecycle_lock = Lock()
+        self._background_consumers_started = False
         self._background_consumers_enabled = _background_consumers_enabled()
         if reconcile_on_startup is None:
             reconcile_on_startup = _reconcile_on_startup_enabled()
-        if self._background_consumers_enabled:
+        self._reconcile_on_startup = bool(reconcile_on_startup)
+        if start_background_consumers:
+            self.start_background_consumers()
+
+    def start_background_consumers(self) -> None:
+        """Start service-owned loops only after their enclosing lifecycle is active."""
+
+        with self._background_consumer_lifecycle_lock:
+            if self._background_consumers_started or not self._background_consumers_enabled:
+                return
+            if self._shutdown_event.is_set():
+                raise RuntimeError("GlassHive service cannot restart after shutdown")
             recover_interactive = getattr(
                 self.runtime,
                 "recover_interactive_provider_sessions",
@@ -706,10 +1601,26 @@ class WorkersProjectsService:
             )
             if callable(recover_interactive):
                 recover_interactive()
-        if self._background_consumers_enabled and reconcile_on_startup:
-            self.reconcile_all_workers()
-        if self._background_consumers_enabled:
-            self.executor.submit(self._replay_pending_callbacks)
+            if self._reconcile_on_startup:
+                mission_network_repair = getattr(
+                    self.runtime, "repair_parallel_clean_room_mission_networks", None
+                )
+                if callable(mission_network_repair):
+                    try:
+                        mission_network_repair()
+                    except Exception:
+                        logger.warning(
+                            "Failed to repair Parallel clean-room mission networks",
+                            exc_info=True,
+                        )
+                self.reconcile_host_run_leases()
+                self.reconcile_all_workers()
+            self._startup_recovery_thread = Thread(
+                target=self._replay_startup_recovery,
+                name="wpr-startup-recovery",
+                daemon=True,
+            )
+            self._startup_recovery_thread.start()
             self._callback_retry_thread = Thread(
                 target=self._callback_retry_loop,
                 name="wpr-callback-retry",
@@ -729,15 +1640,43 @@ class WorkersProjectsService:
                 daemon=True,
             )
             self._scheduler_thread.start()
+            self._host_lease_heartbeat_thread = Thread(
+                target=self._host_lease_heartbeat_loop,
+                name="wpr-host-lease-heartbeat",
+                daemon=True,
+            )
+            self._host_lease_heartbeat_thread.start()
+            if callable(
+                getattr(self.runtime, "refresh_isolated_parallel_readiness", None)
+            ):
+                self._isolated_readiness_thread = Thread(
+                    target=self._isolated_readiness_loop,
+                    name="wpr-isolated-readiness",
+                    daemon=True,
+                )
+                self._isolated_readiness_thread.start()
+            if self.store.has_compute_release_claims():
+                self.executor.submit(self.recover_expired_compute_release_claims_once)
+            self._background_consumers_started = True
 
     def shutdown(self, *, timeout_seconds: float = 10.0) -> None:
-        self._shutdown_event.set()
+        with self._processors_lock:
+            self._shutdown_event.set()
+        with self._run_local_bundles_lock:
+            self._run_local_bundles.clear()
+            self._run_local_grant_waiters.clear()
+            self._run_local_bundles_lock.notify_all()
+        self.store.release_active_work_action_leases(self._executor_id)
+        self._scheduler_wake_event.set()
         background_threads = tuple(
             thread
             for thread in (
+                self._startup_recovery_thread,
                 self._callback_retry_thread,
                 self._idle_reaper_thread,
                 self._scheduler_thread,
+                self._host_lease_heartbeat_thread,
+                self._isolated_readiness_thread,
             )
             if thread is not None
         )
@@ -952,10 +1891,13 @@ class WorkersProjectsService:
         except Exception:
             pass
 
-    def _deliver_callback_record(self, worker: dict, record: dict, callbacks: dict) -> None:
+    def _deliver_callback_record_parallel(self, worker: dict, record: dict, callbacks: dict) -> None:
         callback_id = str(record.get("callback_id") or "")
-        if callback_id and not self.store.claim_pending_callback(callback_id):
-            return
+        if callback_id:
+            claimed = self.store.claim_pending_callback(callback_id)
+            if not claimed:
+                return
+            record = claimed
         stored_attempts = int(record.get("attempts") or 0)
         max_total_attempts = self._callback_max_total_attempts()
         if stored_attempts >= max_total_attempts:
@@ -993,7 +1935,56 @@ class WorkersProjectsService:
             return
         if not isinstance(payload, dict):
             payload = {}
-        payload["callback_id"] = str(callback_id or payload.get("callback_id") or f"cb_{uuid.uuid4().hex}")
+        payload_callback_id = str(payload.get("callback_id") or "").strip()
+        payload_attempt_number = payload.get("attempt_number")
+        payload_result_revision = payload.get("result_revision")
+        payload_callback_ts = payload.get("callback_ts")
+        stored_attempt_number = int(record.get("attempt_number") or 0)
+        stored_result_revision = int(record.get("result_revision") or 0)
+        exact_attempt_identity = (
+            isinstance(payload_attempt_number, int)
+            and not isinstance(payload_attempt_number, bool)
+            and payload_attempt_number > 0
+            and payload_attempt_number == stored_attempt_number
+            if stored_attempt_number > 0
+            else payload_attempt_number is None
+        )
+        exact_result_revision = (
+            isinstance(payload_result_revision, int)
+            and not isinstance(payload_result_revision, bool)
+            and payload_result_revision == stored_result_revision
+            if stored_result_revision > 0
+            else payload_result_revision in (None, 0)
+            and not isinstance(payload_result_revision, bool)
+        )
+        exact_payload_identity = bool(
+            callback_id
+            and payload_callback_id == callback_id
+            and exact_attempt_identity
+            and exact_result_revision
+            and isinstance(payload_callback_ts, (int, float))
+            and not isinstance(payload_callback_ts, bool)
+            and math.isfinite(float(payload_callback_ts))
+            and float(payload_callback_ts) > 0
+            and str(payload.get("event") or "")
+            == str(record.get("event_type") or "")
+            and str(payload.get("worker_id") or "")
+            == str(record.get("worker_id") or "")
+            and str(payload.get("run_id") or "")
+            == str(record.get("run_id") or "")
+            and str(payload.get("result_digest") or "")
+            == str(record.get("result_digest") or "")
+        )
+        if not exact_payload_identity:
+            self._dead_letter_callback(
+                worker,
+                record,
+                callback_id=callback_id,
+                attempts=0,
+                payload_json=str(record.get("payload_json") or "{}"),
+                reason="callback payload identity is incomplete or mismatched",
+            )
+            return
         stored_payload = dict(payload)
         action_capabilities = self._callback_action_capabilities(worker, payload, callbacks)
         if action_capabilities:
@@ -1010,23 +2001,126 @@ class WorkersProjectsService:
         attempts = 0
         stored_payload_json = json.dumps(stored_payload, ensure_ascii=False)
         for attempt in range(retry_attempts):
+            callback_run = self.store.get_run(str(record.get("run_id") or ""))
+            qa_expired_lease = self._consume_local_qa(
+                "expired_sender_lease_race", worker, callback_run
+            )
+            if qa_expired_lease is not None:
+                expired = self.store.expire_callback_delivery_lease_for_local_qa(
+                    callback_id,
+                    lease_token=str(record.get("delivery_lease_token") or ""),
+                    delivery_generation=int(
+                        record.get("delivery_generation") or 0
+                    ),
+                )
+                reclaimed = self.store.reclaim_stale_delivering_callbacks(
+                    stale_before=utc_now(), limit=1
+                )
+                newer = self.store.claim_pending_callback(callback_id)
+                self._record_local_qa_effect(
+                    qa_expired_lease,
+                    "newer_delivery_lease_won"
+                    if expired and reclaimed == 1 and newer is not None
+                    else "sender_lease_race_not_applicable",
+                )
+                if not expired or reclaimed != 1 or newer is None:
+                    return
+                record = newer
+            if not self.store.callback_delivery_is_current(
+                callback_id,
+                lease_token=str(record.get("delivery_lease_token") or ""),
+                delivery_generation=int(record.get("delivery_generation") or 0),
+            ):
+                return
             attempts += 1
-            payload["callback_ts"] = int(time.time())
-            stored_payload["callback_ts"] = payload["callback_ts"]
-            stored_payload_json = json.dumps(stored_payload, ensure_ascii=False)
-            encoded = self._encode_callback_payload(payload)
-            headers = self._callback_headers(callbacks, payload, encoded)
+            delivery_payload = {**payload, "callback_ts": int(time.time())}
+            encoded = self._encode_callback_payload(delivery_payload)
+            headers = self._callback_headers(callbacks, delivery_payload, encoded)
+            qa_transport = self._consume_local_qa(
+                "callback_transport_interruption", worker, callback_run
+            )
             try:
+                if qa_transport is not None:
+                    self._record_local_qa_effect(
+                        qa_transport, "transport_interrupted_before_http"
+                    )
+                    raise httpx.TransportError(
+                        "Synthetic callback transport interruption"
+                    )
                 response = httpx.post(url, content=encoded, headers=headers, timeout=5.0)
-                if response.status_code == 409:
-                    self.store.mark_callback_delivered(
-                        payload["callback_id"], attempts=attempts, payload_json=stored_payload_json
+                receiver_decision, receiver_revision = (
+                    self._terminal_callback_response_decision(
+                        response, delivery_payload
+                    )
+                )
+                qa_duplicate = None
+                if receiver_decision == "accepted":
+                    qa_duplicate = self._consume_local_qa(
+                        "duplicate_callback_replay", worker, callback_run
+                    )
+                if qa_duplicate is not None:
+                    replay = httpx.post(
+                        url, content=encoded, headers=headers, timeout=5.0
+                    )
+                    replay_decision, replay_revision = (
+                        self._terminal_callback_response_decision(
+                            replay, delivery_payload
+                        )
+                    )
+                    if replay_decision not in {"accepted", "superseded"}:
+                        replay.raise_for_status()
+                        raise RuntimeError(
+                            "duplicate callback replay did not return a durable receipt"
+                        )
+                    self._record_local_qa_effect(
+                        qa_duplicate,
+                        "duplicate_receiver_replay_suppressed"
+                        if replay_decision == "accepted"
+                        else "duplicate_receiver_newer_terminal_won",
+                    )
+                    receiver_revision = max(
+                        receiver_revision, replay_revision
+                    )
+                if receiver_decision == "superseded":
+                    self.store.mark_callback_receiver_superseded(
+                        payload["callback_id"],
+                        lease_token=str(
+                            record.get("delivery_lease_token") or ""
+                        ),
+                        delivery_generation=int(
+                            record.get("delivery_generation") or 0
+                        ),
+                        attempts=attempts,
+                        current_result_revision=receiver_revision,
                     )
                     return
+                if receiver_decision == "conflict":
+                    self._dead_letter_callback(
+                        worker,
+                        record,
+                        callback_id=payload["callback_id"],
+                        attempts=attempts,
+                        payload_json=stored_payload_json,
+                        reason="receiver_result_conflict",
+                    )
+                    return
+                if receiver_decision == "invalid":
+                    response.raise_for_status()
+                    raise RuntimeError(
+                        "callback receiver did not return an exact result CAS receipt"
+                    )
                 response.raise_for_status()
-                self.store.mark_callback_delivered(
-                    payload["callback_id"], attempts=attempts, payload_json=stored_payload_json
+                accepted = self.store.mark_callback_http_accepted(
+                    payload["callback_id"],
+                    lease_token=str(record.get("delivery_lease_token") or ""),
+                    delivery_generation=int(record.get("delivery_generation") or 0),
+                    attempts=attempts,
+                    payload_json=stored_payload_json,
                 )
+                if accepted is None:
+                    return
+                if str(accepted.get("status") or "") == "superseded":
+                    return
                 return
             except httpx.HTTPStatusError as exc:
                 last_exc = exc
@@ -1056,7 +2150,12 @@ class WorkersProjectsService:
             reason=str(last_exc or "callback delivery failed"),
         )
 
-    def _replay_pending_callbacks(self) -> None:
+    def _deliver_callback_record(self, worker: dict, record: dict, callbacks: dict) -> None:
+        self._deliver_callback_record_parallel(worker, record, callbacks)
+
+    def _replay_pending_callbacks(self, *, created_before: str | None = None) -> None:
+        if self._shutdown_event.is_set():
+            return
         stale_after_s = _bounded_int_env(
             "GLASSHIVE_CALLBACK_DELIVERING_STALE_AFTER_S",
             300,
@@ -1069,10 +2168,15 @@ class WorkersProjectsService:
         except Exception:
             pass
         try:
-            pending = self.store.list_pending_callbacks(limit=50)
+            pending = self.store.list_pending_callbacks(
+                limit=50,
+                created_before=created_before,
+            )
         except Exception:
             return
         for record in pending:
+            if self._shutdown_event.is_set():
+                return
             worker = self.store.get_worker(str(record.get("worker_id") or ""))
             if not worker:
                 continue
@@ -1093,7 +2197,12 @@ class WorkersProjectsService:
         while not self._shutdown_event.wait(interval):
             self._replay_pending_callbacks()
 
-    def _ensure_execution_allowed(self, worker_or_mode: dict | str) -> None:
+    def _ensure_execution_allowed(
+        self,
+        worker_or_mode: dict | str,
+        *,
+        trusted_run_lane: str = "mission",
+    ) -> None:
         if isinstance(worker_or_mode, dict) and str(worker_or_mode.get("state") or "") in CLOSED_WORKER_STATES:
             raise ControlPlaneConflict(
                 "Workspace is closed; create a new workspace for new work"
@@ -1109,6 +2218,23 @@ class WorkersProjectsService:
             if isinstance(worker_or_mode, dict)
             else str(worker_or_mode or "docker")
         )
+        lane = (
+            self._trusted_run_lane(worker_or_mode)
+            if isinstance(worker_or_mode, dict)
+            else (
+                "conversation"
+                if str(trusted_run_lane or "").strip().lower() == "conversation"
+                else "mission"
+            )
+        )
+        if (
+            execution_mode == "host"
+            and lane == "mission"
+            and isolated_parallel_policy_enabled()
+        ):
+            raise ParallelExecutionIsolationError(
+                "Host-native mission roots are unavailable while isolated Parallel policy is enabled."
+            )
         if execution_mode == "host" and not host_workers_enabled():
             raise HostWorkersDisabledError(
                 "GlassHive host-native workers are disabled by Viventium config"
@@ -1399,7 +2525,9 @@ class WorkersProjectsService:
                     except Exception as cleanup_error:
                         message = public_callback_message_text(str(cleanup_error)) or "Worker close-race cleanup failed"
                         self.store.record_worker_termination_cleanup_failure(worker_id, message)
-                elif current and (current_state == "paused" or (run and run_state != "running")):
+                elif current and (
+                    current_state == "paused" or (run and run_state != "running")
+                ):
                     try:
                         if current_state == "paused":
                             self.runtime.pause_worker(
@@ -1614,6 +2742,397 @@ class WorkersProjectsService:
         suffix = "\n".join(links)
         return f"{text}\n\n{suffix}" if text else suffix
 
+    def _emit_callback_parallel(
+        self,
+        worker: dict,
+        event_type: str,
+        *,
+        run: dict | None = None,
+        message: str = "",
+        full_message: str = "",
+        deliverable: dict[str, object] | None = None,
+        callback_id: str = "",
+        insert_once: bool = False,
+        submit_delivery: bool = True,
+        persist_callback: bool = True,
+    ) -> dict | None:
+        requested_callback_id = str(callback_id or "").strip()
+        callbacks = self._callback_config_for(worker)
+        url = str(callbacks.get("events_webhook_url") or callbacks.get("url") or "").strip()
+        if not url:
+            return None
+        run_id = str((run or {}).get("run_id") or "").strip()
+        # The durable callback producer is run-scoped. Worker-only lifecycle
+        # notices have no exact attempt identity and must not enter this
+        # transport channel.
+        if not run_id:
+            return None
+        durable_run = self.store.get_run(run_id) if run_id else None
+        if run_id and (
+            durable_run is None
+            or str(durable_run.get("worker_id") or "")
+            != str(worker.get("worker_id") or "")
+            or str(durable_run.get("project_id") or "")
+            != str(worker.get("project_id") or "")
+        ):
+            return None
+        delegation = self.store.get_delegation_for_worker(
+            str(worker.get("worker_id") or ""),
+            tenant_id=str(worker.get("tenant_id") or "local"),
+            owner_id=str(worker.get("owner_id") or ""),
+        )
+        if _is_viventium_callback_url(url):
+            if not self._viventium_callback_context_ready(worker, callbacks):
+                missing_parent_fields = _missing_parent_callback_fields(callbacks)
+                logger.info(
+                    "Skipping GlassHive parent callback for worker %s because callback context is incomplete: %s",
+                    worker.get("worker_id"),
+                    ", ".join(missing_parent_fields),
+                )
+                return None
+            if (
+                not run_id
+                or durable_run is None
+                or not delegation
+                or not str(delegation.get("origin_ref") or "").strip()
+                or not str(delegation.get("work_ref") or "").strip()
+            ):
+                return None
+        durable_state = str((durable_run or {}).get("state") or "").strip()
+        durable_ended_at = str((durable_run or {}).get("ended_at") or "").strip()
+        delegation_work_state = ""
+        delegation_work_terminal = False
+        if delegation:
+            delegation_work_state, delegation_work_terminal = (
+                self._delegation_callback_state(
+                    delegation,
+                    callback_run=run,
+                )
+            )
+        terminal_result_state = Store.terminal_callback_wire_state(
+            durable_state=durable_state,
+            event_type=event_type,
+        )
+        terminal_event = bool(
+            terminal_result_state
+            and durable_ended_at
+        )
+        if terminal_event:
+            supplied_run = run or {}
+            exact_terminal_result = all(
+                str(supplied_run.get(key) or "")
+                == str((durable_run or {}).get(key) or "")
+                for key in (
+                    "active_attempt_id",
+                    "state",
+                    "ended_at",
+                    "output_text",
+                    "error_text",
+                    "terminal_result_revision",
+                )
+            )
+            if not exact_terminal_result:
+                return None
+            run = dict(durable_run or {})
+            durable_output = str(run.get("output_text") or "")
+            durable_error = str(run.get("error_text") or "")
+            if durable_state == "completed":
+                message = terminal_callback_message(durable_output) or "Run completed"
+                full_message = terminal_callback_full_message(durable_output)
+                if full_message == message:
+                    full_message = ""
+                deliverable = self._completion_deliverable(
+                    worker, run, durable_output, durable_error
+                )
+            elif durable_state == "failed":
+                message = runtime_failure_callback_message(
+                    run, durable_error or "Run failed"
+                )
+                full_message = ""
+                deliverable = self._completion_deliverable(
+                    worker, run, durable_output, durable_error
+                )
+            elif durable_state == "cancelled":
+                message = "Work stop confirmed."
+                if durable_error:
+                    message = f"{message} {durable_error}"
+                full_message = ""
+                deliverable = None
+            else:
+                message = durable_error or f"Run {durable_state}"
+                full_message = ""
+                deliverable = None
+        attempt_number = self._callback_attempt_number(durable_run or run)
+        replay_callback_timestamp: int | float | None = None
+        if requested_callback_id and insert_once:
+            existing_callback = self.store.get_callback_outbox(
+                requested_callback_id
+            )
+            if existing_callback is not None:
+                try:
+                    existing_payload = json.loads(
+                        str(existing_callback.get("payload_json") or "{}")
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    existing_payload = {}
+                existing_timestamp = (
+                    existing_payload.get("callback_ts")
+                    if isinstance(existing_payload, dict)
+                    else None
+                )
+                if (
+                    isinstance(existing_timestamp, (int, float))
+                    and not isinstance(existing_timestamp, bool)
+                    and math.isfinite(float(existing_timestamp))
+                    and float(existing_timestamp) > 0
+                ):
+                    replay_callback_timestamp = existing_timestamp
+        terminal_generation = bool(
+            not requested_callback_id
+            and terminal_result_state
+            and durable_ended_at
+            and (not delegation or delegation_work_terminal)
+        )
+        run_terminal_observation = bool(
+            not requested_callback_id
+            and terminal_result_state
+            and durable_ended_at
+            and delegation
+            and not delegation_work_terminal
+        )
+        if terminal_generation:
+            terminal_result_revision = int(
+                (durable_run or {}).get("terminal_result_revision") or 0
+            )
+            if terminal_result_revision < 1:
+                return None
+            terminal_result_digest = Store.terminal_result_digest(
+                durable_run or {}
+            )
+            resolved_callback_id = Store.terminal_callback_id(
+                run_id=run_id,
+                state=terminal_result_state,
+                ended_at=durable_ended_at,
+                attempt_number=attempt_number,
+                result_revision=terminal_result_revision,
+                result_digest=terminal_result_digest,
+            )
+            try:
+                callback_timestamp = int(
+                    self._normalized_datetime(durable_ended_at).timestamp()
+                )
+            except (TypeError, ValueError):
+                callback_timestamp = int(time.time())
+        elif run_terminal_observation:
+            observed_result_revision = int(
+                (durable_run or {}).get("terminal_result_revision") or 0
+            )
+            if observed_result_revision < 1:
+                return None
+            observed_result_digest = Store.terminal_result_digest(
+                durable_run or {}
+            )
+            canonical_callback_id = Store.terminal_callback_id(
+                run_id=run_id,
+                state=terminal_result_state,
+                ended_at=durable_ended_at,
+                attempt_number=attempt_number,
+                result_revision=observed_result_revision,
+                result_digest=observed_result_digest,
+            )
+            resolved_callback_id = canonical_callback_id.replace(
+                "cb_terminal_", "cb_run_terminal_", 1
+            )
+            terminal_result_revision = 0
+            terminal_result_digest = ""
+            try:
+                callback_timestamp = int(
+                    self._normalized_datetime(durable_ended_at).timestamp()
+                )
+            except (TypeError, ValueError):
+                callback_timestamp = int(time.time())
+        else:
+            terminal_result_revision = 0
+            terminal_result_digest = ""
+            resolved_callback_id = requested_callback_id or f"cb_{uuid.uuid4().hex}"
+            callback_timestamp = (
+                replay_callback_timestamp
+                if replay_callback_timestamp is not None
+                else int(time.time())
+            )
+        link_safe = event_type != "worker.terminated"
+        operator_url = self._signed_watch_url(worker, callbacks) if link_safe else ""
+        include_watch_link = link_safe and event_type in ACTIONABLE_CALLBACK_LINK_EVENTS
+        payload = {
+            "callback_id": resolved_callback_id,
+            "callback_ts": callback_timestamp,
+            "attempt_number": attempt_number if attempt_number > 0 else None,
+            "event": event_type,
+            "project_id": worker.get("project_id"),
+            "worker_id": worker.get("worker_id"),
+            "run_id": run_id or None,
+            "run_state": callback_run_state(event_type, run),
+            "message": self._callback_message_with_links(
+                worker,
+                message,
+                deliverable,
+                callbacks,
+                include_watch_link=include_watch_link,
+            ),
+            "full_message": self._callback_message_with_links(
+                worker,
+                full_message,
+                deliverable,
+                callbacks,
+                include_watch_link=include_watch_link,
+            )
+            if full_message
+            else "",
+            "user_id": callbacks.get("user_id"),
+            "agent_id": callbacks.get("agent_id"),
+            "conversation_id": callbacks.get("conversation_id"),
+            "parent_message_id": callbacks.get("parent_message_id"),
+            "message_id": callbacks.get("message_id"),
+            "surface": callbacks.get("surface"),
+            "input_mode": callbacks.get("input_mode"),
+            "stream_id": callbacks.get("stream_id"),
+            "voice_call_session_id": callbacks.get("voice_call_session_id"),
+            "voice_request_id": callbacks.get("voice_request_id"),
+            "telegram_chat_id": callbacks.get("telegram_chat_id"),
+            "telegram_user_id": callbacks.get("telegram_user_id"),
+            "telegram_message_id": callbacks.get("telegram_message_id"),
+            "logical_turn_id": callbacks.get("logical_turn_id"),
+            "logical_turn_revision": callbacks.get("logical_turn_revision"),
+        }
+        if terminal_result_digest:
+            payload["result_revision"] = terminal_result_revision
+            payload["result_digest"] = terminal_result_digest
+            payload["result_state"] = terminal_result_state
+            payload["result_ended_at"] = durable_ended_at
+        if event_type in {"run.waiting_on_capacity", "run.queue_status"} or (
+            event_type == "run.failed"
+            and str((run or {}).get("failure_class") or "")
+            == "queue_wait_timeout"
+        ):
+            first_queued_at = str((run or {}).get("first_queued_at") or "")
+            queue_age_seconds = 0
+            if first_queued_at:
+                try:
+                    queue_age_seconds = max(
+                        0,
+                        int(
+                            (
+                                self._now_datetime()
+                                - self._normalized_datetime(first_queued_at)
+                            ).total_seconds()
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    queue_age_seconds = 0
+            payload.update(
+                {
+                    "queueAgeSeconds": queue_age_seconds,
+                    "blocker": {
+                        "class": str(
+                            (run or {}).get("queue_blocker_class")
+                            or (run or {}).get("failure_class")
+                            or "admission_pending"
+                        )
+                    },
+                    "nextRetryAt": str(
+                        (run or {}).get("capacity_next_retry_at")
+                        or (run or {}).get("retry_after")
+                        or ""
+                    )
+                    or None,
+                    "timeoutAt": str(
+                        (run or {}).get("queue_deadline_at") or ""
+                    )
+                    or None,
+                }
+            )
+        if delegation:
+            # These identifiers come from the durable delegation reservation,
+            # never from callback input supplied by the caller.
+            payload["origin_ref"] = str(delegation.get("origin_ref") or "")
+            payload["work_ref"] = str(delegation.get("work_ref") or "")
+            payload["work_state"] = delegation_work_state
+            payload["work_terminal"] = delegation_work_terminal
+        failure_class = str((run or {}).get("failure_class") or "").strip()
+        if failure_class:
+            payload["failure_code"] = failure_class
+            payload["failure_class"] = failure_class
+            payload["failure_retryable"] = bool((run or {}).get("failure_retryable"))
+            provider_route_decision = str(
+                (run or {}).get("provider_route_decision") or ""
+            ).strip()
+            if provider_route_decision:
+                payload["provider_route_decision"] = provider_route_decision
+        projection_resolver = getattr(self.runtime, "effort_projection_for_worker", None)
+        if callable(projection_resolver):
+            try:
+                effort_projection = projection_resolver(worker)
+            except Exception:
+                effort_projection = {}
+            if isinstance(effort_projection, dict) and effort_projection:
+                payload["effort_projection"] = {
+                    "requested": str(effort_projection.get("requested") or "")[:32],
+                    "effective": str(effort_projection.get("effective") or "")[:32],
+                    "fallback_reason": str(effort_projection.get("fallback_reason") or "")[:64],
+                }
+        if deliverable:
+            payload["deliverable"] = deliverable
+        if operator_url:
+            payload["operator_url"] = operator_url
+            payload["watch_url"] = operator_url
+        intent = {
+            "callback_id": str(payload["callback_id"]),
+            "project_id": str(worker.get("project_id") or ""),
+            "worker_id": str(worker.get("worker_id") or ""),
+            "tenant_id": str(worker.get("tenant_id") or "local"),
+            "run_id": (run or {}).get("run_id"),
+            "attempt_number": attempt_number if attempt_number > 0 else None,
+            "event_type": event_type,
+            "url": url,
+            "payload_json": json.dumps(payload, ensure_ascii=False),
+        }
+        if not persist_callback:
+            return intent
+        persisted_intent = {
+            key: value for key, value in intent.items() if key != "tenant_id"
+        }
+        if terminal_generation:
+            record = self.store.insert_terminal_callback_outbox_if_current(
+                **persisted_intent,
+                expected_state=durable_state,
+                expected_ended_at=durable_ended_at,
+                expected_attempt_id=str(
+                    (durable_run or {}).get("active_attempt_id") or ""
+                ),
+                expected_result_revision=terminal_result_revision,
+                expected_result_digest=terminal_result_digest,
+            )
+            if record is None:
+                return None
+        else:
+            insert_callback = (
+                self.store.insert_callback_outbox_once
+                if insert_once
+                else self.store.upsert_callback_outbox
+            )
+            try:
+                record = insert_callback(**persisted_intent)
+            except CallbackIntentGenerationConflictError:
+                # The run advanced after this nonterminal event was built. A
+                # newer attempt now owns callback identity, so discard the
+                # stale intent instead of attaching it to that generation.
+                return None
+        if submit_delivery:
+            self.executor.submit(
+                self._deliver_callback_record, dict(worker), record, callbacks
+            )
+        return record
+
     def _emit_callback(
         self,
         worker: dict,
@@ -1623,11 +3142,38 @@ class WorkersProjectsService:
         message: str = "",
         full_message: str = "",
         deliverable: dict[str, object] | None = None,
-    ) -> None:
+        callback_id: str = "",
+        insert_once: bool = False,
+        submit_delivery: bool = True,
+        persist_callback: bool = True,
+    ) -> dict | None:
+        run_id = str((run or {}).get("run_id") or "").strip()
+        delegation = (
+            self.store.get_delegation_for_worker(
+                str(worker.get("worker_id") or ""),
+                tenant_id=str(worker.get("tenant_id") or "local"),
+                owner_id=str(worker.get("owner_id") or ""),
+            )
+            if run_id
+            else None
+        )
+        if run_id:
+            return self._emit_callback_parallel(
+                worker,
+                event_type,
+                run=run,
+                message=message,
+                full_message=full_message,
+                deliverable=deliverable,
+                callback_id=callback_id,
+                insert_once=insert_once,
+                submit_delivery=submit_delivery,
+                persist_callback=persist_callback,
+            )
         callbacks = self._callback_config_for_event(worker, run)
         url = str(callbacks.get("events_webhook_url") or callbacks.get("url") or "").strip()
         if not url:
-            return
+            return None
         if _is_viventium_callback_url(url):
             missing_parent_fields = _missing_parent_callback_fields(callbacks)
             if missing_parent_fields:
@@ -1636,7 +3182,7 @@ class WorkersProjectsService:
                     worker.get("worker_id"),
                     ", ".join(missing_parent_fields),
                 )
-                return
+                return None
         operator_url = self._signed_watch_url(worker, callbacks)
         include_watch_link = event_type in ACTIONABLE_CALLBACK_LINK_EVENTS
         payload = {
@@ -1709,8 +3255,10 @@ class WorkersProjectsService:
             payload_json=json.dumps(payload, ensure_ascii=False),
         )
         if not getattr(self, "_background_consumers_enabled", True):
-            return
-        self.executor.submit(self._deliver_callback_record, dict(worker), record, callbacks)
+            return record
+        if submit_delivery:
+            self.executor.submit(self._deliver_callback_record, dict(worker), record, callbacks)
+        return record
 
     def _completion_deliverable(self, worker: dict, run: dict, output_text: str, error_text: str = "") -> dict[str, object] | None:
         return deliverable_payload(worker, run, output_text, output_text, error_text)
@@ -2214,30 +3762,67 @@ class WorkersProjectsService:
             age_seconds = self._run_age_seconds(run)
             if age_seconds < threshold:
                 continue
+            if str(run.get("liveness_mode") or "standard") == "declared_long":
+                if int(run.get("meaningful_progress_sequence") or 0) <= 0:
+                    attempt_started_at = str(
+                        run.get("liveness_started_at")
+                        or run.get("runtime_invoked_at")
+                        or ""
+                    )
+                    try:
+                        attempt_age = max(
+                            0.0,
+                            self._now_datetime().timestamp()
+                            - self._normalized_datetime(attempt_started_at).timestamp(),
+                        )
+                    except ValueError:
+                        attempt_age = float("inf")
+                    if attempt_age < threshold:
+                        continue
+                else:
+                    progress_at = str(run.get("meaningful_progress_at") or "")
+                    try:
+                        progress_age = max(
+                            0.0,
+                            self._now_datetime().timestamp()
+                            - self._normalized_datetime(progress_at).timestamp(),
+                        )
+                    except ValueError:
+                        progress_age = float("inf")
+                    if progress_age < self._provider_no_progress_timeout_s():
+                        continue
+                    try:
+                        self.process_provider_liveness_once()
+                    except Exception:
+                        logger.exception(
+                            "Failed to settle stale declared-long GlassHive run %s",
+                            run_id,
+                        )
+                    # A run that earned long-mission extension is governed only by
+                    # typed progress freshness. Never convert its stale-attention
+                    # path back into the ordinary max-duration cancellation path.
+                    continue
             worker = self.store.get_worker(worker_id)
             if not worker:
                 continue
             error_text = f"Run exceeded GLASSHIVE_MAX_RUN_DURATION_S={threshold}; compute was stopped and workspace state was preserved."
             try:
                 self._invalidate_worker_processor(worker_id)
-                info = self.runtime.terminate_worker(worker)
-                finalized = self.store.finalize_run_if_state(run_id, "running", "cancelled", error_text=error_text)
-                self.store.finalize_schedule_for_run(run_id, state="cancelled", last_error=error_text)
-                updated = self._apply_runtime_info(
-                    worker_id,
-                    info,
-                    state="paused",
-                    last_error=error_text,
-                    compute_released_at=utc_now(),
+                item = self._release_worker_compute(
+                    worker,
+                    idle_seconds=(
+                        float(threshold)
+                        if age_seconds == float("inf")
+                        else age_seconds
+                    ),
+                    kind="max_duration",
+                    target_run_id=run_id,
+                    target_started_at=str(run.get("started_at") or ""),
+                    target_error_text=error_text,
                 )
-                self._wake_host_capacity_waiters(updated or worker)
-                self.store.add_event(
-                    str(worker.get("project_id") or run.get("project_id") or ""),
-                    worker_id,
-                    run_id,
-                    "run.duration_exceeded",
-                    error_text,
-                )
+                if not item:
+                    continue
+                finalized = bool(item.get("target_transitioned"))
                 if finalized:
                     self._emit_callback(
                         worker,
@@ -2247,13 +3832,13 @@ class WorkersProjectsService:
                     )
                 reaped.append(
                     {
-                        "worker_id": worker_id,
-                        "project_id": worker.get("project_id"),
-                        "tenant_id": worker.get("tenant_id"),
-                        "owner_id": worker.get("owner_id"),
+                        **item,
                         "run_id": run_id,
-                        "state": (updated or worker).get("state"),
-                        "run_age_seconds": threshold if age_seconds == float("inf") else int(age_seconds),
+                        "run_age_seconds": (
+                            threshold
+                            if age_seconds == float("inf")
+                            else int(age_seconds)
+                        ),
                     }
                 )
             except Exception as exc:
@@ -2274,11 +3859,15 @@ class WorkersProjectsService:
 
     def _scheduler_loop(self) -> None:
         interval = self._scheduler_interval_s()
-        while not self._shutdown_event.wait(interval):
-            try:
-                self.process_due_schedules_once()
-            except Exception:
-                logger.exception("GlassHive scheduler iteration failed; the scheduler will retry")
+        while not self._shutdown_event.is_set():
+            self._scheduler_wake_event.clear()
+            self._process_scheduler_cycle()
+            if self._shutdown_event.is_set():
+                return
+            wait_s = self._safe_next_scheduler_wait_s(interval)
+            if self._shutdown_event.is_set():
+                return
+            self._scheduler_wake_event.wait(wait_s)
 
     def _retry_base_delay_s(self, failure_class: str) -> float:
         if failure_class == "host_worker_busy":
@@ -2352,7 +3941,206 @@ class WorkersProjectsService:
             return error
         return RuntimeErrorBase(str(error))
 
+    def _requeue_retryable_run_parallel(
+        self,
+        worker: dict,
+        run: dict,
+        exc: RuntimeErrorBase,
+        *,
+        failure_fields: dict[str, object] | None = None,
+    ) -> dict | None:
+        failure_fields = dict(failure_fields or {})
+        if not failure_fields:
+            failure_fields = classify_runtime_error(
+                exc,
+                runtime_name=str(worker.get("profile") or worker.get("runtime") or "worker"),
+            ).as_store_fields()
+        failure_class = str(failure_fields.get("failure_class") or "runtime_retryable")
+        capacity_wait = failure_class in {"host_capacity", "host_worker_busy"}
+        attempts = int(
+            run.get("capacity_retry_count" if capacity_wait else "retry_attempts")
+            or 0
+        ) + 1
+        max_attempts = self._capacity_retry_max_attempts()
+        indefinite_wait_classes = {
+            "host_capacity",
+            "host_worker_busy",
+            "provider_rate_limited",
+            "provider_quota_exhausted",
+        }
+        consume_retry_budget = failure_class not in indefinite_wait_classes
+        if consume_retry_budget and attempts > max_attempts:
+            message = (
+                f"GlassHive stopped retrying this run because worker capacity stayed unavailable "
+                f"after {max_attempts} retry attempts."
+            )
+            exhausted_fields = {
+                **failure_fields,
+                "failure_retryable": 0,
+                "failure_user_message": message,
+                "failure_recommended_recovery": (
+                    "Reuse another available workspace, wait for capacity and explicitly continue this "
+                    "workspace, or ask the operator to adjust capacity."
+                ),
+                "failure_diagnostic_summary": (
+                    f"Capacity retry budget exhausted for {failure_class}: {str(exc)}"
+                ),
+            }
+            failed_run = self._finalize_run_if_state(
+                str(run["run_id"]),
+                str(run.get("state") or "running"),
+                state="failed",
+                error_text=str(exc),
+                **self._terminal_generation_for_run(run),
+                **exhausted_fields,
+            )
+            if not failed_run:
+                self._record_late_processor_terminal_ignored(
+                    worker, run, "retry-exhaustion"
+                )
+                return None
+            self.store.finalize_schedule_for_run(str(run["run_id"]), state="failed", last_error=message)
+            self.store.update_worker_state(str(worker["worker_id"]), "ready", last_error=message)
+            self.store.add_event(
+                str(worker.get("project_id") or ""),
+                str(worker["worker_id"]),
+                str(run["run_id"]),
+                "run.failed",
+                message,
+            )
+            self._emit_callback(
+                self.store.get_worker(str(worker["worker_id"])) or worker,
+                "run.failed",
+                run=failed_run,
+                message=message,
+            )
+            return failed_run
+        delay_s = self._retry_delay_s(failure_class, attempts)
+        if capacity_wait:
+            # One durable capacity episode owns one stable retry clock. The
+            # bounded jitter spreads probes without creating attempt records.
+            jitter_seed = int(
+                hashlib.sha256(
+                    (
+                        f"{run.get('run_id')}:{run.get('queue_wait_generation')}:"
+                        f"{attempts}:capacity-wait"
+                    ).encode("utf-8")
+                ).hexdigest()[:8],
+                16,
+            )
+            jitter_ceiling = min(
+                delay_s * 0.10,
+                max(0.0, self._retry_max_delay_s(failure_class) - delay_s),
+            )
+            delay_s += jitter_ceiling * (jitter_seed / 0xFFFFFFFF)
+        provider_retry_after_s = getattr(exc, "retry_after_s", None)
+        if failure_class == "provider_rate_limited" and provider_retry_after_s is not None:
+            authoritative_delay = max(
+                0.1, min(float(provider_retry_after_s), 86_400.0)
+            )
+            delay_s = max(delay_s, authoritative_delay)
+            # Stable per-run jitter prevents a provider reset stampede while
+            # preserving Retry-After as a hard lower bound.
+            jitter_seed = int(
+                hashlib.sha256(
+                    f"{run.get('run_id')}:{attempts}:provider-rate-limit".encode("utf-8")
+                ).hexdigest()[:8],
+                16,
+            )
+            jitter_ceiling = min(30.0, delay_s * 0.10)
+            delay_s = min(
+                86_400.0,
+                delay_s + jitter_ceiling * (jitter_seed / 0xFFFFFFFF),
+            )
+        retry_after = (
+            self._now_datetime() + timedelta(seconds=delay_s)
+        ).isoformat()
+        retry_generation = self.store.get_run_retry_generation(
+            str(run["run_id"])
+        )
+        if retry_generation is None or str(
+            retry_generation.get("expected_attempt_id") or ""
+        ) != str(run.get("active_attempt_id") or ""):
+            return None
+        updated_run = self.store.requeue_run_for_retry(
+            str(run["run_id"]),
+            retry_after=retry_after,
+            **retry_generation,
+            error_text=str(exc),
+            last_retry_class=failure_class,
+            consume_retry_budget=consume_retry_budget,
+            capacity_class=str(getattr(exc, "capacity_class", "") or ""),
+            capacity_available=getattr(exc, "available", None),
+            capacity_required=getattr(exc, "required", None),
+            capacity_shortage=getattr(exc, "shortage", None),
+            capacity_reservation=getattr(exc, "reservation", None),
+            capacity_next_retry_at=(
+                retry_after if failure_class == "host_capacity" else ""
+            ),
+            queue_status_refresh_interval_s=self._queue_status_refresh_interval_s(),
+            **failure_fields,
+        )
+        if updated_run is None:
+            return None
+        self.store.update_worker_state(str(worker["worker_id"]), "ready", last_error="")
+        if capacity_wait:
+            self._release_capacity_wait_compute(
+                self.store.get_worker(str(worker["worker_id"])) or worker,
+                updated_run,
+            )
+        message = str(failure_fields.get("failure_user_message") or "").strip() or (
+            "The worker is waiting for host capacity."
+        )
+        # One continuous admission wait has one transition identity. Blocker
+        # changes update the same generation; only exact runtime invocation
+        # closes it and permits a later generation.
+        if bool(updated_run.get("queue_transition_emitted")):
+            self._scheduler_wake_event.set()
+            return updated_run
+        transition_id = self._queue_callback_id("transition", updated_run)
+        callback_worker = self.store.get_worker(str(worker["worker_id"])) or worker
+        callback_intent = self._emit_callback(
+            callback_worker,
+            "run.waiting_on_capacity",
+            run={**run, **updated_run, "state": "queued"},
+            message=message,
+            callback_id=transition_id,
+            insert_once=True,
+            submit_delivery=False,
+            persist_callback=False,
+        )
+        transitioned = self.store.claim_queue_transition(
+            str(run["run_id"]),
+            expected_generation=int(updated_run.get("queue_wait_generation") or 0),
+            expected_deadline=str(updated_run.get("queue_deadline_at") or ""),
+            callback_id=transition_id,
+            callback_intent=callback_intent,
+            event_message=f"{message} Retrying after {retry_after}.",
+            now=self._now_datetime().isoformat(),
+        )
+        if transitioned:
+            self._submit_persisted_callback(
+                callback_worker, transitioned.get("_callback")
+            )
+        self._scheduler_wake_event.set()
+        return updated_run
+
     def _requeue_retryable_run(
+        self,
+        worker: dict,
+        run: dict,
+        exc: RuntimeErrorBase,
+        *,
+        failure_fields: dict[str, object] | None = None,
+    ) -> dict | None:
+        return self._requeue_retryable_run_parallel(
+            worker,
+            run,
+            exc,
+            failure_fields=failure_fields,
+        )
+
+    def _requeue_retryable_run_legacy(
         self,
         worker: dict,
         run: dict,
@@ -2620,6 +4408,7 @@ class WorkersProjectsService:
         profile: str,
         backend: str,
         execution_mode: str = "docker",
+        resource_class: str = "standard",
         alias: str | None = None,
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
@@ -2629,10 +4418,35 @@ class WorkersProjectsService:
         workspace_kind: WorkspaceKind | str = "legacy",
         tags: list[str] | None = None,
         duplication_report: dict[str, object] | None = None,
+        _trusted_run_lane: str = "mission",
     ) -> dict:
-        self._ensure_execution_allowed(execution_mode)
+        clean_trusted_lane = (
+            "conversation" if _trusted_run_lane == "conversation" else "mission"
+        )
+        if clean_trusted_lane == "conversation" and start_synchronously:
+            raise ParallelExecutionIsolationError(
+                "A conversation worker must be durably linked before its host runtime starts."
+            )
+        self._ensure_execution_allowed(
+            execution_mode,
+            trusted_run_lane=clean_trusted_lane,
+        )
         self._ensure_profile_allowed(profile)
-        self._ensure_runtime_available(profile, execution_mode)
+        clean_resource_class = normalize_worker_resource_class(resource_class)
+        resource_memory_bytes = _configured_worker_resource_memory_bytes(
+            clean_resource_class
+        )
+        self._reserved_runtime_preflight(
+            profile,
+            execution_mode,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            lane=clean_trusted_lane,
+            worker={
+                "resource_class": clean_resource_class,
+                "resource_memory_bytes": resource_memory_bytes,
+            },
+        )
         model = self._resolve_worker_model(profile, execution_mode)
         with self._worker_create_lock:
             self._enforce_worker_limits(tenant_id=tenant_id or "local", owner_id=owner_id)
@@ -2647,6 +4461,8 @@ class WorkersProjectsService:
                 runtime=self._initial_runtime_label(profile, execution_mode),
                 model=model,
                 execution_mode=execution_mode,
+                resource_class=clean_resource_class,
+                resource_memory_bytes=resource_memory_bytes,
                 alias=alias,
                 workspace_root=workspace_root,
                 bootstrap_profile=bootstrap_profile,
@@ -2715,6 +4531,7 @@ class WorkersProjectsService:
         backend: str,
         alias: str,
         execution_mode: str = "docker",
+        resource_class: str = "standard",
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
         bootstrap_bundle: dict | None = None,
@@ -2726,6 +4543,7 @@ class WorkersProjectsService:
         self._ensure_execution_allowed(execution_mode)
         self._ensure_profile_allowed(profile)
         self._ensure_runtime_available(profile, execution_mode)
+        clean_resource_class = normalize_worker_resource_class(resource_class)
         existing = self.store.find_worker_by_alias(
             project_id,
             owner_id,
@@ -2734,6 +4552,16 @@ class WorkersProjectsService:
             tenant_id=tenant_id,
         )
         if existing and str(existing.get("state") or "") not in CLOSED_WORKER_STATES:
+            persisted_resource_class = normalize_worker_resource_class(
+                existing.get("resource_class")
+            )
+            if persisted_resource_class != clean_resource_class:
+                raise WorkAdmissionError(
+                    "worker_resource_class_mismatch",
+                    "Existing worker stored resource_class "
+                    f"'{persisted_resource_class}' does not match requested "
+                    f"resource_class '{clean_resource_class}'."
+                )
             existing_worker_id = str(existing.get("worker_id") or "")
             with self._runtime_start_lock(existing_worker_id):
                 existing = self.store.get_worker(existing_worker_id) or existing
@@ -2780,6 +4608,7 @@ class WorkersProjectsService:
             profile=profile,
             backend=backend,
             execution_mode=execution_mode,
+            resource_class=clean_resource_class,
             alias=alias,
             workspace_root=workspace_root,
             bootstrap_profile=bootstrap_profile,
@@ -4558,14 +6387,195 @@ class WorkersProjectsService:
             "idempotent_replay": False,
         }
 
+    def _assign_run_parallel(
+        self,
+        worker_id: str,
+        instruction: str,
+        event_type: str = "run.queued",
+        runtime_bundle: dict | None = None,
+        run_local_bundle: dict | None = None,
+        start_processor: bool = True,
+        idempotency_key: str | None = None,
+        provider_request_id: str | None = None,
+        resume_paused_worker: bool = True,
+        origin_trace: dict[str, object] | None = None,
+        continuation_contract: dict[str, object] | None = None,
+        continuation_context: dict[str, object] | None = None,
+    ) -> dict:
+        normalized_key = str(idempotency_key or "").strip()
+        while True:
+            needs_resume = False
+            with self._worker_compute_release_lock(worker_id):
+                worker = self.require_worker(worker_id)
+                self._ensure_execution_allowed(worker)
+                self._reserved_runtime_preflight(
+                    str(worker.get("profile") or ""),
+                    str(worker.get("execution_mode") or "docker"),
+                    tenant_id=str(worker.get("tenant_id") or "local"),
+                    owner_id=str(worker.get("owner_id") or ""),
+                    lane=self._trusted_run_lane(worker),
+                    worker=worker,
+                )
+                paused_control_run = (
+                    next(
+                        (
+                            candidate
+                            for candidate in self.store.list_nonterminal_runs_for_worker(
+                                worker_id
+                            )
+                            if str(candidate.get("state") or "") == "paused"
+                        ),
+                        None,
+                    )
+                    if worker["state"] == "paused"
+                    else None
+                )
+                if (
+                    worker["state"] == "paused"
+                    and resume_paused_worker
+                    and paused_control_run is not None
+                ):
+                    needs_resume = True
+                else:
+                    worker = self._refresh_worker_model_for_profile(worker)
+                    if runtime_bundle is not None:
+                        worker = self.store.update_worker(
+                            worker_id,
+                            bootstrap_bundle_json=json.dumps(
+                                merge_bootstrap_bundle(
+                                    self._bootstrap_bundle_for(worker), runtime_bundle
+                                )
+                            ),
+                        ) or worker
+                    created = True
+                    if str(provider_request_id or "").strip():
+                        run, created = self.store.create_and_attach_provider_run(
+                            request_id=str(provider_request_id).strip(),
+                            worker_id=worker_id,
+                            project_id=str(worker["project_id"]),
+                            instruction=instruction,
+                        )
+                    elif normalized_key:
+                        run_id = self._idempotent_run_id(worker_id, normalized_key)
+                        stored_continuation = (
+                            {**continuation_contract, "run_id": run_id}
+                            if isinstance(continuation_contract, dict)
+                            else None
+                        )
+                        run, created = self.store.create_idempotent_run(
+                            run_id=run_id,
+                            worker_id=worker_id,
+                            project_id=str(worker["project_id"]),
+                            instruction=instruction,
+                            origin_trace=origin_trace,
+                            continuation_contract=stored_continuation,
+                            continuation_context=continuation_context,
+                        )
+                    else:
+                        run_id = f"run_{uuid.uuid4().hex[:10]}"
+                        stored_continuation = (
+                            {**continuation_contract, "run_id": run_id}
+                            if isinstance(continuation_contract, dict)
+                            else None
+                        )
+                        run = self.store.create_run(
+                            worker_id,
+                            worker["project_id"],
+                            instruction,
+                            state="queued",
+                            run_id=run_id,
+                            origin_trace=origin_trace,
+                            continuation_contract=stored_continuation,
+                            continuation_context=continuation_context,
+                        )
+                    if worker["state"] == "paused" and resume_paused_worker:
+                        worker = (
+                            self.store.update_worker_state(
+                                worker_id, "starting", last_error=""
+                            )
+                            or worker
+                        )
+                        self.store.add_event(
+                            str(worker.get("project_id") or ""),
+                            worker_id,
+                            None,
+                            "worker.resumed",
+                            "Idle paused worker queued for startup",
+                        )
+            if not needs_resume:
+                break
+            # Never recurse into the non-reentrant lifecycle flock. Resume and
+            # its startup handshake own the next generation; only after it
+            # succeeds do we retry the run reservation under a fresh guard.
+            self.resume_worker(worker_id)
+        if run_local_bundle is not None and str(run.get("state") or "") == "queued":
+            with self._run_local_bundles_lock:
+                self._run_local_bundles[str(run["run_id"])] = dict(run_local_bundle)
+                self._run_local_bundles_lock.notify_all()
+        if not created:
+            if start_processor and str(run.get("state") or "") == "queued":
+                self._ensure_worker_processor(worker_id)
+            return run
+        self.store.add_event(
+            worker["project_id"], worker_id, run["run_id"], event_type, instruction
+        )
+        self._emit_callback(worker, event_type, run=run, message=instruction)
+        if start_processor:
+            self._ensure_worker_processor(worker_id)
+        return run
+
     def assign_run(
         self,
         worker_id: str,
         instruction: str,
         event_type: str = "run.queued",
         runtime_bundle: dict | None = None,
+        run_local_bundle: dict | None = None,
         start_processor: bool = True,
+        idempotency_key: str | None = None,
+        provider_request_id: str | None = None,
+        resume_paused_worker: bool = True,
+        origin_trace: dict[str, object] | None = None,
+        continuation_contract: dict[str, object] | None = None,
+        continuation_context: dict[str, object] | None = None,
     ) -> dict:
+        existing_worker = self.store.get_worker(worker_id)
+        existing_bundle = (
+            self._bootstrap_bundle_for(existing_worker)
+            if existing_worker is not None
+            else None
+        )
+        parallel_clean_room = bool(
+            isinstance(existing_bundle, dict)
+            and str(existing_bundle.get("execution_policy") or "").strip()
+            == PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+        )
+        if any(
+            (
+                parallel_clean_room,
+                run_local_bundle is not None,
+                bool(str(idempotency_key or "").strip()),
+                bool(str(provider_request_id or "").strip()),
+                not resume_paused_worker,
+                origin_trace is not None,
+                continuation_contract is not None,
+                continuation_context is not None,
+            )
+        ):
+            return self._assign_run_parallel(
+                worker_id,
+                instruction,
+                event_type=event_type,
+                runtime_bundle=runtime_bundle,
+                run_local_bundle=run_local_bundle,
+                start_processor=start_processor,
+                idempotency_key=idempotency_key,
+                provider_request_id=provider_request_id,
+                resume_paused_worker=resume_paused_worker,
+                origin_trace=origin_trace,
+                continuation_contract=continuation_contract,
+                continuation_context=continuation_context,
+            )
         worker = self.require_worker(worker_id)
         self._ensure_execution_allowed(worker)
         effective_worker = dict(worker)
@@ -4684,12 +6694,22 @@ class WorkersProjectsService:
 
         if action == "retry":
             self._ensure_execution_allowed(worker)
-            self._ensure_runtime_available(
+            self._reserved_runtime_preflight(
                 str(worker.get("profile") or ""),
                 str(worker.get("execution_mode") or "docker"),
+                tenant_id=str(worker.get("tenant_id") or "local"),
+                owner_id=str(worker.get("owner_id") or ""),
+                lane=self._trusted_run_lane(worker),
+                worker=worker,
             )
             source_run = self.require_run(run_id)
-            instruction = continuation_instruction(previous_run=source_run)
+            retry_context = build_workspace_continuation_context(
+                previous_run=source_run
+            )
+            instruction = continuation_instruction(
+                previous_run=source_run,
+                continuation_context=retry_context,
+            )
             result = self.store.create_retry_run_action(
                 capability_id=capability_id,
                 idempotency_key=idempotency_key,
@@ -4699,6 +6719,7 @@ class WorkersProjectsService:
                 tenant_id=tenant_id,
                 owner_id=owner_id,
                 instruction=instruction,
+                continuation_context=retry_context,
             )
             new_run = dict(result["run"])
             current_worker = self.store.get_worker(worker_id) or worker
@@ -4749,7 +6770,7 @@ class WorkersProjectsService:
         )
         if result["should_execute"]:
             try:
-                self.interrupt_worker(worker_id, run_id=run_id)
+                stop_result = self.stop_run(worker_id, run_id)
             except Exception as exc:
                 self.store.update_run_action_result(
                     capability_id,
@@ -4761,9 +6782,32 @@ class WorkersProjectsService:
                     "The workspace did not accept the cancellation request.",
                     status_code=503,
                 ) from exc
+            if stop_result.get("termination_error"):
+                self.store.update_run_action_result(
+                    capability_id,
+                    status="failed",
+                    result_code="owner_interrupt_failed",
+                )
+                raise RunActionError(
+                    "cancellation_not_accepted",
+                    "The workspace did not accept the cancellation request.",
+                    status_code=503,
+                )
+            if bool(stop_result.get("confirmation_pending")):
+                return {
+                    "version": 1,
+                    "status": "pending",
+                    "action": "cancel",
+                    "projectId": project_id,
+                    "workerId": worker_id,
+                    "sourceRunId": run_id,
+                    "newRun": None,
+                    "confirmationPending": True,
+                    "idempotentReplay": bool(result["idempotent_replay"]),
+                }
             settled = self.store.get_run(run_id)
             settled_state = str((settled or {}).get("state") or "")
-            if settled_state not in {"interrupted", "cancelled"}:
+            if settled_state != "cancelled":
                 result_code = "run_already_completed" if settled_state == "completed" else "run_not_active"
                 self.store.update_run_action_result(
                     capability_id,
@@ -4781,7 +6825,7 @@ class WorkersProjectsService:
             self.store.update_run_action_result(
                 capability_id,
                 status="accepted",
-                result_code="cancellation_requested",
+                result_code="cancellation_confirmed",
             )
         action_record = self.store.get_run_action(capability_id) or result["action"]
         accepted = str(action_record.get("status") or "") == "accepted"
@@ -4837,7 +6881,219 @@ class WorkersProjectsService:
         instruction = self._instruction_for_message(message)
         return self.assign_run(worker_id, instruction, event_type="worker.message")
 
-    def steer_worker(self, worker_id: str, message: str) -> dict:
+    def _steer_worker_parallel(
+        self,
+        worker_id: str,
+        message: str,
+        *,
+        run_id: str = "",
+        idempotency_key: str | None = None,
+        action_use_id: str = "",
+        _prepared_instruction: str = "",
+        _replacement_run_id: str = "",
+        origin_trace: dict[str, object] | None = None,
+        continuation_contract: dict[str, object] | None = None,
+    ) -> dict:
+        instruction = str(_prepared_instruction or "") or self._instruction_for_steer(
+            message
+        )
+        normalized_key = str(idempotency_key or uuid.uuid4().hex).strip()
+        replacement_run_id = str(_replacement_run_id or "") or self._idempotent_run_id(
+            worker_id, normalized_key
+        )
+        existing = self.store.get_run(replacement_run_id)
+        pending_worker = self.store.get_worker(worker_id) or {}
+        pending_same_steer = bool(
+            str(pending_worker.get("compute_release_kind") or "") == "steer_run"
+            and str(
+                pending_worker.get("compute_release_replacement_run_id") or ""
+            )
+            == replacement_run_id
+        )
+        if existing:
+            if (
+                str(existing.get("worker_id") or "") != worker_id
+                or str(existing.get("instruction") or "") != instruction
+            ):
+                raise ValueError(
+                    "GlassHive idempotency key was reused with a different steer"
+                )
+            if not pending_same_steer:
+                return existing
+
+        with self._worker_compute_release_lock(worker_id):
+            worker = self.require_worker(worker_id)
+            self._ensure_execution_allowed(worker)
+            persisted_target_run_id = str(
+                worker.get("compute_release_target_run_id") or ""
+            )
+            target = (
+                self.require_run(run_id)
+                if str(run_id or "").strip()
+                else self.require_run(persisted_target_run_id)
+                if pending_same_steer and persisted_target_run_id
+                else self.store.get_active_run(worker_id)
+                or self.store.get_controllable_run(worker_id)
+            )
+            if (
+                not target
+                or str(target.get("worker_id") or "") != worker_id
+                or str(target.get("state") or "")
+                not in {"queued", "running", "settling"}
+            ):
+                raise RuntimeErrorBase("No exact active run is available to steer")
+            target_state = str(target.get("state") or "")
+            target_run_id = str(target["run_id"])
+            runtime_worker = worker
+            if target_state != "queued":
+                runtime_worker = self._require_confirmed_host_control_identity(
+                    worker, target_run_id
+                )
+            queued_at = str((existing or {}).get("queued_at") or utc_now())
+            replacement_data: dict[str, object] = {
+                "run_id": replacement_run_id,
+                "worker_id": worker_id,
+                "project_id": str(worker["project_id"]),
+                "tenant_id": str(worker.get("tenant_id") or "local"),
+                "instruction": instruction,
+                "state": "queued",
+                "queued_at": queued_at,
+                "started_at": None,
+                "ended_at": None,
+                "output_text": "",
+                "error_text": "",
+                "failure_class": "",
+                "failure_retryable": 0,
+                "failure_structured": 0,
+                "failure_user_message": "",
+                "failure_recommended_recovery": "",
+                "failure_diagnostic_summary": "",
+                "retry_after": None,
+                "retry_attempts": 0,
+                "last_retry_class": "",
+                "native_session_id": "",
+                "native_capabilities_json": "{}",
+                "native_child_summary_json": "{}",
+                "_origin_trace": origin_trace,
+                "continuation_contract_json": json.dumps(
+                    (
+                        {**continuation_contract, "run_id": replacement_run_id}
+                        if isinstance(continuation_contract, dict)
+                        else {}
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+            claim = self._claim_exact_run_control(
+                worker,
+                target,
+                kind="steer_run",
+                replacement_run=replacement_data,
+                action_use_id=action_use_id,
+            )
+            claimed_worker = dict(claim.get("worker") or worker)
+            token = str(claim["token"])
+            epoch = int(claim["epoch"])
+            info = None
+            runtime_already_confirmed = self.store.worker_control_runtime_proof_matches(
+                claimed_worker
+            )
+            if target_state != "queued" and not runtime_already_confirmed:
+                if str(worker.get("execution_mode") or "docker") != "host":
+                    runtime_worker = self._worker_with_host_lease(
+                        claimed_worker, target_run_id
+                    )
+                else:
+                    runtime_worker = {**runtime_worker, **claimed_worker}
+                runtime_worker = self._require_claimed_container_generation(
+                    runtime_worker
+                )
+                try:
+                    info = self.runtime.interrupt_worker(
+                        runtime_worker, run_id=target_run_id
+                    )
+                except TypeError as exc:
+                    if "run_id" not in str(exc):
+                        raise
+                    info = self.runtime.interrupt_worker(runtime_worker)
+                if not self._runtime_control_info_is_confirmed(info):
+                    raise RuntimeErrorBase(
+                        "Runtime steer did not confirm the exact process stopped"
+                    )
+                if not self.store.confirm_worker_control_runtime_effect(
+                    worker_id,
+                    token,
+                    epoch,
+                    kind="steer_run",
+                    target_run_id=target_run_id,
+                ):
+                    raise RuntimeErrorBase(
+                        "Steer runtime proof lost durable lifecycle ownership"
+                    )
+                self._invalidate_worker_processor(worker_id)
+            operation = self.store.finalize_worker_steer_claim(
+                worker_id,
+                token,
+                epoch,
+                target_run_id=target_run_id,
+                target_expected_state=target_state,
+                replacement_run_id=replacement_run_id,
+                replacement_instruction=instruction,
+                runtime_fields=(
+                    self._runtime_info_fields(worker_id, info, last_error="")
+                    if info is not None
+                    else {}
+                ),
+            )
+            if not operation:
+                raise RuntimeErrorBase(
+                    "Steer lost the exact run lifecycle generation before replacement"
+                )
+            target_run = dict(operation.get("target_run") or target)
+            replacement = dict(operation.get("replacement_run") or {})
+            if action_use_id:
+                self.store.checkpoint_active_work_action(
+                    action_use_id,
+                    "source_interrupted",
+                    executor_id=self._executor_id,
+                )
+        self._replay_pending_lifecycle_effects()
+        if bool(operation.get("terminal_won")):
+            return {
+                **target_run,
+                "_control_outcome": "terminal_won",
+                "_control_run": target_run,
+            }
+        self._ensure_worker_processor(worker_id)
+        return replacement
+
+    def steer_worker(
+        self,
+        worker_id: str,
+        message: str,
+        *,
+        run_id: str = "",
+        idempotency_key: str | None = None,
+        action_use_id: str = "",
+        _prepared_instruction: str = "",
+        _replacement_run_id: str = "",
+        origin_trace: dict[str, object] | None = None,
+        continuation_contract: dict[str, object] | None = None,
+    ) -> dict:
+        if run_id or idempotency_key or action_use_id:
+            return self._steer_worker_parallel(
+                worker_id,
+                message,
+                run_id=run_id,
+                idempotency_key=idempotency_key,
+                action_use_id=action_use_id,
+                _prepared_instruction=_prepared_instruction,
+                _replacement_run_id=_replacement_run_id,
+                origin_trace=origin_trace,
+                continuation_contract=continuation_contract,
+            )
         worker = self.require_worker(worker_id)
         self._ensure_execution_allowed(worker)
         # Steering replaces the active run. Prove the replacement route before
@@ -4905,7 +7161,139 @@ class WorkersProjectsService:
         )
         return launched
 
-    def pause_worker(self, worker_id: str) -> dict:
+    def _pause_worker_parallel(
+        self,
+        worker_id: str,
+        *,
+        run_id: str = "",
+        action_use_id: str = "",
+    ) -> dict:
+        if not str(run_id or "").strip() and not self.store.get_controllable_run(
+            worker_id
+        ):
+            return self._pause_worker_without_run(worker_id)
+        with self._worker_compute_release_lock(worker_id):
+            worker = self.require_worker(worker_id)
+            active_run = (
+                self.require_run(run_id)
+                if str(run_id or "").strip()
+                else self.store.get_active_run(worker_id)
+                or self.store.get_controllable_run(worker_id)
+            )
+            if active_run and str(active_run.get("worker_id") or "") != worker_id:
+                raise RuntimeError("active_work_run_scope_mismatch")
+            active_state = str((active_run or {}).get("state") or "")
+            if active_state == "paused":
+                return (
+                    self.store.update_worker_state(worker_id, "paused", last_error="")
+                    or worker
+                )
+            if not active_run or active_state not in {"queued", "running", "settling"}:
+                raise RuntimeErrorBase("No exact active run is available to pause")
+            target_run_id = str(active_run["run_id"])
+            runtime_worker = worker
+            if active_state != "queued":
+                runtime_worker = self._require_confirmed_host_control_identity(
+                    worker, target_run_id
+                )
+            claim = self._claim_exact_run_control(
+                worker,
+                active_run,
+                kind="pause_run",
+                action_use_id=action_use_id,
+            )
+            claimed_worker = dict(claim.get("worker") or worker)
+            token = str(claim["token"])
+            epoch = int(claim["epoch"])
+            info = None
+            runtime_already_confirmed = self.store.worker_control_runtime_proof_matches(
+                claimed_worker
+            )
+            if active_state != "queued" and not runtime_already_confirmed:
+                runtime_worker = (
+                    self._worker_with_host_lease(claimed_worker, target_run_id)
+                    if str(worker.get("execution_mode") or "docker") != "host"
+                    else {**runtime_worker, **claimed_worker}
+                )
+                runtime_worker = self._require_claimed_container_generation(
+                    runtime_worker
+                )
+                info = self.runtime.pause_worker(runtime_worker)
+                if not self._runtime_control_info_is_confirmed(info):
+                    raise RuntimeErrorBase(
+                        "Runtime pause did not confirm the exact process stopped"
+                    )
+                if not self.store.confirm_worker_control_runtime_effect(
+                    worker_id,
+                    token,
+                    epoch,
+                    kind="pause_run",
+                    target_run_id=target_run_id,
+                ):
+                    raise RuntimeErrorBase(
+                        "Pause runtime proof lost durable lifecycle ownership"
+                    )
+                if str(worker.get("execution_mode") or "docker") == "host":
+                    self._invalidate_worker_processor(worker_id)
+                if action_use_id:
+                    self.store.checkpoint_active_work_action(
+                        action_use_id,
+                        "runtime_paused",
+                        executor_id=self._executor_id,
+                    )
+            operation = self.store.finalize_worker_run_control_claim(
+                worker_id,
+                token,
+                epoch,
+                kind="pause_run",
+                target_run_id=target_run_id,
+                target_expected_states=(active_state,),
+                target_state="paused",
+                worker_state="paused",
+                runtime_fields=(
+                    self._runtime_info_fields(worker_id, info, last_error="")
+                    if info is not None
+                    else {}
+                ),
+                error_text="Paused by operator",
+                release_lease=(
+                    active_state != "queued"
+                    and str(worker.get("execution_mode") or "docker") == "host"
+                ),
+            )
+            if not operation:
+                raise RuntimeErrorBase(
+                    "Pause lost the exact run lifecycle generation before finalization"
+                )
+            updated = dict(operation.get("worker") or claimed_worker)
+            paused_run = dict(operation.get("run") or active_run)
+            target_transitioned = bool(operation.get("target_transitioned"))
+        if not target_transitioned:
+            if str(updated.get("state") or "") in CLOSED_WORKER_STATES:
+                raise ControlPlaneConflict(
+                    "Workspace is closed; create a new workspace for new work"
+                )
+            return {
+                **updated,
+                "_control_outcome": "terminal_won",
+                "_control_run": paused_run,
+            }
+        self._replay_pending_lifecycle_effects()
+        return updated
+
+    def pause_worker(
+        self,
+        worker_id: str,
+        *,
+        run_id: str = "",
+        action_use_id: str = "",
+    ) -> dict:
+        if run_id or action_use_id:
+            return self._pause_worker_parallel(
+                worker_id,
+                run_id=run_id,
+                action_use_id=action_use_id,
+            )
         worker = self.require_worker(worker_id)
         self._ensure_execution_allowed(worker)
         # Decide whether this is an already-started, freeze-capable run while
@@ -4935,12 +7323,13 @@ class WorkersProjectsService:
             )
         paused_run = None
         if active_run and not run_started:
-            paused_run = self.store.finalize_run_if_state(
+            paused_run = self._finalize_run_if_state(
                 active_run["run_id"],
                 "running",
                 "paused",
                 output_text=active_run.get("output_text", ""),
                 error_text="Paused by operator",
+                **self._terminal_generation_for_run(active_run),
             )
             if paused_run:
                 self.store.finalize_schedule_for_run(
@@ -4953,7 +7342,110 @@ class WorkersProjectsService:
         self._emit_callback(worker, "worker.paused", run=paused_run or active_run, message="Worker paused")
         return updated or worker
 
+    def _interrupt_worker_parallel(self, worker_id: str, run_id: str | None = None) -> dict:
+        with self._worker_compute_release_lock(worker_id):
+            worker = self.require_worker(worker_id)
+            active_run = self.store.get_active_run(worker_id)
+            if run_id and (
+                not active_run
+                or str(active_run.get("run_id") or "") != str(run_id)
+            ):
+                return worker
+            if not active_run or str(active_run.get("state") or "") not in {
+                "running",
+                "settling",
+            }:
+                return worker
+            target_run_id = str(active_run["run_id"])
+            runtime_worker = self._require_confirmed_host_control_identity(
+                worker, target_run_id
+            )
+            claim = self._claim_exact_run_control(
+                worker, active_run, kind="interrupt_run"
+            )
+            claimed_worker = dict(claim.get("worker") or worker)
+            token = str(claim["token"])
+            epoch = int(claim["epoch"])
+            if str(worker.get("execution_mode") or "docker") != "host":
+                runtime_worker = self._worker_with_host_lease(
+                    claimed_worker, target_run_id
+                )
+            else:
+                runtime_worker = {**runtime_worker, **claimed_worker}
+            info = None
+            if not self.store.worker_control_runtime_proof_matches(claimed_worker):
+                runtime_worker = self._require_claimed_container_generation(
+                    runtime_worker
+                )
+                try:
+                    info = self.runtime.interrupt_worker(
+                        runtime_worker, run_id=target_run_id
+                    )
+                except TypeError as exc:
+                    if "run_id" not in str(exc):
+                        raise
+                    info = self.runtime.interrupt_worker(runtime_worker)
+                if not self._runtime_control_info_is_confirmed(info):
+                    raise RuntimeErrorBase(
+                        "Runtime interrupt did not confirm the exact process stopped"
+                    )
+                if not self.store.confirm_worker_control_runtime_effect(
+                    worker_id,
+                    token,
+                    epoch,
+                    kind="interrupt_run",
+                    target_run_id=target_run_id,
+                ):
+                    raise RuntimeErrorBase(
+                        "Interrupt runtime proof lost durable lifecycle ownership"
+                    )
+            self._invalidate_worker_processor(worker_id)
+            operation = self.store.finalize_worker_run_control_claim(
+                worker_id,
+                token,
+                epoch,
+                kind="interrupt_run",
+                target_run_id=target_run_id,
+                target_expected_states=(str(active_run.get("state") or "running"),),
+                target_state="interrupted",
+                worker_state="ready",
+                runtime_fields=(
+                    self._runtime_info_fields(worker_id, info, last_error="")
+                    if info is not None
+                    else {}
+                ),
+                error_text="Interrupted by operator",
+                release_lease=True,
+            )
+            if not operation:
+                raise RuntimeErrorBase(
+                    "Interrupt lost the exact run lifecycle generation before finalization"
+                )
+            updated = dict(operation.get("worker") or claimed_worker)
+            finalized_run = dict(operation.get("run") or active_run)
+            target_transitioned = bool(operation.get("target_transitioned"))
+        if not target_transitioned:
+            if str(updated.get("state") or "") in CLOSED_WORKER_STATES:
+                raise ControlPlaneConflict(
+                    "Workspace is closed; create a new workspace for new work"
+                )
+            return {
+                **updated,
+                "_control_outcome": "terminal_won",
+                "_control_run": finalized_run,
+            }
+        self._replay_pending_lifecycle_effects()
+        self._wake_host_capacity_waiters(updated)
+        return updated
+
     def interrupt_worker(self, worker_id: str, run_id: str | None = None) -> dict:
+        active_run = (
+            self.store.get_run(str(run_id))
+            if str(run_id or "").strip()
+            else self.store.get_active_run(worker_id)
+        )
+        if active_run is not None and str(active_run.get("active_attempt_id") or ""):
+            return self._interrupt_worker_parallel(worker_id, run_id=run_id)
         worker = self.require_worker(worker_id)
         self._ensure_execution_allowed(worker)
         self._invalidate_worker_processor(worker_id)
@@ -5044,6 +7536,7 @@ class WorkersProjectsService:
             active_run = self.store.get_active_run(worker_id)
             if not active_run or str(active_run.get("run_id") or "") != str(run_id):
                 return worker
+            terminal_generation = self._terminal_generation_for_run(active_run)
             # Stop the processor generation before interrupting the host process. A late
             # runtime return can then never overwrite the durable cancellation with completion.
             self._invalidate_worker_processor(worker_id)
@@ -5067,6 +7560,7 @@ class WorkersProjectsService:
                     state="cancelled",
                     output_text="",
                     error_text="Cancelled by provider client",
+                    **terminal_generation,
                 )
 
         if cancelled:
@@ -5095,7 +7589,186 @@ class WorkersProjectsService:
             self._ensure_worker_processor(worker_id)
         return self.store.get_worker(worker_id) or worker
 
-    def resume_worker(self, worker_id: str) -> dict:
+    def _resume_worker_parallel(
+        self,
+        worker_id: str,
+        *,
+        run_id: str = "",
+        action_use_id: str = "",
+    ) -> dict:
+        current = self.require_worker(worker_id)
+        if (
+            str(current.get("compute_release_token") or "")
+            and str(current.get("compute_release_expires_at") or "") > utc_now()
+        ):
+            raise RuntimeErrorBase("Worker compute release is in progress")
+        if not str(run_id or "").strip():
+            if (
+                str(current.get("state") or "") == "paused"
+                and not self.store.get_controllable_run(worker_id)
+            ):
+                return self._resume_worker_without_run(worker_id)
+        with self._worker_compute_release_lock(worker_id):
+            worker = self.require_worker(worker_id)
+            self._ensure_execution_allowed(worker)
+            worker = self._refresh_worker_model_for_profile(worker)
+            if str(run_id or "").strip():
+                paused_run = self.require_run(run_id)
+            else:
+                controllable_runs = self.store.list_nonterminal_runs_for_worker(
+                    worker_id
+                )
+                paused_run = next(
+                    (
+                        candidate
+                        for candidate in controllable_runs
+                        if str(candidate.get("state") or "") == "paused"
+                    ),
+                    None,
+                )
+                if paused_run is None:
+                    paused_run = (
+                        self.store.get_active_run(worker_id)
+                        or self.store.get_controllable_run(worker_id)
+                    )
+            if paused_run and str(paused_run.get("worker_id") or "") != worker_id:
+                raise RuntimeError("active_work_run_scope_mismatch")
+            if not paused_run or str(paused_run.get("state") or "") != "paused":
+                if paused_run and str(paused_run.get("state") or "") in {
+                    "queued",
+                    "running",
+                    "settling",
+                }:
+                    return worker
+                updated = self._start_worker_again(
+                    worker, event_type="worker.resumed", message="Worker resumed"
+                )
+                active_run = self.store.get_active_run(worker_id)
+                if active_run:
+                    return (
+                        self.store.update_worker_state(
+                            worker_id, "running", last_error=""
+                        )
+                        or updated
+                    )
+                self._ensure_worker_processor(worker_id)
+                return updated
+
+            target_run_id = str(paused_run["run_id"])
+            claim = self._claim_exact_run_control(
+                worker,
+                paused_run,
+                kind="resume_run",
+                action_use_id=action_use_id,
+            )
+            claimed_worker = dict(claim.get("worker") or worker)
+            token = str(claim["token"])
+            epoch = int(claim["epoch"])
+            compute_was_released = bool(worker.get("compute_released_at"))
+            info = None
+            if not self.store.worker_control_runtime_proof_matches(claimed_worker):
+                try:
+                    info = self.runtime.ensure_worker_ready(claimed_worker)
+                except Exception as exc:
+                    self._restore_failed_resume_claim(
+                        worker=claimed_worker,
+                        token=token,
+                        epoch=epoch,
+                        kind="resume_run",
+                        target_run_id=target_run_id,
+                        startup_error=exc,
+                    )
+                    raise
+                if not self.store.confirm_worker_control_runtime_effect(
+                    worker_id,
+                    token,
+                    epoch,
+                    kind="resume_run",
+                    target_run_id=target_run_id,
+                ):
+                    raise RuntimeErrorBase(
+                        "Resume startup proof lost durable lifecycle ownership"
+                    )
+            captured_container_id = str(
+                claimed_worker.get("compute_release_container_id") or ""
+            ).strip()
+            current_container_id = (
+                self._runtime_compute_container_id(claimed_worker)
+                if str(worker.get("execution_mode") or "docker") == "docker"
+                else ""
+            )
+            external_runtime_requires_identity = bool(
+                getattr(self.runtime, "requires_run_start_identity", False)
+            )
+            exact_paused_generation_resumed = bool(
+                not external_runtime_requires_identity
+                or (
+                    captured_container_id
+                    and current_container_id == captured_container_id
+                )
+            )
+            resume_state = (
+                "queued"
+                if compute_was_released
+                or str(worker.get("execution_mode") or "docker") == "host"
+                or not paused_run.get("started_at")
+                or not exact_paused_generation_resumed
+                else "running"
+            )
+            operation = self.store.finalize_worker_run_control_claim(
+                worker_id,
+                token,
+                epoch,
+                kind="resume_run",
+                target_run_id=target_run_id,
+                target_expected_states=("paused",),
+                target_state=resume_state,
+                worker_state="starting" if resume_state == "queued" else "running",
+                runtime_fields=(
+                    self._runtime_info_fields(worker_id, info, last_error="")
+                    if info is not None
+                    else {}
+                ),
+                error_text="",
+                release_lease=False,
+            )
+            if not operation:
+                raise RuntimeErrorBase(
+                    "Resume lost the exact run lifecycle generation before finalization"
+                )
+            updated = dict(operation.get("worker") or claimed_worker)
+            resumed_run = dict(operation.get("run") or paused_run)
+            target_transitioned = bool(operation.get("target_transitioned"))
+            if action_use_id:
+                self.store.checkpoint_active_work_action(
+                    action_use_id,
+                    "runtime_resumed",
+                    executor_id=self._executor_id,
+                )
+        if not target_transitioned:
+            return {
+                **updated,
+                "_control_outcome": "terminal_won",
+                "_control_run": resumed_run,
+            }
+        self._replay_pending_lifecycle_effects()
+        if resume_state == "queued":
+            self._ensure_worker_processor(worker_id)
+        return updated
+
+    def resume_worker(
+        self,
+        worker_id: str,
+        *,
+        run_id: str = "",
+        action_use_id: str = "",
+    ) -> dict:
+        if run_id or action_use_id:
+            return self._resume_worker_parallel(
+                worker_id,
+                run_id=run_id,
+                action_use_id=action_use_id,
+            )
         worker = self.require_worker(worker_id)
         self._ensure_execution_allowed(worker)
         self._ensure_dispatch_provider_ready(worker)
@@ -5194,6 +7867,8 @@ class WorkersProjectsService:
         return updated or worker
 
     def reconcile_all_workers(self) -> None:
+        self.store.reconcile_invalid_running_runs()
+        self.reconcile_terminal_artifact_observations()
         for worker in self.store.list_all_workers():
             try:
                 self._reconcile_worker_row(worker)
@@ -5210,6 +7885,8 @@ class WorkersProjectsService:
                 )
 
     def _reconcile_worker_row(self, worker: dict) -> None:
+        if str(worker.get("compute_release_token") or ""):
+            return
         if worker["state"] == "terminating":
             self.terminate_worker(str(worker["worker_id"]), _reclaim_existing=True)
             return
@@ -5220,6 +7897,8 @@ class WorkersProjectsService:
             self._reconcile_terminated_worker_compute(worker)
             return
         active_run = self.store.get_active_run(worker["worker_id"])
+        if active_run and self._local_processor_owns(str(worker["worker_id"])):
+            return
         if active_run:
             recovered = self._collect_completed_run(worker, active_run)
             if recovered:
@@ -5236,11 +7915,12 @@ class WorkersProjectsService:
             return
         if worker["state"] == "paused":
             if active_run:
-                orphaned_run = self.store.finalize_run_if_state(
+                orphaned_run = self._finalize_run_if_state(
                     active_run["run_id"],
-                    "running",
+                    str(active_run.get("state") or "running"),
                     "interrupted",
                     error_text="Worker was paused during reconcile",
+                    **self._terminal_generation_for_run(active_run),
                 )
                 if orphaned_run:
                     self.store.add_event(
@@ -5264,11 +7944,24 @@ class WorkersProjectsService:
             state = "ready" if info.pid or process_per_run_host else "paused"
         if not info.pid:
             if active_run:
-                orphaned_run = self.store.finalize_run_if_state(
+                orphaned_run = self._finalize_run_if_state(
                     active_run["run_id"],
-                    "running",
+                    str(active_run.get("state") or "running"),
                     "interrupted",
                     error_text="Worker process was not running during reconcile",
+                    **self._terminal_generation_for_run(active_run),
+                    failure_class="provider_temporarily_unavailable",
+                    failure_retryable=1,
+                    failure_structured=1,
+                    failure_user_message=(
+                        "The provider worker stopped unexpectedly before completing the response."
+                    ),
+                    failure_recommended_recovery=(
+                        "Retry the request or use the configured provider fallback."
+                    ),
+                    failure_diagnostic_summary=(
+                        "Reconciliation found no live process for the active host run."
+                    ),
                 )
                 if orphaned_run:
                     self.store.add_event(
@@ -5290,7 +7983,9 @@ class WorkersProjectsService:
                 # Queue processors are process-local. Recreate a monitor after service restart
                 # so any surviving host-native process can be finalized exactly once from its
                 # durable transcript instead of occupying capacity forever.
-                self._ensure_worker_processor(worker["worker_id"])
+                self._ensure_surviving_run_monitor(
+                    str(worker["worker_id"]), str(active_run["run_id"])
+                )
             elif self.store.has_queued_runs(worker["worker_id"]):
                 self._ensure_worker_processor(worker["worker_id"])
 
@@ -5317,23 +8012,44 @@ class WorkersProjectsService:
     def _collect_completed_run(self, worker: dict, run: dict) -> dict[str, object] | None:
         if not hasattr(self.runtime, "collect_completed_run"):
             return None
+        terminal_generation = self._terminal_generation_for_run(run)
+        runtime_worker = {
+            **worker,
+            "_run_attempt_id": str(run.get("active_attempt_id") or ""),
+        }
+
+        def bind_generation(recovered):
+            if not isinstance(recovered, dict):
+                return recovered
+            return {**recovered, "_terminal_generation": terminal_generation}
+
         try:
-            return self.runtime.collect_completed_run(
-                worker,
-                run_id=run["run_id"],
-                instruction=str(run.get("instruction") or ""),
+            return bind_generation(
+                self.runtime.collect_completed_run(
+                    runtime_worker,
+                    run_id=run["run_id"],
+                    instruction=str(run.get("instruction") or ""),
+                )
             )
         except TypeError as exc:
             if "instruction" in str(exc):
                 try:
-                    return self.runtime.collect_completed_run(worker, run_id=run["run_id"])
+                    return bind_generation(
+                        self.runtime.collect_completed_run(
+                            runtime_worker, run_id=run["run_id"]
+                        )
+                    )
                 except TypeError as run_id_exc:
                     if "run_id" not in str(run_id_exc):
                         raise
-                    return self.runtime.collect_completed_run(worker)
+                    return bind_generation(
+                        self.runtime.collect_completed_run(runtime_worker)
+                    )
             if "run_id" not in str(exc):
                 raise
-            return self.runtime.collect_completed_run(worker)
+            return bind_generation(
+                self.runtime.collect_completed_run(runtime_worker)
+            )
 
     def _run_usage(self, worker: dict, run_id: str) -> dict[str, int]:
         reader = getattr(self.runtime, "run_usage", None)
@@ -5412,6 +8128,9 @@ class WorkersProjectsService:
 
     def _apply_recovered_run(self, worker: dict, run: dict, recovered: dict[str, object]) -> dict | None:
         worker_id = worker["worker_id"]
+        terminal_generation = recovered.get("_terminal_generation")
+        if not isinstance(terminal_generation, dict):
+            terminal_generation = self._terminal_generation_for_run(run)
         state = str(recovered.get("state") or "failed")
         output_text = str(recovered.get("output_text") or "")
         error_text = str(recovered.get("error_text") or "")
@@ -5420,20 +8139,26 @@ class WorkersProjectsService:
             for key in (
                 "failure_class",
                 "failure_retryable",
+                "failure_structured",
                 "failure_user_message",
                 "failure_recommended_recovery",
                 "failure_diagnostic_summary",
             )
             if key in recovered
         }
+        if state == "failed":
+            self._record_provider_route_failure(
+                worker, run, failure_fields, recovered
+            )
         usage = recovered.get("usage") if isinstance(recovered.get("usage"), dict) else {}
         if state == "completed":
-            finalized_run = self.store.finalize_run_if_state(
+            finalized_run = self._finalize_run_if_state(
                 run["run_id"],
-                "running",
+                str(run.get("state") or "running"),
                 "completed",
                 output_text=output_text,
                 usage=usage,
+                **terminal_generation,
             )
             if not finalized_run:
                 return self.store.get_worker(worker_id)
@@ -5461,12 +8186,13 @@ class WorkersProjectsService:
             deliverable = self._completion_deliverable(refreshed_worker, recovered_run, output_text, error_text)
             if self._fresh_user_artifact_deliverable(refreshed_worker, recovered_run, deliverable):
                 completed_output = output_text.strip() or self._artifact_completed_output(deliverable or {}, failure_fields)
-                finalized_run = self.store.finalize_run_if_state(
+                finalized_run = self._finalize_run_if_state(
                     run["run_id"],
-                    "running",
+                    str(run.get("state") or "running"),
                     "completed",
                     output_text=completed_output,
                     usage=usage,
+                    **terminal_generation,
                 )
                 if not finalized_run:
                     return self.store.get_worker(worker_id)
@@ -5493,12 +8219,24 @@ class WorkersProjectsService:
                 )
                 self._wake_host_capacity_waiters(refreshed_worker)
                 return self.store.get_worker(worker_id)
-            finalized_run = self.store.finalize_run_if_state(
+            recovered_error = RuntimeErrorBase(
+                error_text or "Structured provider quota exhausted"
+            )
+            if self._switch_quota_exhausted_run_to_fallback(
+                refreshed_worker,
+                {**run, "output_text": output_text},
+                recovered_error,
+                failure_fields,
+            ):
+                return self.store.get_worker(worker_id)
+            finalized_run = self._finalize_run_if_state(
                 run["run_id"],
-                "running",
+                str(run.get("state") or "running"),
                 "failed",
+                output_text=output_text,
                 error_text=error_text,
                 usage=usage,
+                **terminal_generation,
                 **failure_fields,
             )
             if not finalized_run:
@@ -5510,7 +8248,7 @@ class WorkersProjectsService:
             self._emit_callback(
                 refreshed_worker,
                 "run.failed",
-                run=recovered_run,
+                run=finalized_run,
                 message=failure_message,
                 deliverable=deliverable,
             )
@@ -5783,7 +8521,1057 @@ class WorkersProjectsService:
             self._active_processors.discard(worker_id)
             return True
 
+    def _process_worker_queue_parallel(self, worker_id: str, generation: int) -> None:
+        current_run: dict | None = None
+        runtime_invoked = False
+        preserve_start_fence = False
+        terminal_generation: dict[str, str] = {}
+        try:
+            while True:
+                current_run = None
+                runtime_invoked = False
+                preserve_start_fence = False
+                terminal_generation = {}
+                if not self._processor_is_current(worker_id, generation):
+                    return
+                worker = self.store.get_worker(worker_id)
+                if not worker or worker["state"] in {
+                    "paused",
+                    "needs_input",
+                    "stopping",
+                    "terminated",
+                }:
+                    return
+
+                queued_run = self.store.peek_next_queued_run(worker_id)
+                if queued_run:
+                    capacity_error = self._runtime_capacity_error(worker)
+                    if capacity_error:
+                        self._requeue_retryable_run(worker, queued_run, capacity_error)
+                        return
+                    self._mark_run_local_grant_waiter(
+                        worker, str(queued_run["run_id"])
+                    )
+                    try:
+                        # Reserve host/resource capacity while the accepted work
+                        # is still queued. Only a real execution admission may
+                        # mint an immutable run attempt.
+                        self._acquire_host_run_lease(worker, queued_run)
+                    except HostCapacityError as exc:
+                        self._clear_run_local_grant_waiter(
+                            str(queued_run["run_id"])
+                        )
+                        self._requeue_retryable_run(
+                            worker,
+                            queued_run,
+                            exc,
+                            failure_fields=classify_runtime_error(
+                                exc,
+                                runtime_name=str(
+                                    worker.get("profile")
+                                    or worker.get("runtime")
+                                    or "worker"
+                                ),
+                            ).as_store_fields(),
+                        )
+                        return
+
+                run = self.store.claim_next_queued_run(
+                    worker_id,
+                    executor_id=self._executor_id,
+                    lease_ttl_s=self._host_lease_ttl_s(),
+                )
+                if not run:
+                    self._schedule_worker_retry_after(
+                        worker_id,
+                        self.store.next_retry_after_for_worker(worker_id),
+                    )
+                    if queued_run:
+                        self._clear_run_local_grant_waiter(
+                            str(queued_run["run_id"])
+                        )
+                        self._release_host_run_lease(
+                            str(queued_run["run_id"]),
+                            reason="preclaim_generation_lost",
+                        )
+                    current = self.store.get_worker(worker_id)
+                    if (
+                        self._processor_is_current(worker_id, generation)
+                        and current
+                        and current["state"] not in {
+                            "paused",
+                            "needs_input",
+                            "stopping",
+                            "terminated",
+                            "failed",
+                        }
+                        and not self.store.get_active_run(worker_id)
+                    ):
+                        self.store.update_worker_state(worker_id, "ready", last_error="")
+                    return
+
+                current_run = run
+                worker = self.store.get_worker(worker_id) or worker
+                if queued_run and str(queued_run.get("run_id") or "") != str(
+                    run.get("run_id") or ""
+                ):
+                    self._clear_run_local_grant_waiter(
+                        str(queued_run.get("run_id") or "")
+                    )
+                    self._mark_run_local_grant_waiter(
+                        worker, str(run["run_id"])
+                    )
+                qa_claimed_stall = self._consume_local_qa(
+                    "claimed_queue_stall", worker, run
+                )
+                if qa_claimed_stall is not None:
+                    stalled = self.store.force_queue_deadline_for_local_qa(
+                        str(run["run_id"]),
+                        expected_state="claimed",
+                        expected_generation=int(
+                            run.get("queue_wait_generation") or 0
+                        ),
+                        expected_deadline=str(run.get("queue_deadline_at") or ""),
+                        now=self._now_datetime().isoformat(),
+                    )
+                    self._record_local_qa_effect(
+                        qa_claimed_stall,
+                        "claimed_wait_moved_to_deadline"
+                        if stalled is not None
+                        else "claimed_wait_generation_lost",
+                    )
+                    return
+                if self._handle_unhealthy_provider_route(worker, run):
+                    self._clear_run_local_grant_waiter(str(run["run_id"]))
+                    return
+                try:
+                    lease = self._acquire_host_run_lease(worker, run)
+                    if not lease:
+                        raise RuntimeErrorBase(
+                            "GlassHive could not reserve the exact run startup generation."
+                        )
+                    terminal_generation = self._terminal_generation_for_run(
+                        run, lease
+                    )
+                    authority_context: dict[str, str] = {}
+                    if (
+                        self._deferred_capability_authorization(worker) is not None
+                        or self._prompt_workbench_scheduled_authority(worker)
+                        is not None
+                    ):
+                        prepare_authority = getattr(
+                            self.runtime, "prepare_run_authority_context", None
+                        )
+                        if not callable(prepare_authority):
+                            raise BrokerAdmissionError(
+                                "broker_admission_generation_unavailable",
+                                "The exact mission container generation is unavailable.",
+                                retryable=True,
+                            )
+                        prepared = prepare_authority(worker, run_id=str(run["run_id"]))
+                        if isinstance(prepared, dict):
+                            authority_context = {
+                                str(key): str(value)
+                                for key, value in prepared.items()
+                            }
+
+                    runtime_info_run_id = str(run["run_id"])
+                    runtime_info_lease_id = str(lease.get("lease_id") or "")
+                    runtime_info_startup_token = str(
+                        lease.get("startup_token") or ""
+                    )
+
+                    def persist_runtime_info(
+                        info: RuntimeInfo,
+                        *,
+                        exact_run_id: str = runtime_info_run_id,
+                        exact_lease_id: str = runtime_info_lease_id,
+                        exact_startup_token: str = runtime_info_startup_token,
+                    ) -> None:
+                        # OpenClaw publishes its live gateway PID while holding
+                        # the final runtime-start fence. Persist that identity
+                        # before readiness waits so Close can terminate it.
+                        updated = self.store.persist_worker_runtime_info_for_run_start(
+                            worker_id=worker_id,
+                            run_id=exact_run_id,
+                            lease_id=exact_lease_id,
+                            startup_token=exact_startup_token,
+                            executor_id=self._executor_id,
+                            runtime=info.runtime,
+                            model=info.model,
+                            gateway_url=info.gateway_url,
+                            gateway_port=info.gateway_port,
+                            gateway_token=info.gateway_token,
+                            session_key=info.session_key,
+                            state_dir=info.state_dir,
+                            workspace_dir=info.workspace_dir,
+                            pid=info.pid,
+                        )
+                        if updated is None:
+                            raise RuntimeErrorBase(
+                                "The exact run generation changed before runtime identity persistence"
+                            )
+
+                    run_worker = {
+                        **self._run_local_worker(
+                            worker, run, authority_context=authority_context
+                        ),
+                        "_runtime_start_guard": lambda: self._runtime_execution_start_guard(
+                            worker_id,
+                            generation,
+                            str(run["run_id"]),
+                        ),
+                        "_runtime_info_callback": persist_runtime_info,
+                        # Persist only a one-way binding in private active-session
+                        # state. The raw startup CAS token remains in SQLite.
+                        "_run_startup_token_digest": hashlib.sha256(
+                            str(lease.get("startup_token") or "").encode("utf-8")
+                        ).hexdigest(),
+                    }
+                    admitted = self.store.admit_claimed_run(
+                        str(run["run_id"]),
+                        lease_id=str(lease.get("lease_id") or ""),
+                        executor_id=self._executor_id,
+                    )
+                    if admitted is None:
+                        raise RuntimeErrorBase(
+                            "GlassHive lost the exact claimed run before compute admission."
+                        )
+                    run = {**run, **admitted}
+                    qa_admitted_stall = self._consume_local_qa(
+                        "admitted_queue_stall", worker, run
+                    )
+                    if qa_admitted_stall is not None:
+                        stalled = self.store.force_queue_deadline_for_local_qa(
+                            str(run["run_id"]),
+                            expected_state="admitted",
+                            expected_generation=int(
+                                run.get("queue_wait_generation") or 0
+                            ),
+                            expected_deadline=str(
+                                run.get("queue_deadline_at") or ""
+                            ),
+                            now=self._now_datetime().isoformat(),
+                        )
+                        self._record_local_qa_effect(
+                            qa_admitted_stall,
+                            "admitted_wait_moved_to_deadline"
+                            if stalled is not None
+                            else "admitted_wait_generation_lost",
+                        )
+                        return
+                except HostCapacityError as exc:
+                    self._clear_run_local_grant_waiter(str(run["run_id"]))
+                    self._release_host_run_lease(
+                        str(run["run_id"]), reason="capacity_wait"
+                    )
+                    self._requeue_retryable_run(
+                        worker,
+                        run,
+                        exc,
+                        failure_fields=classify_runtime_error(
+                            exc,
+                            runtime_name=str(
+                                worker.get("profile")
+                                or worker.get("runtime")
+                                or "worker"
+                            ),
+                        ).as_store_fields(),
+                    )
+                    return
+                except BrokerAdmissionError as exc:
+                    self._clear_run_local_grant_waiter(str(run["run_id"]))
+                    self._release_host_run_lease(
+                        str(run["run_id"]),
+                        reason=(
+                            "broker_admission_retry"
+                            if exc.retryable and not exc.needs_input
+                            else "broker_admission_rejected"
+                        ),
+                    )
+                    failure_fields = {
+                        "failure_class": exc.code,
+                        "failure_retryable": exc.retryable,
+                        "failure_structured": True,
+                        "failure_user_message": str(exc),
+                        "failure_recommended_recovery": (
+                            "Provide the requested authorization, then resume this work."
+                            if exc.needs_input
+                            else "Retry this work after the broker admission service recovers."
+                            if exc.retryable
+                            else "Review the capability authorization and retry this work."
+                        ),
+                        "failure_diagnostic_summary": "Deferred broker admission rejected the exact run binding.",
+                    }
+                    if exc.retryable and not exc.needs_input:
+                        self._requeue_retryable_run(
+                            worker,
+                            run,
+                            exc,
+                            failure_fields=failure_fields,
+                        )
+                    elif exc.needs_input:
+                        blocked_run = self.store.mark_run_needs_input(
+                            str(run["run_id"]),
+                            expected_state=str(run.get("state") or "claimed"),
+                            error_text=str(exc),
+                            failure_class=exc.code,
+                            failure_user_message=str(exc),
+                        ) or self.store.get_run(str(run["run_id"])) or run
+                        self.store.finalize_schedule_for_run(
+                            str(run["run_id"]),
+                            state="needs_input",
+                            last_error=str(exc),
+                        )
+                        self.store.update_worker_state(
+                            worker_id, "needs_input", last_error=str(exc)
+                        )
+                        needs_input_worker = self.store.get_worker(worker_id) or worker
+                        self._release_needs_input_compute(
+                            needs_input_worker,
+                            {**run, **blocked_run},
+                        )
+                        self.store.add_event(
+                            str(worker["project_id"]),
+                            worker_id,
+                            str(run["run_id"]),
+                            "run.needs_input",
+                            str(exc),
+                            payload={"failureCode": exc.code},
+                        )
+                        self._emit_callback(
+                            worker,
+                            "run.needs_input",
+                            run={**run, **blocked_run},
+                            message=str(exc),
+                        )
+                    else:
+                        failed_run = self._finalize_run_if_state(
+                            str(run["run_id"]),
+                            str(run.get("state") or "claimed"),
+                            "failed",
+                            error_text=str(exc),
+                            **terminal_generation,
+                            **failure_fields,
+                        ) or self.store.get_run(str(run["run_id"])) or run
+                        self.store.finalize_schedule_for_run(
+                            str(run["run_id"]), state="failed", last_error=str(exc)
+                        )
+                        self.store.update_worker_state(
+                            worker_id, "ready", last_error=str(exc)
+                        )
+                        self.store.add_event(
+                            str(worker["project_id"]),
+                            worker_id,
+                            str(run["run_id"]),
+                            "run.failed",
+                            str(exc),
+                            payload={"failureCode": exc.code},
+                        )
+                        self._emit_callback(
+                            worker,
+                            "run.failed",
+                            run={**run, **failed_run},
+                            message=str(exc),
+                        )
+                    return
+                callback_record, callbacks = self._run_start_callback_record(
+                    worker,
+                    run,
+                    str(lease.get("startup_token") or ""),
+                )
+                lifecycle_guard = self._acquire_worker_lifecycle_guard(worker_id)
+                reservation = self.store.validate_host_run_start_reservation(
+                    worker_id=worker_id,
+                    run_id=str(run["run_id"]),
+                    run_started_at=str(run.get("started_at") or ""),
+                    lease_id=str(lease.get("lease_id") or ""),
+                    startup_token=str(lease.get("startup_token") or ""),
+                    executor_id=self._executor_id,
+                )
+                if reservation is None:
+                    lifecycle_guard.release()
+                    clear_run_grant = getattr(
+                        self.runtime, "clear_run_local_capability_grant", None
+                    )
+                    if callable(clear_run_grant):
+                        clear_run_grant(worker)
+                    self._release_host_run_lease(
+                        str(run["run_id"]), reason="startup_fenced"
+                    )
+                    return
+                pending_start: dict[str, object] = {
+                    "worker_id": worker_id,
+                    "run_id": str(run["run_id"]),
+                    "run_started_at": str(run.get("started_at") or ""),
+                    "lease_id": str(lease.get("lease_id") or ""),
+                    "startup_token": str(lease.get("startup_token") or ""),
+                    "worker": dict(worker),
+                    "callback_record": callback_record,
+                    "callbacks": callbacks,
+                    "guard": lifecycle_guard,
+                    "confirmed": False,
+                }
+                with self._pending_run_starts_lock:
+                    self._pending_run_starts[str(run["run_id"])] = pending_start
+                try:
+                    try:
+                        requires_identity = bool(
+                            getattr(
+                                self.runtime,
+                                "requires_run_start_identity",
+                                True,
+                            )
+                        )
+                        if requires_identity and not self._run_start_observer_supported:
+                            raise RunStartupRejectedError(
+                                "The runtime cannot publish an exact startup identity.",
+                                termination_confirmed=True,
+                            )
+                        invocation = self.store.mark_run_runtime_invoked(
+                            str(run["run_id"]),
+                            lease_id=str(lease.get("lease_id") or ""),
+                            executor_id=self._executor_id,
+                        )
+                        if invocation is None:
+                            raise RunStartupRejectedError(
+                                "The run lost its exact live lease before runtime dispatch.",
+                                termination_confirmed=True,
+                            )
+                        run = {**run, **invocation}
+                        terminal_generation = self._terminal_generation_for_run(
+                            run, lease
+                        )
+                        runtime_invoked = True
+                        pending_start["run"] = dict(run)
+                        pending_start["run_started_at"] = str(
+                            run.get("runtime_invoked_at") or ""
+                        )
+                        if not requires_identity:
+                            def confirm_in_process_start() -> None:
+                                self._confirm_in_process_run_start(pending_start)
+
+                            # An in-process adapter has no external process
+                            # observer. It must publish its durable start from
+                            # the same final runtime boundary used by Close,
+                            # Pause, and Interrupt—not before adapter dispatch.
+                            # Its final local boundary also replaces the
+                            # cross-process launch flock, so controls may win
+                            # before the adapter reaches that boundary.
+                            lifecycle_guard.release()
+                            run_worker["_runtime_started_callback"] = (
+                                confirm_in_process_start
+                            )
+                        qa_provider_unavailable = self._consume_local_qa(
+                            "provider_unavailable", worker, run
+                        )
+                        if qa_provider_unavailable is not None:
+                            self._record_local_qa_effect(
+                                qa_provider_unavailable,
+                                "provider_unavailable_before_adapter_call",
+                            )
+                            unavailable = RuntimeErrorBase(
+                                "The configured model provider is temporarily unavailable."
+                            )
+                            unavailable.failure_class = "provider_unavailable"
+                            unavailable.retryable = True
+                            raise unavailable
+                        try:
+                            output = self.runtime.run_task(
+                                run_worker,
+                                run["instruction"],
+                                run_id=run["run_id"],
+                            )
+                        except TypeError as exc:
+                            if "run_id" not in str(exc):
+                                raise
+                            output = self.runtime.run_task(
+                                run_worker, run["instruction"]
+                            )
+                        with self._pending_run_starts_lock:
+                            confirmed = bool(
+                                (
+                                    self._pending_run_starts.get(
+                                        str(run["run_id"])
+                                    )
+                                    or {}
+                                ).get("confirmed")
+                            )
+                        if not confirmed:
+                            raise RunStartupRejectedError(
+                                "The runtime returned without publishing its exact startup identity.",
+                                termination_confirmed=False,
+                            )
+                        confirmed_run = self.store.get_run(str(run["run_id"]))
+                        if confirmed_run:
+                            run = {**run, **confirmed_run}
+                        runtime_invoked = bool(run.get("runtime_invoked_at"))
+                    except RunStartupRejectedError as exc:
+                        preserve_start_fence = not exc.termination_confirmed
+                        if preserve_start_fence:
+                            self.store.mark_host_run_start_termination_unconfirmed(
+                                lease_id=str(lease.get("lease_id") or ""),
+                                run_id=str(run["run_id"]),
+                                executor_id=self._executor_id,
+                                startup_token=str(lease.get("startup_token") or ""),
+                            )
+                        raise
+                    finally:
+                        durable_run = self.store.get_run(str(run["run_id"]))
+                        if durable_run:
+                            run = {**run, **durable_run}
+                            runtime_invoked = bool(
+                                durable_run.get("runtime_invoked_at")
+                            )
+                        with self._pending_run_starts_lock:
+                            self._pending_run_starts.pop(
+                                str(run["run_id"]), None
+                            )
+                        lifecycle_guard.release()
+                        clear_run_grant = getattr(
+                            self.runtime, "clear_run_local_capability_grant", None
+                        )
+                        if callable(clear_run_grant):
+                            try:
+                                clear_run_grant(worker)
+                            except Exception:
+                                logger.exception(
+                                    "Failed to clear run-local capability grant for worker %s",
+                                    worker_id,
+                                )
+                        try:
+                            self._revoke_run_local_capability_grant(run_worker)
+                        except Exception:
+                            logger.exception(
+                                "Failed to revoke run-local capability grant for worker %s",
+                                worker_id,
+                            )
+                        if not preserve_start_fence:
+                            self._release_host_run_lease(
+                                str(run["run_id"]), reason="runtime_returned"
+                            )
+                except RunStartupRejectedError as exc:
+                    if not exc.termination_confirmed:
+                        return
+                    retry_error = RuntimeErrorBase(
+                        "GlassHive safely stopped a startup attempt that lost durable ownership."
+                    )
+                    self._requeue_retryable_run(
+                        self.store.get_worker(worker_id) or worker,
+                        self.store.get_run(str(run["run_id"])) or run,
+                        retry_error,
+                        failure_fields={
+                            "failure_class": "service_startup_fenced",
+                            "failure_retryable": 1,
+                            "failure_structured": 1,
+                            "failure_user_message": (
+                                "GlassHive safely recovered an interrupted worker startup and will retry."
+                            ),
+                            "failure_recommended_recovery": (
+                                "No action is required unless this work remains queued."
+                            ),
+                            "failure_diagnostic_summary": (
+                                "The provider startup was stopped before its durable identity was accepted."
+                            ),
+                        },
+                    )
+                    return
+                except WorkerPausedError as exc:
+                    if not self._processor_is_current(worker_id, generation):
+                        return
+                    paused_run = self.store.transition_run_if_state(
+                        str(run["run_id"]),
+                        "running",
+                        "paused",
+                        ended_at=None,
+                        error_text=str(exc),
+                    )
+                    durable = paused_run or self.store.get_run(str(run["run_id"])) or run
+                    durable_state = str(durable.get("state") or "")
+                    current_worker = self.store.get_worker(worker_id) or worker
+                    if (
+                        not paused_run
+                        and str(current_worker.get("compute_release_token") or "")
+                        and str(
+                            current_worker.get("compute_release_target_run_id") or ""
+                        )
+                        == str(run["run_id"])
+                    ):
+                        return
+                    if durable_state in TERMINAL_RUN_STATES:
+                        self.store.update_worker_state(worker_id, "ready", last_error="")
+                        return
+                    if durable_state == "queued":
+                        # A host resume may requeue the exact run before the
+                        # killed provider unwinds. Preserve that newer CAS; the
+                        # processor-finally path starts its replacement.
+                        self.store.update_worker_state(worker_id, "starting", last_error="")
+                        return
+                    self.store.update_worker_state(worker_id, "paused", last_error="")
+                    self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.paused", str(exc))
+                    self._emit_callback(worker, "run.paused", run={**run, "state": "paused", "error_text": str(exc)}, message=str(exc))
+                    self._wake_host_capacity_waiters(
+                        self.store.get_worker(worker_id) or worker
+                    )
+                    return
+                except WorkerInterruptedError as exc:
+                    if not self._processor_is_current(worker_id, generation):
+                        return
+                    recovered = self._collect_completed_run(worker, run)
+                    if recovered:
+                        self._apply_recovered_run(worker, run, recovered)
+                        continue
+                    current_worker = self.store.get_worker(worker_id) or worker
+                    stop_requested = current_worker.get("state") == "stopping"
+                    final_state = "cancelled" if stop_requested else "interrupted"
+                    finalized_run = self._finalize_run_if_state(
+                        run["run_id"],
+                        "running",
+                        state=final_state,
+                        error_text=str(exc),
+                        **terminal_generation,
+                    )
+                    if not finalized_run:
+                        self._record_late_processor_terminal_ignored(
+                            worker,
+                            run,
+                            "interruption",
+                        )
+                        continue
+                    self.store.finalize_schedule_for_run(
+                        run["run_id"],
+                        state="cancelled" if stop_requested else "failed",
+                        last_error=str(exc),
+                    )
+                    self.store.update_worker_state(worker_id, "ready", last_error="")
+                    if stop_requested:
+                        self.store.accept_cancel_actions_for_run(run["run_id"])
+                    event_type = f"run.{final_state}"
+                    self.store.add_event(
+                        worker["project_id"], worker_id, run["run_id"], event_type, str(exc)
+                    )
+                    self._emit_callback(
+                        worker,
+                        event_type,
+                        run={**run, **finalized_run},
+                        message=str(exc),
+                    )
+                    if final_state == "interrupted":
+                        try:
+                            self._settle_interrupted_steer_claim(
+                                worker_id, str(run["run_id"])
+                            )
+                        except Exception:
+                            # The interrupted source remains authoritative. Keep
+                            # the exact fence for scheduler recovery instead of
+                            # dispatching an unproven replacement.
+                            logger.exception(
+                                "Failed to settle exact interrupted Steer for worker %s",
+                                worker_id,
+                            )
+                    self._wake_host_capacity_waiters(
+                        self.store.get_worker(worker_id) or worker
+                    )
+                    continue
+                except WorkerTerminatedError as exc:
+                    if not self._processor_is_current(worker_id, generation):
+                        return
+                    recovered = self._collect_completed_run(worker, run)
+                    if recovered:
+                        self._apply_recovered_run(worker, run, recovered)
+                        continue
+                    finalized_run = self._finalize_run_if_state(
+                        run["run_id"],
+                        str(run.get("state") or "running"),
+                        state="cancelled",
+                        error_text=str(exc),
+                        **terminal_generation,
+                    )
+                    if not finalized_run:
+                        self._record_late_processor_terminal_ignored(
+                            worker, run, "termination"
+                        )
+                        return
+                    self.store.finalize_schedule_for_run(run["run_id"], state="cancelled", last_error=str(exc))
+                    self.store.update_worker_state(worker_id, "terminated", last_error=str(exc))
+                    self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.cancelled", str(exc))
+                    self._emit_callback(worker, "run.cancelled", run={**run, "state": "cancelled", "error_text": str(exc)}, message=str(exc))
+                    self._wake_host_capacity_waiters(
+                        self.store.get_worker(worker_id) or worker
+                    )
+                    return
+                except RuntimeErrorBase as exc:
+                    durable_liveness_run = self.store.get_run(str(run["run_id"]))
+                    if (
+                        durable_liveness_run
+                        and str(durable_liveness_run.get("state") or "")
+                        == "needs_input"
+                        and str(
+                            durable_liveness_run.get("failure_class") or ""
+                        )
+                        == "provider_progress_stalled"
+                    ):
+                        return
+                    if not self._processor_is_current(worker_id, generation):
+                        return
+                    current_worker = self.store.get_worker(worker_id) or worker
+                    worker_state = current_worker["state"]
+                    final_state = "failed"
+                    if worker_state == "paused":
+                        final_state = "interrupted"
+                    elif worker_state == "terminated":
+                        final_state = "cancelled"
+                    refreshed_worker = (
+                        self._refresh_runtime_info(
+                            worker_id,
+                            state=worker_state if worker_state in {"paused", "terminated"} else "ready",
+                            last_error=str(exc),
+                        )
+                        or self.store.get_worker(worker_id)
+                        or current_worker
+                    )
+                    failure_fields = (
+                        classify_runtime_error(
+                            exc,
+                            runtime_name=str(refreshed_worker.get("profile") or refreshed_worker.get("runtime") or "worker"),
+                        ).as_store_fields()
+                        if final_state == "failed"
+                        else {}
+                    )
+                    if final_state == "failed":
+                        self._record_provider_route_failure(
+                            refreshed_worker, run, failure_fields, exc
+                        )
+                    if (
+                        final_state == "failed"
+                        and str(failure_fields.get("failure_class") or "") != "glasshive_evidence_check_failed"
+                    ):
+                        recovered = self._collect_completed_run(refreshed_worker, run)
+                        if recovered:
+                            self._apply_recovered_run(refreshed_worker, run, recovered)
+                            continue
+                    if final_state == "failed" and self._switch_quota_exhausted_run_to_fallback(
+                        refreshed_worker,
+                        run,
+                        exc,
+                        failure_fields,
+                    ):
+                        return
+                    if (
+                        final_state == "failed"
+                        and bool(failure_fields.get("failure_retryable"))
+                        and str(failure_fields.get("failure_class") or "")
+                        in {"host_worker_busy", "host_capacity", "provider_rate_limited"}
+                        and (
+                            str(failure_fields.get("failure_class") or "")
+                            != "provider_rate_limited"
+                            or getattr(exc, "retry_after_s", None) is not None
+                        )
+                    ):
+                        self._requeue_retryable_run(refreshed_worker, run, exc, failure_fields=failure_fields)
+                        return
+                    finalized_run = self._finalize_run_if_state(
+                        run["run_id"],
+                        "running",
+                        final_state,
+                        error_text=str(exc),
+                        **terminal_generation,
+                        **failure_fields,
+                    )
+                    if not finalized_run:
+                        self._record_late_processor_terminal_ignored(
+                            current_worker,
+                            run,
+                            final_state,
+                        )
+                        if worker_state in {"paused", "terminated"}:
+                            return
+                        continue
+                    self.store.finalize_schedule_for_run(
+                        run["run_id"],
+                        state="cancelled" if final_state == "cancelled" else "failed",
+                        last_error=str(exc),
+                    )
+                    self.store.update_worker_state(worker_id, worker_state if worker_state in {"paused", "terminated"} else "ready", last_error=str(exc))
+                    self.store.add_event(worker["project_id"], worker_id, run["run_id"], f"run.{final_state}", str(exc))
+                    failed_run = {
+                        **run,
+                        **finalized_run,
+                        "state": final_state,
+                        "error_text": str(exc),
+                        **failure_fields,
+                    }
+                    callback_worker = self.store.get_worker(worker_id) or refreshed_worker
+                    deliverable = (
+                        self._completion_deliverable(callback_worker, failed_run, "", str(exc))
+                        if final_state == "failed"
+                        else None
+                    )
+                    failure_message = runtime_failure_callback_message(failure_fields, str(exc))
+                    self._emit_callback(
+                        callback_worker,
+                        f"run.{final_state}",
+                        run=failed_run,
+                        message=failure_message,
+                        deliverable=deliverable,
+                    )
+                    self._wake_host_capacity_waiters(callback_worker)
+                    if worker_state in {"paused", "terminated"}:
+                        return
+                    continue
+                except Exception as exc:
+                    if not self._processor_is_current(worker_id, generation):
+                        return
+                    failure_fields = classify_runtime_error(
+                        exc,
+                        runtime_name=str(worker.get("profile") or worker.get("runtime") or "worker"),
+                    ).as_store_fields()
+                    self._record_provider_route_failure(
+                        worker, run, failure_fields, exc
+                    )
+                    finalized_run = self._finalize_run_if_state(
+                        run["run_id"],
+                        "running",
+                        "failed",
+                        error_text=str(exc),
+                        **terminal_generation,
+                        **failure_fields,
+                    )
+                    if not finalized_run:
+                        self._record_late_processor_terminal_ignored(worker, run, "failed")
+                        continue
+                    self.store.finalize_schedule_for_run(run["run_id"], state="failed", last_error=str(exc))
+                    self.store.update_worker_state(worker_id, "ready", last_error=str(exc))
+                    self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.failed", str(exc))
+                    failed_run = {
+                        **run,
+                        **finalized_run,
+                        "state": "failed",
+                        "error_text": str(exc),
+                        **failure_fields,
+                    }
+                    failure_message = runtime_failure_callback_message(failure_fields, str(exc))
+                    self._emit_callback(worker, "run.failed", run=failed_run, message=failure_message)
+                    self._wake_host_capacity_waiters(
+                        self.store.get_worker(worker_id) or worker
+                    )
+                    continue
+
+                if not self._processor_is_current(worker_id, generation):
+                    return
+                completion_expected_state = self._settle_native_children(
+                    worker,
+                    run,
+                    output,
+                    terminal_generation=terminal_generation,
+                )
+                if completion_expected_state not in {"running", "settling"}:
+                    self._record_late_processor_terminal_ignored(
+                        worker,
+                        run,
+                        "completion",
+                    )
+                    continue
+                completed_run = self._finalize_run_if_state(
+                    run["run_id"],
+                    completion_expected_state,
+                    "completed",
+                    output_text=output,
+                    usage=self._run_usage(worker, run["run_id"]),
+                    **terminal_generation,
+                )
+                if not completed_run:
+                    self._record_late_processor_terminal_ignored(worker, run, "completion")
+                    continue
+                self._clear_provider_route_health(worker, completed_run)
+                self.store.finalize_schedule_for_run(run["run_id"], state="completed")
+                self.store.update_worker(worker_id, state="ready", last_error="", last_run_id=run["run_id"])
+                message = terminal_callback_message(output)
+                full_message = terminal_callback_full_message(output)
+                self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.completed", message[:TERMINAL_CALLBACK_MESSAGE_LIMIT] or "Run completed")
+                completed_run = {**run, **completed_run, "state": "completed", "output_text": output}
+                refreshed_worker = self._refresh_runtime_info(worker_id, state="ready", last_error="") or self.store.get_worker(worker_id) or worker
+                deliverable = self._completion_deliverable(refreshed_worker, completed_run, output)
+                self._promote_completed_deliverable(refreshed_worker, completed_run, deliverable)
+                self._emit_callback(
+                    refreshed_worker,
+                    "run.completed",
+                    run=completed_run,
+                    message=message or "Run completed",
+                    full_message=full_message if full_message != message else "",
+                    deliverable=deliverable,
+                )
+                self._wake_host_capacity_waiters(refreshed_worker)
+                current_run = None
+                runtime_invoked = False
+        except Exception as exc:
+            logger.exception(
+                "Unexpected GlassHive worker processor failure",
+                extra={
+                    "worker_id": worker_id,
+                    "run_id": str((current_run or {}).get("run_id") or ""),
+                },
+            )
+            if current_run and not preserve_start_fence:
+                try:
+                    durable_run = self.store.get_run(str(current_run["run_id"]))
+                    if durable_run and str(durable_run.get("state") or "") in {
+                        "claimed",
+                        "admitted",
+                        "running",
+                    }:
+                        recovered = (
+                            self._collect_completed_run(
+                                self.store.get_worker(worker_id) or {}, durable_run
+                            )
+                            if runtime_invoked
+                            else None
+                        )
+                        if recovered:
+                            self._apply_recovered_run(
+                                self.store.get_worker(worker_id) or {},
+                                durable_run,
+                                recovered,
+                            )
+                        elif not runtime_invoked:
+                            recovery_error = RuntimeErrorBase(
+                                "GlassHive recovered an internal processor interruption "
+                                "before provider execution started."
+                            )
+                            self._requeue_retryable_run(
+                                self.store.get_worker(worker_id) or {
+                                    "worker_id": worker_id,
+                                    "project_id": str(
+                                        durable_run.get("project_id") or ""
+                                    ),
+                                },
+                                durable_run,
+                                recovery_error,
+                                failure_fields={
+                                    "failure_class": "service_processor_unexpected",
+                                    "failure_retryable": 1,
+                                    "failure_structured": 1,
+                                    "failure_user_message": (
+                                        "GlassHive recovered an internal worker interruption and "
+                                        "will retry this work."
+                                    ),
+                                    "failure_recommended_recovery": (
+                                        "No action is required unless the work remains queued."
+                                    ),
+                                    "failure_diagnostic_summary": (
+                                        "The processor exited before invoking the provider runtime."
+                                    ),
+                                },
+                            )
+                        else:
+                            failure_message = (
+                                "GlassHive could not safely confirm the provider result after "
+                                "an internal processor interruption."
+                            )
+                            failed_run = self._finalize_run_if_state(
+                                str(durable_run["run_id"]),
+                                "running",
+                                "failed",
+                                error_text=failure_message,
+                                **terminal_generation,
+                                failure_class="service_processor_unexpected",
+                                failure_retryable=1,
+                                failure_structured=1,
+                                failure_user_message=failure_message,
+                                failure_recommended_recovery=(
+                                    "Retry the work after reviewing any partial workspace output."
+                                ),
+                                failure_diagnostic_summary=(
+                                    "The provider runtime returned, but processor finalization "
+                                    "did not complete."
+                                ),
+                            )
+                            if failed_run:
+                                self.store.finalize_schedule_for_run(
+                                    str(durable_run["run_id"]),
+                                    state="failed",
+                                    last_error=failure_message,
+                                )
+                                failed_worker = (
+                                    self.store.update_worker_state(
+                                        worker_id,
+                                        "ready",
+                                        last_error=failure_message,
+                                    )
+                                    or self.store.get_worker(worker_id)
+                                    or {}
+                                )
+                                self.store.add_event(
+                                    str(failed_worker.get("project_id") or ""),
+                                    worker_id,
+                                    str(durable_run["run_id"]),
+                                    "run.failed",
+                                    failure_message,
+                                )
+                                self._emit_callback(
+                                    failed_worker,
+                                    "run.failed",
+                                    run={**durable_run, **failed_run},
+                                    message=failure_message,
+                                )
+                except Exception:
+                    logger.exception(
+                        "Failed to durably recover unexpected worker processor failure",
+                        extra={"worker_id": worker_id},
+                    )
+        finally:
+            if current_run and not preserve_start_fence:
+                try:
+                    self._release_host_run_lease(
+                        str(current_run["run_id"]), reason="processor_exit"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to release run lease after worker processor exit",
+                        extra={
+                            "worker_id": worker_id,
+                            "run_id": str(current_run.get("run_id") or ""),
+                        },
+                    )
+            try:
+                if self._release_processor(worker_id, generation):
+                    pending = self.store.get_worker(worker_id)
+                    if (
+                        pending
+                        and pending["state"]
+                        not in {"paused", "needs_input", "stopping", "terminated"}
+                        and not str(pending.get("compute_release_token") or "").strip()
+                        and not self.store.has_unconfirmed_host_run_start(worker_id)
+                    ):
+                        if self.store.peek_next_queued_run(worker_id):
+                            self._ensure_worker_processor(worker_id)
+            except Exception:
+                logger.exception(
+                    "Failed to finalize GlassHive worker processor ownership",
+                    extra={"worker_id": worker_id},
+                )
+
     def _process_worker_queue(self, worker_id: str, generation: int) -> None:
+        return self._process_worker_queue_parallel(worker_id, generation)
+
+    def _process_worker_queue_legacy(self, worker_id: str, generation: int) -> None:
+        worker = self.store.get_worker(worker_id)
+        bundle = self._bootstrap_bundle_for(worker) if worker is not None else None
+        delegation = (
+            self.store.get_delegation_for_worker(
+                worker_id,
+                tenant_id=str(worker.get("tenant_id") or "local"),
+                owner_id=str(worker.get("owner_id") or ""),
+            )
+            if worker is not None
+            else None
+        )
+        if delegation is not None or (
+            isinstance(bundle, dict)
+            and str(bundle.get("execution_policy") or "").strip()
+            == PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+        ):
+            return self._process_worker_queue_parallel(worker_id, generation)
         try:
             while True:
                 if self._shutdown_event.is_set():
@@ -5836,7 +9624,7 @@ class WorkersProjectsService:
                         self._requeue_retryable_run(worker, queued_run, capacity_error)
                         return
 
-                run = self.store.claim_next_queued_run(
+                run = self.store._claim_next_queued_run_legacy(
                     worker_id,
                     require_schedule_principal_authority=multi_user_security_enabled(),
                 )
@@ -6128,3 +9916,8005 @@ class WorkersProjectsService:
                 if pending and pending["state"] not in {"paused", "terminating", "termination_failed", "terminated"}:
                     if self.store.peek_next_queued_run(worker_id):
                         self._ensure_worker_processor(worker_id)
+
+
+    def _consume_local_qa(
+        self,
+        boundary: str,
+        worker: dict,
+        run: dict | None = None,
+        *,
+        artifact_id: str = "",
+    ) -> LocalQAFaultDirective | None:
+        plane = self._local_qa_control_plane
+        if plane is None:
+            return None
+        owner_id = str(worker.get("owner_id") or "").strip()
+        tenant_id = str(worker.get("tenant_id") or "local").strip() or "local"
+        worker_id = str(worker.get("worker_id") or "").strip()
+        if not owner_id or not worker_id:
+            return None
+        delegation = self.store.get_delegation_for_worker(
+            worker_id,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+        if not delegation:
+            return None
+        run_id = (
+            str((run or {}).get("run_id") or "").strip()
+            if boundary in LOCAL_QA_RUN_SCOPED_FAULTS
+            else ""
+        )
+        return plane.consume(
+            boundary,
+            owner_id=owner_id,
+            work_id=str(delegation.get("work_ref") or ""),
+            run_id=run_id,
+            artifact_id=artifact_id,
+        )
+
+    def _record_local_qa_effect(
+        self,
+        directive: LocalQAFaultDirective | None,
+        outcome: str,
+    ) -> None:
+        if directive is not None and self._local_qa_control_plane is not None:
+            self._local_qa_control_plane.record_effect(directive, outcome=outcome)
+
+    def local_qa_artifact_fault(
+        self,
+        worker: dict,
+        artifact_path: Path,
+        *,
+        boundary: str = "artifact_unavailable_restart_recovery",
+    ) -> str:
+        """Consume one exact traced artifact fault immediately before serving bytes."""
+
+        if boundary not in {
+            "artifact_link_expired",
+            "artifact_unavailable_restart_recovery",
+        }:
+            return ""
+        try:
+            digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        except OSError:
+            return ""
+        run_id = ""
+        delegation = self.store.get_delegation_for_worker(
+            str(worker.get("worker_id") or ""),
+            tenant_id=str(worker.get("tenant_id") or "local"),
+            owner_id=str(worker.get("owner_id") or ""),
+        )
+        if delegation:
+            run_id = str(delegation.get("current_run_id") or "")
+        run = self.store.get_run(run_id) if run_id else None
+        directive = self._consume_local_qa(
+            boundary,
+            worker,
+            run,
+            artifact_id="artifact_sha256:" + digest,
+        )
+        if directive is None:
+            return ""
+        self._record_local_qa_effect(
+            directive,
+            "signed_link_rejected_before_artifact_serve"
+            if boundary == "artifact_link_expired"
+            else "artifact_temporarily_unavailable_before_serve",
+        )
+        return boundary
+
+    @property
+    def executor_id(self) -> str:
+        """Stable owner for short-lived durable action execution leases."""
+
+        return self._executor_id
+
+    def _host_capacity_policy(self) -> dict[str, int]:
+        """Return the immutable policy shared by dispatch and lease admission."""
+
+        return dict(self._configured_host_capacity)
+
+    def _viventium_callback_context_ready(
+        self,
+        worker: dict,
+        callbacks: dict[str, object],
+    ) -> bool:
+        """Accept either legacy parent identity or Core's opaque durable origin binding."""
+
+        if not _missing_parent_callback_fields(callbacks):
+            return True
+        origin_ref = str(callbacks.get("origin_ref") or "").strip()
+        if not origin_ref:
+            return False
+        delegation = self.store.get_delegation_for_worker(
+            str(worker.get("worker_id") or ""),
+            tenant_id=str(worker.get("tenant_id") or "local"),
+            owner_id=str(worker.get("owner_id") or ""),
+        )
+        return bool(
+            delegation
+            and str(delegation.get("origin_ref") or "").strip() == origin_ref
+            and str(delegation.get("work_ref") or "").strip()
+        )
+
+    def _callback_attempt_number(self, run: dict | None) -> int:
+        if not run or not str(run.get("run_id") or "").strip():
+            return 0
+        attempt_id = str(run.get("active_attempt_id") or "").strip()
+        if attempt_id:
+            attempt = self.store.get_run_attempt(attempt_id)
+            if attempt is not None:
+                number = int(attempt.get("attempt_number") or 0)
+                if number > 0:
+                    return number
+        attempts = self.store.list_run_attempts(str(run.get("run_id") or ""))
+        if attempts:
+            number = int(attempts[-1].get("attempt_number") or 0)
+            if number > 0:
+                return number
+        return 0
+
+    @staticmethod
+    def _terminal_callback_response_decision(
+        response: httpx.Response | object,
+        payload: dict[str, Any],
+    ) -> tuple[str, int]:
+        """Validate the receiver's exact monotonic CAS acknowledgement."""
+
+        revision = payload.get("result_revision")
+        if (
+            not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision < 1
+        ):
+            return "accepted", 0
+        try:
+            body = response.json()
+        except Exception:
+            return "invalid", 0
+        if not isinstance(body, dict):
+            return "invalid", 0
+        status = str(body.get("callback_status") or "")
+        exact_incoming = bool(
+            str(body.get("callback_id") or "")
+            == str(payload.get("callback_id") or "")
+            and str(body.get("run_id") or "")
+            == str(payload.get("run_id") or "")
+            and body.get("result_revision") == revision
+            and str(body.get("result_digest") or "")
+            == str(payload.get("result_digest") or "")
+        )
+        current_revision = body.get("current_result_revision")
+        if (
+            not exact_incoming
+            or not isinstance(current_revision, int)
+            or isinstance(current_revision, bool)
+        ):
+            return "invalid", 0
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if status in {"accepted", "idempotent"}:
+            exact_current = bool(
+                200 <= status_code < 300
+                and current_revision == revision
+                and str(body.get("current_callback_id") or "")
+                == str(payload.get("callback_id") or "")
+                and str(body.get("current_result_digest") or "")
+                == str(payload.get("result_digest") or "")
+            )
+            return ("accepted", revision) if exact_current else ("invalid", 0)
+        if status == "superseded":
+            newer_current = bool(
+                status_code == 409
+                and current_revision > revision
+                and re.fullmatch(
+                    r"cb_terminal_[0-9a-f]{64}",
+                    str(body.get("current_callback_id") or ""),
+                )
+                and re.fullmatch(
+                    r"sha256:[0-9a-f]{64}",
+                    str(body.get("current_result_digest") or ""),
+                )
+            )
+            return (
+                ("superseded", current_revision)
+                if newer_current
+                else ("invalid", 0)
+            )
+        if status == "conflict":
+            current_callback_id = str(body.get("current_callback_id") or "")
+            current_result_digest = str(body.get("current_result_digest") or "")
+            exact_conflict = bool(
+                status_code == 409
+                and current_revision == revision
+                and re.fullmatch(
+                    r"cb_terminal_[0-9a-f]{64}", current_callback_id
+                )
+                and re.fullmatch(
+                    r"sha256:[0-9a-f]{64}", current_result_digest
+                )
+                and (
+                    current_callback_id != str(payload.get("callback_id") or "")
+                    or current_result_digest
+                    != str(payload.get("result_digest") or "")
+                )
+            )
+            return ("conflict", revision) if exact_conflict else ("invalid", 0)
+        return "invalid", 0
+
+    def _reconcile_terminal_callback_intents(
+        self,
+        *,
+        created_before: str | None = None,
+        limit: int = 50,
+    ) -> int:
+        """Create missing terminal outbox rows from exact durable generations."""
+
+        batch_limit = max(1, min(int(limit), 1000))
+        scan_budget = min(batch_limit * 8, 1000)
+        scanned = 0
+        inserted = 0
+        while scanned < scan_budget and inserted < batch_limit:
+            remaining = min(batch_limit, scan_budget - scanned)
+            runs = self.store.list_terminal_runs_missing_callback_intent(
+                created_before=created_before,
+                limit=remaining,
+            )
+            if not runs:
+                break
+            scanned += len(runs)
+            removed_legacy_sink = False
+            for run in runs:
+                worker = self.store.get_worker(str(run.get("worker_id") or ""))
+                if not worker:
+                    continue
+                callbacks = self._callback_config_for(worker)
+                callback_url = str(
+                    callbacks.get("events_webhook_url")
+                    or callbacks.get("url")
+                    or ""
+                ).strip()
+                state = str(run.get("state") or "")
+                attempt_number = self._callback_attempt_number(run)
+                unavailable_reason = ""
+                if not callback_url:
+                    unavailable_reason = "callback_config_missing"
+                elif _is_viventium_callback_url(
+                    callback_url
+                ) and not self._viventium_callback_context_ready(worker, callbacks):
+                    unavailable_reason = "callback_context_incomplete"
+                elif attempt_number < 1:
+                    existing_callbacks = self.store.list_callback_outbox_for_run(
+                        str(run.get("run_id") or ""),
+                        tenant_id=str(worker.get("tenant_id") or "local"),
+                        owner_id=str(worker.get("owner_id") or ""),
+                    )
+                    if any(
+                        str(record.get("event_type") or "") == f"run.{state}"
+                        and int(record.get("attempt_number") or 0) == 0
+                        for record in existing_callbacks
+                    ):
+                        unavailable_reason = "callback_context_incomplete"
+                        removed_legacy_sink = True
+                if unavailable_reason:
+                    self.store.mark_terminal_callback_reconciliation_unavailable(
+                        str(run.get("run_id") or ""),
+                        expected_state=state,
+                        expected_ended_at=str(run.get("ended_at") or ""),
+                        expected_attempt_number=attempt_number,
+                        expected_callback_contract_digest=Store.callback_contract_digest(
+                            worker
+                        ),
+                        reason_code=unavailable_reason,
+                    )
+                    continue
+                output_text = str(run.get("output_text") or "")
+                error_text = str(run.get("error_text") or "")
+                if state == "completed":
+                    message = terminal_callback_message(output_text) or "Run completed"
+                    full_message = terminal_callback_full_message(output_text)
+                    if full_message == message:
+                        full_message = ""
+                elif state == "failed":
+                    failure_fields = {
+                        key: run.get(key)
+                        for key in (
+                            "failure_class",
+                            "failure_retryable",
+                            "failure_structured",
+                            "failure_user_message",
+                            "failure_recommended_recovery",
+                            "failure_diagnostic_summary",
+                        )
+                    }
+                    message = runtime_failure_callback_message(
+                        failure_fields, error_text or "Run failed"
+                    )
+                    full_message = ""
+                else:
+                    message = error_text or f"Run {state}"
+                    full_message = ""
+                deliverable = (
+                    self._completion_deliverable(
+                        worker, run, output_text, error_text
+                    )
+                    if state in {"completed", "failed"}
+                    else None
+                )
+                record = self._emit_callback(
+                    worker,
+                    f"run.{state}",
+                    run=run,
+                    message=message,
+                    full_message=full_message,
+                    deliverable=deliverable,
+                    submit_delivery=False,
+                )
+                if record is None:
+                    self.store.mark_terminal_callback_reconciliation_unavailable(
+                        str(run.get("run_id") or ""),
+                        expected_state=state,
+                        expected_ended_at=str(run.get("ended_at") or ""),
+                        expected_attempt_number=attempt_number,
+                        expected_callback_contract_digest=Store.callback_contract_digest(
+                            worker
+                        ),
+                        reason_code="callback_context_incomplete",
+                    )
+                    continue
+                if bool(record.get("_inserted")):
+                    inserted += 1
+            if len(runs) < remaining or not removed_legacy_sink:
+                break
+        return inserted
+
+    def _replay_startup_recovery(self) -> None:
+        if self._shutdown_event.is_set():
+            return
+        try:
+            self.reap_needs_input_workers_once()
+        except Exception:
+            logger.error(
+                "GlassHive startup needs-input compute recovery faulted safely",
+                extra={"error_code": "transient_dependency"},
+            )
+        if self._shutdown_event.is_set():
+            return
+        try:
+            self._replay_pending_capability_grant_revocations(
+                created_before=self._startup_recovery_cutoff
+            )
+        except Exception:
+            logger.error(
+                "GlassHive startup capability revocation recovery faulted safely",
+                extra={"error_code": "transient_dependency"},
+            )
+        if self._shutdown_event.is_set():
+            return
+        try:
+            self._replay_pending_lifecycle_effects(
+                created_before=self._startup_recovery_cutoff
+            )
+        except Exception:
+            logger.error(
+                "GlassHive startup lifecycle recovery faulted safely",
+                extra={"error_code": "transient_dependency"},
+            )
+        if self._shutdown_event.is_set():
+            return
+        try:
+            self._reconcile_terminal_callback_intents(
+                created_before=self._startup_recovery_cutoff
+            )
+        except Exception:
+            logger.error(
+                "GlassHive startup terminal callback reconciliation faulted safely",
+                extra={"error_code": "transient_dependency"},
+            )
+        if self._shutdown_event.is_set():
+            return
+        self._replay_pending_callbacks(
+            created_before=self._startup_recovery_cutoff
+        )
+
+    def _callback_retry_tick(self) -> None:
+        """Reconcile and replay one bounded callback recovery pass."""
+
+        operations = (
+            (
+                self._reconcile_terminal_callback_intents,
+                "GlassHive terminal callback reconciliation faulted safely",
+            ),
+            (
+                self._replay_pending_capability_grant_revocations,
+                "GlassHive capability revocation replay faulted safely",
+            ),
+            (
+                self._replay_pending_lifecycle_effects,
+                "GlassHive lifecycle replay faulted safely",
+            ),
+            (
+                self._replay_pending_callbacks,
+                "GlassHive callback replay faulted safely",
+            ),
+        )
+        for operation, message in operations:
+            try:
+                operation()
+            except Exception:
+                logger.error(
+                    message,
+                    extra={"error_code": "transient_dependency"},
+                )
+
+    @staticmethod
+    def _capability_revocation_retry_delay_s(record: dict) -> float:
+        attempts = max(1, int(record.get("attempts") or 1))
+        return float(min(300, 2 ** min(attempts, 8)))
+
+    def _retry_capability_grant_revocation(
+        self, record: dict, error_code: str
+    ) -> None:
+        safe_code = str(error_code or "").strip().lower()
+        if safe_code not in {
+            "broker_revocation_rejected",
+            "broker_revocation_unavailable",
+            "transient_dependency",
+        }:
+            safe_code = "unknown"
+        try:
+            self.store.retry_capability_grant_revocation(
+                str(record.get("revocation_id") or ""),
+                self._executor_id,
+                lease_epoch=int(record.get("lease_epoch") or 0),
+                error_code=safe_code,
+                retry_delay_s=self._capability_revocation_retry_delay_s(record),
+            )
+        except Exception:
+            logger.error(
+                "GlassHive capability revocation retry persistence unavailable",
+                extra={"error_code": "transient_dependency"},
+            )
+
+    def _apply_capability_grant_revocation(self, record: dict) -> None:
+        body = {
+            "authorizationRef": str(record.get("authorization_ref") or ""),
+            "originRef": str(record.get("origin_ref") or ""),
+            "workRef": str(record.get("work_ref") or ""),
+            "workerId": str(record.get("worker_id") or ""),
+            "runId": str(record.get("run_id") or ""),
+            "grantId": str(record.get("grant_id") or ""),
+            "containerGenerationId": str(
+                record.get("container_generation_id") or ""
+            ),
+        }
+        load_viventium_runtime_env(
+            {
+                "VIVENTIUM_GLASSHIVE_ADMISSION_URL",
+                "VIVENTIUM_GLASSHIVE_ADMISSION_SECRET",
+            }
+        )
+        try:
+            revoke_capability_grant(
+                str(os.environ.get("VIVENTIUM_GLASSHIVE_ADMISSION_URL") or ""),
+                secret=str(
+                    os.environ.get("VIVENTIUM_GLASSHIVE_ADMISSION_SECRET") or ""
+                ),
+                body=body,
+                timeout_seconds=_bounded_float_env(
+                    "VIVENTIUM_GLASSHIVE_ADMISSION_TIMEOUT_S",
+                    5.0,
+                    min_value=0.1,
+                    max_value=30.0,
+                ),
+            )
+        except BrokerAdmissionError as exc:
+            self._retry_capability_grant_revocation(record, exc.code)
+            return
+        except Exception:
+            self._retry_capability_grant_revocation(record, "unknown")
+            return
+        self.store.mark_capability_grant_revocation_applied(
+            str(record.get("revocation_id") or ""),
+            self._executor_id,
+            lease_epoch=int(record.get("lease_epoch") or 0),
+        )
+
+    def _replay_pending_capability_grant_revocations(
+        self,
+        *,
+        created_before: str | None = None,
+        revocation_id: str | None = None,
+    ) -> None:
+        if self._shutdown_event.is_set():
+            return
+        self.store.activate_due_capability_grant_revocations()
+        for _ in range(100):
+            if self._shutdown_event.is_set():
+                return
+            record = self.store.claim_next_capability_grant_revocation(
+                self._executor_id,
+                ttl_s=60,
+                created_before=created_before,
+                revocation_id=revocation_id,
+            )
+            if not record:
+                return
+            self._apply_capability_grant_revocation(record)
+            if revocation_id:
+                return
+
+    def _replay_pending_lifecycle_effects(
+        self, *, created_before: str | None = None
+    ) -> None:
+        """Drain every durable sink kind independently with leased ownership."""
+
+        effect_kinds = (
+            # Revocation must commit before a terminal callback is visible.
+            "signed_links.revoke_worker",
+            "callback.worker_terminated",
+            "callback.work_stopped",
+            "callback.run_cancelled",
+            "callback.run_paused",
+            "callback.run_resumed",
+            "callback.run_resumed_in_place",
+            "callback.run_resumed_queued",
+            "callback.run_interrupted",
+            "callback.run_steered",
+            "callback.run_needs_input",
+            "callback.worker_paused",
+            "callback.worker_resumed",
+        )
+        # Visit one row per kind per round. A retry-wait row cannot block a
+        # different effect kind, worker, or sink.
+        faulted_kinds: set[str] = set()
+        for _round in range(100):
+            if self._shutdown_event.is_set():
+                return
+            claimed_any = False
+            for effect_kind in effect_kinds:
+                if self._shutdown_event.is_set():
+                    return
+                if effect_kind in faulted_kinds:
+                    continue
+                try:
+                    effect = self.store.claim_next_lifecycle_effect(
+                        self._executor_id,
+                        ttl_s=60,
+                        effect_kinds=(effect_kind,),
+                        created_before=created_before,
+                    )
+                except Exception:
+                    faulted_kinds.add(effect_kind)
+                    logger.error(
+                        "GlassHive lifecycle effect claim will retry",
+                        extra={
+                            "effect_kind": effect_kind,
+                            "error_code": "transient_dependency",
+                        },
+                    )
+                    continue
+                if not effect:
+                    continue
+                claimed_any = True
+                try:
+                    self._apply_lifecycle_effect(effect)
+                except Exception:
+                    # A single malformed dependency or sink must not kill the
+                    # recurring recovery thread or globally HOL-block kinds.
+                    self._retry_lifecycle_effect(effect, "unknown")
+                    faulted_kinds.add(effect_kind)
+                    logger.error(
+                        "GlassHive lifecycle effect application faulted safely",
+                        extra={
+                            "effect_kind": effect_kind,
+                            "worker_id": str(effect.get("worker_id") or ""),
+                            "error_code": "unknown",
+                        },
+                    )
+            if not claimed_any:
+                return
+
+    @staticmethod
+    def _lifecycle_effect_retry_delay_s(effect: dict) -> float:
+        attempts = max(1, int(effect.get("attempts") or 1))
+        return float(min(300, 2 ** min(attempts, 8)))
+
+    def _retry_lifecycle_effect(self, effect: dict, error_code: str) -> bool:
+        try:
+            retried = self.store.retry_lifecycle_effect(
+                str(effect.get("effect_id") or ""),
+                self._executor_id,
+                lease_epoch=int(effect.get("lease_epoch") or 0),
+                error_code=error_code,
+                retry_delay_s=self._lifecycle_effect_retry_delay_s(effect),
+            )
+        except Exception:
+            logger.error(
+                "GlassHive lifecycle effect retry persistence unavailable",
+                extra={
+                    "effect_kind": str(effect.get("effect_kind") or ""),
+                    "worker_id": str(effect.get("worker_id") or ""),
+                    "error_code": "transient_dependency",
+                },
+            )
+            return False
+        if not retried:
+            return False
+        logger.warning(
+            "GlassHive lifecycle effect will retry",
+            extra={
+                "effect_kind": str(effect.get("effect_kind") or ""),
+                "worker_id": str(effect.get("worker_id") or ""),
+                "error_code": error_code,
+            },
+        )
+        return True
+
+    def _apply_lifecycle_effect(self, effect: dict) -> None:
+        effect_id = str(effect.get("effect_id") or "")
+        lease_epoch = int(effect.get("lease_epoch") or 0)
+        effect_kind = str(effect.get("effect_kind") or "")
+        worker = self.store.get_worker(str(effect.get("worker_id") or ""))
+        if not worker:
+            self._retry_lifecycle_effect(effect, "transient_dependency")
+            return
+
+        if effect_kind == "signed_links.revoke_worker":
+            try:
+                revoke_signed_link_refs_for_worker(str(worker["worker_id"]))
+            except Exception:
+                self._retry_lifecycle_effect(effect, "signed_link_revoke_failed")
+                return
+            self.store.mark_lifecycle_effect_applied(
+                effect_id,
+                self._executor_id,
+                lease_epoch=lease_epoch,
+            )
+            return
+
+        if (
+            effect_kind == "callback.worker_terminated"
+            and (
+                not is_worker_signed_link_revoked(
+                    str(worker.get("worker_id") or "")
+                )
+                or not self.store.paired_lifecycle_effect_is_applied(
+                    effect,
+                    required_effect_kind="signed_links.revoke_worker",
+                )
+            )
+        ):
+            self._retry_lifecycle_effect(effect, "transient_dependency")
+            return
+
+        run_id = str(effect.get("run_id") or "")
+        run = self.store.get_run(run_id) if run_id else None
+        run_required = effect_kind not in {
+            "callback.worker_paused",
+            "callback.worker_resumed",
+            "callback.worker_terminated",
+        }
+        if run_required and not run:
+            self._retry_lifecycle_effect(effect, "transient_dependency")
+            return
+        event_type, message = {
+            "callback.run_cancelled": ("run.cancelled", "Run cancelled"),
+            "callback.run_paused": ("run.paused", "Worker paused"),
+            "callback.run_resumed": (
+                "run.started"
+                if str((run or {}).get("state") or "") == "running"
+                else "run.queued",
+                "Paused run resumed",
+            ),
+            "callback.run_resumed_in_place": (
+                "run.started",
+                "Paused run resumed",
+            ),
+            "callback.run_resumed_queued": (
+                "run.queued",
+                "Paused run queued for execution restart",
+            ),
+            "callback.run_interrupted": (
+                "run.interrupted",
+                "Run interruption accepted",
+            ),
+            "callback.run_steered": (
+                "run.queued",
+                "Replacement steer instruction queued",
+            ),
+            "callback.run_needs_input": (
+                "run.needs_input",
+                "Mission needs attention because provider progress stopped",
+            ),
+            "callback.work_stopped": ("run.cancelled", "Work stop confirmed"),
+            "callback.worker_paused": ("worker.paused", "Worker paused"),
+            "callback.worker_resumed": ("worker.resumed", "Worker resumed"),
+            "callback.worker_terminated": (
+                "worker.terminated",
+                "Worker terminated",
+            ),
+        }[effect_kind]
+        callback_id = "cb_effect_" + effect_id
+        existing_record = self.store.get_callback_outbox(callback_id)
+        if existing_record is not None:
+            expected_run_id = str((run or {}).get("run_id") or "")
+            if (
+                str(existing_record.get("worker_id") or "")
+                != str(worker.get("worker_id") or "")
+                or str(existing_record.get("event_type") or "") != event_type
+                or str(existing_record.get("run_id") or "") != expected_run_id
+            ):
+                self._retry_lifecycle_effect(effect, "callback_enqueue_failed")
+                return
+            # A deterministic callback row is the durable sink. Its own retry
+            # loop owns delivery even if callback configuration later vanishes.
+            self.store.mark_lifecycle_effect_applied(
+                effect_id,
+                self._executor_id,
+                lease_epoch=lease_epoch,
+            )
+            return
+
+        # A worker without a declared callback contract has no callback sink to recover. Retrying
+        # that permanent no-op can never succeed and previously created an unbounded journal/log
+        # storm for ordinary conversation workers. A declared but incomplete callback contract
+        # still retries below because its endpoint or origin binding can be repaired later.
+        callback_contract = (self._bootstrap_bundle_for(worker) or {}).get("callbacks")
+        if not isinstance(callback_contract, dict) or not callback_contract:
+            self.store.mark_lifecycle_effect_applied(
+                effect_id,
+                self._executor_id,
+                lease_epoch=lease_epoch,
+            )
+            return
+
+        callbacks = self._callback_config_for(worker)
+        callback_url = str(
+            callbacks.get("events_webhook_url") or callbacks.get("url") or ""
+        ).strip()
+        if not callback_url or (
+            _is_viventium_callback_url(callback_url)
+            and not self._viventium_callback_context_ready(worker, callbacks)
+        ):
+            self._retry_lifecycle_effect(effect, "callback_config_missing")
+            return
+        try:
+            record = self._emit_callback(
+                worker,
+                event_type,
+                run=run,
+                message=message,
+                callback_id=callback_id,
+                insert_once=True,
+                submit_delivery=False,
+            )
+        except Exception:
+            self._retry_lifecycle_effect(effect, "callback_enqueue_failed")
+            return
+        if record is None:
+            self._retry_lifecycle_effect(effect, "callback_enqueue_failed")
+            return
+        # HTTP delivery is owned by callback_outbox. This sink completes once
+        # its immutable outbox row durably exists.
+        applied = self.store.mark_lifecycle_effect_applied(
+            effect_id,
+            self._executor_id,
+            lease_epoch=lease_epoch,
+        )
+        if applied and record and not self._shutdown_event.is_set():
+            delivery_record = {
+                key: value for key, value in record.items() if key != "_inserted"
+            }
+            self.executor.submit(
+                self._deliver_callback_record,
+                dict(worker),
+                delivery_record,
+                callbacks,
+            )
+
+    @staticmethod
+    def _trusted_run_lane(worker: dict | None) -> str:
+        return (
+            "conversation"
+            if isinstance(worker, dict)
+            and str(worker.get("trusted_run_lane") or "").strip().lower()
+            == "conversation"
+            else "mission"
+        )
+
+    def orchestration_capabilities(self) -> dict[str, object]:
+        storage_pressure = self._storage_pressure_v1()
+        policy_enabled = isolated_parallel_policy_enabled()
+        active_worker_ids = self.store.active_host_mission_worker_ids()
+        process_status_reader = getattr(
+            self.runtime, "host_active_process_status", None
+        )
+        process_state_uncertain = False
+        for worker in self.store.list_host_mission_workers():
+            worker_id = str(worker.get("worker_id") or "")
+            if not callable(process_status_reader):
+                process_state_uncertain = True
+                continue
+            try:
+                status = process_status_reader(worker)
+            except Exception:
+                logger.exception(
+                    "Failed to prove host mission process absence for worker %s",
+                    worker_id,
+                )
+                process_state_uncertain = True
+                continue
+            state = str((status or {}).get("state") or "uncertain")
+            if state == "active":
+                active_worker_ids.add(worker_id)
+            elif state != "absent":
+                process_state_uncertain = True
+        isolated_runtime_ready = False
+        isolated_runtime_reason = "isolated_runtime_readiness_unavailable"
+        isolated_readiness_probe = getattr(
+            self.runtime, "isolated_parallel_readiness", None
+        )
+        if callable(isolated_readiness_probe):
+            try:
+                try:
+                    readiness = isolated_readiness_probe(cached_only=True)
+                except TypeError:
+                    readiness = isolated_readiness_probe()
+                isolated_runtime_ready = bool((readiness or {}).get("ready"))
+                raw_reason = str((readiness or {}).get("reason") or "").strip()
+                if raw_reason and re.fullmatch(r"[a-z0-9_.-]{1,120}", raw_reason):
+                    isolated_runtime_reason = raw_reason
+            except Exception:
+                logger.exception("Failed to probe isolated Parallel runtime readiness")
+        active_host_missions = len(active_worker_ids)
+        prompt_layers = worker_prompt_layer_integrity_snapshot(
+            include_producer_scope=True
+        )
+        prompt_layers_ready = valid_worker_prompt_layer_capability(prompt_layers)
+        isolated_parallel_ready = bool(
+            policy_enabled
+            and active_host_missions == 0
+            and not process_state_uncertain
+            and isolated_runtime_ready
+            and bool(storage_pressure.get("healthy"))
+            and prompt_layers_ready
+        )
+        if isolated_parallel_ready:
+            isolated_parallel_reason = ""
+        elif not policy_enabled:
+            isolated_parallel_reason = "isolated_parallel_policy_disabled"
+        elif active_host_missions > 0:
+            isolated_parallel_reason = "host_missions_active"
+        elif process_state_uncertain:
+            isolated_parallel_reason = "host_mission_state_uncertain"
+        elif storage_pressure.get("errorCode"):
+            isolated_parallel_reason = "storage_pressure_unavailable"
+        elif not bool(storage_pressure.get("healthy")):
+            isolated_parallel_reason = "storage_pressure_critical"
+        elif not prompt_layers_ready:
+            isolated_parallel_reason = (
+                "prompt_layers_unknown"
+                if prompt_layers.get("unknownLayerNames")
+                else "prompt_layer_capability_invalid"
+            )
+        else:
+            isolated_parallel_reason = isolated_runtime_reason
+        return {
+            "policyVersion": 1,
+            "readinessScope": {
+                "contractVersion": 1,
+                "scope": "deployment",
+                "ownerCredentialRole": "transport_auth",
+            },
+            "isolatedParallelReady": isolated_parallel_ready,
+            "isolatedParallelReason": isolated_parallel_reason,
+            "hostMissionsAllowed": not policy_enabled,
+            "hostMissionsActive": active_host_missions,
+            "storagePressure": storage_pressure,
+            "promptLayers": prompt_layers,
+            "workTraceContract": self.work_trace_contract_capability(),
+        }
+
+    @staticmethod
+    def work_trace_contract_capability() -> dict[str, object]:
+        return {
+            "contractVersion": 1,
+            "schemaDigest": WORK_TRACE_SCHEMA_DIGEST,
+            "producerSourceIdentity": WORK_TRACE_PRODUCER_SOURCE_IDENTITY,
+            "emittedKeySetDigest": WORK_TRACE_EMITTED_KEY_SET_DIGEST,
+        }
+
+    def worker_prompt_layer_trace(self) -> dict[str, object]:
+        """Return the exact worker prompt-layer fact consumed by Core traceability."""
+
+        snapshot = worker_prompt_layer_integrity_snapshot(
+            include_producer_scope=True
+        )
+        return {
+            "contractVersion": snapshot["contractVersion"],
+            "producerScope": snapshot["producerScope"],
+            "layerNames": sorted(
+                worker_prompt_layer_producer_names()
+            ),
+            "unknownLayerNames": snapshot["unknownLayerNames"],
+        }
+
+    def _storage_pressure_v1(self) -> dict[str, object]:
+        threshold = _bounded_float_env(
+            "GLASSHIVE_STORAGE_PRESSURE_CRITICAL_PERCENT",
+            90.0,
+            min_value=50.0,
+            max_value=99.9,
+        )
+        warning_margin = _bounded_float_env(
+            "GLASSHIVE_STORAGE_PRESSURE_WARNING_MARGIN_PERCENT",
+            10.0,
+            min_value=1.0,
+            max_value=25.0,
+        )
+        try:
+            usage = shutil.disk_usage(self.store.db_path.parent)
+            total = int(usage.total)
+            used = int(usage.used)
+            available = int(usage.free)
+            if total <= 0 or used < 0 or available < 0 or used > total:
+                raise ValueError("invalid storage probe")
+            used_percent = round((used * 100.0) / total, 3)
+        except Exception:
+            logger.warning(
+                "GlassHive storage pressure probe failed closed",
+                extra={"error_code": "storage_probe_unavailable"},
+            )
+            return {
+                "version": 1,
+                "state": "critical",
+                "healthy": False,
+                "usedPercent": None,
+                "availableBytes": None,
+                "thresholdPercent": float(threshold),
+                "errorCode": "storage_probe_unavailable",
+            }
+        if used_percent >= threshold:
+            state = "critical"
+        elif used_percent >= max(0.0, threshold - warning_margin):
+            state = "warning"
+        else:
+            state = "healthy"
+        return {
+            "version": 1,
+            "state": state,
+            "healthy": state != "critical",
+            "usedPercent": float(used_percent),
+            "availableBytes": available,
+            "thresholdPercent": float(threshold),
+        }
+
+    @contextmanager
+    def _durable_preflight_capacity(
+        self,
+        profile: str,
+        execution_mode: str,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        lane: str = "mission",
+        worker: dict | None = None,
+    ):
+        """Hold one durable capacity claim around an external runtime probe."""
+
+        prospective_worker = {
+            "tenant_id": tenant_id or "local",
+            "owner_id": owner_id,
+            "profile": profile,
+            "runtime": self._initial_runtime_label(profile, execution_mode),
+            "execution_mode": execution_mode,
+            "trusted_run_lane": (
+                "conversation" if lane == "conversation" else "mission"
+            ),
+            **(worker or {}),
+        }
+        retry_after_s = self._retry_base_delay_s("host_capacity")
+        next_retry_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=retry_after_s)
+        ).isoformat()
+        pressure, capacity_snapshot = self._host_resource_capacity_error(
+            prospective_worker,
+            docker_cached_only=False,
+            _include_snapshot=True,
+        )
+        if pressure:
+            pressure, recovered_snapshot = self._relieve_docker_resource_pressure(
+                prospective_worker, pressure
+            )
+            if recovered_snapshot is not None:
+                capacity_snapshot = recovered_snapshot
+        if pressure:
+            pressure.next_retry_at = next_retry_at
+            pressure.retry_after_s = retry_after_s
+            raise pressure
+        policy = self._host_capacity_policy()
+        try:
+            reservation = self.store.acquire_preflight_capacity_reservation(
+                runtime_family=self._host_runtime_family(prospective_worker),
+                lane=str(prospective_worker["trusted_run_lane"]),
+                tenant_id=str(prospective_worker.get("tenant_id") or "local"),
+                owner_id=str(prospective_worker.get("owner_id") or ""),
+                profile=profile,
+                execution_mode=execution_mode,
+                executor_id=self._executor_id,
+                **policy,
+                mutation_scope=(
+                    self._host_mutation_scope(prospective_worker)
+                    if execution_mode == "host"
+                    else ""
+                ),
+                lease_ttl_s=self._host_lease_ttl_s(),
+                capacity_available=dict(capacity_snapshot.get("available") or {}),
+                capacity_required=dict(capacity_snapshot.get("required") or {}),
+                capacity_reservation=dict(
+                    capacity_snapshot.get("reservation") or {}
+                ),
+                capacity_observed_lease_ids=list(
+                    capacity_snapshot.get("observedLeaseIds") or []
+                ),
+                capacity_next_retry_at=next_retry_at,
+            )
+        except HostRunLeaseCapacityError as exc:
+            error = HostCapacityError(
+                str(exc),
+                capacity_class=exc.capacity_class,
+                dimension=exc.dimension,
+                configured=exc.configured,
+                used=exc.used,
+            )
+            error.available = dict(exc.available or {})
+            error.required = dict(exc.required or {})
+            error.shortage = dict(exc.shortage or {})
+            error.reservation = dict(exc.reservation or {})
+            error.next_retry_at = str(exc.next_retry_at or next_retry_at)
+            error.retry_after_s = retry_after_s
+            raise error from exc
+        if not isinstance(reservation, dict) or not str(
+            reservation.get("reservation_id") or ""
+        ):
+            error = HostCapacityError(
+                "Durable CLI preflight capacity could not be reserved.",
+                capacity_class="preflight_reservation",
+            )
+            error.next_retry_at = next_retry_at
+            error.retry_after_s = retry_after_s
+            raise error
+        reservation_id = str(reservation["reservation_id"])
+        lease_ttl_s = max(1.0, float(self._host_lease_ttl_s()))
+        expected_expires_at = str(reservation.get("expires_at") or "")
+        probe_lease = _DurablePreflightProbeLease()
+        heartbeat_stop = Event()
+
+        def is_live() -> bool:
+            return not probe_lease.lost and self.store.preflight_capacity_reservation_is_live(
+                reservation_id,
+                executor_id=self._executor_id,
+                profile=profile,
+                execution_mode=execution_mode,
+            )
+
+        def renew_until_stopped() -> None:
+            nonlocal expected_expires_at
+            interval = max(0.1, min(10.0, lease_ttl_s / 3.0))
+            next_renewal = time.monotonic() + interval
+            while True:
+                remaining = max(0.0, next_renewal - time.monotonic())
+                if heartbeat_stop.wait(remaining):
+                    return
+                try:
+                    renewed = self.store.renew_preflight_capacity_reservation(
+                        reservation_id,
+                        executor_id=self._executor_id,
+                        profile=profile,
+                        execution_mode=execution_mode,
+                        expected_expires_at=expected_expires_at,
+                        lease_ttl_s=lease_ttl_s,
+                    )
+                except Exception:
+                    renewed = None
+                if not renewed:
+                    probe_lease.mark_lost()
+                    return
+                expected_expires_at = str(renewed.get("expires_at") or "")
+                next_renewal += interval
+                observed = time.monotonic()
+                if next_renewal <= observed:
+                    next_renewal = observed + interval
+
+        heartbeat_thread: Thread | None = None
+        release_reason = "preflight_failed"
+        try:
+            if not is_live():
+                release_reason = "invalid_before_preflight"
+                raise HostCapacityError(
+                    "CLI preflight capacity expired before adapter invocation.",
+                    capacity_class="preflight_reservation",
+                )
+            heartbeat_thread = Thread(
+                target=renew_until_stopped,
+                name=f"wpr-preflight-lease-{reservation_id[-8:]}",
+                daemon=True,
+            )
+            heartbeat_thread.start()
+            yield capacity_snapshot, probe_lease
+            if probe_lease.lost:
+                release_reason = "preflight_lease_lost"
+                raise HostCapacityError(
+                    "CLI preflight reservation ownership was lost during the external probe.",
+                    capacity_class="preflight_reservation",
+                )
+            if not is_live():
+                raise HostCapacityError(
+                    "CLI preflight capacity expired before acceptance.",
+                    capacity_class="preflight_reservation",
+                )
+            release_reason = "preflight_succeeded"
+        except BaseException:
+            if probe_lease.lost:
+                release_reason = "preflight_lease_lost"
+            raise
+        finally:
+            heartbeat_stop.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=max(1.0, min(2.0, lease_ttl_s)))
+            self.store.release_preflight_capacity_reservation(
+                reservation_id, reason=release_reason
+            )
+
+    def _reserved_runtime_preflight(
+        self,
+        profile: str,
+        execution_mode: str,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        lane: str = "mission",
+        worker: dict | None = None,
+        require_capacity_snapshot: bool = False,
+    ) -> dict[str, object]:
+        """Fence every adapter CLI preflight behind durable, live capacity."""
+
+        has_preflight = hasattr(self.runtime, "preflight_worker_profile")
+        uses_cli_subprocess = bool(
+            getattr(self.runtime, "preflight_uses_cli_subprocess", True)
+        )
+        if not has_preflight and not require_capacity_snapshot:
+            return {}
+        if has_preflight and not uses_cli_subprocess and not require_capacity_snapshot:
+            self._ensure_runtime_available(profile, execution_mode)
+            return {}
+        with self._durable_preflight_capacity(
+            profile,
+            execution_mode,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            lane=lane,
+            worker=worker,
+        ) as (capacity_snapshot, _probe_lease):
+            if has_preflight:
+                self._ensure_runtime_available(profile, execution_mode)
+            return capacity_snapshot
+
+    def run_reserved_host_subprocess_probe(
+        self,
+        profile: str,
+        probe,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        lane: str = "conversation",
+    ):
+        """Run one host probe only while its provisional capacity is durable."""
+
+        with self._durable_preflight_capacity(
+            profile,
+            "host",
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            lane=lane,
+        ) as (_capacity_snapshot, probe_lease):
+            return probe(probe_lease)
+
+    @staticmethod
+    def prompt_workbench_scheduled_alias(alias: str, fingerprint: str) -> str:
+        clean_alias = str(alias or "prompt-workbench-scheduled").strip()
+        clean_fingerprint = str(fingerprint or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", clean_fingerprint):
+            raise ParallelExecutionIsolationError(
+                "Prompt Workbench scheduled authority fingerprint is invalid."
+            )
+        return (
+            f"{clean_alias[:160]}--{PROMPT_WORKBENCH_SCHEDULED_ALIAS_NAMESPACE}-"
+            f"{clean_fingerprint[:24]}"
+        )
+
+    @staticmethod
+    def _configured_prompt_workbench_effort(profile: str) -> str:
+        clean_profile = str(profile or "").strip()
+        if clean_profile == "codex-cli":
+            value = str(
+                os.environ.get("WPR_CODEX_CLI_REASONING_EFFORT") or ""
+            ).strip().lower()
+            return value if value in PARALLEL_CLEAN_ROOM_EFFORT_ENV_VALUES[
+                "WPR_CODEX_CLI_REASONING_EFFORT"
+            ] else ""
+        if clean_profile == "claude-code":
+            value = str(
+                os.environ.get("WPR_CLAUDE_CODE_EFFORT") or "default"
+            ).strip().lower()
+            return value if value in PARALLEL_CLEAN_ROOM_EFFORT_ENV_VALUES[
+                "WPR_CLAUDE_CODE_EFFORT"
+            ] else ""
+        return ""
+
+    def derive_prompt_workbench_scheduled_bootstrap(
+        self,
+        *,
+        owner_id: str,
+        profile: str,
+        execution_mode: str,
+        bootstrap_profile: str | None,
+        bootstrap_bundle: dict | None,
+    ) -> tuple[str, dict, str]:
+        """Validate a service request and mint one isolated scheduled authority."""
+
+        def reject(reason: str) -> None:
+            raise ParallelExecutionIsolationError(
+                f"Prompt Workbench scheduled authority rejected: {reason}.",
+                reason_code="scheduled_authority_invalid",
+            )
+
+        if (
+            str(bootstrap_profile or "").strip()
+            != PROMPT_WORKBENCH_SCHEDULED_BOOTSTRAP_PROFILE
+            or str(execution_mode or "").strip().lower() != "docker"
+            or not isinstance(bootstrap_bundle, dict)
+        ):
+            reject("the bootstrap profile or execution mode is invalid")
+        request = bootstrap_bundle.get(
+            PROMPT_WORKBENCH_SCHEDULED_AUTHORITY_REQUEST
+        )
+        if not isinstance(request, dict) or set(request) not in (
+            {"version", "kind", "execution_mode", "primary"},
+            {"version", "kind", "execution_mode", "primary", "fallback"},
+        ):
+            reject("the structured authority request is invalid")
+        if (
+            request.get("version") != 1
+            or isinstance(request.get("version"), bool)
+            or request.get("kind") != PROMPT_WORKBENCH_SCHEDULED_AUTHORITY_KIND
+            or request.get("execution_mode") != "docker"
+        ):
+            reject("the structured authority request is invalid")
+        if any(
+            key in bootstrap_bundle
+            for key in (
+                "execution_policy",
+                "viventium_launch_authority",
+                "glasshive_capability_authorization",
+                "glasshive_capability_broker",
+                "glasshive_capability_requirement",
+                "claude_project_mcp",
+                "codex_config_append",
+            )
+        ):
+            reject("caller-authored policy or capability authority is not allowed")
+
+        def exact_route(value: object, *, label: str) -> dict[str, str]:
+            if not isinstance(value, dict) or set(value) != {
+                "worker_profile",
+                "model",
+                "reasoning_effort",
+            }:
+                reject(f"the {label} route tuple is invalid")
+            route = {
+                key: str(value.get(key) or "").strip()
+                for key in ("worker_profile", "model", "reasoning_effort")
+            }
+            if not all(route.values()):
+                reject(f"the {label} route tuple is incomplete")
+            return route
+
+        primary = exact_route(request.get("primary"), label="primary")
+        if primary["worker_profile"] != str(profile or "").strip():
+            reject("the primary profile does not match the worker request")
+        try:
+            self._ensure_profile_allowed(primary["worker_profile"])
+        except GlassHiveProfileNotAllowedError:
+            reject("the primary profile is not allowed")
+        primary_model = self._resolve_worker_model(
+            primary["worker_profile"], "docker"
+        ).strip()
+        primary_effort = self._configured_prompt_workbench_effort(
+            primary["worker_profile"]
+        )
+        if (
+            primary["model"] != primary_model
+            or primary["reasoning_effort"] != primary_effort
+        ):
+            reject("the primary tuple does not match the compiled route")
+
+        fallback: dict[str, str] | None = None
+        if "fallback" in request:
+            fallback = exact_route(request.get("fallback"), label="fallback")
+            if fallback["worker_profile"] == primary["worker_profile"]:
+                reject("the fallback profile must be distinct")
+            try:
+                self._ensure_profile_allowed(fallback["worker_profile"])
+            except GlassHiveProfileNotAllowedError:
+                reject("the fallback profile is not allowed")
+            fallback_model = self._resolve_worker_model(
+                fallback["worker_profile"], "docker"
+            ).strip()
+            fallback_effort = self._configured_prompt_workbench_effort(
+                fallback["worker_profile"]
+            )
+            if (
+                fallback["model"] != fallback_model
+                or fallback["reasoning_effort"] != fallback_effort
+            ):
+                reject("the fallback tuple does not match the compiled route")
+        configured_fallback_profile = str(
+            os.environ.get("GLASSHIVE_DEFAULT_FALLBACK_WORKER_PROFILE") or ""
+        ).strip()
+        requested_fallback_profile = (
+            fallback["worker_profile"] if fallback else ""
+        )
+        if requested_fallback_profile != configured_fallback_profile:
+            reject("the fallback profile does not match the compiled route")
+
+        callbacks = bootstrap_bundle.get("callbacks")
+        callback_keys = {
+            "events_webhook_url",
+            "hmac_secret",
+            "user_id",
+            "conversation_id",
+            "parent_message_id",
+            "message_id",
+            "surface",
+            "scheduled_prompt_run_id",
+            "scheduled_prompt_task_id",
+        }
+        if not isinstance(callbacks, dict) or set(callbacks) != callback_keys:
+            reject("the callback envelope is invalid")
+        callback_url = str(callbacks.get("events_webhook_url") or "").strip()
+        callback_secret = str(callbacks.get("hmac_secret") or "").strip()
+        task_id = str(callbacks.get("scheduled_prompt_task_id") or "").strip()
+        run_id = str(callbacks.get("scheduled_prompt_run_id") or "").strip()
+        load_viventium_runtime_env({"VIVENTIUM_GLASSHIVE_CALLBACK_SECRET"})
+        canonical_callback_secret = str(
+            os.environ.get("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET") or ""
+        ).strip()
+        if (
+            not _is_local_scheduling_cortex_callback_url(callback_url)
+            or not callback_secret
+            or not canonical_callback_secret
+            or not hmac.compare_digest(
+                callback_secret.encode("utf-8"),
+                canonical_callback_secret.encode("utf-8"),
+            )
+            or not task_id
+            or not run_id
+            or str(callbacks.get("user_id") or "").strip()
+            != str(owner_id or "").strip()
+            or str(callbacks.get("conversation_id") or "").strip()
+            != f"workbench-scheduled-prompt:{task_id}"
+            or str(callbacks.get("parent_message_id") or "").strip()
+            != f"scheduled-prompt:{task_id}"
+            or str(callbacks.get("message_id") or "").strip() != run_id
+            or callbacks.get("surface") != "workbench"
+        ):
+            reject("the callback envelope is invalid")
+
+        expected_env: dict[str, str] = {}
+        for route in (primary, fallback):
+            if not route:
+                continue
+            env_name = (
+                "WPR_CODEX_CLI_REASONING_EFFORT"
+                if route["worker_profile"] == "codex-cli"
+                else "WPR_CLAUDE_CODE_EFFORT"
+            )
+            expected_env[env_name] = route["reasoning_effort"]
+        if bootstrap_bundle.get("env") != expected_env:
+            reject("the bootstrap environment does not match the route tuples")
+        try:
+            _validate_parallel_clean_room_files(bootstrap_bundle)
+        except ParallelExecutionIsolationError:
+            reject("the workspace file projection is invalid")
+        if _contains_parallel_forbidden_authority_key(bootstrap_bundle):
+            reject("caller provider credentials are not allowed")
+
+        sanitized_bundle = {
+            key: value
+            for key, value in bootstrap_bundle.items()
+            if key != PROMPT_WORKBENCH_SCHEDULED_AUTHORITY_REQUEST
+        }
+        sanitized_bundle["callbacks"] = {
+            "events_webhook_url": callback_url,
+            "hmac_secret": callback_secret,
+            "origin_ref": run_id,
+        }
+        sanitized_bundle["env"] = expected_env
+        clean_profile, canonical_bundle = derive_parallel_clean_room_bootstrap(
+            None, sanitized_bundle
+        )
+        canonical_bundle["viventium_launch_authority"] = {
+            "version": 1,
+            "kind": PROMPT_WORKBENCH_SCHEDULED_AUTHORITY_KIND,
+            "execution_mode": "docker",
+            **(
+                {"fallback_worker_profile": fallback["worker_profile"]}
+                if fallback
+                else {}
+            ),
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                request,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        return clean_profile, canonical_bundle, fingerprint
+
+    def _delegation_callback_state(
+        self,
+        delegation: dict,
+        *,
+        callback_run: dict | None,
+    ) -> tuple[str, bool]:
+        """Project authoritative mission truth without hiding per-run evidence."""
+
+        worker_id = str(delegation.get("worker_id") or "")
+        active = self.store.list_nonterminal_runs_for_worker(worker_id)
+        callback_run_id = str((callback_run or {}).get("run_id") or "")
+        callback_state = str((callback_run or {}).get("state") or "")
+        if callback_run_id and callback_state in TERMINAL_RUN_STATES:
+            active = [
+                item
+                for item in active
+                if str(item.get("run_id") or "") != callback_run_id
+            ]
+        if active:
+            state_priority = (
+                "running",
+                "settling",
+                "paused",
+                "needs_input",
+                "queued",
+            )
+            states = {str(item.get("state") or "") for item in active}
+            state = next((item for item in state_priority if item in states), "queued")
+            return state, False
+
+        latest = callback_run
+        if not latest:
+            current_run_id = str(delegation.get("current_run_id") or "")
+            latest = self.store.get_run(current_run_id) if current_run_id else None
+        state = str((latest or {}).get("state") or "failed")
+        if state == "interrupted":
+            state = "cancelled"
+        if state not in TERMINAL_RUN_STATES:
+            # Missing/unknown mission truth must fail nonterminal, never cause
+            # Core to terminalize a WorkRef accidentally.
+            return state or "queued", False
+        return state, True
+
+    def _submit_persisted_callback(self, worker: dict, record: dict | None) -> None:
+        if not record:
+            return
+        callbacks = self._callback_config_for(worker)
+        self.executor.submit(
+            self._deliver_callback_record,
+            dict(worker),
+            record,
+            callbacks,
+        )
+
+    def _run_start_callback_record(
+        self,
+        worker: dict,
+        run: dict,
+        startup_token: str,
+    ) -> tuple[dict[str, object] | None, dict]:
+        """Build the bounded durable callback row published by the startup CAS.
+
+        This deliberately does not mint signed links or perform network I/O while
+        the lifecycle flock is held. Delivery may add an exact run-action
+        capability after the transaction commits.
+        """
+
+        callbacks = self._callback_config_for(worker)
+        url = str(
+            callbacks.get("events_webhook_url") or callbacks.get("url") or ""
+        ).strip()
+        if not url:
+            return None, callbacks
+        if _is_viventium_callback_url(url):
+            if not self._viventium_callback_context_ready(worker, callbacks):
+                return None, callbacks
+        attempt_number = self._callback_attempt_number(run)
+        if attempt_number < 1:
+            return None, callbacks
+        callback_id = "cb_start_" + hashlib.sha256(
+            str(startup_token).encode("utf-8")
+        ).hexdigest()
+        payload: dict[str, object] = {
+            "callback_id": callback_id,
+            "callback_ts": int(time.time()),
+            "attempt_number": attempt_number,
+            "event": "run.started",
+            "project_id": worker.get("project_id"),
+            "worker_id": worker.get("worker_id"),
+            "run_id": run.get("run_id"),
+            "run_state": "running",
+            "message": public_callback_message_text(
+                str(run.get("instruction") or "")
+            )[:TERMINAL_CALLBACK_MESSAGE_LIMIT],
+            "full_message": "",
+        }
+        for field in (
+            "user_id",
+            "agent_id",
+            "conversation_id",
+            "parent_message_id",
+            "message_id",
+            "surface",
+            "input_mode",
+            "stream_id",
+            "voice_call_session_id",
+            "voice_request_id",
+            "telegram_chat_id",
+            "telegram_user_id",
+            "telegram_message_id",
+            "logical_turn_id",
+            "logical_turn_revision",
+        ):
+            payload[field] = callbacks.get(field)
+        delegation = self.store.get_delegation_for_worker(
+            str(worker.get("worker_id") or ""),
+            tenant_id=str(worker.get("tenant_id") or "local"),
+            owner_id=str(worker.get("owner_id") or ""),
+        )
+        if delegation:
+            payload["origin_ref"] = str(delegation.get("origin_ref") or "")
+            payload["work_ref"] = str(delegation.get("work_ref") or "")
+            work_state, work_terminal = self._delegation_callback_state(
+                delegation,
+                callback_run={**run, "state": "running"},
+            )
+            payload["work_state"] = work_state
+            payload["work_terminal"] = work_terminal
+        elif _is_viventium_callback_url(url):
+            return None, callbacks
+        return {
+            "url": url,
+            "payload_json": json.dumps(payload, ensure_ascii=False),
+            "attempt_number": attempt_number,
+        }, callbacks
+
+    def _compute_release_claim_ttl_s(self) -> int:
+        return _bounded_int_env(
+            "GLASSHIVE_COMPUTE_RELEASE_CLAIM_TTL_S",
+            600,
+            min_value=30,
+            max_value=3600,
+        )
+
+    def _worker_lifecycle_lock_timeout_s(self) -> float:
+        return _bounded_float_env(
+            "GLASSHIVE_WORKER_LIFECYCLE_LOCK_TIMEOUT_S",
+            30.0,
+            min_value=0.1,
+            max_value=300.0,
+        )
+
+    def _acquire_worker_lifecycle_guard(
+        self, worker_id: str
+    ) -> _WorkerLifecycleGuard:
+        digest = hashlib.sha256(worker_id.encode("utf-8")).hexdigest()[:24]
+        canonical_db_path = Path(self.store.db_path).resolve(strict=False)
+        lock_path = Path(f"{canonical_db_path}.compute-release-{digest}.lock")
+        handle = lock_path.open("a+")
+        lock_path.chmod(0o600)
+        deadline = time.monotonic() + self._worker_lifecycle_lock_timeout_s()
+        while True:
+            try:
+                fcntl.flock(
+                    handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+                return _WorkerLifecycleGuard(handle)
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    handle.close()
+                    raise RuntimeErrorBase(
+                        "Worker lifecycle control is busy; retry shortly"
+                    )
+                time.sleep(0.01)
+
+    @contextmanager
+    def _worker_compute_release_lock(self, worker_id: str):
+        guard = self._acquire_worker_lifecycle_guard(worker_id)
+        try:
+            yield
+        finally:
+            guard.release()
+
+    def _runtime_compute_container_id(self, worker: dict) -> str:
+        resolver = getattr(self.runtime, "compute_identity", None)
+        if not callable(resolver):
+            return ""
+        identity = resolver(worker)
+        return str((identity or {}).get("container_id") or "").strip()
+
+    def _require_claimed_container_generation(self, worker: dict) -> dict:
+        """Re-probe and bind one captured Docker generation before control RPC."""
+
+        captured_container_id = str(
+            worker.get("compute_release_container_id") or ""
+        ).strip()
+        if not captured_container_id:
+            return worker
+        current_container_id = self._runtime_compute_container_id(worker)
+        if current_container_id != captured_container_id:
+            raise RuntimeErrorBase(
+                "Worker sandbox generation changed before exact lifecycle control; "
+                "the claim remains fenced"
+            )
+        return {
+            **worker,
+            "_compute_release_container_id": captured_container_id,
+        }
+
+    def _runtime_control_info_is_confirmed(self, info: RuntimeInfo) -> bool:
+        # The deterministic/in-process adapter has no external compute identity;
+        # its synchronous return is the confirmation boundary. Real process or
+        # Docker adapters must report no live target PID after destructive
+        # Interrupt/Steer, and Docker Pause proves suspension in its own call.
+        return bool(
+            getattr(self.runtime, "requires_run_start_identity", True) is False
+            or info.pid is None
+        )
+
+    def _require_confirmed_host_control_identity(
+        self,
+        worker: dict,
+        run_id: str,
+    ) -> dict:
+        """Return one exact confirmed host lease before a destructive signal."""
+
+        if str(worker.get("execution_mode") or "docker") != "host":
+            return worker
+        if getattr(self.runtime, "requires_run_start_identity", True) is False:
+            # Deterministic/in-process adapters have no external PID generation to prove. Their
+            # synchronous control call is already the declared identity boundary; the lifecycle
+            # claim and per-worker flock below still fence the exact durable run. Never extend this
+            # path to a real host adapter, which must publish the full confirmed lease tuple.
+            return {**worker, "_active_run_id": run_id}
+        lease = self.store.get_active_host_run_lease_for_run(run_id)
+        if (
+            not lease
+            or str(lease.get("worker_id") or "") != str(worker.get("worker_id") or "")
+            or str(lease.get("startup_state") or "") != "confirmed"
+            or str(lease.get("startup_identity_kind") or "") != "host_process"
+            or int(lease.get("pid") or 0) <= 0
+            or int(lease.get("process_group") or 0) <= 0
+            or not str(lease.get("process_start_identity") or "").strip()
+            or not str(lease.get("startup_session_id") or "").strip()
+        ):
+            raise RuntimeErrorBase(
+                "The exact host process identity is not confirmed; control remains pending"
+            )
+        return {**worker, "_active_run_id": run_id, "_host_run_lease": lease}
+
+    def _claim_exact_run_control(
+        self,
+        worker: dict,
+        run: dict,
+        *,
+        kind: str,
+        replacement_run: dict[str, object] | None = None,
+        action_use_id: str = "",
+    ) -> dict[str, object]:
+        target_run_id = str(run.get("run_id") or "")
+        expected_container_id = self._runtime_compute_container_id(worker)
+        claim = self.store.try_claim_worker_compute_release(
+            str(worker["worker_id"]),
+            expected_updated_at=str(worker.get("updated_at") or ""),
+            expected_last_run_id=str(worker.get("last_run_id") or ""),
+            expected_state=str(worker.get("state") or ""),
+            expected_container_id=expected_container_id,
+            owner=self._executor_id,
+            ttl_s=self._compute_release_claim_ttl_s(),
+            kind=kind,
+            target_run_id=target_run_id,
+            expected_target_started_at=str(run.get("started_at") or ""),
+            replacement_run=replacement_run,
+            action_use_id=action_use_id,
+            action_executor_id=self._executor_id if action_use_id else "",
+        )
+        if claim is None:
+            raise RuntimeErrorBase("active_work_generation_changed")
+        return claim
+
+    def _restore_failed_resume_claim(
+        self,
+        *,
+        worker: dict,
+        token: str,
+        epoch: int,
+        kind: str,
+        target_run_id: str,
+        startup_error: BaseException,
+    ) -> None:
+        """Restore paused truth only after compensating runtime proof.
+
+        Startup may have made compute live before raising.  Until a compensating
+        pause is explicitly confirmed, the durable claim remains as the safety
+        fence and no resumed truth is published.
+        """
+
+        if getattr(self.runtime, "requires_run_start_identity", True) is False:
+            restored = self.store.abandon_worker_run_control_claim(
+                str(worker["worker_id"]),
+                token,
+                epoch,
+                kind=kind,
+                target_run_id=target_run_id,
+                worker_state="paused",
+                last_error=str(startup_error),
+            )
+            if restored is None:
+                raise RuntimeErrorBase(
+                    "Resume startup failed and paused ownership could not be restored"
+                ) from startup_error
+            return
+        try:
+            info = self.runtime.pause_worker(
+                self._require_claimed_container_generation(worker)
+            )
+            if not self._runtime_control_info_is_confirmed(info):
+                raise RuntimeErrorBase(
+                    "Resume compensation did not confirm paused compute"
+                )
+        except Exception as compensation_error:
+            raise RuntimeErrorBase(
+                "Resume startup failed and compensating pause was not confirmed; "
+                "the lifecycle claim remains fenced"
+            ) from startup_error
+        restored = self.store.abandon_worker_run_control_claim(
+            str(worker["worker_id"]),
+            token,
+            epoch,
+            kind=kind,
+            target_run_id=target_run_id,
+            worker_state="paused",
+            last_error=str(startup_error),
+        )
+        if restored is None:
+            raise RuntimeErrorBase(
+                "Resume startup failed and paused ownership could not be restored"
+            ) from startup_error
+
+    def _release_worker_compute(
+        self,
+        worker: dict,
+        *,
+        idle_seconds: float,
+        kind: str = "idle",
+        target_run_id: str = "",
+        target_started_at: str = "",
+        target_error_text: str = "",
+    ) -> dict[str, object] | None:
+        worker_id = str(worker.get("worker_id") or "")
+        with self._worker_compute_release_lock(worker_id):
+            current = self.store.get_worker(worker_id)
+            if not current or current.get("compute_released_at"):
+                return None
+            existing_token = str(current.get("compute_release_token") or "").strip()
+            requested_kind = str(
+                current.get("compute_release_kind") or kind or "idle"
+            ).strip().lower()
+            if existing_token and requested_kind not in {
+                "idle",
+                "needs_input",
+                "paused",
+                "max_duration",
+            }:
+                # Active-work controls own their exact target and, for steer,
+                # their durable replacement.  An idle/paused reaper must not
+                # reinterpret that fence as a broad compute release.
+                return None
+            requested_target = str(
+                current.get("compute_release_target_run_id") or target_run_id or ""
+            ).strip()
+            requested_target_started_at = str(
+                current.get("compute_release_target_started_at")
+                or target_started_at
+                or ""
+            ).strip()
+            capacity_wait_release = False
+            if requested_kind == "idle" and requested_target:
+                target = self.store.get_run(requested_target)
+                capacity_wait_release = bool(
+                    target
+                    and str(target.get("worker_id") or "") == worker_id
+                    and str(target.get("state") or "") == "queued"
+                )
+            if (
+                not existing_token
+                and requested_kind == "idle"
+                and (
+                    self.store.get_active_run(worker_id)
+                    or self.store.has_queued_runs(worker_id)
+                )
+                and not capacity_wait_release
+            ):
+                return None
+            last_run_id = str(current.get("last_run_id") or "").strip()
+            expected_container_id = (
+                str(current.get("compute_release_container_id") or "").strip()
+                if existing_token
+                else self._runtime_compute_container_id(current)
+            )
+            claim = self.store.try_claim_worker_compute_release(
+                worker_id,
+                expected_updated_at=str(current.get("updated_at") or ""),
+                expected_last_run_id=last_run_id,
+                expected_state=str(current.get("state") or ""),
+                expected_container_id=expected_container_id,
+                owner=self._executor_id,
+                ttl_s=self._compute_release_claim_ttl_s(),
+                kind=requested_kind,
+                target_run_id=requested_target,
+                expected_target_started_at=requested_target_started_at,
+            )
+            if claim is None:
+                return None
+            claimed_worker = dict(claim.get("worker") or current)
+            token = str(claim["token"])
+            epoch = int(claim["epoch"])
+            terminal_run_id = str(
+                claimed_worker.get("compute_release_terminal_run_id")
+                or last_run_id
+                or ""
+            ).strip()
+            if not self.store.worker_compute_release_claim_matches(
+                worker_id, token, epoch
+            ):
+                return None
+            if (
+                requested_kind == "idle"
+                and (
+                    self.store.get_active_run(worker_id)
+                    or self.store.has_queued_runs(worker_id)
+                )
+                and not capacity_wait_release
+            ):
+                abandoned = self.store.abandon_stale_worker_compute_release_claim(
+                    worker_id,
+                    token,
+                    epoch,
+                    kind=requested_kind,
+                )
+                if abandoned is None:
+                    raise RuntimeErrorBase(
+                        "Idle release ownership changed before current work could be re-evaluated"
+                    )
+                if self.store.has_queued_runs(worker_id):
+                    self._ensure_worker_processor(worker_id)
+                return None
+            captured_container_id = str(
+                claimed_worker.get("compute_release_container_id") or ""
+            ).strip()
+            if str(claimed_worker.get("execution_mode") or "docker") == "docker":
+                current_container_id = self._runtime_compute_container_id(
+                    claimed_worker
+                )
+                if current_container_id != captured_container_id:
+                    rebound = (
+                        self.store.rebind_worker_compute_release_claim_generation(
+                            worker_id,
+                            token,
+                            epoch,
+                            kind=requested_kind,
+                            container_id=current_container_id,
+                        )
+                    )
+                    if rebound is None:
+                        raise RuntimeErrorBase(
+                            "Compute release generation changed before it could be rebound"
+                        )
+                    claimed_worker = rebound
+                    epoch = int(rebound["compute_release_epoch"])
+            claimed_runtime_worker = (
+                self._worker_with_host_lease(claimed_worker, requested_target)
+                if requested_kind == "max_duration" and requested_target
+                else claimed_worker
+            )
+            runtime_worker = {
+                **claimed_runtime_worker,
+                "_compute_release_container_id": str(
+                    claimed_worker.get("compute_release_container_id") or ""
+                ).strip(),
+            }
+            terminal_run = (
+                self.store.get_run(terminal_run_id) if terminal_run_id else None
+            )
+            if terminal_run and str(terminal_run.get("state") or "") in TERMINAL_RUN_STATES:
+                runtime_worker["_terminal_run_id"] = terminal_run_id
+            info = self.runtime.terminate_worker(runtime_worker)
+            idle_state = str(current.get("state") or "")
+            if idle_state not in TERMINAL_RUN_STATES:
+                idle_state = "paused"
+            target_result = None
+            if requested_kind == "max_duration":
+                target_result = self.store.finalize_worker_operation_claim(
+                    worker_id,
+                    token,
+                    epoch,
+                    kind=requested_kind,
+                    target_run_id=requested_target,
+                    target_expected_states=("running", "settling"),
+                    target_state="cancelled",
+                    target_error_text=target_error_text,
+                    runtime_fields=self._runtime_info_fields(
+                        worker_id,
+                        info,
+                        last_error=target_error_text,
+                    ),
+                    idle_state="paused",
+                    compute_released_at=utc_now(),
+                )
+                updated = dict((target_result or {}).get("worker") or {})
+            else:
+                updated = self.store.finalize_worker_compute_release(
+                    worker_id,
+                    token,
+                    epoch,
+                    expected_kind=requested_kind,
+                    target_run_id=requested_target,
+                    compute_released_at=utc_now(),
+                    runtime_fields=self._runtime_info_fields(
+                        worker_id,
+                        info,
+                        last_error="",
+                    ),
+                    idle_state=idle_state,
+                )
+            if not updated:
+                raise RuntimeError("Compute release ownership changed before finalization")
+        if requested_kind in {"idle", "needs_input", "paused"}:
+            capacity_wait_release = bool(
+                requested_kind == "idle" and requested_target
+            )
+            event_type = (
+                "worker.paused_compute_terminated"
+                if requested_kind == "paused"
+                else "worker.needs_input_compute_terminated"
+                if requested_kind == "needs_input"
+                else "worker.capacity_wait_compute_terminated"
+                if capacity_wait_release
+                else "worker.idle_terminated"
+            )
+            label = (
+                "Paused worker"
+                if requested_kind == "paused"
+                else "Needs-input worker"
+                if requested_kind == "needs_input"
+                else "Capacity-wait worker"
+                if capacity_wait_release
+                else "Idle worker"
+            )
+            self.store.add_event(
+                str(worker.get("project_id") or ""),
+                worker_id,
+                None,
+                event_type,
+                f"{label} compute stopped after {int(idle_seconds)} seconds; workspace state preserved.",
+            )
+        if (
+            updated.get("state") not in {"paused", "terminated", "needs_input"}
+            and self.store.has_queued_runs(worker_id)
+            and not capacity_wait_release
+        ):
+            self._ensure_worker_processor(worker_id)
+        return {
+            "worker_id": worker_id,
+            "project_id": worker.get("project_id"),
+            "tenant_id": worker.get("tenant_id"),
+            "owner_id": worker.get("owner_id"),
+            "state": updated.get("state"),
+            "idle_seconds": int(idle_seconds),
+            "kind": requested_kind,
+            "target_run_id": requested_target,
+            "target_transitioned": bool(
+                (target_result or {}).get("target_transitioned")
+            ),
+        }
+
+    def _release_needs_input_compute(
+        self,
+        worker: dict,
+        run: dict,
+    ) -> dict[str, object] | None:
+        try:
+            return self._release_worker_compute(
+                worker,
+                idle_seconds=0,
+                kind="needs_input",
+                target_run_id=str(run.get("run_id") or ""),
+                target_started_at=str(run.get("started_at") or ""),
+            )
+        except Exception as exc:
+            # The needs-input truth is already authoritative. Keep the exact
+            # release fence for takeover/restart recovery instead of turning a
+            # compute cleanup fault into a false failed run.
+            logger.warning(
+                "Failed to release needs-input GlassHive worker compute %s: %s",
+                str(worker.get("worker_id") or ""),
+                exc,
+            )
+            return None
+
+    def _release_capacity_wait_compute(
+        self,
+        worker: dict,
+        run: dict,
+    ) -> dict[str, object] | None:
+        try:
+            return self._release_worker_compute(
+                worker,
+                idle_seconds=0,
+                kind="idle",
+                target_run_id=str(run.get("run_id") or ""),
+            )
+        except Exception as exc:
+            # The durable queue episode remains authoritative. Preserve the
+            # exact release fence for recovery instead of losing accepted work.
+            logger.warning(
+                "Failed to release capacity-wait GlassHive worker compute %s: %s",
+                str(worker.get("worker_id") or ""),
+                exc,
+            )
+            return None
+
+    def recover_expired_compute_release_claims_once(self) -> list[dict[str, object]]:
+        recovered: list[dict[str, object]] = []
+        # Older exact-run execution records may retain the internal
+        # ``interrupted`` state.  It is settled proof for steer recovery even
+        # though current public terminal projection uses ``cancelled``.
+        steer_settled_states = {*TERMINAL_RUN_STATES, "interrupted"}
+        for worker_id in self.store.list_expired_compute_release_claim_worker_ids():
+            worker = self.store.get_worker(worker_id)
+            if not worker:
+                continue
+            try:
+                kind = str(worker.get("compute_release_kind") or "idle").strip()
+                target_run_id = str(
+                    worker.get("compute_release_target_run_id") or ""
+                ).strip()
+                target_started_at = str(
+                    worker.get("compute_release_target_started_at") or ""
+                ).strip()
+                target = self.store.get_run(target_run_id) if target_run_id else None
+                if (
+                    kind in {"pause_run", "resume_run", "interrupt_run", "steer_run"}
+                    and target
+                    and str(target.get("state") or "")
+                    in (
+                        steer_settled_states
+                        if kind == "steer_run"
+                        else TERMINAL_RUN_STATES
+                    )
+                ):
+                    replacement = None
+                    if kind == "steer_run":
+                        replacement = self.store.get_run(
+                            str(worker.get("compute_release_replacement_run_id") or "")
+                        )
+                        if not replacement:
+                            raise RuntimeErrorBase(
+                                "Terminal-won steer has no exact fenced replacement"
+                            )
+                    claim = self.store.try_claim_worker_compute_release(
+                        worker_id,
+                        expected_updated_at=str(worker.get("updated_at") or ""),
+                        expected_last_run_id=str(worker.get("last_run_id") or ""),
+                        expected_state=str(worker.get("state") or ""),
+                        expected_container_id=str(
+                            worker.get("compute_release_container_id") or ""
+                        ),
+                        expected_session_fingerprint=str(
+                            worker.get("compute_release_session_fingerprint") or ""
+                        ),
+                        owner=self._executor_id,
+                        ttl_s=self._compute_release_claim_ttl_s(),
+                        kind=kind,
+                        target_run_id=target_run_id,
+                        expected_target_started_at=target_started_at,
+                        replacement_run=replacement,
+                    )
+                    if not claim:
+                        raise RuntimeErrorBase(
+                            "Terminal-won control claim generation changed"
+                        )
+                    if kind == "steer_run":
+                        operation = self.store.finalize_worker_steer_claim(
+                            worker_id,
+                            str(claim["token"]),
+                            int(claim["epoch"]),
+                            target_run_id=target_run_id,
+                            target_expected_state="running",
+                            replacement_run_id=str(replacement["run_id"]),
+                            replacement_instruction=str(replacement["instruction"]),
+                            runtime_fields={},
+                        )
+                    else:
+                        operation = self.store.finalize_worker_run_control_claim(
+                            worker_id,
+                            str(claim["token"]),
+                            int(claim["epoch"]),
+                            kind=kind,
+                            target_run_id=target_run_id,
+                            target_expected_states=("running",),
+                            target_state="paused" if kind == "pause_run" else "interrupted",
+                            worker_state="ready",
+                            runtime_fields={},
+                            release_lease=True,
+                        )
+                    if not operation:
+                        raise RuntimeErrorBase(
+                            "Terminal-won control could not clear its exact fence"
+                        )
+                    if kind == "steer_run":
+                        self._replay_pending_lifecycle_effects()
+                        self._finish_bound_steer_action(
+                            operation_id=str(
+                                worker.get("compute_release_operation_id")
+                                or claim.get("token")
+                                or ""
+                            ),
+                            target_run_id=target_run_id,
+                            replacement_run=dict(
+                                operation.get("replacement_run") or replacement or {}
+                            ),
+                        )
+                    recovered.append(
+                        {
+                            "worker_id": worker_id,
+                            "project_id": worker.get("project_id"),
+                            "tenant_id": worker.get("tenant_id"),
+                            "owner_id": worker.get("owner_id"),
+                            "state": (operation.get("worker") or {}).get("state"),
+                            "kind": kind,
+                            "target_run_id": target_run_id,
+                            "replacement_run_id": (
+                                (operation.get("replacement_run") or {}).get("run_id")
+                                if kind == "steer_run"
+                                else None
+                            ),
+                            "target_transitioned": bool(
+                                operation.get("target_transitioned")
+                            ),
+                            "terminal_won": bool(operation.get("terminal_won")),
+                        }
+                    )
+                    continue
+                if kind == "stop_run":
+                    item = self._recover_stop_run_claim(worker, target_run_id)
+                elif kind == "steer_run":
+                    replacement_run_id = str(
+                        worker.get("compute_release_replacement_run_id") or ""
+                    ).strip()
+                    replacement = self.store.get_run(replacement_run_id)
+                    if (
+                        not replacement
+                        or str(replacement.get("worker_id") or "") != worker_id
+                        or str(replacement.get("state") or "")
+                        not in {"queued", *steer_settled_states}
+                    ):
+                        raise RuntimeErrorBase(
+                            "Expired steer claim has no exact fenced replacement"
+                        )
+                    recovered_replacement = self.steer_worker(
+                        worker_id,
+                        "",
+                        run_id=target_run_id,
+                        _prepared_instruction=str(
+                            replacement.get("instruction") or ""
+                        ),
+                        _replacement_run_id=replacement_run_id,
+                    )
+                    self._finish_bound_steer_action(
+                        operation_id=str(
+                            worker.get("compute_release_operation_id")
+                            or worker.get("compute_release_token")
+                            or ""
+                        ),
+                        target_run_id=target_run_id,
+                        replacement_run=recovered_replacement,
+                    )
+                    item = {
+                        "worker_id": worker_id,
+                        "project_id": worker.get("project_id"),
+                        "tenant_id": worker.get("tenant_id"),
+                        "owner_id": worker.get("owner_id"),
+                        "state": (self.store.get_worker(worker_id) or {}).get(
+                            "state"
+                        ),
+                        "kind": "steer_run",
+                        "target_run_id": target_run_id,
+                        "replacement_run_id": recovered_replacement.get("run_id"),
+                        "target_transitioned": True,
+                    }
+                elif kind in {
+                    "pause_run",
+                    "resume_run",
+                    "interrupt_run",
+                    "pause_worker",
+                    "resume_worker",
+                }:
+                    # Re-enter the same public control path so takeover must
+                    # satisfy the persisted exact target/start identity and
+                    # the adapter must prove (or idempotently re-prove) the
+                    # requested runtime state before the durable CAS commits.
+                    if kind == "pause_run":
+                        updated = self.pause_worker(
+                            worker_id, run_id=target_run_id
+                        )
+                    elif kind == "resume_run":
+                        updated = self.resume_worker(
+                            worker_id, run_id=target_run_id
+                        )
+                    elif kind == "interrupt_run":
+                        updated = self.interrupt_worker(
+                            worker_id, run_id=target_run_id
+                        )
+                    elif kind == "pause_worker":
+                        updated = self._pause_worker_without_run(worker_id)
+                    else:
+                        updated = self._resume_worker_without_run(worker_id)
+                    durable_target = self.store.get_run(target_run_id)
+                    item = (
+                        {
+                            "worker_id": worker_id,
+                            "project_id": worker.get("project_id"),
+                            "tenant_id": worker.get("tenant_id"),
+                            "owner_id": worker.get("owner_id"),
+                            "state": updated.get("state"),
+                            "kind": kind,
+                            "target_run_id": target_run_id,
+                            "target_transitioned": bool(
+                                durable_target
+                                and str(durable_target.get("state") or "")
+                                != str(
+                                    {
+                                        "pause_run": "running",
+                                        "resume_run": "paused",
+                                        "interrupt_run": "running",
+                                    }.get(kind, "")
+                                )
+                            ),
+                        }
+                        if updated
+                        else None
+                    )
+                elif kind == "terminate_worker":
+                    termination = self._execute_worker_termination_claim(worker)
+                    updated = dict((termination or {}).get("worker") or {})
+                    item = (
+                        {
+                            "worker_id": worker_id,
+                            "project_id": worker.get("project_id"),
+                            "tenant_id": worker.get("tenant_id"),
+                            "owner_id": worker.get("owner_id"),
+                            "state": updated.get("state"),
+                            "kind": "terminate_worker",
+                            "target_run_id": target_run_id,
+                            "target_transitioned": True,
+                        }
+                        if updated and bool((termination or {}).get("target_transitioned"))
+                        else None
+                    )
+                elif kind in {"idle", "needs_input", "paused", "max_duration"}:
+                    target_error = ""
+                    if kind == "max_duration":
+                        target_error = (
+                            "Run exceeded its configured maximum duration; compute was "
+                            "stopped and workspace state was preserved."
+                        )
+                    item = self._release_worker_compute(
+                        worker,
+                        idle_seconds=0,
+                        kind=kind,
+                        target_run_id=target_run_id,
+                        target_started_at=target_started_at,
+                        target_error_text=target_error,
+                    )
+                else:
+                    # Unknown/future control claims remain fenced.  Never turn
+                    # an unrecognised exact operation into broad termination.
+                    logger.error(
+                        "Unsupported expired GlassHive lifecycle claim %s for worker %s; retaining fence",
+                        kind,
+                        worker_id,
+                    )
+                    item = None
+                durable_worker = self.store.get_worker(worker_id) or {}
+                if item and str(durable_worker.get("compute_release_token") or ""):
+                    raise RuntimeErrorBase(
+                        "Recovered control did not clear its exact lifecycle fence"
+                    )
+                if item:
+                    recovered.append(item)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to recover compute release for GlassHive worker %s: %s",
+                    worker_id,
+                    exc,
+                )
+        return recovered
+
+    def reap_needs_input_workers_once(self) -> list[dict[str, object]]:
+        reaped: list[dict[str, object]] = []
+        for worker in self.store.list_all_workers():
+            worker_id = str(worker.get("worker_id") or "")
+            if (
+                not worker_id
+                or str(worker.get("state") or "") != "needs_input"
+                or worker.get("compute_released_at")
+            ):
+                continue
+            nonterminal = self.store.list_nonterminal_runs_for_worker(worker_id)
+            needs_input_runs = [
+                run
+                for run in nonterminal
+                if str(run.get("state") or "") == "needs_input"
+            ]
+            executing = [
+                run
+                for run in nonterminal
+                if str(run.get("state") or "") in {"running", "settling", "paused"}
+            ]
+            if len(needs_input_runs) != 1 or executing:
+                continue
+            item = self._release_needs_input_compute(worker, needs_input_runs[0])
+            if item:
+                reaped.append(item)
+        return reaped
+
+    def _queue_status_refresh_interval_s(self) -> int:
+        return _bounded_int_env(
+            "GLASSHIVE_QUEUE_STATUS_REFRESH_INTERVAL_S",
+            120,
+            min_value=10,
+            max_value=24 * 60 * 60,
+        )
+
+    def _now_datetime(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _normalized_datetime(value: str | datetime) -> datetime:
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _queue_callback_id(kind: str, run: dict, *, sequence: int = 0) -> str:
+        material = ":".join(
+            (
+                str(kind),
+                str(run.get("run_id") or ""),
+                str(
+                    run.get("queue_wait_generation")
+                    or run.get("queue_wait_episode")
+                    or 0
+                ),
+                str(sequence),
+                str(run.get("queue_deadline_at") or ""),
+            )
+        )
+        return f"cb_queue_{kind}_" + hashlib.sha256(
+            material.encode("utf-8")
+        ).hexdigest()
+
+    def _record_queue_callback_result(
+        self,
+        run_id: str,
+        record: dict | None,
+    ) -> None:
+        self.store.mark_queue_callback_state(
+            run_id,
+            state="enqueued" if record is not None else "unavailable",
+        )
+
+    def _emit_queue_timeout_callback(self, run: dict) -> None:
+        worker = self.store.get_worker(str(run.get("worker_id") or ""))
+        if not worker:
+            return
+        message = str(run.get("failure_user_message") or "").strip() or (
+            "This work left the queue after its bounded admission wait expired. "
+            "The workspace is preserved and the work can be retried."
+        )
+        record = self._emit_callback(
+            worker,
+            "run.failed",
+            run=run,
+            message=message,
+            insert_once=True,
+        )
+        self._record_queue_callback_result(str(run["run_id"]), record)
+
+    def process_queued_work_status_once(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 100,
+    ) -> dict[str, int]:
+        current = self._normalized_datetime(now or self._now_datetime())
+        now_iso = current.isoformat()
+        result = {"timedOut": 0, "refreshed": 0, "callbacksRecovered": 0}
+
+        for candidate in self.store.list_due_queue_timeouts(
+            now=now_iso,
+            limit=limit,
+        ):
+            worker = self.store.get_worker(str(candidate.get("worker_id") or ""))
+            callback_id = str(candidate.get("queue_terminal_callback_id") or "")
+            terminal_message = (
+                "This work left the queue after its bounded admission wait expired. "
+                "The workspace is preserved and the work can be retried."
+            )
+            terminal_snapshot = {
+                **candidate,
+                "state": "failed",
+                "failure_class": "queue_wait_timeout",
+                "failure_retryable": 1,
+                "failure_user_message": terminal_message,
+            }
+            callback_intent = None
+            if worker:
+                callback_intent = self._emit_callback(
+                    worker,
+                    "run.failed",
+                    run=terminal_snapshot,
+                    message=terminal_message,
+                    callback_id=callback_id,
+                    insert_once=True,
+                    submit_delivery=False,
+                    persist_callback=False,
+                )
+            expired = self.store.expire_queued_run_if_due(
+                str(candidate.get("run_id") or ""),
+                expected_deadline=str(candidate.get("queue_deadline_at") or ""),
+                expected_generation=int(
+                    candidate.get("queue_wait_generation") or 0
+                ),
+                expected_callback_id=callback_id,
+                callback_intent=callback_intent,
+                now=now_iso,
+            )
+            if not expired:
+                continue
+            result["timedOut"] += 1
+            self.store.finalize_schedule_for_run(
+                str(expired.get("run_id") or ""),
+                state="failed",
+                last_error=str(expired.get("failure_user_message") or ""),
+            )
+            worker_id = str(expired.get("worker_id") or "")
+            if not self.store.list_nonterminal_runs_for_worker(worker_id):
+                self.store.update_worker_state(
+                    worker_id,
+                    "ready",
+                    last_error=str(expired.get("failure_user_message") or ""),
+                )
+            if worker:
+                self._submit_persisted_callback(worker, expired.get("_callback"))
+
+        for terminal in self.store.list_queue_timeout_callbacks_pending(
+            limit=limit
+        ):
+            before = str(terminal.get("queue_callback_state") or "")
+            self._emit_queue_timeout_callback(terminal)
+            after = self.store.get_run(str(terminal.get("run_id") or "")) or {}
+            if str(after.get("queue_callback_state") or "") != before:
+                result["callbacksRecovered"] += 1
+
+        refresh_interval = self._queue_status_refresh_interval_s()
+        for queued in self.store.list_due_queue_status(
+            now=now_iso,
+            limit=limit,
+        ):
+            sequence = int(queued.get("queue_status_sequence") or 0) + 1
+            callback_id = self._queue_callback_id(
+                "refresh", queued, sequence=sequence
+            )
+            worker = self.store.get_worker(str(queued.get("worker_id") or ""))
+            record = None
+            if worker:
+                record = self._emit_callback(
+                    worker,
+                    "run.queue_status",
+                    run=queued,
+                    message="This work is still queued.",
+                    callback_id=callback_id,
+                    insert_once=True,
+                    submit_delivery=False,
+                    persist_callback=False,
+                )
+            next_status_at = (
+                current + timedelta(seconds=refresh_interval)
+            ).isoformat()
+            qa_refresh_race = self._consume_local_qa(
+                "status_refresh_timeout_race", worker or {}, queued
+            )
+            if qa_refresh_race is not None:
+                terminal_callback_id = str(
+                    queued.get("queue_terminal_callback_id") or ""
+                )
+                terminal_message = (
+                    "This work left the queue after its bounded admission wait expired. "
+                    "The workspace is preserved and the work can be retried."
+                )
+                terminal_intent = None
+                if worker:
+                    terminal_intent = self._emit_callback(
+                        worker,
+                        "run.failed",
+                        run={
+                            **queued,
+                            "state": "failed",
+                            "failure_class": "queue_wait_timeout",
+                            "failure_retryable": 1,
+                            "failure_user_message": terminal_message,
+                        },
+                        message=terminal_message,
+                        callback_id=terminal_callback_id,
+                        insert_once=True,
+                        submit_delivery=False,
+                        persist_callback=False,
+                    )
+                timeout_won = self.store.expire_queued_run_if_due(
+                    str(queued.get("run_id") or ""),
+                    expected_deadline=str(queued.get("queue_deadline_at") or ""),
+                    expected_generation=int(
+                        queued.get("queue_wait_generation") or 0
+                    ),
+                    expected_callback_id=terminal_callback_id,
+                    callback_intent=terminal_intent,
+                    now=str(queued.get("queue_deadline_at") or now_iso),
+                )
+                self._record_local_qa_effect(
+                    qa_refresh_race,
+                    "timeout_cas_won_before_status_refresh"
+                    if timeout_won is not None
+                    else "timeout_cas_already_settled",
+                )
+            advanced = self.store.advance_queue_status_refresh(
+                str(queued.get("run_id") or ""),
+                expected_next_status_at=str(
+                    queued.get("queue_next_status_at") or ""
+                ),
+                expected_generation=int(
+                    queued.get("queue_wait_generation") or 0
+                ),
+                expected_deadline=str(queued.get("queue_deadline_at") or ""),
+                callback_id=callback_id,
+                callback_intent=record,
+                now=now_iso,
+                next_status_at=next_status_at,
+            )
+            if advanced is None:
+                continue
+            if worker:
+                self._submit_persisted_callback(worker, advanced.get("_callback"))
+            result["refreshed"] += 1
+        return result
+
+    def _process_scheduler_cycle(self) -> None:
+        for phase_name, phase in (
+            ("scheduled runs", self.process_due_schedules_once),
+            ("queued work status", self.process_queued_work_status_once),
+            (
+                "expired lifecycle claims",
+                self.recover_expired_compute_release_claims_once,
+            ),
+            ("worker retries", self.process_due_worker_retries_once),
+            ("provider liveness", self.process_provider_liveness_once),
+        ):
+            if self._shutdown_event.is_set():
+                return
+            try:
+                phase()
+            except Exception:
+                logger.exception("GlassHive scheduler phase failed: %s", phase_name)
+
+    def _next_scheduler_wait_s(self, interval: float) -> float:
+        now = self._now_datetime()
+        if self.store.list_due_retry_worker_ids(
+            now_iso=now.isoformat(),
+            limit=1,
+        ):
+            # A due retry can briefly collide with the processor that just
+            # requeued it. Keep the scheduler eligible to retry after that
+            # local owner exits instead of sleeping the full idle interval.
+            return 0.01
+        candidates = [
+            value
+            for value in (
+                self.store.next_queued_retry_after(now_iso=now.isoformat()),
+                self.store.next_queue_maintenance_at(now=now.isoformat()),
+            )
+            if value
+        ]
+        if not candidates:
+            return interval
+        try:
+            parsed = min(self._normalized_datetime(value) for value in candidates)
+        except ValueError:
+            return interval
+        delay_s = parsed.timestamp() - now.timestamp()
+        if delay_s <= 0:
+            return 0.01
+        return min(interval, max(0.01, delay_s))
+
+    def _safe_next_scheduler_wait_s(self, interval: float) -> float:
+        try:
+            return self._next_scheduler_wait_s(interval)
+        except Exception:
+            logger.exception("GlassHive scheduler wait calculation failed")
+            return interval
+
+    def _host_lease_ttl_s(self) -> float:
+        return _bounded_float_env(
+            "WPR_HOST_LEASE_TTL_S",
+            30.0,
+            min_value=5.0,
+            max_value=3600.0,
+        )
+
+    def _host_runtime_family(self, worker: dict) -> str:
+        profile = str(worker.get("profile") or worker.get("runtime") or "host").lower()
+        if profile.startswith("codex"):
+            return "codex"
+        if profile.startswith("claude"):
+            return "claude"
+        return "openclaw"
+
+    def _host_run_lane(self, worker: dict) -> str:
+        return self._trusted_run_lane(worker)
+
+    def _worker_with_host_lease(self, worker: dict, run_id: str) -> dict:
+        if not run_id:
+            return worker
+        scoped_worker = {**worker, "_active_run_id": run_id}
+        if str(worker.get("execution_mode") or "docker") != "host":
+            return scoped_worker
+        lease = self.store.get_active_host_run_lease_for_run(run_id)
+        return {**scoped_worker, "_host_run_lease": lease} if lease else scoped_worker
+
+    def _prompt_workbench_scheduled_authority(
+        self, worker: dict
+    ) -> dict[str, str] | None:
+        bundle = self._bootstrap_bundle_for(worker) or {}
+        authority = bundle.get("viventium_launch_authority")
+        if not (
+            str(bundle.get("execution_policy") or "").strip()
+            == PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+            and isinstance(authority, dict)
+            and authority.get("version") == 1
+            and not isinstance(authority.get("version"), bool)
+            and authority.get("kind")
+            == PROMPT_WORKBENCH_SCHEDULED_AUTHORITY_KIND
+            and authority.get("execution_mode") == "docker"
+            and str(worker.get("execution_mode") or "").strip() == "docker"
+        ):
+            return None
+        callbacks = bundle.get("callbacks")
+        origin_ref = (
+            str(callbacks.get("origin_ref") or "").strip()
+            if isinstance(callbacks, dict)
+            else ""
+        )
+        return {"origin_ref": origin_ref}
+
+    def _deferred_capability_authorization(self, worker: dict) -> dict[str, str] | None:
+        bundle = self._bootstrap_bundle_for(worker) or {}
+        raw = bundle.get("glasshive_capability_authorization")
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise BrokerAdmissionError(
+                "broker_authorization_invalid",
+                "The deferred capability authorization is invalid.",
+            )
+        if set(raw) != {
+            "version",
+            "status",
+            "authorization_ref",
+            "origin_ref",
+            "max_expires_at",
+            "scope_fingerprint",
+        }:
+            raise BrokerAdmissionError(
+                "broker_authorization_invalid",
+                "The deferred capability authorization is invalid.",
+            )
+        if (
+            isinstance(raw.get("version"), bool)
+            or raw.get("version") != 1
+            or raw.get("status") != "pending_admission"
+        ):
+            raise BrokerAdmissionError(
+                "broker_authorization_invalid",
+                "The deferred capability authorization is invalid.",
+            )
+        normalized = {
+            "authorization_ref": str(raw.get("authorization_ref") or "").strip(),
+            "origin_ref": str(raw.get("origin_ref") or "").strip(),
+            "max_expires_at": str(raw.get("max_expires_at") or "").strip(),
+            "scope_fingerprint": str(raw.get("scope_fingerprint") or "").strip(),
+        }
+        if any(not value or len(value) > 512 for value in normalized.values()):
+            raise BrokerAdmissionError(
+                "broker_authorization_invalid",
+                "The deferred capability authorization is invalid.",
+            )
+        env = bundle.get("env")
+        if isinstance(env, dict) and str(
+            env.get("GLASSHIVE_CAPABILITY_BROKER_TOKEN") or ""
+        ).strip():
+            raise BrokerAdmissionError(
+                "broker_authorization_invalid",
+                "A deferred capability authorization must not contain a bearer grant.",
+            )
+        try:
+            maximum = datetime.fromisoformat(
+                normalized["max_expires_at"].replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise BrokerAdmissionError(
+                "broker_authorization_invalid",
+                "The deferred capability authorization is invalid.",
+            ) from exc
+        if maximum.tzinfo is None or maximum <= datetime.now(timezone.utc):
+            raise BrokerAdmissionError(
+                "capability_authorization_horizon_expired",
+                "The deferred capability authorization has expired.",
+                needs_input=True,
+            )
+        return normalized
+
+    def _run_local_admitted_worker(
+        self,
+        worker: dict,
+        run: dict,
+        *,
+        authority_context: dict[str, str] | None = None,
+    ) -> dict:
+        qa_auth = self._consume_local_qa(
+            "provider_auth_missing", worker, run
+        )
+        if qa_auth is not None:
+            self._record_local_qa_effect(
+                qa_auth, "blocked_before_runtime_admission"
+            )
+            raise BrokerAdmissionError(
+                "provider_auth_missing",
+                "The configured model provider authorization is unavailable.",
+                needs_input=True,
+            )
+        bundle = self._bootstrap_bundle_for(worker) or {}
+        launch_authority = bundle.get("viventium_launch_authority")
+        automatic_clean_room = bool(
+            str(bundle.get("execution_policy") or "").strip()
+            == PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+            and isinstance(launch_authority, dict)
+            and launch_authority.get("version") == 1
+            and launch_authority.get("kind") == "conversation_orchestrator"
+            and launch_authority.get("execution_mode") == "docker"
+        )
+        scheduled_authority = self._prompt_workbench_scheduled_authority(worker)
+        requirement = bundle.get("glasshive_capability_requirement")
+        if isinstance(requirement, dict):
+            try:
+                requirement_version = int(requirement.get("version"))
+            except (TypeError, ValueError):
+                requirement_version = 0
+            if (
+                requirement_version == 1
+                and requirement.get("required") is True
+                and str(requirement.get("status") or "").strip() == "unavailable"
+            ):
+                raise BrokerAdmissionError(
+                    "required_capability_unavailable",
+                    "Required connected-account authorization is unavailable. Reauthorize or restore the protected capability to continue.",
+                    needs_input=True,
+                )
+        authorization = self._deferred_capability_authorization(worker)
+        if automatic_clean_room and authorization is None:
+            raise BrokerAdmissionError(
+                "capability_authorization_missing",
+                "Connect or reauthorize the model account, then resume this work.",
+                needs_input=True,
+            )
+        if scheduled_authority is not None and authorization is not None:
+            raise BrokerAdmissionError(
+                "scheduled_provider_authorization_persisted",
+                "Scheduled provider authorization must be prepared for the exact live sandbox.",
+            )
+        if authorization is None and scheduled_authority is None:
+            return worker
+        load_viventium_runtime_env(
+            {
+                "VIVENTIUM_GLASSHIVE_ADMISSION_URL",
+                "VIVENTIUM_GLASSHIVE_ADMISSION_SECRET",
+            }
+        )
+        admission_url = str(
+            os.environ.get("VIVENTIUM_GLASSHIVE_ADMISSION_URL") or ""
+        ).strip()
+        admission_secret = str(
+            os.environ.get("VIVENTIUM_GLASSHIVE_ADMISSION_SECRET") or ""
+        ).strip()
+        prepared_broker_url = ""
+        if scheduled_authority is not None:
+            container_generation_id = str(
+                (authority_context or {}).get("container_generation_id") or ""
+            ).strip()
+            prepare_body = {
+                "ownerId": str(worker.get("owner_id") or "").strip(),
+                "originRef": scheduled_authority["origin_ref"],
+                "workRef": scheduled_authority["origin_ref"],
+                "workerId": str(worker.get("worker_id") or "").strip(),
+                "runId": str(run.get("run_id") or "").strip(),
+                "containerGenerationId": container_generation_id,
+            }
+            prepared = prepare_scheduled_provider_authorization(
+                admission_url,
+                secret=admission_secret,
+                body=prepare_body,
+                timeout_seconds=_bounded_float_env(
+                    "VIVENTIUM_GLASSHIVE_ADMISSION_TIMEOUT_S",
+                    5.0,
+                    min_value=0.1,
+                    max_value=30.0,
+                ),
+            )
+            authorization = {
+                "authorization_ref": prepared.authorization_ref,
+                "origin_ref": prepared.origin_ref,
+                "max_expires_at": prepared.max_expires_at,
+                "scope_fingerprint": prepared.scope_fingerprint,
+            }
+            origin_ref = prepared.origin_ref
+            work_ref = prepared.work_ref
+            prepared_broker_url = prepared.broker_url
+        else:
+            delegation = self.store.get_delegation_for_worker(
+                str(worker.get("worker_id") or ""),
+                tenant_id=str(worker.get("tenant_id") or "local"),
+                owner_id=str(worker.get("owner_id") or ""),
+            )
+            if not delegation:
+                raise BrokerAdmissionError(
+                    "broker_admission_binding_missing",
+                    "The deferred capability authorization is not bound to durable work.",
+                )
+            origin_ref = str(delegation.get("origin_ref") or "").strip()
+            if not origin_ref or origin_ref != authorization["origin_ref"]:
+                raise BrokerAdmissionError(
+                    "broker_admission_binding_mismatch",
+                    "The deferred capability authorization binding is invalid.",
+                )
+            container_generation_id = str(
+                (authority_context or {}).get("container_generation_id") or ""
+            ).strip()
+            if not re.fullmatch(r"[a-f0-9]{64}", container_generation_id):
+                raise BrokerAdmissionError(
+                    "broker_admission_generation_unavailable",
+                    "The exact mission container generation is unavailable.",
+                    retryable=True,
+                )
+            work_ref = str(delegation.get("work_ref") or "")
+        if authorization is None:
+            raise BrokerAdmissionError(
+                "broker_authorization_invalid",
+                "The deferred provider authorization is unavailable.",
+            )
+        admission_body = {
+            "authorizationRef": authorization["authorization_ref"],
+            "originRef": origin_ref,
+            "runId": str(run.get("run_id") or ""),
+            "workRef": work_ref,
+            "workerId": str(worker.get("worker_id") or ""),
+            "containerGenerationId": container_generation_id,
+        }
+        grant = admit_capability_grant(
+            admission_url,
+            secret=admission_secret,
+            body=admission_body,
+            expected_scope_fingerprint=authorization["scope_fingerprint"],
+            expected_max_expires_at=authorization["max_expires_at"],
+            timeout_seconds=_bounded_float_env(
+                "VIVENTIUM_GLASSHIVE_ADMISSION_TIMEOUT_S",
+                5.0,
+                min_value=0.1,
+                max_value=30.0,
+            ),
+        )
+        revocation_binding = {
+            **admission_body,
+            "grantId": grant.grant_id,
+        }
+        revocation = self.store.enqueue_capability_grant_revocation(
+            revocation_binding
+        )
+        revocation_id = str(revocation.get("revocation_id") or "")
+        if prepared_broker_url and grant.broker_url != prepared_broker_url:
+            self.store.activate_capability_grant_revocation(revocation_id)
+            self._replay_pending_capability_grant_revocations(
+                revocation_id=revocation_id
+            )
+            raise BrokerAdmissionError(
+                "scheduled_provider_authorization_response_invalid",
+                "The admitted provider authorization changed its broker binding.",
+            )
+        provider = (
+            "anthropic"
+            if str(worker.get("profile") or "").strip() == "claude-code"
+            else "openai"
+        )
+        try:
+            preflight_provider_authorization(
+                admission_url,
+                grant_token=grant.grant_token,
+                provider=provider,
+                expected_worker_id=str(worker.get("worker_id") or ""),
+                expected_run_id=str(run.get("run_id") or ""),
+                timeout_seconds=_bounded_float_env(
+                    "VIVENTIUM_GLASSHIVE_PROVIDER_PREFLIGHT_TIMEOUT_S",
+                    3.0,
+                    min_value=0.1,
+                    max_value=30.0,
+                ),
+            )
+            self.store.record_provider_authorization_preflight(
+                str(run.get("run_id") or ""),
+                provider=provider,
+                status="authorized",
+                failure_class="",
+            )
+        except BrokerAdmissionError as exc:
+            self.store.record_provider_authorization_preflight(
+                str(run.get("run_id") or ""),
+                provider=provider,
+                status=(
+                    "needs_input"
+                    if exc.needs_input
+                    else "retryable_failure"
+                    if exc.retryable
+                    else "rejected"
+                ),
+                failure_class=exc.code,
+            )
+            self.store.activate_capability_grant_revocation(revocation_id)
+            self._replay_pending_capability_grant_revocations(
+                revocation_id=revocation_id
+            )
+            raise
+        except Exception:
+            self.store.record_provider_authorization_preflight(
+                str(run.get("run_id") or ""),
+                provider=provider,
+                status="rejected",
+                failure_class="provider_auth_preflight_unexpected",
+            )
+            self.store.activate_capability_grant_revocation(revocation_id)
+            self._replay_pending_capability_grant_revocations(
+                revocation_id=revocation_id
+            )
+            raise
+        bundle = self._bootstrap_bundle_for(worker) or {}
+        run_bundle = merge_bootstrap_bundle(
+            bundle,
+            {
+                "glasshive_capability_broker": grant.broker_projection(),
+            },
+        ) or {}
+        # Clean-room canonicalization deliberately removes bearer material from
+        # every durable/public bundle. Overlay the exact admitted run grant only
+        # after that projection so ProfiledWorkerRuntime can place it in the
+        # generation-bound tmpfs secret file without ever persisting it.
+        run_bundle["env"] = {
+            **(
+                run_bundle.get("env")
+                if isinstance(run_bundle.get("env"), dict)
+                else {}
+            ),
+            "GLASSHIVE_CAPABILITY_BROKER_TOKEN": grant.grant_token,
+        }
+        # The bearer exists only on this in-memory run object. It never updates
+        # workers.bootstrap_bundle_json or another durable row.
+        return {
+            **worker,
+            "bootstrap_bundle_json": json.dumps(run_bundle, ensure_ascii=False),
+            "_run_local_capability_binding": revocation_binding,
+            "_run_local_capability_revocation_id": str(
+                revocation_id
+            ),
+        }
+
+    def _revoke_run_local_capability_grant(self, worker: dict) -> None:
+        revocation_id = str(
+            worker.get("_run_local_capability_revocation_id") or ""
+        ).strip()
+        if not revocation_id:
+            return
+        self.store.activate_capability_grant_revocation(revocation_id)
+        self._replay_pending_capability_grant_revocations(
+            revocation_id=revocation_id
+        )
+
+    def _host_resource_capacity_error(
+        self,
+        prospective_worker: dict | None = None,
+        *,
+        docker_cached_only: bool = False,
+        _include_snapshot: bool = False,
+    ) -> HostCapacityError | None | tuple[HostCapacityError | None, dict[str, object]]:
+        leases = self.store.list_active_host_run_leases()
+        observed_lease_ids = [
+            str(lease.get("lease_id") or "")
+            for lease in leases
+            if str(lease.get("lease_id") or "")
+        ]
+        host_leases: list[dict] = []
+        active_docker_worker_ids: set[str] = set()
+        active_docker_memory_reservations: dict[str, int] = {}
+        unknown_lease_worker = False
+        for lease in leases:
+            lease_worker = self.store.get_worker(str(lease.get("worker_id") or ""))
+            if not lease_worker:
+                unknown_lease_worker = True
+                continue
+            if str(lease_worker.get("execution_mode") or "docker") == "docker":
+                lease_worker_id = str(lease_worker.get("worker_id") or "")
+                active_docker_worker_ids.add(lease_worker_id)
+                active_docker_memory_reservations[lease_worker_id] = max(
+                    0,
+                    int(lease.get("reserved_memory_bytes") or 0)
+                    or _worker_resource_memory_reservation(lease_worker),
+                )
+            else:
+                host_leases.append(lease)
+        usage = host_resource_usage(host_leases)
+        child_processes = usage.child_processes
+        threads = usage.threads
+        available_memory = usage.available_memory_bytes
+        available_disk = usage.available_disk_bytes
+        process_probe_ok = usage.process_probe_ok and not unknown_lease_worker
+        memory_probe_ok = usage.memory_probe_ok
+        disk_probe_ok = usage.disk_probe_ok
+        prospective_docker = (
+            isinstance(prospective_worker, dict)
+            and str(prospective_worker.get("execution_mode") or "docker") == "docker"
+        )
+        prospective_memory_reservation = (
+            _worker_resource_memory_reservation(prospective_worker)
+            if prospective_docker
+            else 0
+        )
+        prospective_reservation = {
+            "childProcesses": (
+                _bounded_int_env(
+                    "WPR_DOCKER_PROCESS_RESERVATION",
+                    20,
+                    min_value=1,
+                    max_value=100000,
+                )
+                if prospective_docker
+                else 0
+            ),
+            "threads": (
+                _bounded_int_env(
+                    "WPR_DOCKER_THREAD_RESERVATION",
+                    512,
+                    min_value=1,
+                    max_value=1000000,
+                )
+                if prospective_docker
+                else 0
+            ),
+            "memoryBytes": (
+                prospective_memory_reservation
+                if prospective_docker
+                else 0
+            ),
+            "diskBytes": (
+                _bounded_int_env(
+                    "WPR_DOCKER_DISK_RESERVATION_MB",
+                    4096,
+                    min_value=1,
+                    max_value=1048576,
+                )
+                * 1024**2
+                if prospective_docker
+                else 0
+            ),
+        }
+        if prospective_docker or active_docker_worker_ids:
+            docker_probe = getattr(self.runtime, "isolated_resource_usage", None)
+            try:
+                if callable(docker_probe):
+                    try:
+                        docker_usage = docker_probe(cached_only=docker_cached_only)
+                    except TypeError:
+                        docker_usage = docker_probe()
+                else:
+                    docker_usage = None
+            except Exception:
+                logger.exception("Docker resource admission probe failed")
+                docker_usage = None
+            if not isinstance(docker_usage, dict):
+                process_probe_ok = False
+                memory_probe_ok = False
+                disk_probe_ok = False
+            else:
+                try:
+                    running_containers = int(
+                        docker_usage.get("running_worker_containers") or 0
+                    )
+                    docker_child_processes = int(
+                        docker_usage.get("child_processes") or 0
+                    )
+                    docker_threads = int(docker_usage.get("threads") or 0)
+                    available_memory = min(
+                        available_memory,
+                        int(docker_usage.get("available_memory_bytes") or 0),
+                    )
+                    available_disk = min(
+                        available_disk,
+                        int(docker_usage.get("available_disk_bytes") or 0),
+                    )
+                except (TypeError, ValueError):
+                    running_containers = 0
+                    process_probe_ok = False
+                    memory_probe_ok = False
+                    disk_probe_ok = False
+                process_probe_ok = process_probe_ok and bool(
+                    docker_usage.get("process_probe_ok")
+                )
+                memory_probe_ok = memory_probe_ok and bool(
+                    docker_usage.get("memory_probe_ok")
+                )
+                disk_probe_ok = disk_probe_ok and bool(
+                    docker_usage.get("disk_probe_ok")
+                )
+                # Reserve a conservative envelope for accepted Docker leases
+                # whose container has not started yet, plus this prospective
+                # mission. Actual container usage replaces its reservation on
+                # subsequent admissions.
+                running_worker_ids_value = docker_usage.get("running_worker_ids")
+                if running_worker_ids_value is None:
+                    # Backward-compatible fail-safe for runtime adapters that
+                    # have not yet published per-worker accounting evidence.
+                    pending_active_containers = max(
+                        0,
+                        len(active_docker_worker_ids) - max(0, running_containers),
+                    )
+                    pending_containers = pending_active_containers + (
+                        1 if prospective_docker else 0
+                    )
+                    pending_memory_reservation = sum(
+                        sorted(
+                            active_docker_memory_reservations.values(),
+                            reverse=True,
+                        )[:pending_active_containers]
+                    ) + prospective_memory_reservation
+                    child_processes += docker_child_processes
+                    threads += docker_threads
+                else:
+                    running_worker_ids = {
+                        str(worker_id).strip()
+                        for worker_id in running_worker_ids_value
+                        if str(worker_id).strip()
+                    }
+                    if len(running_worker_ids) != max(0, running_containers):
+                        process_probe_ok = False
+                        memory_probe_ok = False
+                        disk_probe_ok = False
+                    worker_process_counts_value = docker_usage.get(
+                        "worker_process_counts"
+                    )
+                    if isinstance(worker_process_counts_value, dict):
+                        measured_worker_counts: dict[str, tuple[int, int]] = {}
+                        try:
+                            for worker_id, counts_value in worker_process_counts_value.items():
+                                normalized_worker_id = str(worker_id or "").strip()
+                                if not normalized_worker_id or not isinstance(
+                                    counts_value, dict
+                                ):
+                                    raise ValueError("invalid worker process measurement")
+                                measured_worker_counts[normalized_worker_id] = (
+                                    int(counts_value.get("child_processes") or 0),
+                                    int(counts_value.get("threads") or 0),
+                                )
+                            if (
+                                set(measured_worker_counts) != running_worker_ids
+                                or any(
+                                    process_count < 0 or thread_count < 0
+                                    for process_count, thread_count in measured_worker_counts.values()
+                                )
+                                or sum(
+                                    process_count
+                                    for process_count, _thread_count in measured_worker_counts.values()
+                                )
+                                != docker_child_processes
+                                or sum(
+                                    thread_count
+                                    for _process_count, thread_count in measured_worker_counts.values()
+                                )
+                                != docker_threads
+                            ):
+                                raise ValueError("inconsistent worker process measurement")
+                        except (TypeError, ValueError):
+                            process_probe_ok = False
+                            measured_worker_counts = {}
+                        prospective_worker_id = str(
+                            (prospective_worker or {}).get("worker_id") or ""
+                        ).strip()
+                        counted_worker_ids = active_docker_worker_ids & running_worker_ids
+                        if prospective_docker and prospective_worker_id in running_worker_ids:
+                            counted_worker_ids.add(prospective_worker_id)
+                        child_processes += sum(
+                            measured_worker_counts.get(worker_id, (0, 0))[0]
+                            for worker_id in counted_worker_ids
+                        )
+                        threads += sum(
+                            measured_worker_counts.get(worker_id, (0, 0))[1]
+                            for worker_id in counted_worker_ids
+                        )
+                    else:
+                        # Older runtime adapters expose only aggregate Docker
+                        # usage, so retain the conservative legacy behavior.
+                        child_processes += docker_child_processes
+                        threads += docker_threads
+                    pending_worker_ids = active_docker_worker_ids - running_worker_ids
+                    prospective_worker_id = str(
+                        (prospective_worker or {}).get("worker_id") or ""
+                    ).strip()
+                    if prospective_docker and (
+                        not prospective_worker_id
+                        or prospective_worker_id not in running_worker_ids
+                    ):
+                        pending_id = prospective_worker_id or "__prospective_worker__"
+                        pending_worker_ids.add(pending_id)
+                        active_docker_memory_reservations[pending_id] = (
+                            prospective_memory_reservation
+                        )
+                    pending_containers = len(pending_worker_ids)
+                    pending_memory_reservation = sum(
+                        active_docker_memory_reservations.get(
+                            worker_id,
+                            _configured_worker_resource_memory_bytes("standard"),
+                        )
+                        for worker_id in pending_worker_ids
+                    )
+                child_processes += pending_containers * _bounded_int_env(
+                    "WPR_DOCKER_PROCESS_RESERVATION",
+                    20,
+                    min_value=1,
+                    max_value=100000,
+                )
+                threads += pending_containers * _bounded_int_env(
+                    "WPR_DOCKER_THREAD_RESERVATION",
+                    512,
+                    min_value=1,
+                    max_value=1000000,
+                )
+                available_memory = max(
+                    0,
+                    available_memory - pending_memory_reservation,
+                )
+                available_disk = max(
+                    0,
+                    available_disk
+                    - pending_containers
+                    * _bounded_int_env(
+                        "WPR_DOCKER_DISK_RESERVATION_MB",
+                        4096,
+                        min_value=1,
+                        max_value=1048576,
+                    )
+                    * 1024**2,
+                )
+        process_limit = _bounded_int_env(
+            "WPR_HOST_MAX_CHILD_PROCESSES", 64, min_value=1, max_value=100000
+        )
+        thread_limit = _bounded_int_env(
+            "WPR_HOST_MAX_THREADS", 2048, min_value=1, max_value=1000000
+        )
+        memory_headroom = _bounded_int_env(
+            "WPR_HOST_MIN_AVAILABLE_MEMORY_MB",
+            2048,
+            min_value=0,
+            max_value=1048576,
+        ) * 1024**2
+        disk_headroom = _bounded_int_env(
+            "WPR_HOST_MIN_AVAILABLE_DISK_MB",
+            4096,
+            min_value=0,
+            max_value=1048576,
+        ) * 1024**2
+        available_after_reservation = {
+            "childProcesses": max(0, process_limit - child_processes),
+            "threads": max(0, thread_limit - threads),
+            "memoryBytes": max(0, available_memory),
+            "diskBytes": max(0, available_disk),
+        }
+        required_headroom = {
+            "childProcesses": 1,
+            "threads": 1,
+            "memoryBytes": memory_headroom,
+            "diskBytes": disk_headroom,
+        }
+        shortage = {
+            key: max(0, required_headroom[key] - available_after_reservation[key])
+            for key in required_headroom
+        }
+        available_before_reservation = {
+            key: available_after_reservation[key] + prospective_reservation[key]
+            for key in required_headroom
+        }
+        total_required = {
+            key: required_headroom[key] + prospective_reservation[key]
+            for key in required_headroom
+        }
+        snapshot: dict[str, object] = {
+            "available": available_before_reservation,
+            "availableAfterReservation": available_after_reservation,
+            "required": required_headroom,
+            "shortage": shortage,
+            "reservation": prospective_reservation,
+            "observedLeaseIds": observed_lease_ids,
+        }
+        error: HostCapacityError | None = None
+        if not (
+            process_probe_ok
+            and memory_probe_ok
+            and disk_probe_ok
+        ):
+            error = HostCapacityError(
+                "Host resource admission is waiting for a healthy resource probe.",
+                capacity_class="resource_probe_unavailable",
+            )
+        elif (
+            child_processes >= process_limit
+            or threads >= thread_limit
+            or available_memory < memory_headroom
+            or available_disk < disk_headroom
+        ):
+            error = HostCapacityError(
+                "Host resource headroom is below its configured admission guard.",
+                capacity_class="resource_pressure",
+            )
+        if error is not None:
+            error.available = dict(available_before_reservation)
+            error.required = dict(total_required)
+            error.shortage = dict(shortage)
+            error.reservation = dict(prospective_reservation)
+            error.next_retry_at = ""
+        if _include_snapshot:
+            return error, snapshot
+        return error
+
+    def _host_mutation_scope(self, worker: dict) -> str:
+        """Serialize potentially mutating host missions by a structural target identity.
+
+        Host CLIs intentionally retain broad filesystem capabilities. Until a trusted
+        caller supplies a target-repository identity, an unscoped mission therefore
+        takes one conservative shared mutation lease instead of racing another host
+        mission against an unknown checkout. User wording never changes this guard.
+        """
+
+        if (
+            str(worker.get("execution_mode") or "docker") != "host"
+            or self._host_run_lane(worker) != "mission"
+        ):
+            return ""
+        # The current bootstrap is partially model-authored and carries no
+        # authenticated target-repository provenance. Never allow its
+        # host_mutation_scope/target_repository_root fields to buy a separate
+        # lease. A future Core-owned target authority can replace this shared
+        # scope after it has an independently verified project binding.
+        return hashlib.sha256(b"host-mission:unscoped-mutation-target").hexdigest()
+
+    def _relieve_docker_resource_pressure(
+        self,
+        prospective_worker: dict,
+        pressure: HostCapacityError,
+    ) -> tuple[HostCapacityError | None, dict[str, object] | None]:
+        """Release only eligible idle compute, then re-measure before queueing.
+
+        Durable workspaces live outside the container generation. Retaining an
+        idle workstation is useful for fast takeover, but it must not strand a
+        newly accepted Parallel mission when the Docker VM is otherwise below
+        its admission headroom. Exact compute-release claims keep this recovery
+        safe against a concurrent resume, retry, or action.
+        """
+
+        if (
+            pressure.capacity_class != "resource_pressure"
+            or str(prospective_worker.get("execution_mode") or "docker") != "docker"
+        ):
+            return pressure, None
+        # Admission intentionally consults the background snapshot first, but releasing retained
+        # compute is a destructive lifecycle transition.  Confirm the pressure with a fresh probe
+        # immediately before selecting or releasing the first candidate.
+        current_pressure, current_snapshot = self._host_resource_capacity_error(
+            prospective_worker,
+            docker_cached_only=False,
+            _include_snapshot=True,
+        )
+        if (
+            current_pressure is None
+            or current_pressure.capacity_class != "resource_pressure"
+        ):
+            return current_pressure, current_snapshot
+        candidates: list[tuple[float, dict]] = []
+        prospective_worker_id = str(
+            prospective_worker.get("worker_id") or ""
+        ).strip()
+        for worker in self.store.list_all_workers():
+            worker_id = str(worker.get("worker_id") or "").strip()
+            if (
+                not worker_id
+                or worker_id == prospective_worker_id
+                or str(worker.get("execution_mode") or "docker") != "docker"
+                or worker.get("compute_released_at")
+                or str(worker.get("state") or "")
+                in {"terminated", "paused", "running", "starting", "needs_input"}
+                or self.store.get_active_run(worker_id)
+                or self.store.has_queued_runs(worker_id)
+            ):
+                continue
+            candidates.append((self._worker_idle_seconds(worker), worker))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        for idle_seconds, worker in candidates:
+            try:
+                released = self._release_worker_compute(
+                    worker,
+                    idle_seconds=idle_seconds,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to release idle compute during capacity recovery: %s",
+                    type(exc).__name__,
+                )
+                continue
+            if not released:
+                continue
+            current_pressure, current_snapshot = self._host_resource_capacity_error(
+                prospective_worker,
+                docker_cached_only=False,
+                _include_snapshot=True,
+            )
+            if (
+                current_pressure is None
+                or current_pressure.capacity_class != "resource_pressure"
+            ):
+                return current_pressure, current_snapshot
+        return current_pressure, current_snapshot
+
+    def _acquire_host_run_lease(self, worker: dict, run: dict) -> dict | None:
+        execution_mode = str(worker.get("execution_mode") or "docker")
+        lane = self._host_run_lane(worker)
+        if (
+            execution_mode == "host"
+            and lane == "mission"
+            and isolated_parallel_policy_enabled()
+        ):
+            raise HostCapacityError(
+                "Host-native mission admission is disabled by isolated Parallel policy.",
+                capacity_class="isolated_parallel_policy",
+            )
+        existing_lease = self.store.get_active_host_run_lease_for_run(
+            str(run.get("run_id") or "")
+        )
+        if existing_lease is not None:
+            exact_lease_owner = bool(
+                str(existing_lease.get("executor_id") or "") == self._executor_id
+                and str(existing_lease.get("worker_id") or "")
+                == str(worker.get("worker_id") or "")
+                and str(existing_lease.get("startup_state") or "") == "reserved"
+            )
+            exact_preaccept_reservation = bool(
+                exact_lease_owner
+                and str(run.get("state") or "") == "queued"
+                and not str(existing_lease.get("attempt_id") or "")
+                and not str(run.get("active_attempt_id") or "")
+            )
+            exact_claimed_handoff = bool(
+                exact_lease_owner
+                and str(existing_lease.get("attempt_id") or "")
+                == str(run.get("active_attempt_id") or "")
+                and str(run.get("state") or "") == "claimed"
+            )
+            if exact_preaccept_reservation or exact_claimed_handoff:
+                return {**existing_lease, "idempotent_replay": True}
+        # Docker isolates each mission's filesystem/process namespace, but all
+        # containers still consume the same workstation memory, disk and
+        # process budget. Apply the global guard before either substrate starts.
+        # Admission consumes only the background-refreshed Docker snapshot. A
+        # missing/stale snapshot queues fail-closed; it never cold-runs Docker
+        # CLI probes on the durable-acceptance critical path.
+        pressure, capacity_snapshot = self._host_resource_capacity_error(
+            worker,
+            docker_cached_only=True,
+            _include_snapshot=True,
+        )
+        qa_capacity: tuple[str, LocalQAFaultDirective] | None = None
+        for qa_boundary in (
+            "maximum_capacity_overflow",
+            "measured_memory_4_3_gib_vs_5_gib",
+            "last_reservation_competition",
+            "low_disk",
+        ):
+            directive = self._consume_local_qa(qa_boundary, worker, run)
+            if directive is not None:
+                qa_capacity = (qa_boundary, directive)
+                break
+        if qa_capacity is not None:
+            qa_boundary, directive = qa_capacity
+            parameters = directive.parameters
+            retry_seconds = int(parameters.get("nextRetrySeconds") or 5)
+            next_retry_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=retry_seconds)
+            ).isoformat()
+            if qa_boundary == "maximum_capacity_overflow":
+                pressure = HostCapacityError(
+                    "The mission lane is at its configured maximum capacity.",
+                    capacity_class="mission_slots",
+                    retry_after_s=retry_seconds,
+                    dimension="missionSlots",
+                    configured={"missionSlots": 1},
+                    used={"missionSlots": 1},
+                )
+                pressure.available = {"missionSlots": 0}
+                pressure.required = {"missionSlots": 1}
+                pressure.shortage = {"missionSlots": 1}
+                pressure.reservation = {"missionSlots": 1}
+                pressure.next_retry_at = next_retry_at
+                self._record_local_qa_effect(
+                    directive, "maximum_capacity_rejected_before_lease"
+                )
+            elif qa_boundary == "measured_memory_4_3_gib_vs_5_gib":
+                available = int(parameters["availableMemoryBytes"])
+                required = int(parameters["requiredMemoryBytes"])
+                reservation = int(parameters["reservationMemoryBytes"])
+                pressure = HostCapacityError(
+                    "Measured memory is below the exact admission requirement.",
+                    capacity_class="resource_pressure",
+                    retry_after_s=retry_seconds,
+                    dimension="memoryBytes",
+                )
+                pressure.available = {"memoryBytes": available}
+                pressure.required = {"memoryBytes": required}
+                pressure.shortage = {
+                    "memoryBytes": int(parameters["shortageMemoryBytes"])
+                }
+                pressure.reservation = {"memoryBytes": reservation}
+                pressure.next_retry_at = next_retry_at
+                self._record_local_qa_effect(
+                    directive, "measured_memory_rejected_before_lease"
+                )
+            elif qa_boundary == "low_disk":
+                available = int(parameters["availableDiskBytes"])
+                required = max(
+                    int((capacity_snapshot.get("required") or {}).get("diskBytes") or 0),
+                    4 * 1024**3,
+                )
+                reservation = int(
+                    (capacity_snapshot.get("reservation") or {}).get("diskBytes") or 0
+                )
+                pressure = HostCapacityError(
+                    "Measured disk headroom is below the admission guard.",
+                    capacity_class="resource_pressure",
+                    retry_after_s=retry_seconds,
+                    dimension="diskBytes",
+                )
+                pressure.available = {"diskBytes": available}
+                pressure.required = {"diskBytes": required}
+                pressure.shortage = {"diskBytes": max(0, required - available)}
+                pressure.reservation = {"diskBytes": reservation}
+                pressure.next_retry_at = next_retry_at
+                self._record_local_qa_effect(
+                    directive, "low_disk_rejected_before_lease"
+                )
+            else:
+                capacity_snapshot = {
+                    **capacity_snapshot,
+                    "available": {
+                        **dict(capacity_snapshot.get("available") or {}),
+                        "memoryBytes": int(parameters["availableMemoryBytes"]),
+                    },
+                    "required": {
+                        **dict(capacity_snapshot.get("required") or {}),
+                        "memoryBytes": int(parameters["requiredMemoryBytes"]),
+                    },
+                    "reservation": {
+                        **dict(capacity_snapshot.get("reservation") or {}),
+                        "memoryBytes": int(parameters["reservationMemoryBytes"]),
+                    },
+                }
+                self._record_local_qa_effect(
+                    directive, "last_reservation_competition_entered_atomic_lease"
+                )
+        if pressure and qa_capacity is None:
+            pressure, recovered_snapshot = self._relieve_docker_resource_pressure(
+                worker, pressure
+            )
+            if recovered_snapshot is not None:
+                capacity_snapshot = recovered_snapshot
+        if pressure:
+            raise pressure
+        capacity_next_retry_at = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=self._retry_base_delay_s("host_capacity"))
+        ).isoformat()
+        capacity_policy = self._host_capacity_policy()
+        try:
+            return self.store.acquire_host_run_lease(
+                runtime_family=self._host_runtime_family(worker),
+                lane=lane,
+                tenant_id=str(worker.get("tenant_id") or "local"),
+                owner_id=str(worker.get("owner_id") or ""),
+                worker_id=str(worker.get("worker_id") or ""),
+                run_id=str(run.get("run_id") or ""),
+                executor_id=self._executor_id,
+                **capacity_policy,
+                mutation_scope=(
+                    self._host_mutation_scope(worker)
+                    if execution_mode == "host"
+                    else ""
+                ),
+                lease_ttl_s=self._host_lease_ttl_s(),
+                capacity_available=dict(
+                    capacity_snapshot.get("available") or {}
+                ),
+                capacity_required=dict(
+                    capacity_snapshot.get("required") or {}
+                ),
+                capacity_reservation=dict(
+                    capacity_snapshot.get("reservation") or {}
+                ),
+                capacity_observed_lease_ids=list(
+                    capacity_snapshot.get("observedLeaseIds") or []
+                ),
+                capacity_next_retry_at=capacity_next_retry_at,
+            )
+        except HostRunLeaseCapacityError as exc:
+            error = HostCapacityError(
+                str(exc),
+                capacity_class=exc.capacity_class,
+                dimension=exc.dimension,
+                configured=exc.configured,
+                used=exc.used,
+            )
+            error.available = dict(exc.available)
+            error.required = dict(exc.required)
+            error.shortage = dict(exc.shortage)
+            error.reservation = dict(exc.reservation)
+            error.next_retry_at = str(exc.next_retry_at or capacity_next_retry_at)
+            raise error from exc
+
+    def _observe_host_process(self, payload: dict[str, object]) -> None:
+        run_id = str(payload.get("run_id") or "")
+        lease = self.store.get_active_host_run_lease_for_run(run_id)
+        if not lease:
+            return
+        self.store.heartbeat_host_run_lease(
+            str(lease["lease_id"]),
+            executor_id=self._executor_id,
+            pid=int(payload.get("pid") or 0) or None,
+            process_group=int(payload.get("process_group") or 0) or None,
+            process_start_identity=str(payload.get("process_start_identity") or ""),
+            startup_identity_kind=str(payload.get("identity_kind") or ""),
+            startup_container_id=str(payload.get("container_id") or ""),
+            startup_session_id=str(payload.get("session_id") or ""),
+            lease_ttl_s=self._host_lease_ttl_s(),
+        )
+
+    def _observe_run_start(self, payload: dict[str, object]) -> None:
+        """Accept one exact durable runtime identity and release its launch flock."""
+
+        run_id = str(payload.get("run_id") or "").strip()
+        worker_id = str(payload.get("worker_id") or "").strip()
+        with self._pending_run_starts_lock:
+            pending = dict(self._pending_run_starts.get(run_id) or {})
+        if not pending or worker_id != str(pending.get("worker_id") or ""):
+            raise RunStartupRejectedError(
+                "The exact run startup reservation is no longer active.",
+                termination_confirmed=False,
+            )
+        pending_worker = pending.get("worker")
+        if not isinstance(pending_worker, dict):
+            raise RunStartupRejectedError(
+                "The exact run startup reservation has no worker identity.",
+                termination_confirmed=False,
+            )
+        identity_kind = str(payload.get("identity_kind") or "").strip().lower()
+        if getattr(self.runtime, "requires_run_start_identity", True) is False:
+            expected_identity_kind = "in_process"
+        else:
+            execution_mode = str(
+                pending_worker.get("execution_mode") or "docker"
+            ).strip().lower()
+            expected_identity_kind = {
+                "host": "host_process",
+                "docker": "docker_session",
+            }.get(execution_mode, "")
+        if identity_kind != expected_identity_kind:
+            raise RunStartupRejectedError(
+                "The reported runtime identity grade does not match the reserved execution mode.",
+                termination_confirmed=False,
+            )
+        result = self.store.confirm_host_run_start(
+            worker_id=worker_id,
+            run_id=run_id,
+            run_started_at=str(pending.get("run_started_at") or ""),
+            lease_id=str(pending.get("lease_id") or ""),
+            startup_token=str(pending.get("startup_token") or ""),
+            executor_id=self._executor_id,
+            identity_kind=identity_kind,
+            pid=int(payload.get("pid") or 0) or None,
+            process_group=int(payload.get("process_group") or 0) or None,
+            process_start_identity=str(
+                payload.get("process_start_identity") or ""
+            ),
+            container_id=str(payload.get("container_id") or ""),
+            session_id=str(payload.get("session_id") or ""),
+            allow_runtime_invocation=False,
+            callback_record=pending.get("callback_record")
+            if isinstance(pending.get("callback_record"), dict)
+            else None,
+        )
+        if result is None:
+            raise RunStartupRejectedError(
+                "The exact run startup reservation changed before confirmation.",
+                termination_confirmed=False,
+            )
+        with self._pending_run_starts_lock:
+            current = self._pending_run_starts.get(run_id)
+            if current is not None:
+                current["confirmed"] = True
+                confirmed_run = result.get("run")
+                if isinstance(confirmed_run, dict):
+                    current["run"] = dict(confirmed_run)
+                    current["run_started_at"] = str(
+                        confirmed_run.get("runtime_invoked_at") or ""
+                    )
+        guard = pending.get("guard")
+        if isinstance(guard, _WorkerLifecycleGuard):
+            guard.release()
+        if identity_kind == "docker_session" and is_parallel_clean_room_bootstrap(
+            None, self._bootstrap_bundle_for(pending_worker) or {}
+        ):
+            audit_worker = (
+                self._refresh_runtime_info(worker_id, state="running", last_error="")
+                or pending_worker
+            )
+            try:
+                capture_worker_isolation_audit(
+                    store=self.store,
+                    runtime=self.runtime,
+                    worker=audit_worker,
+                    run_id=run_id,
+                    container_id=str(payload.get("container_id") or ""),
+                )
+            except Exception:
+                logger.warning(
+                    "Confirmed worker isolation could not produce an audited observation",
+                    exc_info=True,
+                )
+        callback = result.get("callback")
+        callbacks = pending.get("callbacks")
+        worker = pending.get("worker")
+        if (
+            isinstance(callback, dict)
+            and isinstance(callbacks, dict)
+            and isinstance(worker, dict)
+        ):
+            # Network delivery happens only after the durable CAS and flock release.
+            self.executor.submit(
+                self._deliver_callback_record,
+                dict(worker),
+                callback,
+                dict(callbacks),
+            )
+
+    def _confirm_in_process_run_start(self, pending: dict[str, object]) -> None:
+        self._observe_run_start(
+            {
+                "worker_id": str(pending.get("worker_id") or ""),
+                "run_id": str(pending.get("run_id") or ""),
+                "identity_kind": "in_process",
+                "pid": 0,
+                "process_group": 0,
+                "process_start_identity": "",
+                "container_id": "",
+                "session_id": "in-process",
+            }
+        )
+
+    @staticmethod
+    def _json_object(value: object) -> dict[str, object]:
+        if isinstance(value, dict):
+            return dict(value)
+        try:
+            decoded = json.loads(str(value or "{}"))
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
+    def _observe_native_event(self, observation: dict[str, object]) -> None:
+        """Persist one prompt-free provider lifecycle projection for an exact run."""
+
+        worker_id = str(observation.get("worker_id") or "").strip()
+        run_id = str(observation.get("run_id") or "").strip()
+        provider = str(observation.get("provider") or "").strip().lower()
+        event = observation.get("event")
+        if provider not in {"codex", "claude"} or not isinstance(event, dict):
+            return
+        event_type = str(event.get("event_type") or "").strip()
+        payload = event.get("payload")
+        if not event_type.startswith("provider.") or not isinstance(payload, dict):
+            return
+        run = self.store.get_run(run_id)
+        if not run or str(run.get("worker_id") or "") != worker_id:
+            return
+        worker = self.store.get_worker(worker_id)
+        if not worker:
+            return
+
+        capabilities = self._json_object(run.get("native_capabilities_json"))
+        child_projection_observed = event_type.startswith("provider.child.") or (
+            event_type == "provider.team.message"
+        )
+        capabilities.update(
+            {
+                "provider": provider,
+                "providerStream": True,
+            }
+        )
+        if child_projection_observed:
+            capabilities["childProjection"] = True
+        else:
+            capabilities.setdefault("childProjection", False)
+        existing_summary = self._json_object(run.get("native_child_summary_json"))
+        projection = NativeTeamProjection.from_summary(existing_summary)
+        if not projection.observable:
+            projection = NativeTeamProjection(provider=provider, observable=True)
+        projection.apply(event)
+
+        updates: dict[str, object] = {
+            "native_capabilities_json": json.dumps(capabilities, sort_keys=True),
+            "native_child_summary_json": json.dumps(projection.summary() or {}, sort_keys=True),
+        }
+        if event_type == "provider.session.started":
+            updates["native_session_id"] = str(payload.get("sessionId") or "")[:256]
+        self.store.update_run(run_id, **updates)
+        self.store.add_event(
+            str(worker.get("project_id") or run.get("project_id") or ""),
+            worker_id,
+            run_id,
+            event_type,
+            "Native provider lifecycle updated",
+            payload=payload,
+        )
+
+    def _provider_internal_retry_limit(self) -> int:
+        return _bounded_int_env(
+            "GLASSHIVE_PROVIDER_INTERNAL_RETRY_LIMIT",
+            3,
+            min_value=1,
+            max_value=100,
+        )
+
+    def _provider_no_progress_timeout_s(self) -> float:
+        return _bounded_float_env(
+            "GLASSHIVE_PROVIDER_NO_PROGRESS_TIMEOUT_S",
+            900.0,
+            min_value=1.0,
+            max_value=30 * 24 * 3600.0,
+        )
+
+    def _settle_provider_liveness_attention(self, run: dict[str, object]) -> None:
+        if run.get("_attention_transitioned") is not True:
+            return
+        run_id = str(run.get("run_id") or "")
+        worker_id = str(run.get("worker_id") or "")
+        worker = self.store.get_worker(worker_id)
+        if not run_id or not worker:
+            return
+        self._invalidate_worker_processor(worker_id)
+        self.store.finalize_schedule_for_run(
+            run_id,
+            state="needs_input",
+            last_error=str(run.get("error_text") or ""),
+        )
+        current_worker = self.store.get_worker(worker_id) or worker
+        self._release_needs_input_compute(current_worker, run)
+        self._replay_pending_lifecycle_effects()
+
+    def _observe_provider_liveness(
+        self, observation: dict[str, object]
+    ) -> dict[str, object] | None:
+        """Persist one prompt-free provider retry or progress observation."""
+
+        worker_id = str(observation.get("worker_id") or "").strip()
+        run_id = str(observation.get("run_id") or "").strip()
+        attempt_id = str(observation.get("attempt_id") or "").strip()
+        run = self.store.get_run(run_id)
+        if (
+            not worker_id
+            or not run_id
+            or not attempt_id
+            or not run
+            or str(run.get("worker_id") or "") != worker_id
+            or str(run.get("active_attempt_id") or "") != attempt_id
+        ):
+            return None
+        updated = self.store.observe_provider_liveness(
+            run_id=run_id,
+            expected_attempt_id=attempt_id,
+            kind=str(observation.get("kind") or ""),
+            failure_class=str(observation.get("failure_class") or ""),
+            runtime=str(observation.get("runtime") or ""),
+            model=str(observation.get("model") or ""),
+            source_sequence=int(observation.get("source_sequence") or 0),
+            source_digest=str(observation.get("source_digest") or ""),
+            observed_at=str(observation.get("observed_at") or utc_now()),
+            retry_limit=self._provider_internal_retry_limit(),
+        )
+        if updated and updated.get("_attention_transitioned") is True:
+            self._settle_provider_liveness_attention(updated)
+        return updated
+
+    def process_provider_liveness_once(self) -> list[dict[str, object]]:
+        transitioned = self.store.transition_stalled_provider_liveness_runs(
+            now=self._now_datetime().isoformat(),
+            inactivity_seconds=self._provider_no_progress_timeout_s(),
+        )
+        for run in transitioned:
+            self._settle_provider_liveness_attention(run)
+        return transitioned
+
+    def _native_child_reconcile_seconds(self) -> float:
+        return _bounded_float_env(
+            "GLASSHIVE_NATIVE_CHILD_RECONCILE_SECONDS",
+            120.0,
+            min_value=0.01,
+            max_value=120.0,
+        )
+
+    def _settle_native_children(
+        self,
+        worker: dict,
+        run: dict,
+        output: str,
+        *,
+        terminal_generation: dict[str, str] | None = None,
+    ) -> str | None:
+        """Hold terminal truth while a proven native child remains live.
+
+        The root result is persisted before waiting. Unknown or unobservable
+        provider schemas never enter settling. A missing child bookend is
+        bounded by the configured window (120 seconds maximum) and becomes an
+        explicit degraded projection rather than pinning the mission forever.
+        """
+
+        run_id = str(run.get("run_id") or "")
+        generation = (
+            dict(terminal_generation)
+            if isinstance(terminal_generation, dict)
+            else self._terminal_generation_for_run(run)
+        )
+        durable = self.store.get_run(run_id) or run
+        capabilities = self._json_object(durable.get("native_capabilities_json"))
+        summary = self._json_object(durable.get("native_child_summary_json"))
+        projection = NativeTeamProjection.from_summary(summary)
+        current_summary = projection.summary()
+        if (
+            capabilities.get("childProjection") is not True
+            or not current_summary
+            or int(current_summary.get("activeCount") or 0) <= 0
+        ):
+            return str(durable.get("state") or "running")
+
+        root_exited_at = datetime.now(timezone.utc)
+        summary_with_root = {
+            **current_summary,
+            "rootExitedAt": root_exited_at.isoformat(),
+            "degraded": False,
+        }
+        transitioned = self.store.settle_run_if_current(
+            run_id,
+            output_text=output,
+            native_child_summary_json=json.dumps(summary_with_root, sort_keys=True),
+            **generation,
+        )
+        if not transitioned:
+            return None
+        self.store.add_event(
+            str(worker.get("project_id") or run.get("project_id") or ""),
+            str(worker.get("worker_id") or run.get("worker_id") or ""),
+            run_id,
+            "run.settling",
+            "Root result is ready while native child reconciliation continues",
+            payload={"activeChildCount": int(current_summary.get("activeCount") or 0)},
+        )
+
+        timeout_seconds = self._native_child_reconcile_seconds()
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline and not self._shutdown_event.is_set():
+            latest = self.store.get_run(run_id) or {}
+            if str(latest.get("state") or "") != "settling":
+                return str(latest.get("state") or "")
+            latest_summary = self._json_object(latest.get("native_child_summary_json"))
+            latest_projection = NativeTeamProjection.from_summary(latest_summary)
+            reduced = latest_projection.summary()
+            if not reduced or int(reduced.get("activeCount") or 0) <= 0:
+                return "settling"
+            time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
+
+        latest = self.store.get_run(run_id) or {}
+        if str(latest.get("state") or "") != "settling":
+            return str(latest.get("state") or "")
+        latest_summary = self._json_object(latest.get("native_child_summary_json"))
+        projection = NativeTeamProjection.from_summary(
+            latest_summary,
+            reconcile_seconds=max(1, int(timeout_seconds)),
+        )
+        decision = projection.settlement(
+            root_exited_at=root_exited_at,
+            now=root_exited_at + timedelta(seconds=max(1, int(timeout_seconds))),
+        )
+        if decision.state == "degraded":
+            degraded_summary = {
+                **(projection.summary() or {}),
+                "rootExitedAt": root_exited_at.isoformat(),
+                "degraded": True,
+                "lostChildRefs": list(decision.lost_child_refs),
+            }
+            updated = self.store.update_native_settling_summary_if_current(
+                run_id,
+                native_child_summary_json=json.dumps(degraded_summary, sort_keys=True),
+                **generation,
+            )
+            if not updated:
+                return None
+            self.store.add_event(
+                str(worker.get("project_id") or run.get("project_id") or ""),
+                str(worker.get("worker_id") or run.get("worker_id") or ""),
+                run_id,
+                "provider.child.reconciliation_lost",
+                "Native child state became unknown after the bounded reconciliation window",
+                payload={"lostChildRefs": list(decision.lost_child_refs)},
+            )
+        return "settling"
+
+    def _release_host_run_lease(self, run_id: str, *, reason: str) -> None:
+        if reason == "runtime_returned":
+            run = self.store.get_run(str(run_id))
+            if run and str(run.get("state") or "") in {"running", "settling"}:
+                # The terminal run CAS releases this lease in the same SQLite
+                # transaction. Releasing it when the adapter returns would
+                # briefly expose a running row without exact dispatch
+                # ownership, allowing a concurrent reconciliation read to
+                # queue and retry a completed single-use provider turn.
+                return
+        lease = self.store.get_active_host_run_lease_for_run(run_id)
+        worker = (
+            self.store.get_worker(str(lease.get("worker_id") or ""))
+            if lease
+            else None
+        )
+        if lease and self._lease_is_fenced_by_lifecycle_claim(worker, lease):
+            return
+        if lease and str(lease.get("executor_id") or "") == self._executor_id:
+            self.store.release_host_run_lease(
+                str(lease["lease_id"]),
+                executor_id=self._executor_id,
+                reason=reason,
+            )
+
+    def _host_lease_heartbeat_loop(self) -> None:
+        interval = max(1.0, min(10.0, self._host_lease_ttl_s() / 3))
+        while not self._shutdown_event.wait(interval):
+            self._heartbeat_host_run_leases_once()
+
+    def _heartbeat_host_run_leases_once(self) -> None:
+        """Renew only live-run leases; one store failure must not kill the daemon."""
+
+        try:
+            leases = self.store.list_active_host_run_leases()
+        except Exception:
+            logger.exception("Host lease heartbeat pass failed")
+            return
+        for lease in leases:
+            if str(lease.get("executor_id") or "") != self._executor_id:
+                continue
+            try:
+                lease_worker = self.store.get_worker(
+                    str(lease.get("worker_id") or "")
+                )
+                if self._lease_is_fenced_by_lifecycle_claim(
+                    lease_worker, lease
+                ):
+                    self.store.heartbeat_host_run_lease(
+                        str(lease["lease_id"]),
+                        executor_id=self._executor_id,
+                        lease_ttl_s=self._host_lease_ttl_s(),
+                    )
+                    continue
+                run = self.store.get_run(str(lease.get("run_id") or ""))
+                if run is None or str(run.get("state") or "") in TERMINAL_RUN_STATES:
+                    self.store.release_host_run_lease(
+                        str(lease["lease_id"]),
+                        executor_id=self._executor_id,
+                        reason="run_terminal",
+                    )
+                    continue
+                self.store.heartbeat_host_run_lease(
+                    str(lease["lease_id"]),
+                    executor_id=self._executor_id,
+                    lease_ttl_s=self._host_lease_ttl_s(),
+                )
+            except Exception:
+                logger.exception(
+                    "Host lease heartbeat failed for lease %s",
+                    str(lease.get("lease_id") or ""),
+                )
+        try:
+            self.reconcile_host_run_leases(stale_after_s=self._host_lease_ttl_s())
+        except Exception:
+            logger.exception("Host lease heartbeat reconciliation failed")
+
+    def _isolated_readiness_loop(self) -> None:
+        refresher = getattr(
+            self.runtime, "refresh_isolated_parallel_readiness", None
+        )
+        if not callable(refresher):
+            return
+        while not self._shutdown_event.is_set():
+            try:
+                refresher()
+            except Exception:
+                logger.exception("Background isolated runtime readiness probe failed")
+            if self._shutdown_event.wait(10.0):
+                return
+
+    @staticmethod
+    def _lease_is_fenced_by_lifecycle_claim(
+        worker: dict | None, lease: dict
+    ) -> bool:
+        """Keep the exact runtime lease owned by an unfinished control."""
+
+        if not worker or not str(worker.get("compute_release_token") or ""):
+            return False
+        return bool(
+            str(worker.get("compute_release_target_run_id") or "")
+            == str(lease.get("run_id") or "")
+            and str(worker.get("compute_release_kind") or "")
+            in {
+                "paused",
+                "max_duration",
+                "pause_run",
+                "resume_run",
+                "interrupt_run",
+                "steer_run",
+                "stop_run",
+                "terminate_worker",
+            }
+        )
+
+    def reconcile_host_run_leases(self, *, stale_after_s: float | None = None) -> dict[str, int]:
+        threshold = datetime.now(timezone.utc) - timedelta(
+            seconds=(self._host_lease_ttl_s() if stale_after_s is None else max(0, stale_after_s))
+        )
+        result = {"renewed": 0, "released": 0, "unchanged": 0}
+        identity_reader = getattr(self.runtime, "host_process_identity", None)
+        absence_reader = getattr(self.runtime, "host_process_absence", None)
+        for lease in self.store.list_stale_host_run_leases(
+            heartbeat_before=threshold.isoformat()
+        ):
+            worker = self.store.get_worker(str(lease.get("worker_id") or ""))
+            if self._lease_is_fenced_by_lifecycle_claim(worker, lease):
+                result["unchanged"] += 1
+                continue
+            run = self.store.get_run(str(lease.get("run_id") or ""))
+            if run is None or str(run.get("state") or "") in TERMINAL_RUN_STATES:
+                released = self.store.release_host_run_lease(
+                    str(lease["lease_id"]),
+                    executor_id=None,
+                    reason="run_terminal",
+                )
+                result["released" if released else "unchanged"] += 1
+                continue
+            if str(lease.get("startup_state") or "") == "reserved":
+                expired_preaccept_without_runtime = bool(
+                    str(run.get("state") or "") == "queued"
+                    and not str(run.get("active_attempt_id") or "")
+                    and not str(lease.get("attempt_id") or "")
+                    and not int(lease.get("pid") or 0)
+                    and not int(lease.get("process_group") or 0)
+                    and not str(lease.get("process_start_identity") or "")
+                    and not str(lease.get("startup_identity_kind") or "")
+                    and not str(lease.get("startup_container_id") or "")
+                    and not str(lease.get("startup_session_id") or "")
+                )
+                if expired_preaccept_without_runtime:
+                    released = self.store.release_expired_preaccept_host_run_lease(
+                        lease_id=str(lease["lease_id"]),
+                        run_id=str(lease.get("run_id") or ""),
+                        reason="expired_preaccept_no_runtime",
+                    )
+                    result["released" if released else "unchanged"] += 1
+                    continue
+                outcome = self._reconcile_reserved_host_run_start(
+                    lease,
+                    worker=worker,
+                    identity_reader=identity_reader,
+                )
+                result[outcome] += 1
+                continue
+            if str(lease.get("startup_state") or "") == "termination_unconfirmed":
+                outcome = self._reconcile_termination_unconfirmed_host_run_start(
+                    lease,
+                    absence_reader=absence_reader,
+                )
+                result[outcome] += 1
+                continue
+            identity = (
+                identity_reader(worker, str(lease.get("run_id") or ""))
+                if worker and callable(identity_reader)
+                else None
+            )
+            if identity and bool(identity.get("verified")):
+                updated = self.store.heartbeat_host_run_lease(
+                    str(lease["lease_id"]),
+                    executor_id=None,
+                    pid=int(identity.get("pid") or 0) or None,
+                    process_group=int(identity.get("process_group") or 0) or None,
+                    process_start_identity=str(identity.get("process_start_identity") or ""),
+                    lease_ttl_s=self._host_lease_ttl_s(),
+                    reconciled=True,
+                )
+                result["renewed" if updated else "unchanged"] += 1
+            else:
+                released = self.store.reconcile_dead_host_run_lease(
+                    lease_id=str(lease["lease_id"]),
+                    run_id=str(lease.get("run_id") or ""),
+                    expected_attempt_id=str(lease.get("attempt_id") or ""),
+                    expected_executor_id=str(lease.get("executor_id") or ""),
+                    reason="stale_owner_no_verified_process",
+                )
+                result["released" if released else "unchanged"] += 1
+        return result
+
+    def _reconcile_termination_unconfirmed_host_run_start(
+        self,
+        stale_lease: dict,
+        *,
+        absence_reader,
+    ) -> str:
+        """Retry exact cleanup until the fenced startup generation is proven absent."""
+
+        worker_id = str(stale_lease.get("worker_id") or "")
+        run_id = str(stale_lease.get("run_id") or "")
+        try:
+            guard = self._acquire_worker_lifecycle_guard(worker_id)
+        except RuntimeErrorBase:
+            return "unchanged"
+        try:
+            lease = self.store.get_host_run_lease(
+                str(stale_lease.get("lease_id") or "")
+            )
+            worker = self.store.get_worker(worker_id)
+            run = self.store.get_run(run_id)
+            if (
+                not lease
+                or not worker
+                or not run
+                or str(lease.get("status") or "") != "active"
+                or str(lease.get("startup_state") or "")
+                != "termination_unconfirmed"
+                or str(lease.get("startup_token") or "")
+                != str(stale_lease.get("startup_token") or "")
+                or str(run.get("state") or "") in TERMINAL_RUN_STATES
+            ):
+                return "unchanged"
+
+            captured_identity = self._reserved_start_identity(lease)
+            cleanup = getattr(
+                self.runtime, "cleanup_unconfirmed_run_start", None
+            )
+            cleaned = False
+            if captured_identity and callable(cleanup):
+                try:
+                    cleaned = cleanup(worker, run_id, captured_identity) is True
+                except Exception:
+                    cleaned = False
+
+            confirmed_absent = False
+            if not cleaned and callable(absence_reader):
+                try:
+                    confirmed_absent = absence_reader(worker, run_id) is True
+                except Exception:
+                    confirmed_absent = False
+            if not cleaned and not confirmed_absent:
+                return "unchanged"
+
+            recovered = self.store.requeue_unconfirmed_host_run_start(
+                worker_id=worker_id,
+                run_id=run_id,
+                lease_id=str(lease.get("lease_id") or ""),
+                startup_token=str(lease.get("startup_token") or ""),
+                retry_after=(
+                    datetime.now(timezone.utc) + timedelta(seconds=1)
+                ).isoformat(),
+                error_text=(
+                    "GlassHive proved the interrupted startup generation absent "
+                    "and queued the exact run for retry."
+                ),
+            )
+            if recovered is None:
+                return "unchanged"
+            self._scheduler_wake_event.set()
+            return "released"
+        finally:
+            guard.release()
+
+    @staticmethod
+    def _reserved_start_identity(lease: dict) -> dict[str, object] | None:
+        """Return only an identity durably published before startup confirmation."""
+
+        kind = str(lease.get("startup_identity_kind") or "").strip()
+        start_identity = str(lease.get("process_start_identity") or "").strip()
+        session_id = str(lease.get("startup_session_id") or "").strip()
+        container_id = str(lease.get("startup_container_id") or "").strip()
+        try:
+            pid = int(lease.get("pid") or 0)
+            process_group = int(lease.get("process_group") or pid or 0)
+        except (TypeError, ValueError):
+            return None
+        if kind == "host_process":
+            valid = bool(
+                pid > 0
+                and start_identity.startswith("ps-lstart:")
+                and session_id
+                and not container_id
+            )
+        elif kind == "docker_session":
+            valid = bool(
+                pid > 0
+                and container_id
+                and session_id
+                and start_identity.startswith(
+                    f"docker:{container_id}:{session_id}:"
+                )
+            )
+        else:
+            valid = False
+        if not valid:
+            return None
+        return {
+            "identity_kind": kind,
+            "pid": pid,
+            "process_group": process_group or pid,
+            "process_start_identity": start_identity,
+            "container_id": container_id,
+            "session_id": session_id,
+        }
+
+    @staticmethod
+    def _restart_identity_matches_reserved(
+        captured: dict[str, object], current: dict[str, object] | None
+    ) -> bool:
+        if not current or current.get("verified") is not True:
+            return False
+        fields = (
+            "identity_kind",
+            "pid",
+            "process_group",
+            "process_start_identity",
+            "container_id",
+            "session_id",
+        )
+        return all(
+            str(current.get(field) or "") == str(captured.get(field) or "")
+            for field in fields
+        )
+
+    @staticmethod
+    def _restart_identity_candidate(
+        current: dict[str, object] | None,
+        *,
+        run_id: str,
+    ) -> dict[str, object] | None:
+        """Validate a token-bound active-session generation without lease copy."""
+
+        if not current or current.get("verified") is not True:
+            return None
+        kind = str(current.get("identity_kind") or "").strip()
+        start_identity = str(
+            current.get("process_start_identity") or ""
+        ).strip()
+        container_id = str(current.get("container_id") or "").strip()
+        session_id = str(current.get("session_id") or "").strip()
+        try:
+            pid = int(current.get("pid") or 0)
+            process_group = int(current.get("process_group") or pid or 0)
+        except (TypeError, ValueError):
+            return None
+        if kind == "host_process":
+            valid = bool(
+                pid > 0
+                and process_group > 0
+                and session_id
+                and not container_id
+                and start_identity.startswith("ps-lstart:")
+            )
+        elif kind == "docker_session":
+            valid = bool(
+                pid > 0
+                and process_group > 0
+                and container_id
+                and session_id
+                and start_identity.startswith(
+                    f"docker:{container_id}:{session_id}:{run_id}:"
+                )
+            )
+        else:
+            valid = False
+        if not valid:
+            return None
+        return {
+            "identity_kind": kind,
+            "pid": pid,
+            "process_group": process_group,
+            "process_start_identity": start_identity,
+            "container_id": container_id,
+            "session_id": session_id,
+        }
+
+    @staticmethod
+    def _restart_identity_has_startup_binding(
+        lease: dict,
+        current: dict[str, object] | None,
+    ) -> bool:
+        startup_token = str(lease.get("startup_token") or "")
+        actual_digest = str(
+            (current or {}).get("startup_token_digest") or ""
+        ).strip()
+        if not startup_token or not re.fullmatch(r"[0-9a-f]{64}", actual_digest):
+            return False
+        expected_digest = hashlib.sha256(startup_token.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(actual_digest, expected_digest)
+
+    def _reconcile_reserved_host_run_start(
+        self,
+        stale_lease: dict,
+        *,
+        worker: dict | None,
+        identity_reader,
+    ) -> str:
+        """Confirm or safely retire one restart-surviving startup reservation."""
+
+        worker_id = str(stale_lease.get("worker_id") or "")
+        run_id = str(stale_lease.get("run_id") or "")
+        callback_delivery: tuple[dict, dict, dict] | None = None
+        try:
+            guard = self._acquire_worker_lifecycle_guard(worker_id)
+        except RuntimeErrorBase:
+            return "unchanged"
+        try:
+            lease = self.store.get_host_run_lease(
+                str(stale_lease.get("lease_id") or "")
+            )
+            worker = self.store.get_worker(worker_id)
+            run = self.store.get_run(run_id)
+            if (
+                not lease
+                or not worker
+                or not run
+                or str(lease.get("status") or "") != "active"
+                or str(lease.get("startup_state") or "") != "reserved"
+                or str(lease.get("startup_token") or "")
+                != str(stale_lease.get("startup_token") or "")
+                or str(run.get("state") or "") in TERMINAL_RUN_STATES
+            ):
+                return "unchanged"
+
+            expired_claim_without_dispatch = bool(
+                str(lease.get("expires_at") or "")
+                <= datetime.now(timezone.utc).isoformat()
+                and str(run.get("state") or "") == "claimed"
+                and not str(run.get("runtime_invoked_at") or "")
+                and self._reserved_start_identity(lease) is None
+            )
+            if expired_claim_without_dispatch:
+                requeued = self.store.requeue_unconfirmed_host_run_start(
+                    worker_id=worker_id,
+                    run_id=run_id,
+                    lease_id=str(lease.get("lease_id") or ""),
+                    startup_token=str(lease.get("startup_token") or ""),
+                    retry_after=datetime.now(timezone.utc).isoformat(),
+                    error_text=(
+                        "GlassHive retired an expired pre-dispatch lease and "
+                        "queued the exact run for retry."
+                    ),
+                )
+                if requeued is not None:
+                    self._scheduler_wake_event.set()
+                    return "released"
+                return "unchanged"
+
+            # This is deliberately a fresh durable-session read under the same
+            # cross-process lifecycle flock used by launch and compute release.
+            current_identity = (
+                identity_reader(worker, run_id)
+                if callable(identity_reader)
+                else None
+            )
+            captured_identity = self._reserved_start_identity(lease)
+            current_candidate = self._restart_identity_candidate(
+                current_identity,
+                run_id=run_id,
+            )
+            token_bound = self._restart_identity_has_startup_binding(
+                lease, current_identity
+            )
+            if captured_identity is None and token_bound:
+                captured_identity = current_candidate
+            if (
+                token_bound
+                and captured_identity
+                and self._restart_identity_matches_reserved(
+                captured_identity, current_identity
+                )
+            ):
+                callback_record, callbacks = self._run_start_callback_record(
+                    worker,
+                    run,
+                    str(lease.get("startup_token") or ""),
+                )
+                confirmed = self.store.confirm_host_run_start(
+                    worker_id=worker_id,
+                    run_id=run_id,
+                    run_started_at=str(
+                        run.get("runtime_invoked_at")
+                        or run.get("started_at")
+                        or ""
+                    ),
+                    lease_id=str(lease.get("lease_id") or ""),
+                    startup_token=str(lease.get("startup_token") or ""),
+                    executor_id=str(lease.get("executor_id") or ""),
+                    identity_kind=str(current_identity.get("identity_kind") or ""),
+                    pid=int(current_identity.get("pid") or 0) or None,
+                    process_group=int(current_identity.get("process_group") or 0)
+                    or None,
+                    process_start_identity=str(
+                        current_identity.get("process_start_identity") or ""
+                    ),
+                    container_id=str(current_identity.get("container_id") or ""),
+                    session_id=str(current_identity.get("session_id") or ""),
+                    callback_record=callback_record,
+                )
+                if confirmed is None:
+                    return "unchanged"
+                callback = confirmed.get("callback")
+                if isinstance(callback, dict):
+                    callback_delivery = (dict(worker), callback, callbacks)
+                return "renewed"
+
+            cleanup = getattr(
+                self.runtime, "cleanup_unconfirmed_run_start", None
+            )
+            cleaned = bool(
+                captured_identity
+                and callable(cleanup)
+                and cleanup(worker, run_id, captured_identity)
+            )
+            if cleaned:
+                requeued = self.store.requeue_unconfirmed_host_run_start(
+                    worker_id=worker_id,
+                    run_id=run_id,
+                    lease_id=str(lease.get("lease_id") or ""),
+                    startup_token=str(lease.get("startup_token") or ""),
+                    retry_after=(
+                        datetime.now(timezone.utc) + timedelta(seconds=1)
+                    ).isoformat(),
+                    error_text=(
+                        "GlassHive safely cleaned an interrupted startup generation "
+                        "and queued the exact run for retry."
+                    ),
+                )
+                if requeued is not None:
+                    self._scheduler_wake_event.set()
+                    return "released"
+
+            self.store.mark_host_run_start_termination_unconfirmed(
+                lease_id=str(lease.get("lease_id") or ""),
+                run_id=run_id,
+                executor_id=str(lease.get("executor_id") or ""),
+                startup_token=str(lease.get("startup_token") or ""),
+            )
+            return "unchanged"
+        except Exception:
+            logger.exception(
+                "Reserved run startup reconciliation failed",
+                extra={"worker_id": worker_id, "run_id": run_id},
+            )
+            return "unchanged"
+        finally:
+            guard.release()
+            if callback_delivery is not None:
+                callback_worker, callback, callbacks = callback_delivery
+                self.executor.submit(
+                    self._deliver_callback_record,
+                    callback_worker,
+                    callback,
+                    callbacks,
+                )
+
+    def _finalize_run_if_state(
+        self,
+        run_id: str,
+        expected_state: str,
+        state: str,
+        output_text: str = "",
+        error_text: str = "",
+        **fields: Any,
+    ) -> dict | None:
+        run = self.store.get_run(str(run_id))
+        worker = (
+            self.store.get_worker(str(run.get("worker_id") or "")) if run else None
+        )
+        artifact_refs = work_artifact_observation(
+            worker,
+            run,
+            output_text=output_text,
+            error_text=error_text,
+        )
+        return self.store.finalize_run_if_state(
+            str(run_id),
+            expected_state,
+            state,
+            output_text=output_text,
+            error_text=error_text,
+            artifact_refs=artifact_refs,
+            **fields,
+        )
+
+    def reconcile_terminal_artifact_observations(self, *, limit: int = 100) -> int:
+        repaired = 0
+        for candidate in self.store.list_terminal_runs_missing_artifact_observation(
+            limit=limit
+        ):
+            run = self.store.get_run(str(candidate.get("run_id") or ""))
+            worker = self.store.get_worker(str(candidate.get("worker_id") or ""))
+            if not run or not worker:
+                continue
+            artifact_refs = work_artifact_observation(
+                worker,
+                run,
+                output_text=str(run.get("output_text") or ""),
+                error_text=str(run.get("error_text") or ""),
+            )
+            if self.store.reconcile_terminal_artifact_observation(
+                run_id=str(run["run_id"]), artifact_refs=artifact_refs
+            ):
+                repaired += 1
+        return repaired
+
+    def _trusted_parallel_fallback_profile(self, worker: dict) -> str:
+        bundle = self._bootstrap_bundle_for(worker) or {}
+        authority = bundle.get("viventium_launch_authority")
+        if (
+            str(bundle.get("execution_policy") or "").strip()
+            != PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+            or not isinstance(authority, dict)
+            or authority.get("version") != 1
+            or authority.get("kind")
+            not in {
+                "conversation_orchestrator",
+                PROMPT_WORKBENCH_SCHEDULED_AUTHORITY_KIND,
+            }
+            or authority.get("execution_mode") != "docker"
+        ):
+            return ""
+        fallback_profile = str(authority.get("fallback_worker_profile") or "").strip()
+        if not fallback_profile or fallback_profile == str(worker.get("profile") or "").strip():
+            return ""
+        self._ensure_profile_allowed(fallback_profile)
+        self._reserved_runtime_preflight(
+            fallback_profile,
+            "docker",
+            tenant_id=str(worker.get("tenant_id") or "local"),
+            owner_id=str(worker.get("owner_id") or ""),
+            lane=self._trusted_run_lane(worker),
+            worker={**worker, "profile": fallback_profile, "execution_mode": "docker"},
+        )
+        return fallback_profile
+
+    def _provider_health_default_cooldown_s(self) -> float:
+        return _bounded_float_env(
+            "GLASSHIVE_PROVIDER_HEALTH_DEFAULT_COOLDOWN_S",
+            300.0,
+            min_value=1.0,
+            max_value=86_400.0,
+        )
+
+    def _provider_route(self, worker: dict) -> dict[str, str]:
+        profile = str(worker.get("profile") or "").strip()
+        execution_mode = str(worker.get("execution_mode") or "docker").strip()
+        return {
+            "tenant_id": str(worker.get("tenant_id") or "local").strip() or "local",
+            "owner_id": str(worker.get("owner_id") or "").strip(),
+            "profile": profile,
+            "runtime": (
+                self._initial_runtime_label(profile, execution_mode)
+                or str(worker.get("runtime") or "").strip()
+            ),
+            "model": str(worker.get("model") or "").strip(),
+        }
+
+    @staticmethod
+    def _provider_exact_retry_at(source: object) -> str:
+        for name in ("retry_at", "reset_at", "provider_retry_at", "provider_reset_at"):
+            value = source.get(name) if isinstance(source, dict) else getattr(source, name, None)
+            if value in (None, ""):
+                continue
+            if isinstance(value, datetime):
+                parsed = value
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                parsed = datetime.fromtimestamp(float(value), tz=timezone.utc)
+            else:
+                try:
+                    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                except (TypeError, ValueError, OSError):
+                    continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).isoformat()
+        return ""
+
+    @staticmethod
+    def _provider_retry_after_s(source: object) -> float | None:
+        names = ("retry_after_s", "provider_retry_after_s")
+        for name in names:
+            value = source.get(name) if isinstance(source, dict) else getattr(source, name, None)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return max(0.0, float(value))
+        return None
+
+    def _record_provider_route_failure(
+        self,
+        worker: dict,
+        run: dict,
+        failure_fields: dict[str, object],
+        source: object,
+    ) -> dict | None:
+        route = self._provider_route(worker)
+        runtime_family = str(route.get("runtime") or "").strip()
+        if runtime_family not in {"codex-cli", "claude-code", "openclaw"}:
+            return None
+        if not all(route.values()):
+            return None
+        consumer = getattr(
+            self.runtime,
+            "consume_provider_route_failure_evidence",
+            None,
+        )
+        if not callable(consumer):
+            return None
+        evidence = consumer(worker, run, source)
+        if not isinstance(evidence, dict):
+            return None
+        evidence_source = str(evidence.get("evidence_kind") or "").strip()
+        evidence_failure_class = str(evidence.get("failure_class") or "").strip()
+        if (
+            int(evidence.get("version") or 0) != 1
+            or evidence.get("failure_structured") is not True
+            or evidence_failure_class
+            not in {"provider_quota_exhausted", "provider_rate_limited"}
+            or evidence_failure_class
+            != str(failure_fields.get("failure_class") or "").strip()
+            or not bool(failure_fields.get("failure_structured"))
+            or not evidence_source
+        ):
+            return None
+        attempt_id = str(run.get("active_attempt_id") or "").strip()
+        explicit_evidence_id = str(evidence.get("evidence_id") or "").strip()
+        if attempt_id:
+            evidence_id = f"run_attempt:{attempt_id}"
+        elif explicit_evidence_id:
+            evidence_id = f"provider_evidence:{explicit_evidence_id}"
+        else:
+            run_id = str(run.get("run_id") or "").strip()
+            evidence_material = json.dumps(
+                {
+                    "run_id": run_id,
+                    "runtime": runtime_family,
+                    "evidence_kind": evidence_source,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            evidence_id = "run_evidence:" + hashlib.sha256(
+                evidence_material.encode("utf-8")
+            ).hexdigest()
+        return self.store.record_provider_route_failure(
+            **route,
+            failure_class=evidence_failure_class,
+            failure_structured=True,
+            retry_at=self._provider_exact_retry_at(evidence),
+            retry_after_s=self._provider_retry_after_s(evidence),
+            default_cooldown_s=self._provider_health_default_cooldown_s(),
+            run_id=str(run.get("run_id") or ""),
+            evidence_id=evidence_id,
+            attempt_id=attempt_id,
+            evidence_kind=evidence_source,
+        )
+
+    def _clear_provider_route_health(self, worker: dict, run: dict) -> None:
+        route = self._provider_route(worker)
+        attempt_id = str(run.get("active_attempt_id") or "")
+        attempt = self.store.get_run_attempt(attempt_id) if attempt_id else None
+        observed_last_failed_at = str(
+            (attempt or {}).get("provider_health_observed_last_failed_at") or ""
+        )
+        observed_generation = int(
+            (attempt or {}).get("provider_health_observed_generation") or 0
+        )
+        if all(route.values()) and observed_last_failed_at and observed_generation > 0:
+            self.store.clear_provider_route_health(
+                **route,
+                expected_last_failed_at=observed_last_failed_at,
+                expected_generation=observed_generation,
+            )
+
+    @staticmethod
+    def _configured_conversation_fallback(request: dict | None) -> dict[str, object]:
+        configured = str((request or {}).get("fallback_model_id") or "").strip()
+        profile, separator, model = configured.partition(":")
+        eligible = bool(separator and profile.strip() and model.strip())
+        return {
+            "fallbackEligible": eligible,
+            "fallbackProfile": profile.strip() if eligible else "",
+            "fallbackModel": model.strip() if eligible else "",
+        }
+
+    def _handle_unhealthy_provider_route(self, worker: dict, run: dict) -> bool:
+        route_locked = bool(int(run.get("provider_liveness_route_locked") or 0))
+        route = (
+            {
+                "tenant_id": str(worker.get("tenant_id") or "local").strip()
+                or "local",
+                "owner_id": str(worker.get("owner_id") or "").strip(),
+                "profile": str(run.get("provider_route_profile") or "").strip(),
+                "runtime": str(run.get("provider_route_runtime") or "").strip(),
+                "model": str(run.get("provider_route_model") or "").strip(),
+            }
+            if route_locked
+            else self._provider_route(worker)
+        )
+        if not all(route.values()):
+            return False
+        qa_quota = self._consume_local_qa(
+            "provider_quota_cooldown_fallback", worker, run
+        )
+        if qa_quota is not None:
+            self.store.record_provider_route_failure(
+                **route,
+                failure_class="provider_quota_exhausted",
+                failure_structured=True,
+                retry_after_s=float(
+                    qa_quota.parameters.get("cooldownSeconds") or 120
+                ),
+                default_cooldown_s=float(
+                    qa_quota.parameters.get("cooldownSeconds") or 120
+                ),
+                run_id=str(run.get("run_id") or ""),
+                evidence_id=qa_quota.control_ref,
+                attempt_id=str(run.get("active_attempt_id") or ""),
+                evidence_kind="local_qa_control",
+            )
+            self._record_local_qa_effect(
+                qa_quota, "provider_cooldown_persisted_before_route_selection"
+            )
+        if not str(run.get("provider_route_decision") or ""):
+            selected = self.store.update_run(
+                str(run["run_id"]),
+                provider_route_profile=route["profile"],
+                provider_route_runtime=route["runtime"],
+                provider_route_model=route["model"],
+                provider_route_decision="primary_selected",
+            )
+            if selected:
+                run.update(selected)
+        health = self.store.get_provider_route_health(**route)
+        attempt_id = str(run.get("active_attempt_id") or "")
+        if attempt_id:
+            self.store.record_run_attempt_provider_health_observation(
+                run_id=str(run["run_id"]),
+                attempt_id=attempt_id,
+                observed_last_failed_at=str(
+                    (health or {}).get("last_failed_at") or ""
+                ),
+                observed_generation=int(
+                    (health or {}).get("failure_generation") or 0
+                ),
+            )
+        if not health:
+            return False
+
+        cooldown_until = str(health.get("cooldown_until") or "")
+        failure_class = str(health.get("failure_class") or "provider_rate_limited")
+        skip_payload = {
+            "profile": route["profile"],
+            "runtime": route["runtime"],
+            "model": route["model"],
+            "failureClass": failure_class,
+            "cooldownUntil": cooldown_until,
+        }
+        self.store.add_event(
+            str(worker.get("project_id") or ""),
+            str(worker["worker_id"]),
+            str(run["run_id"]),
+            "run.provider_route_skipped",
+            "GlassHive skipped a known-unhealthy provider route before compute admission.",
+            payload=skip_payload,
+        )
+
+        if not route_locked and self._trusted_run_lane(worker) == "conversation":
+            request = self.store.get_provider_request_for_run(str(run["run_id"]))
+            fallback = self._configured_conversation_fallback(request)
+            self.store.update_run(
+                str(run["run_id"]),
+                retry_after=cooldown_until or None,
+                provider_route_decision="skipped_unhealthy",
+                provider_route_failure_class=failure_class,
+                provider_route_cooldown_until=cooldown_until or None,
+            )
+            failed = self._finalize_run_if_state(
+                str(run["run_id"]),
+                "claimed",
+                "failed",
+                error_text="GlassHive skipped a provider route during its active cooldown.",
+                **self._terminal_generation_for_run(run),
+                failure_class=failure_class,
+                failure_retryable=1,
+                failure_structured=1,
+                failure_user_message=(
+                    "The selected provider route is in a known quota or rate-limit cooldown."
+                ),
+                failure_recommended_recovery=(
+                    "GlassHive will use the configured fallback or retry after the provider reset."
+                ),
+                failure_diagnostic_summary=(
+                    "Provider circuit was open before runtime invocation."
+                ),
+            )
+            self.store.update_worker_state(
+                str(worker["worker_id"]), "ready", last_error=""
+            )
+            if request and failed:
+                self.store.add_provider_activity(
+                    str(request["request_id"]),
+                    "route-skipped",
+                    "Skipped a known-unhealthy provider route before invocation.",
+                    {**skip_payload, **fallback},
+                )
+            return True
+
+        try:
+            fallback_profile = (
+                self._trusted_parallel_fallback_profile(worker)
+                if not route_locked
+                else ""
+            )
+            fallback_runtime = self._initial_runtime_label(fallback_profile, "docker")
+            fallback_model = self._resolve_worker_model(fallback_profile, "docker")
+            fallback_route = {
+                "tenant_id": route["tenant_id"],
+                "owner_id": route["owner_id"],
+                "profile": fallback_profile,
+                "runtime": fallback_runtime,
+                "model": fallback_model,
+            }
+            fallback_health = (
+                self.store.get_provider_route_health(**fallback_route)
+                if all(fallback_route.values())
+                else None
+            )
+        except Exception:
+            fallback_profile = ""
+            fallback_runtime = ""
+            fallback_model = ""
+            fallback_health = None
+        if fallback_profile and not fallback_health:
+            switched = self.store.switch_worker_profile_and_requeue_run(
+                worker_id=str(worker["worker_id"]),
+                run_id=str(run["run_id"]),
+                expected_profile=route["profile"],
+                fallback_profile=fallback_profile,
+                fallback_backend=self._legacy_backend_label(
+                    fallback_profile, "docker", ""
+                ),
+                fallback_runtime=fallback_runtime,
+                fallback_model=fallback_model,
+                retry_after=(
+                    datetime.now(timezone.utc) + timedelta(milliseconds=100)
+                ).isoformat(),
+                error_text="Primary provider route skipped during cooldown.",
+                route_cooldown_until=cooldown_until,
+                route_failure_class=failure_class,
+                route_source_runtime=route["runtime"],
+                route_source_model=route["model"],
+                failure_class=failure_class,
+                failure_retryable=1,
+                failure_structured=1,
+                failure_user_message=(
+                    "The primary provider route is cooling down; the configured fallback was selected."
+                ),
+                failure_recommended_recovery="No user action is required.",
+                failure_diagnostic_summary=(
+                    "Provider circuit selected an explicit healthy mission fallback."
+                ),
+            )
+            if switched:
+                self.store.add_event(
+                    str(worker.get("project_id") or ""),
+                    str(worker["worker_id"]),
+                    str(run["run_id"]),
+                    "run.provider_route_switched",
+                    "The durable mission switched to its configured healthy fallback route.",
+                    payload={
+                        "fromProfile": route["profile"],
+                        "fromRuntime": route["runtime"],
+                        "fromModel": route["model"],
+                        "toProfile": fallback_profile,
+                        "toRuntime": fallback_runtime,
+                        "toModel": fallback_model,
+                        "failureClass": failure_class,
+                        "cooldownUntil": cooldown_until,
+                    },
+                )
+                self._scheduler_wake_event.set()
+                return True
+
+        self._wait_for_exact_provider_route(
+            worker,
+            run,
+            cooldown_until=cooldown_until,
+            failure_class=failure_class,
+        )
+        return True
+
+    def _wait_for_exact_provider_route(
+        self,
+        worker: dict,
+        run: dict,
+        *,
+        cooldown_until: str,
+        failure_class: str,
+    ) -> dict | None:
+        """Requeue one exact route without consuming retry or selecting fallback."""
+
+        run_id = str(run.get("run_id") or "")
+        retry_generation = self.store.get_run_retry_generation(run_id)
+        if retry_generation is None or str(
+            retry_generation.get("expected_attempt_id") or ""
+        ) != str(run.get("active_attempt_id") or ""):
+            return None
+        updated = self.store.requeue_run_for_retry(
+            run_id,
+            retry_after=str(cooldown_until or ""),
+            **retry_generation,
+            error_text="Provider route remains in cooldown.",
+            last_retry_class=str(failure_class or "provider_rate_limited"),
+            consume_retry_budget=False,
+            failure_class=str(failure_class or "provider_rate_limited"),
+            failure_retryable=1,
+            failure_structured=1,
+            failure_user_message="The configured provider route is cooling down.",
+            failure_recommended_recovery="Wait for the exact provider reset time.",
+            failure_diagnostic_summary=(
+                "The exact provider route remains pinned while its circuit is open."
+            ),
+        )
+        if updated is not None:
+            updated = self.store.update_run(
+                run_id,
+                provider_route_decision="waiting_primary_health",
+                provider_route_failure_class=str(failure_class or ""),
+                provider_route_cooldown_until=str(cooldown_until or "") or None,
+            ) or updated
+            self.store.update_worker_state(
+                str(worker["worker_id"]), "ready", last_error=""
+            )
+            self._scheduler_wake_event.set()
+        return updated
+
+    def _record_unavailable_provider_fallback(
+        self,
+        worker: dict,
+        run: dict,
+        failure_fields: dict[str, object],
+        *,
+        reason: str,
+        fallback_profile: str = "",
+        fallback_health: dict | None = None,
+    ) -> None:
+        if self._trusted_run_lane(worker) != "mission":
+            return
+
+        failure_fields["failure_recommended_recovery"] = (
+            "Restore the configured provider quota or explicitly authorize a healthy fallback provider."
+            if reason == "fallback_not_authorized"
+            else (
+                "Restore the configured provider quota or wait until the authorized fallback provider cooldown ends."
+                if reason == "fallback_in_cooldown"
+                else "Restore the configured provider quota or repair the explicitly authorized fallback provider."
+            )
+        )
+        route = self._provider_route(worker)
+        if not all(route.values()):
+            return
+
+        try:
+            primary_health = self.store.get_provider_route_health(**route)
+            cooldown_until = str(
+                (primary_health or {}).get("cooldown_until") or ""
+            )
+            self.store.update_run(
+                str(run["run_id"]),
+                provider_route_profile=route["profile"],
+                provider_route_runtime=route["runtime"],
+                provider_route_model=route["model"],
+                provider_route_decision="fallback_unavailable",
+                provider_route_failure_class=str(
+                    failure_fields.get("failure_class") or "provider_quota_exhausted"
+                ),
+                provider_route_cooldown_until=cooldown_until or None,
+            )
+            self.store.add_event(
+                str(worker.get("project_id") or ""),
+                str(worker["worker_id"]),
+                str(run["run_id"]),
+                "run.provider_fallback_unavailable",
+                "The configured provider failed and no authorized healthy fallback was available.",
+                payload={
+                    "profile": route["profile"],
+                    "runtime": route["runtime"],
+                    "model": route["model"],
+                    "failureClass": str(
+                        failure_fields.get("failure_class") or "provider_quota_exhausted"
+                    ),
+                    "reason": reason,
+                    "cooldownUntil": cooldown_until,
+                    **(
+                        {"fallbackProfile": fallback_profile}
+                        if fallback_profile
+                        else {}
+                    ),
+                    **(
+                        {
+                            "fallbackCooldownUntil": str(
+                                fallback_health.get("cooldown_until") or ""
+                            )
+                        }
+                        if fallback_health
+                        else {}
+                    ),
+                },
+            )
+        except Exception:
+            logger.warning(
+                "Provider fallback availability telemetry could not be persisted; preserving the primary provider failure"
+            )
+
+    def _switch_quota_exhausted_run_to_fallback(
+        self,
+        worker: dict,
+        run: dict,
+        exc: RuntimeErrorBase,
+        failure_fields: dict[str, object],
+    ) -> dict | None:
+        if (
+            str(failure_fields.get("failure_class") or "")
+            != "provider_quota_exhausted"
+            or not bool(failure_fields.get("failure_retryable"))
+            or not bool(failure_fields.get("failure_structured"))
+            or str(run.get("output_text") or "").strip()
+        ):
+            return None
+        primary_health = self.store.get_provider_route_health(
+            **self._provider_route(worker)
+        )
+        if (
+            not primary_health
+            or str(primary_health.get("last_run_id") or "")
+            != str(run.get("run_id") or "")
+        ):
+            return None
+        if bool(int(run.get("provider_liveness_route_locked") or 0)):
+            return self._wait_for_exact_provider_route(
+                worker,
+                run,
+                cooldown_until=str(primary_health.get("cooldown_until") or ""),
+                failure_class=str(
+                    failure_fields.get("failure_class")
+                    or "provider_quota_exhausted"
+                ),
+            )
+        try:
+            fallback_profile = self._trusted_parallel_fallback_profile(worker)
+            if not fallback_profile:
+                self._record_unavailable_provider_fallback(
+                    worker,
+                    run,
+                    failure_fields,
+                    reason="fallback_not_authorized",
+                )
+                return None
+            fallback_model = self._resolve_worker_model(fallback_profile, "docker")
+            fallback_runtime = self._initial_runtime_label(
+                fallback_profile, "docker"
+            )
+            fallback_health = self.store.get_provider_route_health(
+                tenant_id=str(worker.get("tenant_id") or "local"),
+                owner_id=str(worker.get("owner_id") or ""),
+                profile=fallback_profile,
+                runtime=fallback_runtime,
+                model=fallback_model,
+            )
+            if fallback_health:
+                self._record_unavailable_provider_fallback(
+                    worker,
+                    run,
+                    failure_fields,
+                    reason="fallback_in_cooldown",
+                    fallback_profile=fallback_profile,
+                    fallback_health=fallback_health,
+                )
+                return None
+        except Exception:
+            # The fallback is optional recovery.  A stale/invalid fallback
+            # configuration must not replace the authoritative primary-provider
+            # failure with an unrelated processor exception or expose provider
+            # preflight details to the user surface.
+            logger.warning(
+                "Configured Parallel worker fallback is unavailable; preserving the primary provider failure"
+            )
+            self._record_unavailable_provider_fallback(
+                worker,
+                run,
+                failure_fields,
+                reason="fallback_preflight_failed",
+            )
+            return None
+        current_profile = str(worker.get("profile") or "").strip()
+        switched = self.store.switch_worker_profile_and_requeue_run(
+            worker_id=str(worker["worker_id"]),
+            run_id=str(run["run_id"]),
+            expected_profile=current_profile,
+            fallback_profile=fallback_profile,
+            fallback_backend=self._legacy_backend_label(fallback_profile, "docker", ""),
+            fallback_runtime=fallback_runtime,
+            fallback_model=fallback_model,
+            retry_after=(datetime.now(timezone.utc) + timedelta(milliseconds=100)).isoformat(),
+            error_text=str(exc),
+            route_cooldown_until=str(
+                (primary_health or {}).get("cooldown_until") or ""
+            ),
+            route_failure_class=str(
+                failure_fields.get("failure_class") or "provider_quota_exhausted"
+            ),
+            route_source_runtime=self._provider_route(worker)["runtime"],
+            route_source_model=self._provider_route(worker)["model"],
+            **failure_fields,
+        )
+        if not switched:
+            return None
+        self.store.add_event(
+            str(worker.get("project_id") or ""),
+            str(worker["worker_id"]),
+            str(run["run_id"]),
+            "run.provider_fallback",
+            "The primary worker provider quota was exhausted; the same durable mission is continuing with its configured fallback worker.",
+            payload={"fromProfile": current_profile, "toProfile": fallback_profile},
+        )
+        self.store.add_event(
+            str(worker.get("project_id") or ""),
+            str(worker["worker_id"]),
+            str(run["run_id"]),
+            "run.provider_route_switched",
+            "The durable mission switched to its configured healthy fallback route.",
+            payload={
+                "fromProfile": current_profile,
+                "fromRuntime": str(worker.get("runtime") or ""),
+                "fromModel": str(worker.get("model") or ""),
+                "toProfile": fallback_profile,
+                "toRuntime": self._initial_runtime_label(fallback_profile, "docker"),
+                "toModel": fallback_model,
+                "failureClass": str(failure_fields.get("failure_class") or ""),
+                "cooldownUntil": str(
+                    (primary_health or {}).get("cooldown_until") or ""
+                ),
+            },
+        )
+        self._scheduler_wake_event.set()
+        return switched
+
+    def reserve_delegation(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        idempotency_key: str,
+        request_digest: str,
+        origin_ref: str,
+        title: str,
+        goal: str,
+        instruction: str,
+        origin_surface: str,
+        worker_name: str,
+        worker_role: str,
+        profile: str,
+        execution_mode: str,
+        resource_class: str = "standard",
+        workspace_root: str | None = None,
+        bootstrap_profile: str | None = None,
+        bootstrap_bundle: dict | None = None,
+    ) -> dict:
+        """Atomically reserve a durable project, worker, and first run."""
+
+        clean_resource_class = normalize_worker_resource_class(resource_class)
+        resource_memory_bytes = _configured_worker_resource_memory_bytes(
+            clean_resource_class
+        )
+
+        committed = self.store.get_delegation_by_idempotency_key(
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            idempotency_key=idempotency_key,
+        )
+        if committed is not None:
+            if str(committed.get("request_digest") or "") != request_digest:
+                raise DelegationIdempotencyConflictError(
+                    "The delegation idempotency key was reused with a different request."
+                )
+            # The first transaction already durably accepted this exact request.
+            # A lost-response replay must not be invalidated by a later profile,
+            # runtime, policy, or capacity change. The scheduler owns recovery of
+            # any accepted queued work after a crash.
+            return {**committed, "idempotent_replay": True}
+
+        prospective_worker = {
+            "tenant_id": tenant_id,
+            "owner_id": owner_id,
+            "profile": profile,
+            "runtime": self._initial_runtime_label(profile, execution_mode),
+            "execution_mode": execution_mode,
+            "trusted_run_lane": "mission",
+            "resource_class": clean_resource_class,
+            "resource_memory_bytes": resource_memory_bytes,
+        }
+
+        launch_authority = (
+            bootstrap_bundle.get("viventium_launch_authority")
+            if isinstance(bootstrap_bundle, dict)
+            else None
+        )
+        if launch_authority is not None:
+            launch_authority_keys = (
+                set(launch_authority) if isinstance(launch_authority, dict) else set()
+            )
+            valid_launch_authority = (
+                isinstance(launch_authority, dict)
+                and launch_authority_keys
+                in (
+                    {"version", "kind", "execution_mode"},
+                    {
+                        "version",
+                        "kind",
+                        "execution_mode",
+                        "fallback_worker_profile",
+                    },
+                )
+                and launch_authority.get("version") == 1
+                and not isinstance(launch_authority.get("version"), bool)
+                and launch_authority.get("kind") == "conversation_orchestrator"
+                and launch_authority.get("execution_mode") == "docker"
+                and (
+                    "fallback_worker_profile" not in launch_authority
+                    or bool(str(launch_authority.get("fallback_worker_profile") or "").strip())
+                )
+            )
+            capabilities = self.orchestration_capabilities()
+            if (
+                not valid_launch_authority
+                or str(execution_mode or "").strip().lower() != "docker"
+                or not isolated_parallel_policy_enabled()
+                or capabilities["isolatedParallelReady"] is not True
+            ):
+                raise ParallelExecutionIsolationError(
+                    "Automatic Parallel work requires an isolated Docker/workstation runtime."
+                )
+            bootstrap_profile, bootstrap_bundle = derive_parallel_clean_room_bootstrap(
+                bootstrap_profile,
+                bootstrap_bundle,
+            )
+            fallback_worker_profile = str(
+                launch_authority.get("fallback_worker_profile") or ""
+            ).strip()
+            if fallback_worker_profile:
+                self._ensure_profile_allowed(fallback_worker_profile)
+                self._reserved_runtime_preflight(
+                    fallback_worker_profile,
+                    "docker",
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                    lane="mission",
+                    worker={
+                        **prospective_worker,
+                        "profile": fallback_worker_profile,
+                        "runtime": self._initial_runtime_label(
+                            fallback_worker_profile,
+                            "docker",
+                        ),
+                    },
+                )
+        self._ensure_execution_allowed(execution_mode)
+        self._ensure_profile_allowed(profile)
+        capacity_snapshot = self._reserved_runtime_preflight(
+            profile,
+            execution_mode,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            lane="mission",
+            worker=prospective_worker,
+            require_capacity_snapshot=True,
+        )
+        model = self._resolve_worker_model(profile, execution_mode)
+        capacity_next_retry_at = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=self._retry_base_delay_s("host_capacity"))
+        ).isoformat()
+        capacity_policy = self._host_capacity_policy()
+        with self._worker_create_lock:
+            self._enforce_worker_limits(tenant_id=tenant_id, owner_id=owner_id)
+            try:
+                record = self.store.reserve_delegation(
+                    tenant_id=tenant_id,
+                    owner_id=owner_id,
+                    idempotency_key=idempotency_key,
+                    request_digest=request_digest,
+                    origin_ref=origin_ref,
+                    title=title,
+                    goal=goal,
+                    instruction=instruction,
+                    origin_surface=origin_surface,
+                    worker_name=worker_name,
+                    worker_role=worker_role,
+                    profile=profile,
+                    backend=self._legacy_backend_label(profile, execution_mode, ""),
+                    runtime=self._initial_runtime_label(profile, execution_mode),
+                    model=model,
+                    execution_mode=execution_mode,
+                    resource_class=clean_resource_class,
+                    resource_memory_bytes=resource_memory_bytes,
+                    workspace_root=workspace_root,
+                    bootstrap_profile=bootstrap_profile,
+                    bootstrap_bundle=bootstrap_bundle,
+                    require_isolated_parallel_ready=launch_authority is not None,
+                    preaccept_host_lease={
+                        "runtime_family": self._host_runtime_family(
+                            prospective_worker
+                        ),
+                        "lane": "mission",
+                        "executor_id": self._executor_id,
+                        **capacity_policy,
+                        "mutation_scope": (
+                            self._host_mutation_scope(prospective_worker)
+                            if execution_mode == "host"
+                            else ""
+                        ),
+                        "lease_ttl_s": self._host_lease_ttl_s(),
+                        "capacity_available": dict(
+                            capacity_snapshot.get("available") or {}
+                        ),
+                        "capacity_required": dict(
+                            capacity_snapshot.get("required") or {}
+                        ),
+                        "capacity_reservation": dict(
+                            capacity_snapshot.get("reservation") or {}
+                        ),
+                        "capacity_observed_lease_ids": list(
+                            capacity_snapshot.get("observedLeaseIds") or []
+                        ),
+                        "capacity_next_retry_at": capacity_next_retry_at,
+                    },
+                    trace_context={
+                        "promptLayers": self.worker_prompt_layer_trace()
+                    },
+                )
+            except IsolatedParallelAdmissionConflictError as exc:
+                raise ParallelExecutionIsolationError(str(exc)) from exc
+            except HostRunLeaseCapacityError as exc:
+                error = HostCapacityError(
+                    str(exc),
+                    capacity_class=exc.capacity_class,
+                    dimension=exc.dimension,
+                    configured=exc.configured,
+                    used=exc.used,
+                )
+                available = dict(capacity_snapshot.get("available") or {})
+                required_headroom = dict(
+                    capacity_snapshot.get("required") or {}
+                )
+                reservation = dict(
+                    capacity_snapshot.get("reservation") or {}
+                )
+                total_required = {
+                    key: max(0, int(required_headroom.get(key) or 0))
+                    + max(0, int(reservation.get(key) or 0))
+                    for key in (
+                        "childProcesses",
+                        "threads",
+                        "memoryBytes",
+                        "diskBytes",
+                    )
+                }
+                error.available = dict(exc.available or available)
+                error.required = dict(exc.required or total_required)
+                error.shortage = dict(
+                    exc.shortage
+                    or {
+                        key: max(
+                            0,
+                            int(error.required.get(key) or 0)
+                            - int(error.available.get(key) or 0),
+                        )
+                        for key in total_required
+                    }
+                )
+                error.reservation = dict(exc.reservation or reservation)
+                error.next_retry_at = str(
+                    exc.next_retry_at or capacity_next_retry_at
+                )
+                error.retry_after_s = self._retry_base_delay_s("host_capacity")
+                raise error from exc
+        if not bool(record.get("idempotent_replay")):
+            worker = self.store.get_worker(str(record.get("worker_id") or ""))
+            run = self.store.get_run(str(record.get("initial_run_id") or ""))
+            if worker and run:
+                self._emit_callback(worker, "run.queued", run=run, message=instruction)
+        self.start_assigned_run(str(record.get("worker_id") or ""))
+        return record
+
+    def _apply_capability_reauthorization(
+        self,
+        worker: dict,
+        refresh: dict[str, object],
+    ) -> dict:
+        """Persist only Core's safe, scope-preserving authorization horizon refresh."""
+
+        bundle = self._bootstrap_bundle_for(worker) or {}
+        authorization = bundle.get("glasshive_capability_authorization")
+        invalid = RuntimeError("capability_reauthorization_invalid")
+        if not isinstance(authorization, dict) or set(refresh) != {
+            "version",
+            "authorization_ref",
+            "max_expires_at",
+            "scope_fingerprint",
+        }:
+            raise invalid
+        if isinstance(refresh.get("version"), bool) or refresh.get("version") != 1:
+            raise invalid
+        existing_ref = str(authorization.get("authorization_ref") or "")
+        refreshed_ref = str(refresh.get("authorization_ref") or "")
+        existing_scope = str(authorization.get("scope_fingerprint") or "")
+        refreshed_scope = str(refresh.get("scope_fingerprint") or "")
+        if (
+            not existing_ref
+            or not existing_scope
+            or not hmac.compare_digest(existing_ref, refreshed_ref)
+            or not hmac.compare_digest(existing_scope, refreshed_scope)
+        ):
+            raise invalid
+        try:
+            existing_max = datetime.fromisoformat(
+                str(authorization.get("max_expires_at") or "").replace("Z", "+00:00")
+            )
+            refreshed_text = str(refresh.get("max_expires_at") or "")
+            refreshed_max = datetime.fromisoformat(
+                refreshed_text.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise invalid from exc
+        if existing_max.tzinfo is None or refreshed_max.tzinfo is None:
+            raise invalid
+        now = datetime.now(timezone.utc)
+        existing_utc = existing_max.astimezone(timezone.utc)
+        refreshed_utc = refreshed_max.astimezone(timezone.utc)
+        if (
+            refreshed_utc <= existing_utc
+            or refreshed_utc <= now + timedelta(seconds=60)
+            or refreshed_utc > now + timedelta(hours=24, seconds=60)
+        ):
+            raise invalid
+        updated_authorization = {
+            **authorization,
+            "max_expires_at": refreshed_text,
+        }
+        updated_bundle = {
+            **bundle,
+            "glasshive_capability_authorization": updated_authorization,
+        }
+        updated = self.store.update_worker(
+            str(worker["worker_id"]),
+            bootstrap_bundle_json=json.dumps(updated_bundle, ensure_ascii=False),
+        )
+        self.store.add_event(
+            str(worker.get("project_id") or ""),
+            str(worker["worker_id"]),
+            None,
+            "capability.authorization_refreshed",
+            "Connected capability authorization was explicitly refreshed",
+        )
+        return updated or worker
+
+    def _active_work_follow_up_authority(
+        self, action_record: dict[str, object]
+    ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+        try:
+            source_context = json.loads(
+                str(action_record.get("source_context_json") or "{}")
+            )
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("active_work_source_context_invalid") from exc
+        if not isinstance(source_context, dict):
+            raise RuntimeError("active_work_source_context_invalid")
+        if not source_context:
+            return None, None
+        output_contract = source_context.get("output_contract")
+        prompt_layers = source_context.get("prompt_layers")
+        if not isinstance(output_contract, dict) or not isinstance(prompt_layers, dict):
+            raise RuntimeError("active_work_source_context_invalid")
+        origin_trace: dict[str, object] = {
+            "origin_ref": str(source_context.get("origin_ref") or ""),
+            "source_event_id": str(source_context.get("source_event_id") or ""),
+            "source_revision": source_context.get("source_revision"),
+            "surface": str(source_context.get("surface") or ""),
+            "prompt_layers": dict(prompt_layers),
+        }
+        return origin_trace, {
+            "version": 1,
+            "run_id": "",
+            "source": {
+                "source_event_id": origin_trace["source_event_id"],
+                "source_revision": origin_trace["source_revision"],
+                "surface": origin_trace["surface"],
+            },
+            "output": output_contract,
+        }
+
+    def execute_active_work_action(
+        self,
+        delegation: dict,
+        *,
+        action: str,
+        instruction: str = "",
+        idempotency_key: str,
+        capability_reauthorization: dict[str, object] | None = None,
+        action_use_id: str = "",
+    ) -> dict[str, object]:
+        worker_id = str(delegation.get("worker_id") or "")
+        project_id = str(delegation.get("project_id") or "")
+        run_id = str(delegation.get("run_id") or delegation.get("current_run_id") or "")
+        worker = self.require_worker(worker_id)
+        # Re-read mission truth at execution time. The roster payload used to
+        # render the action can race a completion, pause, or queued sibling.
+        live_delegation = self.store.get_delegation(
+            str(delegation.get("work_ref") or ""),
+            tenant_id=str(delegation.get("tenant_id") or ""),
+            owner_id=str(delegation.get("owner_id") or ""),
+        )
+        if not live_delegation:
+            raise RuntimeError("active_work_not_found")
+        run_id = str(live_delegation.get("run_id") or live_delegation.get("current_run_id") or run_id)
+        if action_use_id:
+            action_record = self.store.get_active_work_action(action_use_id) or {}
+            bound_run_id = str(action_record.get("source_run_id") or "")
+            if bound_run_id and bound_run_id != run_id:
+                recovered = self.reconcile_active_work_action(
+                    live_delegation,
+                    action=action,
+                    instruction=instruction,
+                    idempotency_key=idempotency_key,
+                    source_run_id=bound_run_id,
+                    capability_reauthorization=capability_reauthorization,
+                    action_use_id=action_use_id,
+                )
+                if recovered is not None:
+                    return recovered
+                raise RuntimeError("active_work_generation_changed")
+        else:
+            action_record = {}
+        run = self.require_run(run_id)
+        run_state = str(run.get("state") or "")
+        public_state = self._active_work_service_state(live_delegation)
+        allowed_actions = self._active_work_service_actions(live_delegation, public_state)
+        if action not in allowed_actions:
+            recovered = self.reconcile_active_work_action(
+                live_delegation,
+                action=action,
+                instruction=instruction,
+                idempotency_key=idempotency_key,
+                source_run_id=(
+                    str(action_record.get("source_run_id") or run_id)
+                    if action_use_id
+                    else run_id
+                ),
+                capability_reauthorization=capability_reauthorization,
+                action_use_id=action_use_id,
+            )
+            if recovered is not None:
+                return recovered
+            raise RuntimeError("active_work_action_not_available")
+
+        if capability_reauthorization is not None and not (
+            action == "resume" and run_state == "needs_input"
+        ):
+            raise RuntimeError("capability_reauthorization_invalid")
+
+        if action in {"queue", "message", "steer"}:
+            clean_instruction = str(instruction or "").strip()
+            if not clean_instruction:
+                raise ValueError("active_work_instruction_required")
+            effect_idempotency_key = self._active_work_effect_idempotency_key(
+                str(delegation.get("work_ref") or ""),
+                idempotency_key,
+            )
+            origin_trace, continuation_contract = (
+                self._active_work_follow_up_authority(action_record)
+            )
+            if action == "queue":
+                created = self.assign_run(
+                    worker_id,
+                    clean_instruction,
+                    event_type="run.followup_queued",
+                    idempotency_key=effect_idempotency_key,
+                    resume_paused_worker=False,
+                    origin_trace=origin_trace,
+                    continuation_contract=continuation_contract,
+                )
+            elif action == "message":
+                # Current host adapters have no proven live-message primitive.
+                # Queue at the next safe run boundary and report that truthfully. A Message adds
+                # guidance to the durable mission; it must not replace the original request or its
+                # output/verification contract when the new run builds its constraint ledger.
+                message_context = build_workspace_continuation_context(
+                    previous_run=run,
+                    continuation_goal=clean_instruction,
+                )
+                message_instruction = continuation_instruction(
+                    previous_run=run,
+                    continuation_context=message_context,
+                )
+                created = None
+                created_now = False
+                if run_state == "queued":
+                    with self._worker_compute_release_lock(worker_id):
+                        worker = self.require_worker(worker_id)
+                        self._ensure_execution_allowed(worker)
+                        self._reserved_runtime_preflight(
+                            str(worker.get("profile") or ""),
+                            str(worker.get("execution_mode") or "docker"),
+                            tenant_id=str(worker.get("tenant_id") or "local"),
+                            owner_id=str(worker.get("owner_id") or ""),
+                            lane=self._trusted_run_lane(worker),
+                            worker=worker,
+                        )
+                        created, created_now = (
+                            self.store.replace_queued_run_idempotently(
+                                source_run_id=run_id,
+                                replacement_run_id=self._idempotent_run_id(
+                                    worker_id, effect_idempotency_key
+                                ),
+                                worker_id=worker_id,
+                                project_id=str(worker["project_id"]),
+                                instruction=message_instruction,
+                                origin_trace=origin_trace,
+                                continuation_contract=(
+                                    {
+                                        **continuation_contract,
+                                        "run_id": self._idempotent_run_id(
+                                            worker_id, effect_idempotency_key
+                                        ),
+                                    }
+                                    if isinstance(continuation_contract, dict)
+                                    else None
+                                ),
+                                continuation_context=message_context,
+                            )
+                        )
+                    if created is not None:
+                        if created_now:
+                            self.store.add_event(
+                                project_id,
+                                worker_id,
+                                run_id,
+                                "run.cancelled",
+                                "Queued run coalesced into message guidance",
+                            )
+                            self.store.add_event(
+                                project_id,
+                                worker_id,
+                                str(created["run_id"]),
+                                "worker.message_queued",
+                                message_instruction,
+                            )
+                            self._emit_callback(
+                                worker,
+                                "worker.message_queued",
+                                run=created,
+                                message=message_instruction,
+                            )
+                        self._ensure_worker_processor(worker_id)
+                if created is None:
+                    created = self.assign_run(
+                        worker_id,
+                        message_instruction,
+                        event_type="worker.message_queued",
+                        idempotency_key=effect_idempotency_key,
+                        resume_paused_worker=False,
+                        origin_trace=origin_trace,
+                        continuation_contract=continuation_contract,
+                        continuation_context=message_context,
+                    )
+            else:
+                created = self.steer_worker(
+                    worker_id,
+                    clean_instruction,
+                    run_id=run_id,
+                    idempotency_key=effect_idempotency_key,
+                    action_use_id=action_use_id,
+                    origin_trace=origin_trace,
+                    continuation_contract=continuation_contract,
+                )
+                if str(created.get("_control_outcome") or "") == "terminal_won":
+                    authoritative = dict(created.get("_control_run") or created)
+                    authoritative_state = str(
+                        authoritative.get("state") or "completed"
+                    )
+                    return {
+                        "status": "accepted",
+                        "state": (
+                            "cancelled"
+                            if authoritative_state == "interrupted"
+                            else authoritative_state
+                        ),
+                        "run_id": str(authoritative.get("run_id") or run_id),
+                        "confirmation_pending": False,
+                        "control_outcome": "terminal_won",
+                    }
+            return {
+                "status": "queued",
+                "state": "queued",
+                "run_id": str(created.get("run_id") or ""),
+                "confirmation_pending": False,
+                "delivery_mode": (
+                    "queued_next_boundary" if action == "message" else "queued"
+                ),
+            }
+
+        if action == "pause":
+            if run_state not in {"queued", "running", "paused"}:
+                raise RuntimeError("active_work_not_active")
+            paused = self.pause_worker(
+                worker_id, run_id=run_id, action_use_id=action_use_id
+            )
+            if str(paused.get("_control_outcome") or "") == "terminal_won":
+                authoritative = dict(paused.get("_control_run") or {})
+                authoritative_state = str(
+                    authoritative.get("state") or "completed"
+                )
+                return {
+                    "status": "accepted",
+                    "state": (
+                        "cancelled"
+                        if authoritative_state == "interrupted"
+                        else authoritative_state
+                    ),
+                    "run_id": str(authoritative.get("run_id") or run_id),
+                    "confirmation_pending": False,
+                    "control_outcome": "terminal_won",
+                }
+            return {
+                "status": "accepted",
+                "state": "paused",
+                "run_id": run_id,
+                "confirmation_pending": False,
+                "worker": paused,
+            }
+
+        if action == "resume":
+            if run_state == "needs_input":
+                provider_attention = bool(
+                    str(run.get("failure_class") or "")
+                    == "provider_progress_stalled"
+                )
+                if provider_attention and not worker.get("compute_released_at"):
+                    self._release_needs_input_compute(worker, run)
+                    worker = self.require_worker(worker_id)
+                    if not worker.get("compute_released_at"):
+                        raise RuntimeError("active_work_attention_still_settling")
+                if capability_reauthorization is not None:
+                    worker = self._apply_capability_reauthorization(
+                        worker,
+                        capability_reauthorization,
+                    )
+                if action_use_id:
+                    resumed = self.store.resume_needs_input_active_work_action(
+                        action_use_id,
+                        worker_id=worker_id,
+                        run_id=run_id,
+                        executor_id=self._executor_id,
+                    )
+                    if not resumed:
+                        raise RuntimeError("active_work_not_waiting_for_input")
+                    self._replay_pending_lifecycle_effects()
+                else:
+                    resumed_run = self.store.transition_run_if_state(
+                        run_id,
+                        "needs_input",
+                        "queued",
+                        ended_at=None,
+                        error_text="",
+                        retry_after=None,
+                    )
+                    if not resumed_run:
+                        raise RuntimeError("active_work_not_waiting_for_input")
+                    self.store.update_worker_state(worker_id, "starting", last_error="")
+                    self.store.add_event(
+                        project_id,
+                        worker_id,
+                        run_id,
+                        "run.resumed" if provider_attention else "run.authorization_resumed",
+                        (
+                            "Provider attention cleared; exact run queued for execution restart"
+                            if provider_attention
+                            else "Authorization attention cleared; exact run queued for re-admission"
+                        ),
+                    )
+                    self._emit_callback(
+                        worker,
+                        "run.queued",
+                        run=resumed_run,
+                        message=(
+                            "Provider attention cleared; run queued for execution restart"
+                            if provider_attention
+                            else "Authorization attention cleared; run queued for re-admission"
+                        ),
+                    )
+                self._ensure_worker_processor(worker_id)
+                return {
+                    "status": "queued",
+                    "state": "queued",
+                    "run_id": run_id,
+                    "confirmation_pending": False,
+                    "resume_mode": (
+                        "provider_restart_same_run"
+                        if provider_attention
+                        else "authorization_re_admission"
+                    ),
+                }
+            if str(worker.get("state") or "") != "paused":
+                raise RuntimeError("active_work_not_paused")
+            resumed = self.resume_worker(
+                worker_id, run_id=run_id, action_use_id=action_use_id
+            )
+            if str(resumed.get("_control_outcome") or "") == "terminal_won":
+                authoritative = dict(resumed.get("_control_run") or {})
+                authoritative_state = str(
+                    authoritative.get("state") or "completed"
+                )
+                return {
+                    "status": "accepted",
+                    "state": (
+                        "cancelled"
+                        if authoritative_state == "interrupted"
+                        else authoritative_state
+                    ),
+                    "run_id": str(authoritative.get("run_id") or run_id),
+                    "confirmation_pending": False,
+                    "control_outcome": "terminal_won",
+                }
+            durable_run = self.require_run(run_id)
+            resumed_state = str(durable_run.get("state") or "queued")
+            return {
+                "status": "accepted",
+                "state": resumed_state,
+                "run_id": run_id,
+                "confirmation_pending": False,
+                "worker": resumed,
+                "resume_mode": (
+                    "provider_restart_same_run"
+                    if resumed_state == "queued" and bool(run.get("started_at"))
+                    else "in_place"
+                    if resumed_state == "running"
+                    else "queued_same_run"
+                ),
+            }
+
+        if action == "stop":
+            if run_state in {
+                "queued",
+                "running",
+                "settling",
+                "paused",
+                "needs_input",
+            }:
+                stopped = self.stop_run(
+                    worker_id, run_id, action_use_id=action_use_id
+                )
+                if not bool(stopped.get("accepted")) and not bool(
+                    stopped.get("confirmation_pending")
+                ):
+                    raise RuntimeError("active_work_stop_not_accepted")
+                stopped_run = stopped.get("run") if isinstance(stopped, dict) else None
+                response = {
+                    "status": "pending" if stopped.get("confirmation_pending") else "accepted",
+                    "state": "stopping"
+                    if stopped.get("confirmation_pending")
+                    else str((stopped_run or {}).get("state") or "cancelled"),
+                    "run_id": run_id,
+                    "confirmation_pending": bool(stopped.get("confirmation_pending")),
+                }
+                if str(stopped.get("work_stop_outcome") or "") == "completion_won":
+                    response["control_outcome"] = "terminal_won"
+                return response
+            if run_state == "cancelled":
+                return {
+                    "status": "accepted",
+                    "state": "cancelled",
+                    "run_id": run_id,
+                    "confirmation_pending": False,
+                }
+            raise RuntimeError("active_work_not_active")
+
+        if action == "retry":
+            if run_state != "failed" or not is_user_resumable_failure(
+                failure_class=run.get("failure_class"),
+                retryable=run.get("failure_retryable"),
+            ):
+                raise RuntimeError("active_work_not_retryable")
+            if self.store.get_active_run(worker_id) or self.store.has_queued_runs(worker_id):
+                raise RuntimeError("active_work_has_active_run")
+            retry_guidance = str(instruction or "").strip()
+            origin_trace, continuation_contract = (
+                self._active_work_follow_up_authority(action_record)
+            )
+            retry_context = build_workspace_continuation_context(
+                previous_run=run,
+                continuation_goal=retry_guidance or None,
+            )
+            created = self.assign_run(
+                worker_id,
+                continuation_instruction(
+                    previous_run=run,
+                    continuation_context=retry_context,
+                ),
+                event_type="run.queued",
+                idempotency_key=self._active_work_effect_idempotency_key(
+                    str(delegation.get("work_ref") or ""),
+                    idempotency_key,
+                ),
+                origin_trace=origin_trace,
+                continuation_contract=continuation_contract,
+                continuation_context=retry_context,
+            )
+            return {
+                "status": "queued",
+                "state": "queued",
+                "run_id": str(created.get("run_id") or ""),
+                "confirmation_pending": False,
+            }
+
+        if action == "dismiss":
+            if run_state not in {"completed", "failed", "cancelled", "interrupted"}:
+                raise RuntimeError("active_work_not_terminal")
+            self.store.dismiss_delegation(
+                str(delegation.get("work_ref") or ""),
+                tenant_id=str(delegation.get("tenant_id") or ""),
+                owner_id=str(delegation.get("owner_id") or ""),
+            )
+            return {
+                "status": "accepted",
+                "state": "cancelled" if run_state == "interrupted" else run_state,
+                "run_id": run_id,
+                "confirmation_pending": False,
+            }
+
+        raise ValueError("active_work_action_invalid")
+
+    @staticmethod
+    def _active_work_effect_idempotency_key(work_ref: str, idempotency_key: str) -> str:
+        return f"active-work:{str(work_ref or '').strip()}:{str(idempotency_key or '').strip()}"
+
+    @staticmethod
+    def _idempotent_run_id(worker_id: str, idempotency_key: str) -> str:
+        return "run_idem_" + hashlib.sha256(
+            f"{worker_id}\0{idempotency_key}".encode("utf-8")
+        ).hexdigest()[:32]
+
+    def active_work_effect_run_id(
+        self,
+        delegation: dict,
+        *,
+        idempotency_key: str,
+    ) -> str:
+        return self._idempotent_run_id(
+            str(delegation.get("worker_id") or ""),
+            self._active_work_effect_idempotency_key(
+                str(delegation.get("work_ref") or ""),
+                idempotency_key,
+            ),
+        )
+
+    def active_work_action_claim_is_pending(self, action_record: dict) -> bool:
+        """Whether one receipt is still fenced by its exact bound control claim."""
+
+        action_use_id = str(action_record.get("action_use_id") or "").strip()
+        current_action = (
+            self.store.get_active_work_action(action_use_id) if action_use_id else None
+        ) or {}
+        if (
+            str(current_action.get("status") or "") != "pending"
+            or str(current_action.get("executor_id") or "") != self._executor_id
+        ):
+            return False
+        operation_id = str(
+            current_action.get("lifecycle_operation_id") or ""
+        ).strip()
+        operation_kind = str(
+            current_action.get("lifecycle_operation_kind") or ""
+        ).strip()
+        target_run_id = str(
+            current_action.get("lifecycle_target_run_id") or ""
+        ).strip()
+        expected_kind = {
+            "pause": "pause_run",
+            "resume": "resume_run",
+            "steer": "steer_run",
+            "stop": "stop_run",
+        }.get(str(current_action.get("action") or ""), "")
+        source_run = self.store.get_run(
+            str(current_action.get("source_run_id") or "")
+        )
+        worker = (
+            self.store.get_worker(str(source_run.get("worker_id") or ""))
+            if source_run
+            else None
+        ) or {}
+        return bool(
+            operation_id
+            and operation_kind == expected_kind
+            and target_run_id == str(current_action.get("source_run_id") or "")
+            and str(worker.get("compute_release_token") or "").strip()
+            and str(worker.get("compute_release_operation_id") or "")
+            == operation_id
+            and str(worker.get("compute_release_kind") or "") == operation_kind
+            and str(worker.get("compute_release_target_run_id") or "")
+            == target_run_id
+        )
+
+    def _finish_bound_steer_action(
+        self,
+        *,
+        operation_id: str,
+        target_run_id: str,
+        replacement_run: dict,
+    ) -> dict | None:
+        """Finish only the action receipt bound to one proven Steer lifecycle."""
+
+        action = self.store.get_pending_active_work_action_for_lifecycle(
+            operation_id=operation_id,
+            operation_kind="steer_run",
+            target_run_id=target_run_id,
+        )
+        if not action:
+            return None
+        replacement_run_id = str(replacement_run.get("run_id") or "").strip()
+        replacement_worker_id = str(replacement_run.get("worker_id") or "").strip()
+        if not replacement_run_id or not replacement_worker_id:
+            return None
+        delegation = self.store.get_delegation(
+            str(action.get("work_ref") or ""),
+            tenant_id=str(action.get("tenant_id") or ""),
+            owner_id=str(action.get("owner_id") or ""),
+        )
+        source_run = self.store.get_run(target_run_id)
+        if (
+            not delegation
+            or not source_run
+            or str(delegation.get("worker_id") or "") != replacement_worker_id
+            or str(source_run.get("worker_id") or "") != replacement_worker_id
+            or str(delegation.get("current_run_id") or "") != replacement_run_id
+        ):
+            return None
+        replacement_state = str(replacement_run.get("state") or "queued")
+        response: dict[str, object] = {
+            "workRef": str(action.get("work_ref") or ""),
+            "action": "steer",
+            "status": "queued" if replacement_state == "queued" else "accepted",
+            "state": replacement_state,
+            "confirmationPending": False,
+            "idempotentReplay": False,
+            "updatedAt": str(delegation.get("updated_at") or ""),
+            "deliveryMode": "queued",
+        }
+        return self.store.finish_active_work_action(
+            str(action.get("action_use_id") or ""),
+            response=response,
+            current_run_id=replacement_run_id,
+            executor_id=str(action.get("executor_id") or ""),
+        )
+
+    def _settle_interrupted_steer_claim(
+        self,
+        worker_id: str,
+        target_run_id: str,
+    ) -> dict | None:
+        """Advance one exact replacement after its source interruption is durable."""
+
+        clean_worker_id = str(worker_id or "").strip()
+        clean_target_run_id = str(target_run_id or "").strip()
+        if not clean_worker_id or not clean_target_run_id:
+            return None
+        with self._worker_compute_release_lock(clean_worker_id):
+            worker = self.store.get_worker(clean_worker_id) or {}
+            target = self.store.get_run(clean_target_run_id) or {}
+            replacement_run_id = str(
+                worker.get("compute_release_replacement_run_id") or ""
+            ).strip()
+            replacement = self.store.get_run(replacement_run_id) or {}
+            if (
+                str(worker.get("compute_release_kind") or "") != "steer_run"
+                or str(worker.get("compute_release_scope") or "") != "run"
+                or str(worker.get("compute_release_target_run_id") or "")
+                != clean_target_run_id
+                or not str(worker.get("compute_release_token") or "").strip()
+                or str(target.get("worker_id") or "") != clean_worker_id
+                or str(target.get("state") or "") != "interrupted"
+                or str(target.get("started_at") or "")
+                != str(worker.get("compute_release_target_started_at") or "")
+                or str(replacement.get("worker_id") or "") != clean_worker_id
+                or str(replacement.get("run_id") or "") != replacement_run_id
+                or str(replacement.get("state") or "")
+                not in ({"queued"} | TERMINAL_RUN_STATES)
+            ):
+                return None
+            operation_id = str(
+                worker.get("compute_release_operation_id")
+                or worker.get("compute_release_token")
+                or ""
+            )
+            operation = self.store.finalize_worker_steer_claim(
+                clean_worker_id,
+                str(worker["compute_release_token"]),
+                int(worker.get("compute_release_epoch") or 0),
+                target_run_id=clean_target_run_id,
+                target_expected_state="running",
+                replacement_run_id=replacement_run_id,
+                replacement_instruction=str(replacement.get("instruction") or ""),
+                runtime_fields={},
+            )
+        if not operation:
+            return None
+        self._replay_pending_lifecycle_effects()
+        self._finish_bound_steer_action(
+            operation_id=operation_id,
+            target_run_id=clean_target_run_id,
+            replacement_run=dict(operation.get("replacement_run") or replacement),
+        )
+        return operation
+
+    @staticmethod
+    def _active_work_service_state(record: dict) -> str:
+        worker_state = str(record.get("worker_state") or "")
+        run_state = str(record.get("run_state") or "")
+        if worker_state == "stopping":
+            return "stopping"
+        if worker_state == "paused" and run_state in {
+            "queued",
+            "running",
+            "settling",
+            "paused",
+        }:
+            return "paused"
+        if run_state == "queued" and worker_state == "created":
+            return "accepted"
+        if run_state == "queued" and worker_state in {"starting", "resuming"}:
+            return "starting"
+        if run_state == "interrupted":
+            return "cancelled"
+        if run_state in {
+            "queued",
+            "running",
+            "settling",
+            "paused",
+            "needs_input",
+            "completed",
+            "failed",
+            "cancelled",
+        }:
+            return run_state
+        return "failed" if worker_state == "failed" else "queued"
+
+    @staticmethod
+    def _active_work_service_actions(record: dict, state: str) -> set[str]:
+        if state in {"accepted", "queued", "starting", "running"}:
+            return {"queue", "message", "steer", "pause", "stop"}
+        if state == "settling":
+            return {"queue", "message", "stop"}
+        if state == "paused":
+            return {"queue", "message", "resume", "stop"}
+        if state == "needs_input":
+            return {"queue", "message", "resume", "stop"}
+        if state == "failed" and is_user_resumable_failure(
+            failure_class=record.get("run_failure_class"),
+            retryable=record.get("run_failure_retryable"),
+        ):
+            return {"retry", "dismiss"}
+        if state == "completed":
+            return {"queue", "message", "dismiss"}
+        if state in {"failed", "cancelled"}:
+            return {"dismiss"}
+        return set()
+
+    def reconcile_active_work_action(
+        self,
+        delegation: dict,
+        *,
+        action: str,
+        instruction: str = "",
+        idempotency_key: str,
+        source_run_id: str,
+        capability_reauthorization: dict[str, object] | None = None,
+        action_use_id: str = "",
+    ) -> dict[str, object] | None:
+        """Recover an action receipt from its durable effect after a lost response."""
+
+        worker_id = str(delegation.get("worker_id") or "")
+        project_id = str(delegation.get("project_id") or "")
+        tenant_id = str(delegation.get("tenant_id") or "")
+        source_run = self.store.get_run(str(source_run_id or ""))
+        if (
+            not source_run
+            or str(source_run.get("worker_id") or "") != worker_id
+            or str(source_run.get("project_id") or "") != project_id
+            or str(source_run.get("tenant_id") or "") != tenant_id
+        ):
+            return None
+
+        action_record = (
+            self.store.get_active_work_action(action_use_id) if action_use_id else None
+        )
+        action_operation_id = str(
+            (action_record or {}).get("lifecycle_operation_id") or ""
+        )
+        action_operation_kind = str(
+            (action_record or {}).get("lifecycle_operation_kind") or ""
+        )
+        action_operation_target = str(
+            (action_record or {}).get("lifecycle_target_run_id") or ""
+        )
+
+        def action_proves(kind: str, event_type: str) -> bool:
+            return bool(
+                action_operation_id
+                and action_operation_kind == kind
+                and action_operation_target == str(source_run["run_id"])
+                and self.store.has_lifecycle_operation_event(
+                    operation_id=action_operation_id,
+                    operation_kind=kind,
+                    event_type=event_type,
+                    worker_id=worker_id,
+                    run_id=str(source_run["run_id"]),
+                )
+            )
+
+        worker = self.store.get_worker(worker_id) or {}
+        claim_kind = str(worker.get("compute_release_kind") or "")
+        claim_target = str(worker.get("compute_release_target_run_id") or "")
+        if claim_kind and claim_target == str(source_run.get("run_id") or ""):
+            claim_action = {
+                "pause_run": "pause",
+                "resume_run": "resume",
+                "steer_run": "steer",
+                "stop_run": "stop",
+            }.get(claim_kind)
+            if claim_action == action:
+                raw_expiry = str(worker.get("compute_release_expires_at") or "")
+                try:
+                    claim_expired = bool(raw_expiry) and datetime.fromisoformat(
+                        raw_expiry
+                    ) <= datetime.now(timezone.utc)
+                except ValueError:
+                    claim_expired = False
+                if claim_expired:
+                    self.recover_expired_compute_release_claims_once()
+                    worker = self.store.get_worker(worker_id) or {}
+                    source_run = self.store.get_run(
+                        str(source_run["run_id"])
+                    ) or source_run
+                if str(worker.get("compute_release_token") or ""):
+                    return None
+
+        if action in {"queue", "message", "steer", "retry"}:
+            effect_run_id = self.active_work_effect_run_id(
+                delegation,
+                idempotency_key=idempotency_key,
+            )
+            effect_run = self.store.get_run(effect_run_id)
+            if (
+                not effect_run
+                or str(effect_run.get("worker_id") or "") != worker_id
+                or str(effect_run.get("project_id") or "") != project_id
+                or str(effect_run.get("tenant_id") or "") != tenant_id
+            ):
+                return None
+            effect_state = str(effect_run.get("state") or "queued")
+            source_state = str(source_run.get("state") or "")
+            if (
+                action == "steer"
+                and source_state in TERMINAL_RUN_STATES
+                and effect_state == "cancelled"
+                and str(effect_run.get("error_text") or "")
+                == STEER_REPLACEMENT_SUPPRESSED_ERROR
+                and action_proves("steer_run", "control.terminal_won")
+            ):
+                current_delegation = self.store.get_delegation(
+                    str(delegation.get("work_ref") or ""),
+                    tenant_id=tenant_id,
+                    owner_id=str(delegation.get("owner_id") or ""),
+                )
+                if (
+                    not current_delegation
+                    or str(current_delegation.get("current_run_id") or "")
+                    != str(source_run["run_id"])
+                ):
+                    return None
+                return {
+                    "status": "accepted",
+                    "state": (
+                        "cancelled" if source_state == "interrupted" else source_state
+                    ),
+                    "run_id": str(source_run["run_id"]),
+                    "replacement_run_id": effect_run_id,
+                    "confirmation_pending": False,
+                    "control_outcome": "terminal_won",
+                    "advance_current_run": False,
+                }
+            if action == "steer" and not (
+                source_state in {"interrupted", "cancelled"}
+                and action_proves("steer_run", f"run.{source_state}")
+            ):
+                return None
+            return {
+                "status": "queued" if effect_state == "queued" else "accepted",
+                "state": effect_state,
+                "run_id": effect_run_id,
+                "confirmation_pending": False,
+                "delivery_mode": (
+                    "queued_next_boundary" if action == "message" else "queued"
+                ),
+            }
+
+        source_state = str(source_run.get("state") or "")
+        if (
+            action == "pause"
+            and source_state in TERMINAL_RUN_STATES
+            and action_proves("pause_run", "control.terminal_won")
+        ):
+            return {
+                "status": "accepted",
+                "state": "cancelled" if source_state == "interrupted" else source_state,
+                "run_id": str(source_run["run_id"]),
+                "confirmation_pending": False,
+                "control_outcome": "terminal_won",
+                "advance_current_run": False,
+            }
+        if action == "pause" and source_state == "paused":
+            if not action_proves("pause_run", "run.paused"):
+                return None
+            return {
+                "status": "accepted",
+                "state": "paused",
+                "run_id": str(source_run["run_id"]),
+                "confirmation_pending": False,
+            }
+        if (
+            action == "resume"
+            and source_state in TERMINAL_RUN_STATES
+            and action_proves("resume_run", "control.terminal_won")
+        ):
+            return {
+                "status": "accepted",
+                "state": "cancelled" if source_state == "interrupted" else source_state,
+                "run_id": str(source_run["run_id"]),
+                "confirmation_pending": False,
+                "control_outcome": "terminal_won",
+                "advance_current_run": False,
+            }
+        if action == "resume" and source_state in {"queued", "running"}:
+            authorization_re_admitted = bool(
+                str((action_record or {}).get("effect_phase") or "")
+                == "authorization_re_admitted"
+                and action_proves("resume_run", "run.authorization_resumed")
+            )
+            provider_progress_re_admitted = bool(
+                str((action_record or {}).get("effect_phase") or "")
+                == "provider_progress_re_admitted"
+                and action_proves("resume_run", "run.resumed")
+            )
+            if not (
+                authorization_re_admitted
+                or provider_progress_re_admitted
+                or action_proves("resume_run", "run.resumed")
+            ):
+                return None
+            if authorization_re_admitted or provider_progress_re_admitted:
+                self._replay_pending_lifecycle_effects()
+                self._ensure_worker_processor(worker_id)
+                resume_mode = (
+                    "provider_restart_same_run"
+                    if provider_progress_re_admitted
+                    else "authorization_re_admission"
+                )
+            elif capability_reauthorization is not None:
+                resume_mode = "authorization_re_admission"
+            elif source_state == "running":
+                resume_mode = "in_place"
+            elif bool(source_run.get("started_at")):
+                resume_mode = "provider_restart_same_run"
+            else:
+                resume_mode = "queued_same_run"
+            return {
+                "status": "queued" if source_state == "queued" else "accepted",
+                "state": source_state,
+                "run_id": str(source_run["run_id"]),
+                "confirmation_pending": False,
+                "resume_mode": resume_mode,
+            }
+        if action == "stop":
+            work_stop_outcome = str(worker.get("work_stop_outcome") or "")
+            stop_settled = bool(
+                action_operation_id
+                and action_operation_kind == "stop_run"
+                and action_operation_target == str(source_run["run_id"])
+                and str(worker.get("work_stop_id") or "") == action_operation_id
+                and worker.get("work_stop_settled_at")
+                and work_stop_outcome in {"cancelled", "completion_won"}
+                and not self.store.list_nonterminal_runs_for_worker(worker_id)
+                and action_proves(
+                    "stop_run",
+                    "run.cancelled"
+                    if work_stop_outcome == "cancelled"
+                    else "work.stop_completion_won",
+                )
+            )
+            if stop_settled:
+                return {
+                    "status": "accepted",
+                    "state": (
+                        "cancelled"
+                        if work_stop_outcome == "cancelled"
+                        else "cancelled"
+                        if source_state == "interrupted"
+                        else source_state
+                    ),
+                    "run_id": str(source_run["run_id"]),
+                    "confirmation_pending": False,
+                    "control_outcome": (
+                        "terminal_won"
+                        if work_stop_outcome == "completion_won"
+                        else "work_stopped"
+                    ),
+                    "advance_current_run": False,
+                }
+            if (
+                str(worker.get("state") or "") == "stopping"
+                and str(worker.get("compute_release_kind") or "") == "stop_run"
+                and str(worker.get("compute_release_scope") or "") == "work"
+                and str(worker.get("compute_release_target_run_id") or "")
+                == str(source_run["run_id"])
+                and str(worker.get("compute_release_operation_id") or "")
+                == action_operation_id
+                and str(worker.get("work_stop_id") or "") == action_operation_id
+            ):
+                return {
+                    "status": "pending",
+                    "state": "stopping",
+                    "run_id": str(source_run["run_id"]),
+                    "confirmation_pending": True,
+                }
+            return None
+        if action == "dismiss":
+            refreshed = self.store.get_delegation(
+                str(delegation.get("work_ref") or ""),
+                tenant_id=tenant_id,
+                owner_id=str(delegation.get("owner_id") or ""),
+            )
+            if refreshed and refreshed.get("dismissed_at"):
+                return {
+                    "status": "accepted",
+                    "state": "cancelled" if source_state == "interrupted" else source_state,
+                    "run_id": str(source_run["run_id"]),
+                    "confirmation_pending": False,
+                }
+        return None
+
+    def activate_prepared_conversation_worker(self, worker_id: str) -> dict:
+        worker = self.require_worker(worker_id)
+        session = self.store.get_provider_session_by_worker(worker_id)
+        if (
+            not session
+            or self._trusted_run_lane(worker) != "conversation"
+            or str(session.get("tenant_id") or "")
+            != str(worker.get("tenant_id") or "")
+            or str(session.get("owner_id") or "")
+            != str(worker.get("owner_id") or "")
+        ):
+            raise ParallelExecutionIsolationError(
+                "The conversation worker does not have a durable provider-session binding."
+            )
+        self._ensure_execution_allowed(worker)
+        return self._start_worker_again(
+            worker,
+            "worker.ready",
+            "Conversation worker ready",
+        )
+
+    def process_due_worker_retries_once(self, *, limit: int = 1000) -> list[str]:
+        if self._shutdown_event.is_set():
+            return []
+        worker_ids = self.store.list_due_retry_worker_ids(limit=limit)
+        refresh_isolated_usage = getattr(
+            self.runtime, "isolated_resource_usage", None
+        )
+        if callable(refresh_isolated_usage):
+            needs_capacity_refresh = any(
+                str(
+                    (self.store.get_worker(worker_id) or {}).get("execution_mode")
+                    or "docker"
+                )
+                .strip()
+                .lower()
+                == "docker"
+                and str(
+                    (self.store.peek_next_queued_run(worker_id) or {}).get(
+                        "last_retry_class"
+                    )
+                    or ""
+                )
+                == "host_capacity"
+                for worker_id in worker_ids
+            )
+            if needs_capacity_refresh:
+                try:
+                    # Durable admission remains cached-only. The background
+                    # retry scheduler refreshes a stale or expired Docker
+                    # snapshot once before dispatching this due batch.
+                    refresh_isolated_usage(cached_only=False)
+                except Exception:
+                    logger.warning(
+                        "Due Docker capacity retry could not refresh resource usage",
+                        exc_info=True,
+                    )
+        dispatched: list[str] = []
+        for worker_id in worker_ids:
+            if self._shutdown_event.is_set():
+                break
+            self._ensure_worker_processor(worker_id)
+            dispatched.append(worker_id)
+        return dispatched
+
+    def discard_run_local_bundle(self, run_id: str) -> None:
+        with self._run_local_bundles_lock:
+            self._run_local_bundles.pop(str(run_id), None)
+
+    def attach_run_local_bundle(
+        self,
+        run_id: str,
+        bundle: dict | None,
+        *,
+        provider_request_id: str = "",
+        response_timeout_s: float | None = None,
+        response_deadline_at: str = "",
+    ) -> bool:
+        """Refresh one queued run's invocation-local authority after a retry.
+
+        The exact bearer remains memory-only. A direct authorization retry may
+        atomically reopen its blocked provider request and run; an invocation
+        that already entered the provider must finish or fail without having
+        authority changed underneath it.
+        """
+
+        if not bundle:
+            return False
+        run = self.store.get_run(str(run_id))
+        if not run or str(run.get("state") or "") not in {
+            "queued",
+            "claimed",
+            "admitted",
+            "running",
+            "needs_input",
+        }:
+            return False
+        with self._run_local_bundles_lock:
+            current = self.store.get_run(str(run_id))
+            current_state = str((current or {}).get("state") or "")
+            if not current or current_state not in {
+                "queued",
+                "claimed",
+                "admitted",
+                "running",
+                "needs_input",
+            }:
+                return False
+            if (
+                current_state in {"claimed", "admitted", "running"}
+                and bool(current.get("runtime_invoked_at"))
+                and current_state != "running"
+            ):
+                return False
+            if (
+                current_state in {"claimed", "admitted", "running"}
+                and str(run_id) not in self._run_local_grant_waiters
+            ):
+                return False
+            if current_state == "needs_input":
+                if str(provider_request_id or "").strip():
+                    reopened = self.store.reopen_direct_provider_needs_input(
+                        str(provider_request_id),
+                        run_id=str(run_id),
+                        response_timeout_s=response_timeout_s,
+                        response_deadline_at=str(response_deadline_at or ""),
+                    )
+                    refreshed = (reopened or {}).get("run")
+                else:
+                    refreshed = self.store.transition_run_if_state(
+                        str(run_id),
+                        "needs_input",
+                        "queued",
+                        ended_at=None,
+                        retry_after=None,
+                        error_text="",
+                        failure_class="",
+                        failure_retryable=0,
+                        failure_structured=0,
+                        failure_user_message="",
+                        failure_recommended_recovery="",
+                        failure_diagnostic_summary="",
+                    )
+                if not refreshed:
+                    return False
+            self._run_local_bundles[str(run_id)] = dict(bundle)
+            self._run_local_bundles_lock.notify_all()
+            if current_state == "queued":
+                self.store.update_run(
+                    str(run_id),
+                    retry_after=None,
+                    error_text="",
+                    failure_class="",
+                    failure_retryable=0,
+                    failure_structured=0,
+                    failure_user_message="",
+                    failure_recommended_recovery="",
+                    failure_diagnostic_summary="",
+                )
+        return True
+
+    def has_run_local_bundle(self, run_id: str) -> bool:
+        with self._run_local_bundles_lock:
+            return str(run_id) in self._run_local_bundles
+
+    def _requires_conversation_invocation_bearer(self, worker: dict) -> bool:
+        bundle = self._bootstrap_bundle_for(worker) or {}
+        broker = bundle.get("glasshive_capability_broker")
+        return bool(
+            self._trusted_run_lane(worker) == "conversation"
+            and isinstance(broker, dict)
+            and str(broker.get("authority_kind") or "").strip()
+            == "conversation_orchestrator"
+        )
+
+    def _mark_run_local_grant_waiter(self, worker: dict, run_id: str) -> None:
+        if not self._requires_conversation_invocation_bearer(worker):
+            return
+        with self._run_local_bundles_lock:
+            self._run_local_grant_waiters.add(str(run_id))
+
+    def _clear_run_local_grant_waiter(self, run_id: str) -> None:
+        with self._run_local_bundles_lock:
+            self._run_local_grant_waiters.discard(str(run_id))
+
+    def _run_local_worker(
+        self,
+        worker: dict,
+        run: dict,
+        *,
+        authority_context: dict[str, str] | None = None,
+    ) -> dict:
+        if bool(int(run.get("provider_liveness_route_locked") or 0)):
+            locked_profile = str(run.get("provider_route_profile") or "").strip()
+            locked_runtime = str(run.get("provider_route_runtime") or "").strip()
+            locked_model = str(run.get("provider_route_model") or "").strip()
+            if not locked_profile or not locked_runtime or not locked_model:
+                raise RuntimeError("provider_liveness_route_lock_invalid")
+            worker = {
+                **worker,
+                "profile": locked_profile,
+                "backend": self._legacy_backend_label(
+                    locked_profile,
+                    str(worker.get("execution_mode") or "docker"),
+                    "",
+                ),
+                "runtime": locked_runtime,
+                "model": locked_model,
+            }
+        try:
+            run_worker = self._run_local_admitted_worker(
+                worker, run, authority_context=authority_context
+            )
+        except Exception:
+            self._clear_run_local_grant_waiter(str(run["run_id"]))
+            raise
+        admitted_bundle = self._bootstrap_bundle_for(run_worker) or {}
+        admitted_env = (
+            admitted_bundle.get("env")
+            if isinstance(admitted_bundle.get("env"), dict)
+            else {}
+        )
+        admitted_bearer = str(
+            admitted_env.get(PARALLEL_CLEAN_ROOM_BROKER_TOKEN_ENV) or ""
+        ).strip()
+        requires_invocation_bearer = self._requires_conversation_invocation_bearer(
+            run_worker
+        )
+        run_id = str(run["run_id"])
+        with self._run_local_bundles_lock:
+            if requires_invocation_bearer:
+                self._run_local_grant_waiters.add(run_id)
+            transient = self._run_local_bundles.pop(run_id, None)
+        transient_env = (
+            transient.get("env")
+            if isinstance(transient, dict) and isinstance(transient.get("env"), dict)
+            else {}
+        )
+        has_invocation_bearer = bool(
+            str(
+                transient_env.get("GLASSHIVE_CAPABILITY_BROKER_TOKEN") or ""
+            ).strip()
+        )
+        if requires_invocation_bearer and not has_invocation_bearer:
+            deadline = time.monotonic() + 0.5
+            with self._run_local_bundles_lock:
+                try:
+                    while not self._shutdown_event.is_set():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        self._run_local_bundles_lock.wait(timeout=remaining)
+                        transient = self._run_local_bundles.pop(run_id, None)
+                        transient_env = (
+                            transient.get("env")
+                            if isinstance(transient, dict)
+                            and isinstance(transient.get("env"), dict)
+                            else {}
+                        )
+                        if str(
+                            transient_env.get(
+                                "GLASSHIVE_CAPABILITY_BROKER_TOKEN"
+                            )
+                            or ""
+                        ).strip():
+                            break
+                finally:
+                    self._run_local_grant_waiters.discard(run_id)
+            has_invocation_bearer = bool(
+                str(
+                    transient_env.get("GLASSHIVE_CAPABILITY_BROKER_TOKEN") or ""
+                ).strip()
+            )
+        elif requires_invocation_bearer:
+            with self._run_local_bundles_lock:
+                self._run_local_grant_waiters.discard(run_id)
+        if requires_invocation_bearer and not has_invocation_bearer:
+            raise BrokerAdmissionError(
+                "conversation_capability_grant_required",
+                "The conversation capability grant must be refreshed before this queued turn can start.",
+                needs_input=True,
+            )
+        try:
+            continuation_contract = json.loads(
+                str(run.get("continuation_contract_json") or "{}")
+            )
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("continuation_contract_invalid") from exc
+        if not isinstance(continuation_contract, dict):
+            raise RuntimeError("continuation_contract_invalid")
+        try:
+            continuation_context = json.loads(
+                str(run.get("continuation_context_json") or "{}")
+            )
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("continuation_context_invalid") from exc
+        if not isinstance(continuation_context, dict):
+            raise RuntimeError("continuation_context_invalid")
+        continuation_projection: dict[str, object] = {}
+        if continuation_contract:
+            continuation_projection["viventium_continuation_contract"] = (
+                continuation_contract
+            )
+        if continuation_context:
+            continuation_projection["viventium_continuation_context"] = (
+                continuation_context
+            )
+        run_bundle = self._bootstrap_bundle_for(run_worker) or {}
+        if continuation_projection:
+            run_bundle = merge_bootstrap_bundle(
+                run_bundle,
+                continuation_projection,
+            ) or {}
+        if transient:
+            run_bundle = merge_bootstrap_bundle(run_bundle, transient) or {}
+        # Clean-room canonicalization deliberately excludes per-run continuation
+        # state and bearer material from every durable/public merge. Apply only
+        # these exact server-owned facts after all canonical merges, on the
+        # in-memory run object that is handed directly to the runtime.
+        run_bundle.update(continuation_projection)
+        run_bundle.pop("viventium_run_liveness", None)
+        if str(run.get("liveness_mode") or "standard") == "declared_long":
+            run_bundle["viventium_run_liveness"] = {
+                "version": 1,
+                "long_mission": True,
+            }
+        if admitted_bearer:
+            run_bundle["env"] = {
+                **(
+                    run_bundle.get("env")
+                    if isinstance(run_bundle.get("env"), dict)
+                    else {}
+                ),
+                PARALLEL_CLEAN_ROOM_BROKER_TOKEN_ENV: admitted_bearer,
+            }
+        return {
+            **run_worker,
+            "_run_attempt_id": str(run.get("active_attempt_id") or ""),
+            "bootstrap_bundle_json": json.dumps(run_bundle, ensure_ascii=False),
+        }
+
+    def _finish_paused_worker_transition(
+        self,
+        worker: dict,
+        active_run: dict | None,
+        *,
+        runtime_info: RuntimeInfo | None,
+    ) -> dict:
+        """Commit the durable half of Pause after the runtime is suspended."""
+
+        worker_id = str(worker["worker_id"])
+        active_state = str((active_run or {}).get("state") or "")
+        paused_run = None
+        if active_run and active_state in {"queued", "running", "settling"}:
+            paused_run = self.store.transition_run_if_state(
+                str(active_run["run_id"]),
+                active_state,
+                "paused",
+                ended_at=None,
+                error_text="Paused by operator",
+            )
+            if not paused_run:
+                durable = self.store.get_run(str(active_run["run_id"])) or {}
+                if str(durable.get("state") or "") in TERMINAL_RUN_STATES:
+                    # Completion/cancellation that commits while the runtime
+                    # pause RPC is in flight is authoritative.
+                    return self.store.update_worker_state(
+                        worker_id, "ready", last_error=""
+                    ) or worker
+                if str(durable.get("state") or "") == "paused":
+                    return self.store.update_worker_state(
+                        worker_id, "paused", last_error=""
+                    ) or worker
+                return worker
+
+        updated = (
+            self._apply_runtime_info(
+                worker_id,
+                runtime_info,
+                state="paused",
+                last_error=worker.get("last_error") or "",
+            )
+            if runtime_info is not None
+            else self.store.update_worker_state(worker_id, "paused", last_error="")
+        )
+        if paused_run:
+            self.store.add_event(
+                worker["project_id"], worker_id, paused_run["run_id"], "run.paused", "Run paused by operator"
+            )
+            self.store.add_event(
+                worker["project_id"], worker_id, paused_run["run_id"], "worker.paused", "Worker paused"
+            )
+            self._emit_callback(
+                worker,
+                "run.paused",
+                run=paused_run,
+                message="Worker paused",
+            )
+        elif active_run is None:
+            self.store.add_event(
+                worker["project_id"], worker_id, None, "worker.paused", "Worker paused"
+            )
+            self._emit_callback(
+                worker,
+                "worker.paused",
+                run=None,
+                message="Worker paused",
+            )
+        return updated or worker
+
+    def _pause_worker_without_run(self, worker_id: str) -> dict:
+        """Pause idle compute under the same durable lifecycle ownership."""
+
+        with self._worker_compute_release_lock(worker_id):
+            worker = self.require_worker(worker_id)
+            if self.store.get_controllable_run(worker_id):
+                raise RuntimeErrorBase(
+                    "The worker lifecycle generation changed; retry Pause"
+                )
+            if str(worker.get("state") or "") == "paused":
+                return worker
+            if str(worker.get("execution_mode") or "docker") == "host":
+                raise RuntimeErrorBase(
+                    "The exact host process identity is not confirmed; control remains pending"
+                )
+            claim = self.store.try_claim_worker_compute_release(
+                worker_id,
+                expected_updated_at=str(worker.get("updated_at") or ""),
+                expected_last_run_id=str(worker.get("last_run_id") or ""),
+                expected_state=str(worker.get("state") or ""),
+                expected_container_id=self._runtime_compute_container_id(worker),
+                owner=self._executor_id,
+                ttl_s=self._compute_release_claim_ttl_s(),
+                kind="pause_worker",
+            )
+            if claim is None:
+                raise RuntimeErrorBase(
+                    "The exact worker lifecycle generation changed; retry Pause"
+                )
+            claimed_worker = dict(claim.get("worker") or worker)
+            runtime_worker = self._require_claimed_container_generation(
+                claimed_worker
+            )
+            info = self.runtime.pause_worker(runtime_worker)
+            if not self._runtime_control_info_is_confirmed(info):
+                raise RuntimeErrorBase(
+                    "Runtime pause did not confirm the exact compute state"
+                )
+            updated = self.store.finalize_worker_compute_release(
+                worker_id,
+                str(claim["token"]),
+                int(claim["epoch"]),
+                expected_kind="pause_worker",
+                compute_released_at=worker.get("compute_released_at"),
+                runtime_fields=self._runtime_info_fields(
+                    worker_id, info, last_error=""
+                ),
+                idle_state="paused",
+            )
+            if not updated:
+                raise RuntimeErrorBase(
+                    "Pause lost the exact worker lifecycle generation before finalization"
+                )
+        self._replay_pending_lifecycle_effects()
+        return updated
+
+    def _execute_stop_run_claim(
+        self,
+        worker: dict,
+        run_id: str,
+        *,
+        action_use_id: str = "",
+    ) -> dict[str, object] | None:
+        """Own, execute, and atomically finalize one exact run stop."""
+
+        worker_id = str(worker.get("worker_id") or "")
+        with self._worker_compute_release_lock(worker_id):
+            current = self.store.get_worker(worker_id)
+            target = self.store.get_run(run_id)
+            existing_token = str(
+                (current or {}).get("compute_release_token") or ""
+            ).strip()
+            if (
+                not current
+                or not target
+                or str(target.get("worker_id") or "") != worker_id
+                or (
+                    str(target.get("state") or "") in TERMINAL_RUN_STATES
+                    and not existing_token
+                )
+            ):
+                return None
+            expected_container_id = (
+                str(current.get("compute_release_container_id") or "").strip()
+                if existing_token
+                else self._runtime_compute_container_id(current)
+            )
+            claim = self.store.try_claim_worker_compute_release(
+                worker_id,
+                expected_updated_at=str(current.get("updated_at") or ""),
+                expected_last_run_id=str(current.get("last_run_id") or ""),
+                expected_state=str(current.get("state") or ""),
+                expected_container_id=expected_container_id,
+                owner=self._executor_id,
+                ttl_s=self._compute_release_claim_ttl_s(),
+                kind="stop_run",
+                target_run_id=run_id,
+                expected_target_started_at=str(target.get("started_at") or ""),
+                action_use_id=action_use_id,
+                action_executor_id=self._executor_id if action_use_id else "",
+            )
+            if claim is None:
+                return None
+            claimed_worker = dict(claim.get("worker") or current)
+            token = str(claim["token"])
+            epoch = int(claim["epoch"])
+            if not self.store.worker_compute_release_claim_matches(
+                worker_id, token, epoch
+            ):
+                return None
+            durable_target = self.store.get_run(run_id) or target
+            if str(durable_target.get("state") or "") in TERMINAL_RUN_STATES:
+                # Terminal truth that committed before recovery is authoritative.
+                # Settle only the durable Stop/tombstone transaction; there is
+                # no exact live target left that this control may signal.
+                result = self.store.finalize_worker_work_stop_claim(
+                    worker_id,
+                    token,
+                    epoch,
+                    target_run_id=run_id,
+                    runtime_fields={},
+                    compute_released_at=claimed_worker.get("compute_released_at"),
+                    error_text="Stopped by operator",
+                )
+                if result is None:
+                    raise RuntimeError(
+                        "Terminal-won run stop ownership changed before finalization"
+                    )
+                return {**result, "confirmation_pending": False}
+            runtime_worker = self._worker_with_host_lease(claimed_worker, run_id)
+            runtime_worker = {
+                **runtime_worker,
+                "_compute_release_container_id": str(
+                    claimed_worker.get("compute_release_container_id") or ""
+                ).strip(),
+            }
+            captured_container_id = str(
+                claimed_worker.get("compute_release_container_id") or ""
+            ).strip()
+            if captured_container_id:
+                current_container_id = self._runtime_compute_container_id(
+                    claimed_worker
+                )
+                if current_container_id != captured_container_id:
+                    raise RuntimeErrorBase(
+                        "Worker sandbox generation changed before exact-run stop"
+                    )
+            active_lease = self.store.get_active_host_run_lease_for_run(run_id)
+            prelaunch_reservation = bool(
+                active_lease
+                and str(active_lease.get("startup_state") or "") == "reserved"
+                and not int(active_lease.get("pid") or 0)
+                and not str(
+                    active_lease.get("process_start_identity") or ""
+                ).strip()
+                and not str(
+                    active_lease.get("startup_container_id") or ""
+                ).strip()
+                and not str(
+                    active_lease.get("startup_session_id") or ""
+                ).strip()
+            )
+            no_started_compute = bool(
+                str(target.get("state") or "") in {"queued", "needs_input"}
+                and not active_lease
+            )
+            if prelaunch_reservation or no_started_compute:
+                # The work-stop tombstone won before any external identity was
+                # accepted. The waiting processor will fail its reservation
+                # re-read under the same flock, so there is nothing to signal.
+                info = RuntimeInfo(
+                    runtime=str(claimed_worker.get("runtime") or ""),
+                    model=str(claimed_worker.get("model") or ""),
+                    gateway_url=str(claimed_worker.get("gateway_url") or ""),
+                    gateway_port=claimed_worker.get("gateway_port"),
+                    gateway_token=claimed_worker.get("gateway_token"),
+                    session_key=claimed_worker.get("session_key"),
+                    state_dir=claimed_worker.get("state_dir"),
+                    workspace_dir=claimed_worker.get("workspace_dir"),
+                    pid=None,
+                )
+            else:
+                try:
+                    info = self.runtime.interrupt_worker(
+                        runtime_worker, run_id=run_id
+                    )
+                except TypeError as exc:
+                    if "run_id" not in str(exc):
+                        raise
+                    info = self.runtime.interrupt_worker(runtime_worker)
+            if info.pid is not None:
+                updated = self._apply_runtime_info(
+                    worker_id,
+                    info,
+                    state="stopping",
+                    last_error="",
+                )
+                return {
+                    "worker": updated or claimed_worker,
+                    "run": target,
+                    "confirmation_pending": True,
+                    "target_transitioned": False,
+                }
+            result = self.store.finalize_worker_work_stop_claim(
+                worker_id,
+                token,
+                epoch,
+                target_run_id=run_id,
+                runtime_fields=self._runtime_info_fields(
+                    worker_id,
+                    info,
+                    last_error="",
+                ),
+                compute_released_at=claimed_worker.get("compute_released_at"),
+                error_text="Stopped by operator",
+            )
+            if result is None:
+                raise RuntimeError("Run stop ownership changed before finalization")
+            return {
+                **result,
+                "confirmation_pending": False,
+            }
+
+    def _recover_stop_run_claim(
+        self,
+        worker: dict,
+        run_id: str,
+    ) -> dict[str, object] | None:
+        result = self._execute_stop_run_claim(worker, run_id)
+        if not result or result.get("confirmation_pending"):
+            return None
+        updated = dict(result.get("worker") or {})
+        if updated.get("state") not in {"paused", "terminated", "needs_input"}:
+            if self.store.has_queued_runs(str(worker.get("worker_id") or "")):
+                self._ensure_worker_processor(str(worker.get("worker_id") or ""))
+        return {
+            "worker_id": worker.get("worker_id"),
+            "project_id": worker.get("project_id"),
+            "tenant_id": worker.get("tenant_id"),
+            "owner_id": worker.get("owner_id"),
+            "state": updated.get("state"),
+            "kind": "stop_run",
+            "target_run_id": run_id,
+            "target_transitioned": bool(result.get("target_transitioned")),
+        }
+
+    def stop_run(
+        self,
+        worker_id: str,
+        run_id: str,
+        *,
+        action_use_id: str = "",
+    ) -> dict[str, object]:
+        """Stop one exact run without claiming cancellation before process death is proven."""
+
+        worker = self.require_worker(worker_id)
+        target_run = self.store.get_run(run_id)
+        if (
+            not target_run
+            or str(target_run.get("worker_id") or "") != worker_id
+            or str(target_run.get("state") or "") in TERMINAL_RUN_STATES
+        ):
+            return {
+                "worker": worker,
+                "run": target_run,
+                "confirmation_pending": False,
+                "accepted": False,
+            }
+        try:
+            operation = self._execute_stop_run_claim(
+                worker, run_id, action_use_id=action_use_id
+            )
+        except Exception as exc:
+            error_text = (
+                public_callback_message_text(str(exc))
+                or "Run termination could not be confirmed"
+            )
+            logger.warning(
+                "GlassHive exact-run stop remains pending because termination was not confirmed",
+                extra={"worker_id": worker_id, "run_id": run_id},
+                exc_info=True,
+            )
+            updated = self.store.update_worker_state(
+                worker_id,
+                "stopping",
+                last_error=error_text,
+            )
+            message = "Run stop requested; termination confirmation is pending"
+            self.store.add_event(
+                worker["project_id"],
+                worker_id,
+                run_id,
+                "run.stopping",
+                f"{message}: {error_text}",
+            )
+            return {
+                "worker": updated or worker,
+                "run": target_run,
+                "confirmation_pending": True,
+                "accepted": True,
+                "termination_error": error_text,
+            }
+        if operation is None:
+            current = self.store.get_worker(worker_id) or worker
+            pending = bool(
+                current.get("compute_release_token")
+                and str(current.get("compute_release_kind") or "") == "stop_run"
+                and str(current.get("compute_release_scope") or "") == "work"
+                and str(current.get("compute_release_target_run_id") or "") == run_id
+                and str(current.get("work_stop_id") or "")
+                == str(current.get("compute_release_operation_id") or "")
+            )
+            if pending and action_use_id:
+                action_record = self.store.get_active_work_action(action_use_id) or {}
+                pending = bool(
+                    str(action_record.get("lifecycle_operation_id") or "")
+                    == str(current.get("work_stop_id") or "")
+                    and str(action_record.get("lifecycle_operation_kind") or "")
+                    == "stop_run"
+                    and str(action_record.get("lifecycle_target_run_id") or "")
+                    == run_id
+                )
+            return {
+                "worker": current,
+                "run": self.store.get_run(run_id),
+                "confirmation_pending": pending,
+                "accepted": pending,
+            }
+        confirmation_pending = bool(operation.get("confirmation_pending"))
+        updated = dict(operation.get("worker") or worker)
+        if confirmation_pending:
+            self.store.add_event(
+                worker["project_id"],
+                worker_id,
+                run_id,
+                "run.stopping",
+                "Run stop requested; termination confirmation is pending",
+            )
+            self._emit_callback(
+                worker,
+                "run.stopping",
+                run={**target_run, "state": "stopping"},
+                message="Run stop requested; termination confirmation is pending",
+            )
+            return {
+                "worker": updated,
+                "run": target_run,
+                "confirmation_pending": True,
+                "accepted": True,
+            }
+        cancelled_run = operation.get("run")
+        transitioned = bool(operation.get("target_transitioned"))
+        self._replay_pending_lifecycle_effects()
+        if (
+            updated.get("state") not in {"paused", "terminated", "needs_input"}
+            and self.store.has_queued_runs(worker_id)
+        ):
+            self._ensure_worker_processor(worker_id)
+        return {
+            "worker": updated,
+            "run": cancelled_run or self.store.get_run(run_id),
+            "confirmation_pending": False,
+            "accepted": bool(operation.get("work_stop_outcome")) or transitioned,
+            "work_stop_outcome": str(operation.get("work_stop_outcome") or ""),
+        }
+
+    def _finish_resumed_worker_transition(
+        self,
+        worker: dict,
+        paused_run: dict,
+        runtime_updated_worker: dict,
+    ) -> dict:
+        """Commit the exact paused run after the runtime resume RPC succeeds."""
+
+        worker_id = str(worker["worker_id"])
+        # Docker pause freezes the live provider process, so unpausing can
+        # continue it in place. Host pause terminates the provider process;
+        # requeue the same durable run for the same isolated workspace.
+        resume_state = (
+            "queued"
+            if str(worker.get("execution_mode") or "docker") == "host"
+            or not paused_run.get("started_at")
+            else "running"
+        )
+        resumed_run = self.store.transition_run_if_state(
+            str(paused_run["run_id"]),
+            "paused",
+            resume_state,
+            ended_at=None,
+            error_text="",
+            retry_after=None,
+        )
+        if resumed_run:
+            refreshed = self.store.update_worker_state(
+                worker_id,
+                "running" if resume_state == "running" else "starting",
+                last_error="",
+            )
+            self.store.add_event(
+                str(worker["project_id"]),
+                worker_id,
+                str(paused_run["run_id"]),
+                "run.resumed",
+                "Paused run resumed",
+            )
+            self._emit_callback(
+                worker,
+                "run.started" if resume_state == "running" else "run.queued",
+                run=resumed_run,
+                message=(
+                    "Paused run resumed"
+                    if resume_state == "running"
+                    else "Paused run queued for execution restart"
+                ),
+            )
+            if resume_state == "queued":
+                self._ensure_worker_processor(worker_id)
+            return refreshed or runtime_updated_worker
+        durable = self.store.get_run(str(paused_run["run_id"])) or {}
+        if str(durable.get("state") or "") in TERMINAL_RUN_STATES:
+            return self.store.update_worker_state(
+                worker_id, "ready", last_error=""
+            ) or runtime_updated_worker
+        if str(durable.get("state") or "") in {"queued", "running"}:
+            return self.store.update_worker_state(
+                worker_id,
+                "running" if str(durable.get("state")) == "running" else "starting",
+                last_error="",
+            ) or runtime_updated_worker
+        return runtime_updated_worker
+
+    def _resume_worker_without_run(self, worker_id: str) -> dict:
+        """Resume an idle paused worker only after its startup handshake succeeds."""
+
+        with self._worker_compute_release_lock(worker_id):
+            worker = self.require_worker(worker_id)
+            self._ensure_execution_allowed(worker)
+            worker = self._refresh_worker_model_for_profile(worker)
+            if str(worker.get("state") or "") != "paused":
+                return worker
+            if self.store.get_controllable_run(worker_id):
+                raise RuntimeErrorBase(
+                    "The worker lifecycle generation changed; retry Resume"
+                )
+            expected_container_id = (
+                str(worker.get("compute_release_container_id") or "").strip()
+                if str(worker.get("compute_release_token") or "").strip()
+                else self._runtime_compute_container_id(worker)
+            )
+            claim = self.store.try_claim_worker_compute_release(
+                worker_id,
+                expected_updated_at=str(worker.get("updated_at") or ""),
+                expected_last_run_id=str(worker.get("last_run_id") or ""),
+                expected_state=str(worker.get("state") or ""),
+                expected_container_id=expected_container_id,
+                owner=self._executor_id,
+                ttl_s=self._compute_release_claim_ttl_s(),
+                kind="resume_worker",
+            )
+            if claim is None:
+                raise RuntimeErrorBase(
+                    "The exact worker lifecycle generation changed; retry Resume"
+                )
+            claimed_worker = dict(claim.get("worker") or worker)
+            try:
+                info = self.runtime.ensure_worker_ready(claimed_worker)
+            except Exception as exc:
+                self._restore_failed_resume_claim(
+                    worker=claimed_worker,
+                    token=str(claim["token"]),
+                    epoch=int(claim["epoch"]),
+                    kind="resume_worker",
+                    target_run_id="",
+                    startup_error=exc,
+                )
+                raise
+            updated = self.store.finalize_worker_compute_release(
+                worker_id,
+                str(claim["token"]),
+                int(claim["epoch"]),
+                expected_kind="resume_worker",
+                compute_released_at=None,
+                runtime_fields=self._runtime_info_fields(
+                    worker_id, info, last_error=""
+                ),
+                idle_state="ready",
+            )
+            if not updated:
+                raise RuntimeErrorBase(
+                    "Resume lost the exact worker lifecycle generation before finalization"
+                )
+        self._replay_pending_lifecycle_effects()
+        return updated
+
+    def _execute_worker_termination_claim(
+        self, worker: dict
+    ) -> dict[str, object] | None:
+        """Terminate a whole worker only while the exact durable claim owns it."""
+
+        worker_id = str(worker.get("worker_id") or "")
+        with self._worker_compute_release_lock(worker_id):
+            claim: dict[str, object] | None = None
+            current: dict = {}
+            target_run_id = ""
+            # A queue processor can atomically promote queued -> running just
+            # before this whole-worker tombstone is reserved. That benign CAS
+            # loss must not turn an explicit Terminate into a false conflict.
+            # Re-read the durable generation while the lifecycle guard keeps
+            # the promoted run behind its final pre-launch boundary.
+            for _attempt in range(3):
+                current = self.store.get_worker(worker_id) or {}
+                if not current:
+                    return None
+                if str(current.get("state") or "") == "terminated" and not str(
+                    current.get("compute_release_token") or ""
+                ).strip():
+                    return {"worker": current, "target_transitioned": False}
+                existing_token = str(
+                    current.get("compute_release_token") or ""
+                ).strip()
+                if existing_token:
+                    target_run_id = str(
+                        current.get("compute_release_target_run_id") or ""
+                    ).strip()
+                    target_started_at = str(
+                        current.get("compute_release_target_started_at") or ""
+                    ).strip()
+                    expected_container_id = str(
+                        current.get("compute_release_container_id") or ""
+                    ).strip()
+                else:
+                    target = self.store.get_active_run(
+                        worker_id
+                    ) or self.store.get_controllable_run(worker_id)
+                    target_run_id = str((target or {}).get("run_id") or "").strip()
+                    target_started_at = str(
+                        (target or {}).get("started_at") or ""
+                    ).strip()
+                    expected_container_id = self._runtime_compute_container_id(current)
+                claim = self.store.try_claim_worker_compute_release(
+                    worker_id,
+                    expected_updated_at=str(current.get("updated_at") or ""),
+                    expected_last_run_id=str(current.get("last_run_id") or ""),
+                    expected_state=str(current.get("state") or ""),
+                    expected_container_id=expected_container_id,
+                    owner=self._executor_id,
+                    ttl_s=self._compute_release_claim_ttl_s(),
+                    kind="terminate_worker",
+                    target_run_id=target_run_id,
+                    expected_target_started_at=target_started_at,
+                )
+                if claim is not None:
+                    break
+                refreshed = self.store.get_worker(worker_id) or {}
+                if str(refreshed.get("compute_release_token") or "").strip():
+                    return None
+            if claim is None:
+                return None
+            claimed_worker = dict(claim.get("worker") or current)
+            token = str(claim["token"])
+            epoch = int(claim["epoch"])
+            if not self.store.worker_compute_release_claim_matches(
+                worker_id, token, epoch
+            ):
+                return None
+            if str(claimed_worker.get("execution_mode") or "docker") == "docker":
+                captured_container_id = str(
+                    claimed_worker.get("compute_release_container_id") or ""
+                ).strip()
+                current_container_id = self._runtime_compute_container_id(
+                    claimed_worker
+                )
+                if current_container_id != captured_container_id:
+                    rebound = self.store.rebind_worker_termination_claim_generation(
+                        worker_id,
+                        token,
+                        epoch,
+                        container_id=current_container_id,
+                    )
+                    if rebound is None:
+                        raise RuntimeErrorBase(
+                            "Worker termination generation changed before rebinding"
+                        )
+                    claimed_worker = rebound
+                    epoch = int(rebound["compute_release_epoch"])
+            runtime_worker = (
+                self._worker_with_host_lease(claimed_worker, target_run_id)
+                if target_run_id
+                else claimed_worker
+            )
+            runtime_worker = {
+                **runtime_worker,
+                "_compute_release_container_id": str(
+                    claimed_worker.get("compute_release_container_id") or ""
+                ).strip(),
+            }
+            terminal_run_id = str(
+                claimed_worker.get("last_run_id") or ""
+            ).strip()
+            terminal_run = (
+                self.store.get_run(terminal_run_id) if terminal_run_id else None
+            )
+            if terminal_run and str(terminal_run.get("state") or "") in TERMINAL_RUN_STATES:
+                runtime_worker["_terminal_run_id"] = terminal_run_id
+            active_host_lease = (
+                self.store.get_active_host_run_lease_for_run(target_run_id)
+                if target_run_id
+                else None
+            )
+            no_started_host_compute = bool(
+                str(claimed_worker.get("execution_mode") or "docker") == "host"
+                and (
+                    active_host_lease is None
+                    or str(active_host_lease.get("startup_state") or "")
+                    == "reserved"
+                )
+            )
+            if no_started_host_compute:
+                info = RuntimeInfo(
+                    runtime=str(claimed_worker.get("runtime") or ""),
+                    model=str(claimed_worker.get("model") or ""),
+                    gateway_url=str(claimed_worker.get("gateway_url") or ""),
+                    gateway_port=claimed_worker.get("gateway_port"),
+                    gateway_token=claimed_worker.get("gateway_token"),
+                    session_key=claimed_worker.get("session_key"),
+                    state_dir=claimed_worker.get("state_dir"),
+                    workspace_dir=claimed_worker.get("workspace_dir"),
+                    pid=None,
+                )
+            else:
+                info = self.runtime.terminate_worker(runtime_worker)
+            updated = self.store.finalize_worker_termination_claim(
+                worker_id,
+                token,
+                epoch,
+                compute_released_at=utc_now(),
+                runtime_fields=self._runtime_info_fields(
+                    worker_id,
+                    info,
+                    last_error="",
+                ),
+                error_text="Worker terminated by operator",
+            )
+            if updated is None:
+                raise RuntimeError("Worker termination ownership changed before finalization")
+            return {"worker": updated, "target_transitioned": True}
+
+    def _local_processor_owns(self, worker_id: str) -> bool:
+        with self._processors_lock:
+            return worker_id in self._active_processors
+
+    def _terminal_generation_for_run(
+        self,
+        run: dict,
+        lease: dict | None = None,
+    ) -> dict[str, str]:
+        """Derive a terminal fence only from one captured durable attempt."""
+
+        attempt_id = str(run.get("active_attempt_id") or "")
+        if not attempt_id:
+            return {
+                "expected_attempt_id": "",
+                "expected_lease_id": "",
+                "expected_executor_id": "",
+                "expected_startup_token": "",
+                "expected_runtime_invoked_at": "",
+            }
+        attempt = self.store.get_run_attempt(attempt_id)
+        if (
+            attempt is None
+            or str(attempt.get("run_id") or "") != str(run.get("run_id") or "")
+        ):
+            return {}
+        bound_lease = lease or self.store.get_host_run_lease(
+            str(attempt.get("lease_id") or "")
+        )
+        if not str(attempt.get("lease_id") or ""):
+            return {
+                "expected_attempt_id": attempt_id,
+                "expected_lease_id": "",
+                "expected_executor_id": "",
+                "expected_startup_token": "",
+                "expected_runtime_invoked_at": str(
+                    run.get("runtime_invoked_at") or ""
+                ),
+            }
+        if (
+            not bound_lease
+            or str(bound_lease.get("run_id") or "") != str(run.get("run_id") or "")
+            or str(bound_lease.get("attempt_id") or "") != attempt_id
+        ):
+            return {}
+        return {
+            "expected_attempt_id": attempt_id,
+            "expected_lease_id": str(bound_lease.get("lease_id") or ""),
+            "expected_executor_id": str(bound_lease.get("executor_id") or ""),
+            "expected_startup_token": str(bound_lease.get("startup_token") or ""),
+            "expected_runtime_invoked_at": str(run.get("runtime_invoked_at") or ""),
+        }
+
+    @staticmethod
+    def _runtime_info_fields(
+        worker_id: str,
+        info: RuntimeInfo,
+        *,
+        last_error: str,
+    ) -> dict[str, object]:
+        return {
+            "runtime": info.runtime,
+            "model": info.model,
+            "gateway_url": info.gateway_url,
+            "gateway_port": info.gateway_port,
+            "gateway_token": info.gateway_token,
+            "session_key": info.session_key,
+            "state_dir": info.state_dir,
+            "workspace_dir": info.workspace_dir,
+            "pid": info.pid,
+            "takeover_url": f"/ui/workers/{worker_id}",
+            "control_url": f"/ui/workers/{worker_id}",
+            "last_error": last_error,
+        }
+
+    def _ensure_surviving_run_monitor(self, worker_id: str, run_id: str) -> None:
+        """Adopt one verified live restart survivor without launching a duplicate run."""
+
+        worker = self.store.get_worker(worker_id) or {}
+        executor = (
+            self.conversation_executor
+            if self._trusted_run_lane(worker) == "conversation"
+            else self.executor
+        )
+        with self._processors_lock:
+            if self._shutdown_event.is_set() or worker_id in self._active_processors:
+                return
+            generation = self._processor_generations.get(worker_id, 0) + 1
+            self._processor_generations[worker_id] = generation
+            self._active_processors.add(worker_id)
+            try:
+                executor.submit(
+                    self._monitor_surviving_run,
+                    worker_id,
+                    run_id,
+                    generation,
+                )
+            except Exception:
+                self._active_processors.discard(worker_id)
+                raise
+
+    def _release_reconciled_run_lease(self, run_id: str, *, reason: str) -> None:
+        lease = self.store.get_active_host_run_lease_for_run(run_id)
+        if lease:
+            self.store.release_host_run_lease(
+                str(lease["lease_id"]),
+                executor_id=None,
+                reason=reason,
+            )
+
+    def _monitor_surviving_run(
+        self,
+        worker_id: str,
+        run_id: str,
+        generation: int,
+    ) -> None:
+        """Collect or truthfully requeue a process adopted after service restart."""
+
+        interval = _bounded_float_env(
+            "WPR_SURVIVOR_MONITOR_INTERVAL_S",
+            0.5,
+            min_value=0.01,
+            max_value=10.0,
+        )
+        try:
+            while (
+                not self._shutdown_event.is_set()
+                and self._processor_is_current(worker_id, generation)
+            ):
+                try:
+                    worker = self.store.get_worker(worker_id)
+                    run = self.store.get_run(run_id)
+                    if not worker or not run:
+                        return
+                    if str(run.get("state") or "") in TERMINAL_RUN_STATES:
+                        self._release_reconciled_run_lease(
+                            run_id, reason="survivor_terminal"
+                        )
+                        return
+
+                    recovered = self._collect_completed_run(worker, run)
+                    if recovered:
+                        self._apply_recovered_run(worker, run, recovered)
+                        self._release_reconciled_run_lease(
+                            run_id, reason="survivor_terminal"
+                        )
+                        return
+
+                    runtime_worker = {
+                        **worker,
+                        "_active_run_id": run_id,
+                        "_run_attempt_id": str(run.get("active_attempt_id") or ""),
+                    }
+                    info = self.runtime.reconcile_worker(runtime_worker)
+                    if info.pid:
+                        self._apply_runtime_info(
+                            worker_id,
+                            info,
+                            state="running",
+                            last_error=worker.get("last_error") or "",
+                        )
+                    else:
+                        # The process may have written its terminal evidence just
+                        # before disappearing. Collect once more before retrying.
+                        recovered = self._collect_completed_run(worker, run)
+                        if recovered:
+                            self._apply_recovered_run(worker, run, recovered)
+                            self._release_reconciled_run_lease(
+                                run_id, reason="survivor_terminal"
+                            )
+                            return
+                        self._release_reconciled_run_lease(
+                            run_id, reason="survivor_process_exited"
+                        )
+                        retry_after = (
+                            datetime.now(timezone.utc) + timedelta(seconds=1)
+                        ).isoformat()
+                        retry_generation = self.store.get_run_retry_generation(
+                            run_id
+                        )
+                        if retry_generation is None or str(
+                            retry_generation.get("expected_attempt_id") or ""
+                        ) != str(run.get("active_attempt_id") or ""):
+                            return
+                        requeued = self.store.requeue_run_for_retry(
+                            run_id,
+                            retry_after=retry_after,
+                            **retry_generation,
+                            error_text=(
+                                "The adopted provider process exited before GlassHive could "
+                                "confirm a terminal result."
+                            ),
+                            last_retry_class="provider_temporarily_unavailable",
+                            failure_class="provider_temporarily_unavailable",
+                            failure_retryable=1,
+                            failure_structured=1,
+                            failure_user_message=(
+                                "The provider worker stopped before its result was confirmed; "
+                                "GlassHive will retry this work."
+                            ),
+                            failure_recommended_recovery=(
+                                "No action is required unless the retry remains queued."
+                            ),
+                            failure_diagnostic_summary=(
+                                "A restart-adopted process disappeared without terminal evidence."
+                            ),
+                        )
+                        self.store.update_worker_state(
+                            worker_id, "ready", last_error=""
+                        )
+                        self.store.add_event(
+                            str(worker.get("project_id") or ""),
+                            worker_id,
+                            run_id,
+                            "run.requeued",
+                            "Restart survivor exited without terminal evidence; retry queued",
+                        )
+                        self._emit_callback(
+                            worker,
+                            "run.requeued",
+                            run={**run, **(requeued or {}), "state": "queued"},
+                            message=(
+                                "The provider worker stopped before its result was confirmed; "
+                                "GlassHive will retry this work."
+                            ),
+                        )
+                        self._scheduler_wake_event.set()
+                        return
+                except Exception:
+                    logger.exception(
+                        "Restart survivor monitor pass failed",
+                        extra={"worker_id": worker_id, "run_id": run_id},
+                    )
+                if self._shutdown_event.wait(interval):
+                    return
+        finally:
+            try:
+                released = self._release_processor(worker_id, generation)
+                if released:
+                    worker = self.store.get_worker(worker_id)
+                    if (
+                        worker
+                        and worker["state"]
+                        not in {"paused", "needs_input", "stopping", "terminated"}
+                        and self.store.peek_next_queued_run(worker_id)
+                    ):
+                        self._ensure_worker_processor(worker_id)
+            except Exception:
+                logger.exception(
+                    "Failed to release restart survivor monitor ownership",
+                    extra={"worker_id": worker_id, "run_id": run_id},
+                )
+
+    def _record_late_processor_terminal_ignored(
+        self,
+        worker: dict,
+        run: dict,
+        attempted_state: str,
+    ) -> dict:
+        durable_run = self.store.get_run(str(run["run_id"])) or run
+        self.store.add_event(
+            str(worker["project_id"]),
+            str(worker["worker_id"]),
+            str(run["run_id"]),
+            "run.late_completion_ignored",
+            (
+                f"Ignored late processor {attempted_state} because the durable run state is "
+                f"{str(durable_run.get('state') or 'unknown')}"
+            ),
+        )
+        return durable_run

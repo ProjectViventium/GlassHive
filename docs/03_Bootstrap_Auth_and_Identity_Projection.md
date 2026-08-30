@@ -69,11 +69,20 @@ Host-native workers also materialize visible prompt/context files in the host wo
 - `claude.md` / `CLAUDE.md` as Claude Code compatibility files that import or mirror `AGENTS.md`
 - `codex.md` / `CODEX.md` as legacy compatibility mirrors only
 
-Bootstrap-projected instructions must include a general completion self-check. Before a worker writes
-its final user-facing report, it should inspect the concrete result it produced, compare that result
-with the user's request, success criteria, constraints, and relevant files/artifacts/tool output, and
-continue or repair when it can. This must stay universal: the bootstrap should not hardcode one
-LibreChat prompt, one QA case, one provider, or one file type.
+Bootstrap-projected instructions contain one proportional-verification rule. The worker chooses
+verification depth from the user's explicit success criteria, requested rigor, risk, and concrete
+defects. It uses the smallest evidence that proves the result and repeats an equivalent check only
+after a relevant output change or a detected defect. This stays universal: the bootstrap does not
+hardcode one host prompt, QA case, provider, file type, model effort, resource class, or token limit.
+
+The worker prompt lineage is direct and testable:
+
+- source: the editable worker-facing constants at the top of
+  `runtime_phase1/src/workers_projects_runtime/bootstrap.py`
+- assembled runtime contract: `GLASSHIVE_WORKER_PROJECT_CONTRACT`
+- materialized worker instruction: `AGENTS.md` with `agents.md` as its exact mirror; Claude and Codex
+  compatibility files point back to that canonical instruction
+- focused proof: `test_bootstrap_materializes_one_proportional_verification_rule`
 
 The projection contract is sparse by design. The host may advertise MCP/tool capability, broker
 grants, uploads, and retrieved context, but it must not invent goals, success criteria, tool results,
@@ -84,8 +93,12 @@ When a trusted host client passes existing upload metadata, GlassHive reuses the
 contract instead of adding a second upload route:
 
 - virtual `/uploads/...` paths can map to `WPR_LIBRECHAT_UPLOADS_ROOT`
-- owner-scoped uploaded bytes can be resolved by original filename when the host model exposes only
-  filename/text context
+- owner-scoped uploaded bytes require an exact stable upload token or owner-scoped virtual path
+- trusted `selected_files` entries must use that stable reference; a display filename is never file
+  authority
+- two authorized stable references remain two worker files even when their display names or proposed
+  workspace paths match; GlassHive assigns deterministic collision-safe workspace paths and never
+  deduplicates them by name/path alone
 - extracted text can be materialized directly
 - metadata-only attachments become an `uploads/*.metadata.json` manifest
 
@@ -114,9 +127,10 @@ owner/user id. That is the cross-user safety boundary for shared upload storage.
 deployment stores upload metadata as `/uploads/<conversation-id>/...`, `/uploads/<file-id>/...`, or
 any other layout where the first segment is not the authenticated user id, GlassHive will not copy
 the bytes and will fall back to a metadata manifest until the deployment provides an owner-scoped
-upload projection. When only model-visible attachment text is available, GlassHive may search only
-the authenticated owner's mounted upload directory for a normalized original filename match and use
-the newest matching file; it must never search other users' directories or the whole host filesystem.
+upload projection. When only model-visible attachment text or a display filename is available,
+GlassHive does not search the mounted upload directory for matching bytes. It projects safe text or a
+blocker manifest. A missing, unmatched, duplicate, or filename-only selected-file identity fails
+closed; GlassHive never chooses the newest same-owner file as a substitute.
 
 ## Source-Specific Best Practice
 
@@ -128,8 +142,15 @@ For Docker sandboxes, minimal host CLI auth is copied into the worker home accor
 `bootstrap_profile`.
 
 For host-native workers, the CLI runs on the host and uses the host's existing CLI/browser/OS
-session directly. v1 caps active host workers to one per CLI family unless isolated CLI homes are
-explicitly enabled later.
+session directly. The typed v1 capacity dimensions are separate: 2 active conversation turns per
+CLI profile/family lane, 3 active missions per CLI profile/family lane, 4 active missions per
+account, and 12 active missions per tenant by default. Repository mutation scope is an additional
+one-owner exclusion only when a host mission declares that exact scope; it is not a general
+"one worker per family" rule. Host resource headroom is a separate measured vector.
+
+Every host CLI version/help/auth/readiness subprocess runs only after a durable provisional capacity
+reservation is live. A failed or expired preflight releases that reservation and cannot create or
+accept work. Successful admission later acquires the exact run lease under the same typed policy.
 
 Host-native CLI subprocesses receive a minimal runtime environment. Parent process secrets, provider
 API keys, callback secrets, and LibreChat internals are not inherited by default.

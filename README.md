@@ -65,6 +65,12 @@ Important boundary:
 
 Release-oriented docs live in [`docs/`](./docs).
 
+Run the API with its application factory so importing the module stays side-effect free:
+
+```bash
+uv run uvicorn workers_projects_runtime.api:create_app --factory
+```
+
 Start here:
 
 1. [`docs/01_Vision_Requirements_and_Terminology.md`](./docs/01_Vision_Requirements_and_Terminology.md)

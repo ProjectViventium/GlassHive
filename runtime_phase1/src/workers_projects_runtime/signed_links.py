@@ -64,6 +64,29 @@ def signed_link_secret() -> str:
     )
 
 
+def _worker_is_terminated_in_runtime_db(worker_id: str) -> bool:
+    clean_worker_id = str(worker_id or "").strip()
+    raw_db_path = str(os.environ.get("WPR_DB_PATH") or "").strip()
+    if not clean_worker_id or not raw_db_path:
+        return False
+    db_path = Path(raw_db_path).expanduser()
+    if not db_path.is_file():
+        return False
+    try:
+        with sqlite3.connect(db_path, timeout=1) as conn:
+            row = conn.execute(
+                "SELECT state FROM workers WHERE worker_id = ?",
+                (clean_worker_id,),
+            ).fetchone()
+    except sqlite3.Error:
+        return False
+    return bool(row and str(row[0] or "") == "terminated")
+
+def worker_signed_links_blocked(worker_id: str) -> bool:
+    return _worker_is_terminated_in_runtime_db(
+        worker_id
+    ) or is_worker_signed_link_revoked(worker_id)
+
 def signed_link_ttl_seconds() -> int:
     raw = os.environ.get("GLASSHIVE_SIGNED_LINK_TTL_S", "").strip()
     if raw.lower() in {"0", "none", "never", "disabled", "off", "false", "no"}:
@@ -450,6 +473,32 @@ def create_signed_link_ref(*, token: str, target_url: str = "") -> str:
         )
     return ref_id
 
+
+def is_worker_signed_link_revoked(worker_id: str) -> bool:
+    clean_worker_id = str(worker_id or "").strip()
+    if not clean_worker_id:
+        return False
+    db_path = link_ref_state_path()
+    if not db_path.is_file():
+        return False
+    try:
+        with sqlite3.connect(db_path, timeout=1) as conn:
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'signed_link_worker_revocations'"
+            ).fetchone()
+            if table is None:
+                return False
+            return (
+                conn.execute(
+                    "SELECT 1 FROM signed_link_worker_revocations "
+                    "WHERE worker_id = ?",
+                    (clean_worker_id,),
+                ).fetchone()
+                is not None
+            )
+    except sqlite3.Error:
+        return False
 
 def revoke_signed_link_refs_for_worker(worker_id: str) -> int:
     clean_worker_id = str(worker_id or "").strip()

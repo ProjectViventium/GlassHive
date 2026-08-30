@@ -13,6 +13,7 @@ import time
 import tomllib
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -141,16 +142,18 @@ def test_host_runtime_recovers_and_stops_a_persisted_process_after_api_restart(t
                 "exit_path": str(tmp_path / "exit_code"),
                 "model": "gpt-5.6-sol",
                 "process_pid": process.pid,
+                "process_group": os.getpgid(process.pid),
+                "process_start_identity": (
+                    runtime_before_restart._process_start_identity(process.pid)
+                ),
                 "started_at": datetime.now().astimezone().isoformat(),
             },
         )
 
         assert runtime_after_restart.reconcile_worker(worker).pid == process.pid
 
-        runtime_after_restart._stop_active_process(
-            worker["worker_id"],
-            worker=worker,
-            run_id="run_restart",
+        assert runtime_after_restart._stop_active_process(
+            worker["worker_id"], worker=worker, run_id="run_restart"
         )
         process.wait(timeout=3)
 
@@ -184,6 +187,7 @@ def test_host_runtime_rejects_recycled_pid_identity_without_stopping_the_process
                 "model": "gpt-5.6-sol",
                 "process_pid": unrelated_process.pid,
                 "process_identity_sha256": "0" * 64,
+                "process_start_identity": "ps-lstart:synthetic-prior-generation",
                 "started_at": datetime.now().astimezone().isoformat(),
             },
         )
@@ -252,6 +256,29 @@ def test_host_runtime_stop_failure_preserves_process_and_active_session(tmp_path
     assert runtime._active_processes[worker_id] is process
     assert runtime._host_active_slots()["mission"] == worker_id
     assert runtime._host_worker_lanes()[worker_id] == "mission"
+
+
+def test_host_runtime_stale_cleanup_does_not_clear_replacement_process(tmp_path):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path))
+    worker_id = "wrk_host_replacement_process"
+
+    class SyntheticProcess:
+        def poll(self):
+            return None
+
+    stale_process = cast(subprocess.Popen[str], SyntheticProcess())
+    replacement_process = cast(subprocess.Popen[str], SyntheticProcess())
+    runtime._register_process(worker_id, stale_process)
+    runtime._register_process(worker_id, replacement_process)
+
+    assert runtime._clear_process(
+        worker_id, expected_process=stale_process
+    ) is False
+    assert runtime._active_processes[worker_id] is replacement_process
+    assert runtime._clear_process(
+        worker_id, expected_process=replacement_process
+    ) is True
+    assert worker_id not in runtime._active_processes
 
 
 def test_host_runtime_process_group_permission_probe_fails_closed(tmp_path, monkeypatch):
@@ -328,6 +355,7 @@ def test_host_native_child_persists_completion_for_restart_recovery_without_dupl
         "name": "Synthetic conversation worker",
         "profile": profile,
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "model": model,
         "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
@@ -462,6 +490,7 @@ def test_host_native_restart_cancellation_stops_process_group_and_persists_termi
         "name": "Synthetic cancellation worker",
         "profile": "codex-cli",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
     }
     run_id = "run_cancel_after_restart"
     run_root = runtime_before_restart._run_root(worker["worker_id"], run_id)
@@ -546,6 +575,7 @@ def test_host_native_nonzero_exit_is_durably_recovered_with_precise_failure(tmp_
         "name": "Synthetic nonzero worker",
         "profile": "codex-cli",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "model": "gpt-5.6-sol",
         "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
@@ -625,6 +655,7 @@ def test_host_native_configured_timeout_survives_api_restart_and_stops_child_gro
         "name": "Synthetic timeout worker",
         "profile": "codex-cli",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "model": "gpt-5.6-sol",
         "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
@@ -2897,6 +2928,7 @@ def test_host_codex_conversation_developer_instructions_are_exact_and_worker_loc
         "worker_id": "wrk_codex_developer_authority",
         "profile": "codex-cli",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "bootstrap_bundle_json": json.dumps(
             {
@@ -4240,8 +4272,12 @@ def test_host_claude_chrome_can_be_explicitly_disabled(tmp_path, monkeypatch):
     assert "--chrome" not in command
 
 
-def test_host_cli_runtime_allows_one_active_worker_per_family(tmp_path):
+def test_host_cli_runtime_honors_one_configured_mission_slot_per_family(
+    tmp_path,
+    monkeypatch,
+):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_HOST_MISSION_SLOTS_PER_CLI", "1")
     first = {
         "worker_id": "wrk_host_one",
         "name": "First Host Worker",
@@ -4259,13 +4295,48 @@ def test_host_cli_runtime_allows_one_active_worker_per_family(tmp_path):
 
     runtime._acquire_host_slot(first)
     try:
-        with pytest.raises(RuntimeErrorBase, match="one active host worker per CLI family"):
+        with pytest.raises(RuntimeErrorBase, match="mission lane is at capacity"):
             runtime._acquire_host_slot(second)
     finally:
         runtime._release_host_slot(first["worker_id"])
 
     runtime._acquire_host_slot(second)
     runtime._release_host_slot(second["worker_id"])
+
+
+def test_host_cli_runtime_does_not_trust_conversation_mode_from_bundle_alone(
+    tmp_path,
+    monkeypatch,
+):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    monkeypatch.setenv("WPR_HOST_MISSION_SLOTS_PER_CLI", "1")
+    mission = {
+        "worker_id": "wrk_trusted_mission",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "bootstrap_bundle_json": json.dumps({"run_mode": "mission"}),
+    }
+    untrusted_conversation_claim = {
+        "worker_id": "wrk_untrusted_conversation_claim",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
+    }
+    trusted_conversation = {
+        **untrusted_conversation_claim,
+        "worker_id": "wrk_trusted_conversation",
+        "trusted_run_lane": "conversation",
+    }
+
+    assert runtime._host_capacity_lane(untrusted_conversation_claim) == "mission"
+    runtime._acquire_host_slot(mission)
+    try:
+        with pytest.raises(RuntimeErrorBase, match="mission lane is at capacity"):
+            runtime._acquire_host_slot(untrusted_conversation_claim)
+        runtime._acquire_host_slot(trusted_conversation)
+        runtime._release_host_slot(trusted_conversation["worker_id"])
+    finally:
+        runtime._release_host_slot(mission["worker_id"])
 
 
 def test_host_cli_runtime_reserves_a_separate_interactive_conversation_lane(tmp_path):
@@ -4280,19 +4351,26 @@ def test_host_cli_runtime_reserves_a_separate_interactive_conversation_lane(tmp_
         "worker_id": "wrk_conversation_lane",
         "profile": "codex-cli",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
     }
     second_conversation = {
         **conversation,
         "worker_id": "wrk_conversation_lane_two",
     }
+    third_conversation = {
+        **conversation,
+        "worker_id": "wrk_conversation_lane_three",
+    }
 
     runtime._acquire_host_slot(mission)
     runtime._acquire_host_slot(conversation)
+    runtime._acquire_host_slot(second_conversation)
     try:
-        with pytest.raises(RuntimeErrorBase, match="active conversation worker"):
-            runtime._acquire_host_slot(second_conversation)
+        with pytest.raises(RuntimeErrorBase, match="conversation lane is at capacity"):
+            runtime._acquire_host_slot(third_conversation)
     finally:
+        runtime._release_host_slot(second_conversation["worker_id"])
         runtime._release_host_slot(conversation["worker_id"])
         runtime._release_host_slot(mission["worker_id"])
 
@@ -6500,6 +6578,7 @@ def test_host_conversation_mode_uses_exact_workspace_without_scaffolding(tmp_pat
         "name": "Viventium Main",
         "profile": "codex-cli",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "bootstrap_bundle_json": json.dumps(
             {"run_mode": "conversation", "provider_model": "gpt-5.6-sol", "access_mode": "full"}
@@ -6533,6 +6612,7 @@ def test_host_codex_conversation_can_exclude_workspace_project_instructions(
         "worker_id": "wrk_conversation_without_project_instructions",
         "profile": "codex-cli",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "bootstrap_bundle_json": json.dumps(
             {
@@ -6556,19 +6636,24 @@ def test_host_codex_conversation_can_exclude_workspace_project_instructions(
     assert command[command.index("--add-dir") + 1] == str(life)
 
 
-def test_host_capacity_reserves_an_independent_interactive_lane_per_cli_profile(tmp_path):
+def test_host_capacity_reserves_an_independent_interactive_lane_per_cli_profile(
+    tmp_path,
+    monkeypatch,
+):
     class ActiveProcess:
         @staticmethod
         def poll():
             return None
 
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "private-state"))
+    monkeypatch.setenv("WPR_HOST_CONVERSATION_SLOTS_PER_CLI", "1")
     mission = {
         "worker_id": "wrk_mission_busy",
         "bootstrap_bundle_json": json.dumps({"run_mode": "mission"}),
     }
     conversation = {
         "worker_id": "wrk_conversation_waiting",
+        "trusted_run_lane": "conversation",
         "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
     }
     runtime._host_active_slots()["mission"] = mission["worker_id"]
@@ -6580,7 +6665,7 @@ def test_host_capacity_reserves_an_independent_interactive_lane_per_cli_profile(
     runtime._active_processes["wrk_conversation_active"] = ActiveProcess()
     error = runtime.worker_capacity_error(conversation)
     assert error is not None
-    assert "active conversation worker" in str(error)
+    assert "conversation lane is at capacity" in str(error)
 
 
 def test_provider_activity_log_reads_incrementally_and_marks_a_bounded_tail(tmp_path, monkeypatch):
@@ -6627,6 +6712,7 @@ def test_host_conversation_broker_config_stays_in_private_worker_state(tmp_path,
         "name": "Viventium Main",
         "profile": "codex-cli",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "bootstrap_bundle_json": json.dumps(
             {
@@ -6662,6 +6748,7 @@ def test_host_conversation_broker_config_stays_in_private_worker_state(tmp_path,
         "name": "Viventium Main",
         "profile": "claude-code",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "model": "opus",
         "bootstrap_bundle_json": json.dumps(
@@ -6690,12 +6777,12 @@ def test_host_conversation_broker_config_stays_in_private_worker_state(tmp_path,
     assert "--strict-mcp-config" in claude_command
     authority_path = (
         claude_runtime._state_dir(claude_worker["worker_id"])
-        / "conversation-developer-instructions.md"
+        / "developer-instructions.txt"
     )
     assert claude_command[claude_command.index("--append-system-prompt-file") + 1] == str(
         authority_path
     )
-    assert authority_path.read_text() == "Current Viventium authority.\n"
+    assert authority_path.read_text() == "Current Viventium authority."
     assert authority_path.stat().st_mode & 0o777 == 0o600
     assert claude_env["CLAUDE_CONFIG_DIR"].startswith(str(tmp_path / "claude-private-state"))
     claude_home = Path(claude_env["CLAUDE_CONFIG_DIR"])
@@ -6731,6 +6818,7 @@ def test_host_conversation_projects_agent_builder_control_schema_to_both_native_
         "worker_id": "wrk_codex_graph_control",
         "profile": "codex-cli",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "bootstrap_bundle_json": json.dumps(
             {
@@ -6847,6 +6935,7 @@ def test_host_mission_and_plain_conversation_commands_do_not_gain_graph_control_
                 "worker_id": f"wrk_no_graph_control_{index}_{run_mode}",
                 "profile": profile,
                 "execution_mode": "host",
+                "trusted_run_lane": run_mode,
                 "workspace_root": str(life),
                 "model": "gpt-5.6-sol" if profile == "codex-cli" else "opus",
                 "bootstrap_bundle_json": json.dumps({"run_mode": run_mode}),
@@ -6877,6 +6966,7 @@ def test_host_audio_eligible_conversation_projects_delivery_schema_to_both_nativ
             "worker_id": f"wrk_delivery_control_{index}",
             "profile": profile,
             "execution_mode": "host",
+            "trusted_run_lane": "conversation",
             "workspace_root": str(life),
             "model": "gpt-5.6-sol" if profile == "codex-cli" else "opus",
             "bootstrap_bundle_json": json.dumps(
@@ -7007,6 +7097,7 @@ def test_codex_resume_flags_change_only_for_conversation_mode(tmp_path):
         "name": "Viventium Main",
         "profile": "codex-cli",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "bootstrap_bundle_json": json.dumps(
             {"run_mode": "conversation", "provider_model": "gpt-5.6-sol", "access_mode": "full"}
@@ -7015,6 +7106,7 @@ def test_codex_resume_flags_change_only_for_conversation_mode(tmp_path):
     mission_worker = {
         **conversation_worker,
         "worker_id": "wrk_codex_mission_resume",
+        "trusted_run_lane": "mission",
         "bootstrap_bundle_json": json.dumps({"run_mode": "mission"}),
     }
     runtime._ensure_dirs(conversation_worker["worker_id"])
@@ -7054,6 +7146,7 @@ def test_host_codex_conversation_mode_honors_each_declared_effort(tmp_path, effo
         "worker_id": f"wrk_codex_effort_{effort}",
         "profile": "codex-cli",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "bootstrap_bundle_json": json.dumps(
             {
@@ -7082,6 +7175,7 @@ def test_host_codex_workspace_access_limits_writes_without_full_bypass(tmp_path)
         "worker_id": "wrk_codex_workspace_access",
         "profile": "codex-cli",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "bootstrap_bundle_json": json.dumps(
             {
@@ -7124,6 +7218,7 @@ def test_host_claude_conversation_mode_uses_native_stream_json_without_changing_
         "name": "Viventium Main",
         "profile": "claude-code",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "model": "opus",
         "bootstrap_bundle_json": json.dumps(
@@ -7133,6 +7228,7 @@ def test_host_claude_conversation_mode_uses_native_stream_json_without_changing_
     mission_worker = {
         **conversation_worker,
         "worker_id": "wrk_claude_mission",
+        "trusted_run_lane": "mission",
         "bootstrap_bundle_json": json.dumps({"run_mode": "mission"}),
     }
 
@@ -7164,6 +7260,7 @@ def test_host_claude_conversation_removes_cli_marker_created_in_life(tmp_path, m
         "name": "Viventium Main",
         "profile": "claude-code",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "model": "opus",
         "bootstrap_bundle_json": json.dumps(
@@ -7203,7 +7300,13 @@ def test_host_claude_conversation_removes_cli_marker_created_in_life(tmp_path, m
 
     runtime.ensure_worker_ready = lambda _worker: runtime._host_runtime_info(worker)  # type: ignore[method-assign]
     runtime._build_command = lambda _worker, _instruction, _info: (["claude"], {})  # type: ignore[method-assign]
-    runtime._process_identity_sha256 = lambda _pid: "1" * 64  # type: ignore[method-assign]
+    monkeypatch.setattr(runtime, "_process_identity_sha256", lambda _pid: "1" * 64)
+    monkeypatch.setattr(runtime, "_process_group_identity", lambda pid: pid)
+    monkeypatch.setattr(
+        runtime,
+        "_process_start_identity",
+        lambda _pid: "ps-lstart:Mon Jan 01 00:00:00 2024",
+    )
     monkeypatch.setattr(
         "workers_projects_runtime.profile_runtime.subprocess.Popen", MarkerCreatingProcess
     )
@@ -7230,6 +7333,7 @@ def test_host_claude_conversation_preserves_preexisting_workspace_content(tmp_pa
         "worker_id": "wrk_claude_conversation_preexisting",
         "profile": "claude-code",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "model": "opus",
         "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
@@ -7265,7 +7369,13 @@ def test_host_claude_conversation_preserves_preexisting_workspace_content(tmp_pa
 
     runtime.ensure_worker_ready = lambda _worker: runtime._host_runtime_info(worker)  # type: ignore[method-assign]
     runtime._build_command = lambda _worker, _instruction, _info: (["claude"], {})  # type: ignore[method-assign]
-    runtime._process_identity_sha256 = lambda _pid: "1" * 64  # type: ignore[method-assign]
+    monkeypatch.setattr(runtime, "_process_identity_sha256", lambda _pid: "1" * 64)
+    monkeypatch.setattr(runtime, "_process_group_identity", lambda pid: pid)
+    monkeypatch.setattr(
+        runtime,
+        "_process_start_identity",
+        lambda _pid: "ps-lstart:Mon Jan 01 00:00:00 2024",
+    )
     monkeypatch.setattr(
         "workers_projects_runtime.profile_runtime.subprocess.Popen", SuccessfulProcess
     )
@@ -7292,6 +7402,7 @@ def test_host_claude_conversation_mode_honors_each_declared_effort(
         "worker_id": f"wrk_claude_effort_{effort}",
         "profile": "claude-code",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "model": "opus",
         "bootstrap_bundle_json": json.dumps(
@@ -7322,6 +7433,7 @@ def test_host_claude_workspace_access_fails_closed_into_native_sandbox(tmp_path,
         "worker_id": "wrk_claude_workspace_access",
         "profile": "claude-code",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "model": "opus",
         "bootstrap_bundle_json": json.dumps(
@@ -7388,6 +7500,7 @@ def test_host_claude_private_config_receives_subscription_auth_without_copying_u
         "worker_id": "wrk_claude_private_auth",
         "profile": "claude-code",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "model": "opus",
         "bootstrap_bundle_json": json.dumps(
@@ -7423,6 +7536,7 @@ def test_host_claude_private_auth_prefers_explicit_environment_tokens(tmp_path, 
         "worker_id": "wrk_claude_env_auth",
         "profile": "claude-code",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(tmp_path / "Life"),
         "model": "opus",
         "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
@@ -7492,6 +7606,7 @@ def test_host_claude_private_auth_refreshes_expired_keychain_token_into_isolated
         "worker_id": "wrk_claude_expired_auth",
         "profile": "claude-code",
         "execution_mode": "host",
+        "trusted_run_lane": "conversation",
         "workspace_root": str(tmp_path / "Life"),
         "model": "opus",
         "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),

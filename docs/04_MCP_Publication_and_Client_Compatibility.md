@@ -97,6 +97,11 @@ no follow-up context and the host preserves stable conversation metadata. MCP ou
 `gh_token` URLs or opaque signed-link tokens; they should expose `/r/{ref}` and `/v1/link-refs/{ref}`
 indirection instead.
 
+A successful nonterminal `workspace_launch`, `worker_delegate_once`, or continuation receipt labels
+that mission-control link `View / Steer <task>`, with `<task>` derived from the typed launch title or
+description. Its structured kind is `mission_control` and its state is `nonterminal`; the link proves
+that the workspace exists, not that a requested deliverable or artifact is complete.
+
 Workspace-native tool and account setup stays inside the selected persistent workstation. The
 Workspaces `Set up tools` action opens that profile's installed AI harness through the generic desktop
 action contract; it does not add connector-specific frontend flows or copy connector credentials into
@@ -214,21 +219,23 @@ the bytes into the worker workspace under `uploads/<safe-filename>`. When a host
 by SSO/email but stores uploads under an internal user id, it must also send
 `X-GlassHive-Storage-User-Id` (or `X-Viventium-Storage-User-Id`) with the internal storage owner.
 GlassHive uses that value only for upload byte lookup; the authenticated user id still owns the
-workspace, callbacks, and signed links.
+workspace, callbacks, and signed links. The internal storage id is transport-only authority and is
+removed from worker-visible context, prompts, callbacks, traces, API detail, and logs.
 
 Some older LibreChat-compatible hosts can pass authenticated user/message headers but cannot project
 `files` or `attachments` into MCP request headers without a LibreChat image upgrade. For those hosts,
-GlassHive provides an opt-in compatibility fallback:
+GlassHive provides an opt-in compatibility lookup:
 `GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_FALLBACK=true`. The fallback is disabled by default. When enabled,
 it only runs in enterprise mode, only with `X-GlassHive-Storage-User-Id`, `X-GlassHive-Conversation-Id`,
-and `X-GlassHive-Message-Id` present, and only scans that storage owner's upload folder under the
-configured upload roots. It materializes files modified within
+and `X-GlassHive-Message-Id` present, and only resolves a stable upload token declared by trusted
+`selected_files` against that storage owner's upload folder under the configured upload roots. It
+considers files modified within
 `GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_RECENT_SECONDS` (default `900`, clamped to 5 seconds through 24
-hours), capped by `GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_MAX_FILES` (default `8`, max `32`). Prefer real
-request-file headers whenever the host supports them; the compatibility fallback is for legacy
-bridges, not the primary contract. Keep the fallback window close to expected upload-to-dispatch
-latency and monitor its log event; long windows can pick unrelated recent uploads from the same
-storage owner because the fallback cannot prove exact message membership.
+hours), capped by `GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_MAX_FILES` (default `8`, max `32`). A missing,
+filename-only, or ambiguous selection attaches no file and fails closed. Without a trusted stable
+selection, recent same-owner files are unrelated and are never projected. Prefer real request-file
+headers whenever the host supports them; this lookup remains a legacy bridge, not the primary
+contract.
 
 ### Claude / Claude Code
 Support:

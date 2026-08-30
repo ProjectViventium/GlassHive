@@ -43,6 +43,17 @@ _PROVIDER_ENV_KEYS = [
 ]
 
 
+def _declared_long_mission(worker: dict) -> bool:
+    try:
+        bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(bundle, dict)
+        and bundle.get("viventium_run_liveness")
+        == {"version": 1, "long_mission": True}
+    )
+
 def _run_timeout_sec(timeout_sec: float | None = None) -> float | None:
     raw = (
         os.environ.get("GLASSHIVE_RUN_TIMEOUT_SEC", "").strip()
@@ -77,6 +88,49 @@ class RuntimeErrorBase(RuntimeError):
     pass
 
 
+class ProviderRateLimitError(RuntimeErrorBase):
+    """Structured provider throttling with an authoritative bounded retry delay."""
+
+    failure_class = "provider_rate_limited"
+    retryable = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_s: float,
+        provider_event_source: str = "http",
+        provider_failure_attestation: dict[str, str | int] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_s = max(0.1, min(float(retry_after_s), 86_400.0))
+        self.provider_event_source = str(provider_event_source or "")
+        self.provider_failure_attestation = dict(provider_failure_attestation or {})
+
+class HostCapacityError(RuntimeErrorBase):
+    """Structured, retryable host admission pressure; never a terminal run failure."""
+
+    code = "host_capacity"
+    failure_class = "host_capacity"
+    retryable = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        capacity_class: str,
+        retry_after_s: float | None = None,
+        dimension: str = "",
+        configured: dict[str, int] | None = None,
+        used: dict[str, int] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.capacity_class = str(capacity_class or "host")
+        self.retry_after_s = retry_after_s
+        self.dimension = str(dimension or "")
+        self.configured = dict(configured or {})
+        self.used = dict(used or {})
+
 class RuntimeDependencyMissingError(RuntimeErrorBase):
     def __init__(
         self,
@@ -101,6 +155,13 @@ class RuntimeDependencyMissingError(RuntimeErrorBase):
         self.dependency_label = dependency_label
         self.recovery_hint = recovery_hint
 
+
+class ProviderAuthenticationMissingError(RuntimeDependencyMissingError):
+    """The selected runtime cannot start without reconnecting its provider auth."""
+
+    code = "provider_auth_missing"
+    failure_class = "provider_auth_missing"
+    retryable = False
 
 class WorkerPausedError(RuntimeErrorBase):
     pass
@@ -211,6 +272,13 @@ def _streamed_response_text(response: httpx.Response) -> str:
     return str(completed_response or {"status": "completed"})
 
 
+class RunStartupRejectedError(RuntimeErrorBase):
+    """A spawned exact run could not cross the durable startup fence."""
+
+    def __init__(self, message: str, *, termination_confirmed: bool) -> None:
+        super().__init__(message)
+        self.termination_confirmed = bool(termination_confirmed)
+
 class WorkerRuntime(Protocol):
     def resolve_model(self, profile: str) -> str: ...
 
@@ -276,7 +344,9 @@ class StubRuntime:
         return self._runtime_info(worker, pid=None)
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
-        return self.ensure_worker_ready(worker)
+        # The stub has no external process, so a synthetic exact-run interrupt
+        # is synchronously confirmed and must not report a fake live PID.
+        return self._runtime_info(worker, pid=None)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
         return self._runtime_info(worker, pid=None)
@@ -292,8 +362,31 @@ class StubRuntime:
         return self.ensure_worker_ready(worker)
 
 
+    preflight_uses_cli_subprocess = False
+
+    requires_run_start_identity = False
+
+    def isolated_resource_usage(self) -> dict[str, object]:
+        # Deterministic synthetic substrate used only by unit/API test setups.
+        return {
+            "child_processes": 0,
+            "threads": 0,
+            "available_memory_bytes": 16 * 1024**3,
+            "available_disk_bytes": 64 * 1024**3,
+            "running_worker_containers": 0,
+            "process_probe_ok": True,
+            "memory_probe_ok": True,
+            "disk_probe_ok": True,
+        }
+
+
 class OpenClawRuntime:
     _sandbox_build_lock = Lock()
+
+    # This adapter publishes start synchronously from its guarded HTTP dispatch
+    # boundary. It does not launch a detached per-run process that needs the
+    # external startup-identity observer used by the CLI runtimes.
+    requires_run_start_identity = False
 
     def __init__(self, base_dir: str | None = None) -> None:
         self.base_dir = Path(base_dir) if base_dir else Path(__file__).resolve().parents[2] / "data"

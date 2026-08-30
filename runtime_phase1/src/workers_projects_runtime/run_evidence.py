@@ -25,8 +25,14 @@ from .deliverables import (
 from .failure_classification import classify_cli_failure, has_structured_failure_evidence
 from .runtime_identity import derive_legacy_backend_label
 
+import zipfile
+
+from threading import Lock
+
 
 RUN_EVIDENCE_DIR_NAME = "glasshive-run"
+_EVIDENCE_WRITE_LOCK = Lock()
+
 _MAX_TEXT_SCAN_BYTES = 512_000
 _MAX_TEXT_SCAN_FILES = 200
 _SECRET_KEY_MARKERS = (
@@ -54,6 +60,14 @@ _FINAL_REPORT_RE = re.compile(
     r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*)?"
     r"(?:(?:[*_]{1,3}|`{1,3})[ \t]*)?FINAL REPORT\s*:\s*"
     r"(?:(?:[*_]{1,3}|`{1,3})[ \t]*)?",
+    re.I,
+)
+
+FINAL_REPORT_PATTERN = re.compile(
+    r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*)?"
+    r"(?P<final_report_emphasis>[*_]{1,3})?"
+    r"FINAL REPORT[ \t]*:[ \t]*"
+    r"(?(final_report_emphasis)(?P=final_report_emphasis))[ \t]*",
     re.I,
 )
 
@@ -143,6 +157,10 @@ _OUTPUT_FORMAT_ALIASES = {
     "txt": {"txt"},
     "md": {"md"},
 }
+_OUTPUT_FORMAT_MENTION_TERMS = {
+    "md": {"md", "markdown"},
+}
+
 _OUTPUT_ACTION_RE = re.compile(
     r"\b(deliver|create|generate|produce|write|save|export|output|return|build|prepare|compose|draft|render|"
     r"artifact|artifacts|deliverable|deliverables|report|reports|file|files)\b",
@@ -500,6 +518,213 @@ def _bootstrap_seed_files(worker: dict[str, object]) -> list[str]:
     return files
 
 
+def _constraint_instruction(worker: dict[str, object], fallback: str) -> str:
+    """Return this run's task while excluding projected prior-conversation context.
+
+    The durable worker bundle can preserve the launch-time source as a fallback, but it cannot
+    describe later Message/Queue continuations.  The run instruction is therefore authoritative
+    after removing the host's explicitly labelled recent-conversation projection.  Verbatim
+    triggering user segments and later continuation guidance remain in the ledger.
+    """
+
+    current_run_instruction = _without_projected_context_section(
+        str(fallback or ""),
+        heading="## Recent conversation context",
+    )
+    if current_run_instruction:
+        return current_run_instruction
+
+    try:
+        bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return fallback
+    if not isinstance(bundle, dict):
+        return fallback
+    source = bundle.get("viventium_constraint_source")
+    if not isinstance(source, dict) or set(source) != {"version", "instruction"}:
+        return fallback
+    instruction = source.get("instruction")
+    if source.get("version") != 1 or not isinstance(instruction, str):
+        return fallback
+    clean = instruction.strip()
+    if not clean or len(clean.encode("utf-8")) > 128 * 1024:
+        return str(fallback or "").strip()
+    return clean
+
+def _constraint_source_instruction(worker: dict[str, object]) -> str:
+    try:
+        bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return ""
+    if not isinstance(bundle, dict):
+        return ""
+    source = bundle.get("viventium_constraint_source")
+    if (
+        not isinstance(source, dict)
+        or set(source) != {"version", "instruction"}
+        or source.get("version") != 1
+        or not isinstance(source.get("instruction"), str)
+    ):
+        return ""
+    instruction = str(source["instruction"]).strip()
+    if not instruction or len(instruction.encode("utf-8")) > 128 * 1024:
+        return ""
+    return instruction
+
+def _trusted_continuation_context(worker: dict[str, object]) -> dict[str, object] | None:
+    """Recognize the host-persisted continuation marker without reading its prose."""
+
+    try:
+        bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(bundle, dict):
+        return None
+    raw = bundle.get("viventium_continuation_context")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {
+        "version",
+        "base_instruction",
+        "guidance",
+    }:
+        raise ValueError("Invalid trusted continuation context")
+    base_instruction = raw.get("base_instruction")
+    guidance = raw.get("guidance")
+    if (
+        raw.get("version") != 1
+        or not isinstance(base_instruction, str)
+        or not base_instruction.strip()
+        or len(base_instruction.encode("utf-8")) > 128 * 1024
+        or not isinstance(guidance, list)
+        or len(guidance) > 128
+        or any(
+            not isinstance(item, str)
+            or not item.strip()
+            or len(item.encode("utf-8")) > 100 * 1024
+            for item in guidance
+        )
+        or sum(len(item.encode("utf-8")) for item in guidance) > 512 * 1024
+    ):
+        raise ValueError("Invalid trusted continuation context")
+    return {
+        "version": 1,
+        "base_instruction": base_instruction.strip(),
+        "guidance": [str(item).strip() for item in guidance],
+    }
+
+def _trusted_continuation_output_contract(
+    worker: dict[str, object],
+    *,
+    run_id: str,
+) -> dict[str, object] | None:
+    """Read output authority only from the exact typed host contract."""
+
+    try:
+        bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(bundle, dict):
+        return None
+    raw = bundle.get("viventium_continuation_contract")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {
+        "version",
+        "run_id",
+        "source",
+        "output",
+    }:
+        raise ValueError("Invalid trusted continuation contract")
+    source = raw.get("source")
+    output = raw.get("output")
+    if (
+        raw.get("version") != 1
+        or str(raw.get("run_id") or "") != str(run_id)
+        or not isinstance(source, dict)
+        or set(source) != {"source_event_id", "source_revision", "surface"}
+        or not isinstance(output, dict)
+        or set(output)
+        != {"mode", "required", "forbidden", "formats", "forbidden_formats"}
+    ):
+        raise ValueError("Invalid trusted continuation contract")
+    source_event_id = source.get("source_event_id")
+    source_revision = source.get("source_revision")
+    surface = source.get("surface")
+    if (
+        not isinstance(source_event_id, str)
+        or not source_event_id
+        or len(source_event_id) > 512
+        or any(ord(character) < 32 or ord(character) == 127 for character in source_event_id)
+        or isinstance(source_revision, bool)
+        or not isinstance(source_revision, int)
+        or source_revision < 0
+        or not isinstance(surface, str)
+        or not surface
+        or len(surface) > 64
+        or any(ord(character) < 32 or ord(character) == 127 for character in surface)
+    ):
+        raise ValueError("Invalid trusted continuation source identity")
+
+    def text_list(key: str) -> list[str]:
+        value = output.get(key)
+        if (
+            not isinstance(value, list)
+            or len(value) > 64
+            or any(
+                not isinstance(item, str)
+                or not item.strip()
+                or len(item.encode("utf-8")) > 16 * 1024
+                for item in value
+            )
+        ):
+            raise ValueError("Invalid trusted continuation output declaration")
+        return [str(item).strip() for item in value]
+
+    mode = output.get("mode")
+    if mode not in {"inherit", "replace"}:
+        raise ValueError("Invalid trusted continuation output mode")
+    required = text_list("required")
+    forbidden = text_list("forbidden")
+    formats = text_list("formats")
+    forbidden_formats = text_list("forbidden_formats")
+    allowed_formats = set(_OUTPUT_FORMAT_SUFFIXES)
+    if any(item not in allowed_formats for item in (*formats, *forbidden_formats)):
+        raise ValueError("Invalid trusted continuation output format")
+    if mode == "inherit" and any(
+        (required, forbidden, formats, forbidden_formats)
+    ):
+        raise ValueError("Inherited continuation output contract must not redefine outputs")
+    return {
+        "mode": mode,
+        "required": required,
+        "forbidden": forbidden,
+        "format_expectations": list(dict.fromkeys(formats)),
+        "forbidden_format_expectations": list(dict.fromkeys(forbidden_formats)),
+    }
+
+def _without_projected_context_section(text: str, *, heading: str) -> str:
+    lines = str(text or "").splitlines()
+    filtered: list[str] = []
+    skipping = False
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if stripped == heading:
+            skipping = True
+            continue
+        if skipping and (
+            stripped.startswith("## ")
+            or stripped
+            in {
+                "Previous failure classification:",
+                "GlassHive completion contract:",
+            }
+        ):
+            skipping = False
+        if not skipping:
+            filtered.append(raw_line)
+    return "\n".join(filtered).strip()
+
 def _is_markdown_heading(line: str) -> bool:
     text = str(line or "").strip()
     return bool(re.match(r"^#{1,6}\s+", text) or re.match(r"^\*\*[^*]{2,120}\*\*\s*$", text))
@@ -609,7 +834,29 @@ def build_constraint_ledger(
 ) -> dict[str, object]:
     """Build a generic, conservative ledger from the user's instruction and structured inputs."""
 
-    instruction_text = str(instruction or "")
+    instruction_text = _constraint_instruction(worker, str(instruction or ""))
+    continuation_output = _trusted_continuation_output_contract(
+        worker,
+        run_id=run_id,
+    )
+    continuation_context = _trusted_continuation_context(worker)
+    trusted_output_source = _constraint_source_instruction(worker)
+    if (
+        (
+            continuation_context is not None
+            or (
+                continuation_output is not None
+                and continuation_output["mode"] == "inherit"
+            )
+        )
+        and not trusted_output_source
+    ):
+        raise ValueError("Missing trusted continuation output source")
+    deliverable_instruction_text = (
+        trusted_output_source
+        if continuation_context is not None or continuation_output is not None
+        else trusted_output_source or instruction_text
+    )
     source_lines: list[str] = []
     date_lines: list[str] = []
     auth_lines: list[str] = []
@@ -636,12 +883,17 @@ def build_constraint_ledger(
             exclusion_lines.append(line)
         if _contains_any(lower, ("seed", "seed file", "seed entity", "input file", "uploaded file")) and not _is_seed_block_heading(line):
             seed_lines.append(line)
-        if _line_has_required_output_context(line) and not (
-            memory_write_mode_off and _line_is_memory_proposal_output_context(line)
-        ):
-            required_output_lines.append(line)
-        if _line_forbids_output(line):
-            forbidden_output_lines.extend(_forbidden_output_fragments(line))
+    if continuation_output is None or continuation_output["mode"] == "inherit":
+        for line in _lines(deliverable_instruction_text):
+            if _line_is_passive_structured_context(line):
+                continue
+            if _line_has_required_output_context(line) and not (
+                memory_write_mode_off
+                and _line_is_memory_proposal_output_context(line)
+            ):
+                required_output_lines.append(line)
+            if _line_forbids_output(line):
+                forbidden_output_lines.extend(_forbidden_output_fragments(line))
 
     def unique_redacted(values: list[str]) -> list[str]:
         return list(dict.fromkeys(_redact_text(item) for item in values))
@@ -674,14 +926,36 @@ def build_constraint_ledger(
             "scope": unique_redacted(scope_lines),
             "exclusion_or_flag": unique_redacted(exclusion_lines),
         },
-        "outputs": {
-            "required": unique_redacted(required_output_lines),
-            "forbidden": unique_redacted(forbidden_output_lines),
-            "format_expectations": _required_output_formats(required_output_lines),
-            "forbidden_format_expectations": _output_formats(forbidden_output_lines),
-        },
+        "outputs": (
+            {
+                "required": unique_redacted(required_output_lines),
+                "forbidden": unique_redacted(forbidden_output_lines),
+                "format_expectations": _required_output_formats(
+                    required_output_lines,
+                ),
+                "forbidden_format_expectations": _output_formats(
+                    forbidden_output_lines
+                ),
+            }
+            if continuation_output is None
+            or continuation_output["mode"] == "inherit"
+            else {
+                "required": unique_redacted(
+                    list(continuation_output["required"])
+                ),
+                "forbidden": unique_redacted(
+                    list(continuation_output["forbidden"])
+                ),
+                "format_expectations": list(
+                    continuation_output["format_expectations"]
+                ),
+                "forbidden_format_expectations": list(
+                    continuation_output["forbidden_format_expectations"]
+                ),
+            }
+        ),
         "seed_entities_or_files": seeds,
-        "coverage_expectations": _coverage_expectations(instruction_text),
+        "coverage_expectations": _coverage_expectations(deliverable_instruction_text),
         "do_not_widen_or_soften": do_not_widen_or_soften,
     }
 
@@ -689,7 +963,7 @@ def build_constraint_ledger(
 def _output_formats(lines: list[str]) -> list[str]:
     found: list[str] = []
     for suffix in _OUTPUT_FORMAT_SUFFIXES:
-        if any(re.search(rf"\b{re.escape(suffix)}\b", line, re.I) for line in lines):
+        if any(any(_format_mentions(line, suffix)) for line in lines):
             found.append(suffix)
     return found
 
@@ -729,7 +1003,9 @@ def _line_is_final_answer_only_context(line: str) -> bool:
 
 
 def _format_mentions(line: str, suffix: str) -> Iterable[re.Match[str]]:
-    return re.finditer(rf"\b{re.escape(suffix)}\b", str(line or ""), re.I)
+    terms = _OUTPUT_FORMAT_MENTION_TERMS.get(suffix, {suffix})
+    pattern = "|".join(re.escape(term) for term in sorted(terms, key=len, reverse=True))
+    return re.finditer(rf"\b(?:{pattern})\b", str(line or ""), re.I)
 
 
 def _format_looks_like_filename_extension(line: str, match: re.Match[str]) -> bool:
@@ -885,6 +1161,35 @@ def write_constraint_ledger(workspace_dir: Path | str, ledger: dict[str, object]
     per_run_path.write_text(body + "\n")
     return latest_path
 
+
+def _atomic_write_text(path: Path, text: str, *, mode: int = 0o644) -> None:
+    """Replace one evidence file without exposing concurrent partial writes."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        dir=str(path.parent),
+    )
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+        directory_descriptor = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
 
 def _walk_values(value: object, prefix: str = "") -> Iterable[tuple[str, str]]:
     if isinstance(value, dict):

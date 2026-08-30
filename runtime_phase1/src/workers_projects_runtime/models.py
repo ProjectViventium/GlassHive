@@ -14,14 +14,36 @@ WorkerState = Literal[
     "starting",
     "ready",
     "running",
+    "stopping",
     "paused",
+    "needs_input",
     "failed",
     "terminated",
 ]
 WorkerCloseState = Literal["terminating", "termination_failed", "terminated"]
 CLOSED_WORKER_STATES = frozenset({"terminating", "termination_failed", "terminated"})
-RunState = Literal["queued", "running", "interrupted", "paused", "completed", "failed", "cancelled"]
-ScheduleState = Literal["pending", "running", "queued", "completed", "failed", "cancelled"]
+RunState = Literal[
+    "queued",
+    "claimed",
+    "admitted",
+    "running",
+    "settling",
+    "interrupted",
+    "paused",
+    "needs_input",
+    "completed",
+    "failed",
+    "cancelled",
+]
+ScheduleState = Literal[
+    "pending",
+    "running",
+    "queued",
+    "needs_input",
+    "completed",
+    "failed",
+    "cancelled",
+]
 RecurringScheduleOccurrenceState = Literal[
     "pending",
     "claimed",
@@ -75,6 +97,33 @@ class WorkspaceDuplicateReport(BaseModel):
     skipped_items: int = Field(ge=0)
 
 
+WorkerResourceClass = Literal["standard", "light"]
+
+STANDARD_WORKER_MEMORY_MIB = 3072
+
+LIGHT_WORKER_MEMORY_MIB = 1536
+
+def normalize_worker_resource_class(value: object) -> WorkerResourceClass:
+    clean = str(value or "standard").strip().lower()
+    if clean not in {"standard", "light"}:
+        raise ValueError("Worker resource class must be standard or light")
+    return cast(WorkerResourceClass, clean)
+
+def worker_resource_memory_bytes(
+    resource_class: object,
+    *,
+    standard_memory_mib: int = STANDARD_WORKER_MEMORY_MIB,
+) -> int:
+    clean = normalize_worker_resource_class(resource_class)
+    memory_mib = (
+        LIGHT_WORKER_MEMORY_MIB
+        if clean == "light"
+        else int(standard_memory_mib)
+    )
+    if memory_mib <= 0:
+        raise ValueError("Worker memory reservation must be positive")
+    return memory_mib * 1024**2
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -122,6 +171,9 @@ class CreateWorkerRequest(BaseModel):
     start_synchronously: bool = True
     workspace_kind: WorkspaceKind = "legacy"
     tags: list[str] = Field(default_factory=list)
+
+
+    resource_class: WorkerResourceClass = "standard"
 
 
 class DuplicateWorkerRequest(BaseModel):
@@ -193,15 +245,182 @@ class WorkerResponse(BaseModel):
         return data
 
 
+    resource_class: WorkerResourceClass = "standard"
+
+    resource_memory_bytes: int | None = None
+
+
+class WorkspaceContinuationContextRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    version: Literal[1]
+    base_instruction: str = Field(
+        alias="baseInstruction", min_length=1, max_length=131072
+    )
+    guidance: list[str] = Field(default_factory=list, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_guidance(self) -> "WorkspaceContinuationContextRequest":
+        if any(
+            not item.strip()
+            or len(item.encode("utf-8")) > 100 * 1024
+            for item in self.guidance
+        ) or sum(len(item.encode("utf-8")) for item in self.guidance) > 512 * 1024:
+            raise ValueError("Workspace continuation context is invalid")
+        return self
+
 class AssignRunRequest(BaseModel):
     instruction: str = Field(min_length=1)
     effort: str | None = None
     bootstrap_bundle: dict[str, object] | None = None
 
+    continuation_context: WorkspaceContinuationContextRequest | None = Field(
+        default=None, alias="continuationContext"
+    )
+
 
 class SendMessageRequest(BaseModel):
     message: str = Field(min_length=1)
 
+
+class CreateDelegationRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    title: str = Field(min_length=1, max_length=200)
+    goal: str = Field(min_length=1, max_length=10000)
+    instruction: str = Field(min_length=1, max_length=100000)
+    profile: str = Field(default="", max_length=100)
+    execution_mode: str = Field(default="", alias="executionMode", max_length=20)
+    worker_name: str = Field(default="", alias="workerName", max_length=200)
+    worker_role: str = Field(default="", alias="workerRole", max_length=500)
+    workspace_root: str | None = Field(default=None, alias="workspaceRoot", max_length=4096)
+    bootstrap_profile: str | None = Field(default=None, alias="bootstrapProfile", max_length=200)
+    bootstrap_bundle: dict[str, object] | None = Field(default=None, alias="bootstrapBundle")
+    origin_ref: str | None = Field(
+        default=None,
+        alias="originRef",
+        min_length=8,
+        max_length=192,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]+$",
+    )
+    origin_surface: Literal["web", "telegram", "voice", "workbench", "scheduler"] = Field(
+        default="web",
+        alias="originSurface",
+    )
+    resource_class: WorkerResourceClass = Field(
+        default="standard",
+        alias="resourceClass",
+    )
+
+class CallbackAssociationVerifyRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    origin_ref: str = Field(alias="originRef", min_length=8, max_length=192)
+    work_ref: str = Field(alias="workRef", min_length=8, max_length=192)
+    worker_id: str = Field(alias="workerId", min_length=8, max_length=192)
+    run_id: str = Field(alias="runId", min_length=8, max_length=192)
+
+class CapabilityReauthorizationRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    version: Literal[1]
+    authorization_ref: str = Field(
+        alias="authorizationRef",
+        min_length=8,
+        max_length=192,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]+$",
+    )
+    max_expires_at: str = Field(alias="maxExpiresAt", min_length=20, max_length=64)
+    scope_fingerprint: str = Field(
+        alias="scopeFingerprint", min_length=8, max_length=256
+    )
+
+class ContinuationOutputContractRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    mode: Literal["inherit", "replace"]
+    required: list[str] = Field(default_factory=list, max_length=32)
+    forbidden: list[str] = Field(default_factory=list, max_length=32)
+    formats: list[
+        Literal["md", "pdf", "docx", "xlsx", "csv", "pptx", "json", "txt"]
+    ] = Field(default_factory=list, max_length=16)
+    forbidden_formats: list[
+        Literal["md", "pdf", "docx", "xlsx", "csv", "pptx", "json", "txt"]
+    ] = Field(default_factory=list, alias="forbiddenFormats", max_length=16)
+
+    @model_validator(mode="after")
+    def validate_declaration(self) -> "ContinuationOutputContractRequest":
+        declarations = [*self.required, *self.forbidden]
+        if any(
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value) > 1000
+            or any(ord(character) < 32 and character not in "\n\t" for character in value)
+            for value in declarations
+        ):
+            raise ValueError("Continuation output declarations are invalid")
+        if self.mode == "inherit" and (
+            declarations or self.formats or self.forbidden_formats
+        ):
+            raise ValueError("An inherited output contract cannot add declarations")
+        return self
+
+class ActiveWorkSourceContextRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    version: Literal[1]
+    origin_ref: str = Field(
+        alias="originRef",
+        min_length=1,
+        max_length=512,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]*$",
+    )
+    source_event_id: str = Field(
+        alias="sourceEventId",
+        min_length=1,
+        max_length=512,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]*$",
+    )
+    source_revision: int = Field(alias="sourceRevision", ge=0)
+    surface: Literal[
+        "web", "chat", "desktop", "telegram", "voice", "workbench", "scheduler"
+    ]
+    output_contract: ContinuationOutputContractRequest = Field(alias="outputContract")
+
+class ActiveWorkActionRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    action: Literal[
+        "queue",
+        "message",
+        "steer",
+        "pause",
+        "resume",
+        "stop",
+        "retry",
+        "dismiss",
+    ]
+    instruction: str | None = Field(default=None, max_length=100000)
+    capability_reauthorization: CapabilityReauthorizationRequest | None = Field(
+        default=None, alias="capabilityReauthorization"
+    )
+    source_context: ActiveWorkSourceContextRequest | None = Field(
+        default=None, alias="sourceContext"
+    )
+    idempotency_key: str = Field(
+        alias="idempotencyKey",
+        min_length=8,
+        max_length=192,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]+$",
+    )
+
+    @model_validator(mode="after")
+    def validate_source_context_action(self) -> "ActiveWorkActionRequest":
+        if self.source_context is not None and self.action not in {
+            "queue", "message", "steer", "retry"
+        }:
+            raise ValueError("Source context is valid only for a run-producing action")
+        return self
 
 class RunActionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -383,6 +602,83 @@ class RunResponse(BaseModel):
         return self
 
 
+    first_queued_at: str = ""
+
+    queue_deadline_at: str = ""
+
+    queue_blocker_class: str = ""
+
+    queue_next_status_at: str | None = None
+
+    queue_wait_episode: int = 0
+
+    queue_wait_open: bool = False
+
+    queue_wait_generation: int = 0
+
+    queue_wait_started_at: str = ""
+
+    queue_wait_closed_at: str | None = None
+
+    queue_wait_duration_seconds: int | None = None
+
+    queue_transition_emitted: bool = False
+
+    queue_status_sequence: int = 0
+
+    queue_callback_state: Literal[
+        "unknown", "pending", "enqueued", "unavailable"
+    ] = "unknown"
+
+    queue_terminal_callback_id: str = ""
+
+    claimed_at: str | None = None
+
+    admitted_at: str | None = None
+
+    runtime_invoked_at: str | None = None
+
+    active_attempt_id: str = ""
+
+    native_session_id: str = ""
+
+    native_capabilities_json: str = "{}"
+
+    native_child_summary_json: str = "{}"
+
+    capacity_class: str = ""
+
+    capacity_available_json: str = "{}"
+
+    capacity_required_json: str = "{}"
+
+    capacity_shortage_json: str = "{}"
+
+    capacity_reservation_json: str = "{}"
+
+    capacity_next_retry_at: str | None = None
+
+    provider_route_profile: str = ""
+
+    provider_route_runtime: str = ""
+
+    provider_route_model: str = ""
+
+    provider_route_decision: str = ""
+
+    provider_route_from_profile: str = ""
+
+    provider_route_from_runtime: str = ""
+
+    provider_route_from_model: str = ""
+
+    provider_route_failure_class: str = ""
+
+    provider_route_cooldown_until: str | None = None
+
+    continuation_context_json: str = "{}"
+
+
 class ScheduleResponse(BaseModel):
     schedule_id: str
     worker_id: str
@@ -485,6 +781,9 @@ class EventResponse(BaseModel):
     event_type: str
     message: str
     created_at: str
+
+
+    payload_json: str = "{}"
 
 
 class TakeoverInfo(BaseModel):

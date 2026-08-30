@@ -18,7 +18,7 @@ from workers_projects_runtime.signed_links import (
     resolve_signed_link_ref,
     sign_link_token,
 )
-from workers_projects_runtime.store import Store
+from workers_projects_runtime.store import RunRestorationState, Store
 
 
 class PersistentFixtureRuntime(StubRuntime):
@@ -99,6 +99,45 @@ def _worker(
         execution_mode=execution_mode,
         workspace_root=workspace_root,
     )
+
+
+def _invoke_queued_run(
+    store: Store,
+    service: WorkersProjectsService,
+    worker: dict,
+    run: dict,
+) -> dict:
+    executor_id = service._executor_id
+    claimed = store.claim_next_queued_run(
+        worker["worker_id"], executor_id=executor_id
+    )
+    assert claimed is not None and claimed["run_id"] == run["run_id"]
+    lease = store.acquire_host_run_lease(
+        runtime_family="fixture-runtime",
+        lane="mission",
+        tenant_id=str(worker.get("tenant_id") or "local"),
+        owner_id=str(worker["owner_id"]),
+        worker_id=str(worker["worker_id"]),
+        run_id=str(run["run_id"]),
+        executor_id=executor_id,
+        conversation_limit=64,
+        mission_limit=64,
+        account_mission_limit=64,
+        tenant_mission_limit=64,
+        lease_ttl_s=300,
+    )
+    assert store.admit_claimed_run(
+        run["run_id"],
+        lease_id=lease["lease_id"],
+        executor_id=executor_id,
+    )
+    invoked = store.mark_run_runtime_invoked(
+        run["run_id"],
+        lease_id=lease["lease_id"],
+        executor_id=executor_id,
+    )
+    assert invoked is not None
+    return invoked
 
 
 def _expire_worker(store: Store, worker_id: str) -> str:
@@ -237,7 +276,12 @@ def test_ephemeral_reaper_fails_closed_for_active_or_scheduled_work(tmp_path, mo
         active = _worker(service, active_project, name="Active one-off", workspace_kind="ephemeral")
         scheduled_project = _project(store, title="Scheduled project")
         scheduled = _worker(service, scheduled_project, name="Scheduled one-off", workspace_kind="ephemeral")
-        store.create_run(active["worker_id"], active_project["project_id"], "Still running", state="running")
+        store.create_run(
+            active["worker_id"],
+            active_project["project_id"],
+            "Still running",
+            state=RunRestorationState.RUNNING,
+        )
         store.create_scheduled_run(
             worker_id=scheduled["worker_id"],
             project_id=scheduled_project["project_id"],
@@ -645,7 +689,7 @@ def test_hosted_steer_checks_replacement_route_before_interrupting_active_work(
             bootstrap_bundle={"provider_account": {"policy": "legacy"}},
         )
         active = service.assign_run(worker["worker_id"], "Keep this work active")
-        store.update_run(active["run_id"], state="running")
+        active = _invoke_queued_run(store, service, worker, active)
         store.update_worker_state(worker["worker_id"], "running")
         monkeypatch.delenv("OPENAI_API_KEY")
 
@@ -766,7 +810,7 @@ def test_busy_preferred_account_requires_ready_deployment_fallback_before_dispat
         assert fallback_item["provider_readiness"]["readiness"] == "deployment_managed"
         assert fallback_item["provider_readiness"]["fallback"] is True
         active = service.assign_run(preferred["worker_id"], "Keep this work active")
-        store.update_run(active["run_id"], state="running")
+        active = _invoke_queued_run(store, service, preferred, active)
         store.update_worker_state(preferred["worker_id"], "running")
         monkeypatch.delenv("OPENAI_API_KEY")
 

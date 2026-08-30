@@ -138,6 +138,7 @@ class FakeApiClient:
         profile: str = "codex-cli",
         backend: str = "openclaw",
         execution_mode: str = "docker",
+        resource_class: str = "standard",
         alias: str | None = None,
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
@@ -154,6 +155,7 @@ class FakeApiClient:
             "profile": profile,
             "backend": backend,
             "execution_mode": execution_mode,
+            "resource_class": resource_class,
             "runtime": _fake_runtime_for_profile(profile),
             "alias": alias,
             "workspace_root": workspace_root,
@@ -227,8 +229,24 @@ class FakeApiClient:
     def worker_events(self, worker_id: str):
         return [{"event_id": "evt_123", "worker_id": worker_id, "event_type": "worker.ready"}]
 
-    def assign_run(self, worker_id: str, instruction: str, *, effort: str | None = None, bootstrap_bundle: dict | None = None):
-        return {"run_id": "run_assign", "worker_id": worker_id, "instruction": instruction, "effort": effort or "", "state": "queued", "bootstrap_bundle": bootstrap_bundle}
+    def assign_run(
+        self,
+        worker_id: str,
+        instruction: str,
+        *,
+        effort: str | None = None,
+        bootstrap_bundle: dict | None = None,
+        continuation_context: dict | None = None,
+    ):
+        return {
+            "run_id": "run_assign",
+            "worker_id": worker_id,
+            "instruction": instruction,
+            "effort": effort or "",
+            "state": "queued",
+            "bootstrap_bundle": bootstrap_bundle,
+            "continuation_context": continuation_context,
+        }
 
     def send_message(self, worker_id: str, message: str):
         return {"run_id": "run_msg", "worker_id": worker_id, "instruction": message, "state": "queued"}
@@ -303,10 +321,18 @@ class TrackingApiClient(FakeApiClient):
         self.create_worker_payloads.append(kwargs)
         return super().create_worker(**kwargs)
 
-    def assign_run(self, worker_id: str, instruction: str, *, effort: str | None = None, bootstrap_bundle: dict | None = None):
+    def assign_run(
+        self,
+        worker_id: str,
+        instruction: str,
+        *,
+        effort: str | None = None,
+        bootstrap_bundle: dict | None = None,
+        continuation_context: dict | None = None,
+    ):
         self.calls.append("assign_run")
-        self.assign_run_payloads.append({"worker_id": worker_id, "instruction": instruction, "effort": effort or "", "bootstrap_bundle": bootstrap_bundle})
-        return super().assign_run(worker_id, instruction, effort=effort, bootstrap_bundle=bootstrap_bundle)
+        self.assign_run_payloads.append({"worker_id": worker_id, "instruction": instruction, "effort": effort or "", "bootstrap_bundle": bootstrap_bundle, "continuation_context": continuation_context})
+        return super().assign_run(worker_id, instruction, effort=effort, bootstrap_bundle=bootstrap_bundle, continuation_context=continuation_context)
 
     def send_message(self, worker_id: str, message: str):
         self.calls.append("send_message")
@@ -513,12 +539,14 @@ class RememberedDispatchApiClient(TrackingApiClient):
         *,
         effort: str | None = None,
         bootstrap_bundle: dict | None = None,
+        continuation_context: dict | None = None,
     ):
         payload = super().assign_run(
             worker_id,
             instruction,
             effort=effort,
             bootstrap_bundle=bootstrap_bundle,
+            continuation_context=continuation_context,
         )
         payload.update(
             {
@@ -612,6 +640,7 @@ class RetryableFailureApiClient(FakeApiClient):
         *,
         effort: str | None = None,
         bootstrap_bundle: dict | None = None,
+        continuation_context: dict | None = None,
     ):
         self.assigned.append(
             {
@@ -619,6 +648,7 @@ class RetryableFailureApiClient(FakeApiClient):
                 "instruction": instruction,
                 "effort": effort or "",
                 "bootstrap_bundle": bootstrap_bundle,
+                "continuation_context": continuation_context,
             }
         )
         return {
@@ -674,12 +704,14 @@ class EnterpriseRetryableFailureApiClient(RetryableFailureApiClient):
         *,
         effort: str | None = None,
         bootstrap_bundle: dict | None = None,
+        continuation_context: dict | None = None,
     ):
         payload = super().assign_run(
             worker_id,
             instruction,
             effort=effort,
             bootstrap_bundle=bootstrap_bundle,
+            continuation_context=continuation_context,
         )
         payload["tenant_id"] = self.new_run_tenant_id
         return payload
@@ -3172,12 +3204,19 @@ def test_workspace_continue_queues_same_workspace_recovery(monkeypatch):
     asyncio.run(scenario())
     assert len(api_client.assigned) == 1
     instruction = api_client.assigned[0]["instruction"]
-    assert "Original task:" in instruction
+    assert "Prior run task context:" in instruction
     assert "Build the requested research workbook and report." in instruction
     assert "Previous failure classification:" in instruction
     assert "provider_rate_limited" in instruction
     assert "current files" in instruction
     assert api_client.assigned[0]["effort"] == "medium"
+    assert api_client.assigned[0]["continuation_context"] == {
+        "version": 1,
+        "base_instruction": "Build the requested research workbook and report.",
+        "guidance": [
+            "Continue and finish the workbook from current partial files."
+        ],
+    }
 
 
 def test_workspace_continue_exposes_raw_details_only_with_diagnostics(monkeypatch):
@@ -3199,7 +3238,7 @@ def test_workspace_continue_exposes_raw_details_only_with_diagnostics(monkeypatc
             payload = _tool_json(continued)
             assert payload["previous_run_id"] == "run_retryable_failed"
             assert payload["run"]["run_id"] == "run_continued"
-            assert "Original task:" in payload["continuation_instruction_preview"]
+            assert "Prior run task context:" in payload["continuation_instruction_preview"]
 
     asyncio.run(scenario())
 
@@ -3216,6 +3255,17 @@ def test_workspace_continue_does_not_nest_previous_continue_wrappers(monkeypatch
                     "Previous failure classification:\n- class: provider_response_failed\n"
                     "- retryable: True\n\n"
                     "Continuation request:\nResume the original task from current files."
+                )
+                payload["continuation_context_json"] = json.dumps(
+                    {
+                        "version": 1,
+                        "base_instruction": (
+                            "Build the requested research workbook and report."
+                        ),
+                        "guidance": [
+                            "Resume the original task from current files."
+                        ],
+                    }
                 )
             return payload
 
@@ -3236,10 +3286,19 @@ def test_workspace_continue_does_not_nest_previous_continue_wrappers(monkeypatch
 
     asyncio.run(scenario())
     instruction = api_client.assigned[0]["instruction"]
-    assert instruction.count("Original task:") == 1
+    assert instruction.count("Prior run task context:") == 1
+    assert instruction.count("Continuation context:") == 1
     assert "Build the requested research workbook and report." in instruction
-    assert "Resume the original task from current files." not in instruction
+    assert "Resume the original task from current files." in instruction
     assert "Finish from the existing files." in instruction
+    assert api_client.assigned[0]["continuation_context"] == {
+        "version": 1,
+        "base_instruction": "Build the requested research workbook and report.",
+        "guidance": [
+            "Resume the original task from current files.",
+            "Finish from the existing files.",
+        ],
+    }
 
 
 def test_workspace_continue_rejects_mismatched_worker_id(monkeypatch):

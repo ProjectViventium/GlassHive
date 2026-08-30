@@ -4,6 +4,8 @@ import os
 
 import pytest
 
+import workers_projects_runtime.service as service_module
+
 
 RUNTIME_ENV_KEYS = (
     "GLASSHIVE_ENTERPRISE_MODE",
@@ -46,6 +48,8 @@ RUNTIME_ENV_KEYS = (
     "WPR_HOST_CODEX_NATIVE_MCP_ALLOWLIST",
     "GLASSHIVE_HOST_CODEX_PLUGIN_CACHE",
     "WPR_HOST_CODEX_PLUGIN_CACHE",
+    "GLASSHIVE_HOST_PLUGIN_DENYLIST",
+    "WPR_HOST_PLUGIN_DENYLIST",
     "GLASSHIVE_AUTO_DISCOVER_CODEX_WORKSPACE_DEPS",
     "WPR_AUTO_DISCOVER_CODEX_WORKSPACE_DEPS",
     "GLASSHIVE_CODEX_WORKSPACE_DEPS_ROOT",
@@ -79,10 +83,17 @@ RUNTIME_ENV_KEYS = (
     "GLASSHIVE_WORKER_ENV_ALLOWLIST",
     "GLASSHIVE_ALLOWED_WORKER_PROFILES",
     "GLASSHIVE_DEFAULT_WORKER_PROFILE",
+    "GLASSHIVE_BOOTSTRAP_SOURCE_SECRET",
+    "GLASSHIVE_BACKGROUND_CONSUMERS_ENABLED",
     "WPR_API_TOKEN",
+    "VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET",
     "WPR_DB_PATH",
     "WPR_LINK_REF_TTL_SECONDS",
     "WPR_DEFAULT_EXECUTION_MODE",
+    "WPR_HOST_CONVERSATION_SLOTS_PER_CLI",
+    "WPR_HOST_MISSION_SLOTS_PER_CLI",
+    "WPR_HOST_ACCOUNT_ACTIVE_LIMIT",
+    "WPR_HOST_TENANT_ACTIVE_LIMIT",
     "WPR_ENTERPRISE_MODE",
     "WPR_ENTERPRISE_TENANT_ID",
     "WPR_LIBRECHAT_UPLOADS_ROOT",
@@ -100,6 +111,8 @@ RUNTIME_ENV_KEYS = (
     "WPR_CODEX_CLI_DISABLE_CUSTOM_PROVIDER",
     "WPR_CODEX_CLI_IGNORE_USER_CONFIG",
     "WPR_CODEX_CLI_DISABLE_FEATURES",
+    "WPR_CODEX_CLI_PERSONALITY",
+    "WPR_CODEX_CLI_CONVERSATION_PROJECT_INSTRUCTIONS",
     "WPR_MODEL_CODEX_CLI",
     "WPR_MODEL_HOST_CODEX_CLI",
     "CODEX_MODEL",
@@ -126,4 +139,27 @@ def isolate_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path):
     for key in RUNTIME_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(tmp_path / "link_refs.sqlite3"))
+    monkeypatch.setenv(
+        "GLASSHIVE_BOOTSTRAP_SOURCE_SECRET",
+        "synthetic-bootstrap-source-secret",
+    )
+    # Stubbed runtime tests must not inherit the developer machine's momentary
+    # memory or disk pressure. Capacity tests replace this exact projection.
+    monkeypatch.setattr(
+        service_module,
+        "host_resource_usage",
+        lambda _leases: service_module.HostResourceUsage(
+            child_processes=0,
+            threads=0,
+            available_memory_bytes=16 * 1024**3,
+            available_disk_bytes=64 * 1024**3,
+        ),
+    )
     yield
+
+
+@pytest.fixture
+def background_consumers_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep direct service-unit fixtures isolated from live scheduler threads."""
+
+    monkeypatch.setenv("GLASSHIVE_BACKGROUND_CONSUMERS_ENABLED", "false")

@@ -53,6 +53,21 @@ Every enterprise deployment must configure and QA these controls before users ar
 - `WPR_SANDBOX_CPUS`, `WPR_SANDBOX_MEMORY`, `WPR_SANDBOX_MEMORY_SWAP`,
   `WPR_SANDBOX_PIDS_LIMIT`, and `WPR_SANDBOX_SHM_SIZE`: Docker worker resource caps.
 
+Host-native dispatch uses one typed capacity policy across executor dispatch, preflight, preaccept,
+and runtime lease admission. Defaults are 2 interactive turns per CLI profile, 3 missions per CLI
+profile, 4 active missions per account, and 12 active missions per tenant. The 2 and 3 limits are
+separate profile/family lane dimensions. The 4 and 12 limits apply only to mission account/tenant
+scope; conversation turns are governed by the conversation profile/family lane. A declared host
+repository mutation scope is a separate typed one-owner dimension, and measured process/thread/
+memory/disk headroom is a separate resource vector. None of these dimensions means a generic
+"one worker per family" cap. Deployments may override these values with `WPR_HOST_CONVERSATION_SLOTS_PER_CLI`,
+`WPR_HOST_MISSION_SLOTS_PER_CLI`, `WPR_HOST_ACCOUNT_ACTIVE_LIMIT`, and
+`WPR_HOST_TENANT_ACTIVE_LIMIT`; the service freezes one policy snapshot at startup.
+
+Before any host CLI version/help/auth/readiness subprocess, GlassHive persists a provisional
+capacity reservation under these same dimensions. Missing or expired ownership means zero CLI or
+provider process invocation. Preflight failure releases the reservation and accepts no work.
+
 Termination is verified, not assumed. Docker removal must be followed by a fresh inspect proving the
 container is gone, the service rejects a termination result that still reports active compute, and
 the always-on orphan reconciler removes any container left behind a terminated or failed worker
@@ -150,6 +165,14 @@ Provider quota errors are different from GlassHive worker quotas. GlassHive quot
 workers/workspaces can exist or run; provider quota errors mean the model route, billing, budget, or
 rate limit rejected the request. Fix provider quota by changing the model route, budget, key, or
 deployment capacity, not by raising GlassHive worker caps.
+
+Provider route health is fail-closed. A task, model message, tool result, stderr line, or caller-made
+attestation cannot open the route circuit. For native Codex, GlassHive accepts only an official
+app-server `thread/read` typed `usageLimitExceeded` result bound to the exact failed, pre-authoring
+thread and an `account/rateLimits/read` typed reached state. A typed exhausted window supplies the
+exact reset time. The route is skipped until that time. GlassHive may use only the fallback profile
+declared in the trusted launch authority; with no eligible configured fallback, the same route waits
+for its reset. Localized provider prose is never parsed for quota class or reset time.
 
 Provider-account cards show only what GlassHive directly observed: account-bound worker runs,
 failed outcomes, elapsed worker-dispatch time, and—only when the worker harness reports them—input
@@ -331,18 +354,21 @@ not a passing upload result for binary/PDF/workbook work. If the host authentica
 email/SSO while the upload share is keyed by an internal LibreChat user id, the host must send the
 internal id as `X-GlassHive-Storage-User-Id` or `X-Viventium-Storage-User-Id`. That storage identity
 is authorized only for upload byte lookup and must not replace the authenticated owner used for
-workspace/link access.
+workspace/link access. It is transport-only authority and must not enter worker-visible context,
+prompts, callbacks, trace events, API detail, or logs. Exact selected-file authority requires a
+stable upload token or owner-scoped virtual path; filename-only, missing, or ambiguous identity fails
+closed. Distinct selected stable references remain distinct even when they share one display name or
+proposed workspace path; projection assigns deterministic collision-safe worker paths instead of
+silently dropping either reference.
 
 If a legacy host cannot project request `files`/`attachments` without changing its LibreChat image,
 `GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_FALLBACK=true` may be enabled as a bounded compatibility mode.
 It must stay owner-scoped to the storage id, request-context-gated by conversation/message headers,
-and time-bounded by `GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_RECENT_SECONDS` (default `900`). Without real
-file metadata or an approved DB resolver, the fallback cannot prove per-message file membership, so
-the normal upload-header contract remains the preferred architecture. It must never scan a global
-upload folder, pick another owner's file, or replace the normal upload-header contract when that
-contract is available. Keep the time window close to real upload-to-dispatch latency and require an
-operator-visible fallback-use log; broad windows can copy unrelated same-owner uploads into a worker
-and violate literal file-input expectations.
+and time-bounded by `GLASSHIVE_LIBRECHAT_UPLOAD_COMPAT_RECENT_SECONDS` (default `900`). It may
+materialize only a stable token/path identity present in trusted `selected_files`; without that exact
+selection, it projects no recent file. It must never resolve by display filename, choose the newest
+same-owner match, scan a global upload folder, pick another owner's file, or replace the normal
+upload-header contract when that contract is available.
 
 Status/wait QA must also cover stale requested runs. If a user asks about an older failed run after
 the same worker later completed, GlassHive must preserve the requested run outcome while surfacing

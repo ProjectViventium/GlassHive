@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import sqlite3
+import threading
 import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,21 @@ from fastapi.testclient import TestClient
 from workers_projects_runtime.api import create_app
 from workers_projects_runtime.openclaw_runtime import StubRuntime
 from workers_projects_runtime.store import Store
+
+
+def _service_background_threads(service) -> tuple[Thread, ...]:
+    return tuple(
+        thread
+        for thread in (
+            service._startup_recovery_thread,
+            service._callback_retry_thread,
+            service._idle_reaper_thread,
+            service._scheduler_thread,
+            service._host_lease_heartbeat_thread,
+            service._isolated_readiness_thread,
+        )
+        if thread is not None
+    )
 
 
 def _sqlite_sidecars(db_path: Path) -> tuple[Path, Path]:
@@ -65,6 +81,43 @@ def test_store_keeps_wal_sidecars_for_its_explicit_lifetime(tmp_path: Path) -> N
 
     assert store._lifetime_connection is None
     _assert_connection_closed(keeper)
+
+
+def test_api_service_background_threads_are_owned_by_lifespan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GLASSHIVE_BACKGROUND_CONSUMERS_ENABLED", "true")
+    baseline_thread_ids = {
+        thread.ident for thread in threading.enumerate() if thread.ident is not None
+    }
+    app = create_app(
+        str(tmp_path / "runtime.db"),
+        runtime_backend="stub",
+        runtime=StubRuntime(),
+        reconcile_on_startup=False,
+    )
+    service = app.state.service
+
+    assert _service_background_threads(service) == ()
+    assert {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.ident is not None and thread.ident not in baseline_thread_ids
+    } == set()
+
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        owned_threads = _service_background_threads(service)
+        assert owned_threads
+        assert all(thread.is_alive() for thread in owned_threads)
+
+    assert all(not thread.is_alive() for thread in owned_threads)
+    assert {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.ident is not None and thread.ident not in baseline_thread_ids
+    } == set()
 
 
 def test_short_lived_store_finalizer_closes_forgotten_keeper(tmp_path: Path) -> None:
