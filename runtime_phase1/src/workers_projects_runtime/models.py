@@ -14,9 +14,7 @@ WorkerState = Literal[
     "starting",
     "ready",
     "running",
-    "stopping",
     "paused",
-    "needs_input",
     "failed",
     "terminated",
 ]
@@ -24,13 +22,9 @@ WorkerCloseState = Literal["terminating", "termination_failed", "terminated"]
 CLOSED_WORKER_STATES = frozenset({"terminating", "termination_failed", "terminated"})
 RunState = Literal[
     "queued",
-    "claimed",
-    "admitted",
     "running",
-    "settling",
     "interrupted",
     "paused",
-    "needs_input",
     "completed",
     "failed",
     "cancelled",
@@ -39,7 +33,6 @@ ScheduleState = Literal[
     "pending",
     "running",
     "queued",
-    "needs_input",
     "completed",
     "failed",
     "cancelled",
@@ -231,6 +224,12 @@ class WorkerResponse(BaseModel):
             # Keep the frozen public state enum compatible while the optional close-state field
             # carries truthful close progress for modern clients.
             data["state"] = "terminated"
+        elif raw_state == "stopping":
+            data = dict(data)
+            data["state"] = "running"
+        elif raw_state == "needs_input":
+            data = dict(data)
+            data["state"] = "paused"
         backend = derive_legacy_backend_label(
             profile=data.get("profile"),
             runtime=data.get("runtime"),
@@ -588,6 +587,23 @@ class RunResponse(BaseModel):
         description="Normalized per-assignment effort accepted by the runtime.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def project_internal_state_to_legacy_contract(cls, data):
+        if not isinstance(data, dict):
+            return data
+        public_state = {
+            "claimed": "queued",
+            "admitted": "queued",
+            "settling": "running",
+            "needs_input": "paused",
+        }.get(str(data.get("state") or ""))
+        if not public_state:
+            return data
+        projected = dict(data)
+        projected["state"] = public_state
+        return projected
+
     @model_validator(mode="after")
     def calculate_total_tokens(self):
         self.total_tokens = sum(
@@ -693,6 +709,15 @@ class ScheduleResponse(BaseModel):
     last_error: str = ""
     created_at: str
     updated_at: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def project_internal_state_to_legacy_contract(cls, data):
+        if not isinstance(data, dict) or str(data.get("state") or "") != "needs_input":
+            return data
+        projected = dict(data)
+        projected["state"] = "failed"
+        return projected
 
 
 class RecurringScheduleDefinitionResponse(BaseModel):

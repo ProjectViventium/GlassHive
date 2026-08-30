@@ -27,6 +27,7 @@ from workers_projects_runtime.conversation_provider import (
     ResponsesRequest,
 )
 from workers_projects_runtime.mcp_server import _apply_effort_to_bundle, create_mcp_server
+from workers_projects_runtime.models import RunResponse, ScheduleResponse, WorkerResponse
 from workers_projects_runtime.service import WorkersProjectsService
 
 
@@ -537,6 +538,18 @@ async def _listed_mcp_tools() -> dict[str, dict[str, Any]]:
 class _CaptureStore:
     def __init__(self) -> None:
         self.saved: dict[str, Any] | None = None
+        self.run: dict[str, Any] | None = None
+
+    def get_run(self, run_id):
+        if self.run is None or self.run.get("run_id") != run_id:
+            return None
+        return self.run
+
+    def get_delegation_for_worker(self, *_args, **_kwargs):
+        return None
+
+    def list_run_attempts(self, _run_id):
+        return []
 
     def upsert_callback_outbox(self, **kwargs):
         self.saved = kwargs
@@ -589,15 +602,19 @@ def _candidate_callback_payload() -> tuple[dict[str, Any], WorkersProjectsServic
     service._callback_message_with_links = (
         lambda _worker, message, _deliverable, _callbacks, include_watch_link: message
     )
+    run = {
+        "run_id": "run-1",
+        "project_id": "project-1",
+        "worker_id": "worker-1",
+        "state": "failed",
+        "failure_class": "provider_rate_limited",
+        "failure_retryable": True,
+    }
+    service.store.run = run
     service._emit_callback(
         {"project_id": "project-1", "worker_id": "worker-1"},
         "run.failed",
-        run={
-            "run_id": "run-1",
-            "state": "failed",
-            "failure_class": "provider_rate_limited",
-            "failure_retryable": True,
-        },
+        run=run,
         message="Synthetic failure",
         full_message="Synthetic failure details",
         deliverable={
@@ -831,6 +848,75 @@ def test_complete_legacy_http_openapi_contract_is_additive(tmp_path):
             "state"
         ]["enum"]
     )
+
+
+@pytest.mark.parametrize(
+    ("durable_state", "public_state"),
+    [
+        ("claimed", "queued"),
+        ("admitted", "queued"),
+        ("settling", "running"),
+        ("needs_input", "paused"),
+    ],
+)
+def test_legacy_run_response_projects_internal_states(
+    durable_state: str,
+    public_state: str,
+):
+    response = RunResponse(
+        run_id="run-1",
+        worker_id="worker-1",
+        project_id="project-1",
+        instruction="Synthetic work",
+        state=durable_state,
+        queued_at="2026-01-01T00:00:00+00:00",
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+
+    assert response.state == public_state
+
+
+@pytest.mark.parametrize(
+    ("durable_state", "public_state"),
+    [("stopping", "running"), ("needs_input", "paused")],
+)
+def test_legacy_worker_response_projects_internal_states(
+    durable_state: str,
+    public_state: str,
+):
+    response = WorkerResponse(
+        worker_id="worker-1",
+        project_id="project-1",
+        owner_id="owner-1",
+        name="Synthetic worker",
+        role="Synthetic role",
+        profile="synthetic",
+        backend="synthetic",
+        state=durable_state,
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+
+    assert response.state == public_state
+
+
+def test_legacy_schedule_response_projects_needs_input_to_failed():
+    response = ScheduleResponse(
+        schedule_id="schedule-1",
+        worker_id="worker-1",
+        project_id="project-1",
+        owner_id="owner-1",
+        instruction="Synthetic scheduled work",
+        run_at="2026-01-01T00:00:00+00:00",
+        state="needs_input",
+        last_error="Synthetic authorization is required",
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+
+    assert response.state == "failed"
+    assert response.last_error == "Synthetic authorization is required"
 
 
 def test_http_compatibility_checker_rejects_breaking_semantic_diffs():
