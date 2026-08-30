@@ -57,6 +57,39 @@ from .signed_links import (
     signed_link_ttl_seconds,
 )
 
+import hashlib
+
+from .bootstrap import (
+    BOOTSTRAP_SOURCE_TOKEN_KEY,
+    GLASSHIVE_CAPABILITY_BROKER_TOKEN_ENV,
+    sign_bootstrap_source_path,
+    worker_prompt_layer_producer,
+)
+
+from .models import worker_resource_memory_bytes
+
+from .service_assertions import (
+    SERVICE_ASSERTION_HEADER,
+    mint_service_assertion,
+    verify_service_assertion,
+)
+
+from .workspace_continuation import (
+    CONNECTED_ACCOUNT_NO_BROKER_NOTE,
+    build_workspace_continuation_context,
+    continuation_instruction,
+)
+
+from .store import canonical_parallel_clean_room_bootstrap
+
+from .upload_projection import (
+    intersect_upload_records,
+    merge_projected_upload_files,
+    project_upload_files as _project_request_upload_files,
+    public_upload_ledger,
+    trusted_selected_files,
+)
+
 try:
     from fastmcp.server.dependencies import get_http_headers
 except Exception:  # pragma: no cover - optional dependency path differs by FastMCP package
@@ -208,6 +241,199 @@ def _finite_tool_float(value: float | int | str, *, field_name: str) -> float:
     return parsed
 
 
+def _safe_request_validation_failure(payload: object) -> dict[str, Any]:
+    """Classify an HTTP 422 without copying rejected values or free-form messages."""
+    summaries: list[str] = []
+    details = payload.get("detail") if isinstance(payload, dict) else None
+    if isinstance(details, list):
+        for item in details[:8]:
+            if not isinstance(item, dict):
+                continue
+            location = item.get("loc")
+            field = "request"
+            if isinstance(location, (list, tuple)):
+                safe_parts = [
+                    str(part)
+                    for part in location
+                    if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", str(part))
+                    and str(part) not in {"body", "query", "path"}
+                ]
+                if safe_parts:
+                    field = ".".join(safe_parts[-3:])
+            error_type = str(item.get("type") or "invalid")
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", error_type):
+                error_type = "invalid"
+            summary = f"{field}:{error_type}"
+            if summary not in summaries:
+                summaries.append(summary)
+    return {
+        "status": "blocked",
+        "failure_class": "glasshive_request_validation_failed",
+        "failure_retryable": False,
+        "failure_user_message": (
+            "GlassHive could not accept this mission because its request metadata did not match "
+            "the account API contract."
+        ),
+        "failure_recommended_recovery": (
+            "Refresh the Viventium and GlassHive runtime artifacts so both sides use the same "
+            "mission request contract."
+        ),
+        "failure_diagnostic_summary": ",".join(summaries) or "request:invalid",
+    }
+
+_CAPACITY_VECTOR_KEYS = (
+    "childProcesses",
+    "threads",
+    "memoryBytes",
+    "diskBytes",
+)
+
+def _safe_capacity_vector(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    vector: dict[str, int] = {}
+    for key in _CAPACITY_VECTOR_KEYS:
+        raw = value.get(key)
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            continue
+        vector[key] = raw
+    return vector
+
+def _safe_capacity_timestamp(value: object) -> str:
+    clean = str(value or "").strip()
+    if not clean or len(clean) > 64:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(clean.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return clean if parsed.tzinfo is not None else ""
+
+def _safe_account_api_capacity(detail: dict[str, Any]) -> dict[str, Any] | None:
+    capacity_class = str(detail.get("capacityClass") or "").strip()
+    if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", capacity_class):
+        return None
+    capacity: dict[str, Any] = {"class": capacity_class}
+    vectors = {
+        name: _safe_capacity_vector(detail.get(name))
+        for name in ("available", "required", "shortage", "reservation")
+    }
+    capacity.update({name: value for name, value in vectors.items() if value})
+    dimension = str(detail.get("dimension") or "").strip()
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", dimension):
+        capacity["dimension"] = dimension
+    next_retry_at = _safe_capacity_timestamp(detail.get("nextRetryAt"))
+    if next_retry_at:
+        capacity["nextRetryAt"] = next_retry_at
+    retry_after = detail.get("retryAfter")
+    if (
+        not isinstance(retry_after, bool)
+        and isinstance(retry_after, int)
+        and 0 < retry_after <= 86400
+    ):
+        capacity["retryAfter"] = retry_after
+
+    available = vectors["available"]
+    required = vectors["required"]
+    reservation = vectors["reservation"]
+    complete_vectors = all(
+        set(vector) == set(_CAPACITY_VECTOR_KEYS)
+        for vector in (available, required, reservation)
+    )
+    standard_memory = reservation.get("memoryBytes", 0)
+    light_memory = worker_resource_memory_bytes("light")
+    if capacity_class == "resource_pressure" and complete_vectors and standard_memory > light_memory:
+        recommended_required = dict(required)
+        recommended_required["memoryBytes"] = max(
+            0,
+            required["memoryBytes"] - standard_memory + light_memory,
+        )
+        recommended_reservation = dict(reservation)
+        recommended_reservation["memoryBytes"] = light_memory
+        light_would_fit = all(
+            available[key] >= recommended_required[key]
+            for key in _CAPACITY_VECTOR_KEYS
+        )
+        capacity["lightWouldFit"] = light_would_fit
+        if light_would_fit:
+            capacity.update(
+                {
+                    "recommendedResourceClass": "light",
+                    "recommendedRequired": recommended_required,
+                    "recommendedReservation": recommended_reservation,
+                }
+            )
+    return capacity
+
+def _safe_account_api_failure(payload: object, *, status_code: int) -> dict[str, Any] | None:
+    """Preserve a local account-API error code without copying free-form detail."""
+
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if not isinstance(detail, dict):
+        return None
+    code = str(detail.get("code") or "").strip()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,119}", code):
+        return None
+    retryable = int(status_code) in {408, 425, 429, 500, 502, 503, 504}
+    diagnostic = f"http_{int(status_code)}:{code}"
+    message = str(detail.get("message") or "").strip()
+    bootstrap_prefix = "Automatic Parallel work rejected unsafe bootstrap authority: "
+    safe_bootstrap_reasons = {
+        "host bootstrap profiles are not allowed": "host_profile",
+        "bootstrap bundle is invalid": "bundle_invalid",
+        "execution policy is server-owned": "caller_execution_policy",
+        "caller provider credentials are not allowed": "caller_provider_credentials",
+        "caller bootstrap environment is not allowed": "caller_environment",
+        "files must be a workspace-scoped list": "files_not_workspace_list",
+        "every file must be workspace-scoped": "file_not_workspace_scoped",
+        "home-scoped files are not allowed": "home_scoped_file",
+        "workspace file path is invalid": "workspace_path_invalid",
+        "workspace provider or credential config files are not allowed": "workspace_authority_file",
+        "capability broker metadata is invalid": "broker_metadata_invalid",
+        "caller broker credentials are not allowed": "caller_broker_credentials",
+        "caller MCP config is not allowed": "caller_mcp_config",
+        "caller Claude MCP config is not allowed": "caller_claude_mcp_config",
+        "caller Codex MCP config is not allowed": "caller_codex_mcp_config",
+    }
+    structured_reason = str(detail.get("reason") or "").strip()
+    if structured_reason in set(safe_bootstrap_reasons.values()):
+        diagnostic = f"{diagnostic}:{structured_reason}"
+    elif message.startswith(bootstrap_prefix) and message.endswith("."):
+        reason = message[len(bootstrap_prefix) : -1]
+        reason_code = safe_bootstrap_reasons.get(reason)
+        if reason_code:
+            diagnostic = f"{diagnostic}:{reason_code}"
+    elif message == "Automatic Parallel work requires an isolated Docker/workstation runtime.":
+        diagnostic = f"{diagnostic}:runtime_not_ready"
+    elif message == "Existing host-native mission work blocks isolated Parallel admission.":
+        diagnostic = f"{diagnostic}:host_missions_active"
+    failure: dict[str, Any] = {
+        "status": "blocked",
+        "failure_class": code,
+        "failure_retryable": retryable,
+        "failure_user_message": "GlassHive could not accept this mission at the account boundary.",
+        "failure_recommended_recovery": (
+            "Retry after the reported dependency recovers."
+            if retryable
+            else "Refresh the Viventium and GlassHive runtime artifacts before launching again."
+        ),
+        "failure_diagnostic_summary": diagnostic,
+    }
+    if code == "host_capacity":
+        capacity = _safe_account_api_capacity(detail)
+        if capacity is not None:
+            failure["capacity"] = capacity
+            if capacity.get("recommendedResourceClass") == "light":
+                failure["failure_recommended_recovery"] = (
+                    "Retry this same bounded mission once with resource_class='light'. "
+                    "Otherwise wait for the reported capacity dependency to recover."
+                )
+                failure["main_agent_next_action"] = (
+                    "Retry this same bounded mission once with resource_class='light'. "
+                    "Do not use light for an unbounded or memory-intensive mission."
+                )
+    return failure
+
 def _configured_default_worker_profile() -> str:
     raw_configured = os.environ.get("GLASSHIVE_DEFAULT_WORKER_PROFILE", "").strip()
     configured = raw_configured or "codex-cli"
@@ -353,6 +579,10 @@ HEADER_VOICE_REQUEST_ID = "x-viventium-voice-request-id"
 HEADER_TELEGRAM_CHAT_ID = "x-viventium-telegram-chat-id"
 HEADER_TELEGRAM_USER_ID = "x-viventium-telegram-user-id"
 HEADER_TELEGRAM_MESSAGE_ID = "x-viventium-telegram-message-id"
+HEADER_LOGICAL_TURN_ID = "x-viventium-logical-turn-id"
+
+HEADER_LOGICAL_TURN_REVISION = "x-viventium-logical-turn-revision"
+
 HEADER_REQUEST_FILES = "x-viventium-request-files"
 HEADER_REQUEST_ATTACHMENTS = "x-viventium-request-attachments"
 HEADER_TOOL_RESOURCES = "x-viventium-tool-resources"
@@ -636,6 +866,13 @@ def _mcp_transport_security_settings(host: str, port: int) -> TransportSecurityS
     )
 
 
+def _host_worker_mentions() -> tuple[str, str, str]:
+    return (
+        os.environ.get("WPR_HOST_MENTION_CODEX", "@codex").strip() or "@codex",
+        os.environ.get("WPR_HOST_MENTION_CLAUDE", "@claude").strip() or "@claude",
+        os.environ.get("WPR_HOST_MENTION_OPENCLAW", "@openclaw").strip() or "@openclaw",
+    )
+
 def _worker_execution_instruction() -> str:
     if _host_workers_enabled():
         if _default_execution_mode() == "host":
@@ -655,6 +892,33 @@ def _worker_execution_instruction() -> str:
     )
 
 
+def _worker_surface_summary() -> str:
+    if _host_workers_enabled():
+        return (
+            "persistent projects, resumable workers, host-native workers for browser and desktop action, "
+            "local files/projects, installed CLIs, workstation sandboxes, and live operator takeover"
+        )
+    return (
+        "persistent projects, resumable workers, Docker/workstation sandboxes, generated artifacts, "
+        "sandboxed browser/desktop action, and live operator takeover"
+    )
+
+def _worker_surface_routing_guidance() -> str:
+    if _host_workers_enabled():
+        return (
+            "Use it when the user asks the host assistant to act in a real browser, desktop app, local file, "
+            "local project, installed tool, or current computer session; the user does not need to say "
+            "GlassHive, Codex, Computer Use, or local machine. Do not answer from memory or inference when "
+            "real browser/desktop/local state must be inspected or changed. "
+        )
+    return (
+        "Use it for advanced long-running workspace, file, code, research, artifact, sandboxed browser, "
+        "or sandboxed desktop work; host-native access to the user's real computer/session is disabled in "
+        "this deployment, so do not imply real local-browser, desktop-app, local-file, installed-CLI, or OS "
+        "control unless the host explicitly exposes a separate capability. "
+    )
+
+@worker_prompt_layer_producer("mcp_server_instructions")
 def glasshive_workers_server_instructions() -> str:
     return (
         "Use the one GlassHive tool whose action matches the user's request. Make one call when one "
@@ -699,6 +963,56 @@ def _header_value(headers: dict[str, str], primary: str) -> str:
     return ""
 
 
+def _header_was_supplied(headers: dict[str, str], primary: str) -> bool:
+    """Return whether a trusted identity header was present, even when its value is invalid."""
+
+    return any(name in headers for name in (primary, *HEADER_ALIASES.get(primary, ())))
+
+def _strict_event_identity_value(
+    raw_value: object,
+    *,
+    label: str,
+    max_bytes: int = 512,
+) -> str:
+    """Normalize one durable event identifier and reject ambiguous or unsafe forms."""
+
+    if not isinstance(raw_value, str):
+        raise ValueError(f"The trusted {label} source identity is invalid")
+    value = _sanitize_context_value(raw_value)
+    if (
+        not value
+        or len(value.encode("utf-8")) > max_bytes
+        or any(ord(char) < 32 or ord(char) == 127 for char in raw_value)
+    ):
+        raise ValueError(f"The trusted {label} source identity is invalid")
+    return value
+
+def _trusted_identity_header(
+    headers: dict[str, str],
+    primary: str,
+    *,
+    label: str,
+    max_bytes: int = 512,
+) -> tuple[bool, str]:
+    """Read one event-identity header without alias ambiguity or unsafe bytes."""
+
+    names = (primary, *HEADER_ALIASES.get(primary, ()))
+    present = [(name, str(headers.get(name) or "")) for name in names if name in headers]
+    if not present:
+        return False, ""
+    values: list[str] = []
+    for _name, raw_value in present:
+        values.append(
+            _strict_event_identity_value(
+                raw_value,
+                label=label,
+                max_bytes=max_bytes,
+            )
+        )
+    if any(value != values[0] for value in values[1:]):
+        raise ValueError(f"The trusted {label} source identity is invalid")
+    return True, values[0]
+
 def _request_headers() -> dict[str, str]:
     headers: dict[str, str] = {}
     if get_http_headers is not None:
@@ -729,6 +1043,14 @@ def _request_headers() -> dict[str, str]:
     return {key: value for key, value in headers.items() if value}
 
 
+def _trusted_request_upload_scope() -> tuple[str | None, str | None, str | None]:
+    headers = _request_headers()
+    return (
+        _header_value(headers, HEADER_TENANT_ID) or None,
+        _header_value(headers, HEADER_USER_ID) or None,
+        _header_value(headers, HEADER_STORAGE_USER_ID) or None,
+    )
+
 def _request_owner_id(owner_id: str | None) -> str | None:
     if _enterprise_mode_enabled():
         headers = _request_headers()
@@ -740,6 +1062,257 @@ def _request_owner_id(owner_id: str | None) -> str | None:
         return explicit
     return _header_value(_request_headers(), HEADER_USER_ID) or None
 
+
+def _account_request_scope(owner_id: str | None = None) -> tuple[str, str]:
+    if _enterprise_mode_enabled():
+        return _enterprise_request_scope()
+    headers = _request_headers()
+    tenant_id = _header_value(headers, HEADER_TENANT_ID) or "local"
+    resolved_owner = (
+        _header_value(headers, HEADER_USER_ID)
+        or _sanitize_context_value(owner_id)
+        or DEFAULT_OWNER_ID
+        or "demo-owner"
+    )
+    return tenant_id, resolved_owner
+
+def _delegation_launch_payload_digest(payload: dict[str, Any]) -> str:
+    """Fingerprint the normalized launch controls that Core actually authorized.
+
+    Bootstrap security metadata is verified separately and clean-room bundle contents are validated
+    by the account API. This digest binds the user objective and every scalar launch control while
+    avoiding JSON-number canonicalization differences between JavaScript and Python.
+    """
+
+    canonical = json.dumps(
+        {
+            "alias": str(payload.get("alias") or "").strip(),
+            "backend": str(payload.get("backend") or "").strip(),
+            "bootstrap_profile": str(
+                payload.get("bootstrap_profile") or payload.get("bootstrapProfile") or ""
+            ).strip(),
+            "connected_account_content_intent": bool(
+                payload.get("connected_account_content_intent", False)
+            ),
+            "effort": str(payload.get("effort") or "").strip(),
+            "execution_mode": str(
+                payload.get("execution_mode") or payload.get("executionMode") or ""
+            ).strip(),
+            "expose_diagnostics": bool(payload.get("expose_diagnostics", False)),
+            "goal": str(payload.get("goal") or "").strip(),
+            "instruction": str(payload.get("instruction") or "").strip(),
+            "owner_id": str(payload.get("owner_id") or "").strip(),
+            "profile": str(payload.get("profile") or "").strip(),
+            "project_id": str(payload.get("project_id") or "").strip(),
+            "require_callback": bool(payload.get("require_callback", False)),
+            "reuse_existing_workspace": bool(
+                payload.get("reuse_existing_workspace", False)
+            ),
+            "title": str(payload.get("title") or "").strip(),
+            "worker_name": str(
+                payload.get("worker_name") or payload.get("workerName") or ""
+            ).strip(),
+            "worker_role": str(
+                payload.get("worker_role") or payload.get("workerRole") or ""
+            ).strip(),
+            "workspace_root": str(
+                payload.get("workspace_root") or payload.get("workspaceRoot") or ""
+            ).strip(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+def _trusted_operation_idempotency_key(
+    prefix: str,
+    *,
+    tenant_id: str,
+    owner_id: str,
+    payload: dict[str, Any],
+    signed_launch_payload: dict[str, Any] | None = None,
+    mcp_request_id: str | None = None,
+) -> str:
+    bootstrap_bundle = payload.get("bootstrapBundle")
+    if isinstance(bootstrap_bundle, dict):
+        identity = bootstrap_bundle.get("viventium_delegation_identity")
+        assertion_value = bootstrap_bundle.get("viventium_delegation_assertion")
+        if (identity is None) != (assertion_value is None):
+            raise ValueError("viventium delegation identity and assertion must be supplied together")
+        if identity is not None:
+            if not isinstance(identity, dict) or set(identity) != {
+                "version",
+                "idempotency_key",
+                "goal_digest",
+                "launch_payload_digest",
+                "call_identity_digest",
+                "source_event_id",
+                "objective_ordinal",
+            }:
+                raise ValueError("viventium_delegation_identity is invalid")
+            version = identity.get("version")
+            objective_ordinal = identity.get("objective_ordinal")
+            idempotency_key = str(identity.get("idempotency_key") or "")
+            goal_digest = str(identity.get("goal_digest") or "")
+            launch_payload_digest = str(identity.get("launch_payload_digest") or "")
+            call_identity_digest = str(identity.get("call_identity_digest") or "")
+            try:
+                source_event_id = _strict_event_identity_value(
+                    identity.get("source_event_id"),
+                    label="delegation",
+                )
+            except ValueError as exc:
+                raise ValueError("viventium_delegation_identity is invalid") from exc
+            if (
+                isinstance(version, bool)
+                or version != 2
+                or not re.fullmatch(r"[0-9a-f]{64}", idempotency_key)
+                or not re.fullmatch(r"[0-9a-f]{64}", goal_digest)
+                or not re.fullmatch(r"[0-9a-f]{64}", launch_payload_digest)
+                or not re.fullmatch(r"[0-9a-f]{64}", call_identity_digest)
+                or isinstance(objective_ordinal, bool)
+                or not isinstance(objective_ordinal, int)
+                or objective_ordinal < 0
+                or objective_ordinal > 1_000_000
+            ):
+                raise ValueError("viventium_delegation_identity is invalid")
+            expected_idempotency_key = hashlib.sha256(
+                (
+                    f"{tenant_id}\0{owner_id}\0{source_event_id}\0"
+                    f"call:{call_identity_digest}\0{goal_digest}"
+                ).encode("utf-8")
+            ).hexdigest()
+            if not hmac.compare_digest(idempotency_key, expected_idempotency_key):
+                raise ValueError("viventium delegation identity scope is invalid")
+            expected_launch_payload_digest = _delegation_launch_payload_digest(
+                signed_launch_payload if signed_launch_payload is not None else payload
+            )
+            if not hmac.compare_digest(
+                launch_payload_digest, expected_launch_payload_digest
+            ):
+                raise ValueError("viventium delegation launch payload is invalid")
+            assertion = str(assertion_value or "").strip().lower()
+            load_viventium_runtime_env({"VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET"})
+            assertion_secret = str(
+                os.environ.get("VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET") or ""
+            ).strip()
+            canonical_assertion = json.dumps(
+                {
+                    "identity": {
+                        "call_identity_digest": call_identity_digest,
+                        "goal_digest": goal_digest,
+                        "idempotency_key": idempotency_key,
+                        "launch_payload_digest": launch_payload_digest,
+                        "objective_ordinal": objective_ordinal,
+                        "source_event_id": source_event_id,
+                        "version": version,
+                    },
+                    "owner_id": owner_id,
+                    "tenant_id": tenant_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            expected_assertion = hmac.new(
+                assertion_secret.encode("utf-8"),
+                b"viventium.delegation-identity.v2\0" + canonical_assertion,
+                hashlib.sha256,
+            ).hexdigest()
+            if (
+                not assertion_secret
+                or assertion_secret.startswith("${")
+                or not re.fullmatch(r"[0-9a-f]{64}", assertion)
+                or not hmac.compare_digest(assertion, expected_assertion)
+            ):
+                raise ValueError("viventium delegation identity assertion is invalid")
+            return idempotency_key
+    headers = _request_headers()
+    logical_id_supplied, logical_turn_id = _trusted_identity_header(
+        headers, HEADER_LOGICAL_TURN_ID, label="logical-turn"
+    )
+    logical_revision_supplied, logical_turn_revision = _trusted_identity_header(
+        headers,
+        HEADER_LOGICAL_TURN_REVISION,
+        label="logical-turn",
+        max_bytes=10,
+    )
+    message_supplied, message_id = _trusted_identity_header(
+        headers, HEADER_MESSAGE_ID, label="message"
+    )
+    telegram_message_supplied, telegram_message_id = _trusted_identity_header(
+        headers, HEADER_TELEGRAM_MESSAGE_ID, label="Telegram"
+    )
+    telegram_chat_supplied, telegram_chat_id = _trusted_identity_header(
+        headers, HEADER_TELEGRAM_CHAT_ID, label="Telegram"
+    )
+    voice_request_supplied, voice_request_id = _trusted_identity_header(
+        headers, HEADER_VOICE_REQUEST_ID, label="Voice"
+    )
+    voice_session_supplied, voice_call_session_id = _trusted_identity_header(
+        headers, HEADER_VOICE_CALL_SESSION_ID, label="Voice"
+    )
+    stream_supplied, stream_id = _trusted_identity_header(
+        headers, HEADER_STREAM_ID, label="stream"
+    )
+    logical_turn_supplied = logical_id_supplied or logical_revision_supplied
+    telegram_supplied = telegram_message_supplied or telegram_chat_supplied
+    voice_supplied = voice_request_supplied or voice_session_supplied
+
+    if logical_turn_supplied:
+        if not logical_id_supplied or not logical_revision_supplied or not re.fullmatch(
+            r"[1-9][0-9]{0,9}", logical_turn_revision
+        ):
+            raise ValueError("The trusted logical-turn source identity is invalid")
+        source: dict[str, Any] = {
+            "kind": "logical_turn",
+            "logical_turn_id": logical_turn_id,
+            "revision": int(logical_turn_revision),
+        }
+    elif message_supplied:
+        if not message_id:
+            raise ValueError("The trusted message source identity is invalid")
+        source = {"kind": "message", "message_id": message_id}
+    elif telegram_supplied:
+        if not telegram_message_id or not telegram_chat_id:
+            raise ValueError("The trusted Telegram source identity is invalid")
+        source = {
+            "kind": "telegram_message",
+            "chat_id": telegram_chat_id,
+            "message_id": telegram_message_id,
+        }
+    elif voice_supplied:
+        if not voice_request_id or not voice_call_session_id:
+            raise ValueError("The trusted Voice source identity is invalid")
+        source = {
+            "kind": "voice_request",
+            "call_session_id": voice_call_session_id,
+            "request_id": voice_request_id,
+        }
+    elif stream_supplied:
+        if not stream_id:
+            raise ValueError("The trusted stream source identity is invalid")
+        source = {"kind": "stream", "stream_id": stream_id}
+    else:
+        # JSON-RPC request ids restart independently for every client/session. They cannot both
+        # distinguish independent mutations and remain stable across a reconnect, so they are never
+        # accepted as durable mutation identity. Keep the parameter only for internal compatibility
+        # while callers migrate; trusted source headers or the signed delegation identity are required.
+        _ = mcp_request_id
+        raise ValueError("A trusted source event identity is required")
+    canonical = json.dumps(
+        {
+            "tenant_id": tenant_id,
+            "owner_id": owner_id,
+            "source": source,
+            "payload": payload,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return f"{prefix}_{hashlib.sha256(canonical).hexdigest()}"
 
 def _enterprise_request_scope() -> tuple[str, str]:
     headers = _request_headers()
@@ -811,6 +1384,24 @@ def _token_matches(candidate: str | None, expected: str | None) -> bool:
     return hmac.compare_digest(candidate_text, expected_text)
 
 
+def _require_mcp_http_service_auth(headers: dict[str, str]) -> None:
+    """Authenticate every network MCP request, including local loopback traffic."""
+
+    expected = str(DEFAULT_API_TOKEN or os.environ.get("WPR_API_TOKEN", "")).strip()
+    if not expected:
+        raise PermissionError("GlassHive MCP service authentication is not configured")
+    auth_header = str(headers.get("authorization") or "").strip()
+    bearer = (
+        auth_header.removeprefix("Bearer ").strip()
+        if auth_header.lower().startswith("bearer ")
+        else ""
+    )
+    header_token = _header_value(headers, HEADER_SERVICE_TOKEN)
+    if not (
+        _token_matches(header_token, expected) or _token_matches(bearer, expected)
+    ):
+        raise PermissionError("GlassHive MCP service authentication is required")
+
 def _require_enterprise_mcp_service_auth(headers: dict[str, str]) -> None:
     if not _enterprise_mode_enabled():
         return
@@ -865,6 +1456,21 @@ class McpHttpAuthMiddleware(BaseHTTPMiddleware):
 
 # Backward-compatible import name for deployments/tests that referenced the former enterprise-only
 # middleware. HTTP service authentication now applies in both local and enterprise deployments.
+def _require_mcp_http_identity_assertion(headers: dict[str, str]) -> None:
+    if _enterprise_mode_enabled():
+        _require_enterprise_mcp_identity_assertion(headers)
+        return
+    try:
+        supplied, _user_id = _trusted_identity_header(
+            headers,
+            HEADER_USER_ID,
+            label="user",
+        )
+    except ValueError as exc:
+        raise PermissionError("GlassHive MCP requires an authenticated user assertion") from exc
+    if not supplied:
+        raise PermissionError("GlassHive MCP requires an authenticated user assertion")
+
 EnterpriseMcpHttpAuthMiddleware = McpHttpAuthMiddleware
 
 
@@ -958,6 +1564,21 @@ def _audit_preview(value: str, *, max_chars: int = 700) -> str:
         return f"{text[: max_chars - 3].rstrip()}..."
     return text
 
+
+def _view_steer_link(
+    *,
+    task: str,
+    url: str | None,
+    terminal: bool = False,
+) -> dict[str, Any]:
+    task_label = _audit_preview(task, max_chars=96) or "task"
+    return {
+        "label": f"View / Steer {task_label}",
+        "url": url,
+        "include_in_response": bool(url),
+        "link_kind": "mission_control",
+        "state": "terminal" if terminal else "nonterminal",
+    }
 
 def _decode_json_header(value: str | None) -> Any:
     sanitized = _sanitize_context_value(value)
@@ -1844,6 +2465,56 @@ def _append_materialized_uploads_instruction(
     bundle["project_definition"] = (existing + "\n".join(lines) + "\n").lstrip()
 
 
+def _strip_materialized_uploads_instruction(bundle: dict[str, Any]) -> None:
+    project_definition = str(bundle.get("project_definition") or "")
+    marker = "## Attached workspace files"
+    if marker in project_definition:
+        bundle["project_definition"] = (
+            project_definition.split(marker, 1)[0].rstrip() + "\n"
+        )
+
+def _apply_trusted_selected_file_scope(
+    bundle: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, str]] | None]:
+    selected = trusted_selected_files(bundle)
+    if selected is None:
+        return bundle, None
+    scoped = dict(bundle)
+    scoped_files = intersect_upload_records(scoped.get("files"), selected)
+    if scoped_files:
+        scoped["files"] = scoped_files
+    else:
+        scoped.pop("files", None)
+    scoped.pop("glasshive_upload_context", None)
+    scoped.pop("viventium_upload_context", None)
+    _strip_materialized_uploads_instruction(scoped)
+    return scoped, selected
+
+def _selected_upload_context(
+    upload_context: dict[str, Any],
+    selected: list[dict[str, str]] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    records = intersect_upload_records(upload_context, selected)
+    public_context: dict[str, Any] = {}
+    for key, value in upload_context.items():
+        public = public_upload_ledger(intersect_upload_records(value, selected))
+        if public:
+            public_context[key] = public
+    return records, public_context
+
+def _without_internal_storage_authority(value: Any) -> Any:
+    """Remove transport-only owner authority from every worker-visible projection."""
+
+    if isinstance(value, dict):
+        return {
+            key: _without_internal_storage_authority(item)
+            for key, item in value.items()
+            if str(key) not in {"storage_user_id", "storageUserId"}
+        }
+    if isinstance(value, list):
+        return [_without_internal_storage_authority(item) for item in value]
+    return value
+
 def _safe_text_content(value: Any) -> str:
     if value is None:
         return ""
@@ -1905,6 +2576,53 @@ def _normalize_bootstrap_bundle(value: Any) -> dict[str, Any] | None:
     return parsed
 
 
+def _validate_viventium_feelings_projection(
+    bundle: dict[str, Any], *, required: bool = False
+) -> None:
+    """Fail closed when a trusted Viventium delegation loses or contradicts its pinned capsule."""
+
+    projection = bundle.get("viventium_feelings_projection")
+    if not isinstance(projection, dict):
+        if required:
+            raise ValueError("viventium_feelings_projection is required")
+        return
+    enabled = projection.get("enabled")
+    scope = str(projection.get("scope") or "").strip()
+    expected_count = projection.get("expected_capsule_count")
+    canonical_field = str(projection.get("canonical_instruction_field") or "").strip()
+    snapshot_hash = str(projection.get("snapshot_sha256") or "").strip()
+    if (
+        projection.get("version") != 1
+        or not isinstance(enabled, bool)
+        or scope not in {"all_agents", "conscious_agent", "unknown"}
+        or expected_count not in {0, 1}
+        or canonical_field != "agents_md"
+        or (snapshot_hash and not re.fullmatch(r"[a-f0-9]{64}", snapshot_hash))
+    ):
+        raise ValueError("viventium_feelings_projection is invalid")
+    if enabled != (scope == "all_agents" and expected_count == 1):
+        raise ValueError("viventium_feelings_projection contradicts its scope")
+    if enabled and not snapshot_hash:
+        raise ValueError("viventium_feelings_projection snapshot is missing")
+
+    start_tag = "<viventium_feeling_state>"
+    end_tag = "</viventium_feeling_state>"
+    for field in ("agents_md", "claude_md", "codex_md"):
+        instructions = str(bundle.get(field) or "")
+        count = instructions.count(start_tag)
+        required_count = expected_count if field == canonical_field else 0
+        if count != required_count or instructions.count(end_tag) != required_count:
+            raise ValueError("viventium_feelings_projection capsule count is invalid")
+        if required_count == 1:
+            start = instructions.index(start_tag)
+            end = instructions.index(end_tag, start) + len(end_tag)
+            capsule = instructions[start:end]
+            if instructions.rstrip() != instructions[:end].rstrip():
+                raise ValueError("viventium_feelings_projection capsule is not final")
+            actual_hash = hashlib.sha256(capsule.encode("utf-8")).hexdigest()
+            if not hmac.compare_digest(actual_hash, snapshot_hash):
+                raise ValueError("viventium_feelings_projection snapshot hash is invalid")
+
 def _slugify_alias(*parts: str) -> str:
     raw = "-".join(part for part in parts if str(part or "").strip())
     slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
@@ -1926,6 +2644,331 @@ def _default_project_definition(*, title: str, goal: str, instruction: str) -> s
         sections.extend(["", "## Task", "", clean_instruction])
     return "\n".join(sections).strip() + "\n"
 
+
+def _delegation_packet_block(
+    bundle: dict[str, Any],
+    source_segments: list[tuple[int, str, bool, str]],
+) -> str:
+    packet = bundle.get("viventium_delegation_packet")
+    if not isinstance(packet, dict) or not set(packet).issubset(
+        {
+            "version",
+            "task",
+            "explicit_constraints",
+            "selected_files",
+            "authorized_tool_context",
+        }
+    ):
+        raise ValueError("viventium_delegation_packet is invalid")
+    if packet.get("version") != 1 or isinstance(packet.get("version"), bool):
+        raise ValueError("viventium_delegation_packet is invalid")
+
+    task = packet.get("task")
+    if not isinstance(task, dict) or not set(task).issubset(
+        {"title", "instruction", "goal", "source_segments"}
+    ):
+        raise ValueError("viventium_delegation_packet is invalid")
+    task_text: dict[str, str] = {}
+    for key, limit in (("title", 10_000), ("instruction", 100_000), ("goal", 100_000)):
+        value = task.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip() or len(value.encode("utf-8")) > limit:
+            raise ValueError("viventium_delegation_packet is invalid")
+        task_text[key] = value.strip()
+
+    packet_segments = task.get("source_segments", [])
+    if not isinstance(packet_segments, list) or len(packet_segments) > 32:
+        raise ValueError("viventium_delegation_packet is invalid")
+    normalized_packet_segments: list[tuple[int, str, bool, str]] = []
+    packet_source_bytes = 0
+    for expected_ordinal, segment in enumerate(packet_segments):
+        if not isinstance(segment, dict) or not set(segment).issubset(
+            {"ordinal", "text", "truncated", "original_sha256"}
+        ):
+            raise ValueError("viventium_delegation_packet is invalid")
+        ordinal = segment.get("ordinal")
+        text = segment.get("text")
+        truncated = segment.get("truncated") is True
+        original_sha256 = str(segment.get("original_sha256") or "")
+        if (
+            isinstance(ordinal, bool)
+            or ordinal != expected_ordinal
+            or not isinstance(text, str)
+            or not text
+            or len(text.encode("utf-8")) > 32 * 1024
+            or ("truncated" in segment and segment.get("truncated") is not True)
+            or (truncated and not re.fullmatch(r"[0-9a-f]{64}", original_sha256))
+            or (not truncated and "original_sha256" in segment)
+        ):
+            raise ValueError("viventium_delegation_packet is invalid")
+        packet_source_bytes += len(text.encode("utf-8"))
+        if packet_source_bytes > 64 * 1024:
+            raise ValueError("viventium_delegation_packet is invalid")
+        normalized_packet_segments.append(
+            (expected_ordinal, text, truncated, original_sha256)
+        )
+    if normalized_packet_segments != source_segments:
+        raise ValueError("viventium_delegation_packet is invalid")
+    if not task_text.get("instruction") and not normalized_packet_segments:
+        raise ValueError("viventium_delegation_packet is invalid")
+
+    constraints = packet.get("explicit_constraints", [])
+    if not isinstance(constraints, list) or len(constraints) > 8:
+        raise ValueError("viventium_delegation_packet is invalid")
+    normalized_constraints: list[tuple[str, str]] = []
+    constraint_bytes = 0
+    for constraint in constraints:
+        if not isinstance(constraint, dict) or set(constraint) != {"kind", "text"}:
+            raise ValueError("viventium_delegation_packet is invalid")
+        kind = constraint.get("kind")
+        text = constraint.get("text")
+        if kind not in {"success_criteria", "additional_instructions", "context"}:
+            raise ValueError("viventium_delegation_packet is invalid")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("viventium_delegation_packet is invalid")
+        constraint_bytes += len(text.encode("utf-8"))
+        if constraint_bytes > 128 * 1024:
+            raise ValueError("viventium_delegation_packet is invalid")
+        normalized_constraints.append((kind, text.strip()))
+
+    selected_files = packet.get("selected_files", [])
+    if not isinstance(selected_files, list) or len(selected_files) > 64:
+        raise ValueError("viventium_delegation_packet is invalid")
+    normalized_files: list[str] = []
+    for expected_ordinal, selected in enumerate(selected_files):
+        if not isinstance(selected, dict) or not set(selected).issubset(
+            {"ordinal", "name", "ref"}
+        ):
+            raise ValueError("viventium_delegation_packet is invalid")
+        ordinal = selected.get("ordinal")
+        name = selected.get("name")
+        ref = selected.get("ref")
+        if (
+            isinstance(ordinal, bool)
+            or ordinal != expected_ordinal
+            or (name is None) == (ref is None)
+        ):
+            raise ValueError("viventium_delegation_packet is invalid")
+        value = name if name is not None else ref
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value) > 512
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+            or (name is not None and ("/" in value or "\\" in value or value in {".", ".."}))
+        ):
+            raise ValueError("viventium_delegation_packet is invalid")
+        normalized_files.append(value.strip())
+
+    tool_context = packet.get("authorized_tool_context")
+    normalized_tool_context: dict[str, Any] | None = None
+    if tool_context is not None:
+        if not isinstance(tool_context, dict) or set(tool_context) != {
+            "broker",
+            "status",
+            "servers",
+            "host_tools",
+            "content_read",
+        }:
+            raise ValueError("viventium_delegation_packet is invalid")
+        broker = tool_context.get("broker")
+        status = tool_context.get("status")
+        servers = tool_context.get("servers")
+        host_tools = tool_context.get("host_tools")
+        content_read = tool_context.get("content_read")
+        if (
+            not isinstance(broker, str)
+            or not broker.strip()
+            or status not in {"active", "available", "pending_admission", "ready", "unavailable"}
+            or not isinstance(servers, list)
+            or not isinstance(host_tools, list)
+            or len(servers) > 64
+            or len(host_tools) > 64
+            or not isinstance(content_read, bool)
+        ):
+            raise ValueError("viventium_delegation_packet is invalid")
+        for values in (servers, host_tools):
+            if values != sorted(set(values)) or any(
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > 160
+                or any(ord(char) < 32 or ord(char) == 127 for char in value)
+                for value in values
+            ):
+                raise ValueError("viventium_delegation_packet is invalid")
+        normalized_tool_context = {
+            "broker": broker.strip(),
+            "status": status,
+            "servers": servers,
+            "host_tools": host_tools,
+            "content_read": content_read,
+        }
+
+    lines = ["## Delegation packet", ""]
+    for label, key in (("Title", "title"), ("Task", "instruction"), ("Goal", "goal")):
+        if key in task_text:
+            lines.extend([f"{label}:", task_text[key], ""])
+    if normalized_packet_segments:
+        lines.extend(["Selected user task segments:", ""])
+        for ordinal, text, truncated, _digest in normalized_packet_segments:
+            suffix = " (truncated by Core)" if truncated else ""
+            lines.extend(
+                [
+                    f"--- BEGIN USER TASK SEGMENT {ordinal}{suffix} ---",
+                    text,
+                    f"--- END USER TASK SEGMENT {ordinal} ---",
+                    "",
+                ]
+            )
+    if normalized_constraints:
+        lines.extend(["Explicit constraints:", ""])
+        for kind, text in normalized_constraints:
+            lines.extend([f"- {kind}:", text])
+        lines.append("")
+    if normalized_files:
+        lines.extend(["Selected files:", *[f"- {value}" for value in normalized_files], ""])
+    if normalized_tool_context:
+        lines.extend(
+            [
+                "Authorized tool context:",
+                f"- Broker: {normalized_tool_context['broker']}",
+                f"- Status: {normalized_tool_context['status']}",
+                "- Servers: " + (", ".join(normalized_tool_context["servers"]) or "none"),
+                "- Host tools: " + (", ".join(normalized_tool_context["host_tools"]) or "none"),
+                "- Content read: " + ("authorized" if normalized_tool_context["content_read"] else "not authorized"),
+            ]
+        )
+    return "\n".join(lines).strip()
+
+def _trusted_triggering_source_block(bundle: dict[str, Any]) -> str:
+    context = bundle.get("viventium_delegation_context")
+    if context is None:
+        return ""
+    identity = bundle.get("viventium_delegation_identity")
+    if not isinstance(context, dict) or not isinstance(identity, dict):
+        raise ValueError("viventium_delegation_context is invalid")
+    allowed_context_keys = {
+        "version",
+        "source_event_id",
+        "logical_turn_id",
+        "surface",
+        "triggering_source_segments",
+    }
+    if (
+        not {"version", "source_event_id", "triggering_source_segments"}.issubset(context)
+        or not set(context).issubset(allowed_context_keys)
+        or isinstance(context.get("version"), bool)
+        or context.get("version") != 1
+    ):
+        raise ValueError("viventium_delegation_context is invalid")
+    source_event_id = str(context.get("source_event_id") or "")
+    if (
+        not source_event_id
+        or len(source_event_id) > 512
+        or any(ord(char) < 32 or ord(char) == 127 for char in source_event_id)
+        or source_event_id != str(identity.get("source_event_id") or "")
+    ):
+        raise ValueError("viventium_delegation_context is invalid")
+    logical_turn_id = context.get("logical_turn_id")
+    if logical_turn_id is not None and (
+        not isinstance(logical_turn_id, str)
+        or not logical_turn_id
+        or len(logical_turn_id) > 512
+        or any(ord(char) < 32 or ord(char) == 127 for char in logical_turn_id)
+    ):
+        raise ValueError("viventium_delegation_context is invalid")
+    surface = context.get("surface")
+    if surface is not None and surface not in {
+        "librechat",
+        "telegram",
+        "voice",
+        "workbench",
+    }:
+        raise ValueError("viventium_delegation_context is invalid")
+    segments = context.get("triggering_source_segments")
+    if not isinstance(segments, list) or len(segments) > 32:
+        raise ValueError("viventium_delegation_context is invalid")
+    total_chars = 0
+    normalized: list[tuple[int, str, bool, str]] = []
+    source_identities: set[tuple[str, int]] = set()
+    for expected_ordinal, segment in enumerate(segments):
+        if not isinstance(segment, dict) or not set(segment).issubset(
+            {
+                "ordinal",
+                "source_event_id",
+                "source_index",
+                "text",
+                "truncated",
+                "original_sha256",
+            }
+        ):
+            raise ValueError("viventium_delegation_context is invalid")
+        ordinal = segment.get("ordinal")
+        segment_source_event_id = segment.get("source_event_id")
+        source_index = segment.get("source_index")
+        text = segment.get("text")
+        truncated = segment.get("truncated") is True
+        original_sha256 = segment.get("original_sha256")
+        source_identity = (str(segment_source_event_id or ""), source_index)
+        if (
+            isinstance(ordinal, bool)
+            or ordinal != expected_ordinal
+            or not isinstance(segment_source_event_id, str)
+            or not segment_source_event_id
+            or len(segment_source_event_id) > 160
+            or any(
+                ord(char) < 32 or ord(char) == 127
+                for char in segment_source_event_id
+            )
+            or isinstance(source_index, bool)
+            or not isinstance(source_index, int)
+            or source_index < 0
+            or source_index > 1_000_000
+            or source_identity in source_identities
+            or not isinstance(text, str)
+            or len(text.encode("utf-8")) > 32 * 1024
+            or ("truncated" in segment and segment.get("truncated") is not True)
+            or (
+                truncated
+                and (
+                    not isinstance(original_sha256, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", original_sha256)
+                )
+            )
+            or (not truncated and "original_sha256" in segment)
+        ):
+            raise ValueError("viventium_delegation_context is invalid")
+        total_chars += len(text.encode("utf-8"))
+        if total_chars > 64 * 1024:
+            raise ValueError("viventium_delegation_context is invalid")
+        source_identities.add(source_identity)
+        normalized.append((expected_ordinal, text, truncated, str(original_sha256 or "")))
+    return _delegation_packet_block(bundle, normalized)
+
+def _project_trusted_triggering_source_segments(
+    bundle: dict[str, Any],
+    instruction: str,
+    *,
+    constraint_instruction: str,
+) -> tuple[dict[str, Any], str]:
+    # This is a host-derived protocol field, never caller-authored state. The evidence runtime
+    # needs the current allowlisted task packet so model-supplied context cannot become a
+    # completion requirement.
+    bundle.pop("viventium_constraint_source", None)
+    block = _trusted_triggering_source_block(bundle)
+    if not block:
+        return bundle, instruction
+    clean_constraint_instruction = str(constraint_instruction or "").strip()
+    if not clean_constraint_instruction:
+        raise ValueError("constraint_instruction is required for trusted delegation context")
+    bundle["viventium_constraint_source"] = {
+        "version": 1,
+        "instruction": clean_constraint_instruction,
+    }
+    project_definition = str(bundle.get("project_definition") or "").rstrip()
+    bundle["project_definition"] = f"{project_definition}\n\n{block}\n".lstrip()
+    return bundle, f"{instruction.rstrip()}\n\n{block}".lstrip()
 
 def _with_worker_host_side_orchestration_rule(instruction: str) -> str:
     clean = instruction.strip()
@@ -2528,6 +3571,7 @@ class WorkersProjectsApiClient:
         profile: str = "codex-cli",
         backend: str | None = None,
         execution_mode: str | None = None,
+        resource_class: Literal["standard", "light"] = "standard",
         alias: str | None = None,
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
@@ -2541,6 +3585,7 @@ class WorkersProjectsApiClient:
             "role": role,
             "profile": profile,
             "execution_mode": _resolve_execution_mode(execution_mode),
+            "resource_class": resource_class,
             "alias": alias,
             "workspace_root": workspace_root,
             "bootstrap_profile": bootstrap_profile,
@@ -2565,6 +3610,7 @@ class WorkersProjectsApiClient:
         profile: str = "codex-cli",
         backend: str | None = None,
         execution_mode: str | None = None,
+        resource_class: Literal["standard", "light"] = "standard",
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
         bootstrap_bundle: dict[str, Any] | None = None,
@@ -2577,6 +3623,7 @@ class WorkersProjectsApiClient:
             "role": role,
             "profile": profile,
             "execution_mode": _resolve_execution_mode(execution_mode),
+            "resource_class": resource_class,
             "alias": alias,
             "workspace_root": workspace_root,
             "bootstrap_profile": bootstrap_profile,
@@ -2617,12 +3664,15 @@ class WorkersProjectsApiClient:
         *,
         effort: str | None = None,
         bootstrap_bundle: dict[str, Any] | None = None,
+        continuation_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"instruction": instruction}
         if effort:
             payload["effort"] = effort
         if bootstrap_bundle is not None:
             payload["bootstrap_bundle"] = bootstrap_bundle
+        if continuation_context is not None:
+            payload["continuationContext"] = continuation_context
         worker_path_id = self._path_id(worker_id, "worker_id")
         return self._request("POST", f"/v1/workers/{worker_path_id}/assign", json_body=payload)
 
@@ -2761,6 +3811,109 @@ class WorkersProjectsApiClient:
         return self._request("GET", "/v1/metrics/summary")
 
 
+    def _account_headers(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        idempotency_key: str | None = None,
+    ) -> dict[str, str]:
+        load_viventium_runtime_env({"VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET"})
+        secret = str(
+            os.environ.get("VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET") or ""
+        ).strip()
+        assertion = mint_service_assertion(
+            secret,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+        )
+        headers = {SERVICE_ASSERTION_HEADER: assertion}
+        if idempotency_key:
+            headers["Idempotency-Key"] = str(idempotency_key).strip()
+        return headers
+
+    def create_delegation(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        idempotency_key: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/v1/delegations",
+            json_body=payload,
+            extra_headers=self._account_headers(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                idempotency_key=idempotency_key,
+            ),
+        )
+
+    def list_active_work(
+        self,
+        *,
+        tenant_id: str,
+        owner_id: str,
+    ) -> dict[str, Any]:
+        response = self._request(
+            "GET",
+            "/v1/active-work",
+            extra_headers=self._account_headers(tenant_id=tenant_id, owner_id=owner_id),
+        )
+        if not isinstance(response, dict):
+            return {"snapshot": "unavailable", "work": [], "overflowCount": 0}
+        return {
+            "snapshot": str(response.get("snapshot") or "fresh"),
+            "work": list(response.get("work", [])),
+            "overflowCount": int(response.get("overflowCount") or 0),
+            **({"cursor": response["cursor"]} if response.get("cursor") else {}),
+        }
+
+    def get_active_work(
+        self,
+        work_ref: str,
+        *,
+        tenant_id: str,
+        owner_id: str,
+    ) -> dict[str, Any]:
+        ref = self._path_id(work_ref, "work_ref")
+        return self._request(
+            "GET",
+            f"/v1/work/{ref}",
+            extra_headers=self._account_headers(tenant_id=tenant_id, owner_id=owner_id),
+        )
+
+    def active_work_action(
+        self,
+        work_ref: str,
+        *,
+        tenant_id: str,
+        owner_id: str,
+        action: str,
+        instruction: str | None,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        ref = self._path_id(work_ref, "work_ref")
+        payload: dict[str, Any] = {
+            "action": action,
+            "idempotencyKey": idempotency_key,
+        }
+        if instruction is not None:
+            payload["instruction"] = instruction
+        return self._request(
+            "POST",
+            f"/v1/work/{ref}/actions",
+            json_body=payload,
+            extra_headers=self._account_headers(
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+            ),
+        )
+
+
+@worker_prompt_layer_producer("tool_schemas")
 def create_mcp_server(
     *,
     base_url: str = DEFAULT_BASE_URL,
@@ -3521,6 +4674,15 @@ def create_mcp_server(
         profile: ProfileParam = "",
         backend: BackendParam = None,
         execution_mode: ExecutionModeParam = None,
+        resource_class: Annotated[
+            Literal["standard", "light"],
+            Field(
+                description=(
+                    "Worker memory class. Use light for explicitly requested small, bounded jobs; "
+                    "omit for the standard class."
+                )
+            ),
+        ] = "standard",
         workspace_root: str | None = None,
         bootstrap_profile: str | None = None,
         connected_account_content_intent: Annotated[
@@ -3709,6 +4871,7 @@ def create_mcp_server(
                 profile=resolved_profile,
                 backend=backend,
                 execution_mode=resolved_execution_mode,
+                resource_class=resource_class,
                 workspace_root=workspace_root,
                 bootstrap_profile=bootstrap_profile,
                 bootstrap_bundle=bundle,
@@ -3726,6 +4889,17 @@ def create_mcp_server(
         worker_id = str(worker.get("worker_id") or "").strip()
         if not worker_id:
             raise ValueError("GlassHive worker create/resume did not return worker_id")
+        persisted_resource_class = str(worker.get("resource_class") or "").strip()
+        if persisted_resource_class not in {"standard", "light"}:
+            raise ValueError(
+                "GlassHive worker create/resume did not return persisted resource_class"
+            )
+        if persisted_resource_class != resource_class:
+            raise ValueError(
+                "GlassHive worker create/resume persisted resource_class "
+                f"'{persisted_resource_class}' does not match requested resource_class "
+                f"'{resource_class}'."
+            )
 
         if favorite:
             worker = {
@@ -3769,6 +4943,7 @@ def create_mcp_server(
         )
         result: dict[str, Any] = {
             "status": "dispatched",
+            "resource_class": persisted_resource_class,
             "callback_ready": callback_ready,
             "callback_delivery": "optional" if callback_ready else "not_configured_standalone_polling_available",
             **(
@@ -5730,9 +6905,13 @@ def create_mcp_server(
             preferences = {}
         worker_profile = str(worker.get("profile") or "").strip()
         resolved_effort = _resolve_effort_for_profile(worker_profile, effort, preferences)
-        instruction = continuation_instruction(
+        continuation_context = build_workspace_continuation_context(
             previous_run=previous_run,
             continuation_goal=continuation_goal,
+        )
+        instruction = continuation_instruction(
+            previous_run=previous_run,
+            continuation_context=continuation_context,
         )
         parsed_bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json)
         parsed_bundle = _merge_request_context(parsed_bundle)
@@ -5752,9 +6931,15 @@ def create_mcp_server(
                 instruction,
                 effort=resolved_effort or None,
                 bootstrap_bundle=parsed_bundle,
+                continuation_context=continuation_context,
             )
         else:
-            new_run = client.assign_run(clean_worker_id, instruction, effort=resolved_effort or None)
+            new_run = client.assign_run(
+                clean_worker_id,
+                instruction,
+                effort=resolved_effort or None,
+                continuation_context=continuation_context,
+            )
         if _enterprise_mode_enabled():
             _require_enterprise_payload_scope(new_run, label="continued run", tenant_id=tenant_id)
         request_surface = _header_value(_request_headers(), HEADER_SURFACE)

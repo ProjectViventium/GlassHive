@@ -26,7 +26,11 @@ from workers_projects_runtime.service import (
     SchedulePrincipalAuthorityError,
     WorkersProjectsService,
 )
-from workers_projects_runtime.store import Store, WorkerClosedStoreError
+from workers_projects_runtime.store import (
+    RunRestorationState,
+    Store,
+    WorkerClosedStoreError,
+)
 
 
 def test_delegated_owner_client_uses_scoped_identity_and_internal_route():
@@ -886,7 +890,7 @@ def test_recurring_occurrence_is_retryable_when_user_concurrency_is_full(tmp_pat
             worker["worker_id"],
             worker["project_id"],
             "Existing synthetic run.",
-            state="running",
+            state=RunRestorationState.RUNNING,
         )
         definition = service.create_recurring_schedule(
             worker["worker_id"],

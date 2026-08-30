@@ -9,7 +9,7 @@ import pytest
 import workers_projects_runtime.service as service_module
 from workers_projects_runtime.openclaw_runtime import RuntimeInfo, StubRuntime
 from workers_projects_runtime.service import WorkersProjectsService
-from workers_projects_runtime.store import Store
+from workers_projects_runtime.store import RunRestorationState, Store
 
 
 class TemporaryWorkspaceRuntime(StubRuntime):
@@ -267,7 +267,7 @@ def test_duplicate_copies_only_regular_project_files_and_returns_report(tmp_path
             source["worker_id"],
             source_project["project_id"],
             "Synthetic active source run",
-            state="running",
+            state=RunRestorationState.RUNNING,
         )
 
         duplicate = service.duplicate_worker(

@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import json
+
 CONNECTED_ACCOUNT_NO_BROKER_NOTE = (
     "Connected-account content intent was requested, but this workspace did not receive a complete "
     "host-signed `glasshive-user-capabilities` broker grant/config in its bootstrap bundle. Do not "
@@ -12,6 +14,12 @@ CONNECTED_ACCOUNT_NO_BROKER_NOTE = (
 )
 
 
+DEFAULT_CONTINUATION_REQUEST = (
+    "Resume the original task from the current workspace state. "
+    "Use available partial work, avoid repeating failed provider-heavy loops when possible, "
+    "and produce the final requested deliverables."
+)
+
 def _strip_instruction_note(instruction: str, note: str) -> str:
     clean_note = str(note or "").strip()
     if not clean_note:
@@ -19,29 +27,101 @@ def _strip_instruction_note(instruction: str, note: str) -> str:
     return re.sub(r"\n{0,2}" + re.escape(clean_note), "", str(instruction or "")).strip()
 
 
+def _validated_continuation_context(value: object) -> dict[str, Any] | None:
+    if value in (None, "", {}):
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "base_instruction",
+        "guidance",
+    }:
+        raise ValueError("Invalid workspace continuation context")
+    base_instruction = value.get("base_instruction")
+    guidance = value.get("guidance")
+    if (
+        value.get("version") != 1
+        or not isinstance(base_instruction, str)
+        or not base_instruction.strip()
+        or len(base_instruction.encode("utf-8")) > 128 * 1024
+        or not isinstance(guidance, list)
+        or len(guidance) > 128
+        or any(
+            not isinstance(item, str)
+            or not item.strip()
+            or len(item.encode("utf-8")) > 100 * 1024
+            for item in guidance
+        )
+        or sum(len(item.encode("utf-8")) for item in guidance) > 512 * 1024
+    ):
+        raise ValueError("Invalid workspace continuation context")
+    return {
+        "version": 1,
+        "base_instruction": base_instruction.strip(),
+        "guidance": [str(item).strip() for item in guidance],
+    }
+
+def build_workspace_continuation_context(
+    *,
+    previous_run: dict[str, Any],
+    continuation_goal: str | None = None,
+) -> dict[str, Any]:
+    """Build context from host-persisted structure without parsing prompt prose."""
+
+    raw_context = previous_run.get("continuation_context_json")
+    if isinstance(raw_context, str):
+        try:
+            decoded_context = json.loads(raw_context or "{}")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("Invalid workspace continuation context") from exc
+    else:
+        decoded_context = raw_context
+    stored = _validated_continuation_context(decoded_context)
+    if stored is None:
+        base_instruction = _strip_instruction_note(
+            str(previous_run.get("instruction") or ""),
+            CONNECTED_ACCOUNT_NO_BROKER_NOTE,
+        )
+        if not base_instruction:
+            raise ValueError("Workspace continuation requires prior task context")
+        stored = {
+            "version": 1,
+            "base_instruction": base_instruction,
+            "guidance": [],
+        }
+    clean_goal = str(continuation_goal or "").strip()
+    if clean_goal:
+        stored = {
+            **stored,
+            "guidance": [*stored["guidance"], clean_goal],
+        }
+    validated = _validated_continuation_context(stored)
+    if validated is None:
+        raise ValueError("Workspace continuation requires prior task context")
+    return validated
+
 def continuation_instruction(
     *,
     previous_run: dict[str, Any],
     continuation_goal: str | None = None,
+    continuation_context: dict[str, Any] | None = None,
 ) -> str:
-    text = str(previous_run.get("instruction") or "").strip()
-    for _ in range(8):
-        if not text.startswith("Continue this GlassHive workspace"):
-            break
-        marker = "Original task:\n"
-        if marker not in text:
-            break
-        text = text.split(marker, 1)[1].strip()
-        for stop_marker in (
-            "\n\nPrevious failure classification:",
-            "\n\nContinuation request:",
-            "\n\nGlassHive completion contract:",
-        ):
-            index = text.find(stop_marker)
-            if index >= 0:
-                text = text[:index].strip()
-                break
-    original_instruction = _strip_instruction_note(text, CONNECTED_ACCOUNT_NO_BROKER_NOTE)
+    context = _validated_continuation_context(continuation_context)
+    if context is None:
+        context = build_workspace_continuation_context(
+            previous_run=previous_run,
+            continuation_goal=continuation_goal,
+        )
+    elif str(continuation_goal or "").strip():
+        raise ValueError(
+            "Continuation goal must already be included in structured context"
+        )
+    prior_context = str(context["base_instruction"])
+    continuation_parts = [str(item) for item in context["guidance"]]
+    rendered_continuation = (
+        "\n\n".join(continuation_parts)
+        if continuation_parts
+        else DEFAULT_CONTINUATION_REQUEST
+    )
     failure_class = ""
     failure_retryable = False
     recovery = ""
@@ -52,11 +132,13 @@ def continuation_instruction(
 
     chunks = [
         "Continue this GlassHive workspace from its current files, browser state, notes, and partial outputs.",
-        "Preserve the original user request, success criteria, response format, and any files already available in the workspace.",
+        "Preserve trusted requirements and any files already available in the workspace.",
         "Do not replace binary source files with text extracts unless the user explicitly asked for text extraction only.",
     ]
-    if original_instruction:
-        chunks.append(f"Original task:\n{original_instruction}")
+    if prior_context:
+        # Worker-readable text is a projection only. The host-persisted
+        # structured continuation contract remains the authority.
+        chunks.append(f"Prior run task context:\n{prior_context}")
     if failure_class:
         chunks.append(
             "Previous failure classification:\n"
@@ -64,13 +146,5 @@ def continuation_instruction(
             f"- retryable: {failure_retryable}\n"
             f"- recovery guidance: {recovery or 'Continue carefully.'}"
         )
-    clean_goal = str(continuation_goal or "").strip()
-    if clean_goal:
-        chunks.append(f"Continuation request:\n{clean_goal}")
-    else:
-        chunks.append(
-            "Continuation request:\nResume the original task from the current workspace state. "
-            "Use available partial work, avoid repeating failed provider-heavy loops when possible, "
-            "and produce the final requested deliverables."
-        )
+    chunks.append(f"Continuation context:\n{rendered_continuation}")
     return "\n\n".join(chunks)

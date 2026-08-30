@@ -5,6 +5,32 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from datetime import datetime, timezone
+
+from email.utils import parsedate_to_datetime
+
+
+USER_RESUMABLE_FAILURE_CLASSES = frozenset(
+    {
+        "provider_auth_missing",
+        "provider_connected_account_reconnect_required",
+        "provider_unauthorized",
+        "provider_context_limit_exceeded",
+    }
+)
+
+def is_user_resumable_failure(*, failure_class: object, retryable: object) -> bool:
+    """Return whether an explicit user Retry may continue the durable workspace.
+
+    Authentication repair is not an automatic retry condition: it needs a real
+    reconnect first.  It is nevertheless explicitly resumable once the user has
+    repaired that external prerequisite, so Active Work must not strand the
+    existing workspace behind a Dismiss-only terminal card.
+    """
+
+    return bool(retryable) or str(failure_class or "").strip().lower() in (
+        USER_RESUMABLE_FAILURE_CLASSES
+    )
 
 @dataclass(frozen=True)
 class FailureClassification:
@@ -14,11 +40,15 @@ class FailureClassification:
     recommended_recovery: str
     diagnostic_summary: str
     personal_account_reconnect: bool = False
+    structured: bool = False
+    retry_after_s: float | None = None
+    provider_event_source: str = ""
 
     def as_store_fields(self) -> dict[str, Any]:
         return {
             "failure_class": self.failure_class,
             "failure_retryable": 1 if self.retryable else 0,
+            "failure_structured": 1 if self.structured else 0,
             "failure_user_message": self.user_message,
             "failure_recommended_recovery": self.recommended_recovery,
             "failure_diagnostic_summary": self.diagnostic_summary,
@@ -226,6 +256,126 @@ def classify_runtime_error(
     actual_version = str(getattr(exc, "actual_version", "") or "").strip()
     recovery_hint = str(getattr(exc, "recovery_hint", "") or "").strip()
 
+    structured_failure_class = str(getattr(exc, "failure_class", "") or "")
+    if structured_failure_class == "host_capacity":
+        capacity_class = str(getattr(exc, "capacity_class", "host") or "host")
+        return FailureClassification(
+            failure_class="host_capacity",
+            retryable=True,
+            user_message="The worker is waiting for host capacity and will retry.",
+            recommended_recovery=(
+                "No action is required. GlassHive will continue through the durable capacity queue; "
+                "the exact work can also be stopped explicitly."
+            ),
+            diagnostic_summary=f"host capacity class={capacity_class}: {message}",
+            structured=True,
+        )
+    if structured_failure_class == "provider_rate_limited":
+        return FailureClassification(
+            failure_class="provider_rate_limited",
+            retryable=True,
+            user_message=(
+                "The model or research provider rate-limited the worker before it could finish."
+            ),
+            recommended_recovery=(
+                "No action is required while GlassHive honors the provider retry window and retries "
+                "the same workspace without changing the configured model or effort."
+            ),
+            diagnostic_summary=message,
+            structured=True,
+            retry_after_s=float(getattr(exc, "retry_after_s", 0) or 0) or None,
+        )
+    if structured_failure_class == "provider_quota_exhausted":
+        return FailureClassification(
+            failure_class="provider_quota_exhausted",
+            retryable=True,
+            user_message=(
+                "The selected model provider quota was exhausted before the worker could finish."
+            ),
+            recommended_recovery=(
+                "GlassHive will continue the same untouched mission with its configured fallback "
+                "worker when one is available."
+            ),
+            diagnostic_summary=message,
+            structured=True,
+        )
+    if structured_failure_class == "provider_auth_missing":
+        return FailureClassification(
+            failure_class="provider_auth_missing",
+            retryable=False,
+            user_message="The worker could not use the configured model provider credentials.",
+            recommended_recovery=(
+                recovery_hint
+                or "Fix the provider key, route, or CLI login projected into this worker, then use "
+                "workspace_continue to resume the same workspace."
+            ),
+            diagnostic_summary=message,
+            structured=True,
+        )
+    structured_provider_failures = {
+        "provider_unavailable": (
+            True,
+            "The configured model provider is temporarily unavailable.",
+            "Continue the same workspace after the provider recovers.",
+        ),
+        "provider_auth_projection_unavailable": (
+            True,
+            "The model account authorization is temporarily unavailable for this mission.",
+            "Retry the same durable workspace after Core can read the existing authorization.",
+        ),
+        "provider_connected_account_reconnect_required": (
+            False,
+            "The connected model account must be reconnected before this mission can continue.",
+            "Reconnect the same model account, then resume this durable workspace.",
+        ),
+        "provider_unauthorized": (
+            False,
+            "The model provider rejected the configured credentials.",
+            "Repair the configured credentials, then resume this durable workspace.",
+        ),
+        "provider_upstream_unavailable": (
+            True,
+            "The connected model provider is temporarily unavailable.",
+            "Retry the same durable workspace after the provider recovers.",
+        ),
+        "provider_response_failed": (
+            True,
+            "The model provider ended the worker continuation unexpectedly before it could finish.",
+            "Use workspace_continue to resume from the same durable workspace; GlassHive "
+            "preserved the worker session, files, and completed research.",
+        ),
+        "provider_request_rejected": (
+            False,
+            "The model provider rejected the worker request before it could finish.",
+            "Inspect the provider diagnostic and continue the same workspace only after correcting "
+            "the provider route, request shape, or unsupported option.",
+        ),
+        "provider_content_filter": (
+            False,
+            "The worker was stopped by the model provider's safety filter before it could finish.",
+            "Ask GlassHive to continue with a safer, narrower plan that preserves the original "
+            "success criteria, or adjust the request if the filter was expected.",
+        ),
+        "provider_context_limit_exceeded": (
+            False,
+            "The worker's model request exceeded the provider context capacity before it could finish.",
+            "Reduce the projected tool or evidence context, then resume the same durable workspace "
+            "without rewriting the user's request.",
+        ),
+    }
+    if structured_failure_class in structured_provider_failures:
+        retryable, user_message, recommended_recovery = structured_provider_failures[
+            structured_failure_class
+        ]
+        return FailureClassification(
+            failure_class=structured_failure_class,
+            retryable=retryable,
+            user_message=user_message,
+            recommended_recovery=recommended_recovery,
+            diagnostic_summary=message,
+            structured=True,
+        )
+
     if _looks_like_provider_auth_failure(lowered):
         return FailureClassification(
             failure_class="provider_auth_missing",
@@ -390,6 +540,511 @@ def _has_structured_authentication_failed(*texts: str) -> bool:
             )
     return False
 
+
+def extract_structured_retry_after_seconds(*texts: str) -> float | None:
+    """Read provider Retry-After only from JSONL control events, never prose."""
+
+    delays: list[float] = []
+
+    def parse_delay(value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            delay = float(value)
+        elif isinstance(value, str):
+            clean = value.strip()
+            try:
+                delay = float(clean)
+            except ValueError:
+                try:
+                    parsed = parsedate_to_datetime(clean)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                delay = (
+                    parsed.astimezone(timezone.utc) - datetime.now(timezone.utc)
+                ).total_seconds()
+        else:
+            return None
+        if not (delay > 0):
+            return None
+        return min(delay, 86_400.0)
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = re.sub(r"[-_]", "", str(key)).lower()
+                if normalized in {"retryafter", "retryafterseconds"}:
+                    parsed = parse_delay(child)
+                    if parsed is not None:
+                        delays.append(parsed)
+                if isinstance(child, (dict, list)):
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    for text in texts:
+        for line in str(text or "").splitlines():
+            raw = line.strip()
+            if not raw.startswith("{"):
+                continue
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            trusted = _trusted_provider_control_event(decoded)
+            if trusted is not None:
+                visit(trusted)
+    return max(delays) if delays else None
+
+_STRUCTURED_RATE_LIMIT_CODES = frozenset(
+    {
+        "rate_limit",
+        "rate_limit_error",
+        "rate_limit_exceeded",
+        "resource_exhausted",
+        "throttled",
+        "throttling_error",
+    }
+)
+
+_STRUCTURED_QUOTA_CODES = frozenset(
+    {
+        "insufficient_quota",
+        "plan_limit_reached",
+        "quota_exhausted",
+        "usage_limit_reached",
+        "weekly_limit_reached",
+    }
+)
+
+_STRUCTURED_PROVIDER_OUTAGE_CODES = frozenset(
+    {
+        "overloaded",
+        "overloaded_error",
+        "provider_unavailable",
+        "service_unavailable",
+    }
+)
+
+_STRUCTURED_PROVIDER_AUTH_CODES = frozenset(
+    {
+        "authentication_error",
+        "authentication_required",
+        "expired_token",
+        "invalid_api_key",
+        "invalid_authentication",
+        "invalid_token",
+        "not_authenticated",
+        "oauth_required",
+        "permission_denied",
+        "provider_auth_missing",
+        "provider_connected_account_reconnect_required",
+        "provider_unauthorized",
+        "unauthorized",
+    }
+)
+
+_STRUCTURED_PROVIDER_REQUEST_CODES = frozenset(
+    {
+        "bad_request",
+        "invalid_request",
+        "invalid_request_error",
+        "request_rejected",
+        "unsupported_option",
+    }
+)
+
+_STRUCTURED_PROVIDER_CONTENT_FILTER_CODES = frozenset(
+    {
+        "content_filter",
+        "content_filter_error",
+        "safety_filter",
+    }
+)
+
+_STRUCTURED_STATUS_KEYS = frozenset(
+    {"apierrorstatus", "httpstatus", "statuscode"}
+)
+
+_STRUCTURED_CODE_KEYS = frozenset(
+    {"code", "errorcode", "errortype", "type"}
+)
+
+_TRUSTED_PROVIDER_CONTROL_EVENT_TYPES = frozenset(
+    {"response.failed", "turn.failed"}
+)
+
+def _normalized_structured_code(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+def _trusted_provider_control_event(value: object) -> dict[str, Any] | None:
+    """Accept only native terminal/provider-failure schemas, never arbitrary JSON."""
+
+    if not isinstance(value, dict):
+        return None
+    event_type = str(value.get("type") or "").strip().lower()
+    if event_type in _TRUSTED_PROVIDER_CONTROL_EVENT_TYPES:
+        error = value.get("error")
+        return value if isinstance(error, dict) else None
+    if (
+        event_type == "result"
+        and value.get("is_error") is True
+        and str(value.get("terminal_reason") or "").strip().lower() == "api_error"
+    ):
+        try:
+            status = int(value.get("api_error_status") or 0)
+        except (TypeError, ValueError):
+            return None
+        return value if 400 <= status <= 599 else None
+    return None
+
+def _structured_provider_signals(*texts: str) -> tuple[set[int], set[str]]:
+    """Extract exact provider control fields from JSONL without reading prose."""
+
+    statuses: set[int] = set()
+    codes: set[str] = set()
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized_key = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                if normalized_key in _STRUCTURED_STATUS_KEYS and not isinstance(child, bool):
+                    try:
+                        status = int(child)
+                    except (TypeError, ValueError):
+                        status = 0
+                    if 100 <= status <= 599:
+                        statuses.add(status)
+                if normalized_key in _STRUCTURED_CODE_KEYS:
+                    code = _normalized_structured_code(child)
+                    if code:
+                        codes.add(code)
+                if isinstance(child, (dict, list)):
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    for text in texts:
+        for line in str(text or "").splitlines():
+            raw = line.strip()
+            if not raw.startswith("{"):
+                continue
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            trusted = _trusted_provider_control_event(decoded)
+            if trusted is not None:
+                visit(trusted)
+    return statuses, codes
+
+def _structured_provider_capacity_class(*texts: str) -> str:
+    """Map only exact provider/runtime controls into capacity classes.
+
+    Human-readable messages, stderr prose, and user/task output are deliberately
+    excluded. Unknown structured failures remain generic provider failures.
+    """
+
+    statuses, codes = _structured_provider_signals(*texts)
+    if codes & _STRUCTURED_QUOTA_CODES:
+        return "provider_quota_exhausted"
+    if 429 in statuses or codes & _STRUCTURED_RATE_LIMIT_CODES:
+        return "provider_rate_limited"
+    if statuses & {503, 529} or codes & _STRUCTURED_PROVIDER_OUTAGE_CODES:
+        return "provider_response_failed"
+    return ""
+
+def _structured_provider_auth_failure(*texts: str) -> bool:
+    """Recognize provider authentication only from exact JSONL control fields."""
+
+    statuses, codes = _structured_provider_signals(*texts)
+    return bool(statuses & {401, 403} or codes & _STRUCTURED_PROVIDER_AUTH_CODES)
+
+def _terminal_native_provider_error(*texts: str) -> dict[str, Any] | None:
+    """Return the final native result error without inspecting assistant or task prose."""
+
+    terminal_result: dict[str, Any] | None = None
+    for text in texts:
+        for line in str(text or "").splitlines():
+            raw = line.strip()
+            if not raw.startswith("{"):
+                continue
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(decoded, dict)
+                and str(decoded.get("type") or "").strip().lower() == "result"
+            ):
+                terminal_result = decoded
+    if not terminal_result or terminal_result.get("is_error") is not True:
+        return None
+    if str(terminal_result.get("terminal_reason") or "").strip().lower() != "api_error":
+        return None
+    try:
+        status = int(terminal_result.get("api_error_status") or 0)
+    except (TypeError, ValueError):
+        return None
+    return terminal_result if 400 <= status <= 599 else None
+
+def _terminal_native_context_limit(*texts: str) -> dict[str, Any] | None:
+    """Recognize a final native prompt-capacity stop over stale earlier provider failures."""
+
+    terminal_result: dict[str, Any] | None = None
+    for text in texts:
+        for line in str(text or "").splitlines():
+            raw = line.strip()
+            if not raw.startswith("{"):
+                continue
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(decoded, dict)
+                and str(decoded.get("type") or "").strip().lower() == "result"
+            ):
+                terminal_result = decoded
+    if not terminal_result or terminal_result.get("is_error") is not True:
+        return None
+    terminal_reason = str(terminal_result.get("terminal_reason") or "").strip().lower()
+    result = " ".join(str(terminal_result.get("result") or "").lower().split())
+    if terminal_reason == "blocking_limit" and result == "prompt is too long":
+        return terminal_result
+    return None
+
+def _latest_native_attempt(stdout: str, stderr: str) -> tuple[str, str]:
+    """Scope multi-invocation native logs to the last structured attempt.
+
+    Codex emits a new ``thread.started`` record for each native invocation but no terminal
+    ``result`` envelope. When a harness appends a fallback attempt to the same capture, earlier
+    provider failures must not override the final attempt's recovery truth.
+    """
+
+    lines = str(stdout or "").splitlines()
+    starts: list[int] = []
+    for index, line in enumerate(lines):
+        raw = line.strip()
+        if not raw.startswith("{"):
+            continue
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(decoded, dict)
+            and str(decoded.get("type") or "").strip().lower() == "thread.started"
+        ):
+            starts.append(index)
+    if len(starts) < 2:
+        return stdout, stderr
+    # Codex attempt boundaries are emitted on stdout.  stderr has no matching boundary marker, so
+    # discarding it loses final-attempt structured auth/capacity evidence and can strand a durable
+    # workspace behind an unknown, non-resumable failure.  Keep stderr; scoped final stdout remains
+    # the first source consulted by the classifier.
+    return "\n".join(lines[starts[-1] :]), stderr
+
+def _classify_terminal_native_provider_error(
+    terminal_result: dict[str, Any],
+    *,
+    diagnostic_summary: str,
+) -> FailureClassification:
+    """Classify the final provider attempt without inheriting stale earlier failures."""
+
+    try:
+        status = int(terminal_result.get("api_error_status") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    _statuses, codes = _structured_provider_signals(json.dumps(terminal_result))
+
+    if status in {401, 403} or codes & _STRUCTURED_PROVIDER_AUTH_CODES:
+        return FailureClassification(
+            failure_class="provider_auth_missing",
+            retryable=False,
+            user_message="The worker could not use the configured model provider credentials.",
+            recommended_recovery=(
+                "Fix the provider key, route configuration, or CLI login projected into this "
+                "worker, then use workspace_continue to resume the same workspace."
+            ),
+            diagnostic_summary=diagnostic_summary,
+            structured=True,
+            provider_event_source="provider_native",
+        )
+    if codes & _STRUCTURED_PROVIDER_CONTENT_FILTER_CODES:
+        return FailureClassification(
+            failure_class="provider_content_filter",
+            retryable=False,
+            user_message=(
+                "The worker was stopped by the model provider's safety filter before it could "
+                "finish."
+            ),
+            recommended_recovery=(
+                "Ask GlassHive to continue with a safer, narrower plan that preserves the original "
+                "success criteria, or adjust the request if the filter was expected."
+            ),
+            diagnostic_summary=diagnostic_summary,
+            structured=True,
+            provider_event_source="provider_native",
+        )
+    if codes & _STRUCTURED_QUOTA_CODES:
+        return FailureClassification(
+            failure_class="provider_quota_exhausted",
+            retryable=True,
+            user_message=(
+                "The selected model provider quota was exhausted before the worker could finish."
+            ),
+            recommended_recovery=(
+                "Keep the same configured model and effort queued until its provider quota resets, "
+                "unless the user explicitly chooses a different model."
+            ),
+            diagnostic_summary=diagnostic_summary,
+            structured=True,
+            provider_event_source="provider_native",
+        )
+    if status == 429 or codes & _STRUCTURED_RATE_LIMIT_CODES:
+        return FailureClassification(
+            failure_class="provider_rate_limited",
+            retryable=True,
+            user_message=(
+                "The model or research provider rate-limited the worker before it could finish."
+            ),
+            recommended_recovery=(
+                "Use workspace_continue to resume the same workspace after a short wait, preserving "
+                "the original task and any files already produced."
+            ),
+            diagnostic_summary=diagnostic_summary,
+            structured=True,
+            provider_event_source="provider_native",
+        )
+    if codes & _STRUCTURED_PROVIDER_REQUEST_CODES:
+        return FailureClassification(
+            failure_class="provider_request_rejected",
+            retryable=False,
+            user_message=(
+                "The model provider rejected the worker request before it could finish."
+            ),
+            recommended_recovery=(
+                "Inspect the provider diagnostic and continue the same workspace only after "
+                "correcting the provider route, request shape, or unsupported option."
+            ),
+            diagnostic_summary=diagnostic_summary,
+            structured=True,
+        )
+
+    return FailureClassification(
+        failure_class="provider_response_failed",
+        retryable=True,
+        user_message=(
+            "The model provider ended the worker continuation unexpectedly before it could finish."
+        ),
+        recommended_recovery=(
+            "Use workspace_continue to resume from the same durable workspace; GlassHive preserved "
+            "the worker session, files, and completed research."
+        ),
+        diagnostic_summary=diagnostic_summary,
+        structured=True,
+    )
+
+_CORE_PROVIDER_PROXY_MESSAGES = {
+    (409, "connect the configured model account, then resume this work."): (
+        "provider_auth_missing",
+        False,
+        "The worker could not use the configured model provider credentials.",
+        "Connect the configured model account, then resume this durable workspace.",
+    ),
+    (409, "reconnect the connected model account, then resume this work."): (
+        "provider_connected_account_reconnect_required",
+        False,
+        "The connected model account must be reconnected before this mission can continue.",
+        "Reconnect the same model account, then resume this durable workspace.",
+    ),
+    (409, "the model provider rejected the configured credentials."): (
+        "provider_unauthorized",
+        False,
+        "The model provider rejected the configured credentials.",
+        "Repair the configured credentials, then resume this durable workspace.",
+    ),
+    (503, "the model account authorization could not be read for this mission."): (
+        "provider_auth_projection_unavailable",
+        True,
+        "The model account authorization is temporarily unavailable for this mission.",
+        "GlassHive will retry the same durable workspace automatically after Core can read the "
+        "existing authorization.",
+    ),
+    (502, "the connected model provider is temporarily unavailable."): (
+        "provider_upstream_unavailable",
+        True,
+        "The connected model provider is temporarily unavailable.",
+        "GlassHive will retry the same durable workspace after the provider recovers.",
+    ),
+}
+
+def _classify_core_provider_proxy_failure(
+    terminal_result: dict[str, Any] | None,
+    *,
+    diagnostic_summary: str,
+) -> FailureClassification | None:
+    """Preserve Core's exact provider contract from the final native result only."""
+
+    if not terminal_result:
+        return None
+    try:
+        status = int(terminal_result.get("api_error_status") or 0)
+    except (TypeError, ValueError):
+        return None
+    result = " ".join(str(terminal_result.get("result") or "").strip().lower().split())
+    for prefix in (f"api error: {status} ", f"api error: {status}: "):
+        if result.startswith(prefix):
+            result = result[len(prefix) :]
+            break
+    contract = _CORE_PROVIDER_PROXY_MESSAGES.get((status, result))
+    if contract is None:
+        return None
+    failure_class, retryable, user_message, recommended_recovery = contract
+    return FailureClassification(
+        failure_class=failure_class,
+        retryable=retryable,
+        user_message=user_message,
+        recommended_recovery=recommended_recovery,
+        diagnostic_summary=diagnostic_summary,
+        structured=True,
+        provider_event_source="core_provider_proxy",
+    )
+
+def _structured_provider_auth_projection_unavailable(*texts: str) -> bool:
+    """Recognize Core's exact clean-room auth blocker in a native result envelope.
+
+    A fallback profile can append its result after the primary provider's quota event in the same
+    durable run log. The terminal native result is authoritative; ordinary assistant/task prose is
+    never inspected by this classifier.
+    """
+
+    terminal_result = _terminal_native_provider_error(*texts)
+    if not terminal_result:
+        return False
+    try:
+        status = int(terminal_result.get("api_error_status") or 0)
+    except (TypeError, ValueError):
+        return False
+    result = " ".join(str(terminal_result.get("result") or "").lower().split())
+    return (
+        status == 409
+        and str(terminal_result.get("terminal_reason") or "").strip().lower() == "api_error"
+        and result
+        == "api error: 409 the connected model account is unavailable for this mission."
+    )
+
+def _collect_prefixed_cli_stderr_failure_evidence(text: str) -> list[str]:
+    """Collect native-CLI control errors without treating ordinary task prose as evidence."""
+
+    return [line.strip() for line in text.splitlines() if line.lstrip().startswith("ERROR:")]
 
 def _extract_failure_strings(value: Any, *, path: str = "", failure_context: bool = False) -> list[str]:
     results: list[str] = []

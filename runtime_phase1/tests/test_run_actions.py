@@ -17,6 +17,7 @@ from workers_projects_runtime.run_actions import (
     mint_run_action_capability,
     unverified_run_action_claims,
 )
+from workers_projects_runtime.store import RunRestorationState
 
 
 class CountingInterruptRuntime(StubRuntime):
@@ -95,6 +96,67 @@ def _create_scoped_worker(app, *, tenant_id: str = "local", owner_id: str = "own
     return project, store.get_worker(worker["worker_id"])
 
 
+def _truthfully_invoke_run(app, worker: dict, run: dict) -> dict:
+    store = app.state.store
+    executor_id = app.state.service._executor_id
+    claimed = store.claim_next_queued_run(
+        worker["worker_id"], executor_id=executor_id
+    )
+    assert claimed is not None and claimed["run_id"] == run["run_id"]
+    lease = store.acquire_host_run_lease(
+        runtime_family="openclaw",
+        lane="mission",
+        tenant_id=str(worker.get("tenant_id") or "local"),
+        owner_id=str(worker["owner_id"]),
+        worker_id=str(worker["worker_id"]),
+        run_id=str(run["run_id"]),
+        executor_id=executor_id,
+        conversation_limit=2,
+        mission_limit=64,
+        account_mission_limit=64,
+        tenant_mission_limit=64,
+        lease_ttl_s=300,
+    )
+    assert store.admit_claimed_run(
+        run["run_id"],
+        lease_id=lease["lease_id"],
+        executor_id=executor_id,
+    )
+    invoked = store.mark_run_runtime_invoked(
+        run["run_id"],
+        lease_id=lease["lease_id"],
+        executor_id=executor_id,
+    )
+    assert invoked is not None
+    confirmed = store.confirm_host_run_start(
+        worker_id=str(worker["worker_id"]),
+        run_id=str(run["run_id"]),
+        run_started_at=str(invoked["runtime_invoked_at"]),
+        lease_id=str(lease["lease_id"]),
+        startup_token=str(lease["startup_token"]),
+        executor_id=executor_id,
+        identity_kind="in_process",
+        pid=None,
+        process_group=None,
+        process_start_identity="",
+        container_id="",
+        session_id="in-process",
+    )
+    assert confirmed is not None
+    store.update_worker_state(worker["worker_id"], "running")
+    return confirmed["run"]
+
+
+def _exact_terminal_generation(app, run_id: str) -> dict[str, str]:
+    store = app.state.store
+    run = store.get_run(run_id)
+    assert run is not None
+    return {
+        **(store.get_run_retry_generation(run_id) or {}),
+        "expected_runtime_invoked_at": str(run.get("runtime_invoked_at") or ""),
+    }
+
+
 def _latest_callback_payload(app, *, event_type: str, run_id: str) -> dict:
     with app.state.store._connect() as conn:
         row = conn.execute(
@@ -165,7 +227,10 @@ def test_retryable_failed_callback_carries_signed_short_lived_retry_capability(t
     with TestClient(app):
         project, worker = _create_scoped_worker(app)
         run = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Create the requested artifact.", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Create the requested artifact.",
+            state=RunRestorationState.RUNNING,
         )
         failed = app.state.store.finalize_run(
             run["run_id"],
@@ -217,7 +282,10 @@ def test_nonretryable_failure_and_unproven_checkpoint_never_mint_actions(tmp_pat
     with TestClient(app):
         project, worker = _create_scoped_worker(app)
         failed_run = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Nonretryable task", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Nonretryable task",
+            state=RunRestorationState.RUNNING,
         )
         failed_run = app.state.store.finalize_run(
             failed_run["run_id"],
@@ -243,7 +311,10 @@ def test_retry_action_is_atomic_idempotent_and_preserves_workspace(tmp_path, mon
         project, worker = _create_scoped_worker(app)
         app.state.service._ensure_worker_processor = lambda _worker_id: None
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Produce final-report.html", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Produce final-report.html",
+            state=RunRestorationState.RUNNING,
         )
         source = app.state.store.finalize_run(
             source["run_id"],
@@ -281,8 +352,8 @@ def test_retry_action_is_atomic_idempotent_and_preserves_workspace(tmp_path, mon
         assert new_run is not None
         assert new_run["worker_id"] == worker["worker_id"]
         assert new_run["project_id"] == project["project_id"]
-        assert "Original task:\nProduce final-report.html" in new_run["instruction"]
-        assert new_run["instruction"].count("Original task:") == 1
+        assert "Prior run task context:\nProduce final-report.html" in new_run["instruction"]
+        assert new_run["instruction"].count("Prior run task context:") == 1
         assert app.state.store.get_worker(worker["worker_id"])["workspace_dir"] == worker["workspace_dir"]
         runs = app.state.store.list_runs_for_worker(worker["worker_id"])
         assert len([item for item in runs if item["run_id"] != source["run_id"]]) == 1
@@ -295,7 +366,10 @@ def test_retry_rejects_scope_mismatch_expiry_nonretryable_active_and_ended(tmp_p
         project, worker = _create_scoped_worker(app)
         app.state.service._ensure_worker_processor = lambda _worker_id: None
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Retry guard task", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Retry guard task",
+            state=RunRestorationState.RUNNING,
         )
         source = app.state.store.finalize_run(
             source["run_id"], state="failed", failure_retryable=1, failure_class="provider_temporarily_unavailable"
@@ -326,7 +400,10 @@ def test_retry_rejects_scope_mismatch_expiry_nonretryable_active_and_ended(tmp_p
         )
         app.state.store.update_run(source["run_id"], failure_retryable=1)
         active = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Already active", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Already active",
+            state=RunRestorationState.RUNNING,
         )
         active_response = client.post(
             "/v1/run-actions",
@@ -359,7 +436,10 @@ def test_action_capability_rejects_signature_tampering_and_changed_db_owner(tmp_
     with TestClient(app) as client:
         project, worker = _create_scoped_worker(app)
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Authenticated retry", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Authenticated retry",
+            state=RunRestorationState.RUNNING,
         )
         source = app.state.store.finalize_run(
             source["run_id"], state="failed", failure_retryable=1, failure_class="provider_temporarily_unavailable"
@@ -396,7 +476,10 @@ def test_action_capability_rejects_noncanonical_base64url_signature_alias(tmp_pa
     with TestClient(app) as client:
         project, worker = _create_scoped_worker(app)
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Canonical signature", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Canonical signature",
+            state=RunRestorationState.RUNNING,
         )
         source = app.state.store.finalize_run(
             source["run_id"], state="failed", failure_retryable=1, failure_class="temporary"
@@ -434,7 +517,10 @@ def test_unverified_unknown_scope_is_uniform_invalid_capability(tmp_path, monkey
     with TestClient(app) as client:
         project, worker = _create_scoped_worker(app)
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Unknown scope", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Unknown scope",
+            state=RunRestorationState.RUNNING,
         )
         callbacks = app.state.service._callback_config_for(worker)
         unknown_scope = mint_run_action_capability(
@@ -461,8 +547,12 @@ def test_cancel_is_exact_run_idempotent_and_only_confirmed_by_terminal_callback(
     with TestClient(app) as client:
         project, worker = _create_scoped_worker(app)
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Long active task", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Long active task",
+            state="queued",
         )
+        source = _truthfully_invoke_run(app, worker, source)
         app.state.store.update_worker_state(worker["worker_id"], "running")
         app.state.service._emit_callback(worker, "run.started", run=source, message="Work started")
         capability = _outbound_callback(
@@ -482,21 +572,27 @@ def test_cancel_is_exact_run_idempotent_and_only_confirmed_by_terminal_callback(
         assert replay.json()["idempotentReplay"] is True
         assert len(runtime.interrupts) == 1
         assert runtime.interrupts[0] == (worker["worker_id"], source["run_id"])
-        assert app.state.store.get_run(source["run_id"])["state"] == "interrupted"
-        terminal = _outbound_callback(outbound, event_type="run.interrupted", run_id=source["run_id"])
-        assert terminal["run_state"] == "interrupted"
+        assert app.state.store.get_run(source["run_id"])["state"] == "cancelled"
+        terminal = _outbound_callback(outbound, event_type="run.cancelled", run_id=source["run_id"])
+        assert terminal["run_state"] == "cancelled"
         assert "actionCapabilities" not in terminal
 
 
-def test_cancel_replay_resumes_after_owner_interrupt_failure_without_false_acceptance(tmp_path, monkeypatch):
+def test_cancel_replay_waits_for_expired_exact_claim_recovery_without_false_acceptance(
+    tmp_path, monkeypatch
+):
     outbound = _capture_callbacks(monkeypatch)
     runtime = FlakyInterruptRuntime()
     app = create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=runtime)
     with TestClient(app) as client:
         project, worker = _create_scoped_worker(app)
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Flaky cancel task", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Flaky cancel task",
+            state="queued",
         )
+        source = _truthfully_invoke_run(app, worker, source)
         app.state.store.update_worker_state(worker["worker_id"], "running")
         app.state.service._emit_callback(worker, "run.started", run=source, message="Work started")
         capability = _outbound_callback(
@@ -511,10 +607,40 @@ def test_cancel_replay_resumes_after_owner_interrupt_failure_without_false_accep
 
         replay = client.post("/v1/run-actions", json=body, headers=_capability_headers(capability))
         assert replay.status_code == 202
-        assert replay.json()["status"] == "accepted"
+        assert replay.json()["status"] == "pending"
         assert replay.json()["idempotentReplay"] is True
+        assert len(runtime.interrupts) == 1
+        assert app.state.store.get_run(source["run_id"])["state"] == "running"
+        pending_worker = app.state.store.get_worker(worker["worker_id"])
+        assert pending_worker["compute_release_kind"] == "stop_run"
+        assert pending_worker["compute_release_target_run_id"] == source["run_id"]
+
+        with app.state.store._connect() as conn:
+            conn.execute(
+                "UPDATE workers SET compute_release_expires_at = ? WHERE worker_id = ?",
+                ("2000-01-01T00:00:00+00:00", worker["worker_id"]),
+            )
+        recovered = app.state.service.recover_expired_compute_release_claims_once()
+        assert [item["kind"] for item in recovered] == ["stop_run"]
+
+        settled_replay = client.post(
+            "/v1/run-actions", json=body, headers=_capability_headers(capability)
+        )
+        assert settled_replay.status_code == 202
+        assert settled_replay.json()["status"] == "accepted"
+        assert settled_replay.json()["idempotentReplay"] is True
         assert len(runtime.interrupts) == 2
-        assert app.state.store.get_run(source["run_id"])["state"] == "interrupted"
+        assert app.state.store.get_run(source["run_id"])["state"] == "cancelled"
+        assert not app.state.store.get_worker(worker["worker_id"])[
+            "compute_release_token"
+        ]
+
+        final_replay = client.post(
+            "/v1/run-actions", json=body, headers=_capability_headers(capability)
+        )
+        assert final_replay.status_code == 202
+        assert final_replay.json()["status"] == "accepted"
+        assert len(runtime.interrupts) == 2
 
 
 def test_concurrent_cancel_replay_invokes_owner_once_and_reports_pending_until_accepted(tmp_path, monkeypatch):
@@ -524,8 +650,12 @@ def test_concurrent_cancel_replay_invokes_owner_once_and_reports_pending_until_a
     with TestClient(app):
         project, worker = _create_scoped_worker(app)
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Concurrent cancel task", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Concurrent cancel task",
+            state="queued",
         )
+        source = _truthfully_invoke_run(app, worker, source)
         app.state.store.update_worker_state(worker["worker_id"], "running")
         callbacks = app.state.service._callback_config_for(worker)
         capability = mint_run_action_capability(
@@ -562,8 +692,12 @@ def test_stale_cancel_execution_lease_recovers_after_process_crash(tmp_path, mon
     with TestClient(app):
         project, worker = _create_scoped_worker(app)
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Crash recovery cancel", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Crash recovery cancel",
+            state="queued",
         )
+        source = _truthfully_invoke_run(app, worker, source)
         app.state.store.update_worker_state(worker["worker_id"], "running")
         callbacks = app.state.service._callback_config_for(worker)
         capability = mint_run_action_capability(
@@ -612,25 +746,39 @@ def test_cancel_completion_race_returns_exact_already_completed_outcome(
     with TestClient(app) as client:
         project, worker = _create_scoped_worker(app)
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Completing task", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Completing task",
+            state="queued",
         )
+        source = _truthfully_invoke_run(app, worker, source)
         app.state.store.update_worker_state(worker["worker_id"], "running")
         app.state.service._emit_callback(worker, "run.started", run=source, message="Work started")
         capability = _outbound_callback(
             outbound, event_type="run.started", run_id=source["run_id"]
         )["actionCapabilities"][0]
         if completion_timing == "before_reserve":
-            app.state.store.finalize_run(source["run_id"], state="completed", output_text="Done")
+            app.state.store.finalize_run(
+                source["run_id"],
+                state="completed",
+                output_text="Done",
+                **_exact_terminal_generation(app, source["run_id"]),
+            )
             app.state.store.update_worker_state(worker["worker_id"], "ready")
         else:
-            original_interrupt = app.state.service.interrupt_worker
+            original_stop = app.state.service.stop_run
 
-            def complete_then_interrupt(worker_id: str, run_id: str | None = None):
-                app.state.store.finalize_run(run_id, state="completed", output_text="Done")
+            def complete_then_stop(worker_id: str, run_id: str):
+                app.state.store.finalize_run(
+                    run_id,
+                    state="completed",
+                    output_text="Done",
+                    **_exact_terminal_generation(app, run_id),
+                )
                 app.state.store.update_worker_state(worker_id, "ready")
-                return original_interrupt(worker_id, run_id=run_id)
+                return original_stop(worker_id, run_id)
 
-            app.state.service.interrupt_worker = complete_then_interrupt
+            app.state.service.stop_run = complete_then_stop
         body = _action_request(
             capability,
             idempotency_key=f"idem-completion-race-{completion_timing}",
@@ -664,8 +812,12 @@ def test_cancel_completion_during_owner_interrupt_preserves_completed_result(tmp
     with TestClient(app) as client:
         project, worker = _create_scoped_worker(app)
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Complete during cancel", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Complete during cancel",
+            state="queued",
         )
+        source = _truthfully_invoke_run(app, worker, source)
         app.state.store.update_worker_state(worker["worker_id"], "running")
         app.state.service._emit_callback(worker, "run.started", run=source, message="Work started")
         capability = _outbound_callback(
@@ -677,6 +829,7 @@ def test_cancel_completion_during_owner_interrupt_preserves_completed_result(tmp
                 source["run_id"],
                 state="completed",
                 output_text="Durable completed result",
+                **_exact_terminal_generation(app, source["run_id"]),
             )
             app.state.store.update_worker_state(worker["worker_id"], "ready")
 
@@ -713,7 +866,10 @@ def test_retry_replay_restarts_canonical_queued_run_after_post_commit_crash(tmp_
     with TestClient(app):
         project, worker = _create_scoped_worker(app)
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Crash-window retry", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Crash-window retry",
+            state=RunRestorationState.RUNNING,
         )
         source = app.state.store.finalize_run(
             source["run_id"], state="failed", failure_retryable=1, failure_class="provider_temporarily_unavailable"
@@ -762,7 +918,10 @@ def test_callback_redelivery_capabilities_cannot_retry_one_source_twice(tmp_path
         project, worker = _create_scoped_worker(app)
         app.state.service._ensure_worker_processor = lambda _worker_id: None
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Retry once", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Retry once",
+            state=RunRestorationState.RUNNING,
         )
         source = app.state.store.finalize_run(
             source["run_id"],
@@ -822,8 +981,12 @@ def test_cancel_capability_covers_extended_calls_then_expires(
     with TestClient(app) as client:
         project, worker = _create_scoped_worker(app)
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Extended active task", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Extended active task",
+            state="queued",
         )
+        source = _truthfully_invoke_run(app, worker, source)
         app.state.store.update_worker_state(worker["worker_id"], "running")
         app.state.service._emit_callback(worker, "run.started", run=source, message="Work started")
         capability = _outbound_callback(
@@ -862,7 +1025,10 @@ def test_enterprise_action_capability_is_sole_auth_for_exact_action_path(tmp_pat
         project, worker = _create_scoped_worker(app, tenant_id="tenant-alpha", owner_id="owner-a")
         app.state.service._ensure_worker_processor = lambda _worker_id: None
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Enterprise retry", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Enterprise retry",
+            state=RunRestorationState.RUNNING,
         )
         source = app.state.store.finalize_run(
             source["run_id"], state="failed", failure_retryable=1, failure_class="provider_temporarily_unavailable"
@@ -909,7 +1075,10 @@ def test_enterprise_action_rejects_capability_outside_deployment_tenant(tmp_path
             owner_id="owner-beta",
         )
         source = app.state.store.create_run(
-            worker["worker_id"], project["project_id"], "Wrong deployment tenant", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "Wrong deployment tenant",
+            state=RunRestorationState.RUNNING,
         )
         callbacks = app.state.service._callback_config_for(worker)
         capability = mint_run_action_capability(

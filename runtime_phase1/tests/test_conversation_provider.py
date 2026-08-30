@@ -8,6 +8,7 @@ import json
 import subprocess
 import threading
 import time
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -31,9 +32,14 @@ from workers_projects_runtime.conversation_provider import (
     _system_snapshot,
     _versioned_idempotency_key,
 )
-from workers_projects_runtime.openclaw_runtime import RuntimeErrorBase, StubRuntime
+from workers_projects_runtime.openclaw_runtime import (
+    RuntimeErrorBase,
+    StubRuntime,
+    notify_runtime_started,
+    runtime_start_boundary,
+)
 from workers_projects_runtime.service import WorkersProjectsService
-from workers_projects_runtime.store import Store
+from workers_projects_runtime.store import RunRestorationState, Store
 
 AUTH = {
     "Authorization": "Bearer provider-test-token",
@@ -41,6 +47,54 @@ AUTH = {
 }
 
 BOOTSTRAP_SIGNATURE_SECRET = "synthetic-bootstrap-signature-secret"
+
+_TEST_CLIENT_LIFESPANS: ExitStack | None = None
+
+
+@pytest.fixture(autouse=True)
+def lifecycle_owned_test_clients():
+    global _TEST_CLIENT_LIFESPANS
+    assert _TEST_CLIENT_LIFESPANS is None
+    baseline_owned_threads = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.ident is not None
+        and (
+            thread.name.startswith("wpr-")
+            or thread.name.startswith("glasshive-provider-")
+        )
+    }
+    stack = ExitStack()
+    _TEST_CLIENT_LIFESPANS = stack
+    try:
+        yield
+    finally:
+        try:
+            stack.close()
+        finally:
+            _TEST_CLIENT_LIFESPANS = None
+    leaked_threads = [
+        thread.name
+        for thread in threading.enumerate()
+        if thread.ident is not None
+        and thread.ident not in baseline_owned_threads
+        and (
+            thread.name.startswith("wpr-")
+            or thread.name.startswith("glasshive-provider-")
+        )
+    ]
+    assert leaked_threads == []
+
+
+def _lifespan_owned_client(app) -> TestClient:
+    if _TEST_CLIENT_LIFESPANS is None:
+        raise RuntimeError("Conversation-provider test client has no lifecycle owner")
+    return _TEST_CLIENT_LIFESPANS.enter_context(TestClient(app))
+
+
+def _publish_in_process_test_start(worker: dict) -> None:
+    with runtime_start_boundary(worker):
+        notify_runtime_started(worker)
 
 
 def test_system_snapshot_preserves_all_current_request_instruction_messages():
@@ -219,7 +273,7 @@ def _client(tmp_path: Path, monkeypatch, runtime=None) -> TestClient:
     monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "1")
     monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,claude-code")
     monkeypatch.setenv("GLASSHIVE_PROVIDER_ALLOWED_WORKSPACE_ROOTS", str(tmp_path))
-    return TestClient(
+    return _lifespan_owned_client(
         create_app(
             str(tmp_path / "runtime.db"),
             runtime_backend="stub",
@@ -256,7 +310,7 @@ def _scoped_client(
     )
     monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "1")
     monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,claude-code")
-    return TestClient(
+    return _lifespan_owned_client(
         create_app(
             str(tmp_path / "runtime.db"),
             runtime_backend="stub",
@@ -318,7 +372,8 @@ class SplitSecretStreamingRuntime(StubRuntime):
         timeout_sec: float | None = None,
         run_id: str | None = None,
     ) -> str:
-        _ = worker, instruction, timeout_sec, run_id
+        _ = instruction, timeout_sec, run_id
+        _publish_in_process_test_start(worker)
         first = {
             "type": "assistant",
             "message": {
@@ -403,7 +458,8 @@ class ProviderRateLimitedRuntime(StubRuntime):
         timeout_sec: float | None = None,
         run_id: str | None = None,
     ) -> str:
-        _ = worker, instruction, timeout_sec, run_id
+        _ = instruction, timeout_sec, run_id
+        _publish_in_process_test_start(worker)
         raise RuntimeErrorBase("codex-cli exited after the model provider reached its usage limit")
 
     def collect_completed_run(
@@ -442,7 +498,8 @@ class StructuredDeliveryRuntime(StubRuntime):
         timeout_sec: float | None = None,
         run_id: str | None = None,
     ) -> str:
-        _ = worker, instruction, timeout_sec, run_id
+        _ = instruction, timeout_sec, run_id
+        _publish_in_process_test_start(worker)
         bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
         if "messaging_delivery_control" not in bundle:
             return "Text-only answer."
@@ -2116,7 +2173,7 @@ def test_run_scoped_interrupt_cannot_cancel_a_newer_active_turn(tmp_path):
             worker["worker_id"],
             project["project_id"],
             "newer turn",
-            state="running",
+            state=RunRestorationState.RUNNING,
         )
 
         service.interrupt_worker(worker["worker_id"], run_id="older-request-run")
@@ -2131,6 +2188,7 @@ def test_provider_cancel_marks_a_queued_run_cancelled_before_native_execution(tm
     store = Store(str(tmp_path / "runtime.db"))
     runtime = InterruptCountingRuntime()
     service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    provider: ConversationProvider | None = None
     try:
         project = store.create_project(
             "owner-a",
@@ -2184,6 +2242,8 @@ def test_provider_cancel_marks_a_queued_run_cancelled_before_native_execution(tm
         assert runtime.interrupt_calls == []
         assert provider._sync(store.get_provider_request(request["request_id"]))["state"] == "cancelled"
     finally:
+        if provider is not None:
+            provider.shutdown()
         service.shutdown()
 
 
@@ -2194,6 +2254,7 @@ def test_sync_never_resurrects_a_cancelled_provider_request(tmp_path):
         InterruptCountingRuntime(),
         reconcile_on_startup=False,
     )
+    provider: ConversationProvider | None = None
     try:
         project = store.create_project(
             "owner-a", "Synthetic conversation", "Cancellation race", "codex-cli"
@@ -2220,7 +2281,10 @@ def test_sync_never_resurrects_a_cancelled_provider_request(tmp_path):
             access_mode="workspace",
         )
         run = store.create_run(
-            worker["worker_id"], project["project_id"], "late completion", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "late completion",
+            state=RunRestorationState.RUNNING,
         )
         request, _ = store.create_provider_request(
             tenant_id="local",
@@ -2245,6 +2309,8 @@ def test_sync_never_resurrects_a_cancelled_provider_request(tmp_path):
             for event in store.list_provider_activity(request["request_id"])
         )
     finally:
+        if provider is not None:
+            provider.shutdown()
         service.shutdown()
 
 
@@ -2255,6 +2321,7 @@ def test_stream_disconnect_reconciles_a_later_completed_run(tmp_path):
 
     store = Store(str(tmp_path / "runtime.db"))
     service = WorkersProjectsService(store, StubRuntime(), reconcile_on_startup=False)
+    provider: ConversationProvider | None = None
     try:
         project = store.create_project(
             "owner-a", "Synthetic conversation", "Disconnect reconciliation", "codex-cli"
@@ -2281,7 +2348,10 @@ def test_stream_disconnect_reconciles_a_later_completed_run(tmp_path):
             access_mode="workspace",
         )
         run = store.create_run(
-            worker["worker_id"], project["project_id"], "finish after disconnect", state="running"
+            worker["worker_id"],
+            project["project_id"],
+            "finish after disconnect",
+            state=RunRestorationState.RUNNING,
         )
         request_record, _ = store.create_provider_request(
             tenant_id="local",
@@ -2327,6 +2397,8 @@ def test_stream_disconnect_reconciles_a_later_completed_run(tmp_path):
         ].count("completed") == 1
         assert store.get_provider_session_by_id(session["session_id"])["history_count"] == 3
     finally:
+        if provider is not None:
+            provider.shutdown()
         service.shutdown()
 
 
@@ -2343,6 +2415,7 @@ def test_provider_startup_reconciles_a_request_left_running_by_process_restart(t
     store = Store(str(tmp_path / "runtime.db"))
     runtime = RecoveredCompletionRuntime()
     service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    provider: ConversationProvider | None = None
     try:
         project = store.create_project(
             "owner-a", "Synthetic conversation", "Provider restart recovery", "codex-cli"
@@ -2372,7 +2445,7 @@ def test_provider_startup_reconciles_a_request_left_running_by_process_restart(t
             worker["worker_id"],
             project["project_id"],
             "finish across provider restart",
-            state="running",
+            state=RunRestorationState.RUNNING,
         )
         request_record, _ = store.create_provider_request(
             tenant_id="local",
@@ -2407,6 +2480,8 @@ def test_provider_startup_reconciles_a_request_left_running_by_process_restart(t
             time.sleep(0.01)
         assert request_record["request_id"] not in provider._detached_reconciliations
     finally:
+        if provider is not None:
+            provider.shutdown()
         service.shutdown()
 
 
@@ -2414,6 +2489,7 @@ def test_provider_startup_fails_loudly_for_prestart_request_without_native_run(t
     store = Store(str(tmp_path / "runtime.db"))
     runtime = StubRuntime()
     service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    provider: ConversationProvider | None = None
     try:
         project = store.create_project(
             "owner-a", "Synthetic conversation", "Prestart recovery", "codex-cli"
@@ -2466,6 +2542,8 @@ def test_provider_startup_fails_loudly_for_prestart_request_without_native_run(t
         assert json.loads(failed_events[0]["payload_json"])["failure_class"] == "prestart_interrupted"
         assert request_record["request_id"] not in provider._detached_reconciliations
     finally:
+        if provider is not None:
+            provider.shutdown()
         service.shutdown()
 
 
@@ -2508,7 +2586,7 @@ def test_service_startup_monitor_recovers_a_non_provider_host_run(tmp_path):
             worker["worker_id"],
             project["project_id"],
             "finish the mission across restart",
-            state="running",
+            state=RunRestorationState.RUNNING,
         )
 
         service.reconcile_all_workers()
@@ -2802,7 +2880,8 @@ def test_completed_native_harness_without_terminal_answer_fails_loudly(
             timeout_sec: float | None = None,
             run_id: str | None = None,
         ) -> str:
-            _ = worker, instruction, timeout_sec, run_id
+            _ = instruction, timeout_sec, run_id
+            _publish_in_process_test_start(worker)
             return "I am still working on it."
 
         def provider_activity_log(self, worker: dict, run_id: str) -> tuple[str, str]:
@@ -2865,6 +2944,7 @@ def test_provider_startup_prunes_only_old_terminal_requests_and_idle_sessions(tm
     store = Store(str(tmp_path / "runtime.db"))
     runtime = InterruptCountingRuntime()
     service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    provider: ConversationProvider | None = None
     try:
         project = store.create_project("owner-a", "Old conversation", "retention", "codex-cli")
         worker = store.create_worker(
@@ -2912,12 +2992,14 @@ def test_provider_startup_prunes_only_old_terminal_requests_and_idle_sessions(tm
                 (old, old, session["session_id"]),
             )
 
-        ConversationProvider(store, service)
+        provider = ConversationProvider(store, service)
 
         assert store.get_provider_request(request["request_id"]) is None
         assert store.list_provider_sessions(owner_id="owner-a") == []
         assert store.get_worker(worker["worker_id"])["state"] == "terminated"
     finally:
+        if provider is not None:
+            provider.shutdown()
         service.shutdown()
 
 
@@ -2925,6 +3007,7 @@ def test_provider_reapplies_retention_during_a_long_lived_process(tmp_path, monk
     store = Store(str(tmp_path / "runtime.db"))
     runtime = InterruptCountingRuntime()
     service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    provider: ConversationProvider | None = None
     try:
         provider = ConversationProvider(store, service)
         calls = 0
@@ -2942,6 +3025,8 @@ def test_provider_reapplies_retention_during_a_long_lived_process(tmp_path, monk
         assert calls == 1
         assert time.monotonic() - provider._last_retention_monotonic < 2
     finally:
+        if provider is not None:
+            provider.shutdown()
         service.shutdown()
 
 
