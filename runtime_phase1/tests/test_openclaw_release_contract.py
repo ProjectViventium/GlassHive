@@ -96,6 +96,7 @@ def test_runtime_sources_have_no_mutable_or_rejected_openclaw_install():
     )
 
     assert "openclaw@latest" not in source_text
+    assert "WPR_SANDBOX_OPENCLAW_NPM_SPEC" not in source_text
     assert "2026.2.9" not in source_text
 
 

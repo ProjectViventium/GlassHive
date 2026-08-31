@@ -414,8 +414,6 @@ def _stage_reviewed_file(source: Path, destination: Path) -> None:
         staged.unlink(missing_ok=True)
 
 
-AI_WORKER_OPENCLAW_NPM_SPEC = os.environ.get("WPR_SANDBOX_OPENCLAW_NPM_SPEC", "openclaw@latest").strip() or "openclaw@latest"
-
 def _enabled_ai_worker_browser_extension_names() -> tuple[str, ...]:
     raw = (
         os.environ.get("GLASSHIVE_AI_WORKER_BROWSER_EXTENSIONS")
