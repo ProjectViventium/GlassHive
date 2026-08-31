@@ -114,15 +114,14 @@ Viventium's generated GlassHive MCP config injects request context headers:
 - `X-Viventium-Surface`
 - `X-Viventium-Input-Mode`
 - `X-Viventium-Stream-Id`
-- `X-Viventium-Voice-Call-Session-Id`
-- `X-Viventium-Voice-Request-Id`
-- `X-Viventium-Telegram-Chat-Id`
-- `X-Viventium-Telegram-User-Id`
-- `X-Viventium-Telegram-Message-Id`
 - `X-Viventium-Request-Files`
 - `X-Viventium-Request-Attachments`
 - `X-Viventium-Tool-Resources`
 - `X-Viventium-File-Ids`
+
+Surface recipient identifiers stay inside Viventium Core. Core persists the authoritative
+Telegram or voice destination before delegation and resolves later callbacks through that binding;
+it does not forward raw Telegram chat/user/message IDs or voice session/request IDs to GlassHive.
 
 GlassHive's MCP layer merges those headers into `bootstrap_bundle.callbacks` and adds the generated
 callback URL/secret from runtime env when available. The runtime emits signed events with
