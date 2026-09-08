@@ -843,7 +843,8 @@ def test_collect_completed_run_recovers_from_latest_run_artifacts(tmp_path):
     assert json.loads(runtime._session_meta_path(worker["worker_id"]).read_text())["session_key"] == "thread_123"
 
 
-def test_collect_completed_run_preserves_success_when_internal_diagnostic_was_unavailable(tmp_path):
+@pytest.mark.parametrize("summarized_evidence", [False, True])
+def test_collect_completed_run_preserves_success_when_internal_diagnostic_was_unavailable(tmp_path, summarized_evidence):
     runtime = CodexCliRuntime(base_dir=str(tmp_path))
     worker = {
         "worker_id": "wrk_missing_ledger",
@@ -863,6 +864,16 @@ def test_collect_completed_run_preserves_success_when_internal_diagnostic_was_un
     (run_root / "exit_code").write_text("0")
     _write_pass_evidence(runtime, worker["worker_id"], run_id)
     (runtime._workspace_dir(worker["worker_id"]) / "glasshive-run" / "runs" / run_id / "constraint-ledger.json").unlink()
+    if summarized_evidence:
+        from workers_projects_runtime.run_evidence import summarize_run_evidence_result
+
+        evidence_path = runtime._workspace_dir(worker["worker_id"]) / "glasshive-run" / "runs" / run_id / "evidence.json"
+        evidence = json.loads(evidence_path.read_text())
+        evidence["constraint_compliance"] = {"status": "not_available", "issues": []}
+        evidence["evidence_result"] = summarize_run_evidence_result(evidence)
+        assert evidence["evidence_result"]["status"] == "warn"
+        assert {"reason": "internal constraint diagnostic was unavailable"} in evidence["evidence_result"]["warning_reasons"]
+        evidence_path.write_text(json.dumps(evidence))
 
     runtime.reconcile_worker = lambda worker: runtime._runtime_info(worker, pid=1234)  # type: ignore[method-assign]
 
@@ -1754,6 +1765,47 @@ def test_openclaw_collect_completed_run_recovers_final_json_without_exit_file(tm
     assert evidence["evidence_result"]["status"] == "pass"
     assert stopped == [runtime._session_name_for_run_id(run_id)]
     assert terminated == [run_id]
+
+
+@pytest.mark.parametrize("explicit_run_id", [False, True])
+def test_host_completed_output_cannot_finalize_until_exact_process_stop_succeeds(tmp_path, explicit_run_id):
+    runtime = HostOpenClawRuntime(base_dir=str(tmp_path))
+    worker = {"worker_id": "wrk_stop_recovery", "profile": "openclaw-general", "model": "openai/gpt-5.2"}
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_stop_recovery"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    stdout_path = run_root / "stdout.log"
+    stdout_path.write_text(json.dumps({
+        "finalAssistantVisibleText": "FINAL REPORT:\nRecovered result.",
+        "completion": {"stopReason": "stop"},
+    }))
+    (run_root / "stderr.log").write_text("")
+    runtime._write_active_session(worker["worker_id"], {
+        "session_name": runtime._session_name_for_run_id(run_id), "run_id": run_id,
+        "stdout_path": str(stdout_path), "stderr_path": str(run_root / "stderr.log"),
+        "exit_path": str(run_root / "exit_code"),
+    })
+    _write_pass_evidence(runtime, worker["worker_id"], run_id)
+    original_session = runtime._active_session_meta_path(worker["worker_id"]).read_bytes()
+    stopped = []
+    stop_succeeds = False
+    def stop(worker_id, *, worker, run_id):
+        stopped.append((worker_id, run_id))
+        return stop_succeeds
+    runtime._stop_active_process = stop
+    runtime.reconcile_worker = lambda worker: runtime._runtime_info(worker, pid=4321)
+    options = {"run_id": run_id} if explicit_run_id else {}
+    for _ in range(2):
+        assert runtime.collect_completed_run(worker, **options) is None
+        assert not (run_root / "exit_code").exists()
+        assert runtime._active_session_meta_path(worker["worker_id"]).read_bytes() == original_session
+    stop_succeeds = True
+    recovered = runtime.collect_completed_run(worker, **options)
+    assert recovered is not None and recovered["state"] == "completed"
+    assert recovered["output_text"] == "Recovered result."
+    assert (run_root / "exit_code").read_text() == "0"
+    assert stopped == [(worker["worker_id"], run_id)] * 3
 
 
 def test_interrupt_worker_stops_exact_run_session_when_metadata_is_missing(tmp_path):

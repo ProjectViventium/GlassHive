@@ -46,7 +46,8 @@ marker, inferred date/format/count or unavailable internal ledger must not disca
 output. The runtime authors these diagnostics; the model does not have to create an internal ledger
 or a planning artifact. The result retains a visible warning and private diagnostic detail. Recovery
 uses the same boundary and never invents missing historical evidence. Declared or present evidence
-still has to be readable and belong to the exact run.
+still has to be readable and belong to the exact run. An unavailable internal diagnostic names
+that missing diagnostic in the warning; it must not emit an unexplained empty warning.
 
 ## Core Worker Operating Instructions
 

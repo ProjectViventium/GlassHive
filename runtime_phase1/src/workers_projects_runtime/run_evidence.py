@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .secret_redaction import CREDENTIAL_REDACTIONS
+from .secret_redaction import CREDENTIAL_REDACTIONS, RedactionRule
 
 import json
 import csv
@@ -53,12 +53,12 @@ _LOCAL_PATH_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"~/[^\s\"'`]+(?:/[^\s\"'`]+)+"), "[REDACTED_LOCAL_PATH]"),
     (re.compile(r"/Users/[^/\s\"']+"), "~"),
 )
-_OWNER_SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+_OWNER_SECRET_REDACTIONS: tuple[RedactionRule, ...] = (
+    *CREDENTIAL_REDACTIONS,
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)((?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s\"']{6,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)([?&](?:gh_token|gh_sig|gh_exp|gh_kind)=)([^&#\s\"']+)"), r"\1[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
-    *CREDENTIAL_REDACTIONS,
 )
 _SECRET_REDACTIONS = (*_LOCAL_PATH_REDACTIONS, *_OWNER_SECRET_REDACTIONS)
 _FINAL_REPORT_RE = re.compile(
@@ -2438,7 +2438,9 @@ def summarize_run_evidence_result(evidence: dict[str, object]) -> dict[str, obje
     if isinstance(constraint, dict):
         constraint_status = str(constraint.get("status") or "").lower()
         issues = constraint.get("issues") if isinstance(constraint.get("issues"), list) else []
-        if constraint_status in {"fail", "warn", "not_available"}:
+        if constraint_status == "not_available":
+            warning_reasons.append({"reason": "internal constraint diagnostic was unavailable"})
+        elif constraint_status in {"fail", "warn"}:
             warning_reasons.append({"reason": "constraint diagnostic warning", "issues": issues[:10]})
 
     invalid_artifacts = _invalid_professional_artifacts(

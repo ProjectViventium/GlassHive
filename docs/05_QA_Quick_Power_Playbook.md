@@ -151,6 +151,7 @@ The focused deterministic owners below live under `runtime_phase1/tests/`:
 | Boundary | Regression owner | Required result |
 |---|---|---|
 | Exact host generation | `test_host_generation_preservation.py` | Stale controls and old process cleanup preserve a replacement session/process/slot, including the same run ID. |
+| Credential and result recovery | `test_credential_redaction.py`, `test_profile_runtime.py` | Both credential halves stay hidden across four output paths; an unconfirmed process stop cannot manufacture completion; missing diagnostics give a concrete nonblocking warning. |
 | Managed shutdown | `test_host_run_leases.py` | Unknown or failed stop retains the lease; proven absence permits one retry of the accepted run. |
 | Lost conversation authority | `test_stateless_restart_preservation.py` | No bearer persists; exact retry keeps instructions; stateless siblings progress while persistent/control/lease fences hold. |
 | Interrupted retry projection | `test_restart_retry_preservation.py` | Durable Pause and a concurrent active generation survive retry reconciliation. |

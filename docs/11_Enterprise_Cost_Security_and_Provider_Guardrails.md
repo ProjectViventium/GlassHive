@@ -329,6 +329,12 @@ opaque-reference pages must not fetch third-party font resources. Log redaction 
 plain strings and structured URL objects supplied by HTTP clients, so an opaque ref cannot bypass
 the filter merely because a logging library preserved it as a URL instance.
 
+Output, evidence, failure summaries and streamed text share credential protection, including both
+halves of an unquoted alphanumeric `ID:secret` pair. Pair redaction runs before individual key
+redaction so a masked identifier cannot leave its secret visible. Valid URI host/port syntax remains
+usable; credentials in the path or query still require redaction. Ambiguous unquoted long pairs
+are treated conservatively; ordinary structured identifiers should use quoted JSON fields.
+
 Artifact delivery should expose the scoped download short ref as the default chat-facing file link,
 labeled `Download file`, while preserving a preview/open short ref or View / Steer workspace link
 for inspection and all-deliveries access. A direct download default is a UX choice, not a weaker

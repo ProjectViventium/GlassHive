@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .secret_redaction import CREDENTIAL_REDACTIONS
+from .secret_redaction import CREDENTIAL_REDACTIONS, RedactionRule
 from . import native_input
 
 import json
@@ -4252,12 +4252,18 @@ class BaseCliWorkerRuntime:
         if exit_code is None:
             if not self._stdout_has_complete_response(stdout_path):
                 return None
+            effective_run_id = str(run_id or active_session.get("run_id") or "").strip()
+            if self._stop_active_process(
+                worker["worker_id"], worker=worker, run_id=effective_run_id
+            ) is False:
+                # A final response is not proof that its native generation stopped.
+                # Do not publish a synthetic exit marker that a later collector could trust.
+                return None
             try:
                 exit_path.write_text("0")
             except OSError:
                 return None
             exit_code = 0
-            self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
         stdout = stdout_path.read_text() if stdout_path.exists() else ""
         stderr = stderr_path.read_text() if stderr_path.exists() else ""
         effective_run_id = str(run_id or active_session.get("run_id") or "").strip()
@@ -8940,7 +8946,8 @@ _LOCAL_MARKDOWN_CITATION = re.compile(
     r"|(?:file://)?(?:/(?:Users|home|root|Volumes|private/var)/|~/)(?:[^()\s]|\([^()\r\n]*\))*)"
     r"\s*\)"
 )
-_SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+_SECRET_REDACTIONS: tuple[RedactionRule, ...] = (
+    *CREDENTIAL_REDACTIONS,
     (re.compile(r"/Users/[^/\s\"'`]+(?:/[^\s\"'`]*)*"), "[REDACTED_LOCAL_PATH]"),
     (re.compile(r"/(?:home|root|Volumes|private/var)/[^\s\"'`]+(?:/[^\s\"'`]*)*"), "[REDACTED_LOCAL_PATH]"),
     (re.compile(r"~/[^\s\"'`]+(?:/[^\s\"'`]*)*"), "[REDACTED_LOCAL_PATH]"),
@@ -8953,7 +8960,6 @@ _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"), "[REDACTED_JWT]"),
     (re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z ]+ )?PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
     (re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\s\S]*\Z"), "[REDACTED_PRIVATE_KEY]"),
-    *CREDENTIAL_REDACTIONS,
     (re.compile(r"(?i)data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{256,}"), "[REDACTED_IMAGE_BASE64]"),
     (re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{512,}={0,2}(?![A-Za-z0-9+/=])"), "[REDACTED_LONG_BASE64]"),
 )

@@ -59,6 +59,8 @@ the worker recorded on the run even if the conversation session now points to an
 Managed shutdown stops the exact owned generation and proves it absent before releasing its lease
 for retry. Failed cleanup or unknown absence retains the lease. Processor exit cannot release that
 shutdown-owned fence. Configured live-generation restart adoption keeps its separate ownership path.
+Recovery from a complete native response without an exit marker must confirm the exact process
+stopped before writing a synthetic exit marker. Failed or unknown stop leaves recovery pending.
 
 Automatic crash/capacity retry projects worker readiness in the same database transaction that reads
 durable Pause intent. A committed Pause or paused run remains paused even if a crash left the worker

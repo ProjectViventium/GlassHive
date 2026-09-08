@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .secret_redaction import CREDENTIAL_REDACTIONS
+from .secret_redaction import CREDENTIAL_REDACTIONS, RedactionRule
 
 import json
 import re
@@ -1446,12 +1446,12 @@ def _looks_failure_related(value: str) -> bool:
     )
 
 
-_FAILURE_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+_FAILURE_REDACTIONS: tuple[RedactionRule, ...] = (
+    *CREDENTIAL_REDACTIONS,
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)((?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s\"']{6,}"), r"\1[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
     (re.compile(r"\b(?:wrk|run|prj)_[A-Za-z0-9_-]{6,}\b"), "[glasshive-id]"),
-    *CREDENTIAL_REDACTIONS,
     (re.compile(r"(?:~\/|\/Users\/|\/home\/|\/private\/var\/|\/var\/folders\/|[A-Za-z]:\\Users\\)[^\s`'\"<>]+"), "[local path]"),
     (re.compile(r"(?i)data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{256,}"), "[REDACTED_IMAGE_BASE64]"),
     (re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{512,}={0,2}(?![A-Za-z0-9+/=])"), "[REDACTED_LONG_BASE64]"),

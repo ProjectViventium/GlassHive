@@ -18,8 +18,8 @@ REDACTORS = [redact_output, redact_evidence, redact_failure, redact_stream]
 @pytest.mark.parametrize('value', [
     '[Earlier conversation](http://localhost:7190/c/56d7416e-4e31-5521-ac2f-d701e8102dba)',
     'https://chat.example.test/app/c/56d7416e-4e31-5521-ac2f-d701e8102dba',
-    'sourceDigest:' + 'abcdef0123456789' * 4,
-    'artifactIdentifier:accepted-source-98765432101234567890',
+    '"sourceDigest":"' + 'abcdef0123456789' * 4 + '"',
+    '"artifactIdentifier":"accepted-source-98765432101234567890"',
 ])
 def test_preserves_non_secret_links_and_identifiers(redact, value):
     assert redact(value) == value
@@ -52,4 +52,28 @@ def test_unlabelled_known_credentials_are_redacted_across_failure_and_output(red
     result = redact(value)
     assert value not in result
     assert 'synthetic-private-key-bytes' not in result
+    assert 'REDACTED' in result
+
+
+@pytest.mark.parametrize('redact', REDACTORS)
+@pytest.mark.parametrize('identifier, secret', [
+    ('AK' + 'IA' + 'A' * 16, 'synthetic_key_secret_' + 'a' * 20),
+    ('A' + 'C' + '1' * 32, 'b' * 32),
+    ('clientid' + '12345678', 'synthetic_client_secret_' + 'c' * 20),
+])
+def test_generic_credential_pairs_redact_both_halves(redact, identifier, secret):
+    value = identifier + ':' + secret
+    result = redact(value)
+    assert identifier not in result
+    assert secret not in result
+    assert 'REDACTED' in result
+
+
+@pytest.mark.parametrize('redact', REDACTORS)
+def test_uri_authority_exclusion_still_redacts_credentials_in_its_path(redact):
+    secret = 'synthetic_path_secret_' + 'd' * 24
+    value = 'http://localhost:7190/path/clientid12345678:' + secret
+    result = redact(value)
+    assert result.startswith('http://localhost:7190/path/')
+    assert secret not in result
     assert 'REDACTED' in result
