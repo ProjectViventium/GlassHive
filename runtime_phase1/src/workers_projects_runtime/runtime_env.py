@@ -177,7 +177,7 @@ def _candidate_env_files() -> list[Path]:
     candidates: list[Path] = []
     explicit = os.environ.get("VIVENTIUM_ENV_FILE", "").strip()
     if explicit:
-        candidates.append(Path(explicit).expanduser())
+        return [Path(explicit).expanduser()]
     if _env_flag("VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV"):
         return candidates
     app_support = Path.home() / "Library" / "Application Support" / "Viventium" / "runtime"

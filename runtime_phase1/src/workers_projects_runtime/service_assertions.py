@@ -97,13 +97,16 @@ def verify_service_assertion(
         raw = json.loads(payload_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise _invalid() from exc
-    if not isinstance(raw, dict) or set(raw) != _CLAIM_KEYS:
+    if not isinstance(raw, dict) or set(raw) not in (_CLAIM_KEYS, _CLAIM_KEYS | {"native_input_digest"}):
         raise _invalid()
     if payload_bytes != _canonical_claims(raw):
         raise _invalid("The Viventium service assertion payload is not canonical JSON.")
     if raw.get("v") != SERVICE_ASSERTION_VERSION or raw.get("aud") != SERVICE_ASSERTION_AUDIENCE:
         raise _invalid()
 
+    native_input_digest = raw.get("native_input_digest")
+    if native_input_digest is not None and not re.fullmatch(r"[a-f0-9]{64}", str(native_input_digest)):
+        raise _invalid("Native input digest is invalid")
     tenant_id = _principal(raw.get("tenant_id"), name="tenant_id")
     owner_id = _principal(raw.get("owner_id"), name="owner_id")
     nonce = str(raw.get("nonce") or "").strip()
@@ -129,6 +132,7 @@ def verify_service_assertion(
         "iat": issued_at,
         "exp": expires_at,
         "nonce": nonce,
+        **({"native_input_digest": native_input_digest} if native_input_digest is not None else {}),
     }
 
 
@@ -140,6 +144,7 @@ def mint_service_assertion(
     now_epoch: int | None = None,
     ttl_seconds: int = SERVICE_ASSERTION_MAX_TTL_SECONDS,
     nonce: str | None = None,
+    native_input_digest: str | None = None,
 ) -> str:
     if not secret:
         raise ServiceAssertionError(
@@ -160,6 +165,10 @@ def mint_service_assertion(
         "exp": issued_at + ttl,
         "nonce": nonce or f"nonce_{uuid.uuid4().hex}",
     }
+    if native_input_digest is not None:
+        if not re.fullmatch(r"[a-f0-9]{64}", native_input_digest):
+            raise ValueError("Native input digest is invalid")
+        claims["native_input_digest"] = native_input_digest
     if not _NONCE_PATTERN.fullmatch(str(claims["nonce"])):
         raise ValueError("Service assertion nonce is invalid")
     payload_segment = _b64url_encode(_canonical_claims(claims))

@@ -15,6 +15,10 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from .workspace_continuation import accepted_run_input
+
+from .runtime_requirements import CLAUDE_CODE_EFFORT_LEVELS
+
 from .models import WorkspaceKind, normalize_workspace_kind, normalize_workspace_tags, utc_now
 from .parallel_orchestration_schema import ensure_parallel_orchestration_schema
 from .recurrence import canonical_recurrence_owner
@@ -42,7 +46,7 @@ from .models import (
 )
 
 
-RUNTIME_STORE_SCHEMA_VERSION = 7
+RUNTIME_STORE_SCHEMA_VERSION = 8
 
 
 class SchedulePrincipalAuthorityStoreError(ValueError):
@@ -74,6 +78,7 @@ def _workspace_tags_json(values: list[str] | tuple[str, ...] | None) -> str:
 _FAILURE_FIELD_NAMES = {
     "failure_class",
     "failure_retryable",
+    "failure_structured",
     "failure_user_message",
     "failure_recommended_recovery",
     "failure_diagnostic_summary",
@@ -195,6 +200,7 @@ PARALLEL_CLEAN_ROOM_BOOTSTRAP_KEYS = frozenset(
         "glasshive_capability_broker",
         "glasshive_capability_requirement",
         "project_definition",
+        "provider_model",
         "system_instructions",
         "viventium_constraint_source",
         "viventium_delegation_assertion",
@@ -307,6 +313,7 @@ def canonical_parallel_clean_room_bootstrap(value: object) -> dict[str, Any]:
         "codex_md",
         "developer_instructions",
         "project_definition",
+        "provider_model",
         "system_instructions",
     ):
         if key in result and not isinstance(result[key], str):
@@ -341,8 +348,10 @@ def canonical_parallel_clean_room_bootstrap(value: object) -> dict[str, Any]:
                 "medium",
                 "high",
                 "xhigh",
+                "max",
+                "ultra",
             },
-            "WPR_CLAUDE_CODE_EFFORT": {"default", "max"},
+            "WPR_CLAUDE_CODE_EFFORT": frozenset(CLAUDE_CODE_EFFORT_LEVELS),
         }
         result["env"] = {
             key: item
@@ -414,7 +423,9 @@ def canonical_parallel_clean_room_bootstrap(value: object) -> dict[str, Any]:
             }
         ),
         "viventium_launch_authority": frozenset(
-            {"version", "kind", "execution_mode", "fallback_worker_profile"}
+            {"version", "kind", "execution_mode", "fallback_worker_profile",
+             "worker_model", "worker_reasoning_effort",
+             "fallback_worker_model", "fallback_worker_reasoning_effort"}
         ),
         "viventium_run_liveness": frozenset({"version", "long_mission"}),
     }
@@ -496,6 +507,10 @@ def canonical_parallel_clean_room_bootstrap(value: object) -> dict[str, Any]:
             "kind": str,
             "execution_mode": str,
             "fallback_worker_profile": str,
+            "worker_model": str,
+            "worker_reasoning_effort": str,
+            "fallback_worker_model": str,
+            "fallback_worker_reasoning_effort": str,
         },
         "viventium_run_liveness": {
             "version": int,
@@ -699,6 +714,22 @@ STOPPING_OPERATION_KINDS = frozenset(
     {"max_duration", "stop_run", "terminate_worker"}
 )
 
+MANAGED_SHUTDOWN_LEASE_RELEASE_REASON = "managed_shutdown"
+
+MANAGED_RESTART_FAILURE_USER_MESSAGE = (
+    "Interrupted by a managed restart; the same work resumes automatically."
+)
+
+MANAGED_RESTART_FAILURE_RECOMMENDED_RECOVERY = (
+    "No action is needed; the preserved work is re-admitted automatically "
+    "after the restart."
+)
+
+MANAGED_RESTART_FAILURE_DIAGNOSTIC_SUMMARY = (
+    "Running state was re-queued because its host run lease was released by a "
+    "managed shutdown."
+)
+
 NONTERMINAL_RUN_STATES = frozenset(
     {"queued", "claimed", "admitted", "running", "settling", "paused", "needs_input"}
 )
@@ -786,6 +817,9 @@ class ProviderFamilyStoppedError(RuntimeError):
 
 class ProviderAdmissionConflictError(RuntimeError):
     """Raised when a provider request tries to reserve an already-owned visible input."""
+
+class ProviderInvocationConflictError(RuntimeError):
+    """An exact host invocation disagrees with an existing native request binding."""
 
 class DelegationIdempotencyConflictError(RuntimeError):
     """Raised when a delegation key is reused for a different canonical request."""
@@ -1100,6 +1134,37 @@ def _callback_trace_event_sha256_values(
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
+
+def verified_callback_trace_snapshots(rows: list[sqlite3.Row], run_id: str) -> list[dict[str, Any]]:
+    """Verify the stored chain before either public projection or portable capture."""
+    snapshots = []
+    previous_sha = ""
+    sequences: dict[str, int] = {}
+    for index, row in enumerate(rows, start=1):
+        try:
+            snapshot = json.loads(str(row["snapshot_json"] or "{}"))
+            if not isinstance(snapshot, dict) or set(snapshot) != set(CALLBACK_TRACE_SNAPSHOT_FIELDS):
+                raise ValueError("snapshot shape")
+            expected_sha = _callback_trace_event_sha256_values(row["callback_id"], row["callback_sequence"],
+                row["run_sequence"], row["snapshot_json"], row["previous_event_sha256"])
+            expected_payload = "sha256:" + _text_sha256(snapshot["payloadJson"])
+            expected_authority = "sha256:" + _text_sha256(_callback_trace_authority_values(
+                *(snapshot[field] for field in CALLBACK_TRACE_AUTHORITY_FIELDS)))
+            callback_id = str(snapshot["callbackId"] or "")
+            sequence = sequences.get(callback_id, 0) + 1
+            if (str(row["run_id"] or "") != run_id or callback_id != str(row["callback_id"] or "")
+                or str(snapshot["runId"] or "") != run_id or str(snapshot["status"] or "") != str(row["status"] or "")
+                or int(row["callback_sequence"] or 0) != sequence or int(row["run_sequence"] or 0) != index
+                or str(row["previous_event_sha256"] or "") != previous_sha or str(row["event_sha256"] or "") != expected_sha
+                or str(row["payload_sha256"] or "") != expected_payload or str(row["authority_sha256"] or "") != expected_authority):
+                raise ValueError("chain identity")
+        except (TypeError, ValueError, KeyError) as exc:
+            raise RuntimeError("Callback trace integrity check failed") from exc
+        previous_sha = expected_sha
+        sequences[callback_id] = sequence
+        snapshots.append(snapshot)
+    return snapshots
+
 def _queue_defaults(queued_at: str, *, run_id: str = "") -> dict[str, Any]:
     first = _parse_utc(queued_at)
     deadline = (
@@ -1148,7 +1213,9 @@ def _normalized_failure_fields(fields: dict[str, Any]) -> dict[str, Any]:
         if key not in fields:
             continue
         value = fields.get(key)
-        if key == "failure_retryable":
+        if key in {"failure_retryable", "failure_structured"}:
+            # Structured provider evidence is a durable run fact: the conversation-lane
+            # fallback and the quota failover both read it from the run row.
             normalized[key] = 1 if bool(value) else 0
         else:
             normalized[key] = str(value or "")
@@ -1311,12 +1378,23 @@ class Store:
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
+            session_columns = {row["name"] for row in conn.execute("PRAGMA table_info(provider_sessions)")}
+            migrate_session_scope = bool(session_columns and "actor_kind" not in session_columns)
+            if migrate_session_scope:
+                # SQLite's documented table-rebuild procedure requires this only on the
+                # private migration connection, before BEGIN; integrity is checked before commit.
+                conn.execute("PRAGMA foreign_keys = OFF")
             begin_schema_migration(conn)
             require_compatible_schema(
                 conn,
                 component="runtime_store",
                 target_version=RUNTIME_STORE_SCHEMA_VERSION,
             )
+            if migrate_session_scope:
+                # Another startup may have completed this migration while BEGIN waited.
+                current_columns = {row["name"] for row in conn.execute("PRAGMA table_info(provider_sessions)")}
+                if "actor_kind" not in current_columns:
+                    self._migrate_provider_session_scopes(conn)
             execute_schema_script(
                 conn,
                 """
@@ -1596,6 +1674,8 @@ class Store:
                     owner_id TEXT NOT NULL,
                     conversation_id TEXT NOT NULL,
                     agent_id TEXT NOT NULL,
+                    actor_kind TEXT NOT NULL DEFAULT 'external_user',
+                    origin TEXT NOT NULL DEFAULT 'interactive',
                     model_id TEXT NOT NULL,
                     project_id TEXT NOT NULL,
                     worker_id TEXT NOT NULL,
@@ -1605,7 +1685,7 @@ class Store:
                     context_manifest_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    UNIQUE (tenant_id, owner_id, conversation_id, agent_id),
+                    UNIQUE (tenant_id, owner_id, conversation_id, agent_id, actor_kind, origin),
                     FOREIGN KEY(project_id) REFERENCES projects(project_id),
                     FOREIGN KEY(worker_id) REFERENCES workers(worker_id)
                 );
@@ -1788,6 +1868,23 @@ class Store:
                 "ON workers(tenant_id, owner_id, workspace_kind, favorite DESC, updated_at DESC, worker_id DESC)"
             )
             ensure_parallel_orchestration_schema(conn)
+            provider_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(provider_requests)")
+            }
+            for column in ("native_invocation_id", "native_body_sha256"):
+                if column not in provider_columns:
+                    conn.execute(
+                        f"ALTER TABLE provider_requests ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                    )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_requests_native_invocation "
+                "ON provider_requests(tenant_id, owner_id, native_invocation_id) "
+                "WHERE native_invocation_id <> ''"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_provider_requests_missing_response "
+                "ON provider_requests(created_at) WHERE state = 'completed' AND response_json = ''"
+            )
             if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise RuntimeError(
                     "SQLite foreign-key integrity check failed (one or more violations)"
@@ -1797,6 +1894,55 @@ class Store:
                 component="runtime_store",
                 version=RUNTIME_STORE_SCHEMA_VERSION,
             )
+            if migrate_session_scope:
+                conn.commit()
+                conn.execute("PRAGMA foreign_keys = ON")
+                if conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+                    raise RuntimeError("SQLite foreign-key enforcement could not be restored")
+
+    @staticmethod
+    def _migrate_provider_session_scopes(conn: sqlite3.Connection) -> None:
+        """Preserve legacy session IDs and every dependent row while extending the unique key."""
+        schema_objects = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE tbl_name = 'provider_sessions' "
+            "AND type IN ('index', 'trigger') AND sql IS NOT NULL"
+        ).fetchall()
+        conn.execute("""
+            CREATE TABLE provider_sessions_scoped (
+                session_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL DEFAULT 'local',
+                owner_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                actor_kind TEXT NOT NULL DEFAULT 'external_user',
+                origin TEXT NOT NULL DEFAULT 'interactive',
+                model_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                workspace_dir TEXT NOT NULL,
+                access_mode TEXT NOT NULL,
+                history_count INTEGER NOT NULL DEFAULT 0,
+                context_manifest_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (tenant_id, owner_id, conversation_id, agent_id, actor_kind, origin),
+                FOREIGN KEY(project_id) REFERENCES projects(project_id),
+                FOREIGN KEY(worker_id) REFERENCES workers(worker_id)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO provider_sessions_scoped (
+                session_id, tenant_id, owner_id, conversation_id, agent_id, model_id,
+                project_id, worker_id, workspace_dir, access_mode, history_count,
+                context_manifest_json, created_at, updated_at
+            ) SELECT session_id, tenant_id, owner_id, conversation_id, agent_id, model_id,
+                project_id, worker_id, workspace_dir, access_mode, history_count,
+                context_manifest_json, created_at, updated_at FROM provider_sessions
+        """)
+        conn.execute("DROP TABLE provider_sessions")
+        conn.execute("ALTER TABLE provider_sessions_scoped RENAME TO provider_sessions")
+        for schema_object in schema_objects:
+            conn.execute(schema_object["sql"])
 
     def consume_internal_assertion_jti(
         self,
@@ -1835,14 +1981,17 @@ class Store:
         owner_id: str,
         conversation_id: str,
         agent_id: str,
+        actor_kind: str = "external_user",
+        origin: str = "interactive",
     ) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT * FROM provider_sessions
                 WHERE tenant_id = ? AND owner_id = ? AND conversation_id = ? AND agent_id = ?
+                  AND actor_kind = ? AND origin = ?
                 """,
-                (tenant_id or "local", owner_id, conversation_id, agent_id),
+                (tenant_id or "local", owner_id, conversation_id, agent_id, actor_kind, origin),
             ).fetchone()
         return self._row(row)
 
@@ -1883,6 +2032,8 @@ class Store:
         owner_id: str,
         conversation_id: str,
         agent_id: str,
+        actor_kind: str = "external_user",
+        origin: str = "interactive",
         model_id: str,
         project_id: str,
         worker_id: str,
@@ -1897,6 +2048,8 @@ class Store:
             owner_id=owner_id,
             conversation_id=conversation_id,
             agent_id=agent_id,
+            actor_kind=actor_kind,
+            origin=origin,
         )
         session_id = str(existing.get("session_id") or "") if existing else f"ghs_{uuid.uuid4().hex}"
         data = {
@@ -1905,6 +2058,8 @@ class Store:
             "owner_id": owner_id,
             "conversation_id": conversation_id,
             "agent_id": agent_id,
+            "actor_kind": actor_kind,
+            "origin": origin,
             "model_id": model_id,
             "project_id": project_id,
             "worker_id": worker_id,
@@ -1938,15 +2093,15 @@ class Store:
             conn.execute(
                 """
                 INSERT INTO provider_sessions (
-                    session_id, tenant_id, owner_id, conversation_id, agent_id, model_id,
+                    session_id, tenant_id, owner_id, conversation_id, agent_id, actor_kind, origin, model_id,
                     project_id, worker_id, workspace_dir, access_mode, history_count,
                     context_manifest_json, created_at, updated_at
                 ) VALUES (
-                    :session_id, :tenant_id, :owner_id, :conversation_id, :agent_id, :model_id,
+                    :session_id, :tenant_id, :owner_id, :conversation_id, :agent_id, :actor_kind, :origin, :model_id,
                     :project_id, :worker_id, :workspace_dir, :access_mode, :history_count,
                     :context_manifest_json, :created_at, :updated_at
                 )
-                ON CONFLICT(tenant_id, owner_id, conversation_id, agent_id) DO UPDATE SET
+                ON CONFLICT(tenant_id, owner_id, conversation_id, agent_id, actor_kind, origin) DO UPDATE SET
                     session_id = excluded.session_id,
                     model_id = excluded.model_id,
                     project_id = excluded.project_id,
@@ -1997,6 +2152,7 @@ class Store:
         tenant_id: str | None = None,
         owner_id: str | None = None,
         idempotency_key: str | None = None,
+        native_invocation_id: str | None = None,
     ) -> dict[str, Any] | None:
         if request_id:
             query = "SELECT * FROM provider_requests WHERE request_id = ?"
@@ -2004,6 +2160,9 @@ class Store:
         elif idempotency_key:
             query = "SELECT * FROM provider_requests WHERE idempotency_key = ?"
             params = [idempotency_key]
+        elif native_invocation_id:
+            query = "SELECT * FROM provider_requests WHERE native_invocation_id = ?"
+            params = [native_invocation_id]
         else:
             return None
         if tenant_id:
@@ -2015,6 +2174,38 @@ class Store:
         with self._connect() as conn:
             row = conn.execute(query, params).fetchone()
         return self._row(row)
+
+    @staticmethod
+    def assert_provider_invocation_matches(existing: dict[str, Any], expected: dict[str, Any]) -> None:
+        """All duplicate paths validate the same immutable, owner-scoped invocation."""
+        if not (existing.get("native_invocation_id") or expected.get("native_invocation_id")):
+            return
+        identity = ("tenant_id", "owner_id", "session_id", "idempotency_key", "message_id",
+                    "stream_id", "native_invocation_id", "native_body_sha256")
+        if any(str(existing.get(key) or "") != str(expected.get(key) or "") for key in identity):
+            raise ProviderInvocationConflictError("Native invocation identity conflict")
+        try:
+            actual_authority = json.loads(existing.get("replay_decision_json") or "{}").get("request_authority_sha256")
+            expected_authority = json.loads(expected.get("replay_decision_json") or "{}").get("request_authority_sha256")
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ProviderInvocationConflictError("Native invocation authority unavailable") from exc
+        if not actual_authority or actual_authority != expected_authority:
+            raise ProviderInvocationConflictError("Native invocation authority conflict")
+
+    def list_provider_graph_requests(self, anchor: dict[str, Any], context: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+        """Read the existing request journal for one exact admitted host graph context."""
+        keys = ("main_context_protocol", "main_context_owner", "main_context_snapshot_sha256",
+                "context_epoch", "logical_turn_id", "logical_turn_revision")
+        clauses = " AND ".join(f"json_extract(r.replay_decision_json, '$.{key}') = ?" for key in keys)
+        values = [anchor["tenant_id"], anchor["owner_id"], anchor["stream_id"], anchor["message_id"],
+                  anchor["created_at"], *[context[key] for key in keys]]
+        where = f"""r.tenant_id = ? AND r.owner_id = ? AND r.stream_id = ? AND r.message_id = ?
+                    AND r.created_at >= ? AND json_valid(r.replay_decision_json) AND {clauses}"""
+        with self._connect() as conn:
+            count = conn.execute(f"SELECT COUNT(*) FROM provider_requests r WHERE {where}", values).fetchone()[0]
+            rows = conn.execute(f"""SELECT r.* FROM provider_requests r WHERE {where}
+                                   ORDER BY r.created_at, r.request_id LIMIT 128""", values).fetchall()
+        return self._rows(rows), max(0, count - len(rows))
 
     def list_provider_requests_by_state(
         self,
@@ -2057,6 +2248,8 @@ class Store:
         response_timeout_s: float | None = None,
         response_deadline_at: str = "",
         base_idempotency_key: str = "",
+        native_invocation_id: str = "",
+        native_body_sha256: str = "",
     ) -> tuple[dict[str, Any], bool]:
         now = utc_now()
         data = {
@@ -2068,6 +2261,8 @@ class Store:
             "idempotency_key": idempotency_key,
             "message_id": message_id,
             "stream_id": stream_id,
+            "native_invocation_id": native_invocation_id,
+            "native_body_sha256": native_body_sha256,
             "state": "queued",
             "requested_history_count": max(0, int(requested_history_count)),
             "replay_decision_json": json.dumps(
@@ -2126,6 +2321,7 @@ class Store:
                     (tenant_id or "local", owner_id, idempotency_key),
                 ).fetchone()
                 if existing:
+                    self.assert_provider_invocation_matches(dict(existing), data)
                     conn.execute("COMMIT")
                     return self._row(existing) or data, False
                 session_row = conn.execute(
@@ -2377,6 +2573,27 @@ class Store:
                     raise ProviderAdmissionConflictError(
                         "Provider visible-input admission changed before request creation"
                     )
+                predecessor_id = str(decision.get("predecessor_request_id") or "")
+                if predecessor_id:
+                    predecessor = conn.execute(
+                        "SELECT state, run_id FROM provider_requests WHERE request_id = ? AND session_id = ?",
+                        (predecessor_id, session_id),
+                    ).fetchone()
+                    active = conn.execute(
+                        "SELECT 1 FROM provider_requests WHERE session_id = ? AND state IN ('queued', 'running') LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    predecessor_run = conn.execute("SELECT state FROM runs WHERE run_id = ?",
+                        (predecessor["run_id"],)).fetchone() if predecessor else None
+                    active_lease = conn.execute("SELECT 1 FROM host_run_leases WHERE run_id = ? AND status = 'active'",
+                        (predecessor["run_id"],)).fetchone() if predecessor else None
+                    if (session_manifest.get("last_native_admission_request_id") != predecessor_id
+                            or session_manifest.get("native_context_epoch", "") != decision.get("native_context_epoch", "")
+                            or not predecessor or predecessor["state"] not in {"completed", "cancelled", "failed"}
+                            or not predecessor_run or predecessor_run["state"] not in {"completed", "failed", "cancelled", "interrupted"}
+                            or active or active_lease):
+                        conn.execute("ROLLBACK")
+                        raise ProviderAdmissionConflictError("Native predecessor changed before continuation admission")
                 if uses_stable_admission:
                     admission_sequence = max_sequence + 1
                     decision.update(
@@ -2389,6 +2606,7 @@ class Store:
                         decision, separators=(",", ":"), sort_keys=True
                     )
                     session_manifest["admission_sequence"] = admission_sequence
+                    session_manifest["last_native_admission_request_id"] = data["request_id"]
                     conn.execute(
                         """
                         UPDATE provider_sessions
@@ -2402,6 +2620,7 @@ class Store:
                     INSERT INTO provider_requests (
                         request_id, tenant_id, owner_id, session_id, run_id, idempotency_key,
                         message_id, stream_id, state, requested_history_count, response_json,
+                        native_invocation_id, native_body_sha256,
                         replay_decision_json, admitted_instruction,
                         fallback_model_id, fallback_reasoning_effort, fallback_instruction,
                         fallback_state, fallback_from_run_id, response_timeout_s,
@@ -2410,6 +2629,7 @@ class Store:
                     ) VALUES (
                         :request_id, :tenant_id, :owner_id, :session_id, :run_id, :idempotency_key,
                         :message_id, :stream_id, :state, :requested_history_count, :response_json,
+                        :native_invocation_id, :native_body_sha256,
                         :replay_decision_json, :admitted_instruction,
                         :fallback_model_id, :fallback_reasoning_effort, :fallback_instruction,
                         :fallback_state, :fallback_from_run_id, :response_timeout_s,
@@ -2427,9 +2647,25 @@ class Store:
                 idempotency_key=idempotency_key,
             )
             if raced:
+                self.assert_provider_invocation_matches(raced, data)
                 return raced, False
+            if native_invocation_id and self.get_provider_request(
+                tenant_id=tenant_id, owner_id=owner_id, native_invocation_id=native_invocation_id,
+            ):
+                raise ProviderInvocationConflictError("Native invocation is already bound")
             raise
         return data, True
+
+    def list_provider_completed_without_response(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        """Bounded repair of retained contracts; legacy rows without one remain unsupported."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM provider_requests WHERE state = 'completed' AND response_json = ''
+                AND json_valid(replay_decision_json)
+                AND json_extract(replay_decision_json, '$.completion_contract_v1.version') = 1
+                ORDER BY created_at LIMIT ?""", (max(1, min(int(limit), 5000)),),
+            ).fetchall()
+        return self._rows(rows)
 
     def update_provider_request(self, request_id: str, **fields: Any) -> dict[str, Any] | None:
         if not fields:
@@ -5186,10 +5422,32 @@ class Store:
                 return None
             if conn.execute(
                 """
-                SELECT 1 FROM runs
-                WHERE worker_id = ? AND state IN (
+                SELECT 1 FROM runs AS blocking
+                WHERE blocking.worker_id = ? AND blocking.state IN (
                     'claimed', 'admitted', 'running', 'settling', 'paused', 'needs_input'
-                )
+                  )
+                  AND NOT (
+                      blocking.state = 'needs_input'
+                      AND blocking.failure_class =
+                          'conversation_capability_grant_required'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM host_run_leases
+                          WHERE host_run_leases.run_id = blocking.run_id
+                            AND host_run_leases.status = 'active'
+                      )
+                      AND EXISTS (
+                          SELECT 1 FROM provider_requests
+                          WHERE provider_requests.run_id = blocking.run_id
+                            AND provider_requests.state = 'failed'
+                            AND COALESCE(
+                                json_extract(
+                                    provider_requests.replay_decision_json,
+                                    '$.provider_session_mode'
+                                ),
+                                ''
+                            ) = 'stateless'
+                      )
+                  )
                 LIMIT 1
                 """,
                 (worker_id,),
@@ -7910,7 +8168,9 @@ class Store:
             row = conn.execute("SELECT * FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
         return self._row(row)
 
-    def _claim_pending_callback_parallel(self, callback_id: str) -> dict[str, Any] | None:
+    def _claim_pending_callback_parallel(
+        self, callback_id: str, *, recovery: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
         now = utc_now()
         lease_token = "cbdel_" + uuid.uuid4().hex
         lease_expires_at = (
@@ -7926,18 +8186,82 @@ class Store:
         ).isoformat()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            expected_status = "dead_lettered" if recovery is not None else "pending"
+            lifecycle_recovery = recovery is not None and bool(recovery.get("callback_ref"))
+            if lifecycle_recovery:
+                # Reuse the immutable callback trace identity. A new control operation or run
+                # cannot revive a prior Stop notification after its delivery budget expired.
+                candidate = conn.execute(
+                    """
+                    SELECT cb.callback_id FROM callback_outbox cb
+                    JOIN lifecycle_operation_effects effect
+                      ON cb.callback_id = 'cb_effect_' || effect.effect_id
+                      AND effect.worker_id = cb.worker_id AND effect.run_id = cb.run_id
+                    JOIN workers worker ON worker.worker_id = cb.worker_id
+                    JOIN runs run ON run.run_id = cb.run_id AND run.worker_id = cb.worker_id
+                    JOIN callback_trace_events trace ON trace.callback_id = cb.callback_id
+                      AND trace.callback_sequence = (
+                        SELECT MAX(latest.callback_sequence) FROM callback_trace_events latest
+                        WHERE latest.callback_id = cb.callback_id)
+                    WHERE cb.worker_id = ? AND cb.run_id = ? AND cb.status = 'dead_lettered'
+                      AND 'callback_sha256:' || glasshive_sha256(cb.callback_id) = ?
+                      AND 'sha256:' || glasshive_sha256(cb.payload_json) = ? AND trace.payload_sha256 = ?
+                      AND trace.authority_sha256 = ?
+                      AND effect.status = 'applied' AND effect.effect_kind = 'callback.work_stopped'
+                      AND effect.operation_kind = 'stop_run'
+                      AND effect.operation_digest = glasshive_sha256(worker.work_stop_id)
+                      AND worker.work_stop_id != '' AND worker.work_stop_settled_at IS NOT NULL
+                      AND worker.work_stop_outcome = 'cancelled'
+                      AND run.state = 'cancelled' AND run.ended_at IS NOT NULL
+                      AND cb.event_type = 'run.cancelled' AND cb.result_revision = 0
+                      AND COALESCE(cb.result_digest, '') = ''
+                    """,
+                    (recovery["worker_id"], recovery["run_id"], recovery["callback_ref"],
+                     recovery["payload_sha256"], recovery["payload_sha256"],
+                     recovery["authority_sha256"]),
+                ).fetchone()
+                if candidate is None:
+                    conn.execute("COMMIT")
+                    return None
+                callback_id = str(candidate["callback_id"])
             pending = conn.execute(
-                """
-                SELECT * FROM callback_outbox
-                WHERE callback_id = ? AND status = 'pending'
-                """,
-                (str(callback_id),),
+                "SELECT * FROM callback_outbox WHERE callback_id = ? AND status = ?",
+                (str(callback_id), expected_status),
             ).fetchone()
             if pending is None:
                 conn.execute("COMMIT")
                 return None
+            if recovery is not None:
+                association = conn.execute(
+                    """
+                    SELECT 1 FROM delegations
+                    JOIN runs ON runs.run_id = ?
+                      AND runs.worker_id = delegations.worker_id
+                      AND runs.project_id = delegations.project_id
+                      AND runs.tenant_id = delegations.tenant_id
+                    WHERE delegations.tenant_id = ? AND delegations.owner_id = ?
+                      AND delegations.origin_ref = ? AND delegations.work_ref = ?
+                      AND delegations.worker_id = ?
+                    """,
+                    (pending["run_id"], recovery["tenant_id"], recovery["owner_id"],
+                     recovery["origin_ref"], recovery["work_ref"], pending["worker_id"]),
+                ).fetchone()
+                if (
+                    association is None
+                    or pending["worker_id"] != recovery["worker_id"]
+                    or pending["run_id"] != recovery["run_id"]
+                    or (not lifecycle_recovery and (
+                        pending["result_revision"] != recovery["result_revision"]
+                        or pending["result_digest"] != recovery["result_digest"]
+                        or int(pending["result_revision"] or 0) < 1
+                    ))
+                    or (_parse_utc(now) - _parse_utc(pending["updated_at"])).total_seconds() < 60
+                ):
+                    conn.execute("COMMIT")
+                    return None
             if not self._terminal_callback_is_current_conn(conn, pending):
-                self._supersede_terminal_callback_conn(conn, pending, now=now)
+                if recovery is None:
+                    self._supersede_terminal_callback_conn(conn, pending, now=now)
                 conn.execute("COMMIT")
                 return None
             cur = conn.execute(
@@ -7947,9 +8271,9 @@ class Store:
                     delivery_lease_token = ?,
                     delivery_generation = delivery_generation + 1,
                     delivery_lease_expires_at = ?
-                WHERE callback_id = ? AND status = 'pending'
+                WHERE callback_id = ? AND status = ?
                 """,
-                (now, lease_token, lease_expires_at, callback_id),
+                (now, lease_token, lease_expires_at, callback_id, expected_status),
             )
             if cur.rowcount != 1:
                 conn.execute("COMMIT")
@@ -7964,6 +8288,21 @@ class Store:
 
     def claim_pending_callback(self, callback_id: str) -> dict[str, Any] | None:
         return self._claim_pending_callback_parallel(callback_id)
+
+    def claim_terminal_callback_recovery(
+        self, *, tenant_id: str, owner_id: str,
+        origin_ref: str, work_ref: str, worker_id: str, run_id: str,
+        callback_id: str = "", result_revision: int = 0, result_digest: str = "",
+        callback_ref: str = "", payload_sha256: str = "", authority_sha256: str = "",
+    ) -> dict[str, Any] | None:
+        """Lease one receiver-requested replay; retain the payload and total attempt history."""
+        return self._claim_pending_callback_parallel(callback_id, recovery={
+            "tenant_id": tenant_id, "owner_id": owner_id, "origin_ref": origin_ref,
+            "work_ref": work_ref, "worker_id": worker_id, "run_id": run_id,
+            "result_revision": result_revision, "result_digest": result_digest,
+            "callback_ref": callback_ref, "payload_sha256": payload_sha256,
+            "authority_sha256": authority_sha256,
+        })
 
     def _mark_callback_pending_parallel(
         self,
@@ -9333,6 +9672,44 @@ class Store:
                 attempt_id=downgraded_attempt_id,
                 created_at=str(now),
             )
+        # A lease this executor released on purpose during a managed shutdown is
+        # not lost dispatch ownership: the same run is re-queued and resumes on
+        # its own, so the user-facing wording must say exactly that.
+        managed_restart = (
+            conn.execute(
+                """
+                SELECT 1 FROM host_run_leases
+                WHERE run_id = ? AND status = 'released' AND release_reason = ?
+                  AND (? = '' OR attempt_id = ?)
+                ORDER BY acquired_at DESC, lease_id DESC
+                LIMIT 1
+                """,
+                (
+                    run_id,
+                    MANAGED_SHUTDOWN_LEASE_RELEASE_REASON,
+                    active_attempt_id,
+                    active_attempt_id,
+                ),
+            ).fetchone()
+            is not None
+        )
+        if managed_restart:
+            failure_user_message = MANAGED_RESTART_FAILURE_USER_MESSAGE
+            failure_recommended_recovery = (
+                MANAGED_RESTART_FAILURE_RECOMMENDED_RECOVERY
+            )
+            failure_diagnostic_summary = MANAGED_RESTART_FAILURE_DIAGNOSTIC_SUMMARY
+        else:
+            failure_user_message = (
+                "The prior execution state lacked exact durable dispatch ownership."
+            )
+            failure_recommended_recovery = (
+                "Retry the preserved work through normal admission."
+            )
+            failure_diagnostic_summary = (
+                "Running state was downgraded because its invocation lease or "
+                "attempt was not exact."
+            )
         conn.execute(
             """
             UPDATE host_run_leases
@@ -9361,12 +9738,9 @@ class Store:
                 retry_after = ?, last_retry_class = ?, error_text = ?,
                 failure_class = ?, failure_retryable = 1,
                 failure_structured = 1,
-                failure_user_message =
-                    'The prior execution state lacked exact durable dispatch ownership.',
-                failure_recommended_recovery =
-                    'Retry the preserved work through normal admission.',
-                failure_diagnostic_summary =
-                    'Running state was downgraded because its invocation lease or attempt was not exact.',
+                failure_user_message = ?,
+                failure_recommended_recovery = ?,
+                failure_diagnostic_summary = ?,
                 queue_wait_open = 1, queue_wait_generation = ?,
                 queue_wait_episode = ?, queue_wait_started_at = ?,
                 queue_wait_closed_at = NULL, queue_wait_duration_seconds = NULL,
@@ -9379,6 +9753,9 @@ class Store:
                 str(reason),
                 str(reason),
                 str(reason),
+                failure_user_message,
+                failure_recommended_recovery,
+                failure_diagnostic_summary,
                 generation,
                 generation,
                 wait_started_at,
@@ -10159,6 +10536,20 @@ class Store:
             ).fetchone()
         return row is not None
 
+    def latest_host_run_lease_for_run(self, run_id: str) -> dict[str, Any] | None:
+        """The most recently acquired host run lease for a run, whatever its status."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM host_run_leases
+                WHERE run_id = ?
+                ORDER BY acquired_at DESC, lease_id DESC
+                LIMIT 1
+                """,
+                (str(run_id or ""),),
+            ).fetchone()
+        return self._row(row) if row else None
+
     def list_active_host_run_leases(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -10200,22 +10591,27 @@ class Store:
         startup_session_id: str = "",
         lease_ttl_s: float = 30.0,
         reconciled: bool = False,
+        allow_expired: bool = False,
         now: datetime | None = None,
     ) -> dict[str, Any] | None:
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         now_iso = current.isoformat()
         expires_at = (current + timedelta(seconds=max(1.0, float(lease_ttl_s)))).isoformat()
+        # ``allow_expired`` is reserved for startup reconciliation that has verified the
+        # exact live generation identity recorded on this lease: the executor died, its
+        # lease timed out, but the durable worker process it fenced is provably still
+        # running. Every other heartbeat keeps the expiry fence.
         clauses = [
             "lease_id = ?",
             "status = 'active'",
-            "expires_at > ?",
+            *([] if allow_expired else ["expires_at > ?"]),
             """NOT EXISTS (
                 SELECT 1 FROM runs
                 WHERE runs.run_id = host_run_leases.run_id
                   AND runs.state IN ('completed', 'failed', 'cancelled')
             )""",
         ]
-        params: list[Any] = [lease_id, now_iso]
+        params: list[Any] = [lease_id, *([] if allow_expired else [now_iso])]
         if executor_id is not None:
             clauses.append("executor_id = ?")
             params.append(executor_id)
@@ -11366,6 +11762,7 @@ class Store:
         bootstrap_bundle: dict[str, Any] | None = None,
         require_isolated_parallel_ready: bool = False,
         preaccept_host_lease: dict[str, Any] | None = None,
+        queue_on_capacity: bool = False,
         trace_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         clean_resource_class, clean_resource_memory_bytes = _worker_resource_values(
@@ -11492,44 +11889,50 @@ class Store:
                 next_retry_at = str(
                     preaccept_host_lease.get("capacity_next_retry_at") or ""
                 ).strip()
-                self._assert_preaccept_host_lease_capacity(
-                    conn,
-                    runtime_family=str(
-                        preaccept_host_lease.get("runtime_family") or "host"
-                    ),
-                    lane=str(preaccept_host_lease.get("lane") or "mission"),
-                    tenant_id=tenant_id,
-                    owner_id=owner_id,
-                    run_id=run_id,
-                    conversation_limit=int(
-                        preaccept_host_lease.get("conversation_limit") or 1
-                    ),
-                    mission_limit=int(
-                        preaccept_host_lease.get("mission_limit") or 1
-                    ),
-                    account_mission_limit=int(
-                        preaccept_host_lease.get("account_mission_limit") or 1
-                    ),
-                    tenant_mission_limit=int(
-                        preaccept_host_lease.get("tenant_mission_limit") or 1
-                    ),
-                    mutation_scope=str(
-                        preaccept_host_lease.get("mutation_scope") or ""
-                    ),
-                    capacity_available=preaccept_host_lease.get(
-                        "capacity_available"
-                    ),
-                    capacity_required=preaccept_host_lease.get(
-                        "capacity_required"
-                    ),
-                    capacity_reservation=preaccept_host_lease.get(
-                        "capacity_reservation"
-                    ),
-                    capacity_observed_lease_ids=preaccept_host_lease.get(
-                        "capacity_observed_lease_ids"
-                    ),
-                    capacity_next_retry_at=next_retry_at,
-                )
+                try:
+                    self._assert_preaccept_host_lease_capacity(
+                        conn,
+                        runtime_family=str(
+                            preaccept_host_lease.get("runtime_family") or "host"
+                        ),
+                        lane=str(preaccept_host_lease.get("lane") or "mission"),
+                        tenant_id=tenant_id,
+                        owner_id=owner_id,
+                        run_id=run_id,
+                        conversation_limit=int(
+                            preaccept_host_lease.get("conversation_limit") or 1
+                        ),
+                        mission_limit=int(
+                            preaccept_host_lease.get("mission_limit") or 1
+                        ),
+                        account_mission_limit=int(
+                            preaccept_host_lease.get("account_mission_limit") or 1
+                        ),
+                        tenant_mission_limit=int(
+                            preaccept_host_lease.get("tenant_mission_limit") or 1
+                        ),
+                        mutation_scope=str(
+                            preaccept_host_lease.get("mutation_scope") or ""
+                        ),
+                        capacity_available=preaccept_host_lease.get(
+                            "capacity_available"
+                        ),
+                        capacity_required=preaccept_host_lease.get(
+                            "capacity_required"
+                        ),
+                        capacity_reservation=preaccept_host_lease.get(
+                            "capacity_reservation"
+                        ),
+                        capacity_observed_lease_ids=preaccept_host_lease.get(
+                            "capacity_observed_lease_ids"
+                        ),
+                        capacity_next_retry_at=next_retry_at,
+                    )
+                except HostRunLeaseCapacityError:
+                    if not queue_on_capacity:
+                        raise
+                    preaccept_host_lease = None
+            if preaccept_host_lease is not None:
                 reservation = _capacity_vector(
                     preaccept_host_lease.get("capacity_reservation")
                 )
@@ -13011,6 +13414,11 @@ class Store:
             if executor_id and str(row["executor_id"] or "") != str(executor_id):
                 conn.execute("ROLLBACK")
                 return None
+            if executor_id and str(row["status"] or "") == "completed":
+                # Startup recovery and its concurrent HTTP replay can finish the
+                # same owned effect. Return the first durable receipt unchanged.
+                conn.execute("ROLLBACK")
+                return self._row(row)
             if str(row["status"] or "") != "pending":
                 conn.execute("ROLLBACK")
                 return None
@@ -14202,7 +14610,7 @@ class Store:
         return self._row(row)
 
     def reconcile_cancelled_provider_needs_input_runs_for_worker(
-        self, worker_id: str
+        self, worker_id: str, *, run_id: str = ""
     ) -> list[dict[str, Any]]:
         """Settle legacy provider turns cancelled while their run awaited input."""
 
@@ -14221,6 +14629,7 @@ class Store:
                 WHERE runs.worker_id = ?
                   AND runs.state = 'needs_input'
                   AND provider_requests.state = 'cancelled'
+                  AND (? = '' OR runs.run_id = ?)
                   AND NOT EXISTS (
                       SELECT 1 FROM host_run_leases
                       WHERE host_run_leases.run_id = runs.run_id
@@ -14228,7 +14637,7 @@ class Store:
                   )
                 ORDER BY runs.run_id
                 """,
-                (clean_worker_id,),
+                (clean_worker_id, run_id, run_id),
             ).fetchall()
             run_ids = [str(row["run_id"]) for row in rows]
             if run_ids:
@@ -14272,7 +14681,7 @@ class Store:
                       AND NOT EXISTS (
                           SELECT 1 FROM runs
                           WHERE worker_id = ? AND state IN (
-                              'queued', 'claimed', 'admitted', 'running',
+                              'claimed', 'admitted', 'running',
                               'settling', 'paused', 'needs_input'
                           )
                       )
@@ -14516,6 +14925,42 @@ class Store:
             "newly_expired": newly_expired,
         }
 
+    def commit_provider_request_terminal(
+        self, request_id: str, *, expected_run_id: str, state: str,
+        response_json: str = "", summary: str = "", activity_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Commit terminal state and its first canonical artifact against the same run/Stop."""
+        if state not in {"completed", "failed", "cancelled"}:
+            raise ValueError("Invalid provider terminal state")
+        if state == "completed" and not response_json:
+            raise ValueError("Completed provider request requires a saved response")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = conn.execute(
+                """
+                UPDATE provider_requests SET state = ?, response_json = ?, updated_at = ?
+                WHERE request_id = ? AND run_id = ?
+                  AND fallback_state NOT IN ('claimed', 'context_recovery_claimed')
+                  AND (state IN ('queued', 'running') OR
+                       (state = 'completed' AND ? = 'completed' AND response_json = ''))
+                """,
+                (state, response_json if state == "completed" else "", utc_now(),
+                 request_id, expected_run_id, state),
+            ).rowcount
+            if changed and summary:
+                conn.execute(
+                    """
+                    INSERT INTO provider_activity(request_id, event_type, summary, payload_json, created_at)
+                    SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (
+                        SELECT 1 FROM provider_activity WHERE request_id = ? AND event_type = ?)
+                    """,
+                    (request_id, state, summary, json.dumps(activity_payload or {}, sort_keys=True),
+                     utc_now(), request_id, state),
+                )
+            row = conn.execute("SELECT * FROM provider_requests WHERE request_id = ?", (request_id,)).fetchone()
+            conn.execute("COMMIT")
+        return self._row(row)
+
     def set_provider_request_response_if_empty(
         self, request_id: str, response_json: str
     ) -> dict[str, Any] | None:
@@ -14629,7 +15074,24 @@ class Store:
                 == "conversation_capability_grant_required"
                 and not bool(run["failure_retryable"])
                 and bool(run["failure_structured"])
-                and str(worker["state"] or "") == "needs_input"
+                and (
+                    str(worker["state"] or "") == "needs_input"
+                    or (
+                        str(worker["state"] or "") in {"ready", "starting", "running"}
+                        and json.loads(str(request["replay_decision_json"] or "{}")).get(
+                            "provider_session_mode") == "stateless"
+                    )
+                )
+                and not str(worker["compute_release_token"] or "")
+                and not conn.execute(
+                    "SELECT 1 FROM runs WHERE worker_id = ? AND state = 'paused' LIMIT 1",
+                    (worker["worker_id"],),
+                ).fetchone()
+                and str((conn.execute(
+                    "SELECT event_type FROM events WHERE worker_id = ? AND event_type IN "
+                    "('worker.paused', 'worker.resumed', 'worker.resumed_by_alias') ORDER BY rowid DESC LIMIT 1",
+                    (worker["worker_id"],),
+                ).fetchone() or [""])[0]) != "worker.paused"
                 and active_lease is None
                 and (
                     not attempt_id
@@ -15061,9 +15523,8 @@ class Store:
                     JOIN runs ON runs.worker_id = workers.worker_id
                     WHERE workers.execution_mode = 'host'
                       AND workers.trusted_run_lane = 'mission'
-                      AND runs.state IN (
-                          'queued', 'claimed', 'admitted', 'running',
-                          'settling', 'paused', 'needs_input'
+                      AND runs.state NOT IN (
+                          'completed', 'failed', 'cancelled', 'interrupted'
                       )
                     UNION
                     SELECT leases.worker_id AS worker_id
@@ -15088,9 +15549,8 @@ class Store:
                     JOIN runs ON runs.worker_id = workers.worker_id
                     WHERE workers.execution_mode = 'host'
                       AND workers.trusted_run_lane = 'mission'
-                      AND runs.state IN (
-                          'queued', 'claimed', 'admitted', 'running',
-                          'settling', 'paused', 'needs_input'
+                      AND runs.state NOT IN (
+                          'completed', 'failed', 'cancelled', 'interrupted'
                       )
                     UNION
                     SELECT leases.worker_id AS worker_id
@@ -15115,6 +15575,41 @@ class Store:
                 """
             ).fetchall()
         return self._rows(rows)
+
+    def conclusively_terminal_host_mission_history(
+        self,
+    ) -> set[tuple[str, str]]:
+        """Return exact finished runs with no current mission or active lease."""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT workers.worker_id, runs.run_id
+                FROM workers
+                JOIN runs ON runs.worker_id = workers.worker_id
+                WHERE workers.execution_mode = 'host'
+                  AND workers.trusted_run_lane = 'mission'
+                  AND runs.state IN (
+                      'completed', 'failed', 'cancelled', 'interrupted'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM runs AS current_runs
+                      WHERE current_runs.worker_id = workers.worker_id
+                        AND current_runs.state NOT IN (
+                            'completed', 'failed', 'cancelled', 'interrupted'
+                        )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM host_run_leases AS active_leases
+                      WHERE active_leases.worker_id = workers.worker_id
+                        AND active_leases.status = 'active'
+                  )
+                """
+            ).fetchall()
+        return {
+            (str(row["worker_id"]), str(row["run_id"]))
+            for row in rows
+        }
 
     @staticmethod
     def _lifecycle_event_id(
@@ -15314,8 +15809,10 @@ class Store:
             "grantId",
             "containerGenerationId",
         }
-        if not isinstance(binding, dict) or set(binding) != expected:
+        host_expected = (expected - {"containerGenerationId"}) | {"hostStartupLeaseId"}
+        if not isinstance(binding, dict) or set(binding) not in (expected, host_expected):
             raise ValueError("Capability revocation requires an exact binding")
+        expected = set(binding)
         normalized = {key: str(binding.get(key) or "").strip() for key in expected}
         if any(not value or len(value) > 256 for value in normalized.values()):
             raise ValueError("Capability revocation requires an exact binding")
@@ -15331,10 +15828,10 @@ class Store:
                 INSERT OR IGNORE INTO capability_grant_revocations (
                     revocation_id, authorization_ref, origin_ref, work_ref,
                     worker_id, run_id, grant_id, container_generation_id,
-                    status, lease_owner, lease_epoch, lease_expires_at,
+                    host_startup_lease_id, status, lease_owner, lease_epoch, lease_expires_at,
                     next_attempt_at, attempts, last_error_code,
                     created_at, updated_at, applied_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'armed', '', 0, NULL,
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'armed', '', 0, NULL,
                           NULL, 0, '', ?, ?, NULL)
                 """,
                 (
@@ -15345,7 +15842,8 @@ class Store:
                     normalized["workerId"],
                     normalized["runId"],
                     normalized["grantId"],
-                    normalized["containerGenerationId"],
+                    normalized.get("containerGenerationId", ""),
+                    normalized.get("hostStartupLeaseId", ""),
                     now,
                     now,
                 ),
@@ -19219,6 +19717,20 @@ class Store:
         else:
             result_revision = 0
 
+        if "run_input" in payload:
+            # Validate against the same run inside the outbox transaction, so
+            # a stale or forged source cannot join an otherwise valid result.
+            if (
+                str(exact_run["state"] or "") not in TERMINAL_RUN_STATES
+                or not str(exact_run["ended_at"] or "")
+                or not _terminal_callback_wire_state(str(exact_run["state"] or ""), event_type)
+                or json.dumps(payload["run_input"], sort_keys=True, ensure_ascii=False)
+                != json.dumps(accepted_run_input(dict(exact_run)), sort_keys=True, ensure_ascii=False)
+            ):
+                raise CallbackIntentGenerationConflictError(
+                    "Callback accepted run input is not exact"
+                )
+
         exact_fields = {
             "callback_id": callback_id,
             "event": event_type,
@@ -19972,6 +20484,7 @@ class Store:
         capacity_attempts: list[dict[str, Any]] = []
         callbacks_by_ref: dict[str, dict[str, Any]] = {}
         artifact_history: list[dict[str, Any]] = []
+        continuity_projections: list[dict[str, Any]] = []
         all_attempt_refs: set[str] = set()
         all_capacity_count = 0
         previous_sha = ""
@@ -20009,6 +20522,8 @@ class Store:
                     origin = dict(stored_origin)
                 if isinstance(stored_prompt_layers, dict):
                     prompt_layers = dict(stored_prompt_layers)
+            elif event_type == "continuity.projected" and in_snapshot:
+                continuity_projections.append(dict(payload))
             elif event_type == "provider.invoked" and in_snapshot:
                 provider_attempts.append(dict(payload))
             elif event_type == "runtime.invoked" and in_snapshot:
@@ -20062,53 +20577,9 @@ class Store:
             attempts_by_ref.values(), key=lambda item: int(item.get("attemptNumber") or 0)
         )
         callbacks: list[dict[str, Any]] = []
-        previous_callback_sha = ""
-        callback_sequences: dict[str, int] = {}
-        for ledger_index, row in enumerate(callback_ledger_rows, start=1):
-            try:
-                snapshot = json.loads(str(row["snapshot_json"] or "{}"))
-            except (TypeError, json.JSONDecodeError) as exc:
-                raise RuntimeError("Callback trace integrity check failed") from exc
-            if not isinstance(snapshot, dict) or set(snapshot) != set(
-                CALLBACK_TRACE_SNAPSHOT_FIELDS
-            ):
-                raise RuntimeError("Callback trace integrity check failed")
-            expected_event_sha = _callback_trace_event_sha256_values(
-                row["callback_id"],
-                row["callback_sequence"],
-                row["run_sequence"],
-                row["snapshot_json"],
-                row["previous_event_sha256"],
-            )
-            expected_payload_sha = "sha256:" + _text_sha256(snapshot["payloadJson"])
-            expected_authority_sha = "sha256:" + _text_sha256(
-                _callback_trace_authority_values(
-                    *(
-                        snapshot[field]
-                        for field in CALLBACK_TRACE_AUTHORITY_FIELDS
-                    )
-                )
-            )
-            callback_id = str(snapshot["callbackId"] or "")
-            expected_callback_sequence = callback_sequences.get(callback_id, 0) + 1
-            expected_run_sequence = ledger_index
-            if (
-                str(row["run_id"] or "") != str(run_id)
-                or callback_id != str(row["callback_id"] or "")
-                or str(snapshot["runId"] or "") != str(row["run_id"] or "")
-                or str(snapshot["status"] or "") != str(row["status"] or "")
-                or int(row["callback_sequence"] or 0)
-                != expected_callback_sequence
-                or int(row["run_sequence"] or 0) != expected_run_sequence
-                or str(row["previous_event_sha256"] or "")
-                != previous_callback_sha
-                or str(row["event_sha256"] or "") != expected_event_sha
-                or str(row["payload_sha256"] or "") != expected_payload_sha
-                or str(row["authority_sha256"] or "") != expected_authority_sha
-            ):
-                raise RuntimeError("Callback trace integrity check failed")
-            previous_callback_sha = expected_event_sha
-            callback_sequences[callback_id] = expected_callback_sequence
+        verified_snapshots = verified_callback_trace_snapshots(callback_ledger_rows, str(run_id))
+        for ledger_index, (row, snapshot) in enumerate(zip(callback_ledger_rows, verified_snapshots, strict=True), start=1):
+            callback_id = str(snapshot["callbackId"])
             if ledger_index <= callback_snapshot_count:
                 callbacks.append(
                     {
@@ -20194,6 +20665,8 @@ class Store:
             }
         else:
             traceability["providerAttempts"] = provider_attempts
+        if continuity_projections:
+            traceability["continuityProjections"] = continuity_projections
         totals = (
             len(attempts),
             len(capacity_attempts),
@@ -21401,6 +21874,196 @@ class Store:
             ).fetchone()
         return row is not None
 
+    def has_queued_running_invariant_retry(self, worker_id: str) -> bool:
+        """Return whether startup recovery requeued an unowned running generation."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM runs
+                WHERE worker_id = ?
+                  AND state = 'queued'
+                  AND retry_after IS NOT NULL
+                  AND retry_after != ''
+                  AND failure_retryable = 1
+                  AND failure_structured = 1
+                  AND failure_class = 'running_invariant_reconciled'
+                  AND last_retry_class = 'running_invariant_reconciled'
+                  AND queue_blocker_class = 'running_invariant_reconciled'
+                LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+        return row is not None
+
+    def reconcile_automatic_retry_worker(self, worker_id: str) -> dict[str, Any] | None:
+        """Atomically project a system retry without overriding durable pause intent."""
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            worker = conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            retry = conn.execute(
+                """
+                SELECT 1 FROM runs
+                WHERE worker_id = ?
+                  AND state = 'queued'
+                  AND retry_after IS NOT NULL
+                  AND retry_after != ''
+                  AND failure_retryable = 1
+                  AND failure_structured = 1
+                  AND (
+                      (
+                          failure_class IN ('host_capacity', 'host_worker_busy')
+                          AND last_retry_class IN ('host_capacity', 'host_worker_busy')
+                      )
+                      OR (
+                          failure_class = 'running_invariant_reconciled'
+                          AND last_retry_class = 'running_invariant_reconciled'
+                          AND queue_blocker_class = 'running_invariant_reconciled'
+                      )
+                  )
+                LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+            if worker is None or retry is None:
+                conn.execute("COMMIT")
+                return None
+            paused_run = conn.execute(
+                """
+                SELECT 1 FROM runs
+                WHERE worker_id = ? AND state = 'paused'
+                LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+            latest_control = conn.execute(
+                """
+                SELECT event_type FROM events
+                WHERE worker_id = ?
+                  AND event_type IN (
+                      'worker.paused', 'worker.resumed', 'worker.resumed_by_alias'
+                  )
+                ORDER BY rowid DESC
+                LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+            operator_paused = bool(
+                latest_control is not None
+                and str(latest_control["event_type"] or "") == "worker.paused"
+            )
+            state = "paused" if paused_run is not None or operator_paused else "ready"
+            conn.execute(
+                """
+                UPDATE workers
+                SET state = ?
+                WHERE worker_id = ?
+                  AND compute_release_token = ''
+                  AND COALESCE(work_stop_id, '') = ''
+                  AND state NOT IN ('needs_input', 'stopping', 'terminated',
+                                    'terminating', 'termination_failed')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM runs AS active
+                      WHERE active.worker_id = workers.worker_id
+                        AND active.state IN ('claimed', 'admitted', 'running', 'settling')
+                  )
+                """,
+                (state, worker_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            conn.execute("COMMIT")
+        return self._row(row)
+
+    def reconcile_restart_authority_blocked_workers(
+        self,
+        *,
+        limit: int = 64,
+    ) -> list[str]:
+        """Unblock siblings behind an exact-replay-recoverable stateless turn."""
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT workers.worker_id
+                FROM workers
+                WHERE workers.state IN ('needs_input', 'paused')
+                  AND workers.work_stop_id = ''
+                  AND workers.compute_release_token = ''
+                  AND EXISTS (
+                      SELECT 1 FROM runs AS blocked
+                      WHERE blocked.worker_id = workers.worker_id
+                        AND blocked.state = 'needs_input'
+                        AND blocked.failure_class =
+                            'conversation_capability_grant_required'
+                        AND NOT EXISTS (
+                            SELECT 1 FROM host_run_leases
+                            WHERE host_run_leases.run_id = blocked.run_id
+                              AND host_run_leases.status = 'active'
+                        )
+                        AND EXISTS (
+                            SELECT 1 FROM provider_requests
+                            WHERE provider_requests.run_id = blocked.run_id
+                              AND provider_requests.state = 'failed'
+                              AND COALESCE(
+                                  json_extract(
+                                      provider_requests.replay_decision_json,
+                                      '$.provider_session_mode'
+                                  ),
+                                  ''
+                              ) = 'stateless'
+                        )
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM runs AS sibling
+                      WHERE sibling.worker_id = workers.worker_id
+                        AND sibling.state = 'queued'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM runs AS paused
+                      WHERE paused.worker_id = workers.worker_id
+                        AND paused.state = 'paused'
+                  )
+                  AND COALESCE(
+                      (
+                          SELECT event_type FROM events
+                          WHERE events.worker_id = workers.worker_id
+                            AND event_type IN (
+                                'worker.paused', 'worker.resumed',
+                                'worker.resumed_by_alias'
+                            )
+                          ORDER BY rowid DESC
+                          LIMIT 1
+                      ),
+                      ''
+                  ) != 'worker.paused'
+                ORDER BY workers.worker_id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 256)),),
+            ).fetchall()
+            worker_ids = [str(row["worker_id"]) for row in rows]
+            for worker_id in worker_ids:
+                conn.execute(
+                    """
+                    UPDATE workers
+                    SET state = 'ready'
+                    WHERE worker_id = ?
+                      AND state IN ('needs_input', 'paused')
+                      AND compute_release_token = ''
+                    """,
+                    (worker_id,),
+                )
+            conn.execute("COMMIT")
+        return worker_ids
+
     def has_active_operator_pause(self, worker_id: str) -> bool:
         """Return whether the latest explicit pause/resume intent is still paused."""
 
@@ -21437,6 +22100,7 @@ class Store:
         route_failure_class: str = "",
         route_source_runtime: str = "",
         route_source_model: str = "",
+        fallback_bootstrap_bundle: dict[str, Any] | None = None,
         **failure_fields: Any,
     ) -> dict[str, Any] | None:
         """Atomically move one untouched Parallel run to its trusted fallback profile."""
@@ -21495,6 +22159,21 @@ class Store:
             ):
                 conn.execute("COMMIT")
                 return None
+            # Persist the model source with the route in this same transaction.
+            # A later worker refresh must never restore the primary model.
+            bundle = json.loads(str(worker["bootstrap_bundle_json"] or "{}"))
+            effort_key = {
+                "codex-cli": "WPR_CODEX_CLI_REASONING_EFFORT",
+                "claude-code": "WPR_CLAUDE_CODE_EFFORT",
+            }.get(fallback_profile)
+            selected_env = (fallback_bootstrap_bundle or {}).get("env") or {}
+            if effort_key and effort_key in selected_env:
+                bundle["env"] = {
+                    **dict(bundle.get("env") or {}),
+                    effort_key: selected_env[effort_key],
+                }
+            bundle["provider_model"] = fallback_model
+            params["bootstrap_bundle_json"] = json.dumps(bundle)
             wait_open = bool(run["queue_wait_open"])
             generation = max(1, int(run["queue_wait_generation"] or 0))
             if not wait_open:
@@ -21545,6 +22224,7 @@ class Store:
                     backend = :fallback_backend,
                     runtime = :fallback_runtime,
                     model = :fallback_model,
+                    bootstrap_bundle_json = :bootstrap_bundle_json,
                     session_key = NULL,
                     state = 'ready',
                     last_error = '',

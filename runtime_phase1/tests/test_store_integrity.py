@@ -70,6 +70,102 @@ def _project(store: Store, suffix: str) -> dict:
     )
 
 
+@pytest.mark.parametrize("migration_mode", ["normal", "rollback", "concurrent"])
+def test_provider_session_scope_migration_preserves_legacy_identity_and_dependants(tmp_path, monkeypatch, migration_mode):
+    db_path = tmp_path / "runtime.db"
+    store = Store(str(db_path))
+    project = _project(store, "session scopes")
+    worker = store.create_worker(
+        project_id=project["project_id"], owner_id="owner", name="Legacy conversation",
+        role="conversation-agent", profile="codex-cli", backend="", runtime="codex-cli", model="stub",
+    )
+    legacy = store.upsert_provider_session(
+        tenant_id="local", owner_id="owner", conversation_id="same-conversation", agent_id="same-agent",
+        model_id="codex-cli:gpt-5.6-sol", project_id=project["project_id"], worker_id=worker["worker_id"],
+        workspace_dir=str(tmp_path), access_mode="workspace", history_count=7,
+        context_manifest={"messages": 7, "stable_authority_sha256": "a" * 64},
+    )
+    request, _ = store.create_provider_request(
+        tenant_id="local", owner_id="owner", session_id=legacy["session_id"],
+        idempotency_key="retained-request", requested_history_count=7,
+        message_id="retained-message", stream_id="retained-stream",
+    )
+    with store._connect() as conn:
+        conn.execute("INSERT INTO provider_session_visible_admissions VALUES (?, ?, ?, ?)",
+                     (legacy["session_id"], "msg:retained", "retained-turn:1", "2026-01-01T00:00:00Z"))
+    # Materialize the actual pre-scope table, retaining its rows and referencing request.
+    store.close()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("CREATE TABLE legacy_sessions (session_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL DEFAULT 'local', owner_id TEXT NOT NULL, conversation_id TEXT NOT NULL, agent_id TEXT NOT NULL, model_id TEXT NOT NULL, project_id TEXT NOT NULL, worker_id TEXT NOT NULL, workspace_dir TEXT NOT NULL, access_mode TEXT NOT NULL, history_count INTEGER NOT NULL DEFAULT 0, context_manifest_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(tenant_id,owner_id,conversation_id,agent_id), FOREIGN KEY(project_id) REFERENCES projects(project_id), FOREIGN KEY(worker_id) REFERENCES workers(worker_id))")
+        fields = [row[1] for row in conn.execute("PRAGMA table_info(legacy_sessions)")]
+        columns = ",".join(fields)
+        conn.execute(f"INSERT INTO legacy_sessions ({columns}) SELECT {columns} FROM provider_sessions")
+        conn.execute("DROP TABLE provider_sessions")
+        conn.execute("ALTER TABLE legacy_sessions RENAME TO provider_sessions")
+        conn.execute("UPDATE glasshive_schema_versions SET version=7 WHERE component='runtime_store'")
+        conn.execute("CREATE INDEX scoped_legacy_index ON provider_sessions(history_count)")
+        conn.execute("CREATE TABLE scope_migration_audit(session_id TEXT)")
+        conn.execute("CREATE TRIGGER scoped_legacy_trigger AFTER UPDATE ON provider_sessions BEGIN INSERT INTO scope_migration_audit VALUES (NEW.session_id); END")
+
+    if migration_mode == "rollback":
+        migrate = Store._migrate_provider_session_scopes
+
+        def fail_after_rebuild(conn):
+            migrate(conn)
+            raise RuntimeError("Synthetic failure after rebuilding sessions")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Store, "_migrate_provider_session_scopes", staticmethod(fail_after_rebuild))
+            with pytest.raises(RuntimeError, match="Synthetic failure"):
+                Store(str(db_path))
+        with sqlite3.connect(db_path) as conn:
+            assert "actor_kind" not in {row[1] for row in conn.execute("PRAGMA table_info(provider_sessions)")}
+            assert conn.execute("SELECT version FROM glasshive_schema_versions WHERE component='runtime_store'").fetchone()[0] == 7
+            assert conn.execute("SELECT COUNT(*) FROM provider_session_visible_admissions").fetchone()[0] == 1
+    if migration_mode == "concurrent":
+        begin = store_module.begin_schema_migration
+        barrier = Barrier(2)
+
+        def simultaneous_begin(conn):
+            barrier.wait(timeout=5)
+            begin(conn)
+
+        with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=2) as pool:
+            patch.setattr(store_module, "begin_schema_migration", simultaneous_begin)
+            instances = list(pool.map(lambda _: Store(str(db_path)), range(2)))
+        reopened = instances[0]
+        instances[1].close()
+    else:
+        reopened = Store(str(db_path))
+    try:
+        migrated = reopened.get_provider_session_by_id(legacy["session_id"])
+        assert {field: migrated[field] for field in fields} == {field: legacy[field] for field in fields}
+        assert (migrated["actor_kind"], migrated["origin"]) == ("external_user", "interactive")
+        assert reopened.get_provider_request(request["request_id"])["session_id"] == legacy["session_id"]
+        other_worker = reopened.create_worker(
+            project_id=project["project_id"], owner_id="owner", name="Scheduled conversation",
+            role="conversation-agent", profile="codex-cli", backend="", runtime="codex-cli", model="stub",
+        )
+        scheduled = reopened.upsert_provider_session(
+            tenant_id="local", owner_id="owner", conversation_id="same-conversation", agent_id="same-agent",
+            actor_kind="system", origin="scheduler", model_id="codex-cli:gpt-5.6-sol",
+            project_id=project["project_id"], worker_id=other_worker["worker_id"], workspace_dir=str(tmp_path), access_mode="workspace",
+        )
+        assert scheduled["session_id"] != legacy["session_id"]
+        assert reopened.get_provider_session(tenant_id="local", owner_id="owner", conversation_id="same-conversation", agent_id="same-agent")["session_id"] == legacy["session_id"]
+        with reopened._connect() as conn:
+            assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+            assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+            assert conn.execute("SELECT message_key FROM provider_session_visible_admissions").fetchone()[0] == "msg:retained"
+            assert {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE name IN ('scoped_legacy_index', 'scoped_legacy_trigger')")} == {"scoped_legacy_index", "scoped_legacy_trigger"}
+        reopened.update_provider_session_history(legacy["session_id"], history_count=8)
+        with reopened._connect() as conn:
+            assert conn.execute("SELECT session_id FROM scope_migration_audit").fetchone()[0] == legacy["session_id"]
+    finally:
+        reopened.close()
+
+
 def test_provider_session_advancement_is_exactly_once_and_cursor_guarded(tmp_path):
     store = Store(str(tmp_path / "runtime.db"))
     project = _project(store, "provider advancement")

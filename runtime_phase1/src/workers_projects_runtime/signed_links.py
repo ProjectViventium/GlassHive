@@ -11,6 +11,8 @@ import stat
 import sys
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from hashlib import sha256
 from pathlib import Path
 from urllib.parse import quote, urlencode
@@ -73,7 +75,7 @@ def _worker_is_terminated_in_runtime_db(worker_id: str) -> bool:
     if not db_path.is_file():
         return False
     try:
-        with sqlite3.connect(db_path, timeout=1) as conn:
+        with closing(sqlite3.connect(db_path, timeout=1)) as conn:
             row = conn.execute(
                 "SELECT state FROM workers WHERE worker_id = ?",
                 (clean_worker_id,),
@@ -341,7 +343,8 @@ def _validate_shared_link_ref_state(db_path: Path, shared_gid: int) -> None:
             raise PermissionError("shared link reference database has unsafe ownership or permissions")
 
 
-def _link_ref_conn() -> sqlite3.Connection:
+@contextmanager
+def _link_ref_conn() -> Iterator[sqlite3.Connection]:
     db_path = link_ref_state_path()
     if _shared_link_ref_group_gid() is None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -375,10 +378,10 @@ def _link_ref_conn() -> sqlite3.Connection:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signed_link_refs_expires_at ON signed_link_refs(expires_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signed_link_refs_scope_key ON signed_link_refs(scope_key)")
         _harden_sqlite_state_path(db_path)
-        return conn
-    except Exception:
+        with conn:
+            yield conn
+    finally:
         conn.close()
-        raise
 
 
 def _payload_json(payload: dict[str, object]) -> str:
@@ -482,7 +485,7 @@ def is_worker_signed_link_revoked(worker_id: str) -> bool:
     if not db_path.is_file():
         return False
     try:
-        with sqlite3.connect(db_path, timeout=1) as conn:
+        with closing(sqlite3.connect(db_path, timeout=1)) as conn:
             table = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "
                 "AND name = 'signed_link_worker_revocations'"

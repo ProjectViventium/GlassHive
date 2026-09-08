@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 
 from .schema_version import execute_schema_script
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS capability_grant_revocations (
                     run_id TEXT NOT NULL,
                     grant_id TEXT NOT NULL,
                     container_generation_id TEXT NOT NULL,
+                    host_startup_lease_id TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'armed',
                     lease_owner TEXT NOT NULL DEFAULT '',
                     lease_epoch INTEGER NOT NULL DEFAULT 0,
@@ -382,6 +384,7 @@ CREATE TABLE IF NOT EXISTS work_trace_events (
 COMMON_TABLE_COLUMN_ADDITIONS: dict[str, tuple[str, ...]] = {'callback_outbox': ('attempt_number INTEGER NOT NULL DEFAULT 0', 'result_revision INTEGER NOT NULL DEFAULT 0', "result_digest TEXT NOT NULL DEFAULT ''", 'http_accepted_at TEXT', "delivery_lease_token TEXT NOT NULL DEFAULT ''", 'delivery_generation INTEGER NOT NULL DEFAULT 0', 'delivery_lease_expires_at TEXT'), 'events': ("payload_json TEXT NOT NULL DEFAULT '{}'",), 'provider_requests': ("replay_decision_json TEXT NOT NULL DEFAULT '{}'", "admitted_instruction TEXT NOT NULL DEFAULT ''", "fallback_model_id TEXT NOT NULL DEFAULT ''", "fallback_reasoning_effort TEXT NOT NULL DEFAULT ''", "fallback_instruction TEXT NOT NULL DEFAULT ''", "fallback_state TEXT NOT NULL DEFAULT ''", "fallback_from_run_id TEXT NOT NULL DEFAULT ''", 'response_timeout_s REAL', "response_deadline_at TEXT NOT NULL DEFAULT ''"), 'runs': ('first_queued_at TEXT NOT NULL', 'queue_deadline_at TEXT NOT NULL', "queue_blocker_class TEXT NOT NULL DEFAULT 'admission_pending'", 'queue_next_status_at TEXT', 'queue_wait_episode INTEGER NOT NULL DEFAULT 1', 'queue_wait_open INTEGER NOT NULL DEFAULT 1', 'queue_wait_generation INTEGER NOT NULL DEFAULT 1', 'queue_wait_started_at TEXT NOT NULL', 'queue_wait_closed_at TEXT', 'queue_wait_duration_seconds INTEGER', 'queue_transition_emitted INTEGER NOT NULL DEFAULT 0', 'queue_status_sequence INTEGER NOT NULL DEFAULT 0', "queue_callback_state TEXT NOT NULL DEFAULT 'unknown'", "queue_terminal_callback_id TEXT NOT NULL DEFAULT ''", 'claimed_at TEXT', 'admitted_at TEXT', 'runtime_invoked_at TEXT', "active_attempt_id TEXT NOT NULL DEFAULT ''", 'terminal_result_revision INTEGER NOT NULL DEFAULT 0', 'failure_structured INTEGER NOT NULL DEFAULT 0', 'capacity_retry_count INTEGER NOT NULL DEFAULT 0', "native_session_id TEXT NOT NULL DEFAULT ''", "native_capabilities_json TEXT NOT NULL DEFAULT '{}'", "native_child_summary_json TEXT NOT NULL DEFAULT '{}'", 'liveness_started_at TEXT', 'meaningful_progress_at TEXT', 'meaningful_progress_sequence INTEGER NOT NULL DEFAULT 0', 'internal_retry_count INTEGER NOT NULL DEFAULT 0', "last_internal_retry_class TEXT NOT NULL DEFAULT ''", "liveness_mode TEXT NOT NULL DEFAULT 'standard'", 'provider_liveness_route_locked INTEGER NOT NULL DEFAULT 0', "capacity_class TEXT NOT NULL DEFAULT ''", "capacity_available_json TEXT NOT NULL DEFAULT '{}'", "capacity_required_json TEXT NOT NULL DEFAULT '{}'", "capacity_shortage_json TEXT NOT NULL DEFAULT '{}'", "capacity_reservation_json TEXT NOT NULL DEFAULT '{}'", 'capacity_next_retry_at TEXT', "provider_route_profile TEXT NOT NULL DEFAULT ''", "provider_route_runtime TEXT NOT NULL DEFAULT ''", "provider_route_model TEXT NOT NULL DEFAULT ''", "provider_route_decision TEXT NOT NULL DEFAULT ''", "provider_route_from_profile TEXT NOT NULL DEFAULT ''", "provider_route_from_runtime TEXT NOT NULL DEFAULT ''", "provider_route_from_model TEXT NOT NULL DEFAULT ''", "provider_route_failure_class TEXT NOT NULL DEFAULT ''", 'provider_route_cooldown_until TEXT', "continuation_contract_json TEXT NOT NULL DEFAULT '{}'", "continuation_context_json TEXT NOT NULL DEFAULT '{}'"), 'workers': ("trusted_run_lane TEXT NOT NULL DEFAULT 'mission'", "resource_class TEXT NOT NULL DEFAULT 'standard'", 'resource_memory_bytes INTEGER NOT NULL DEFAULT 3221225472', "compute_release_token TEXT NOT NULL DEFAULT ''", "compute_release_owner TEXT NOT NULL DEFAULT ''", 'compute_release_claimed_at TEXT', 'compute_release_expires_at TEXT', 'compute_release_epoch INTEGER NOT NULL DEFAULT 0', "compute_release_kind TEXT NOT NULL DEFAULT ''", "compute_release_scope TEXT NOT NULL DEFAULT 'compute_only'", "compute_release_container_id TEXT NOT NULL DEFAULT ''", "compute_release_session_fingerprint TEXT NOT NULL DEFAULT ''", "compute_release_target_run_id TEXT NOT NULL DEFAULT ''", "compute_release_target_started_at TEXT NOT NULL DEFAULT ''", "compute_release_terminal_run_id TEXT NOT NULL DEFAULT ''", "compute_release_replacement_run_id TEXT NOT NULL DEFAULT ''", 'compute_release_runtime_confirmed_at TEXT', "compute_release_runtime_proof_digest TEXT NOT NULL DEFAULT ''", "compute_release_operation_id TEXT NOT NULL DEFAULT ''", "work_stop_id TEXT NOT NULL DEFAULT ''", 'work_stop_requested_at TEXT', 'work_stop_settled_at TEXT', "work_stop_outcome TEXT NOT NULL DEFAULT ''")}
 
 PARALLEL_TABLE_COLUMN_ADDITIONS: dict[str, tuple[str, ...]] = {
+    "capability_grant_revocations": ("host_startup_lease_id TEXT NOT NULL DEFAULT ''",),
     "active_work_action_uses": (
         "source_run_id TEXT NOT NULL DEFAULT ''",
         "effect_phase TEXT NOT NULL DEFAULT ''",
@@ -797,6 +800,69 @@ CREATE INDEX IF NOT EXISTS work_trace_events_scope_idx
 """
 
 
+# `CREATE TRIGGER IF NOT EXISTS` never replaces a trigger that an older runtime installed. A
+# database created before the callback trace gained its run-id guard therefore kept the pre-guard
+# `callback_outbox_trace_*` bodies, and every runless lifecycle callback (for example
+# `worker.resumed_by_alias` on pre-run alias reuse) tripped `callback_trace_events.run_id NOT NULL`
+# from inside the trigger. Only these two triggers are reconciled against this module's text.
+RECONCILED_TRIGGERS: tuple[str, ...] = (
+    "callback_outbox_trace_insert",
+    "callback_outbox_trace_update",
+)
+
+
+def _schema_statements(script: str) -> list[str]:
+    statements: list[str] = []
+    pending: list[str] = []
+    for line in str(script or "").splitlines():
+        pending.append(line)
+        candidate = "\n".join(pending).strip()
+        if candidate and sqlite3.complete_statement(candidate):
+            statements.append(candidate)
+            pending = []
+    return statements
+
+
+def expected_trigger_statement(name: str) -> str:
+    """Return this module's CREATE TRIGGER statement for one reconciled trigger name."""
+
+    header = re.compile(
+        rf"^\s*CREATE\s+TRIGGER\s+IF\s+NOT\s+EXISTS\s+{re.escape(name)}\b",
+        re.IGNORECASE,
+    )
+    for statement in _schema_statements(PARALLEL_ORCHESTRATION_INDEXES_AND_TRIGGERS):
+        if header.match(statement):
+            return statement
+    raise KeyError(name)
+
+
+def normalized_trigger_sql(sql: str) -> str:
+    """Compare trigger bodies the way sqlite_master stores them (no IF NOT EXISTS, no ';')."""
+
+    text = re.sub(r"(?i)\bIF\s+NOT\s+EXISTS\b", "", str(sql or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.rstrip(";").strip()
+
+
+def reconcile_stale_triggers(connection: sqlite3.Connection) -> list[str]:
+    """Replace only the reconciled triggers whose installed body differs from this module."""
+
+    replaced: list[str] = []
+    for name in RECONCILED_TRIGGERS:
+        expected = expected_trigger_statement(name)
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (name,),
+        ).fetchone()
+        installed = str(row[0] if row is not None else "")
+        if normalized_trigger_sql(installed) == normalized_trigger_sql(expected):
+            continue
+        connection.execute(f"DROP TRIGGER IF EXISTS {name}")
+        connection.execute(expected)
+        replaced.append(name)
+    return replaced
+
+
 def ensure_parallel_orchestration_schema(connection: sqlite3.Connection) -> None:
     """Add the durable orchestration schema without replacing newer core tables."""
 
@@ -821,3 +887,4 @@ def ensure_parallel_orchestration_schema(connection: sqlite3.Connection) -> None
                 connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
                 present.add(name)
     execute_schema_script(connection, PARALLEL_ORCHESTRATION_INDEXES_AND_TRIGGERS)
+    reconcile_stale_triggers(connection)

@@ -271,6 +271,9 @@ def test_retryable_failed_callback_carries_signed_short_lived_retry_capability(t
         derived = hmac.new(b"synthetic-callback-secret", binding, hashlib.sha256).hexdigest().encode()
         expected = "sha256=" + hmac.new(derived, encoded, hashlib.sha256).hexdigest()
         assert headers["X-GlassHive-Signature"] == expected
+        assert headers["X-GlassHive-Callback-Id"] == payload["callback_id"]
+        assert headers["X-GlassHive-Result-Revision"] == str(payload["result_revision"])
+        assert headers["X-GlassHive-Result-Digest"] == payload["result_digest"]
         stored_payload = _latest_callback_payload(app, event_type="run.failed", run_id=run["run_id"])
         assert "actionCapabilities" not in stored_payload
         assert capability["capability"] not in json.dumps(stored_payload)
@@ -860,7 +863,9 @@ def test_cancel_completion_during_owner_interrupt_preserves_completed_result(tmp
         )
 
 
-def test_retry_replay_restarts_canonical_queued_run_after_post_commit_crash(tmp_path, monkeypatch):
+def test_retry_replay_restarts_canonical_queued_run_after_post_commit_crash(
+    tmp_path, monkeypatch, background_consumers_disabled
+):
     _capture_callbacks(monkeypatch)
     app = create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime())
     with TestClient(app):

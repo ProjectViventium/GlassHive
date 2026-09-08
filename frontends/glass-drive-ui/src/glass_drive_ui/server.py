@@ -325,7 +325,7 @@ def _load_viventium_runtime_env() -> None:
     explicit = os.environ.get("VIVENTIUM_ENV_FILE", "").strip()
     if explicit:
         candidates.append(Path(explicit).expanduser())
-    if os.environ.get("VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV", "").strip().lower() not in {"1", "true", "yes", "on"}:
+    if not explicit and os.environ.get("VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV", "").strip().lower() not in {"1", "true", "yes", "on"}:
         app_support = Path.home() / "Library" / "Application Support" / "Viventium" / "runtime"
         candidates.extend([app_support / "runtime.env", app_support / "runtime.local.env"])
     for env_path in candidates:
@@ -2394,6 +2394,8 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         normalized_path = str(path or "").strip("/")
         if normalized_method not in {"GET", "HEAD"}:
             return False
+        if prefix == "w":
+            return bool(re.fullmatch(r"ghr_[A-Za-z0-9_-]{12,96}", normalized_path))
         if prefix == "ui":
             return bool(
                 re.fullmatch(r"(?:projects|workers)/[A-Za-z0-9._-]{1,128}", normalized_path)
@@ -2414,8 +2416,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Not found")
         if _public_links_only_enabled() and prefix == "v1" and str(path).startswith("signed-links/"):
             raise HTTPException(status_code=404, detail="GlassHive public links use opaque references")
-        worker_id = _worker_id_from_runtime_proxy_path(path, request)
-        auth_headers = _runtime_headers_for_request(request, worker_id)
+        # Mission references carry their own read-only authority, checked by the runtime.
+        # Never attach the operator's service credentials or create a control-session cookie.
+        worker_id = None if prefix == "w" else _worker_id_from_runtime_proxy_path(path, request)
+        auth_headers = {} if prefix == "w" else _runtime_headers_for_request(request, worker_id)
         upstream_headers = {
             key: value
             for key, value in request.headers.items()
@@ -3939,6 +3943,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             if redirect is not None:
                 return redirect
         return await _runtime_proxy("v1", runtime_path, request)
+
+    @app.get("/w/{ref_id}")
+    async def mission_view(ref_id: str, request: Request) -> Response:
+        return await _runtime_proxy("w", ref_id, request)
 
     @app.get("/")
     def home(request: Request) -> Response:

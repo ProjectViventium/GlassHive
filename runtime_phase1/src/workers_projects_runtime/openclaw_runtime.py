@@ -175,6 +175,15 @@ class WorkerInterruptedError(RuntimeErrorBase):
     pass
 
 
+class WorkerDetachedError(WorkerInterruptedError):
+    """This process stopped waiting on a live generation that keeps running.
+
+    Raised only by a managed restart: the exact native session, its container, and its
+    transcript files stay untouched so the restarted service can adopt the same generation
+    and collect its single terminal result instead of launching a duplicate.
+    """
+
+
 @contextmanager
 def runtime_start_boundary(worker: dict):
     """Enter the service-owned Close/start fence at the real external start boundary."""

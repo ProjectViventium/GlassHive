@@ -21,7 +21,10 @@ from urllib.parse import urlencode, urlparse
 
 import httpx
 
+from .runtime_requirements import CLAUDE_CODE_EFFORT_LEVELS
+
 from .auth import multi_user_security_enabled
+from .bootstrap import GLASSHIVE_PROVIDER_SESSION_MODE_ENV
 
 from .deliverables import (
     PROFESSIONAL_ARTIFACT_EXTENSIONS,
@@ -29,6 +32,8 @@ from .deliverables import (
     deliverable_payload,
     is_user_deliverable_relative_path,
     is_valid_professional_artifact,
+    native_media_observations,
+    NATIVE_MEDIA_PREFIX, NATIVE_IMAGE_SUFFIXES, _publish_native_media, _native_media_snapshot,
 )
 from .control_plane import (
     PROFILE_ACCOUNT_PROVIDERS,
@@ -86,6 +91,7 @@ from .signed_links import (
     sign_link_token,
 )
 from .store import (
+    MANAGED_SHUTDOWN_LEASE_RELEASE_REASON,
     ProviderAccountBusyStoreError,
     SchedulePrincipalAuthorityStoreError,
     Store,
@@ -176,6 +182,7 @@ from .store import (
 )
 
 from .workspace_continuation import (
+    accepted_run_input,
     build_workspace_continuation_context,
     continuation_instruction,
 )
@@ -673,6 +680,10 @@ class _WorkerLifecycleGuard:
             fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
             self._handle.close()
 
+class BackgroundWorkerConfigurationError(ValueError):
+    """A trusted background preference is unsupported by its exact model."""
+
+
 class ParallelExecutionIsolationError(RuntimeError):
     """Automatic conversation-orchestrated missions may not enter the host lane."""
 
@@ -706,8 +717,10 @@ PARALLEL_CLEAN_ROOM_EFFORT_ENV_VALUES = {
         "medium",
         "high",
         "xhigh",
+        "max",
+        "ultra",
     },
-    "WPR_CLAUDE_CODE_EFFORT": {"default", "max"},
+    "WPR_CLAUDE_CODE_EFFORT": frozenset(CLAUDE_CODE_EFFORT_LEVELS),
 }
 
 PARALLEL_CLEAN_ROOM_FORBIDDEN_BUNDLE_KEYS = {
@@ -1279,6 +1292,15 @@ def isolated_parallel_policy_enabled() -> bool:
 
     return _env_truthy("VIVENTIUM_GLASSHIVE_ISOLATED_PARALLEL_POLICY")
 
+
+def native_parallel_policy_enabled() -> bool:
+    return (
+        os.environ.get("VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE") == "host"
+        and not isolated_parallel_policy_enabled()
+        and host_workers_enabled()
+        and _env_truthy("GLASSHIVE_PROVIDER_ALLOW_FULL_ACCESS")
+    )
+
 class HostWorkersDisabledError(RuntimeError):
     pass
 
@@ -1396,6 +1418,15 @@ def runtime_failure_callback_message(failure_fields: dict[str, object], fallback
     if diagnostic and diagnostic not in message:
         return f"{message}\n\nDetails: {diagnostic}"
     return message
+
+
+def _attach_failure_guidance(payload: dict, run: dict | None) -> None:
+    """Copy the run's user-facing failure guidance strings onto a payload."""
+
+    for key in ("failure_user_message", "failure_recommended_recovery"):
+        value = str((run or {}).get(key) or "").strip()
+        if value:
+            payload[key] = value
 
 
 def _is_viventium_callback_url(url: str) -> bool:
@@ -1544,6 +1575,8 @@ class WorkersProjectsService:
         self._scheduler_wake_event = Event()
         self._processors_lock = Lock()
         self._active_processors: set[str] = set()
+        self._retained_restart_run_ids: set[str] = set()
+        self._managed_shutdown_lease_ids: set[str] = set()
         self._processor_generations: dict[str, int] = {}
         self._runtime_start_locks: dict[str, Lock] = {}
         self._worker_create_lock = Lock()
@@ -1614,7 +1647,6 @@ class WorkersProjectsService:
                             exc_info=True,
                         )
                 self.reconcile_host_run_leases()
-                self.reconcile_all_workers()
             self._startup_recovery_thread = Thread(
                 target=self._replay_startup_recovery,
                 name="wpr-startup-recovery",
@@ -1659,9 +1691,250 @@ class WorkersProjectsService:
                 self.executor.submit(self.recover_expired_compute_release_claims_once)
             self._background_consumers_started = True
 
+    def release_owned_host_run_leases(
+        self, *, reason: str = MANAGED_SHUTDOWN_LEASE_RELEASE_REASON
+    ) -> int:
+        """Stop owned running generations and release only leases proven safe to retry.
+
+        A managed stop ends this executor's heartbeat on purpose. Releasing the
+        leases of its running runs with a typed reason keeps the
+        provider-liveness monitor from reading the silent heartbeat as a
+        stalled provider, and lets startup reconciliation re-queue the same run
+        with managed-restart wording. Pre-accept reservations and not-yet-running
+        generations keep their existing restart contract (transfer or expiry),
+        and a lease fenced by an unfinished control stays with that control.
+        Idempotent and never raises: shutdown must continue regardless.
+        """
+
+        released = 0
+        try:
+            leases = self.store.list_active_host_run_leases()
+        except Exception:
+            logger.exception("Managed shutdown could not list host run leases")
+            return released
+        for lease in leases:
+            if str(lease.get("executor_id") or "") != self._executor_id:
+                continue
+            lease_id = str(lease.get("lease_id") or "")
+            try:
+                run = self.store.get_run(str(lease.get("run_id") or ""))
+                if run is None or str(run.get("state") or "") != "running":
+                    continue
+                worker = self.store.get_worker(str(lease.get("worker_id") or ""))
+                if self._lease_is_fenced_by_lifecycle_claim(worker, lease):
+                    # An unfinished control still owns this exact lease; its
+                    # claim recovery, not shutdown, decides when it ends.
+                    continue
+                if self._retain_live_generation_for_restart(worker, run, lease):
+                    continue
+                # Claim only this dispatch generation before stopping it. Its processor may
+                # unwind during cleanup; it must not terminalize or release an unproved stop.
+                with self._processors_lock:
+                    self._managed_shutdown_lease_ids.add(lease_id)
+                if not self._stop_managed_shutdown_generation(worker, run, lease):
+                    logger.warning(
+                        "Managed shutdown retained lease %s: generation absence is unproved",
+                        lease_id,
+                    )
+                    continue
+                record = self.store.release_host_run_lease(
+                    lease_id,
+                    executor_id=self._executor_id,
+                    reason=reason,
+                )
+            except Exception:
+                logger.exception(
+                    "Managed shutdown could not release host run lease %s", lease_id
+                )
+                continue
+            if (
+                record
+                and str(record.get("status") or "") == "released"
+                and str(record.get("release_reason") or "") == str(reason)
+            ):
+                released += 1
+        return released
+
+    def _managed_restart_lease_grace_s(self) -> float:
+        """How long a retained generation's lease stays exact while the service restarts."""
+        return _bounded_float_env(
+            "WPR_MANAGED_RESTART_LEASE_GRACE_S",
+            180.0,
+            min_value=30.0,
+            max_value=3600.0,
+        )
+
+    @staticmethod
+    def _restart_survivor_adoption_enabled() -> bool:
+        """Restart survivor adoption is opt-in; the bounded retry/resume path owns recovery.
+
+        Adoption keeps a live docker generation across a managed restart and collects its
+        result in the restarted service. It is disabled by default because its collection
+        path still has evidence-parity gaps; the default recovery shape is the proven one:
+        the same durable run is requeued after restart and its retry resumes the same
+        provider session, completing exactly once.
+        """
+        return str(os.environ.get("WPR_RESTART_SURVIVOR_ADOPTION") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _retain_live_generation_for_restart(
+        self, worker: dict | None, run: dict | None, lease: dict | None
+    ) -> bool:
+        """Keep a verified live docker mission generation running across a managed restart.
+
+        The durable worker process is the container's screen session, not this executor.
+        When the runtime can verify that exact generation, this shutdown only detaches its
+        local wait, extends the same lease for the restart window, and leaves the run
+        running: the restarted service adopts the survivor through its existing startup
+        reconciliation and collects one terminal result. Nothing is released or requeued
+        until that generation's exit is confirmed. Anything unverifiable keeps the
+        stop-and-release contract.
+        """
+        if not self._restart_survivor_adoption_enabled():
+            return False
+        if not worker or not run or not lease:
+            return False
+        if str(worker.get("execution_mode") or "docker") != "docker":
+            return False
+        if self._trusted_run_lane(worker) != "mission":
+            return False
+        if (
+            str(lease.get("startup_state") or "") != "confirmed"
+            or str(lease.get("startup_identity_kind") or "") != "docker_session"
+        ):
+            return False
+        identity_reader = getattr(self.runtime, "host_process_identity", None)
+        detach = getattr(self.runtime, "detach_worker", None)
+        if not callable(identity_reader) or not callable(detach):
+            return False
+        run_id = str(run.get("run_id") or "").strip()
+        worker_id = str(worker.get("worker_id") or "").strip()
+        with self._processors_lock:
+            if run_id in self._retained_restart_run_ids:
+                # The lifespan and shutdown() both release owned leases; the
+                # generation was already retained by the first pass.
+                return True
+            if worker_id not in self._active_processors:
+                return False
+        runtime_worker = {
+            **worker,
+            "_active_run_id": run_id,
+            "_run_attempt_id": str(run.get("active_attempt_id") or ""),
+        }
+        try:
+            identity = identity_reader(runtime_worker, run_id)
+        except Exception:
+            logger.warning(
+                "Managed shutdown could not verify the live generation of run %s", run_id
+            )
+            return False
+        if (
+            not isinstance(identity, dict)
+            or identity.get("verified") is not True
+            or str(identity.get("identity_kind") or "") != "docker_session"
+            or str(identity.get("container_id") or "")
+            != str(lease.get("startup_container_id") or "")
+        ):
+            return False
+        renewed = self.store.heartbeat_host_run_lease(
+            str(lease["lease_id"]),
+            executor_id=self._executor_id,
+            lease_ttl_s=self._managed_restart_lease_grace_s(),
+        )
+        if not renewed:
+            return False
+        try:
+            detached = bool(detach(runtime_worker, run_id=run_id))
+        except Exception:
+            logger.exception(
+                "Managed shutdown could not detach from the live generation of run %s", run_id
+            )
+            detached = False
+        if not detached:
+            return False
+        with self._processors_lock:
+            self._retained_restart_run_ids.add(run_id)
+        self.store.add_event(
+            str(worker.get("project_id") or ""),
+            worker_id,
+            run_id,
+            "run.generation_retained",
+            "Managed restart left the live worker generation running for adoption",
+            payload={
+                "containerId": str(identity.get("container_id") or ""),
+                "sessionId": str(identity.get("session_id") or ""),
+            },
+        )
+        logger.info(
+            "Managed shutdown retained the live generation of run %s for restart adoption",
+            run_id,
+        )
+        return True
+
+    def _released_for_managed_shutdown(self, run: dict, terminal_generation: dict | None) -> bool:
+        """True when managed shutdown owns this exact generation's restart handoff.
+
+        The in-memory lease claim covers the interval while native cleanup is still running;
+        afterward the typed durable release keeps the same handoff visible to late exits.
+        """
+        with self._processors_lock:
+            if str(run.get("run_id") or "") in self._retained_restart_run_ids:
+                return True
+        lease = None
+        lease_id = str((terminal_generation or {}).get("expected_lease_id") or "").strip()
+        with self._processors_lock:
+            if lease_id in self._managed_shutdown_lease_ids:
+                return True
+        if lease_id:
+            lease = self.store.get_host_run_lease(lease_id)
+        if lease is None:
+            latest = getattr(self.store, "latest_host_run_lease_for_run", None)
+            if callable(latest):
+                lease = latest(str(run.get("run_id") or ""))
+        return (
+            bool(lease)
+            and str(lease.get("status") or "") == "released"
+            and str(lease.get("release_reason") or "") == MANAGED_SHUTDOWN_LEASE_RELEASE_REASON
+        )
+
+    def _stop_managed_shutdown_generation(
+        self, worker: dict | None, run: dict, lease: dict
+    ) -> bool:
+        """Keep the exact lease until its recorded generation is stopped and proven absent."""
+        absence_reader = getattr(self.runtime, "host_process_absence", None)
+        if self._reserved_start_identity(lease):
+            # Reuse the restart owner's identity-bound cleanup. A mutable worker pid or
+            # a successful interrupt alone cannot prove this lease's generation absent.
+            return self._stale_lease_generation_proven_absent(
+                worker, run, lease, absence_reader=absence_reader
+            )
+        if not worker:
+            return False
+        run_id = str(run.get("run_id") or "")
+        interrupt = getattr(self.runtime, "interrupt_worker", None)
+        if str(run.get("runtime_invoked_at") or "") and callable(interrupt):
+            try:
+                # Legacy adapters without an exact run target cannot safely stop a generation.
+                interrupt(worker, run_id=run_id)
+            except Exception:
+                logger.exception(
+                    "Managed shutdown could not stop run %s; retaining its lease", run_id
+                )
+                return False
+        return self._stale_lease_generation_proven_absent(
+            worker, run, lease, absence_reader=absence_reader
+        )
+
     def shutdown(self, *, timeout_seconds: float = 10.0) -> None:
         with self._processors_lock:
             self._shutdown_event.set()
+        # Stop owned running generations before releasing their dispatch fences. Unknown
+        # termination keeps the exact lease for startup reconciliation to prove safe later.
+        self.release_owned_host_run_leases()
         with self._run_local_bundles_lock:
             self._run_local_bundles.clear()
             self._run_local_grant_waiters.clear()
@@ -1771,6 +2044,19 @@ class WorkersProjectsService:
 
     def _callback_headers(self, callbacks: dict, payload: dict, encoded: bytes) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
+        result_revision = payload.get("result_revision")
+        if (
+            isinstance(result_revision, int)
+            and not isinstance(result_revision, bool)
+            and result_revision > 0
+        ):
+            headers["X-GlassHive-Callback-Id"] = str(
+                payload.get("callback_id") or ""
+            )
+            headers["X-GlassHive-Result-Revision"] = str(result_revision)
+            headers["X-GlassHive-Result-Digest"] = str(
+                payload.get("result_digest") or ""
+            )
         secret = str(callbacks.get("hmac_secret") or callbacks.get("secret") or "")
         if secret:
             derived_secret = self._derive_callback_secret(
@@ -1834,12 +2120,16 @@ class WorkersProjectsService:
         payload_json: str,
         reason: str,
     ) -> None:
-        self.store.mark_callback_dead_lettered(
+        updated = self.store.mark_callback_dead_lettered(
             callback_id,
+            lease_token=str(record.get("delivery_lease_token") or ""),
+            delivery_generation=int(record.get("delivery_generation") or 0),
             attempts=attempts,
             payload_json=payload_json,
             last_error=reason,
         )
+        if updated is None:
+            return
         try:
             self.store.add_event(
                 str(record.get("project_id") or worker.get("project_id") or ""),
@@ -1874,12 +2164,16 @@ class WorkersProjectsService:
                 reason=f"callback retry budget exhausted after {total_attempts} attempts: {reason}",
             )
             return
-        self.store.mark_callback_pending(
+        updated = self.store.mark_callback_pending(
             callback_id,
+            lease_token=str(record.get("delivery_lease_token") or ""),
+            delivery_generation=int(record.get("delivery_generation") or 0),
             attempts=attempts,
             payload_json=payload_json,
             last_error=reason,
         )
+        if updated is None:
+            return
         try:
             self.store.add_event(
                 str(record.get("project_id") or worker.get("project_id") or ""),
@@ -1910,6 +2204,25 @@ class WorkersProjectsService:
                 reason=f"callback retry budget exhausted before delivery after {stored_attempts} attempts",
             )
             return
+        self._deliver_claimed_callback_record(worker, record, callbacks)
+
+    def recover_terminal_callback(self, **identity: Any) -> bool:
+        record = self.store.claim_terminal_callback_recovery(**identity)
+        if record is None:
+            return False
+        worker = self.store.get_worker(str(record["worker_id"]))
+        run = self.store.get_run(str(record["run_id"]))
+        callbacks = self._callback_config_for_event(worker, run)
+        self.executor.submit(
+            self._deliver_claimed_callback_record, worker, record, callbacks,
+            delivery_attempts=1,
+        )
+        return True
+
+    def _deliver_claimed_callback_record(
+        self, worker: dict, record: dict, callbacks: dict, *, delivery_attempts: int | None = None
+    ) -> None:
+        callback_id = str(record.get("callback_id") or "")
         url = str(callbacks.get("events_webhook_url") or callbacks.get("url") or record.get("url") or "").strip()
         if not url:
             self._dead_letter_callback(
@@ -1990,7 +2303,9 @@ class WorkersProjectsService:
         if action_capabilities:
             payload["actionCapabilities"] = action_capabilities
 
-        retry_attempts = _bounded_int_env("GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", 3, min_value=1, max_value=25)
+        retry_attempts = delivery_attempts if delivery_attempts is not None else _bounded_int_env(
+            "GLASSHIVE_CALLBACK_RETRY_ATTEMPTS", 3, min_value=1, max_value=25
+        )
         retry_base_delay_s = _bounded_float_env(
             "GLASSHIVE_CALLBACK_RETRY_BASE_DELAY_S",
             0.5,
@@ -2238,6 +2553,15 @@ class WorkersProjectsService:
         if execution_mode == "host" and not host_workers_enabled():
             raise HostWorkersDisabledError(
                 "GlassHive host-native workers are disabled by Viventium config"
+            )
+        if (
+            execution_mode == "host"
+            and isinstance(worker_or_mode, dict)
+            and self._is_native_conversation_delegation(worker_or_mode)
+            and not _env_truthy("GLASSHIVE_PROVIDER_ALLOW_FULL_ACCESS")
+        ):
+            raise HostWorkersDisabledError(
+                "Full host access was revoked for this native mission."
             )
 
     def _ensure_dispatch_provider_ready(self, worker: dict) -> None:
@@ -2677,6 +3001,70 @@ class WorkersProjectsService:
     def _signed_artifact_download_url(self, worker: dict, workspace_path: str) -> str:
         return self._signed_artifact_url(worker, workspace_path, kind="artifact_download", action="download")
 
+    def render_provider_native_images(self, request: dict, run: dict, output: str) -> str:
+        """Resolve model-selected input images through the existing owner artifact boundary."""
+        if "](" not in output:
+            return output
+        run_id = str(run.get("run_id") or "")
+        worker = self.store.get_worker(str(run.get("worker_id") or ""))
+        resolver = getattr(self.runtime, "provider_native_image_output", None)
+        if not worker or not callable(resolver):
+            if re.search(r"\]\(\s*<?artifact_sha256:", output):
+                raise RuntimeErrorBase("Selected native image is unavailable for this request")
+            return output
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", run_id)
+            or request.get("run_id") != run_id
+            or not request.get("owner_id") or request.get("owner_id") != worker.get("owner_id")
+            or request.get("tenant_id") != worker.get("tenant_id")
+        ):
+            raise RuntimeErrorBase("Native image output does not match the request owner and run")
+        projected, images = resolver(worker, run, output)
+        authorized = {"artifact_sha256:" + hashlib.sha256(data).hexdigest(): (mime, data)
+                      for _path, mime, data in images}
+        selected_urls: dict[str, str] = {}
+
+        def render(match: re.Match[str]) -> str:
+            reference = match.group(2).strip().removeprefix("<").removesuffix(">")
+            if not reference.startswith("artifact_sha256:"):
+                return match.group(0)
+            if reference not in authorized:
+                raise RuntimeErrorBase("Selected native image is unavailable for this request")
+            if reference not in selected_urls:
+                mime, data = authorized[reference]
+                relative = NATIVE_MEDIA_PREFIX / run_id / (reference.split(":", 1)[1] + NATIVE_IMAGE_SUFFIXES[mime])
+                workspace = Path(str(worker.get("workspace_dir") or ""))
+                try:
+                    published = _native_media_snapshot(workspace, relative, len(data))
+                except (OSError, ValueError):
+                    published = None
+                if published != data:
+                    _publish_native_media(workspace, relative, data)
+                url = self._signed_artifact_download_url(worker, relative.as_posix())
+                if not url:
+                    raise RuntimeErrorBase("Selected native image download is unavailable")
+                selected_urls[reference] = url
+            return f"{match.group(1)}({selected_urls[reference]})"
+
+        return re.sub(r"(!?\[(?:\\.|[^\]\r\n])*\])\((<[^>\r\n]*>|[^()\r\n]*)\)", render, projected)
+
+    def _native_media_callback_observations(self, worker: dict, run: dict) -> dict[str, object]:
+        media = native_media_observations(worker, run)
+        observations = []
+        omitted = media["omitted_count"]
+        for item in media["observations"]:
+            path = str(item["workspace_path"])
+            download_url = self._signed_artifact_download_url(worker, path)
+            open_url = self._signed_artifact_open_url(worker, path)
+            if not download_url or not open_url:
+                omitted += 1
+                continue
+            observations.append({
+                **{key: value for key, value in item.items() if key != "workspace_path"},
+                "download_url": download_url, "open_url": open_url,
+            })
+        return {"observations": observations, "omitted_count": omitted}
+
     def _signed_watch_url(self, worker: dict, callbacks: dict[str, object] | None = None) -> str:
         callbacks = callbacks or {}
         worker_id = str(worker.get("worker_id") or "").strip()
@@ -2852,6 +3240,9 @@ class WorkersProjectsService:
                 deliverable = self._completion_deliverable(
                     worker, run, durable_output, durable_error
                 )
+                if deliverable and self._fresh_user_artifact_deliverable(worker, run, deliverable):
+                    # Deliver the preserved file with the typed failure; never as completion.
+                    message = self._partial_artifact_failure_message(deliverable, message)
             elif durable_state == "cancelled":
                 message = "Work stop confirmed."
                 if durable_error:
@@ -3063,6 +3454,7 @@ class WorkersProjectsService:
             payload["failure_code"] = failure_class
             payload["failure_class"] = failure_class
             payload["failure_retryable"] = bool((run or {}).get("failure_retryable"))
+            _attach_failure_guidance(payload, run)
             provider_route_decision = str(
                 (run or {}).get("provider_route_decision") or ""
             ).strip()
@@ -3082,6 +3474,19 @@ class WorkersProjectsService:
                 }
         if deliverable:
             payload["deliverable"] = deliverable
+        if terminal_result_state and durable_ended_at:
+            retained_callback = self.store.get_callback_outbox(resolved_callback_id)
+            if retained_callback is None:
+                payload["run_input"] = accepted_run_input(durable_run or {})
+            else:
+                # The outbox owns replay bytes. Do not retrofit an older
+                # accepted callback or reinterpret its input after an upgrade.
+                retained_payload = json.loads(retained_callback["payload_json"])
+                if "run_input" in retained_payload:
+                    payload["run_input"] = retained_payload["run_input"]
+            media = self._native_media_callback_observations(worker, durable_run or run or {})
+            if media["observations"] or media["omitted_count"]:
+                payload["native_media"] = media
         if operator_url:
             payload["operator_url"] = operator_url
             payload["watch_url"] = operator_url
@@ -3228,6 +3633,7 @@ class WorkersProjectsService:
             payload["failure_code"] = failure_class
             payload["failure_class"] = failure_class
             payload["failure_retryable"] = bool((run or {}).get("failure_retryable"))
+            _attach_failure_guidance(payload, run)
         projection_resolver = getattr(self.runtime, "effort_projection_for_worker", None)
         if callable(projection_resolver):
             try:
@@ -3971,19 +4377,18 @@ class WorkersProjectsService:
         consume_retry_budget = failure_class not in indefinite_wait_classes
         if consume_retry_budget and attempts > max_attempts:
             message = (
-                f"GlassHive stopped retrying this run because worker capacity stayed unavailable "
-                f"after {max_attempts} retry attempts."
+                "This work could not finish. You can retry it."
             )
             exhausted_fields = {
                 **failure_fields,
-                "failure_retryable": 0,
+                # Terminal state ends automatic scheduling. Keep the failure's
+                # recoverability so an explicit Retry can continue after repair.
                 "failure_user_message": message,
                 "failure_recommended_recovery": (
-                    "Reuse another available workspace, wait for capacity and explicitly continue this "
-                    "workspace, or ask the operator to adjust capacity."
+                    "Resolve the reported issue, then retry this work."
                 ),
                 "failure_diagnostic_summary": (
-                    f"Capacity retry budget exhausted for {failure_class}: {str(exc)}"
+                    f"Automatic retry budget exhausted after {max_attempts} attempts for {failure_class}: {str(exc)}"
                 ),
             }
             failed_run = self._finalize_run_if_state(
@@ -4159,19 +4564,18 @@ class WorkersProjectsService:
         max_attempts = self._capacity_retry_max_attempts(failure_class)
         if attempts > max_attempts:
             message = (
-                f"GlassHive stopped retrying this run because worker capacity stayed unavailable "
-                f"after {max_attempts} retry attempts."
+                "This work could not finish. You can retry it."
             )
             exhausted_fields = {
                 **failure_fields,
-                "failure_retryable": 0,
+                # Terminal state ends automatic scheduling. Keep the failure's
+                # recoverability so an explicit Retry can continue after repair.
                 "failure_user_message": message,
                 "failure_recommended_recovery": (
-                    "Reuse another available workspace, wait for capacity and explicitly continue this "
-                    "workspace, or ask the operator to adjust capacity."
+                    "Resolve the reported issue, then retry this work."
                 ),
                 "failure_diagnostic_summary": (
-                    f"Capacity retry budget exhausted for {failure_class}: {str(exc)}"
+                    f"Automatic retry budget exhausted after {max_attempts} attempts for {failure_class}: {str(exc)}"
                 ),
             }
             failed_run = self.store.finalize_run(
@@ -6387,6 +6791,20 @@ class WorkersProjectsService:
             "idempotent_replay": False,
         }
 
+    def _can_restart_released_idle_worker(self, worker: dict) -> bool:
+        """Compute reclamation does not carry the user's Pause intent."""
+        worker_id = str(worker.get("worker_id") or "")
+        return bool(
+            worker.get("state") == "paused"
+            and worker.get("compute_released_at")
+            and not worker.get("compute_release_token")
+            and not self.store.has_active_operator_pause(worker_id)
+            and all(
+                run.get("state") == "queued"
+                for run in self.store.list_nonterminal_runs_for_worker(worker_id)
+            )
+        )
+
     def _assign_run_parallel(
         self,
         worker_id: str,
@@ -6408,7 +6826,7 @@ class WorkersProjectsService:
             with self._worker_compute_release_lock(worker_id):
                 worker = self.require_worker(worker_id)
                 self._ensure_execution_allowed(worker)
-                self._reserved_runtime_preflight(
+                self._queued_runtime_preflight(
                     str(worker.get("profile") or ""),
                     str(worker.get("execution_mode") or "docker"),
                     tenant_id=str(worker.get("tenant_id") or "local"),
@@ -6488,7 +6906,9 @@ class WorkersProjectsService:
                             continuation_contract=stored_continuation,
                             continuation_context=continuation_context,
                         )
-                    if worker["state"] == "paused" and resume_paused_worker:
+                    if worker["state"] == "paused" and (
+                        resume_paused_worker or self._can_restart_released_idle_worker(worker)
+                    ):
                         worker = (
                             self.store.update_worker_state(
                                 worker_id, "starting", last_error=""
@@ -6627,6 +7047,15 @@ class WorkersProjectsService:
         if start_processor:
             self._ensure_worker_processor(worker_id)
         return run
+
+    def reconcile_restart_authority_backlog_once(self) -> list[str]:
+        """Unblock only restart-orphaned conversation turns and their siblings."""
+
+        worker_ids = self.store.reconcile_restart_authority_blocked_workers()
+        for worker_id in worker_ids:
+            self._ensure_worker_processor(worker_id)
+        return worker_ids
+
     def start_assigned_run(self, worker_id: str) -> None:
         """Start processing after an external owner has durably attached a queued run."""
 
@@ -6944,6 +7373,10 @@ class WorkersProjectsService:
                 raise RuntimeErrorBase("No exact active run is available to steer")
             target_state = str(target.get("state") or "")
             target_run_id = str(target["run_id"])
+            continuation_context = build_workspace_continuation_context(
+                previous_run=target,
+                continuation_goal=message,
+            )
             runtime_worker = worker
             if target_state != "queued":
                 runtime_worker = self._require_confirmed_host_control_identity(
@@ -6981,6 +7414,12 @@ class WorkersProjectsService:
                         if isinstance(continuation_contract, dict)
                         else {}
                     ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "continuation_context_json": json.dumps(
+                    continuation_context,
                     ensure_ascii=False,
                     sort_keys=True,
                     separators=(",", ":"),
@@ -7509,7 +7948,7 @@ class WorkersProjectsService:
         return updated or worker
 
     def cancel_run(self, worker_id: str, run_id: str) -> dict:
-        """Cancel one queued or running run without affecting a newer turn."""
+        """Cancel one exact pending run without affecting a newer turn."""
 
         worker = self.require_worker(worker_id)
         run = self.store.get_run(run_id)
@@ -7518,9 +7957,17 @@ class WorkersProjectsService:
         state = str(run.get("state") or "")
         if state in {"completed", "failed", "cancelled", "interrupted"}:
             return worker
-
         cancelled = None
-        released_running_capacity = state == "running"
+        released_running_capacity = state in {"running", "needs_input"}
+        if state == "needs_input":
+            if self.store.get_active_host_run_lease_for_run(run_id):
+                self._release_needs_input_compute(worker, run)
+            # Reconcile only this cancelled provider turn after its compute is
+            # released; stopping the whole mission would discard later turns.
+            reconciled = self.store.reconcile_cancelled_provider_needs_input_runs_for_worker(
+                worker_id, run_id=run_id
+            )
+            cancelled = next((item for item in reconciled if item["run_id"] == run_id), None)
         if state == "queued":
             cancelled = self.store.finalize_run_if_state(
                 run_id,
@@ -7870,6 +8317,8 @@ class WorkersProjectsService:
         self.store.reconcile_invalid_running_runs()
         self.reconcile_terminal_artifact_observations()
         for worker in self.store.list_all_workers():
+            if self._shutdown_event.is_set():
+                return
             try:
                 self._reconcile_worker_row(worker)
             except Exception as exc:
@@ -7893,10 +8342,18 @@ class WorkersProjectsService:
         if worker["state"] == "termination_failed":
             self.terminate_worker(str(worker["worker_id"]))
             return
+        active_run = self.store.get_active_run(worker["worker_id"])
+        if (not active_run and worker["state"] not in {"terminated", "needs_input", "stopping"}
+                and not str(worker.get("work_stop_id") or "")
+                and (self.store.has_queued_capacity_retry(str(worker["worker_id"]))
+                     or self.store.has_queued_running_invariant_retry(str(worker["worker_id"])))):
+            # Retry projection and durable Pause intent must share a transaction.
+            # A crash can leave the worker row behind the committed control event.
+            if self.store.reconcile_automatic_retry_worker(str(worker["worker_id"])) is not None:
+                return
         if worker["state"] in {"terminated", "failed"}:
             self._reconcile_terminated_worker_compute(worker)
             return
-        active_run = self.store.get_active_run(worker["worker_id"])
         if active_run and self._local_processor_owns(str(worker["worker_id"])):
             return
         if active_run:
@@ -7906,6 +8363,12 @@ class WorkersProjectsService:
                 return
         if not active_run and self.store.has_queued_runs(worker["worker_id"]):
             if worker["state"] == "paused":
+                with self._worker_compute_release_lock(worker["worker_id"]):
+                    current = self.require_worker(worker["worker_id"])
+                    if not self._can_restart_released_idle_worker(current):
+                        return
+                    self.store.update_worker_state(worker["worker_id"], "starting", last_error="")
+                self._ensure_worker_processor(worker["worker_id"])
                 return
             # Queue processors are process-local, but queued work is durable. Restore the
             # starting state and processor after a service restart without claiming a second
@@ -7914,6 +8377,14 @@ class WorkersProjectsService:
             self._ensure_worker_processor(worker["worker_id"])
             return
         if worker["state"] == "paused":
+            if (not active_run and worker.get("execution_mode") == "host"
+                    and worker.get("last_run_id")):
+                # Released native compute retains its admitted workspace. Refresh
+                # the existing runtime identity without resuming paused work.
+                self._refresh_runtime_info(
+                    str(worker["worker_id"]), state="paused",
+                    last_error=str(worker.get("last_error") or ""),
+                )
             if active_run:
                 orphaned_run = self._finalize_run_if_state(
                     active_run["run_id"],
@@ -8017,6 +8488,13 @@ class WorkersProjectsService:
             **worker,
             "_run_attempt_id": str(run.get("active_attempt_id") or ""),
         }
+        runtime_worker["bootstrap_bundle_json"] = json.dumps(
+            self._exact_provider_session_bundle_for_run(
+                self._bootstrap_bundle_for(runtime_worker) or {},
+                str(run["run_id"]),
+            ),
+            ensure_ascii=False,
+        )
 
         def bind_generation(recovered):
             if not isinstance(recovered, dict):
@@ -8115,22 +8593,47 @@ class WorkersProjectsService:
                 return False
         return bool(re.search(token_pattern.format(r"(?:final|finished|complete|completed|report|deliverable|summary|brief|workbook|deck)"), name))
 
-    def _artifact_completed_output(self, deliverable: dict[str, object], failure_fields: dict[str, object]) -> str:
+    def _partial_artifact_failure_message(self, deliverable: dict[str, object], failure_message: str) -> str:
+        """Name the preserved artifact without claiming the run finished.
+
+        Only the worker's own terminal success evidence completes a run. A file that appeared
+        before the provider ended the worker is delivered as a partial artifact next to the
+        typed failure, so the user gets the work that exists and a truthful status.
+        """
+
         path = str(deliverable.get("workspace_path") or deliverable.get("label") or "generated artifact").strip()
-        warning = str(failure_fields.get("failure_user_message") or "").strip()
         lines = [
-            "FINAL REPORT:",
-            f"GlassHive produced the requested downloadable artifact before the model provider stream ended: `{path}`.",
+            f"GlassHive preserved a partial artifact before the model provider ended the worker: `{path}`.",
+            "The run did not complete; review the artifact before relying on it.",
         ]
-        if warning:
-            lines.append(f"Provider warning after artifact creation: {warning}")
+        if failure_message.strip():
+            lines.append(failure_message.strip())
         return "\n".join(lines)
+
+    def _recovered_run_lease_is_active(self, run: dict, terminal_generation: dict | None) -> bool:
+        """A result bound to a released host run lease must never be applied.
+
+        Managed shutdown releases running-dispatch leases with a typed reason so the same run is
+        re-queued on restart; a result that arrives afterwards from the old execution would
+        otherwise duplicate the run's external effects.
+        """
+        expected_lease_id = str((terminal_generation or {}).get("expected_lease_id") or "").strip()
+        if not expected_lease_id:
+            return True
+        lease = self.store.get_host_run_lease(expected_lease_id)
+        return bool(lease) and str(lease.get("status") or "") == "active"
 
     def _apply_recovered_run(self, worker: dict, run: dict, recovered: dict[str, object]) -> dict | None:
         worker_id = worker["worker_id"]
         terminal_generation = recovered.get("_terminal_generation")
         if not isinstance(terminal_generation, dict):
             terminal_generation = self._terminal_generation_for_run(run)
+        if not self._recovered_run_lease_is_active(run, terminal_generation):
+            logger.warning(
+                "Ignoring a late result for run %s: its host run lease is no longer active",
+                run.get("run_id"),
+            )
+            return None
         state = str(recovered.get("state") or "failed")
         output_text = str(recovered.get("output_text") or "")
         error_text = str(recovered.get("error_text") or "")
@@ -8184,41 +8687,10 @@ class WorkersProjectsService:
             recovered_run = {**run, "state": "failed", "error_text": error_text, **failure_fields}
             refreshed_worker = self._refresh_runtime_info(worker_id, state="ready", last_error=error_text) or self.store.get_worker(worker_id) or worker
             deliverable = self._completion_deliverable(refreshed_worker, recovered_run, output_text, error_text)
-            if self._fresh_user_artifact_deliverable(refreshed_worker, recovered_run, deliverable):
-                completed_output = output_text.strip() or self._artifact_completed_output(deliverable or {}, failure_fields)
-                finalized_run = self._finalize_run_if_state(
-                    run["run_id"],
-                    str(run.get("state") or "running"),
-                    "completed",
-                    output_text=completed_output,
-                    usage=usage,
-                    **terminal_generation,
-                )
-                if not finalized_run:
-                    return self.store.get_worker(worker_id)
-                self.store.finalize_schedule_for_run(run["run_id"], state="completed")
-                self.store.update_worker(worker_id, state="ready", last_error="", last_run_id=run["run_id"])
-                message = terminal_callback_message(completed_output)
-                full_message = terminal_callback_full_message(completed_output)
-                self.store.add_event(
-                    worker["project_id"],
-                    worker_id,
-                    run["run_id"],
-                    "run.completed",
-                    message[:TERMINAL_CALLBACK_MESSAGE_LIMIT] or "Run completed with artifacts",
-                )
-                completed_run = {**run, **finalized_run, "state": "completed", "output_text": completed_output}
-                self._promote_completed_deliverable(refreshed_worker, completed_run, deliverable)
-                self._emit_callback(
-                    refreshed_worker,
-                    "run.completed",
-                    run=completed_run,
-                    message=message or "Run completed with artifacts",
-                    full_message=full_message if full_message != message else "",
-                    deliverable=deliverable,
-                )
-                self._wake_host_capacity_waiters(refreshed_worker)
-                return self.store.get_worker(worker_id)
+            # A fresh user-facing file that appeared before the provider ended the worker is
+            # preserved and delivered with the typed failure. It never upgrades the run to
+            # completed: only the worker's own terminal success evidence does that.
+            partial_artifact = self._fresh_user_artifact_deliverable(refreshed_worker, recovered_run, deliverable)
             recovered_error = RuntimeErrorBase(
                 error_text or "Structured provider quota exhausted"
             )
@@ -8245,6 +8717,14 @@ class WorkersProjectsService:
             self.store.update_worker(worker_id, state="ready", last_error=error_text, last_run_id=run["run_id"])
             self.store.add_event(worker["project_id"], worker_id, run["run_id"], "run.failed", error_text or "Run failed")
             failure_message = runtime_failure_callback_message(failure_fields, error_text or "Run failed")
+            if partial_artifact:
+                self.store.add_event(
+                    worker["project_id"],
+                    worker_id,
+                    run["run_id"],
+                    "run.partial_artifact_preserved",
+                    str((deliverable or {}).get("workspace_path") or "")[:TERMINAL_CALLBACK_MESSAGE_LIMIT],
+                )
             self._emit_callback(
                 refreshed_worker,
                 "run.failed",
@@ -8327,21 +8807,8 @@ class WorkersProjectsService:
         last_error: str,
         compute_released_at: str | None | object = _UNSET,
     ) -> dict | None:
-        fields = {
-            "runtime": info.runtime,
-            "model": info.model,
-            "state": state,
-            "gateway_url": info.gateway_url,
-            "gateway_port": info.gateway_port,
-            "gateway_token": info.gateway_token,
-            "session_key": info.session_key,
-            "state_dir": info.state_dir,
-            "workspace_dir": info.workspace_dir,
-            "pid": info.pid,
-            "takeover_url": f"/ui/workers/{worker_id}",
-            "control_url": f"/ui/workers/{worker_id}",
-            "last_error": last_error,
-        }
+        fields = self._runtime_info_fields(worker_id, info, last_error=last_error)
+        fields["state"] = state
         if compute_released_at is not _UNSET:
             fields["compute_released_at"] = compute_released_at
         return self.store.update_worker(worker_id, **fields)
@@ -8653,27 +9120,44 @@ class WorkersProjectsService:
                     terminal_generation = self._terminal_generation_for_run(
                         run, lease
                     )
+                    # The startup lease is the host generation. Keep its raw CAS
+                    # token local; this digest already fences active-session identity.
+                    startup_token = str(lease.get("startup_token") or "")
+                    startup_token_digest = hashlib.sha256(
+                        startup_token.encode("utf-8")
+                    ).hexdigest()
                     authority_context: dict[str, str] = {}
                     if (
                         self._deferred_capability_authorization(worker) is not None
                         or self._prompt_workbench_scheduled_authority(worker)
                         is not None
                     ):
-                        prepare_authority = getattr(
-                            self.runtime, "prepare_run_authority_context", None
-                        )
-                        if not callable(prepare_authority):
-                            raise BrokerAdmissionError(
-                                "broker_admission_generation_unavailable",
-                                "The exact mission container generation is unavailable.",
-                                retryable=True,
-                            )
-                        prepared = prepare_authority(worker, run_id=str(run["run_id"]))
-                        if isinstance(prepared, dict):
+                        if str(worker.get("execution_mode") or "docker") == "host":
+                            if not startup_token:
+                                raise BrokerAdmissionError(
+                                    "broker_admission_generation_unavailable",
+                                    "The exact mission startup lease is unavailable.",
+                                    retryable=True,
+                                )
                             authority_context = {
-                                str(key): str(value)
-                                for key, value in prepared.items()
+                                "host_startup_lease_id": startup_token_digest
                             }
+                        else:
+                            prepare_authority = getattr(
+                                self.runtime, "prepare_run_authority_context", None
+                            )
+                            if not callable(prepare_authority):
+                                raise BrokerAdmissionError(
+                                    "broker_admission_generation_unavailable",
+                                    "The exact mission container generation is unavailable.",
+                                    retryable=True,
+                                )
+                            prepared = prepare_authority(worker, run_id=str(run["run_id"]))
+                            if isinstance(prepared, dict):
+                                authority_context = {
+                                    str(key): str(value)
+                                    for key, value in prepared.items()
+                                }
 
                     runtime_info_run_id = str(run["run_id"])
                     runtime_info_lease_id = str(lease.get("lease_id") or "")
@@ -8724,9 +9208,7 @@ class WorkersProjectsService:
                         "_runtime_info_callback": persist_runtime_info,
                         # Persist only a one-way binding in private active-session
                         # state. The raw startup CAS token remains in SQLite.
-                        "_run_startup_token_digest": hashlib.sha256(
-                            str(lease.get("startup_token") or "").encode("utf-8")
-                        ).hexdigest(),
+                        "_run_startup_token_digest": startup_token_digest,
                     }
                     admitted = self.store.admit_claimed_run(
                         str(run["run_id"]),
@@ -9028,9 +9510,15 @@ class WorkersProjectsService:
                                 str(run["run_id"]), None
                             )
                         lifecycle_guard.release()
-                        clear_run_grant = getattr(
-                            self.runtime, "clear_run_local_capability_grant", None
-                        )
+                        if self._run_retained_for_restart(str(run["run_id"])):
+                            # The generation keeps running across the managed restart and
+                            # still needs its run-local authority; the restarted service
+                            # revokes it once that generation is terminal.
+                            clear_run_grant = None
+                        else:
+                            clear_run_grant = getattr(
+                                self.runtime, "clear_run_local_capability_grant", None
+                            )
                         if callable(clear_run_grant):
                             try:
                                 clear_run_grant(worker)
@@ -9040,7 +9528,9 @@ class WorkersProjectsService:
                                     worker_id,
                                 )
                         try:
-                            self._revoke_run_local_capability_grant(run_worker)
+                            self._revoke_run_local_capability_grant(
+                                run_worker, run_id=str(run["run_id"])
+                            )
                         except Exception:
                             logger.exception(
                                 "Failed to revoke run-local capability grant for worker %s",
@@ -9117,10 +9607,15 @@ class WorkersProjectsService:
                 except WorkerInterruptedError as exc:
                     if not self._processor_is_current(worker_id, generation):
                         return
-                    recovered = self._collect_completed_run(worker, run)
-                    if recovered:
-                        self._apply_recovered_run(worker, run, recovered)
-                        continue
+                    if self._released_for_managed_shutdown(run, terminal_generation):
+                        # Managed shutdown released this run's lease and stopped its generation;
+                        # the same run resumes in the restarted service, so the old generation's
+                        # exit must not become a terminal state or a callback.
+                        logger.info(
+                            "Managed shutdown stopped the generation of run %s; leaving it for restart requeue",
+                            run["run_id"],
+                        )
+                        return
                     current_worker = self.store.get_worker(worker_id) or worker
                     stop_requested = current_worker.get("state") == "stopping"
                     final_state = "cancelled" if stop_requested else "interrupted"
@@ -9213,6 +9708,12 @@ class WorkersProjectsService:
                     ):
                         return
                     if not self._processor_is_current(worker_id, generation):
+                        return
+                    if self._released_for_managed_shutdown(run, terminal_generation):
+                        logger.info(
+                            "Managed shutdown stopped the generation of run %s; leaving it for restart requeue",
+                            run["run_id"],
+                        )
                         return
                     current_worker = self.store.get_worker(worker_id) or worker
                     worker_state = current_worker["state"]
@@ -10272,6 +10773,21 @@ class WorkersProjectsService:
     def _replay_startup_recovery(self) -> None:
         if self._shutdown_event.is_set():
             return
+        # The retained workspace inventory may be large. Its per-worker recovery
+        # already uses current run ownership and durable lease fences; run it on
+        # the existing lifespan-owned recovery thread so it cannot hold HTTP
+        # startup hostage. Credential cleanup and host lease recovery still run
+        # synchronously before this thread starts.
+        if self._reconcile_on_startup:
+            try:
+                self.reconcile_all_workers()
+            except Exception:
+                logger.error(
+                    "GlassHive startup worker recovery faulted safely",
+                    extra={"error_code": "transient_dependency"},
+                )
+        if self._shutdown_event.is_set():
+            return
         try:
             self.reap_needs_input_workers_once()
         except Exception:
@@ -10279,6 +10795,13 @@ class WorkersProjectsService:
                 "GlassHive startup needs-input compute recovery faulted safely",
                 extra={"error_code": "transient_dependency"},
             )
+        if self._shutdown_event.is_set():
+            return
+        try:
+            self.reconcile_restart_authority_backlog_once()
+        except Exception:
+            logger.error("GlassHive startup restart-authority recovery faulted safely",
+                         extra={"error_code": "transient_dependency"})
         if self._shutdown_event.is_set():
             return
         try:
@@ -10385,9 +10908,14 @@ class WorkersProjectsService:
             "workerId": str(record.get("worker_id") or ""),
             "runId": str(record.get("run_id") or ""),
             "grantId": str(record.get("grant_id") or ""),
-            "containerGenerationId": str(
-                record.get("container_generation_id") or ""
-            ),
+            **{
+                key: str(record[column])
+                for key, column in (
+                    ("containerGenerationId", "container_generation_id"),
+                    ("hostStartupLeaseId", "host_startup_lease_id"),
+                )
+                if record.get(column)
+            },
         }
         load_viventium_runtime_env(
             {
@@ -10636,6 +11164,15 @@ class WorkersProjectsService:
                 "Worker terminated",
             ),
         }[effect_kind]
+        if effect_kind == "callback.run_needs_input":
+            # The durable run row owns the attention wording (provider stall,
+            # missing account, ...). Keep the generic text only when no typed
+            # user message was recorded.
+            attention_message = str(
+                (run or {}).get("failure_user_message") or ""
+            ).strip()
+            if attention_message:
+                message = attention_message
         callback_id = "cb_effect_" + effect_id
         existing_record = self.store.get_callback_outbox(callback_id)
         if existing_record is not None:
@@ -10728,6 +11265,7 @@ class WorkersProjectsService:
         storage_pressure = self._storage_pressure_v1()
         policy_enabled = isolated_parallel_policy_enabled()
         active_worker_ids = self.store.active_host_mission_worker_ids()
+        terminal_history = self.store.conclusively_terminal_host_mission_history()
         process_status_reader = getattr(
             self.runtime, "host_active_process_status", None
         )
@@ -10746,9 +11284,22 @@ class WorkersProjectsService:
                 )
                 process_state_uncertain = True
                 continue
-            state = str((status or {}).get("state") or "uncertain")
+            if not isinstance(status, dict):
+                process_state_uncertain = True
+                continue
+            state = str(status.get("state") or "uncertain")
             if state == "active":
                 active_worker_ids.add(worker_id)
+            elif state == "uncertain":
+                observed_run_id = str(status.get("run_id") or "").strip()
+                historical_record_only = (
+                    status.get("historical_record_only") is True
+                )
+                if (
+                    not historical_record_only
+                    or (worker_id, observed_run_id) not in terminal_history
+                ):
+                    process_state_uncertain = True
             elif state != "absent":
                 process_state_uncertain = True
         isolated_runtime_ready = False
@@ -10801,6 +11352,22 @@ class WorkersProjectsService:
             )
         else:
             isolated_parallel_reason = isolated_runtime_reason
+        native_parallel_ready = bool(
+            native_parallel_policy_enabled()
+            and bool(storage_pressure.get("healthy"))
+            and prompt_layers_ready
+        )
+        native_parallel_reason = (
+            ""
+            if native_parallel_ready
+            else "native_parallel_not_authorized"
+            if not native_parallel_policy_enabled()
+            else "storage_pressure_unavailable"
+            if storage_pressure.get("errorCode")
+            else "storage_pressure_critical"
+            if not storage_pressure.get("healthy")
+            else "prompt_layer_capability_invalid"
+        )
         return {
             "policyVersion": 1,
             "readinessScope": {
@@ -10810,6 +11377,9 @@ class WorkersProjectsService:
             },
             "isolatedParallelReady": isolated_parallel_ready,
             "isolatedParallelReason": isolated_parallel_reason,
+            "nativeParallelReady": native_parallel_ready,
+            "nativeParallelReason": native_parallel_reason,
+            "sharedHostDesktop": native_parallel_ready,
             "hostMissionsAllowed": not policy_enabled,
             "hostMissionsActive": active_host_missions,
             "storagePressure": storage_pressure,
@@ -10901,6 +11471,7 @@ class WorkersProjectsService:
         owner_id: str,
         lane: str = "mission",
         worker: dict | None = None,
+        trusted_delegation: bool = False,
     ):
         """Hold one durable capacity claim around an external runtime probe."""
 
@@ -10946,7 +11517,7 @@ class WorkersProjectsService:
                 executor_id=self._executor_id,
                 **policy,
                 mutation_scope=(
-                    self._host_mutation_scope(prospective_worker)
+                    self._host_mutation_scope(prospective_worker, trusted_delegation=trusted_delegation)
                     if execution_mode == "host"
                     else ""
                 ),
@@ -11078,6 +11649,7 @@ class WorkersProjectsService:
         lane: str = "mission",
         worker: dict | None = None,
         require_capacity_snapshot: bool = False,
+        trusted_delegation: bool = False,
     ) -> dict[str, object]:
         """Fence every adapter CLI preflight behind durable, live capacity."""
 
@@ -11097,6 +11669,7 @@ class WorkersProjectsService:
             owner_id=owner_id,
             lane=lane,
             worker=worker,
+            trusted_delegation=trusted_delegation,
         ) as (capacity_snapshot, _probe_lease):
             if has_preflight:
                 self._ensure_runtime_available(profile, execution_mode)
@@ -12535,6 +13108,7 @@ class WorkersProjectsService:
                 "expired lifecycle claims",
                 self.recover_expired_compute_release_claims_once,
             ),
+            ("restart authority backlog", self.reconcile_restart_authority_backlog_once),
             ("worker retries", self.process_due_worker_retries_once),
             ("provider liveness", self.process_provider_liveness_once),
         ):
@@ -12806,6 +13380,8 @@ class WorkersProjectsService:
             origin_ref = prepared.origin_ref
             work_ref = prepared.work_ref
             prepared_broker_url = prepared.broker_url
+            generation_key = "containerGenerationId"
+            generation_id = container_generation_id
         else:
             delegation = self.store.get_delegation_for_worker(
                 str(worker.get("worker_id") or ""),
@@ -12823,13 +13399,17 @@ class WorkersProjectsService:
                     "broker_admission_binding_mismatch",
                     "The deferred capability authorization binding is invalid.",
                 )
-            container_generation_id = str(
-                (authority_context or {}).get("container_generation_id") or ""
-            ).strip()
-            if not re.fullmatch(r"[a-f0-9]{64}", container_generation_id):
+            host_mode = str(worker.get("execution_mode") or "docker") == "host"
+            generation_key = "hostStartupLeaseId" if host_mode else "containerGenerationId"
+            context_key = "host_startup_lease_id" if host_mode else "container_generation_id"
+            generation_id = str((authority_context or {}).get(context_key) or "").strip()
+            if (
+                set(authority_context or {}) != {context_key}
+                or not re.fullmatch(r"[a-f0-9]{64}", generation_id)
+            ):
                 raise BrokerAdmissionError(
                     "broker_admission_generation_unavailable",
-                    "The exact mission container generation is unavailable.",
+                    "The exact mission runtime generation is unavailable.",
                     retryable=True,
                 )
             work_ref = str(delegation.get("work_ref") or "")
@@ -12844,7 +13424,7 @@ class WorkersProjectsService:
             "runId": str(run.get("run_id") or ""),
             "workRef": work_ref,
             "workerId": str(worker.get("worker_id") or ""),
-            "containerGenerationId": container_generation_id,
+            generation_key: generation_id,
         }
         grant = admit_capability_grant(
             admission_url,
@@ -12876,61 +13456,65 @@ class WorkersProjectsService:
                 "scheduled_provider_authorization_response_invalid",
                 "The admitted provider authorization changed its broker binding.",
             )
-        provider = (
-            "anthropic"
-            if str(worker.get("profile") or "").strip() == "claude-code"
-            else "openai"
-        )
-        try:
-            preflight_provider_authorization(
-                admission_url,
-                grant_token=grant.grant_token,
-                provider=provider,
-                expected_worker_id=str(worker.get("worker_id") or ""),
-                expected_run_id=str(run.get("run_id") or ""),
-                timeout_seconds=_bounded_float_env(
-                    "VIVENTIUM_GLASSHIVE_PROVIDER_PREFLIGHT_TIMEOUT_S",
-                    3.0,
-                    min_value=0.1,
-                    max_value=30.0,
-                ),
+        # Only clean-room providers use Core's provider broker. Native host
+        # runtimes validate their selected account through the existing local
+        # account binder before launch; this grant authorizes connected tools.
+        if str(worker.get("execution_mode") or "docker") == "docker":
+            provider = (
+                "anthropic"
+                if str(worker.get("profile") or "").strip() == "claude-code"
+                else "openai"
             )
-            self.store.record_provider_authorization_preflight(
-                str(run.get("run_id") or ""),
-                provider=provider,
-                status="authorized",
-                failure_class="",
-            )
-        except BrokerAdmissionError as exc:
-            self.store.record_provider_authorization_preflight(
-                str(run.get("run_id") or ""),
-                provider=provider,
-                status=(
-                    "needs_input"
-                    if exc.needs_input
-                    else "retryable_failure"
-                    if exc.retryable
-                    else "rejected"
-                ),
-                failure_class=exc.code,
-            )
-            self.store.activate_capability_grant_revocation(revocation_id)
-            self._replay_pending_capability_grant_revocations(
-                revocation_id=revocation_id
-            )
-            raise
-        except Exception:
-            self.store.record_provider_authorization_preflight(
-                str(run.get("run_id") or ""),
-                provider=provider,
-                status="rejected",
-                failure_class="provider_auth_preflight_unexpected",
-            )
-            self.store.activate_capability_grant_revocation(revocation_id)
-            self._replay_pending_capability_grant_revocations(
-                revocation_id=revocation_id
-            )
-            raise
+            try:
+                preflight_provider_authorization(
+                    admission_url,
+                    grant_token=grant.grant_token,
+                    provider=provider,
+                    expected_worker_id=str(worker.get("worker_id") or ""),
+                    expected_run_id=str(run.get("run_id") or ""),
+                    timeout_seconds=_bounded_float_env(
+                        "VIVENTIUM_GLASSHIVE_PROVIDER_PREFLIGHT_TIMEOUT_S",
+                        3.0,
+                        min_value=0.1,
+                        max_value=30.0,
+                    ),
+                )
+                self.store.record_provider_authorization_preflight(
+                    str(run.get("run_id") or ""),
+                    provider=provider,
+                    status="authorized",
+                    failure_class="",
+                )
+            except BrokerAdmissionError as exc:
+                self.store.record_provider_authorization_preflight(
+                    str(run.get("run_id") or ""),
+                    provider=provider,
+                    status=(
+                        "needs_input"
+                        if exc.needs_input
+                        else "retryable_failure"
+                        if exc.retryable
+                        else "rejected"
+                    ),
+                    failure_class=exc.code,
+                )
+                self.store.activate_capability_grant_revocation(revocation_id)
+                self._replay_pending_capability_grant_revocations(
+                    revocation_id=revocation_id
+                )
+                raise
+            except Exception:
+                self.store.record_provider_authorization_preflight(
+                    str(run.get("run_id") or ""),
+                    provider=provider,
+                    status="rejected",
+                    failure_class="provider_auth_preflight_unexpected",
+                )
+                self.store.activate_capability_grant_revocation(revocation_id)
+                self._replay_pending_capability_grant_revocations(
+                    revocation_id=revocation_id
+                )
+                raise
         bundle = self._bootstrap_bundle_for(worker) or {}
         run_bundle = merge_bootstrap_bundle(
             bundle,
@@ -12961,11 +13545,22 @@ class WorkersProjectsService:
             ),
         }
 
-    def _revoke_run_local_capability_grant(self, worker: dict) -> None:
+    def _run_retained_for_restart(self, run_id: str) -> bool:
+        with self._processors_lock:
+            return str(run_id or "") in self._retained_restart_run_ids
+
+    def _revoke_run_local_capability_grant(
+        self, worker: dict, *, run_id: str = ""
+    ) -> None:
         revocation_id = str(
             worker.get("_run_local_capability_revocation_id") or ""
         ).strip()
         if not revocation_id:
+            return
+        retained_run_id = str(run_id or worker.get("_active_run_id") or "").strip()
+        if retained_run_id and self._run_retained_for_restart(retained_run_id):
+            # A retained generation keeps its armed revocation until it is terminal;
+            # activating it here would strip the live worker's provider authority.
             return
         self.store.activate_capability_grant_revocation(revocation_id)
         self._replay_pending_capability_grant_revocations(
@@ -13325,13 +13920,29 @@ class WorkersProjectsService:
             return error, snapshot
         return error
 
-    def _host_mutation_scope(self, worker: dict) -> str:
-        """Serialize potentially mutating host missions by a structural target identity.
+    def _is_native_conversation_delegation(self, worker: dict) -> bool:
+        authority = (self._bootstrap_bundle_for(worker) or {}).get("viventium_launch_authority")
+        if (
+            not isinstance(authority, dict)
+            or authority.get("version") != 1
+            or authority.get("kind") != "conversation_orchestrator"
+            or authority.get("execution_mode") != "host"
+        ):
+            return False
+        return self.store.get_delegation_for_worker(
+            str(worker.get("worker_id") or ""),
+            tenant_id=str(worker.get("tenant_id") or ""),
+            owner_id=str(worker.get("owner_id") or ""),
+        ) is not None
 
-        Host CLIs intentionally retain broad filesystem capabilities. Until a trusted
-        caller supplies a target-repository identity, an unscoped mission therefore
-        takes one conservative shared mutation lease instead of racing another host
-        mission against an unknown checkout. User wording never changes this guard.
+    def _has_native_delegation_authority(self, worker: dict) -> bool:
+        return native_parallel_policy_enabled() and self._is_native_conversation_delegation(worker)
+
+    def _host_mutation_scope(self, worker: dict, *, trusted_delegation: bool = False) -> str:
+        """Keep the conservative fence for manual host missions.
+
+        Core-owned native missions use distinct workspaces and model coordination.
+        This fence does not give them exclusive control of the shared desktop.
         """
 
         if (
@@ -13339,11 +13950,12 @@ class WorkersProjectsService:
             or self._host_run_lane(worker) != "mission"
         ):
             return ""
-        # The current bootstrap is partially model-authored and carries no
-        # authenticated target-repository provenance. Never allow its
-        # host_mutation_scope/target_repository_root fields to buy a separate
-        # lease. A future Core-owned target authority can replace this shared
-        # scope after it has an independently verified project binding.
+        if native_parallel_policy_enabled() and (
+            trusted_delegation or self._has_native_delegation_authority(worker)
+        ):
+            return ""
+        # Model-authored bootstrap fields cannot turn a manual worker into a
+        # Core-owned mission or buy an independent mutation lease.
         return hashlib.sha256(b"host-mission:unscoped-mutation-target").hexdigest()
 
     def _relieve_docker_resource_pressure(
@@ -14023,6 +14635,10 @@ class WorkersProjectsService:
         return "settling"
 
     def _release_host_run_lease(self, run_id: str, *, reason: str) -> None:
+        if self._run_retained_for_restart(str(run_id)):
+            # The lease now belongs to the live generation retained across this
+            # managed restart; the restarted service releases it after adoption.
+            return
         if reason == "runtime_returned":
             run = self.store.get_run(str(run_id))
             if run and str(run.get("state") or "") in {"running", "settling"}:
@@ -14038,6 +14654,10 @@ class WorkersProjectsService:
             if lease
             else None
         )
+        with self._processors_lock:
+            if lease and str(lease.get("lease_id") or "") in self._managed_shutdown_lease_ids:
+                # Only shutdown's absence proof may release this generation's fence.
+                return
         if lease and self._lease_is_fenced_by_lifecycle_claim(worker, lease):
             return
         if lease and str(lease.get("executor_id") or "") == self._executor_id:
@@ -14200,6 +14820,17 @@ class WorkersProjectsService:
                 else None
             )
             if identity and bool(identity.get("verified")):
+                # A launcher restart kills the executor without a graceful shutdown and
+                # takes longer than the lease TTL. The generation it fenced (a container
+                # screen session) keeps running. When the live identity matches the one
+                # recorded on the lease exactly, revive the expired lease so startup adopts
+                # that generation instead of downgrading the run into a duplicate.
+                lease_expired = str(lease.get("expires_at") or "") <= utc_now()
+                revive = bool(
+                    self._restart_survivor_adoption_enabled()
+                    and lease_expired
+                    and self._survivor_identity_matches_lease(identity, lease)
+                )
                 updated = self.store.heartbeat_host_run_lease(
                     str(lease["lease_id"]),
                     executor_id=None,
@@ -14208,9 +14839,54 @@ class WorkersProjectsService:
                     process_start_identity=str(identity.get("process_start_identity") or ""),
                     lease_ttl_s=self._host_lease_ttl_s(),
                     reconciled=True,
+                    allow_expired=revive,
                 )
+                if updated and revive:
+                    logger.info(
+                        "Revived the expired lease of run %s for its verified live generation",
+                        str(lease.get("run_id") or ""),
+                    )
+                elif lease_expired and not updated and self._restart_survivor_adoption_enabled():
+                    logger.warning(
+                        "Expired lease of run %s has a live generation whose identity does not match; leaving it fenced",
+                        str(lease.get("run_id") or ""),
+                    )
                 result["renewed" if updated else "unchanged"] += 1
             else:
+                # A generation that finished while no executor was watching (for example
+                # during a managed restart) publishes its terminal transcript before its
+                # session disappears. Collect that single result under the still-active
+                # lease instead of requeueing the exact run into a duplicate generation.
+                recovered = None
+                if (
+                    self._restart_survivor_adoption_enabled()
+                    and worker
+                    and str(run.get("state") or "") == "running"
+                ):
+                    try:
+                        recovered = self._collect_completed_run(worker, run)
+                    except Exception:
+                        logger.exception(
+                            "Stale lease terminal-evidence collection failed",
+                            extra={"run_id": str(lease.get("run_id") or "")},
+                        )
+                        recovered = None
+                if recovered:
+                    self._apply_recovered_run(worker, run, recovered)
+                    self._release_reconciled_run_lease(
+                        str(lease.get("run_id") or ""), reason="survivor_terminal"
+                    )
+                    result["released"] += 1
+                    continue
+                if not self._stale_lease_generation_proven_absent(
+                    worker, run, lease, absence_reader=absence_reader
+                ):
+                    logger.warning(
+                        "Stale lease of run %s stays fenced: its recorded generation could not be stopped or proven absent",
+                        str(lease.get("run_id") or ""),
+                    )
+                    result["unchanged"] += 1
+                    continue
                 released = self.store.reconcile_dead_host_run_lease(
                     lease_id=str(lease["lease_id"]),
                     run_id=str(lease.get("run_id") or ""),
@@ -14220,6 +14896,68 @@ class WorkersProjectsService:
                 )
                 result["released" if released else "unchanged"] += 1
         return result
+
+    def _stale_lease_generation_proven_absent(
+        self,
+        worker: dict | None,
+        run: dict,
+        lease: dict,
+        *,
+        absence_reader,
+    ) -> bool:
+        """Stop the exact generation a stale lease fenced and prove it absent before any requeue.
+
+        A lease whose executor stopped heartbeating is not evidence that the generation it fenced
+        is dead: a launcher restart kills the executor first while the container screen session or
+        host process it started keeps working. Releasing the lease there requeues the same run into
+        a second, concurrent generation of the same work. Cleanup targets only the identity the
+        lease durably recorded (immutable container id plus exact screen session, or exact pid
+        start identity); absence of that generation is the only release proof, and ambiguity keeps
+        the fence for the next pass. Survivor adoption stays off: nothing here collects a result.
+        """
+
+        run_id = str(lease.get("run_id") or "")
+        if not worker or not run_id:
+            return False
+        if not str(run.get("runtime_invoked_at") or "").strip():
+            # Nothing was ever launched for this attempt, so there is no generation to stop.
+            return True
+        captured_identity = self._reserved_start_identity(lease)
+        cleanup = getattr(self.runtime, "cleanup_unconfirmed_run_start", None)
+        if captured_identity and callable(cleanup):
+            try:
+                if cleanup(worker, run_id, captured_identity) is True:
+                    return True
+            except Exception:
+                logger.exception(
+                    "Stale lease generation cleanup failed", extra={"run_id": run_id}
+                )
+        if callable(absence_reader):
+            try:
+                return absence_reader(worker, run_id) is True
+            except Exception:
+                logger.exception(
+                    "Stale lease absence proof failed", extra={"run_id": run_id}
+                )
+        return False
+
+    @staticmethod
+    def _survivor_identity_matches_lease(identity: dict, lease: dict) -> bool:
+        """True only when the live generation is exactly the one this lease fenced."""
+        kind = str(identity.get("identity_kind") or "").strip()
+        if not kind or kind != str(lease.get("startup_identity_kind") or "").strip():
+            return False
+        recorded = str(lease.get("process_start_identity") or "").strip()
+        if not recorded or recorded != str(identity.get("process_start_identity") or "").strip():
+            return False
+        if kind == "docker_session":
+            return (
+                str(identity.get("container_id") or "").strip()
+                == str(lease.get("startup_container_id") or "").strip() != ""
+                and str(identity.get("session_id") or "").strip()
+                == str(lease.get("startup_session_id") or "").strip() != ""
+            )
+        return True
 
     def _reconcile_termination_unconfirmed_host_run_start(
         self,
@@ -14637,12 +15375,53 @@ class WorkersProjectsService:
                 repaired += 1
         return repaired
 
-    def _trusted_parallel_fallback_profile(self, worker: dict) -> str:
+    def _configured_parallel_worker_route(
+        self, profile: str, execution_mode: str, bundle: dict | None, *, fallback: bool = False
+    ) -> tuple[str, dict]:
+        """Resolve explicit trusted preferences through the existing model catalog."""
+        from .conversation_provider import GLASSHIVE_MODELS
+
+        result = dict(bundle or {})
+        authority = result.get("viventium_launch_authority") or {}
+        prefix = "fallback_worker" if fallback else "worker"
+        model_id = authority.get(f"{prefix}_model")
+        effort = authority.get(f"{prefix}_reasoning_effort")
+        selected = None
+        if model_id is not None:
+            selected = GLASSHIVE_MODELS.get(model_id)
+            if selected is None or selected.harness_profile != profile:
+                raise BackgroundWorkerConfigurationError("Configured background model is unknown or incompatible with its worker profile.")
+            model = selected.native_model
+        else:
+            model = self._resolve_worker_model(profile, execution_mode)
+        if effort is not None:
+            if selected is None:
+                selected = next((item for item in GLASSHIVE_MODELS.values()
+                                 if item.harness_profile == profile and item.native_model == model), None)
+            if selected is None or effort not in selected.effort_choices:
+                raise BackgroundWorkerConfigurationError("Configured background reasoning effort is unsupported by its exact model.")
+            effort_env = {"codex-cli": "WPR_CODEX_CLI_REASONING_EFFORT",
+                          "claude-code": "WPR_CLAUDE_CODE_EFFORT"}.get(profile)
+            if effort_env is None:
+                raise BackgroundWorkerConfigurationError("Configured background worker does not support reasoning effort.")
+            result["env"] = {**dict(result.get("env") or {}), effort_env: effort}
+        result["provider_model"] = model
+        return model, result
+
+    def _trusted_parallel_fallback_profile(
+        self, worker: dict, *, preflight: bool = True
+    ) -> str:
         bundle = self._bootstrap_bundle_for(worker) or {}
         authority = bundle.get("viventium_launch_authority")
-        if (
+        execution_mode = str(worker.get("execution_mode") or "docker")
+        policy_ready = (
             str(bundle.get("execution_policy") or "").strip()
-            != PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+            == PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+            if execution_mode == "docker"
+            else self._has_native_delegation_authority(worker)
+        )
+        if (
+            not policy_ready
             or not isinstance(authority, dict)
             or authority.get("version") != 1
             or authority.get("kind")
@@ -14650,20 +15429,22 @@ class WorkersProjectsService:
                 "conversation_orchestrator",
                 PROMPT_WORKBENCH_SCHEDULED_AUTHORITY_KIND,
             }
-            or authority.get("execution_mode") != "docker"
+            or authority.get("execution_mode") != execution_mode
         ):
             return ""
         fallback_profile = str(authority.get("fallback_worker_profile") or "").strip()
         if not fallback_profile or fallback_profile == str(worker.get("profile") or "").strip():
             return ""
         self._ensure_profile_allowed(fallback_profile)
+        if not preflight:
+            return fallback_profile
         self._reserved_runtime_preflight(
             fallback_profile,
-            "docker",
+            execution_mode,
             tenant_id=str(worker.get("tenant_id") or "local"),
             owner_id=str(worker.get("owner_id") or ""),
             lane=self._trusted_run_lane(worker),
-            worker={**worker, "profile": fallback_profile, "execution_mode": "docker"},
+            worker={**worker, "profile": fallback_profile, "execution_mode": execution_mode},
         )
         return fallback_profile
 
@@ -14944,8 +15725,11 @@ class WorkersProjectsService:
                 if not route_locked
                 else ""
             )
-            fallback_runtime = self._initial_runtime_label(fallback_profile, "docker")
-            fallback_model = self._resolve_worker_model(fallback_profile, "docker")
+            execution_mode = str(worker.get("execution_mode") or "docker")
+            fallback_runtime = self._initial_runtime_label(fallback_profile, execution_mode)
+            fallback_model, fallback_bundle = self._configured_parallel_worker_route(
+                fallback_profile, execution_mode, self._bootstrap_bundle_for(worker), fallback=True
+            )
             fallback_route = {
                 "tenant_id": route["tenant_id"],
                 "owner_id": route["owner_id"],
@@ -14970,10 +15754,11 @@ class WorkersProjectsService:
                 expected_profile=route["profile"],
                 fallback_profile=fallback_profile,
                 fallback_backend=self._legacy_backend_label(
-                    fallback_profile, "docker", ""
+                    fallback_profile, execution_mode, ""
                 ),
                 fallback_runtime=fallback_runtime,
                 fallback_model=fallback_model,
+                fallback_bootstrap_bundle=fallback_bundle,
                 retry_after=(
                     datetime.now(timezone.utc) + timedelta(milliseconds=100)
                 ).isoformat(),
@@ -15160,6 +15945,7 @@ class WorkersProjectsService:
             or str(run.get("output_text") or "").strip()
         ):
             return None
+        execution_mode = str(worker.get("execution_mode") or "docker")
         primary_health = self.store.get_provider_route_health(
             **self._provider_route(worker)
         )
@@ -15180,7 +15966,23 @@ class WorkersProjectsService:
                 ),
             )
         try:
-            fallback_profile = self._trusted_parallel_fallback_profile(worker)
+            try:
+                fallback_profile = self._trusted_parallel_fallback_profile(worker)
+            except HostCapacityError as capacity_exc:
+                # Host capacity and its Docker probe are transient state, not fallback
+                # configuration. The switched run is requeued and re-admitted by the same
+                # capacity gate, so select the authorized fallback without this fence.
+                logger.warning(
+                    "Parallel fallback preflight hit transient host capacity (%s); "
+                    "switching without the capacity fence",
+                    str(
+                        getattr(capacity_exc, "capacity_class", "")
+                        or type(capacity_exc).__name__
+                    ),
+                )
+                fallback_profile = self._trusted_parallel_fallback_profile(
+                    worker, preflight=False
+                )
             if not fallback_profile:
                 self._record_unavailable_provider_fallback(
                     worker,
@@ -15189,9 +15991,11 @@ class WorkersProjectsService:
                     reason="fallback_not_authorized",
                 )
                 return None
-            fallback_model = self._resolve_worker_model(fallback_profile, "docker")
+            fallback_model, fallback_bundle = self._configured_parallel_worker_route(
+                fallback_profile, execution_mode, self._bootstrap_bundle_for(worker), fallback=True
+            )
             fallback_runtime = self._initial_runtime_label(
-                fallback_profile, "docker"
+                fallback_profile, execution_mode
             )
             fallback_health = self.store.get_provider_route_health(
                 tenant_id=str(worker.get("tenant_id") or "local"),
@@ -15210,13 +16014,14 @@ class WorkersProjectsService:
                     fallback_health=fallback_health,
                 )
                 return None
-        except Exception:
+        except Exception as preflight_exc:
             # The fallback is optional recovery.  A stale/invalid fallback
             # configuration must not replace the authoritative primary-provider
             # failure with an unrelated processor exception or expose provider
             # preflight details to the user surface.
             logger.warning(
-                "Configured Parallel worker fallback is unavailable; preserving the primary provider failure"
+                "Configured Parallel worker fallback is unavailable (%s); preserving the primary provider failure",
+                type(preflight_exc).__name__,
             )
             self._record_unavailable_provider_fallback(
                 worker,
@@ -15231,9 +16036,10 @@ class WorkersProjectsService:
             run_id=str(run["run_id"]),
             expected_profile=current_profile,
             fallback_profile=fallback_profile,
-            fallback_backend=self._legacy_backend_label(fallback_profile, "docker", ""),
+            fallback_backend=self._legacy_backend_label(fallback_profile, execution_mode, ""),
             fallback_runtime=fallback_runtime,
             fallback_model=fallback_model,
+            fallback_bootstrap_bundle=fallback_bundle,
             retry_after=(datetime.now(timezone.utc) + timedelta(milliseconds=100)).isoformat(),
             error_text=str(exc),
             route_cooldown_until=str(
@@ -15267,7 +16073,7 @@ class WorkersProjectsService:
                 "fromRuntime": str(worker.get("runtime") or ""),
                 "fromModel": str(worker.get("model") or ""),
                 "toProfile": fallback_profile,
-                "toRuntime": self._initial_runtime_label(fallback_profile, "docker"),
+                "toRuntime": self._initial_runtime_label(fallback_profile, execution_mode),
                 "toModel": fallback_model,
                 "failureClass": str(failure_fields.get("failure_class") or ""),
                 "cooldownUntil": str(
@@ -15277,6 +16083,19 @@ class WorkersProjectsService:
         )
         self._scheduler_wake_event.set()
         return switched
+
+    def _queued_runtime_preflight(self, *args, **kwargs):
+        try:
+            return self._reserved_runtime_preflight(*args, **kwargs)
+        except HostCapacityError as exc:
+            if exc.capacity_class not in {
+                "resource_pressure", "family_lane", "account", "tenant", "mutation_scope"
+            }:
+                raise
+            # Acceptance is durable; the existing dispatcher acquires capacity
+            # before running any worker or CLI probe. Do not reserve compute
+            # for a queued objective or make the caller resubmit its goal.
+            return None
 
     def reserve_delegation(
         self,
@@ -15344,20 +16163,23 @@ class WorkersProjectsService:
             )
             valid_launch_authority = (
                 isinstance(launch_authority, dict)
-                and launch_authority_keys
-                in (
-                    {"version", "kind", "execution_mode"},
-                    {
-                        "version",
-                        "kind",
-                        "execution_mode",
-                        "fallback_worker_profile",
-                    },
+                and {"version", "kind", "execution_mode"} <= launch_authority_keys
+                and launch_authority_keys <= {
+                    "version", "kind", "execution_mode", "fallback_worker_profile",
+                    "worker_model", "worker_reasoning_effort",
+                    "fallback_worker_model", "fallback_worker_reasoning_effort",
+                }
+                and all(
+                    isinstance(launch_authority[key], str) and bool(launch_authority[key].strip())
+                    for key in launch_authority_keys - {"version", "kind", "execution_mode"}
                 )
+                and (not launch_authority_keys.intersection({"fallback_worker_model", "fallback_worker_reasoning_effort"})
+                     or "fallback_worker_profile" in launch_authority_keys)
                 and launch_authority.get("version") == 1
                 and not isinstance(launch_authority.get("version"), bool)
                 and launch_authority.get("kind") == "conversation_orchestrator"
-                and launch_authority.get("execution_mode") == "docker"
+                and launch_authority.get("execution_mode") == execution_mode
+                and execution_mode in {"docker", "host"}
                 and (
                     "fallback_worker_profile" not in launch_authority
                     or bool(str(launch_authority.get("fallback_worker_profile") or "").strip())
@@ -15366,40 +16188,55 @@ class WorkersProjectsService:
             capabilities = self.orchestration_capabilities()
             if (
                 not valid_launch_authority
-                or str(execution_mode or "").strip().lower() != "docker"
-                or not isolated_parallel_policy_enabled()
-                or capabilities["isolatedParallelReady"] is not True
+                or (
+                    execution_mode == "docker"
+                    and capabilities["isolatedParallelReady"] is not True
+                )
+                or (
+                    execution_mode == "host"
+                    and capabilities["nativeParallelReady"] is not True
+                )
             ):
                 raise ParallelExecutionIsolationError(
-                    "Automatic Parallel work requires an isolated Docker/workstation runtime."
+                    "Automatic Parallel work requires an authorized ready worker runtime."
                 )
-            bootstrap_profile, bootstrap_bundle = derive_parallel_clean_room_bootstrap(
-                bootstrap_profile,
-                bootstrap_bundle,
+            model, bootstrap_bundle = self._configured_parallel_worker_route(
+                profile, execution_mode, bootstrap_bundle
             )
+            if launch_authority.get("fallback_worker_profile"):
+                self._configured_parallel_worker_route(
+                    launch_authority["fallback_worker_profile"], execution_mode,
+                    bootstrap_bundle, fallback=True,
+                )
+            if execution_mode == "docker":
+                bootstrap_profile, bootstrap_bundle = derive_parallel_clean_room_bootstrap(
+                    bootstrap_profile,
+                    bootstrap_bundle,
+                )
             fallback_worker_profile = str(
                 launch_authority.get("fallback_worker_profile") or ""
             ).strip()
             if fallback_worker_profile:
                 self._ensure_profile_allowed(fallback_worker_profile)
-                self._reserved_runtime_preflight(
+                self._queued_runtime_preflight(
                     fallback_worker_profile,
-                    "docker",
+                    execution_mode,
                     tenant_id=tenant_id,
                     owner_id=owner_id,
                     lane="mission",
+                    trusted_delegation=True,
                     worker={
                         **prospective_worker,
                         "profile": fallback_worker_profile,
                         "runtime": self._initial_runtime_label(
                             fallback_worker_profile,
-                            "docker",
+                            execution_mode,
                         ),
                     },
                 )
         self._ensure_execution_allowed(execution_mode)
         self._ensure_profile_allowed(profile)
-        capacity_snapshot = self._reserved_runtime_preflight(
+        capacity_snapshot = self._queued_runtime_preflight(
             profile,
             execution_mode,
             tenant_id=tenant_id,
@@ -15407,8 +16244,10 @@ class WorkersProjectsService:
             lane="mission",
             worker=prospective_worker,
             require_capacity_snapshot=True,
+            trusted_delegation=launch_authority is not None,
         )
-        model = self._resolve_worker_model(profile, execution_mode)
+        if launch_authority is None:
+            model = self._resolve_worker_model(profile, execution_mode)
         capacity_next_retry_at = (
             datetime.now(timezone.utc)
             + timedelta(seconds=self._retry_base_delay_s("host_capacity"))
@@ -15439,8 +16278,9 @@ class WorkersProjectsService:
                     workspace_root=workspace_root,
                     bootstrap_profile=bootstrap_profile,
                     bootstrap_bundle=bootstrap_bundle,
-                    require_isolated_parallel_ready=launch_authority is not None,
-                    preaccept_host_lease={
+                    require_isolated_parallel_ready=launch_authority is not None and execution_mode == "docker",
+                    queue_on_capacity=True,
+                    preaccept_host_lease=None if capacity_snapshot is None else {
                         "runtime_family": self._host_runtime_family(
                             prospective_worker
                         ),
@@ -15448,7 +16288,7 @@ class WorkersProjectsService:
                         "executor_id": self._executor_id,
                         **capacity_policy,
                         "mutation_scope": (
-                            self._host_mutation_scope(prospective_worker)
+                            self._host_mutation_scope(prospective_worker, trusted_delegation=launch_authority is not None)
                             if execution_mode == "host"
                             else ""
                         ),
@@ -15632,6 +16472,15 @@ class WorkersProjectsService:
             "output": output_contract,
         }
 
+    def active_work_pending_native_input(self, delegation: dict) -> dict | None:
+        run_id = str(delegation.get("run_id") or delegation.get("current_run_id") or "")
+        run = self.store.get_run(run_id)
+        worker = self.store.get_worker(str(delegation.get("worker_id") or ""))
+        if not run or not worker or str(run.get("state") or "") not in {"running", "paused"}:
+            return None
+        method = getattr(self.runtime, "pending_native_input", None)
+        return method(worker, run_id=run_id) if callable(method) else None
+
     def execute_active_work_action(
         self,
         delegation: dict,
@@ -15641,6 +16490,7 @@ class WorkersProjectsService:
         idempotency_key: str,
         capability_reauthorization: dict[str, object] | None = None,
         action_use_id: str = "",
+        native_input: dict[str, object] | None = None,
     ) -> dict[str, object]:
         worker_id = str(delegation.get("worker_id") or "")
         project_id = str(delegation.get("project_id") or "")
@@ -15660,6 +16510,8 @@ class WorkersProjectsService:
             action_record = self.store.get_active_work_action(action_use_id) or {}
             bound_run_id = str(action_record.get("source_run_id") or "")
             if bound_run_id and bound_run_id != run_id:
+                if native_input is not None:
+                    raise RuntimeError("native_input_stale")
                 recovered = self.reconcile_active_work_action(
                     live_delegation,
                     action=action,
@@ -15677,6 +16529,26 @@ class WorkersProjectsService:
         run = self.require_run(run_id)
         run_state = str(run.get("state") or "")
         public_state = self._active_work_service_state(live_delegation)
+        if native_input is not None:
+            if action != "resume" or capability_reauthorization is not None:
+                raise RuntimeError("native_input_stale")
+            method = getattr(self.runtime, "respond_native_input", None)
+            if not callable(method):
+                raise RuntimeError("native_input_unavailable")
+            try:
+                result = method(worker, run_id=run_id,
+                                request_id=str(native_input.get("request_id") or ""),
+                                request_fingerprint=str(native_input.get("request_fingerprint") or ""),
+                                action=str(native_input.get("action") or ""), content=native_input.get("content"),
+                                allow_new=run_state in {"running", "paused"})
+            except RuntimeErrorBase as exc:
+                if str(exc) == "native_input_invalid":
+                    raise ValueError("Native input does not match the requested form") from exc
+                raise
+            if result["status"] == "accepted":
+                self.store.add_event(project_id, worker_id, run_id, "worker.native_input_answered",
+                                     "Owner responded to native input", payload={"requestId": native_input.get("request_id"), "action": native_input.get("action")})
+            return {"status": result["status"], "state": run_state, "run_id": run_id, "confirmation_pending": False}
         allowed_actions = self._active_work_service_actions(live_delegation, public_state)
         if action not in allowed_actions:
             recovered = self.reconcile_active_work_action(
@@ -15713,6 +16585,10 @@ class WorkersProjectsService:
                 self._active_work_follow_up_authority(action_record)
             )
             if action == "queue":
+                queue_context = build_workspace_continuation_context(
+                    previous_run=run,
+                    continuation_goal=clean_instruction,
+                )
                 created = self.assign_run(
                     worker_id,
                     clean_instruction,
@@ -15721,6 +16597,7 @@ class WorkersProjectsService:
                     resume_paused_worker=False,
                     origin_trace=origin_trace,
                     continuation_contract=continuation_contract,
+                    continuation_context=queue_context,
                 )
             elif action == "message":
                 # Current host adapters have no proven live-message primitive.
@@ -15741,7 +16618,7 @@ class WorkersProjectsService:
                     with self._worker_compute_release_lock(worker_id):
                         worker = self.require_worker(worker_id)
                         self._ensure_execution_allowed(worker)
-                        self._reserved_runtime_preflight(
+                        self._queued_runtime_preflight(
                             str(worker.get("profile") or ""),
                             str(worker.get("execution_mode") or "docker"),
                             tenant_id=str(worker.get("tenant_id") or "local"),
@@ -16021,6 +16898,8 @@ class WorkersProjectsService:
             if run_state != "failed" or not is_user_resumable_failure(
                 failure_class=run.get("failure_class"),
                 retryable=run.get("failure_retryable"),
+                runtime_invoked_at=run.get("runtime_invoked_at", ...),
+                started_at=run.get("started_at", ...),
             ):
                 raise RuntimeError("active_work_not_retryable")
             if self.store.get_active_run(worker_id) or self.store.has_queued_runs(worker_id):
@@ -16299,12 +17178,12 @@ class WorkersProjectsService:
         if state == "failed" and is_user_resumable_failure(
             failure_class=record.get("run_failure_class"),
             retryable=record.get("run_failure_retryable"),
+            runtime_invoked_at=record.get("run_runtime_invoked_at", ...),
+            started_at=record.get("run_started_at", ...),
         ):
-            return {"retry", "dismiss"}
-        if state == "completed":
+            return {"retry", "queue", "message", "dismiss"}
+        if state in {"completed", "failed", "cancelled"}:
             return {"queue", "message", "dismiss"}
-        if state in {"failed", "cancelled"}:
-            return {"dismiss"}
         return set()
 
     def reconcile_active_work_action(
@@ -16775,6 +17654,33 @@ class WorkersProjectsService:
         with self._run_local_bundles_lock:
             self._run_local_grant_waiters.discard(str(run_id))
 
+    def _exact_provider_session_bundle_for_run(
+        self, bundle: dict[str, object], run_id: str
+    ) -> dict[str, object]:
+        """Project one request's durable native-session mode onto its run."""
+
+        provider_request = self.store.get_provider_request_for_run(str(run_id))
+        if provider_request is None:
+            return bundle
+        try:
+            replay_decision = json.loads(
+                str(provider_request.get("replay_decision_json") or "{}")
+            )
+        except (TypeError, json.JSONDecodeError):
+            replay_decision = {}
+        provider_session_mode = (
+            str(replay_decision.get("provider_session_mode") or "persistent")
+            if isinstance(replay_decision, dict)
+            else "persistent"
+        )
+        exact_bundle = dict(bundle)
+        exact_env = dict(exact_bundle.get("env") or {})
+        exact_env.pop(GLASSHIVE_PROVIDER_SESSION_MODE_ENV, None)
+        if provider_session_mode == "stateless":
+            exact_env[GLASSHIVE_PROVIDER_SESSION_MODE_ENV] = "stateless"
+        exact_bundle["env"] = exact_env
+        return exact_bundle
+
     def _run_local_worker(
         self,
         worker: dict,
@@ -16888,6 +17794,10 @@ class WorkersProjectsService:
             raise RuntimeError("continuation_context_invalid") from exc
         if not isinstance(continuation_context, dict):
             raise RuntimeError("continuation_context_invalid")
+        if continuation_context:
+            continuation_context = build_workspace_continuation_context(
+                previous_run=run,
+            )
         continuation_projection: dict[str, object] = {}
         if continuation_contract:
             continuation_projection["viventium_continuation_contract"] = (
@@ -16905,11 +17815,17 @@ class WorkersProjectsService:
             ) or {}
         if transient:
             run_bundle = merge_bootstrap_bundle(run_bundle, transient) or {}
+        run_bundle = self._exact_provider_session_bundle_for_run(run_bundle, run_id)
         # Clean-room canonicalization deliberately excludes per-run continuation
         # state and bearer material from every durable/public merge. Apply only
         # these exact server-owned facts after all canonical merges, on the
         # in-memory run object that is handed directly to the runtime.
         run_bundle.update(continuation_projection)
+        if continuation_context and "viventium_constraint_source" not in run_bundle:
+            run_bundle["viventium_constraint_source"] = {
+                "version": 1,
+                "instruction": str(continuation_context["base_instruction"]),
+            }
         run_bundle.pop("viventium_run_liveness", None)
         if str(run.get("liveness_mode") or "standard") == "declared_long":
             run_bundle["viventium_run_liveness"] = {
@@ -17700,14 +18616,14 @@ class WorkersProjectsService:
             "expected_runtime_invoked_at": str(run.get("runtime_invoked_at") or ""),
         }
 
-    @staticmethod
     def _runtime_info_fields(
+        self,
         worker_id: str,
         info: RuntimeInfo,
         *,
         last_error: str,
     ) -> dict[str, object]:
-        return {
+        fields: dict[str, object] = {
             "runtime": info.runtime,
             "model": info.model,
             "gateway_url": info.gateway_url,
@@ -17721,6 +18637,17 @@ class WorkersProjectsService:
             "control_url": f"/ui/workers/{worker_id}",
             "last_error": last_error,
         }
+        worker = self.store.get_worker(worker_id)
+        bundle = self._bootstrap_bundle_for(worker) if worker else None
+        env = bundle.get("env") if isinstance(bundle, dict) else None
+        if (
+            info.session_key is None
+            and isinstance(env, dict)
+            and str(env.get(GLASSHIVE_PROVIDER_SESSION_MODE_ENV) or "")
+            == "stateless"
+        ):
+            fields.pop("session_key")
+        return fields
 
     def _ensure_surviving_run_monitor(self, worker_id: str, run_id: str) -> None:
         """Adopt one verified live restart survivor without launching a duplicate run."""

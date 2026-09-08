@@ -8,6 +8,7 @@ import json
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -34,6 +35,7 @@ from workers_projects_runtime.conversation_provider import (
 )
 from workers_projects_runtime.openclaw_runtime import (
     RuntimeErrorBase,
+    RuntimeInfo,
     StubRuntime,
     notify_runtime_started,
     runtime_start_boundary,
@@ -520,13 +522,14 @@ def test_models_expose_exact_harness_registry(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     models = {item["id"]: item for item in response.json()["data"]}
-    assert set(models) == {"codex-cli:gpt-5.6-sol", "claude-code:opus"}
+    assert set(models) == {"codex-cli:gpt-6-astra", "claude-code:claude-opus-5", "codex-cli:gpt-5.6-sol", "claude-code:opus", "codex-cli:gpt-5.6-luna", "codex-cli:gpt-5.6-terra"}
     assert models["codex-cli:gpt-5.6-sol"]["display_name"] == "Codex / GPT-5.6 Sol"
     assert models["codex-cli:gpt-5.6-sol"]["recommended_effort"] == "medium"
     assert models["codex-cli:gpt-5.6-sol"]["context_window"] == 272000
     assert models["claude-code:opus"]["display_name"] == "Claude / Opus"
     assert models["claude-code:opus"]["recommended_effort"] == "max"
     assert models["claude-code:opus"]["effort_choices"] == [
+        "default",
         "low",
         "medium",
         "high",
@@ -551,6 +554,26 @@ def test_models_expose_exact_harness_registry(tmp_path, monkeypatch):
     assert models["claude-code:opus"]["capabilities"]["incremental_text"] is False
     assert all(model["readiness"]["status"] for model in models.values())
     assert all(isinstance(model["created"], int) and model["created"] > 0 for model in models.values())
+
+
+def test_conversation_provider_durably_binds_trusted_lane_before_host_start(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_ISOLATED_PARALLEL_POLICY", "1")
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers=AUTH,
+        json=_payload(workspace),
+    )
+
+    assert response.status_code == 200, response.text
+    sessions = client.app.state.store.list_provider_sessions(owner_id="owner-a")
+    worker = client.app.state.store.get_worker(sessions[0]["worker_id"])
+    assert worker["trusted_run_lane"] == "conversation"
 
 
 def test_provider_rate_limit_uses_standard_openai_429_error(tmp_path, monkeypatch):
@@ -634,6 +657,76 @@ def test_audio_eligibility_header_rejects_ambiguous_values(tmp_path, monkeypatch
     assert response.json()["error"]["code"] == "invalid_request"
 
 
+def test_provider_session_mode_uses_trusted_header_and_exact_run_record(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+
+    body_only = _payload(workspace)
+    body_only["metadata"]["provider_session_mode"] = "stateless"
+    persistent = client.post(
+        "/v1/chat/completions",
+        headers=AUTH,
+        json=body_only,
+    )
+    assert persistent.status_code == 200, persistent.text
+    persistent_request = client.app.state.store.get_provider_request(
+        persistent.json()["id"]
+    )
+    assert json.loads(persistent_request["replay_decision_json"])[
+        "provider_session_mode"
+    ] == "persistent"
+
+    stateless_payload = _payload(workspace)
+    stateless_payload["metadata"]["message_id"] = "message-stateless"
+    stateless_payload["metadata"]["idempotency_key"] = "idem-stateless"
+    stateless = client.post(
+        "/v1/chat/completions",
+        headers={**AUTH, "X-GlassHive-Provider-Session-Mode": "stateless"},
+        json=stateless_payload,
+    )
+    assert stateless.status_code == 200, stateless.text
+    store = client.app.state.store
+    request_record = store.get_provider_request(stateless.json()["id"])
+    assert json.loads(request_record["replay_decision_json"])[
+        "provider_session_mode"
+    ] == "stateless"
+    run = store.get_run(request_record["run_id"])
+    session = store.get_provider_session_by_id(request_record["session_id"])
+    worker = store.get_worker(session["worker_id"])
+    store.update_worker(worker["worker_id"], session_key="prior-native-session")
+    client.app.state.service._apply_runtime_info(
+        worker["worker_id"],
+        RuntimeInfo(
+            runtime="codex-cli",
+            model="gpt-5.6-sol",
+            gateway_url="",
+            gateway_port=None,
+            gateway_token=None,
+            session_key=None,
+            state_dir="",
+            workspace_dir=str(workspace),
+            pid=None,
+        ),
+        state="ready",
+        last_error="",
+    )
+    assert store.get_worker(worker["worker_id"])["session_key"] == "prior-native-session"
+    store.update_worker(
+        worker["worker_id"],
+        bootstrap_bundle_json=json.dumps(
+            {**json.loads(worker["bootstrap_bundle_json"]), "env": {}}
+        ),
+    )
+    projected = client.app.state.service._exact_provider_session_bundle_for_run(
+        json.loads(store.get_worker(worker["worker_id"])["bootstrap_bundle_json"]),
+        run["run_id"],
+    )
+    assert projected["env"]["GLASSHIVE_PROVIDER_SESSION_MODE"] == "stateless"
+
+
 def test_audio_eligibility_is_part_of_idempotent_request_identity(tmp_path, monkeypatch):
     workspace = tmp_path / "Life"
     workspace.mkdir()
@@ -697,6 +790,132 @@ def test_versioned_idempotency_namespace_cannot_collide_with_raw_user_suffix(
     assert audio.status_code == 200, audio.text
     assert standard.json()["id"] != audio.json()["id"]
     assert "provider_specific_fields" in audio.json()["choices"][0]["message"]
+
+
+def test_serial_fallback_headers_arm_the_durable_request(tmp_path, monkeypatch):
+    # LibreChat declares the agent's serial fallback through the trusted transport headers. The
+    # runtime must validate it once at admission and arm the durable request so the
+    # conversation-lane switch can continue the exact turn on the fallback model.
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    payload = _payload(workspace)
+    armed = client.post(
+        "/v1/chat/completions",
+        headers={
+            **AUTH,
+            "X-GlassHive-Fallback-Model": "claude-code:opus",
+            "X-GlassHive-Fallback-Reasoning-Effort": "high",
+        },
+        json=payload,
+    )
+    assert armed.status_code == 200, armed.text
+    record = client.app.state.store.get_provider_request(armed.json()["glasshive"]["request_id"])
+    assert record["fallback_model_id"] == "claude-code:opus"
+    assert record["fallback_reasoning_effort"] == "high"
+    assert str(record["fallback_instruction"]).strip()
+    assert record["fallback_state"] == ""
+
+    plain_payload = _payload(workspace)
+    plain_payload["metadata"]["idempotency_key"] = "plain-turn"
+    plain = client.post("/v1/chat/completions", headers=AUTH, json=plain_payload)
+    assert plain.status_code == 200, plain.text
+    plain_record = client.app.state.store.get_provider_request(plain.json()["glasshive"]["request_id"])
+    assert plain_record["fallback_model_id"] == ""
+    assert plain_record["fallback_instruction"] == ""
+
+    same_payload = _payload(workspace)
+    same_payload["metadata"]["idempotency_key"] = "same-model-turn"
+    rejected = client.post(
+        "/v1/chat/completions",
+        headers={**AUTH, "X-GlassHive-Fallback-Model": same_payload["model"]},
+        json=same_payload,
+    )
+    assert rejected.status_code == 400
+    assert "must differ from the primary model" in rejected.text
+
+
+@pytest.mark.parametrize("authoring_scope", [("external_user", "interactive"), ("system", "scheduler")])
+def test_structured_quota_failure_continues_the_turn_on_the_serial_fallback(tmp_path, authoring_scope):
+    # A primary run that fails with structured provider quota evidence must not fail the request:
+    # the armed serial fallback is claimed exactly once and the exact turn continues on a new
+    # worker running the fallback model.
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, InterruptCountingRuntime(), reconcile_on_startup=False)
+    provider: ConversationProvider | None = None
+    try:
+        project = store.create_project("owner-a", "Synthetic conversation", "Serial fallback", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner-a",
+            name="Synthetic worker",
+            role="conversation-agent",
+            profile="codex-cli",
+            backend="",
+            runtime="codex-cli",
+            model="gpt-5.6-sol",
+        )
+        session = store.upsert_provider_session(
+            tenant_id="local",
+            owner_id="owner-a",
+            conversation_id="conv-fallback",
+            agent_id="agent-fallback",
+            actor_kind=authoring_scope[0],
+            origin=authoring_scope[1],
+            model_id="codex-cli:gpt-5.6-sol",
+            project_id=project["project_id"],
+            worker_id=worker["worker_id"],
+            workspace_dir=str(tmp_path),
+            access_mode="workspace",
+        )
+        run = store.create_run(worker["worker_id"], project["project_id"], "answer the user", state="queued")
+        store.update_run(
+            run["run_id"],
+            state="failed",
+            failure_class="provider_quota_exhausted",
+            failure_retryable=1,
+            failure_structured=1,
+            retry_attempts=0,
+            output_text="",
+        )
+        request, _ = store.create_provider_request(
+            tenant_id="local",
+            owner_id="owner-a",
+            session_id=session["session_id"],
+            idempotency_key="serial-fallback",
+            message_id="message-fallback",
+            stream_id="stream-fallback",
+            requested_history_count=1,
+            fallback_model_id="claude-code:opus",
+            fallback_reasoning_effort="high",
+            fallback_instruction="answer the user",
+        )
+        store.update_provider_request(request["request_id"], run_id=run["run_id"], state="running")
+        provider = ConversationProvider(store, service)
+
+        synced = provider._sync(store.get_provider_request(request["request_id"]))
+
+        after = store.get_provider_request(request["request_id"])
+        activities = [
+            (str(item["event_type"]), item.get("payload"))
+            for item in store.list_provider_activity(request["request_id"])
+        ]
+        assert after["fallback_from_run_id"] == run["run_id"], (after, activities)
+        assert after["fallback_state"] != "", (after, activities)
+        assert after["state"] != "failed", (synced, after, activities)
+        assert after["run_id"] != run["run_id"], (after, activities)
+        fallback_run = store.get_run(str(after["run_id"]))
+        fallback_worker = store.get_worker(str(fallback_run["worker_id"]))
+        assert fallback_worker["profile"] == "claude-code", fallback_worker
+        assert fallback_worker["worker_id"] != worker["worker_id"]
+        current_session = store.get_provider_session_by_id(session["session_id"])
+        assert (current_session["actor_kind"], current_session["origin"]) == authoring_scope
+        assert current_session["worker_id"] == fallback_worker["worker_id"]
+        assert len(store.list_provider_sessions(owner_id="owner-a")) == 1
+    finally:
+        if provider is not None:
+            provider.shutdown()
+        service.shutdown()
 
 
 def test_standard_retry_finds_pre_upgrade_raw_idempotency_record(tmp_path, monkeypatch):
@@ -796,7 +1015,8 @@ def test_audio_eligible_stream_preserves_text_and_fails_audio_closed_when_dispos
         ]
         for chunk in chunks
         for choice in chunk.get("choices", [])
-        if "provider_specific_fields" in choice.get("delta", {})
+        if "delivery_disposition"
+        in choice.get("delta", {}).get("provider_specific_fields", {}).get("viventium", {})
     )
     assert visible == "Text-only answer."
     assert disposition == {
@@ -840,7 +1060,8 @@ def test_audio_eligible_stream_emits_structured_disposition_outside_visible_text
         ]
         for chunk in chunks
         for choice in chunk.get("choices", [])
-        if "provider_specific_fields" in choice.get("delta", {})
+        if "delivery_disposition"
+        in choice.get("delta", {}).get("provider_specific_fields", {}).get("viventium", {})
     )
     assert visible == "Text-only answer."
     assert "{SKIP_VOICE}" not in visible
@@ -1641,6 +1862,48 @@ def test_authenticated_broker_bundle_is_forwarded_and_conversation_policy_is_for
     }
 
 
+@pytest.mark.parametrize("foreign", [False, True])
+def test_native_current_attachment_uses_owner_file_bytes(tmp_path, monkeypatch, foreign):
+    from workers_projects_runtime.bootstrap import _write_project_files
+    import shutil
+
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    uploads = tmp_path / "uploads"
+    owner_dir = uploads / ("owner-b" if foreign else "owner-a")
+    owner_dir.mkdir(parents=True)
+    original = owner_dir / "audio-current__request.m4a"
+    original.write_bytes(b"synthetic-original-audio-bytes")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads))
+    monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", str(uploads))
+    client = _client(tmp_path, monkeypatch)
+    payload = _payload(workspace)
+    payload["messages"][-1]["content"] = ""
+    ledger = {"viventium_upload_context": {"selected_uploads": [
+        {"file_id": "audio-current", "filename": "request.m4a", "type": "audio/mp4",
+         "source": "local", "bytes": original.stat().st_size},
+    ]}}
+    response = client.post("/v1/chat/completions", headers={**AUTH, **_signed_bundle_headers(ledger)}, json=payload)
+    assert response.status_code == 200, response.text
+    session = client.app.state.store.list_provider_sessions(owner_id="owner-a")[0]
+    worker = client.app.state.store.get_worker(session["worker_id"])
+    bundle = json.loads(worker["bootstrap_bundle_json"])
+    assert len(bundle.get("files", [])) == 1
+    record = client.app.state.store.get_provider_request(response.json()["id"])
+    current = record["admitted_instruction"].split("<viventium_current_accepted_turn_v1>")[1]
+    assert bundle["files"][0]["path"] in current.split("</viventium_current_accepted_turn_v1>")[0]
+    home = tmp_path / "worker-home"
+    home.mkdir()
+    _write_project_files(home, workspace, bundle, worker, shutil.copyfile, shutil.copytree)
+    materialized = workspace / bundle["files"][0]["path"]
+    if foreign:
+        assert "source_path" not in bundle["files"][0]
+        assert b"synthetic-original-audio-bytes" not in materialized.read_bytes()
+        assert "original_bytes_unavailable" in materialized.read_text()
+    else:
+        assert materialized.read_bytes() == original.read_bytes()
+
+
 @pytest.mark.parametrize(
     ("model", "profile_instruction_key"),
     [
@@ -2124,15 +2387,17 @@ def test_raw_idempotency_cancel_prefers_and_cancels_active_variant():
 
     class VariantStore:
         @staticmethod
-        def get_provider_request(**kwargs):
-            key = kwargs.get("idempotency_key")
-            return audio if key == audio["idempotency_key"] else standard
+        def upsert_provider_stop_tombstone(**kwargs):
+            pass
+
+        @staticmethod
+        def list_provider_requests_by_idempotency_family(**kwargs):
+            key = kwargs.get("base_idempotency_key")
+            return [audio if key == audio["idempotency_key"] else standard]
 
     provider = ConversationProvider.__new__(ConversationProvider)
     provider.store = VariantStore()
     provider._start_lock = threading.RLock()
-    provider._prestart_cancellations = {}
-    provider._prune_prestart_cancellations = lambda: None
     cancelled_ids = []
 
     def cancel(request_id):
@@ -2184,7 +2449,23 @@ def test_run_scoped_interrupt_cannot_cancel_a_newer_active_turn(tmp_path):
         service.shutdown()
 
 
-def test_provider_cancel_marks_a_queued_run_cancelled_before_native_execution(tmp_path):
+@pytest.mark.parametrize("by_family", [False, True])
+@pytest.mark.parametrize(
+    ("run_state", "already_cancelled", "newer_state", "rebound"),
+    [
+        ("queued", False, None, False),
+        ("needs_input", False, None, False),
+        ("needs_input", True, None, False),
+        ("needs_input", True, "queued", False),
+        ("needs_input", True, "running", False),
+        ("queued", False, None, True),
+        ("needs_input", False, None, True),
+        ("needs_input", True, None, True),
+    ],
+)
+def test_provider_cancel_settles_exact_pending_run(
+    tmp_path, run_state, already_cancelled, newer_state, rebound, by_family
+):
     store = Store(str(tmp_path / "runtime.db"))
     runtime = InterruptCountingRuntime()
     service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
@@ -2217,12 +2498,30 @@ def test_provider_cancel_marks_a_queued_run_cancelled_before_native_execution(tm
             workspace_dir=str(tmp_path),
             access_mode="workspace",
         )
+        newer = None
+        if newer_state == "running":
+            newer = store.create_run(
+                worker["worker_id"], project["project_id"], "preserve the active turn",
+                state=RunRestorationState.RUNNING,
+            )
         run = store.create_run(
             worker["worker_id"],
             project["project_id"],
             "never execute this",
             state="queued",
         )
+        if run_state == "needs_input":
+            store.update_run(run["run_id"], state="needs_input")
+            store.update_worker_state(worker["worker_id"], "needs_input")
+        awakened = []
+        service._ensure_worker_processor = awakened.append
+        if newer_state == "queued":
+            newer = store.create_run(
+                worker["worker_id"], project["project_id"], "preserve the next turn",
+                state="queued",
+            )
+        if newer_state == "running":
+            store.update_worker_state(worker["worker_id"], "running")
         request, _ = store.create_provider_request(
             tenant_id="local",
             owner_id="owner-a",
@@ -2233,13 +2532,55 @@ def test_provider_cancel_marks_a_queued_run_cancelled_before_native_execution(tm
             requested_history_count=0,
         )
         store.update_provider_request(request["request_id"], run_id=run["run_id"])
+        if already_cancelled:
+            store.update_provider_request(request["request_id"], state="cancelled")
+        replacement_run = None
+        if rebound:
+            replacement_worker = store.create_worker(
+                project_id=project["project_id"], owner_id="owner-a",
+                name="Replacement worker", role="conversation-agent",
+                profile="codex-cli", backend="", runtime="codex-cli",
+                model="gpt-5.6-sol",
+            )
+            replacement_session = store.upsert_provider_session(
+                tenant_id="local", owner_id="owner-a", conversation_id="conv-cancel",
+                agent_id="agent-cancel", model_id="codex-cli:gpt-5.6-sol",
+                project_id=project["project_id"], worker_id=replacement_worker["worker_id"],
+                workspace_dir=str(tmp_path), access_mode="workspace",
+            )
+            assert replacement_session["session_id"] == session["session_id"]
+            replacement_run = store.create_run(
+                replacement_worker["worker_id"], project["project_id"],
+                "preserve replacement worker turn", state=RunRestorationState.RUNNING,
+            )
         provider = ConversationProvider(store, service)
 
-        cancelled = provider.cancel(request["request_id"])
+        def cancel_target():
+            return (provider.cancel_by_idempotency("queued-cancel", "owner-a")
+                    if by_family else provider.cancel(request["request_id"]))
+
+        if by_family and not already_cancelled:
+            original_cancel_run = service.cancel_run
+            def interrupted_cancel(*_args, **_kwargs):
+                raise RuntimeError("simulated interrupted cancellation handoff")
+            service.cancel_run = interrupted_cancel
+            with pytest.raises(RuntimeError, match="interrupted cancellation handoff"):
+                cancel_target()
+            assert store.get_provider_request(request["request_id"])["state"] == "cancelled"
+            service.cancel_run = original_cancel_run
+        cancelled = cancel_target()
 
         assert cancelled["state"] == "cancelled"
         assert store.get_run(run["run_id"])["state"] == "cancelled"
         assert runtime.interrupt_calls == []
+        if replacement_run:
+            assert store.get_run(replacement_run["run_id"])["state"] == "running"
+        if newer:
+            assert store.get_run(newer["run_id"])["state"] == newer_state
+        if newer_state == "queued":
+            assert worker["worker_id"] in awakened
+        if run_state == "needs_input":
+            assert store.get_worker(worker["worker_id"])["state"] != "needs_input"
         assert provider._sync(store.get_provider_request(request["request_id"]))["state"] == "cancelled"
     finally:
         if provider is not None:
@@ -2249,11 +2590,7 @@ def test_provider_cancel_marks_a_queued_run_cancelled_before_native_execution(tm
 
 def test_sync_never_resurrects_a_cancelled_provider_request(tmp_path):
     store = Store(str(tmp_path / "runtime.db"))
-    service = WorkersProjectsService(
-        store,
-        InterruptCountingRuntime(),
-        reconcile_on_startup=False,
-    )
+    service = None
     provider: ConversationProvider | None = None
     try:
         project = store.create_project(
@@ -2299,6 +2636,9 @@ def test_sync_never_resurrects_a_cancelled_provider_request(tmp_path):
             request["request_id"], run_id=run["run_id"], state="cancelled"
         )
         store.finalize_run(run["run_id"], state="completed", output_text="late answer")
+        service = WorkersProjectsService(
+            store, InterruptCountingRuntime(), reconcile_on_startup=False,
+        )
         provider = ConversationProvider(store, service)
 
         synced = provider._sync(store.get_provider_request(request["request_id"]))
@@ -2311,7 +2651,8 @@ def test_sync_never_resurrects_a_cancelled_provider_request(tmp_path):
     finally:
         if provider is not None:
             provider.shutdown()
-        service.shutdown()
+        if service is not None:
+            service.shutdown()
 
 
 def test_stream_disconnect_reconciles_a_later_completed_run(tmp_path):
@@ -2919,6 +3260,7 @@ def test_completed_native_harness_without_terminal_answer_fails_loudly(
     )
 
     assert response.status_code == 502
+    assert response.json()["error"]["code"] == "missing_terminal_response"
     assert "terminal authored response" in response.text
     assert "I am still working on it" not in response.text
 
@@ -3099,6 +3441,174 @@ def test_codex_native_events_become_safe_tool_file_plan_and_reasoning_activity()
     assert events[3]["payload"]["change_count"] == 1
 
 
+def test_codex_broker_tool_completion_exposes_only_safe_task_and_status():
+    stdout = json.dumps(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "mcp_tool_call_end",
+                "call_id": "private-call-id",
+                "duration": 1.25,
+                "invocation": {
+                    "server": "glasshive-user-capabilities",
+                    "tool": "gh_scheduling_cortex__schedule_create",
+                    "arguments": {
+                        "title": "private reminder title",
+                        "token": "synthetic-secret-value",
+                    },
+                },
+                "result": {
+                    "Ok": {
+                        "content": [{"type": "text", "text": "private result"}],
+                        "isError": False,
+                    }
+                },
+            },
+        }
+    )
+
+    events = _normalized_harness_activity("codex-cli", stdout)
+
+    assert len(events) == 1
+    assert events[0]["event_type"] == "tool"
+    assert events[0]["summary"] == "Connected tool completed: schedule create."
+    assert {
+        key: value
+        for key, value in events[0]["payload"].items()
+        if key != "source_event_id"
+    } == {
+        "tool": "connected_tool",
+        "task": "schedule create",
+        "status": "completed",
+    }
+    serialized = json.dumps(events)
+    for forbidden in [
+        "glasshive-user-capabilities",
+        "gh_scheduling_cortex",
+        "private-call-id",
+        "private reminder title",
+        "synthetic-secret-value",
+    ]:
+        assert forbidden not in serialized
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {
+            "isError": False,
+            "content": [{"type": "text", "text": "Private successful retrieval"}],
+            "structured_content": {"error": "domain evidence, not an execution error"},
+        },
+        {
+            "success": True,
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Retrieved document: 1 validation error for call\n"
+                        "field\nField required [type=missing]\n"
+                        "https://errors.pydantic.dev/2.12/v/missing"
+                    ),
+                }
+            ],
+        },
+    ],
+)
+def test_codex_explicit_success_is_not_overridden_by_domain_result_data(result):
+    stdout = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "private-call-id",
+                "type": "mcp_tool_call",
+                "tool": "gh_retrieval__read",
+                "status": "completed",
+                "result": result,
+            },
+        }
+    )
+
+    events = _normalized_harness_activity("codex-cli", stdout)
+
+    assert len(events) == 1
+    assert events[0]["summary"] == "Connected tool completed: read."
+    assert events[0]["payload"]["status"] == "completed"
+    serialized = json.dumps(events)
+    assert "domain evidence" not in serialized
+    assert "validation error" not in serialized
+
+
+def test_codex_completed_item_preserves_structured_mcp_failure_truth():
+    stdout = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "private-call-id",
+                "type": "mcp_tool_call",
+                "tool": "gh_scheduling_cortex__schedule_create",
+                "status": "completed",
+                "arguments": {"private": "synthetic-secret-value"},
+                "result": {
+                    "content": [{"type": "text", "text": "Private blocked result"}],
+                    "structured_content": {
+                        "status": "blocked",
+                        "reason": "private broker reason",
+                    },
+                },
+            },
+        }
+    )
+
+    events = _normalized_harness_activity("codex-cli", stdout)
+
+    assert len(events) == 1
+    assert events[0]["summary"] == "Connected tool failed: schedule create."
+    assert events[0]["payload"]["status"] == "failed"
+    serialized = json.dumps(events)
+    assert "synthetic-secret-value" not in serialized
+    assert "private broker reason" not in serialized
+
+
+def test_codex_duplicate_native_views_emit_one_terminal_tool_receipt():
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "mcp_tool_call_end",
+                        "call_id": "shared-private-call-id",
+                        "invocation": {
+                            "server": "glasshive-user-capabilities",
+                            "tool": "gh_scheduling_cortex__schedule_create",
+                            "arguments": {},
+                        },
+                        "result": {"ok": True},
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "shared-private-call-id",
+                        "type": "mcp_tool_call",
+                        "tool": "gh_scheduling_cortex__schedule_create",
+                        "status": "completed",
+                    },
+                }
+            ),
+        ]
+    )
+
+    events = _normalized_harness_activity("codex-cli", stdout)
+
+    terminal = [event for event in events if event["payload"].get("status") == "completed"]
+    assert len(terminal) == 1
+    assert terminal[0]["summary"] == "Connected tool completed: schedule create."
+
+
 def test_identical_native_tool_events_keep_distinct_stable_source_ids():
     event = json.dumps(
         {
@@ -3144,3 +3654,1302 @@ def test_claude_stream_events_expose_tool_categories_without_tool_inputs_or_thin
     assert "hidden internal reasoning" not in serialized
     assert "private-person" not in serialized
     assert "private query" not in serialized
+
+
+def test_public_activity_delta_fields_carry_only_bounded_public_identity():
+    from workers_projects_runtime.conversation_provider import _public_activity_delta_fields
+
+    fields = _public_activity_delta_fields(
+        {
+            "event_type": "tool",
+            "payload_json": json.dumps(
+                {
+                    "tool": "connected_tool",
+                    "task": "worker delegate once",
+                    "status": "completed",
+                    "source_event_id": "codex-cli:12:0",
+                    "call_id": "call_secret",
+                    "invocation": {"tool": "glasshive__worker_delegate_once", "arguments": {"x": 1}},
+                }
+            ),
+        }
+    )
+    assert fields == {
+        "provider_specific_fields": {
+            "viventium": {
+                "activity": {
+                    "event": "tool",
+                    "tool": "connected_tool",
+                    "task": "worker delegate once",
+                    "status": "completed",
+                }
+            }
+        }
+    }
+    assert _public_activity_delta_fields({"event_type": "", "payload_json": "{}"}) == {}
+    assert _public_activity_delta_fields({"event_type": "reasoning-summary", "payload_json": "{}"}) == {
+        "provider_specific_fields": {"viventium": {"activity": {"event": "reasoning-summary"}}}
+    }
+
+
+def test_request_creation_persists_bounded_admission_atomically(tmp_path, monkeypatch):
+    """The admitted instruction and its ReplayDecisionV1 are created with the request row, and a
+    rapid follow-up turn on the same session admits only the delta after the prior history."""
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    first_payload = _payload(workspace)
+    first = client.post("/v1/chat/completions", headers=AUTH, json=first_payload)
+    assert first.status_code == 200, first.text
+    store = client.app.state.store
+    first_request = store.get_provider_request(first.json()["id"])
+    first_decision = json.loads(first_request["replay_decision_json"])
+    assert first_decision["version"] == 1
+    assert first_decision["provider_session_mode"] == "persistent"
+    assert first_decision["admitted_message_indices"] == [
+        index
+        for index, message in enumerate(first_payload["messages"])
+        if str(message.get("role") or "").lower() not in {"system", "developer"}
+    ]
+    first_user_text = next(
+        str(message["content"])
+        for message in reversed(first_payload["messages"])
+        if message.get("role") == "user"
+    )
+    assert first_user_text in str(first_request["admitted_instruction"])
+
+    second_payload = _payload(workspace)
+    second_payload["messages"] = [
+        *first_payload["messages"],
+        {"role": "assistant", "content": first.json()["choices"][0]["message"]["content"]},
+        {"role": "user", "content": "Rapid follow-up: make it shorter."},
+    ]
+    second_payload["metadata"]["message_id"] = "message-rapid-2"
+    second_payload["metadata"]["idempotency_key"] = "idem-rapid-2"
+    second = client.post("/v1/chat/completions", headers=AUTH, json=second_payload)
+    assert second.status_code == 200, second.text
+    second_request = store.get_provider_request(second.json()["id"])
+    assert second_request["session_id"] == first_request["session_id"]
+    second_decision = json.loads(second_request["replay_decision_json"])
+    assert second_decision["version"] == 1
+    previous_history_count = len(first_payload["messages"])
+    assert second_decision["admitted_message_indices"]
+    assert min(second_decision["admitted_message_indices"]) >= previous_history_count
+    assert "Rapid follow-up: make it shorter." in str(second_request["admitted_instruction"])
+    assert first_user_text not in str(second_request["admitted_instruction"])
+
+
+def test_connected_tool_activity_carries_a_typed_deferred_callback_anchor_only_for_dispatch_tools():
+    """Only GlassHive run-dispatching tools may arm long host polling; ordinary tools never do."""
+    from workers_projects_runtime.mcp_tool_registry import DEFERRED_CALLBACK_TOOLS
+
+    def codex_end(tool: str, call_id: str) -> str:
+        return json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "mcp_tool_call_end",
+                    "call_id": call_id,
+                    "invocation": {"server": "glasshive", "tool": tool, "arguments": {}},
+                    "result": {"Ok": {"content": [{"type": "text", "text": "ok"}], "isError": False}},
+                },
+            }
+        )
+
+    stdout = "\n".join(
+        [
+            codex_end("worker_delegate_once", "call-1"),
+            codex_end("feelings_get_state", "call-2"),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "id": "call-3",
+                        "tool": "glasshive__workspace_launch",
+                        "status": "completed",
+                    },
+                }
+            ),
+        ]
+    ) + "\n"
+    events = _normalized_harness_activity("codex-cli", stdout)
+    payloads = [event["payload"] for event in events]
+    assert [p["task"] for p in payloads] == ["worker delegate once", "feelings get state", "workspace launch"]
+    assert payloads[0].get("expects_deferred_callback") is True
+    assert "expects_deferred_callback" not in payloads[1]
+    assert payloads[2].get("expects_deferred_callback") is True
+
+    claude_stdout = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "mcp__glasshive-workers-projects__worker_run", "input": {}},
+                    {"type": "tool_use", "name": "mcp__feelings__feelings_get_state", "input": {}},
+                ]
+            },
+        }
+    )
+    claude_events = _normalized_harness_activity("claude-code", claude_stdout + "\n")
+    assert claude_events[0]["payload"].get("expects_deferred_callback") is True
+    assert "expects_deferred_callback" not in claude_events[1]["payload"]
+    assert "worker_run" in DEFERRED_CALLBACK_TOOLS and "feelings_get_state" not in DEFERRED_CALLBACK_TOOLS
+
+
+def test_public_activity_delta_carries_the_deferred_callback_anchor_as_a_typed_boolean():
+    from workers_projects_runtime.conversation_provider import _public_activity_delta_fields
+
+    fields = _public_activity_delta_fields(
+        {
+            "event_type": "tool",
+            "payload_json": json.dumps(
+                {
+                    "tool": "connected_tool",
+                    "task": "worker delegate once",
+                    "status": "completed",
+                    "expects_deferred_callback": True,
+                    "source_event_id": "codex-cli:12:0",
+                }
+            ),
+        }
+    )
+    activity = fields["provider_specific_fields"]["viventium"]["activity"]
+    assert activity["expects_deferred_callback"] is True
+    plain = _public_activity_delta_fields(
+        {
+            "event_type": "tool",
+            "payload_json": json.dumps(
+                {"tool": "connected_tool", "task": "feelings get state", "status": "completed", "expects_deferred_callback": "yes"}
+            ),
+        }
+    )
+    assert "expects_deferred_callback" not in plain["provider_specific_fields"]["viventium"]["activity"]
+
+
+def test_deferred_callback_anchor_requires_glasshive_provenance():
+    """A foreign MCP server exposing the same tool name must never arm host-side listening."""
+    from workers_projects_runtime.mcp_tool_registry import (
+        DEFERRED_CALLBACK_TOOLS,
+        connected_tool_expects_deferred_callback,
+    )
+
+    # The exact identifier the installed claude harness emitted for a live delegation:
+    # the host brokers GlassHive's tool and appends the origin server as an `_mcp_` suffix.
+    assert connected_tool_expects_deferred_callback(
+        "mcp__glasshive-user-capabilities__worker_delegate_once_mcp_glasshive-workers-projects"
+    )
+    assert connected_tool_expects_deferred_callback(
+        "mcp__glasshive-user-capabilities__gh_glasshive__worker_delegate_once"
+    )
+    # A brokered request/response tool stays out even with full GlassHive provenance.
+    assert not connected_tool_expects_deferred_callback(
+        "mcp__glasshive-user-capabilities__workspace_status_mcp_glasshive-workers-projects"
+    )
+    # The origin-server suffix alone is enough provenance, and a foreign origin is refused.
+    assert connected_tool_expects_deferred_callback("worker_run_mcp_glasshive-workers-projects")
+    assert not connected_tool_expects_deferred_callback("worker_run_mcp_acme-tools")
+    assert connected_tool_expects_deferred_callback(
+        "mcp__glasshive-workers-projects__worker_run"
+    )
+    assert connected_tool_expects_deferred_callback(
+        "worker_delegate_once", server="glasshive-user-capabilities"
+    )
+    # Foreign server, same bare tool name.
+    assert not connected_tool_expects_deferred_callback("mcp__acme-tools__worker_run")
+    assert not connected_tool_expects_deferred_callback("worker_run", server="acme-tools")
+    # No provenance at all fails closed.
+    assert not connected_tool_expects_deferred_callback("worker_run")
+    # Synchronous operator-URL lookup delivers nothing later.
+    assert "worker_takeover" not in DEFERRED_CALLBACK_TOOLS
+    assert not connected_tool_expects_deferred_callback(
+        "mcp__glasshive-workers-projects__worker_takeover"
+    )
+
+
+def test_codex_activity_uses_the_invocation_server_for_provenance():
+    def codex_end(server: str, tool: str, call_id: str) -> str:
+        return json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "mcp_tool_call_end",
+                    "call_id": call_id,
+                    "invocation": {"server": server, "tool": tool, "arguments": {}},
+                    "result": {"Ok": {"content": [], "isError": False}},
+                },
+            }
+        )
+
+    stdout = "\n".join(
+        [
+            codex_end("glasshive-workers-projects", "worker_delegate_once", "c1"),
+            codex_end("acme-tools", "worker_run", "c2"),
+        ]
+    ) + "\n"
+    payloads = [event["payload"] for event in _normalized_harness_activity("codex-cli", stdout)]
+    assert payloads[0].get("expects_deferred_callback") is True
+    assert "expects_deferred_callback" not in payloads[1]
+
+
+def test_visible_message_identity_changes_when_same_source_id_is_corrected():
+    from workers_projects_runtime.conversation_provider import _visible_message_keys
+    def keys(text):
+        return _visible_message_keys(
+            [ChatMessage(role="user", content=text)],
+            [{"id": "source-user", "role": "user", "sha256": hashlib.sha256(text.encode()).hexdigest()}],
+        )
+    assert keys("Wait for approval") != keys("Approval has arrived")
+    assert keys("Wait for approval") == keys("Wait for approval")
+
+
+@pytest.mark.parametrize("current_tail", [[], [ChatMessage(role="assistant", content="Checking the source."), ChatMessage(role="tool", content="Source result.")]])
+def test_mixed_history_delta_retains_reused_current_turn(current_tail):
+    from workers_projects_runtime.conversation_provider import _admit_conversation_history
+    messages = [
+        ChatMessage(role="user", content="Earlier request."),
+        ChatMessage(role="assistant", content="Newly observed historical answer."),
+        ChatMessage(role="user", content="Recheck the attached source."),
+        *current_tail,
+    ]
+    unseen = {1}
+    instruction, decision, _ = _admit_conversation_history(
+        messages, start_at=0, turn_context="", model=next(iter(GLASSHIVE_MODELS.values())),
+        include_indices=unseen,
+    )
+    historical, current = instruction.split("<viventium_current_accepted_turn_v1>", 1)
+    assert "Newly observed historical answer." in historical
+    assert "Recheck the attached source." in current
+    assert "Newly observed historical answer." not in current
+    assert set(range(1, len(messages))).issubset(decision["admitted_message_indices"])
+    assert unseen == {1}
+
+
+def test_core_source_history_is_whole_even_outside_recent_turn_window():
+    from workers_projects_runtime.conversation_provider import _admit_conversation_history
+    source = "Original background. " * 1400 + " Written clearance is still required."
+    messages = [ChatMessage(role="user", content=source), ChatMessage(role="assistant", content="I will wait.")]
+    for index in range(3):
+        messages.extend([ChatMessage(role="user", content=f"Later {index}"), ChatMessage(role="assistant", content="Recorded.")])
+    messages.append(ChatMessage(role="user", content="What remains required?"))
+    instruction, decision, _ = _admit_conversation_history(
+        messages, start_at=0, turn_context="", model=next(iter(GLASSHIVE_MODELS.values())), protected_indices={0, 1},
+    )
+    assert source in instruction
+    assert {0, 1}.issubset(decision["admitted_message_indices"])
+    assert instruction.index(source) < instruction.index("<viventium_current_accepted_turn_v1>")
+
+
+def test_core_source_larger_than_native_budget_fails_without_partial_admission():
+    from fastapi import HTTPException
+    from workers_projects_runtime.conversation_provider import _admit_conversation_history
+    with pytest.raises(HTTPException) as error:
+        _admit_conversation_history(
+            [ChatMessage(role="user", content="Protected " * 300000), ChatMessage(role="assistant", content="Accepted."), ChatMessage(role="user", content="Continue.")],
+            start_at=0, turn_context="", model=next(iter(GLASSHIVE_MODELS.values())), protected_indices={0, 1},
+        )
+    assert error.value.status_code == 413
+
+
+def test_core_message_carrier_preserves_sources_across_selected_sibling_branches(tmp_path, monkeypatch):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    source = "Original long context. " * 1600 + " Wait for written clearance from Rowan."
+    prior = [{"role": "user", "content": source}, {"role": "assistant", "content": "I will wait."}]
+    def send(number, history, ids):
+        payload = _payload(workspace)
+        payload["messages"] = [{"role": "system", "content": f"Current dynamic context {number}"}, *history]
+        chain = [{"id": identity, "role": message["role"], "sha256": hashlib.sha256(message["content"].encode()).hexdigest(), "accepted_source": identity.startswith("prior-")}
+                 for identity, message in zip(ids, history)]
+        payload["metadata"].update({
+            "message_id": f"response-{number}", "idempotency_key": f"request-{number}",
+            "main_context_protocol": "main_context_v1", "main_context_owner": "core",
+            "stable_authority_sha256": "a" * 64, "main_context_snapshot_sha256": str(number) * 64,
+            "main_context_epoch": "a" * 64, "continuity_domain_id": "b" * 64,
+            "continuity_agent_id": "agent-main", "logical_turn_id": f"turn-{number}",
+            "visible_message_chain": chain,
+        })
+        response = client.post("/v1/chat/completions", headers=AUTH, json=payload)
+        assert response.status_code == 200, response.text
+        return client.app.state.store.get_provider_request(response.json()["id"])
+    first = send(1, [*prior, {"role": "user", "content": "What remains required?"}], ["prior-user", "prior-answer", "current-1"])
+    assert source in first["admitted_instruction"]
+    first_decision = json.loads(first["replay_decision_json"])
+    assert first_decision["admission_state"] == "accepted"
+    second = send(2, [*prior, {"role": "user", "content": "Continue reviewing."}], ["prior-user", "prior-answer", "current-2"])
+    assert second["session_id"] == first["session_id"]
+    # Each selected chain omits the previous native answer, so this is a sibling branch.
+    assert source in second["admitted_instruction"]
+    assert json.loads(second["replay_decision_json"])["mode"] == "bootstrap"
+    assert "Continue reviewing." in second["admitted_instruction"]
+    corrected = source + " Correction: only review the document, do not contact Rowan."
+    third = send(3, [{"role": "user", "content": corrected}, prior[1], {"role": "user", "content": "What changed?"}], ["prior-user", "prior-answer", "current-3"])
+    assert third["session_id"] == first["session_id"]
+    assert corrected in third["admitted_instruction"]
+    keys = json.loads(third["replay_decision_json"])["admitted_visible_message_keys"]
+    assert any(key.startswith("msg:prior-user:") for key in keys)
+    regenerated = send(4, [{"role": "user", "content": corrected}, prior[1],
+                           {"role": "user", "content": "What changed?"}],
+                       ["prior-user", "prior-answer", "current-3"])
+    assert regenerated["session_id"] == third["session_id"]
+    assert "What changed?" in regenerated["admitted_instruction"]
+    assert "<viventium_current_accepted_turn_v1>" in regenerated["admitted_instruction"]
+    assert corrected in regenerated["admitted_instruction"]
+    assert json.loads(regenerated["replay_decision_json"])["mode"] == "bootstrap"
+    assert json.loads(regenerated["replay_decision_json"])["admitted_visible_message_keys"] == []
+
+
+def test_reserved_source_stays_in_next_instruction_until_delivery_is_accepted(tmp_path, monkeypatch):
+    from workers_projects_runtime.conversation_provider import _visible_message_keys
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    initial_payload = _payload(workspace)
+    first = client.post("/v1/chat/completions", headers=AUTH, json=initial_payload)
+    assert first.status_code == 200, first.text
+    store = client.app.state.store
+    first_request = store.get_provider_request(first.json()["id"])
+    source = "Keep the draft internal until written approval arrives."
+    chain = [{"id": "source-user", "role": "user", "sha256": hashlib.sha256(source.encode()).hexdigest(), "accepted_source": True}]
+    key = _visible_message_keys([ChatMessage(role="user", content=source)], chain)[0]
+    pending, _ = store.create_provider_request(
+        tenant_id="local", owner_id="owner-a", session_id=first_request["session_id"],
+        idempotency_key="still-pending", message_id="pending-answer", stream_id="", requested_history_count=2,
+        replay_decision={"main_context_protocol": "main_context_v1", "logical_turn_id": "pending-turn",
+                         "advancement_key": "pending-turn:1", "logical_turn_revision": 1,
+                         "admitted_visible_message_keys": [key]},
+        admitted_instruction=source,
+    )
+    payload = _payload(workspace)
+    payload["messages"] = [*initial_payload["messages"], {"role": "user", "content": source},
+                           {"role": "assistant", "content": "Recorded."}, {"role": "user", "content": "What remains required?"}]
+    payload["metadata"].update({
+        "message_id": "next-answer", "idempotency_key": "next-request",
+        "main_context_protocol": "main_context_v1", "main_context_owner": "core",
+        "stable_authority_sha256": "a" * 64, "main_context_snapshot_sha256": "c" * 64,
+        "main_context_epoch": "a" * 64, "continuity_domain_id": "b" * 64,
+        "continuity_agent_id": "agent-main", "logical_turn_id": "next-turn", "visible_message_chain": chain,
+    })
+    # Retain the existing physical worker so this exercises delta admission.
+    session = store.get_provider_session_by_id(first_request["session_id"])
+    manifest = json.loads(session["context_manifest_json"])
+    store.update_provider_session_history(session["session_id"], history_count=session["history_count"],
+                                          context_manifest={**manifest, "stable_authority_sha256": "a" * 64})
+    response = client.post("/v1/chat/completions", headers=AUTH, json=payload)
+    assert response.status_code == 200, response.text
+    request = store.get_provider_request(response.json()["id"])
+    assert source in request["admitted_instruction"]
+    assert key not in json.loads(request["replay_decision_json"])["admitted_visible_message_keys"]
+    store.update_provider_request(pending["request_id"], state="failed")
+    # Failure releases ownership; it cannot retroactively remove the context already delivered above.
+    assert key not in store.get_provider_session_admission_state(session["session_id"])["reserved_visible_message_keys"]
+
+
+def test_core_body_manifest_keeps_long_history_identity_with_bounded_entry_validation(tmp_path, monkeypatch):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    payload = _payload(workspace)
+    history = [{"role": "user", "content": f"Synthetic turn {index}"} for index in range(260)]
+    chain = [{"id": f"source-{index}", "role": "user", "sha256": hashlib.sha256(item["content"].encode()).hexdigest(), "accepted_source": index == 259}
+             for index, item in enumerate(history)]
+    payload["messages"] = history
+    payload["metadata"].update({
+        "main_context_protocol": "main_context_v1", "main_context_owner": "core",
+        "stable_authority_sha256": "a" * 64, "main_context_snapshot_sha256": "c" * 64,
+        "main_context_epoch": "a" * 64, "continuity_domain_id": "b" * 64,
+        "continuity_agent_id": "agent-main", "logical_turn_id": "long-history-turn",
+        "visible_message_chain": chain,
+    })
+    response = client.post("/v1/chat/completions", headers=AUTH, json=payload)
+    assert response.status_code == 200, response.text
+    row = client.app.state.store.get_provider_request(response.json()["id"])
+    assert "Synthetic turn 259" in row["admitted_instruction"]
+    keys = json.loads(row["replay_decision_json"])["admitted_visible_message_keys"]
+    assert any(key.startswith("msg:source-259:") for key in keys)
+    for invalid_chain in [chain + [chain[-1]], [{**chain[0], "sha256": "invalid"}], [{**chain[0], "id": "x" * 161}]]:
+        payload["metadata"]["visible_message_chain"] = invalid_chain
+        rejected = client.post("/v1/chat/completions", headers=AUTH, json=payload)
+        assert rejected.status_code == 400, rejected.text
+
+
+class BlockingFamilyStopRuntime(StubRuntime):
+    """Hold one real service run until Stop reaches the native boundary."""
+
+    def __init__(self):
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.interrupt_calls = []
+
+    def run_task(self, worker, instruction, timeout_sec=None, run_id=None):
+        _publish_in_process_test_start(worker)
+        self.started.set()
+        if not self.release.wait(timeout=10):
+            raise RuntimeError("Synthetic native run was not released")
+        return json.dumps({
+            "type": "assistant_response", "content": "The requested detailed answer.",
+            "tool_name": None,
+        })
+
+    def interrupt_worker(self, worker, run_id=None):
+        self.interrupt_calls.append((worker["worker_id"], run_id))
+        self.release.set()
+        return super().interrupt_worker(worker)
+
+
+@pytest.mark.parametrize("first_scope", [("external_user", "interactive"), ("system", "scheduler"), ("worker", "callback")])
+def test_trusted_authoring_scopes_overlap_without_replacing_native_sessions(tmp_path, monkeypatch, first_scope):
+    runtime = BlockingFamilyStopRuntime()
+    entered = []
+    both_entered = threading.Event()
+    original_run = runtime.run_task
+
+    def record_run(worker, instruction, timeout_sec=None, run_id=None):
+        entered.append((worker["worker_id"], instruction))
+        if len(entered) == 2:
+            both_entered.set()
+        return original_run(worker, instruction, timeout_sec, run_id)
+
+    monkeypatch.setattr(runtime, "run_task", record_run)
+    client = _scoped_client(tmp_path, monkeypatch, runtime, trust_identity_headers=True)
+    store = client.app.state.store
+    scopes = [first_scope, ("system", "scheduler") if first_scope[0] == "external_user" else ("external_user", "interactive")]
+    payloads = []
+    headers = []
+    for index, (actor, origin) in enumerate(scopes):
+        payload = _payload(tmp_path)
+        payload["messages"][0]["content"] = f"Synthetic {origin} authority."
+        payload["metadata"].update(idempotency_key=f"scope-{index}", message_id=f"scope-message-{index}")
+        payloads.append(payload)
+        headers.append({**AUTH, "X-Viventium-Actor-Kind": actor, "X-Viventium-Origin": origin})
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(client.post, "/v1/chat/completions", headers=headers[0], json=payloads[0])
+        second = None
+        try:
+            assert runtime.started.wait(timeout=5)
+            second = pool.submit(client.post, "/v1/chat/completions", headers=headers[1], json=payloads[1])
+            assert both_entered.wait(timeout=3), second.result(timeout=1).text
+            assert len(set(worker for worker, _ in entered)) == 2
+            sessions = store.list_provider_sessions(owner_id="owner-a")
+            assert {(s["actor_kind"], s["origin"]) for s in sessions} == set(scopes)
+            assert len({s["session_id"] for s in sessions}) == 2
+            assert len({s["conversation_id"] for s in sessions}) == 1
+            assert len({s["agent_id"] for s in sessions}) == 1
+            assert all(store.get_worker(s["worker_id"])["state"] != "terminated" for s in sessions)
+            assert runtime.interrupt_calls == []
+        finally:
+            runtime.release.set()
+        assert first.result(timeout=5).status_code == 200
+        assert second.result(timeout=5).status_code == 200
+
+    # Each origin resumes its own worker and history after both concurrent runs finish.
+    for index, scope in enumerate(scopes):
+        previous = next(s for s in sessions if (s["actor_kind"], s["origin"]) == scope)
+        followup = json.loads(json.dumps(payloads[index]))
+        followup["metadata"].update(idempotency_key=f"followup-{index}", message_id=f"followup-message-{index}")
+        followup["messages"].extend([
+            {"role": "assistant", "content": "The requested detailed answer."},
+            {"role": "user", "content": "Continue with the next part."},
+        ])
+        result = client.post("/v1/chat/completions", headers=headers[index], json=followup)
+        assert result.status_code == 200, result.text
+        current = store.get_provider_session_by_id(previous["session_id"])
+        assert current["worker_id"] == previous["worker_id"]
+        assert current["history_count"] > previous["history_count"]
+        assert entered[-1][0] == previous["worker_id"]
+
+
+@pytest.mark.parametrize("carrier", ["headers", "body"])
+@pytest.mark.parametrize("scope", [("system", "scheduler"), ("worker", "callback")])
+def test_untrusted_provider_cannot_claim_noninteractive_authoring_scope(tmp_path, monkeypatch, carrier, scope):
+    client = _scoped_client(tmp_path, monkeypatch)
+    payload = _payload(tmp_path)
+    headers = dict(AUTH)
+    if carrier == "headers":
+        headers.update({"X-Viventium-Actor-Kind": scope[0], "X-Viventium-Origin": scope[1]})
+    else:
+        payload["metadata"].update(actor_kind=scope[0], origin=scope[1])
+    response = client.post("/v1/chat/completions", headers=headers, json=payload)
+    assert response.status_code == 403, response.text
+    assert client.app.state.store.list_provider_sessions(owner_id="owner-a") == []
+
+
+def test_trusted_authoring_scope_rejects_conflicting_body_and_header(tmp_path, monkeypatch):
+    client = _scoped_client(tmp_path, monkeypatch, trust_identity_headers=True)
+    payload = _payload(tmp_path)
+    payload["metadata"].update(actor_kind="external_user", origin="interactive")
+    result = client.post("/v1/chat/completions", json=payload, headers={
+        **AUTH, "X-Viventium-Actor-Kind": "system", "X-Viventium-Origin": "scheduler",
+    })
+    assert result.status_code == 403, result.text
+    assert client.app.state.store.list_provider_sessions(owner_id="owner-a") == []
+
+
+def test_context_recovery_preserves_scheduled_session_scope(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, InterruptCountingRuntime(), reconcile_on_startup=False)
+    provider = ConversationProvider(store, service)
+    try:
+        project = store.create_project("owner-a", "Synthetic recovery", "Keep authoring scope", "codex-cli")
+        worker = store.create_worker(
+            project_id=project["project_id"], owner_id="owner-a", name="Scheduled worker",
+            role="conversation-agent", profile="codex-cli", backend="", runtime="codex-cli", model="gpt-5.6-sol",
+        )
+        session = store.upsert_provider_session(
+            tenant_id="local", owner_id="owner-a", conversation_id="scoped-recovery", agent_id="agent-a",
+            actor_kind="system", origin="scheduler", model_id="codex-cli:gpt-5.6-sol",
+            project_id=project["project_id"], worker_id=worker["worker_id"], workspace_dir=str(tmp_path), access_mode="workspace",
+        )
+        run = store.create_run(worker["worker_id"], project["project_id"], "Exact admitted source", state="queued")
+        store.update_run(run["run_id"], state="failed", failure_class="provider_context_limit_exceeded", failure_structured=1)
+        request, _ = store.create_provider_request(
+            tenant_id="local", owner_id="owner-a", session_id=session["session_id"], idempotency_key="scoped-recovery",
+            message_id="message-a", stream_id="stream-a", requested_history_count=1, admitted_instruction="Exact admitted source",
+        )
+        request = store.update_provider_request(request["request_id"], run_id=run["run_id"], state="running")
+        result = provider._start_context_recovery(request, store.get_run(run["run_id"]))
+        current = store.get_provider_session_by_id(session["session_id"])
+        assert result["session_id"] == session["session_id"]
+        assert result["run_id"] != run["run_id"], result
+        assert (current["actor_kind"], current["origin"]) == ("system", "scheduler")
+        assert current["worker_id"] != worker["worker_id"]
+        assert store.get_run(result["run_id"])["instruction"] == "Exact admitted source"
+        assert len(store.list_provider_sessions(owner_id="owner-a")) == 1
+    finally:
+        provider.shutdown()
+        service.shutdown()
+        store.close()
+
+
+def test_changed_authority_preserves_active_turn_and_retries_after_completion(tmp_path, monkeypatch):
+    runtime = BlockingFamilyStopRuntime()
+    retired = []
+    terminate = runtime.terminate_worker
+
+    def observed_termination(worker):
+        retired.append(worker["worker_id"])
+        runtime.release.set()
+        return terminate(worker)
+
+    monkeypatch.setattr(runtime, "terminate_worker", observed_termination)
+    client = _client(tmp_path, monkeypatch, runtime=runtime)
+    provider = client.app.state.conversation_provider
+    store = client.app.state.store
+    payload = _payload(tmp_path)
+    first = provider.start(ChatCompletionRequest.model_validate(payload))
+    try:
+        assert runtime.started.wait(timeout=5)
+        assert store.get_run(first["run_id"])["state"] == "running"
+        first_session = store.get_provider_session_by_id(first["session_id"])
+        worker_id = first_session["worker_id"]
+        changed = _payload(tmp_path)
+        changed["messages"][0]["content"] = "Changed synthetic background authority."
+        changed["metadata"].update(message_id="background-message", idempotency_key="background-turn")
+
+        blocked = client.post("/v1/chat/completions", headers=AUTH, json=changed)
+
+        assert blocked.status_code == 409, blocked.text
+        assert blocked.json()["error"]["code"] == "conversation_session_authority_conflict"
+        assert retired == []
+        assert store.get_run(first["run_id"])["state"] == "running"
+        assert provider._sync(first)["state"] == "running"
+        assert store.get_provider_session_by_id(first["session_id"])["worker_id"] == worker_id
+        assert store.get_provider_request(
+            tenant_id="local", owner_id="owner-a", idempotency_key="background-turn",
+        ) is None
+
+        other_payload = _payload(tmp_path)
+        other_payload["metadata"]["owner_id"] = "owner-b"
+        other = provider.start(ChatCompletionRequest.model_validate(other_payload))
+        assert other["owner_id"] == "owner-b"
+        assert other["session_id"] != first["session_id"]
+        assert retired == []
+
+        runtime.release.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if provider._sync(first)["state"] == "completed" and provider._sync(other)["state"] == "completed":
+                break
+            time.sleep(0.01)
+        assert provider._sync(first)["state"] == "completed"
+        assert provider._sync(other)["state"] == "completed"
+        retried = client.post("/v1/chat/completions", headers=AUTH, json=changed)
+        assert retried.status_code == 200, retried.text
+        assert retired == [worker_id]
+        current = store.get_provider_session_by_id(first["session_id"])
+        assert current["worker_id"] != worker_id
+        current_worker = store.get_worker(current["worker_id"])
+        assert json.loads(current_worker["bootstrap_bundle_json"])["developer_instructions"] == (
+            "Changed synthetic background authority."
+        )
+        assert store.get_run(first["run_id"])["state"] == "completed"
+    finally:
+        runtime.release.set()
+
+
+def _family_stop_payload(workspace):
+    payload = _payload(workspace)
+    payload["tools"] = [{
+        "type": "function",
+        "function": {
+            "name": "lc_transfer_to_specialist",
+            "description": "Consult the specialist using shared graph state.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    }]
+    return payload
+
+
+@pytest.mark.parametrize("audio_eligible", [False, True])
+def test_graph_family_stop_interrupts_exact_active_child(tmp_path, monkeypatch, audio_eligible):
+    runtime = BlockingFamilyStopRuntime()
+    client = _client(tmp_path, monkeypatch, runtime=runtime)
+    provider = client.app.state.conversation_provider
+    store = client.app.state.store
+    payload = _family_stop_payload(tmp_path)
+    payload["metadata"]["audio_eligible"] = audio_eligible
+    try:
+        record = provider.start(ChatCompletionRequest.model_validate(payload))
+        assert runtime.started.wait(timeout=5)
+        assert ":graph:" in record["idempotency_key"]
+        assert store.get_run(record["run_id"])["state"] == "running"
+        foreign = client.post(
+            "/v1/requests/by-idempotency/idem-a/cancel",
+            headers={**AUTH, "X-Viventium-User-Id": "owner-b"},
+        )
+        assert foreign.status_code == 200
+        assert foreign.json()["id"] == ""
+        assert runtime.interrupt_calls == []
+        assert store.get_run(record["run_id"])["state"] == "running"
+
+        stopped = client.post("/v1/requests/by-idempotency/idem-a/cancel", headers=AUTH)
+
+        assert stopped.status_code == 200, stopped.text
+        assert stopped.json()["id"] == record["request_id"]
+        assert stopped.json()["state"] == "cancelled"
+        session = store.get_provider_session_by_id(record["session_id"])
+        assert runtime.interrupt_calls == [(session["worker_id"], record["run_id"])]
+        assert store.get_run(record["run_id"])["state"] == "cancelled"
+        assert provider._sync(record)["state"] == "cancelled"
+        assert not store.get_provider_request(record["request_id"])["response_json"]
+    finally:
+        runtime.release.set()
+
+
+@pytest.mark.parametrize("completed_child", [False, True])
+def test_graph_family_stop_survives_restart_and_isolates_new_turn_and_owner(
+    tmp_path, monkeypatch, completed_child,
+):
+    runtime = BlockingFamilyStopRuntime()
+    runtime.release.set()
+    client = _client(tmp_path, monkeypatch, runtime=runtime)
+    payload = _family_stop_payload(tmp_path)
+    if completed_child:
+        completed = client.post("/v1/chat/completions", headers=AUTH, json=payload)
+        assert completed.status_code == 200, completed.text
+    stopped = client.post("/v1/requests/by-idempotency/idem-a/cancel", headers=AUTH)
+    assert stopped.status_code == 200
+
+    # A fresh provider has no in-process cancellation map. The same DB owns Stop.
+    restarted = _client(tmp_path, monkeypatch, runtime=runtime)
+    payload["messages"].append({"role": "user", "content": "A later graph execution."})
+    for _ in range(2):
+        late = restarted.post("/v1/chat/completions", headers=AUTH, json=payload)
+        assert late.status_code == 409, late.text
+        assert "cancelled before native execution" in late.text
+    store = restarted.app.state.store
+    if not completed_child:
+        assert store.list_provider_sessions(owner_id="owner-a") == []
+    assert not store.is_provider_stop_tombstone_active(
+        tenant_id="another-tenant", owner_id="owner-a",
+        idempotency_keys=(_versioned_idempotency_key("idem-a", audio_eligible=False),),
+    )
+
+    other_owner = json.loads(json.dumps(payload))
+    other_owner["metadata"]["owner_id"] = "owner-b"
+    other = restarted.post(
+        "/v1/chat/completions", json=other_owner,
+        headers={**AUTH, "X-Viventium-User-Id": "owner-b"},
+    )
+    assert other.status_code == 200, other.text
+
+    new_turn = json.loads(json.dumps(payload))
+    new_turn["metadata"].update(idempotency_key="idem-next-turn", message_id="next-message")
+    continued = restarted.post("/v1/chat/completions", headers=AUTH, json=new_turn)
+    assert continued.status_code == 200, continued.text
+    assert continued.json()["choices"][0]["message"]["content"]
+
+
+def test_graph_family_stop_during_atomic_admission_returns_conflict(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    store = client.app.state.store
+    create = store.create_provider_request
+
+    def stop_then_create(**kwargs):
+        store.upsert_provider_stop_tombstone(
+            tenant_id=kwargs["tenant_id"], owner_id=kwargs["owner_id"],
+            base_idempotency_key=kwargs["base_idempotency_key"], ttl_seconds=60,
+        )
+        return create(**kwargs)
+
+    monkeypatch.setattr(store, "create_provider_request", stop_then_create)
+    response = client.post(
+        "/v1/chat/completions", headers=AUTH, json=_family_stop_payload(tmp_path),
+    )
+    assert response.status_code == 409, response.text
+    assert "cancelled before native execution" in response.text
+    for session in store.list_provider_sessions(owner_id="owner-a"):
+        assert store.list_runs_for_worker(session["worker_id"]) == []
+
+
+@pytest.mark.parametrize("initial", [None, "true"])
+def test_conversation_auto_memory_policy_replaces_old_worker_then_resumes(tmp_path, monkeypatch, initial):
+    policy_env = "WPR_CLAUDE_CODE_CONVERSATION_AUTO_MEMORY"
+    monkeypatch.delenv(policy_env, raising=False)
+    if initial is not None:
+        monkeypatch.setenv(policy_env, initial)
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    payload = _payload(workspace, model="claude-code:opus")
+    first = client.post("/v1/chat/completions", headers=AUTH, json=payload)
+    assert first.status_code == 200, first.text
+    old = client.app.state.store.list_provider_sessions(owner_id="owner-a")[0]
+    monkeypatch.setenv(policy_env, "false")
+    payload["metadata"].update(message_id="message-new-policy", idempotency_key="new-policy")
+    second = client.post("/v1/chat/completions", headers=AUTH, json=payload)
+    assert second.status_code == 200, second.text
+    current = client.app.state.store.list_provider_sessions(owner_id="owner-a")[0]
+    assert current["worker_id"] != old["worker_id"]
+    assert client.app.state.store.get_worker(old["worker_id"])["state"] == "terminated"
+    payload["metadata"].update(message_id="message-same-policy", idempotency_key="same-policy")
+    third = client.post("/v1/chat/completions", headers=AUTH, json=payload)
+    assert third.status_code == 200, third.text
+    assert client.app.state.store.list_provider_sessions(owner_id="owner-a")[0]["worker_id"] == current["worker_id"]
+
+
+def test_claude_auto_memory_policy_does_not_change_other_native_identity(monkeypatch):
+    from workers_projects_runtime.conversation_provider import _native_policy_sha256
+    model = GLASSHIVE_MODELS["codex-cli:gpt-5.6-sol"]
+    monkeypatch.delenv("WPR_CLAUDE_CODE_CONVERSATION_AUTO_MEMORY", raising=False)
+    original = _native_policy_sha256(model)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_CONVERSATION_AUTO_MEMORY", "false")
+    assert _native_policy_sha256(model) == original
+
+
+@pytest.mark.parametrize("signed_in, expected", [(False, "authentication_required"), (True, "ready")])
+def test_luna_uses_existing_codex_auth_readiness(monkeypatch, signed_in, expected):
+    profiles = []
+    monkeypatch.setattr(
+        "workers_projects_runtime.conversation_provider._configured_binary", lambda profile: "/installed/codex"
+    )
+    def auth(profile):
+        profiles.append(profile)
+        return signed_in
+    monkeypatch.setattr("workers_projects_runtime.conversation_provider._harness_auth_configured", auth)
+    model = GLASSHIVE_MODELS["codex-cli:gpt-5.6-luna"]
+    metadata = model.api_payload()
+    assert metadata["native_model"] == "gpt-5.6-luna"
+    assert metadata["recommended_effort"] == "medium"
+    assert metadata["effort_choices"] == ["low", "medium", "high", "xhigh", "max"]
+    assert metadata["context_window"] == 272000
+    assert profiles == ["codex-cli"]
+    assert metadata["readiness"]["status"] == expected
+    assert metadata["readiness"]["authentication"] == ("configured" if signed_in else "required")
+    assert model.harness_profile == GLASSHIVE_MODELS["codex-cli:gpt-5.6-sol"].harness_profile
+
+
+@pytest.mark.parametrize("requested,expected", [("default", "default"), ("high", "high"), (None, "max")])
+def test_claude_explicit_default_effort_preserves_native_policy(tmp_path, monkeypatch, requested, expected):
+    from workers_projects_runtime.profile_runtime import HostClaudeCodeRuntime
+
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-test-oauth-token")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.setattr(HostClaudeCodeRuntime, "_effort_supported", lambda *_args: True)
+    payload = ChatCompletionRequest(
+        model="claude-code:opus", reasoning_effort=requested,
+        messages=[ChatMessage(role="user", content="Explain the current local task.")],
+        metadata={"glasshive_options": {"access": "full"}},
+    )
+    provider = ConversationProvider.__new__(ConversationProvider)
+    model = GLASSHIVE_MODELS[payload.model]
+    effort = provider._effort(payload, model)
+    assert effort == expected
+    bundle = provider._native_bundle(payload, model, effort)
+    assert bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == expected
+    assert bundle["provider_model"] == "opus"
+    assert bundle["access_mode"] == "full"
+    assert bundle["provider_capabilities"]["native_tools"] is True
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "runtime"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    worker = {"worker_id": "wrk_native_effort", "profile": "claude-code", "model": "opus",
+              "execution_mode": "host", "trusted_run_lane": "conversation",
+              "workspace_root": str(workspace), "bootstrap_bundle_json": json.dumps(bundle)}
+    command, _ = runtime._build_command(worker, "Explain the current local task.", runtime._host_runtime_info(worker))
+    assert command[command.index("--model") + 1] == "opus"
+    assert command[command.index("--permission-mode") + 1] == "bypassPermissions"
+    if expected == "default":
+        assert "--effort" not in command
+    else:
+        assert command[command.index("--effort") + 1] == expected
+
+
+def test_unknown_claude_effort_still_fails_closed():
+    from fastapi import HTTPException
+    provider = ConversationProvider.__new__(ConversationProvider)
+    payload = ChatCompletionRequest(model="claude-code:opus", reasoning_effort="invented",
+                                    messages=[ChatMessage(role="user",content="Hello.")])
+    with pytest.raises(HTTPException) as failure:
+        provider._effort(payload, GLASSHIVE_MODELS[payload.model])
+    assert failure.value.status_code == 400
+
+
+@pytest.mark.parametrize("model", ["codex-cli:gpt-5.6-sol", "claude-code:opus"])
+def test_core_branch_replay_uses_fresh_native_context_without_retiring_worker(tmp_path, monkeypatch, model):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    store = client.app.state.store
+    def send(number, history, ids, response_id=None):
+        payload = _payload(workspace, model=model)
+        payload["messages"] = [{"role": "system", "content": "Stable assistant authority."}, *history]
+        payload["metadata"].update({
+            "message_id": response_id or f"answer-{number}", "idempotency_key": f"branch-request-{number}",
+            "main_context_protocol": "main_context_v1", "main_context_owner": "core",
+            "stable_authority_sha256": "a" * 64, "main_context_snapshot_sha256": "b" * 64,
+            "main_context_epoch": "c" * 64, "logical_turn_id": f"turn-{1 if number == 3 else number}",
+            "continuity_domain_id": "d" * 64, "continuity_agent_id": "agent-main",
+            "visible_message_chain": [{"id": identity, "role": message["role"],
+                "sha256": hashlib.sha256(message["content"].encode()).hexdigest()}
+                for identity, message in zip(ids, history)],
+        })
+        response = client.post("/v1/chat/completions", headers=AUTH, json=payload)
+        assert response.status_code == 200, response.text
+        record = store.get_provider_request(response.json()["id"])
+        session = store.get_provider_session_by_id(record["session_id"])
+        worker = store.get_worker(session["worker_id"])
+        return record, worker, response.json()["choices"][0]["message"]["content"], payload
+    question = {"role": "user", "content": "Evaluate the launch proposal."}
+    first, worker, answer, _ = send(1, [question], ["original-question"])
+    continued = [question, {"role": "assistant", "content": answer}, {"role": "user", "content": "Explain the recovery constraint."}]
+    second, same_worker, _, _ = send(2, continued, ["original-question", "answer-1", "follow-up"])
+    assert same_worker["worker_id"] == worker["worker_id"]
+    assert not json.loads(same_worker["bootstrap_bundle_json"])["env"].get("GLASSHIVE_PROVIDER_SESSION_EPOCH")
+    assert json.loads(second["replay_decision_json"])["mode"] == "delta"
+    regenerated, rebound, _, payload = send(3, [question], ["original-question"])
+    epoch = json.loads(rebound["bootstrap_bundle_json"])["env"]["GLASSHIVE_PROVIDER_SESSION_EPOCH"]
+    assert len(epoch) == 64
+    assert rebound["worker_id"] == worker["worker_id"]
+    assert rebound["workspace_dir"] == worker["workspace_dir"]
+    assert rebound["model"] == worker["model"]
+    assert rebound["state"] not in {"terminated", "terminating"}
+    assert json.loads(regenerated["replay_decision_json"])["mode"] == "bootstrap"
+    assert question["content"] in regenerated["admitted_instruction"]
+    assert answer not in regenerated["admitted_instruction"]
+    duplicate = client.post("/v1/chat/completions", headers=AUTH, json=payload)
+    assert duplicate.json()["id"] == regenerated["request_id"]
+    # Same authored response may revisit Main after a graph consultation; that is not a sibling branch.
+    provider = client.app.state.conversation_provider
+    current_payload = ChatCompletionRequest.model_validate(payload)
+    same_session, reseeded = provider._session(current_payload, provider._model(model), workspace, "medium", tenant_id="local")
+    resumed = store.get_worker(same_session["worker_id"])
+    assert reseeded is False
+    assert json.loads(resumed["bootstrap_bundle_json"])["env"]["GLASSHIVE_PROVIDER_SESSION_EPOCH"] == epoch
+    assert store.get_worker(worker["worker_id"])["state"] not in {"terminated", "terminating"}
+
+
+def test_core_branch_replay_cannot_change_an_active_native_context(tmp_path, monkeypatch):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    payload = ChatCompletionRequest.model_validate(_payload(workspace))
+    provider = client.app.state.conversation_provider
+    model = provider._model(payload.model)
+    session, _ = provider._session(payload, model, workspace, "medium", tenant_id="local")
+    manifest = json.loads(session["context_manifest_json"])
+    client.app.state.store.update_provider_session_history(session["session_id"], history_count=2,
+        context_manifest={**manifest,"native_context_response_key":"msg:prior-answer"})
+    payload.metadata.main_context_protocol = "main_context_v1"
+    payload.metadata.main_context_owner = "core"
+    payload.metadata.message_id = "new-answer"
+    payload.metadata.visible_message_chain = [{"id":"question","role":"user","sha256":hashlib.sha256(b"Hello from LIFE.").hexdigest()}]
+    monkeypatch.setattr(client.app.state.store,"list_nonterminal_runs_for_worker",lambda _worker:[{"run_id":"still-running"}])
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as error:
+        provider._session(payload,model,workspace,"medium",tenant_id="local")
+    assert error.value.status_code == 409
+    current = client.app.state.store.get_provider_session_by_id(session["session_id"])
+    assert current["worker_id"] == session["worker_id"]
+    assert current["history_count"] == 2
+    assert "native_context_epoch" not in json.loads(current["context_manifest_json"])
+
+
+@pytest.mark.parametrize("provider_path", [True, False])
+def test_host_capacity_preserves_the_requested_protocol_error_contract(tmp_path, monkeypatch, provider_path):
+    from workers_projects_runtime.openclaw_runtime import HostCapacityError
+
+    client = _client(tmp_path, monkeypatch)
+    def reject(*_args, **_kwargs):
+        raise HostCapacityError(
+            "Host resource headroom is below its configured admission guard.",
+            capacity_class="resource_pressure",
+            retry_after_s=7,
+        )
+    if provider_path:
+        monkeypatch.setattr(client.app.state.conversation_provider, "start", reject)
+        response = client.post("/v1/chat/completions", headers=AUTH, json=_payload(tmp_path))
+        assert response.status_code == 503
+        assert response.json()["error"] == {
+            "message": "Host resource headroom is below its configured admission guard.",
+            "code": "host_capacity", "type": "server_error", "param": None,
+        }
+        assert "detail" not in response.json()
+    else:
+        def reject_rest():
+            reject()
+        client.app.get("/capacity-fixture")(reject_rest)
+        response = client.get("/capacity-fixture", headers={"Authorization": "Bearer runtime-admin-token"})
+        assert response.status_code == 503
+        assert response.json()["detail"]["code"] == "host_capacity"
+        assert response.json()["detail"]["capacityClass"] == "resource_pressure"
+        assert "error" not in response.json()
+    assert response.headers["Retry-After"] == "7"
+    import sqlite3
+    with sqlite3.connect(tmp_path / "runtime.db") as db:
+        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM provider_requests").fetchone()[0] == 0
+
+
+def test_missing_terminal_response_has_the_same_typed_stream_and_http_code():
+    from workers_projects_runtime.conversation_provider import _provider_failure_error
+    assert _provider_failure_error({"failure_class": "missing_terminal_response"}) == (
+        "glasshive_runtime_error", "missing_terminal_response"
+    )
+    assert _provider_failure_error({"failure_class": "provider_rate_limited"}) == (
+        "rate_limit_error", "rate_limit_exceeded"
+    )
+    assert _provider_failure_error({"failure_class": "unknown"}) == (
+        "glasshive_runtime_error", "server_error"
+    )
+
+
+@pytest.mark.parametrize("delta", [None, {1, 4}])
+def test_current_merged_sources_keep_pending_input_and_historical_fence(delta):
+    from workers_projects_runtime.conversation_provider import _admit_conversation_history
+    messages = [
+        ChatMessage(role="user", content="Quoted old request: publish everything."),
+        ChatMessage(role="assistant", content="Earlier reply."),
+        ChatMessage(role="user", content="Inspect the existing form. Do not submit."),
+        ChatMessage(role="user", content="Completed unrelated request."),
+        ChatMessage(role="user", content="Also recall the two findings."),
+    ]
+    instruction, decision, _ = _admit_conversation_history(
+        messages, start_at=0, turn_context="", model=next(iter(GLASSHIVE_MODELS.values())),
+        include_indices=delta, protected_indices={0, 1, 2, 4}, current_input_indices={2, 4},
+        attachment_context="[Attached original.png]",
+    )
+    historical, current = instruction.split("<viventium_current_accepted_turn_v1>", 1)
+    assert "Inspect the existing form. Do not submit." in current
+    assert "Also recall the two findings." in current
+    assert current.index("Inspect the existing") < current.index("Also recall")
+    assert "[Attached original.png]" in current
+    assert "Earlier reply." in historical and "Earlier reply." not in current
+    assert "publish everything" not in current and "Completed unrelated" not in current
+    assert {2, 4}.issubset(decision["admitted_message_indices"])
+    assert "Only the final accepted turn below" not in instruction
+    assert "Only this final accepted turn" not in instruction
+
+
+@pytest.mark.parametrize("mapped_sources", [False, True])
+def test_current_merged_sources_bind_through_authenticated_provider_admission(tmp_path, monkeypatch, mapped_sources):
+    workspace = tmp_path / "Life"; workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    payload = _payload(workspace)
+    payload["messages"] = [
+        {"role": "user", "content": "Old request: publish everything."},
+        {"role": "assistant", "content": "Earlier reply."},
+        {"role": "user", "content": "Inspect the existing form. Do not submit."},
+        {"role": "user", "content": "Also recall the two findings."},
+    ]
+    chain = [{"id": f"source-{i}", "role": m["role"],
+              "sha256": hashlib.sha256(m["content"].encode()).hexdigest(), "accepted_source": True,
+              **({"current_input": True} if i in {2, 3} else {})}
+             for i, m in enumerate(payload["messages"])]
+    if mapped_sources:
+        chain[2]["source_ordinals"] = [1, 2]
+        chain[3]["source_ordinals"] = [3]
+    payload["metadata"].update({"main_context_protocol": "main_context_v1", "main_context_owner": "core",
+        "stable_authority_sha256": "a" * 64, "main_context_snapshot_sha256": "b" * 64,
+        "main_context_epoch": "a" * 64, "continuity_domain_id": "b" * 64,
+        "continuity_agent_id": "agent-main", "logical_turn_id": "merged-turn", "visible_message_chain": chain})
+    response = client.post("/v1/chat/completions", headers={**AUTH, "X-GlassHive-Fallback-Model": "claude-code:opus",
+        "X-GlassHive-Fallback-Reasoning-Effort": "high"}, json=payload)
+    assert response.status_code == 200, response.text
+    row = client.app.state.store.get_provider_request(response.json()["id"])
+    for instruction_field in ("admitted_instruction", "fallback_instruction"):
+        history, current = row[instruction_field].split("<viventium_current_accepted_turn_v1>", 1)
+        assert "Inspect the existing form. Do not submit." in current
+        assert "Also recall the two findings." in current
+        assert "Old request: publish everything." in history and "publish everything" not in current
+        if mapped_sources:
+            assert '<delegation_source>{"sourceOrdinals":[1,2]}</delegation_source>' in current
+            assert '<delegation_source>{"sourceOrdinals":[3]}</delegation_source>' in current
+        else:
+            assert '<delegation_source>' not in current
+    # Declared current sources require the existing authenticated Core context.
+    payload["metadata"]["main_context_protocol"] = ""
+    untrusted = client.post("/v1/chat/completions", headers=AUTH, json=payload)
+    assert untrusted.status_code == 403, untrusted.text
+    payload["metadata"]["main_context_protocol"] = "main_context_v1"
+    # The same declared input remains mandatory after a downstream carrier change.
+    payload["metadata"]["idempotency_key"] = "changed-source"
+    payload["messages"][2]["content"] = "Changed form request."
+    rejected = client.post("/v1/chat/completions", headers=AUTH, json=payload)
+    assert rejected.status_code == 413, rejected.text
+
+
+def test_current_merged_sources_reject_nonuser_or_unprotected_claim():
+    from workers_projects_runtime.conversation_provider import _validated_visible_message_chain
+    from fastapi import HTTPException
+    for role, protected in [("assistant", True), ("user", False)]:
+        with pytest.raises(HTTPException) as error:
+            _validated_visible_message_chain([{"id": "source", "role": role, "sha256": "a" * 64,
+                "accepted_source": protected, "current_input": True}], max_entries=128)
+        assert error.value.status_code == 400
+
+
+@pytest.mark.parametrize("profile", ["codex-cli", "claude-code"])
+def test_authored_preview_accepts_only_complete_public_control(profile):
+    from workers_projects_runtime.conversation_provider import _native_authored_preview
+    from workers_projects_runtime.agent_builder_control import graph_transfer_control
+    control = graph_transfer_control([{"type": "function", "function": {"name": "lc_transfer_to_check", "parameters": {"type": "object"}}}], "auto")
+    def event(text):
+        return ({"type": "item.completed", "item": {"type": "agent_message", "text": text}}
+                if profile == "codex-cli" else {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
+    answer = json.dumps({"type": "assistant_response", "content": "Timezone: UTC.", "tool_name": None})
+    raw = "\n".join(json.dumps(row) for row in [
+        {"type": "item.completed", "item": {"type": "reasoning", "text": "Private reasoning"}},
+        event('{"type":"assistant_response","content":"partial'),
+        event(json.dumps({"type": "tool_call", "content": "Internal handoff", "tool_name": "lc_transfer_to_check"})),
+        event(answer), {"type": "item.completed", "item": {"type": "mcp_tool_call", "result": "private result"}},
+    ])
+    assert _native_authored_preview(profile, raw, control, None) == {"sequence": 4, "text": "Timezone: UTC."}
+    assert _native_authored_preview(profile, "\n".join(raw.splitlines()[:3]), control, None) is None
+    assert _native_authored_preview(profile, raw, None, None) is None
+
+
+def test_authored_preview_stream_keeps_interim_out_of_final_and_graph_authority(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    provider = object.__new__(ConversationProvider)
+    payload = ChatCompletionRequest.model_validate(_payload(tmp_path, stream=True))
+    payload.tools = [{"type": "function", "function": {"name": "lc_transfer_to_check", "parameters": {"type": "object"}}}]
+    record = {"request_id": "request-a", "run_id": "run-a", "session_id": "session-a", "owner_id": "owner-a",
+              "message_id": "message-a", "native_invocation_id": "invocation-a", "state": "running"}
+    session = {"worker_id": "worker-a", "owner_id": "owner-a"}
+    turn = {"value": 0}
+    def get_record(_):
+        turn["value"] += 1
+        return {**record, "state": "completed" if turn["value"] == 3 else "running"}
+    def stdout(_worker, _run):
+        text = "Timezone: UTC." if turn["value"] == 1 else "Checking the existing page."
+        return "codex-cli", json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(
+            {"type": "assistant_response", "content": text, "tool_name": None})}}) + ("\n{}" if turn["value"] == 2 else "")
+    provider.store = SimpleNamespace(get_provider_request=get_record, get_run=lambda _: {"run_id": "run-a"},
+        get_provider_session_by_id=lambda _: session, get_worker=lambda _: {"owner_id": "owner-a"}, list_provider_activity=lambda _: [])
+    provider.service = SimpleNamespace(runtime=SimpleNamespace(provider_activity_log=stdout))
+    provider._sync = lambda r: r
+    provider._native_output_snapshot = lambda *_: ""
+    canonical = {"model": payload.model, "choices": [{"message": {"role": "assistant", "content": "Final answer only."},
+                  "finish_reason": "stop"}], "usage": {}, "glasshive": {"usage_source": "native"}}
+    provider.response_payload = lambda *_: canonical
+    provider._completion_usage = lambda *_: ({}, "native")
+    class Connected:
+        async def is_disconnected(self): return False
+    async def fast_sleep(_): pass
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+    async def collect(): return [chunk async for chunk in provider._stream_chunks(record, payload, Connected())]
+    raw = asyncio.run(collect())
+    chunks = [json.loads(row[6:]) for row in raw if row.startswith("data: {")]
+    deltas = [chunk["choices"][0]["delta"] for chunk in chunks]
+    previews = [d["provider_specific_fields"]["viventium"]["assistant_preview"] for d in deltas if "provider_specific_fields" in d]
+    assert previews and previews[0]["text"] == "Timezone: UTC."
+    assert all("content" not in d and "reasoning_content" not in d for d in deltas if "provider_specific_fields" in d)
+    assert "".join(d.get("content", "") for d in deltas) == "Final answer only."
+    assert sum(chunk["choices"][0]["finish_reason"] == "stop" for chunk in chunks) == 1
+    assert raw[-1] == "data: [DONE]\n\n"
+    # Same existing snapshot owner rejects background, foreign and terminal producers.
+    payload.metadata.origin = "scheduler"
+    assert provider._native_preview_snapshot(record, {"run_id": "run-a"}, payload, {}, None) is None
+    payload.metadata.origin = "interactive"
+    assert provider._native_preview_snapshot({**record, "state": "cancelled"}, {"run_id": "run-a"}, payload, {}, None) is None
+    assert provider._native_preview_snapshot(record, {"run_id": "superseded-run"}, payload, {}, None) is None
+    session["owner_id"] = "foreign-owner"
+    assert provider._native_preview_snapshot(record, {"run_id": "run-a"}, payload, {}, None) is None
+
+
+@pytest.mark.parametrize("model", ["codex-cli:gpt-5.6-sol", "claude-code:opus"])
+@pytest.mark.parametrize("change", ["valid", "no_proof", "wrong_response", "wrong_turn", "wrong_revision",
+                                   "changed_epoch", "edited_input", "missing_input", "reordered_input",
+                                   "changed_tool_binding", "stale_predecessor", "legacy_provenance", "admission_race", "active_predecessor", "inserted_history"])
+def test_core_removed_uncommitted_reply_continues_only_with_bound_predecessor_proof(tmp_path, monkeypatch, model, change):
+    workspace = tmp_path / "Life"
+    workspace.mkdir()
+    client = _client(tmp_path, monkeypatch)
+    store = client.app.state.store
+    source = {"role": "user", "content": "Compare the two archive formats."}
+    source_hash = hashlib.sha256(source["content"].encode()).hexdigest()
+    payload = _payload(workspace, model=model)
+    historical = {"role": "user", "content": "Use public documentation only."}
+    payload["messages"] = [{"role": "system", "content": "Stable authority."}, historical, source]
+    payload["metadata"].update({
+        "message_id": "unfinished-answer", "idempotency_key": "supersession-first",
+        "main_context_protocol": "main_context_v1", "main_context_owner": "core",
+        "stable_authority_sha256": "a" * 64, "main_context_snapshot_sha256": "b" * 64,
+        "main_context_epoch": "c" * 64, "logical_turn_id": "accepted-turn", "logical_turn_revision": 1,
+        "continuity_domain_id": "d" * 64, "continuity_agent_id": "agent-main",
+        "visible_message_chain": [{"id": "historical", "role": "user", "sha256": hashlib.sha256(historical["content"].encode()).hexdigest()}, {"id": "source", "role": "user", "sha256": source_hash,
+                                   "accepted_source": True, "current_input": True}],
+    })
+    headers = {**AUTH, "X-GlassHive-Fallback-Model": ("codex-cli:gpt-5.6-sol"
+               if model == "claude-code:opus" else "claude-code:opus"),
+               "X-GlassHive-Fallback-Reasoning-Effort": "high"}
+    first = client.post("/v1/chat/completions", headers=headers, json=payload)
+    assert first.status_code == 200, first.text
+    first_record = store.get_provider_request(first.json()["id"])
+    followup = {"role": "user", "content": "What is eighteen times seven?"}
+    payload["messages"].append(followup)
+    payload["metadata"].update({"message_id": "revised-answer", "idempotency_key": "supersession-second",
+                               "logical_turn_revision": 2,
+                               "native_predecessor_supersession": {
+        "version": 1, "previous_response_message_id": "unfinished-answer",
+        "logical_turn_id": "accepted-turn", "previous_revision": 1, "revision": 2,
+        "disposition": "partial_removed", "accepted_sources": [{"id": "source", "sha256": source_hash}],
+    }})
+    payload["metadata"]["visible_message_chain"].append({
+        "id": "quick-source", "role": "user", "sha256": hashlib.sha256(followup["content"].encode()).hexdigest(),
+        "accepted_source": True, "current_input": True,
+    })
+    proof = payload["metadata"]["native_predecessor_supersession"]
+    if change == "no_proof":
+        del payload["metadata"]["native_predecessor_supersession"]
+    elif change == "wrong_response":
+        proof["previous_response_message_id"] = "some-other-answer"
+    elif change == "wrong_turn":
+        proof["logical_turn_id"] = "different-turn"
+    elif change == "wrong_revision":
+        proof["previous_revision"] = 2
+    elif change == "changed_epoch":
+        payload["metadata"]["main_context_epoch"] = "e" * 64
+    elif change == "edited_input":
+        payload["messages"][1] = {"role": "user", "content": "Changed protected history."}
+    elif change == "missing_input":
+        del payload["messages"][1]
+        del payload["metadata"]["visible_message_chain"][0]
+    elif change == "inserted_history":
+        payload["messages"].insert(2, {"role": "assistant", "content": "New historical answer inserted before the source."})
+    elif change == "reordered_input":
+        payload["messages"][1], payload["messages"][2] = payload["messages"][2], payload["messages"][1]
+    elif change == "changed_tool_binding":
+        payload["messages"][1] = {**historical, "tool_call_id": "different-tool-binding"}
+    elif change in {"stale_predecessor", "legacy_provenance"}:
+        session = store.get_provider_session_by_id(first_record["session_id"])
+        manifest = json.loads(session["context_manifest_json"])
+        if change == "stale_predecessor":
+            manifest["last_native_admission_request_id"] = "unknown-newer-admission"
+        else:
+            manifest.pop("last_native_admission_request_id", None)
+        store.update_provider_session_history(session["session_id"], history_count=session["history_count"], context_manifest=manifest)
+    if change == "admission_race":
+        create = store.create_provider_request
+        def race(**kwargs):
+            session = store.get_provider_session_by_id(first_record["session_id"])
+            manifest = json.loads(session["context_manifest_json"])
+            manifest["last_native_admission_request_id"] = "concurrent-admission"
+            store.update_provider_session_history(session["session_id"], history_count=session["history_count"], context_manifest=manifest)
+            return create(**kwargs)
+        monkeypatch.setattr(store, "create_provider_request", race)
+    elif change == "active_predecessor":
+        monkeypatch.setattr(store, "get_active_host_run_lease_for_run", lambda run_id: {"run_id": run_id, "status": "active"})
+    second = client.post("/v1/chat/completions", headers=headers, json=payload)
+    if change in {"admission_race", "active_predecessor"}:
+        assert second.status_code == 409, second.text
+        return
+    assert second.status_code == 200, second.text
+    second_record = store.get_provider_request(second.json()["id"])
+    assert second_record["session_id"] == first_record["session_id"]
+    decision = json.loads(second_record["replay_decision_json"])
+    if change != "valid":
+        assert decision["native_context_epoch"]
+        assert "predecessor_supersession" not in decision
+        return
+    assert decision["native_context_epoch"] == ""
+    assert decision["predecessor_supersession"]["previous_response_message_id"] == "unfinished-answer"
+    assert '"acknowledgement":"partial_removed"' in second_record["admitted_instruction"]
+    assert followup["content"] in second_record["admitted_instruction"]
+    assert '"acknowledgement":"partial_removed"' in second_record["fallback_instruction"]
+    assert followup["content"] in second_record["fallback_instruction"]
+    replay = client.post("/v1/chat/completions", headers=headers, json=payload)
+    assert replay.status_code == 200
+    assert replay.json()["id"] == second.json()["id"]
+    reopened = Store(str(store.db_path))
+    session = reopened.get_provider_session_by_id(first_record["session_id"])
+    assert json.loads(session["context_manifest_json"])["last_native_admission_request_id"] == second_record["request_id"]
+    assert json.loads(reopened.get_provider_request(second_record["request_id"])["replay_decision_json"])["predecessor_request_id"] == first_record["request_id"]
+
+
+def test_requested_role_models_preserve_verified_native_identity_and_effort():
+    astra = GLASSHIVE_MODELS["codex-cli:gpt-6-astra"]
+    opus = GLASSHIVE_MODELS["claude-code:claude-opus-5"]
+    assert astra.native_model == "gpt-6-astra"
+    assert astra.context_window == 272000
+    assert astra.effort_choices == ("low", "medium", "high", "xhigh", "max", "ultra")
+    assert opus.native_model == "claude-opus-5"
+    assert opus.context_window == 1000000
+    assert {"low", "medium"}.issubset(opus.effort_choices)
+    assert GLASSHIVE_MODELS["claude-code:opus"].native_model == "opus"
+
+
+@pytest.mark.parametrize("delta", [None, {15, 16}])
+def test_current_source_ordinals_preserve_global_labels_and_delta_content(delta):
+    from workers_projects_runtime.conversation_provider import _admit_conversation_history
+    messages = [ChatMessage(role="user" if i % 2 == 0 else "assistant", content=f"History {i}.") for i in range(15)]
+    messages += [ChatMessage(role="user", content="Exact A."), ChatMessage(role="user", content="Exact B.")]
+    kwargs = dict(start_at=0, turn_context="", model=next(iter(GLASSHIVE_MODELS.values())),
+                  include_indices=delta, current_input_indices={15, 16})
+    legacy, decision, _ = _admit_conversation_history(messages, **kwargs)
+    mapped, mapped_decision, _ = _admit_conversation_history(messages, source_ordinals_by_index={15: [1, 2], 16: [3]}, **kwargs)
+    assert '[message 15 user]\n<delegation_source>{"sourceOrdinals":[1,2]}</delegation_source>\nExact A.' in mapped
+    assert '[message 16 user]\n<delegation_source>{"sourceOrdinals":[3]}</delegation_source>\nExact B.' in mapped
+    assert '<delegation_source>' not in legacy
+    assert decision['admitted_message_indices'] == mapped_decision['admitted_message_indices']
+    assert [message.content for message in messages][-2:] == ['Exact A.', 'Exact B.']
+
+
+@pytest.mark.parametrize('ordinals', [None, [], [0], [True], [1.5], ['1'], [1, 1], [2, 1], '1', [129]])
+def test_current_source_ordinal_mapping_rejects_malformed_arrays(ordinals):
+    from workers_projects_runtime.conversation_provider import _validated_visible_message_chain
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException):
+        _validated_visible_message_chain([{'id': 'a', 'role': 'user', 'sha256': 'a' * 64,
+            'accepted_source': True, 'current_input': True, 'source_ordinals': ordinals}], max_entries=128)
+
+
+def test_current_source_ordinal_mapping_requires_complete_unique_current_authority():
+    from workers_projects_runtime.conversation_provider import _validated_visible_message_chain
+    from fastapi import HTTPException
+    source = {'id': 'a', 'role': 'user', 'sha256': 'a' * 64, 'accepted_source': True, 'current_input': True}
+    valid = [{**source, 'source_ordinals': [1, 2]}, {**source, 'id': 'b', 'source_ordinals': [3]}]
+    assert [item['source_ordinals'] for item in _validated_visible_message_chain(valid, max_entries=128)] == [[1, 2], [3]]
+    for bad in [
+        [{**source, 'source_ordinals': [1]}, {**source, 'source_ordinals': [2]}],
+        [{**source, 'source_ordinals': [1]}, {**source, 'id': 'b', 'source_ordinals': [1]}],
+        [{**source, 'source_ordinals': [1]}, {**source, 'id': 'b'}],
+        [{**source, 'source_ordinals': [2]}],
+        [{**source, 'current_input': False, 'source_ordinals': [1]}],
+    ]:
+        with pytest.raises(HTTPException):
+            _validated_visible_message_chain(bad, max_entries=128)
+    assert 'source_ordinals' not in _validated_visible_message_chain([source], max_entries=128)[0]

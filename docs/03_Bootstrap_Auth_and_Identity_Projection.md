@@ -132,6 +132,20 @@ GlassHive does not search the mounted upload directory for matching bytes. It pr
 blocker manifest. A missing, unmatched, duplicate, or filename-only selected-file identity fails
 closed; GlassHive never chooses the newest same-owner file as a substitute.
 
+## Conversation authorization across restart
+
+Conversation broker bearer authority is run-local memory, not persisted worker bootstrap or replay
+metadata. Initial admission attaches the durable provider request and run atomically before starting
+compute. An exact retry can refresh the lost bearer only after the stored request authority matches;
+changed authority requires a new logical turn. Refresh keeps the accepted run and instructions.
+
+If restart loses that bearer, the affected run remains `needs_input` and its provider request reports
+`failed` with the structured cause. For an explicitly stateless request, a failed grant-required turn
+with no active lease may stop blocking queued siblings. Persistent sessions remain ordered behind
+that input boundary. Operator Pause, paused runs, Work Stop, compute-release claims and active leases
+remain admission fences. Explicit Stop still cancels the exact resumable run after its request has
+reported failure, and a repeated Stop finishes an interrupted cancellation handoff.
+
 ## Source-Specific Best Practice
 
 ### A. Host CLI login projection
@@ -152,6 +166,13 @@ Every host CLI version/help/auth/readiness subprocess runs only after a durable 
 reservation is live. A failed or expired preflight releases that reservation and cannot create or
 accept work. Successful admission later acquires the exact run lease under the same typed policy.
 
+For an owner-managed Claude login, `CLAUDE_CONFIG_DIR` remains the worker's original session
+store. The CLI's native `CLAUDE_SECURESTORAGE_CONFIG_DIR` selector chooses the already-authorized
+owner credential store independently, and the exact combined environment must pass native auth
+status before launch. This preserves the session UUID, history and working directory when a
+projected access token expires. No credential or session file is copied, and selected personal
+accounts and explicit API/enterprise routes keep their existing authority.
+
 Host-native CLI subprocesses receive a minimal runtime environment. Parent process secrets, provider
 API keys, callback secrets, and LibreChat internals are not inherited by default.
 
@@ -160,8 +181,28 @@ for broker MCP grants, it must preserve the selected worker type's native host c
 an operator explicitly configured a locked-down profile. For Codex host workers this means the
 worker-local `CODEX_HOME/config.toml` keeps allowlisted native MCP/tool definitions, including
 bundled plugin manifests such as computer-use when present, then appends the scoped
-`glasshive-user-capabilities` broker block. For Claude Code host workers this means launching with
-the CLI's native Chrome integration enabled when the installed CLI supports it.
+`glasshive-user-capabilities` broker block. Full-access Claude Code host workers reuse that same
+selected native stdio source in their explicit private MCP config, beside the scoped broker, and
+keep the CLI's native Chrome integration when supported. Native server `HOME` remains the OS owner
+unless explicitly configured; the worker's own state stays isolated. Disabled or unselected servers,
+workspace-limited profiles, and `native_tools: false` never gain these host tools. Broker names take
+precedence. Native tool allow/deny lists are preserved on the existing selected MCP child's stdio
+transport. Only filtered servers receive the transparent process adapter; unfiltered servers stay
+direct. It filters tool discovery and rejects excluded calls, retaining schemas, paging, notifications,
+errors and other MCP traffic. The private child command and tool policy are hash-bound, and changed
+or unreadable policy closes the transport. Declared environment and native stderr are retained; the
+adapter owns its child process group through cancellation and exit. Claude's managed permissions,
+hooks and explicit per-run settings remain unchanged: disabling hooks cannot disable this filter.
+A server with a
+Codex-only working directory remains omitted with a diagnostic. Actual Computer/app execution is a
+separate parity gate; metadata connection or screen capture alone is insufficient. No user MCP
+configuration or credential file is copied into the mission.
+
+Claude effort uses one native value set across preferences, delegation, persisted bootstrap, and
+host or sandbox CLI transport: `default`, `low`, `medium`, `high`, `xhigh`, and `max`. The default
+omits the CLI override. Explicit supported values remain unchanged, and the existing launch-time
+CLI help check rejects a value an older installed version cannot support. Invalid values remain
+rejected; they must not be silently dropped from stored worker configuration.
 
 Current validated local footprints on this machine:
 

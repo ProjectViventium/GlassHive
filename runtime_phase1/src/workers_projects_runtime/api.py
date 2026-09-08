@@ -19,6 +19,8 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+from .runtime_requirements import CLAUDE_CODE_EFFORT_LEVELS
+
 from .auth import (
     AuthContext,
     EnterpriseAuthSettings,
@@ -123,6 +125,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 
 from .conversation_provider import (
     HTTP_REQUEST_HEAD_MAX_BYTES,
+    _is_provider_path,
+    _openai_error,
     install_conversation_provider_routes,
 )
 
@@ -134,6 +138,8 @@ from .models import (
     ActiveWorkActionRequest,
     AssignRunRequest,
     CallbackAssociationVerifyRequest,
+    TerminalCallbackRecoveryRequest,
+    LifecycleCallbackRecoveryRequest,
     CreateDelegationRequest,
     CreateProjectRequest,
     CreateWorkerRequest,
@@ -176,6 +182,7 @@ from .service import (
     GlassHiveQuotaExceededError,
     HostWorkersDisabledError,
     ParallelExecutionIsolationError,
+    BackgroundWorkerConfigurationError,
     PROMPT_WORKBENCH_SCHEDULED_AUTHORITY_KIND,
     PROMPT_WORKBENCH_SCHEDULED_AUTHORITY_REQUEST,
     PROMPT_WORKBENCH_SCHEDULED_BOOTSTRAP_PROFILE,
@@ -348,6 +355,10 @@ def create_app(
         try:
             yield
         finally:
+            # Release this executor's host run leases before anything else so a
+            # managed stop is never read as a stalled provider, even when the
+            # launcher's kill window preempts service.shutdown() below.
+            service.release_owned_host_run_leases()
             try:
                 provider_setup.shutdown()
             finally:
@@ -446,6 +457,10 @@ def create_app(
     ) -> JSONResponse:
         _ = request
         detail, retry_after = _host_capacity_http_contract(exc)
+        if _is_provider_path(request.url.path):
+            response = _openai_error(503, str(detail["message"]), str(detail["code"]))
+            response.headers["Retry-After"] = str(retry_after)
+            return response
         return JSONResponse(
             status_code=503,
             headers={"Retry-After": str(retry_after)},
@@ -733,7 +748,7 @@ def create_app(
             or path == "/v1/active-work"
             or path.startswith("/v1/active-work/")
             or path.startswith("/v1/work/")
-            or path == "/v1/callback-associations/verify"
+            or path in {"/v1/callback-associations/verify", "/v1/callback-associations/recover"}
         )
 
     def _account_auth_error(exc: ServiceAssertionError) -> JSONResponse:
@@ -800,6 +815,8 @@ def create_app(
                         },
                     )
             request.state.service_assertion_claims = claims
+            if claims.get("native_input_digest") is not None:
+                request.state.native_input_body_digest = sha256(await request.body()).hexdigest()
             request.state.auth_context = AuthContext(
                 tenant_id=str(claims["tenant_id"]),
                 user_id=str(claims["owner_id"]),
@@ -1015,8 +1032,8 @@ def create_app(
             normalized["codex_reasoning_effort"] = effort
         if payload.claude_effort is not None:
             effort = payload.claude_effort.strip().lower()
-            if effort and effort not in {"default", "max", "xhigh"}:
-                raise HTTPException(status_code=400, detail="claude_effort must be default, max, or xhigh")
+            if effort and effort not in CLAUDE_CODE_EFFORT_LEVELS:
+                raise HTTPException(status_code=400, detail="claude_effort must be default, low, medium, high, xhigh, or max")
             normalized["claude_effort"] = "" if effort == "default" else effort
         if payload.openclaw_effort is not None:
             effort = payload.openclaw_effort.strip().lower()
@@ -1035,8 +1052,8 @@ def create_app(
                 raise HTTPException(status_code=400, detail="Codex effort must be none, minimal, low, medium, high, or xhigh")
             return {"env": {"WPR_CODEX_CLI_REASONING_EFFORT": effort}}
         if profile == "claude-code":
-            if effort not in {"default", "max", "xhigh"}:
-                raise HTTPException(status_code=400, detail="Claude effort must be default, max, or xhigh")
+            if effort not in CLAUDE_CODE_EFFORT_LEVELS:
+                raise HTTPException(status_code=400, detail="Claude effort must be default, low, medium, high, xhigh, or max")
             if effort == "default":
                 return None
             return {"env": {"WPR_CLAUDE_CODE_EFFORT": effort}}
@@ -2600,12 +2617,12 @@ def create_app(
         if state == "failed" and is_user_resumable_failure(
             failure_class=record.get("run_failure_class"),
             retryable=record.get("run_failure_retryable"),
+            runtime_invoked_at=record.get("run_runtime_invoked_at", ...),
+            started_at=record.get("run_started_at", ...),
         ):
-            return ["retry", "dismiss"]
-        if state == "completed":
+            return ["retry", "queue", "message", "dismiss"]
+        if state in {"completed", "failed", "cancelled"}:
             return ["queue", "message", "dismiss"]
-        if state in {"failed", "cancelled"}:
-            return ["dismiss"]
         return []
 
     def _active_work_status(record: dict, state: str) -> str:
@@ -2682,6 +2699,51 @@ def create_app(
                 continue
             return f"{value}/w/{ref_id}"
         return None
+
+    def _active_work_artifact_links(record: dict, view_ref: str) -> dict[str, object]:
+        # Reuse the same bounded inventory and signed links as the mission view.
+        unavailable: dict[str, object] = {"status": "unavailable", "items": []}
+        worker = store.get_worker(str(record.get("worker_id") or ""))
+        if (
+            not worker
+            or worker.get("tenant_id") != record.get("tenant_id")
+            or worker.get("owner_id") != record.get("owner_id")
+            or worker.get("state") == "terminated"
+        ):
+            return unavailable
+        workspace_root = str(worker.get("workspace_dir") or "").strip()
+        if not workspace_root or not Path(workspace_root).is_dir():
+            return unavailable
+        workspace_items, truncated = _workspace_items_with_status(
+            worker, max_entries=21, max_depth=8,
+        )
+        file_items = [
+            item for item in workspace_items
+            if not item.get("is_dir")
+            and not (Path(workspace_root) / str(item.get("path") or "")).is_symlink()
+        ]
+        items = _artifact_items_with_action_urls(worker, file_items, max_entries=5)
+        base_url = view_ref.rsplit("/w/", 1)[0]
+        links: list[dict[str, object]] = []
+        for item in items:
+            open_url = str(item.get("open_url") or "")
+            download_url = str(item.get("download_url") or "")
+            # A missing signer must never expose an authenticated internal endpoint as a link.
+            if not open_url.startswith("/v1/link-refs/ghr_") or not download_url.startswith("/v1/link-refs/ghr_"):
+                return unavailable
+            links.append({
+                "path": str(item.get("path") or ""),
+                "sizeBytes": item.get("size"),
+                "openUrl": base_url + open_url,
+                "downloadUrl": base_url + download_url,
+            })
+        return {
+            "status": "ok",
+            "scope": "workspace",
+            "items": links,
+            "truncated": truncated or len(file_items) > len(items),
+            "workspaceUrl": view_ref,
+        }
 
     def _active_work_provider(record: dict) -> str:
         profile = str(record.get("worker_profile") or "").strip()
@@ -2818,6 +2880,12 @@ def create_app(
             ),
             "actions": _active_work_actions(record, state),
         }
+        pending_native_input = service.active_work_pending_native_input(record)
+        if pending_native_input is not None:
+            payload["pendingNativeInput"] = pending_native_input
+            payload["state"] = "needs_input"
+            payload["statusSummary"] = "Waiting for your response"
+            payload["actions"] = ["resume", "stop"]
         first_queued_at = str(
             record.get("run_first_queued_at")
             or record.get("run_queued_at")
@@ -2962,6 +3030,8 @@ def create_app(
         view_ref = _active_work_view_ref(record, request)
         if view_ref:
             payload["viewRef"] = view_ref
+            if state in {"completed", "failed", "cancelled"}:
+                payload["artifactLinks"] = _active_work_artifact_links(record, view_ref)
         if state == "failed" and not bool(record.get("run_failure_retryable")):
             payload["attention"] = {
                 "kind": "input",
@@ -3113,6 +3183,11 @@ def create_app(
                 bootstrap_profile=payload.bootstrap_profile,
                 bootstrap_bundle=payload.bootstrap_bundle,
             )
+        except BackgroundWorkerConfigurationError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "background_worker_configuration_invalid", "message": str(exc)},
+            ) from exc
         except DelegationIdempotencyConflictError as exc:
             raise HTTPException(
                 status_code=409,
@@ -3243,6 +3318,30 @@ def create_app(
             "workRef": str(association.get("work_ref") or ""),
         }
 
+    @app.post("/v1/callback-associations/recover")
+    def recover_terminal_callback(
+        payload: TerminalCallbackRecoveryRequest | LifecycleCallbackRecoveryRequest,
+        request: Request, response: Response
+    ) -> dict[str, str]:
+        tenant_id, owner_id = _account_scope(request)
+        association = store.verify_callback_association(
+            tenant_id=tenant_id, owner_id=owner_id,
+            origin_ref=payload.origin_ref, work_ref=payload.work_ref,
+            worker_id=payload.worker_id, run_id=payload.run_id,
+        )
+        if not association:
+            raise HTTPException(status_code=404, detail={
+                "code": "callback_association_not_found",
+                "message": "The callback association was not found.",
+            })
+        recovered = service.recover_terminal_callback(
+            tenant_id=tenant_id, owner_id=owner_id,
+            **payload.model_dump(),
+        )
+        response.status_code = 202 if recovered else 200
+        response.headers["Cache-Control"] = "no-store"
+        return {"state": "delivering" if recovered else "unchanged"}
+
     @app.get("/v1/delegations/by-origin/{origin_ref}")
     def get_delegation_by_origin(origin_ref: str, request: Request) -> dict[str, object]:
         tenant_id, owner_id = _account_scope(request)
@@ -3299,6 +3398,11 @@ def create_app(
         record = store.get_delegation(work_ref, tenant_id=tenant_id, owner_id=owner_id)
         if not record:
             raise HTTPException(status_code=404, detail="Active work not found")
+        native_input = payload.native_input.model_dump() if payload.native_input is not None else None
+        if native_input is not None:
+            claims = getattr(request.state, "service_assertion_claims", {})
+            if not claims.get("native_input_digest") or claims["native_input_digest"] != getattr(request.state, "native_input_body_digest", None):
+                raise HTTPException(status_code=403, detail={"code": "native_input_owner_control_required", "message": "Native input requires an authenticated owner control."})
         instruction = str(payload.instruction or "").strip()
         if payload.action in {"queue", "message", "steer"} and not instruction:
             raise HTTPException(
@@ -3336,6 +3440,8 @@ def create_app(
             "instruction": instruction,
             "capabilityReauthorization": capability_reauthorization,
         }
+        if native_input is not None:
+            action_request["nativeInput"] = native_input
         if source_context is not None:
             action_request["sourceContext"] = source_context
         try:
@@ -3387,11 +3493,16 @@ def create_app(
                         "message": "The prior active-work action result is unavailable.",
                     },
                 ) from exc
-            raise HTTPException(status_code=failure_status, detail=failure_detail)
+            raise HTTPException(
+                status_code=failure_status,
+                detail=failure_detail,
+                headers=failure_response.get("headers"),
+            )
         if (
             bool(reservation.get("idempotent_replay"))
             and str(reservation.get("status") or "") != "completed"
             and payload.action in {"pause", "resume", "steer", "stop"}
+            and native_input is None
             and not str(reservation.get("lifecycle_operation_id") or "").strip()
             and should_execute
         ):
@@ -3417,7 +3528,10 @@ def create_app(
                     ),
                 },
             )
-        if not should_execute or recovery_takeover:
+        if native_input is not None and not should_execute and str(reservation.get("status") or "") != "completed":
+            return {"workRef": work_ref, "action": payload.action, "status": "pending",
+                    "state": _active_work_state(record), "confirmationPending": True, "idempotentReplay": True}
+        if not should_execute or (recovery_takeover and native_input is None):
             if str(reservation.get("status") or "") != "completed":
                 reconciled = service.reconcile_active_work_action(
                     record,
@@ -3515,10 +3629,8 @@ def create_app(
                     persisted_response = json.loads(
                         str(finished_action.get("response_json") or "{}")
                     )
-                    prior["updatedAt"] = str(
-                        persisted_response.get("updatedAt") or prior["updatedAt"]
-                    )
-                    return prior
+                    persisted_response["idempotentReplay"] = True
+                    return persisted_response
             elif not should_execute:
                 try:
                     prior = json.loads(str(reservation.get("response_json") or "{}"))
@@ -3541,6 +3653,7 @@ def create_app(
                 idempotency_key=payload.idempotency_key,
                 capability_reauthorization=capability_reauthorization,
                 action_use_id=action_use_id,
+                native_input=native_input,
             )
             new_run_id = str(result.get("run_id") or "")
             response: dict[str, object] = {
@@ -3575,10 +3688,10 @@ def create_app(
             persisted_response = json.loads(
                 str(finished_action.get("response_json") or "{}")
             )
-            response["updatedAt"] = str(
-                persisted_response.get("updatedAt") or response["updatedAt"]
+            persisted_response["idempotentReplay"] = bool(
+                reservation.get("idempotent_replay")
             )
-            return response
+            return persisted_response
         except ValueError as exc:
             code = str(exc)
             detail = {"code": code, "message": code.replace("_", " ")}
@@ -3591,6 +3704,19 @@ def create_app(
             raise HTTPException(
                 status_code=400,
                 detail=detail,
+            ) from exc
+        except HostCapacityError as exc:
+            detail, retry_after = _host_capacity_http_contract(exc)
+            headers = {"Retry-After": str(retry_after)}
+            store.fail_active_work_action(
+                action_use_id,
+                "host_capacity",
+                executor_id=service.executor_id,
+                failure_response={"statusCode": 503, "detail": detail, "headers": headers},
+            )
+            raise HTTPException(
+                status_code=503, detail=detail,
+                headers=headers,
             ) from exc
         except RuntimeError as exc:
             code = str(exc)
@@ -5404,8 +5530,42 @@ def create_app(
     def _read_only_mission_view(worker: dict) -> HTMLResponse:
         worker_id = str(worker.get("worker_id") or "")
         runtime_details = _runtime_details(worker)
-        run_id = str(worker.get("last_run_id") or "").strip()
-        run = store.get_run(run_id) if run_id else None
+        delegation = store.get_delegation_for_worker(
+            worker_id,
+            tenant_id=str(worker.get("tenant_id") or "local"),
+            owner_id=str(worker.get("owner_id") or ""),
+        )
+        # A reusable worker can have other runs; this view belongs to this mission.
+        run_id = str((delegation or {}).get("current_run_id") or "").strip()
+        run = store.get_run(run_id, tenant_id=str(worker.get("tenant_id") or "local")) if run_id else None
+        if run and str(run.get("worker_id") or "") != worker_id:
+            run = None
+        run_state = str((run or {}).get("state") or "")
+        result_text = str((run or {}).get("output_text") or "").strip()
+        if result_text and run_state in {"completed", "failed", "cancelled"}:
+            result_title = "Result" if run_state == "completed" else "Progress before interruption"
+            result_content = f'<div class="result-text">{escape(_redact_text(result_text))}</div>'
+        else:
+            result_title = "Result"
+            result_status = {
+                "queued": "Waiting to start.",
+                "running": "Work is in progress.",
+                "paused": "Work is paused.",
+                "needs_input": "This work needs your input.",
+                "completed": "This work completed without a written result.",
+                "failed": "This work failed before a result was available.",
+                "cancelled": "This work was stopped before a result was available.",
+            }.get(run_state, "No result is available yet.")
+            result_content = f'<p class="empty">{result_status}</p>'
+        if run_state in {"failed", "cancelled", "needs_input"}:
+            failure_message = str((run or {}).get("failure_user_message") or "").strip()
+            if failure_message:
+                result_content += f'<p class="muted">{escape(_redact_text(failure_message))}</p>'
+        refresh = (
+            '<meta http-equiv="refresh" content="5">'
+            if (run or {}).get("state") in {"queued", "running"}
+            else ""
+        )
         mission_state = str((run or {}).get("state") or "not started").replace(
             "_", " "
         ).title()
@@ -5454,10 +5614,10 @@ def create_app(
                     '<p class="muted">More files exist in this mission workspace.</p>'
                 )
         else:
-            artifact_content = '<p class="empty">No result files are available yet.</p>'
+            artifact_content = '<p class="empty">No result files are available.</p>'
         return HTMLResponse(
             f"""
-            <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(worker['name'])} mission view</title>
+            <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">{refresh}<title>{escape(worker['name'])} mission view</title>
             <style>
               :root {{ color-scheme:dark; font-family:ui-sans-serif,system-ui,-apple-system,sans-serif; background:#0b0d10; color:#f1f3f5; }}
               * {{ box-sizing:border-box; }} body {{ margin:0; background:#0b0d10; }}
@@ -5467,7 +5627,8 @@ def create_app(
               dl {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1px; margin:0 0 2rem; background:#2a2f36; border:1px solid #2a2f36; border-radius:12px; overflow:hidden; }}
               dl div {{ padding:14px; background:#12151a; }} dt {{ color:#aeb4bd; font-size:.78rem; }} dd {{ margin:.3rem 0 0; font-weight:650; overflow-wrap:anywhere; }}
               .state-note {{ margin:-1rem 0 2rem; color:#aeb4bd; font-size:.9rem; line-height:1.5; }}
-              section {{ border-top:1px solid #2a2f36; padding-top:1.5rem; }} h2 {{ margin:0 0 1rem; font-size:1rem; }}
+              .result-text {{ white-space:pre-wrap; overflow-wrap:anywhere; line-height:1.65; }}
+              section {{ border-top:1px solid #2a2f36; padding-top:1.5rem; margin-top:1.5rem; }} h2 {{ margin:0 0 1rem; font-size:1rem; }}
               .artifacts {{ list-style:none; margin:0; padding:0; border-bottom:1px solid #2a2f36; }}
               .artifacts li {{ display:flex; justify-content:space-between; align-items:center; gap:20px; padding:14px 0; border-top:1px solid #2a2f36; }}
               .artifacts li div {{ min-width:0; }} .artifacts strong {{ display:block; overflow-wrap:anywhere; }} .artifacts span,.muted,.empty {{ color:#aeb4bd; font-size:.86rem; }}
@@ -5483,8 +5644,9 @@ def create_app(
                 <div><dt>Runtime</dt><dd>{escape(runtime_mode)}</dd></div>
               </dl>
               <p class="state-note">Mission state describes this result. Worker state describes the reusable workspace after the mission.</p>
+              <section aria-labelledby="result-title"><h2 id="result-title">{result_title}</h2>{result_content}</section>
               <section aria-labelledby="results-title"><h2 id="results-title">Result files</h2>{artifact_content}</section>
-              <p class="notice">Mission controls require an authenticated, action-scoped, one-use capability.</p>
+              <p class="notice">To change this work, return to your chat or open Active work.</p>
             </div></main></body></html>
             """,
             headers={

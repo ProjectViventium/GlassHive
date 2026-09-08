@@ -144,6 +144,26 @@ Pass if:
 - the user is not told to change global machine state while a managed or sandboxed recovery path exists
 - if recovery is impossible, the blocker is specific, structured, and does not masquerade as task failure
 
+## 7.2 Native control and restart regression boundaries
+
+The focused deterministic owners below live under `runtime_phase1/tests/`:
+
+| Boundary | Regression owner | Required result |
+|---|---|---|
+| Exact host generation | `test_host_generation_preservation.py` | Stale controls and old process cleanup preserve a replacement session/process/slot, including the same run ID. |
+| Credential and result recovery | `test_credential_redaction.py`, `test_profile_runtime.py` | Both credential halves stay hidden across four output paths; an unconfirmed process stop cannot manufacture completion; missing diagnostics give a concrete nonblocking warning. |
+| Managed shutdown | `test_host_run_leases.py` | Unknown or failed stop retains the lease; proven absence permits one retry of the accepted run. |
+| Lost conversation authority | `test_stateless_restart_preservation.py` | No bearer persists; exact retry keeps instructions; stateless siblings progress while persistent/control/lease fences hold. |
+| Interrupted retry projection | `test_restart_retry_preservation.py` | Durable Pause and a concurrent active generation survive retry reconciliation. |
+| Rebound session cleanup | `test_conversation_provider_recovery.py` | Deadline and historical-result recovery use the original run's worker; later work remains unchanged. |
+
+These tests include simulated failures, database races and local child processes. They prove their
+listed contracts, not installed native-provider parity, response-time targets or channel delivery.
+For a user-visible completion claim, repeat the affected normal client journey: start independent
+work, send another request, target a correction or Stop, restart at the relevant boundary, and inspect
+visible results and retained files. Record the actual configured route and remaining gaps privately;
+publish only sanitized evidence. Reuse valid unchanged evidence and run only the affected checks.
+
 ## 8. Connected-Account Broker Readiness
 
 1. Confirm Glass Hive does not require direct coupling to LibreChat internals.

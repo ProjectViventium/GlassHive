@@ -73,6 +73,8 @@ def _success_body(**overrides):
         },
         "maxExpiresAt": "2099-01-01T00:00:00+00:00",
     }
+    if "hostStartupLeaseId" in overrides:
+        payload.pop("containerGenerationId")
     payload.update(overrides)
     return payload
 
@@ -442,23 +444,18 @@ class _CapturingHostRuntime(StubRuntime):
         )
 
     def prepare_run_authority_context(self, worker, run_id=None):
-        return {"container_generation_id": BODY["containerGenerationId"]}
+        from workers_projects_runtime.profile_runtime import ProfiledWorkerRuntime
+        return ProfiledWorkerRuntime.prepare_run_authority_context(self, worker, run_id=run_id)
 
     def run_task(self, worker, instruction, timeout_sec=None, run_id=None):
+        super().run_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
         self.run_workers.append(dict(worker))
         return "FINAL REPORT:\nAuthorized result"
 
 
-class _UnavailableBrokerHostRuntime(_CapturingHostRuntime):
-    def prepare_run_authority_context(self, worker, run_id=None):
-        raise BrokerAdmissionError(
-            "broker_admission_unavailable",
-            "The capability broker is temporarily unavailable.",
-            retryable=True,
-        )
 
 
-def _reserve_pending_admission(store: Store):
+def _reserve_pending_admission(store: Store, *, execution_mode: str = "host"):
     bundle = {
         "run_mode": "mission",
         "glasshive_capability_authorization": {
@@ -470,6 +467,8 @@ def _reserve_pending_admission(store: Store):
             "scope_fingerprint": "scope_synthetic_0001",
         },
     }
+    if execution_mode == "docker":
+        bundle["execution_policy"] = "parallel-clean-room-v1"
     return store.reserve_delegation(
         tenant_id="tenant-a",
         owner_id="owner-a",
@@ -486,7 +485,7 @@ def _reserve_pending_admission(store: Store):
         backend="codex-cli",
         runtime="codex-cli",
         model="test",
-        execution_mode="host",
+        execution_mode=execution_mode,
         bootstrap_bundle=bundle,
     )
 
@@ -585,9 +584,7 @@ def test_clean_room_deferred_admission_keeps_exact_run_grant_in_memory_only(
         return httpx.Response(
             200,
             json=_success_body(
-                runId=request["runId"],
-                workRef=request["workRef"],
-                workerId=request["workerId"],
+                **request,
             ),
             headers={"Cache-Control": "no-store"},
         )
@@ -735,6 +732,9 @@ def test_scheduled_fallback_prepares_and_admits_exact_generation_without_delegat
             return {"container_generation_id": SCHEDULED_GENERATION}
 
         def run_task(self, worker, instruction, timeout_sec=None, run_id=None):
+            super().run_task(
+                worker, instruction, timeout_sec=timeout_sec, run_id=run_id
+            )
             bundle = json.loads(worker["bootstrap_bundle_json"])
             self.invocations.append(
                 {
@@ -821,6 +821,18 @@ def test_scheduled_fallback_prepares_and_admits_exact_generation_without_delegat
         assert completed is not None
         assert completed["state"] == "completed"
         assert completed["output_text"] == "SCHEDULED_FALLBACK_COMPLETED"
+        assert completed["runtime_invoked_at"]
+        attempts = store.list_run_attempts(run["run_id"])
+        assert [attempt["state"] for attempt in attempts] == [
+            "retry_queued", "completed"
+        ]
+        assert attempts[0]["runtime_invoked_at"] is None
+        assert attempts[1]["runtime_invoked_at"] == completed["runtime_invoked_at"]
+        started_events = [
+            event for event in store.list_events(worker["worker_id"])
+            if event["event_type"] == "run.started"
+        ]
+        assert len(started_events) == 1
         assert completed["provider_route_decision"] == "fallback_selected"
         assert completed["provider_route_profile"] == "claude-code"
         assert runtime.prepared == [("claude-code", run["run_id"])]
@@ -930,9 +942,7 @@ def test_clean_room_continuation_keeps_server_context_and_admitted_grant_ephemer
         return httpx.Response(
             200,
             json=_success_body(
-                runId=request["runId"],
-                workRef=request["workRef"],
-                workerId=request["workerId"],
+                **request,
             ),
             headers={"Cache-Control": "no-store"},
         )
@@ -956,7 +966,11 @@ def test_clean_room_continuation_keeps_server_context_and_admitted_grant_ephemer
             {"version": 1, "run_id": record["run_id"], "mode": "resume"}
         ),
         "continuation_context_json": json.dumps(
-            {"version": 1, "workspace": "preserved", "instruction": "finish"}
+            {
+                "version": 1,
+                "base_instruction": "preserve workspace",
+                "guidance": ["finish"],
+            }
         ),
     }
 
@@ -978,8 +992,8 @@ def test_clean_room_continuation_keeps_server_context_and_admitted_grant_ephemer
         }
         assert run_bundle["viventium_continuation_context"] == {
             "version": 1,
-            "workspace": "preserved",
-            "instruction": "finish",
+            "base_instruction": "preserve workspace",
+            "guidance": ["finish"],
         }
         persisted = store.get_worker(record["worker_id"])
         persisted_bundle = str(persisted["bootstrap_bundle_json"])
@@ -1030,23 +1044,11 @@ def test_deferred_admission_overlays_grant_only_for_exact_started_run(
         assert "synthetic-run-local-grant" not in content.decode()
         if _url.endswith("/revoke"):
             return httpx.Response(204, headers={"Cache-Control": "no-store"})
-        if _url.endswith("/auth/preflight"):
-            return httpx.Response(
-                200,
-                json={
-                    "status": "authorized",
-                    "provider": "openai",
-                    "workerId": record["worker_id"],
-                    "runId": record["initial_run_id"],
-                },
-                headers={"Cache-Control": "no-store"},
-            )
+        assert "/providers/" not in _url
         return httpx.Response(
             200,
             json=_success_body(
-                runId=captured_request["runId"],
-                workRef=captured_request["workRef"],
-                workerId=captured_request["workerId"],
+                **captured_request,
             ),
             headers={"Cache-Control": "no-store"},
         )
@@ -1056,6 +1058,13 @@ def test_deferred_admission_overlays_grant_only_for_exact_started_run(
     runtime = _CapturingHostRuntime()
     service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
     service._emit_callback = lambda *_args, **_kwargs: None
+    leases = []
+    acquire = service._acquire_host_run_lease
+    def capture_lease(worker, run):
+        lease = acquire(worker, run)
+        leases.append(dict(lease))
+        return lease
+    service._acquire_host_run_lease = capture_lease
     record = _reserve_pending_admission(store)
     before = store.get_worker(record["worker_id"])
     assert "synthetic-run-local-grant" not in str(before["bootstrap_bundle_json"])
@@ -1065,20 +1074,25 @@ def test_deferred_admission_overlays_grant_only_for_exact_started_run(
     finally:
         service.shutdown()
 
+    lease_digest = hashlib.sha256(leases[0]["startup_token"].encode()).hexdigest()
     assert captured_requests[0][1] == {
-        **BODY,
+        **{key: value for key, value in BODY.items() if key != "containerGenerationId"},
+        "hostStartupLeaseId": lease_digest,
         "runId": record["initial_run_id"],
         "workRef": record["work_ref"],
         "workerId": record["worker_id"],
     }
-    assert captured_requests[1][0].endswith("/providers/openai/auth/preflight")
-    assert captured_requests[1][1] == {"version": 1}
-    assert captured_requests[2][0].endswith("/revoke")
-    assert captured_requests[2][1] == {
+    assert len(captured_requests) == 2
+    assert captured_requests[1][0].endswith("/revoke")
+    assert captured_requests[1][1] == {
         **captured_requests[0][1],
         "grantId": "grant_synthetic_0001",
     }
     assert len(runtime.run_workers) == 1
+    assert runtime.run_workers[0]["_run_startup_token_digest"] == lease_digest
+    assert runtime.run_workers[0]["_run_local_capability_binding"]["hostStartupLeaseId"] == lease_digest
+    assert leases[0]["startup_token"] not in str(runtime.run_workers)
+    assert leases[0]["startup_token"] not in str(captured_requests)
     run_bundle = json.loads(runtime.run_workers[0]["bootstrap_bundle_json"])
     assert run_bundle["env"]["GLASSHIVE_CAPABILITY_BROKER_TOKEN"] == (
         "synthetic-run-local-grant"
@@ -1089,6 +1103,16 @@ def test_deferred_admission_overlays_grant_only_for_exact_started_run(
     persisted = store.get_worker(record["worker_id"])
     assert "synthetic-run-local-grant" not in str(persisted["bootstrap_bundle_json"])
     assert store.get_run(record["initial_run_id"])["state"] == "completed"
+    assert store.get_run(record["initial_run_id"])["runtime_invoked_at"]
+    assert [
+        attempt["state"]
+        for attempt in store.list_run_attempts(record["initial_run_id"])
+    ] == ["completed"]
+    started_events = [
+        event for event in store.list_events(record["worker_id"])
+        if event["event_type"] == "run.started"
+    ]
+    assert len(started_events) == 1
     assert store.list_active_host_run_leases() == []
 
 
@@ -1122,9 +1146,7 @@ def test_missing_provider_preflight_blocks_before_runtime_and_closes_exact_attem
         return httpx.Response(
             200,
             json=_success_body(
-                runId=request["runId"],
-                workRef=request["workRef"],
-                workerId=request["workerId"],
+                **request,
             ),
             headers={"Cache-Control": "no-store"},
         )
@@ -1132,9 +1154,12 @@ def test_missing_provider_preflight_blocks_before_runtime_and_closes_exact_attem
     monkeypatch.setattr("workers_projects_runtime.broker_admission.httpx.post", fake_post)
     store = Store(str(tmp_path / "runtime.sqlite3"))
     runtime = _CapturingHostRuntime()
+    # Set the fixture's authority before background queue recovery can claim it.
+    # Provider brokerage is a Docker-only route; native hosts own account auth.
+    record = _reserve_pending_admission(store, execution_mode="docker")
+    runtime.prepare_run_authority_context = lambda worker, run_id=None: {"container_generation_id": "a" * 64}
     service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
     service._emit_callback = lambda *_args, **_kwargs: None
-    record = _reserve_pending_admission(store)
 
     try:
         _run_processor(service, record["worker_id"])
@@ -1194,9 +1219,7 @@ def test_failed_exact_grant_revocation_is_durable_and_recovers_after_restart(
         return httpx.Response(
             200,
             json=_success_body(
-                runId=body["runId"],
-                workRef=body["workRef"],
-                workerId=body["workerId"],
+                **body,
             ),
             headers={"Cache-Control": "no-store"},
         )
@@ -1215,6 +1238,7 @@ def test_failed_exact_grant_revocation_is_durable_and_recovers_after_restart(
 
     pending = store.list_capability_grant_revocations()
     assert len(pending) == 1
+    assert len(pending[0]["host_startup_lease_id"]) == 64
     assert {
         key: pending[0][key]
         for key in (
@@ -1225,6 +1249,7 @@ def test_failed_exact_grant_revocation_is_durable_and_recovers_after_restart(
             "run_id",
             "grant_id",
             "container_generation_id",
+            "host_startup_lease_id",
             "status",
             "attempts",
             "last_error_code",
@@ -1236,7 +1261,8 @@ def test_failed_exact_grant_revocation_is_durable_and_recovers_after_restart(
         "worker_id": record["worker_id"],
         "run_id": record["initial_run_id"],
         "grant_id": "grant_synthetic_0001",
-        "container_generation_id": BODY["containerGenerationId"],
+        "container_generation_id": "",
+        "host_startup_lease_id": pending[0]["host_startup_lease_id"],
         "status": "pending",
         "attempts": 1,
         "last_error_code": "broker_revocation_unavailable",
@@ -1333,7 +1359,12 @@ def test_retryable_admission_failure_requeues_without_failed_event_or_callback(
     monkeypatch.setenv("GLASSHIVE_RETRY_BASE_DELAY_S", "300")
     monkeypatch.setenv("GLASSHIVE_RETRY_MAX_DELAY_S", "300")
     store = Store(str(tmp_path / "runtime.sqlite3"))
-    runtime = _UnavailableBrokerHostRuntime()
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_ADMISSION_URL", "http://127.0.0.1:3180/internal/admission")
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_ADMISSION_SECRET", SECRET)
+    def unavailable(*_args, **_kwargs):
+        raise httpx.ConnectError("synthetic unavailable")
+    monkeypatch.setattr("workers_projects_runtime.broker_admission.httpx.post", unavailable)
+    runtime = _CapturingHostRuntime()
     service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
     callbacks: list[str] = []
     service._emit_callback = (
@@ -1396,3 +1427,150 @@ def test_required_protected_capability_unavailable_needs_input_without_provider_
     assert run["failure_class"] == "required_capability_unavailable"
     assert worker["state"] == "needs_input"
     assert store.list_active_host_run_leases() == []
+
+
+HOST_BODY = {
+    **{key: value for key, value in BODY.items() if key != "containerGenerationId"},
+    "hostStartupLeaseId": "d" * 64,
+}
+
+
+@pytest.mark.parametrize("mutation", ["both", "neither", "malformed", "unknown"])
+def test_host_admission_rejects_ambiguous_or_invalid_generation_before_network(
+    mutation, monkeypatch
+):
+    body = dict(HOST_BODY)
+    if mutation == "both":
+        body["containerGenerationId"] = "a" * 64
+    elif mutation == "neither":
+        body.pop("hostStartupLeaseId")
+    elif mutation == "malformed":
+        body["hostStartupLeaseId"] = "not-a-startup-lease-digest"
+    else:
+        body["executionMode"] = "host"
+    calls = []
+    monkeypatch.setattr(broker_admission_module.httpx, "post", lambda *args, **kwargs: calls.append(args))
+    with pytest.raises(BrokerAdmissionError, match="binding is invalid"):
+        admit_capability_grant(
+            "http://127.0.0.1:3180/api/viventium/glasshive/capabilities/admit",
+            secret=SECRET,
+            body=body,
+            expected_scope_fingerprint="scope_synthetic_0001",
+        )
+    with pytest.raises(BrokerAdmissionError, match="binding is invalid"):
+        revoke_capability_grant(
+            "http://127.0.0.1:3180/api/viventium/glasshive/capabilities/admit",
+            secret=SECRET,
+            body={**body, "grantId": "grant_synthetic_0001"},
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("mutation", ["none", "other_lease", "container", "both"])
+def test_host_admission_requires_exact_generation_response(mutation, monkeypatch):
+    payload = _success_body(**HOST_BODY)
+    if mutation == "other_lease":
+        payload["hostStartupLeaseId"] = "e" * 64
+    elif mutation == "container":
+        payload.pop("hostStartupLeaseId")
+        payload["containerGenerationId"] = "d" * 64
+    elif mutation == "both":
+        payload["containerGenerationId"] = "d" * 64
+    calls = []
+    def post(url, *, content, headers, timeout):
+        calls.append((json.loads(content), headers))
+        return httpx.Response(200, json=payload, headers={"Cache-Control": "no-store"})
+    monkeypatch.setattr(broker_admission_module.httpx, "post", post)
+    if mutation == "none":
+        grant = admit_capability_grant(
+            "http://127.0.0.1:3180/api/viventium/glasshive/capabilities/admit",
+            secret=SECRET, body=HOST_BODY,
+            expected_scope_fingerprint="scope_synthetic_0001",
+        )
+        assert grant.host_startup_lease_id == "d" * 64
+        assert grant.container_generation_id == ""
+        assert calls[0][0] == HOST_BODY
+        header = calls[0][1]["X-Viventium-GlassHive-Admission"]
+        _, timestamp, nonce, digest = header.split(":")
+        canonical = json.dumps(HOST_BODY, sort_keys=True, separators=(",", ":"))
+        material = f"v1\n{timestamp}\n{nonce}\n{canonical}"
+        expected = base64.urlsafe_b64encode(hmac.new(SECRET.encode(), material.encode(), hashlib.sha256).digest()).decode().rstrip("=")
+        assert digest == expected
+    else:
+        with pytest.raises(BrokerAdmissionError, match="response is invalid"):
+            admit_capability_grant(
+                "http://127.0.0.1:3180/api/viventium/glasshive/capabilities/admit",
+                secret=SECRET, body=HOST_BODY,
+                expected_scope_fingerprint="scope_synthetic_0001",
+            )
+
+
+@pytest.mark.parametrize("mutation", ["none", "stale_lease", "missing_lease", "other_run", "other_worker", "container", "both"])
+def test_native_host_checks_exact_admitted_lease_before_secret_materialization(mutation):
+    from workers_projects_runtime.profile_runtime import HostNativeCliMixin
+    from workers_projects_runtime.openclaw_runtime import RuntimeErrorBase
+    class ReachedMaterialization(Exception):
+        pass
+    class Runtime(HostNativeCliMixin):
+        def _conversation_mode_from_worker(self, worker):
+            return False
+        def ensure_worker_ready(self, worker):
+            raise ReachedMaterialization()
+    worker = {
+        "worker_id": BODY["workerId"],
+        "_run_startup_token_digest": "d" * 64,
+        "_run_local_capability_binding": dict(HOST_BODY),
+    }
+    binding = worker["_run_local_capability_binding"]
+    if mutation == "stale_lease":
+        worker["_run_startup_token_digest"] = "e" * 64
+    elif mutation == "missing_lease":
+        worker.pop("_run_startup_token_digest")
+    elif mutation == "other_run":
+        binding["runId"] = "run_other_synthetic"
+    elif mutation == "other_worker":
+        binding["workerId"] = "wrk_other_synthetic"
+    elif mutation == "container":
+        binding.pop("hostStartupLeaseId")
+        binding["containerGenerationId"] = "d" * 64
+    elif mutation == "both":
+        binding["containerGenerationId"] = "d" * 64
+    expected = ReachedMaterialization if mutation == "none" else RuntimeErrorBase
+    with pytest.raises(expected):
+        Runtime().run_task(worker, "Use approved capabilities.", run_id=BODY["runId"])
+
+
+@pytest.mark.parametrize("mode,context", [
+    ("host", {"container_generation_id": "a" * 64}),
+    ("docker", {"host_startup_lease_id": "d" * 64}),
+    ("host", {"container_generation_id": "a" * 64, "host_startup_lease_id": "d" * 64}),
+])
+def test_service_does_not_exchange_generation_kinds(tmp_path, monkeypatch, mode, context):
+    store = Store(str(tmp_path / "runtime.sqlite3"))
+    record = _reserve_pending_admission(store)
+    worker = {**store.get_worker(record["worker_id"]), "execution_mode": mode}
+    service = WorkersProjectsService(store, _CapturingHostRuntime(), reconcile_on_startup=False)
+    calls = []
+    monkeypatch.setattr(broker_admission_module.httpx, "post", lambda *args, **kwargs: calls.append(args))
+    try:
+        with pytest.raises(BrokerAdmissionError) as error:
+            service._run_local_admitted_worker(worker, store.get_run(record["run_id"]), authority_context=context)
+        assert error.value.code == "broker_admission_generation_unavailable"
+        assert calls == []
+    finally:
+        service.shutdown()
+
+
+def test_existing_docker_revocation_schema_migrates_without_changing_binding(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "runtime.sqlite3")
+    store = Store(path)
+    record = _reserve_pending_admission(store)
+    binding = {**BODY, "runId": record["run_id"], "workerId": record["worker_id"], "grantId": "grant_synthetic_0001"}
+    original = store.enqueue_capability_grant_revocation(binding)
+    with sqlite3.connect(path) as connection:
+        connection.execute("ALTER TABLE capability_grant_revocations DROP COLUMN host_startup_lease_id")
+    migrated = Store(path)
+    restored = migrated.list_capability_grant_revocations()[0]
+    assert restored == {**{key: value for key, value in original.items() if key != "host_startup_lease_id"}, "host_startup_lease_id": ""}
+    assert migrated.enqueue_capability_grant_revocation(binding)["revocation_id"] == original["revocation_id"]

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -142,6 +143,8 @@ VIVENTIUM_FEELING_STATE_END = "</viventium_feeling_state>"
 DEFAULT_BOOTSTRAP_SOURCE_MAX_BYTES = 25 * 1024 * 1024
 BOOTSTRAP_SOURCE_TOKEN_KEY = "source_path_token"
 GLASSHIVE_CAPABILITY_BROKER_TOKEN_ENV = "GLASSHIVE_CAPABILITY_BROKER_TOKEN"
+GLASSHIVE_PROVIDER_SESSION_MODE_ENV = "GLASSHIVE_PROVIDER_SESSION_MODE"
+GLASSHIVE_PROVIDER_SESSION_EPOCH_ENV = "GLASSHIVE_PROVIDER_SESSION_EPOCH"
 PARALLEL_CLEAN_ROOM_EXECUTION_POLICY = "parallel-clean-room-v1"
 
 PARALLEL_CLEAN_ROOM_BROKER_NAME = "glasshive-user-capabilities"
@@ -197,20 +200,45 @@ GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS = f"""CRITICAL OPERATING INSTRUCTIONS 
 If a server is only for QA or preview, use a bounded run or explicit cleanup; never leave a foreground server blocking final delivery or wasting compute.
 
 4. NO USER INTERVENTION: Deliver a COMPLETE, WORKING solution."""
-GLASSHIVE_SAFETY_CHECKPOINT_RULE = (
-    "Safety boundary: these operating instructions do not override platform policy, tenant/user "
-    "scope, auth boundaries, or destructive-action checkpoints. Before destructive host changes, "
-    "credential/keychain/browser-session changes, broad network exfiltration, or writes outside the "
-    "workspace, stop and request a clear checkpoint unless the project definition explicitly and "
-    "safely authorizes that action. Do not loop forever or spend indefinitely: when a blocker cannot "
-    "be resolved with the available runtime, tools, MCPs, files, auth, time, or budget, report the "
-    "concrete blocker and the best available partial result after `FINAL REPORT:`."
-)
-GLASSHIVE_WORKER_COMPLETION_CONTRACT = (
+def _load_viventium_worker_prompts() -> dict[str, Any] | None:
+    # A standalone GlassHive install retains its own compatibility contract. A managed
+    # Viventium install requires its compiled registry, including when the path is missing.
+    if not (os.environ.get("VIVENTIUM_PROMPT_BUNDLE_PATH") or os.environ.get("VIVENTIUM_INSTALL_MODE")):
+        return None
+    shared = next((parent / "shared" for parent in Path(__file__).resolve().parents
+                   if (parent / "shared/compiled_prompt_contract.py").is_file()), None)
+    if shared is None:
+        raise RuntimeError("Viventium worker prompt runtime is missing; rebuild this installation")
+    if str(shared) not in sys.path:
+        sys.path.insert(0, str(shared))
+    from compiled_prompt_contract import load_compiled_prompts
+    return load_compiled_prompts()
+
+
+_VIVENTIUM_WORKER_PROMPTS = _load_viventium_worker_prompts()
+
+
+def _worker_prompt(
+    prompt_id: str, standalone: str, *, variables: dict[str, str] | None = None
+) -> str:
+    if _VIVENTIUM_WORKER_PROMPTS is None:
+        return standalone
+    from compiled_prompt_contract import render_compiled_prompt
+    text = render_compiled_prompt(prompt_id, prompts=_VIVENTIUM_WORKER_PROMPTS, variables=variables)
+    return text + ("\n" if standalone.endswith("\n") else "")
+
+
+GLASSHIVE_SAFETY_CHECKPOINT_RULE = _worker_prompt("worker.safety_checkpoint", "Safety boundary: these operating instructions never override platform policy, tenant/user scope, authentication, or OS security controls. Determine task scope from the user's current request and applicable prior authorization, preserving the project definition's constraints. Do not ask again for an action already authorized. Full-access tools and a project file do not grant new authority. Ordinary reversible local file or app work within the task may use authorized locations outside the default workspace. Before destructive changes, external publication or purchases, privileged or persistent system changes, credential/session changes, unrelated process termination, or sharing private data, request a clear checkpoint if that action is not already authorized. Use existing signed-in sessions through supported app flows; do not extract authentication material or bypass a permission denial, quarantine, or required OS consent. Do not loop forever or spend indefinitely: when a blocker cannot be resolved with the available runtime, tools, MCPs, files, auth, time, or budget, report the concrete blocker and the best available partial result after `FINAL REPORT:`.")
+
+
+# These text literals are standalone GlassHive compatibility defaults. Managed
+# Viventium uses only its registered worker.* sources, with no inline fallback.
+# Source parity tests bind the initial compatibility text to those registered bodies.
+GLASSHIVE_WORKER_COMPLETION_CONTRACT = _worker_prompt("worker.completion_contract", (
     "GlassHive completion contract:\n"
     "- Do the requested work before reporting completion.\n"
     "- Before `FINAL REPORT:`, inspect the concrete output/artifacts/tool results/visible state you produced against the user's request, success criteria, constraints, and files. Correct a detected mismatch. Report a concrete blocker only when you cannot complete it.\n"
-    "- For research/source-gathering work, preserve citations and evidence, respect the user's source/date/auth/scope constraints, and do not dump large raw webpages, docs, logs, or command outputs into the conversation context. If a source/date/auth/scope constraint excludes an item, do not use that item to support facts, scoring, or deliverables; record it only as rejected or out-of-scope evidence when useful. Keep source publication/evidence dates distinct from retrieval/access timestamps; an access date must not widen or replace a user-limited source window. If `glasshive-run/constraint-ledger.json` exists, read it before planning, delegation, source collection, and final delivery. If you create research plans, specs, subagent prompts, or delegation notes, carry the user's constraints forward literally and exactly instead of widening, weakening, summarizing away, or rewriting them. If a plan/spec/delegation conflicts with the ledger, correct that file before continuing. Save working notes/excerpts to files when useful and bring back concise source-grounded summaries so the task can continue without overflowing or destabilizing the provider route.\n"
+    "- For research/source-gathering work, preserve citations and evidence, respect the user's source/date/auth/scope constraints, and do not dump large raw webpages, docs, logs, or command outputs into the conversation context. If a source/date/auth/scope constraint excludes an item, do not use that item to support facts, scoring, or deliverables; record it only as rejected or out-of-scope evidence when useful. Keep source publication/evidence dates distinct from retrieval/access timestamps; an access date must not widen or replace a user-limited source window. If `glasshive-run/constraint-ledger.json` exists, its original request and typed continuation authority preserve the admitted input; interpret that input yourself. If you create research plans, specs, subagent prompts, or delegation notes, carry the user's constraints forward literally and exactly instead of widening, weakening, summarizing away, or rewriting them. If a plan/spec/delegation conflicts with the admitted user request or typed authority, correct that file before continuing. Save working notes/excerpts to files when useful and bring back concise source-grounded summaries so the task can continue without overflowing or destabilizing the provider route.\n"
     "- For long-running work, keep durable checkpoints in workspace files and prioritize a usable core result before optional expansion. If time, tool, auth, or dependency limits prevent the full requested deliverable, stop with an honest partial artifact/report and the exact blocker instead of spending the entire run on private notes.\n"
     "- When the request calls for a report, document, deck, client deliverable, or other shareable work product and the user did not ask for a technical/source format, make the primary user-facing output a polished ordinary end-user artifact such as PDF, DOCX, PPTX, spreadsheet, or another appropriate professional format. Markdown, HTML, or source files may be included as supporting artifacts, but should not be the only default deliverable for that class of work unless the runtime cannot create a professional artifact; if blocked, say so concretely.\n"
     "- For visual/shareable artifacts such as PDFs, slide decks, screenshots, or HTML reports, open or render the final artifact itself and verify that key text, tables, images, and pages are readable, not clipped, and not overlapped. Correct a detected layout defect or state the specific remaining limitation before `FINAL REPORT:`.\n"
@@ -218,8 +246,8 @@ GLASSHIVE_WORKER_COMPLETION_CONTRACT = (
     "- Put only the user-facing result after `FINAL REPORT:`. Include the concrete outcome, key facts, artifact/file names when useful, blockers, or the next decision needed.\n"
     "- If the user requested a very short answer or an exact string, put only that answer after `FINAL REPORT:`.\n"
     "- Do not put progress narration after `FINAL REPORT:`."
-)
-GLASSHIVE_NATIVE_CAPABILITY_INVENTORY = """Native capability discovery (choose when relevant, never forced):
+))
+GLASSHIVE_NATIVE_CAPABILITY_INVENTORY = _worker_prompt("worker.native_capability_inventory", """Native capability discovery (choose when relevant, never forced):
 
 - You may have worker-native CLI, browser/computer-use, MCP, plugin, and skill surfaces. Inspect what is actually available before saying a capability is unavailable, and do not claim to have used a capability unless you have evidence.
 - In GlassHive workstation workspaces, a visible desktop/browser substrate may already be running. When browser or computer use is relevant, verify the live browser, noVNC desktop, local Chromium, `wmctrl`/`xdotool`, and WebDriver/Selenium endpoint before choosing a headless or offscreen path. Use the visible workstation surface when it improves user observability or task reliability.
@@ -227,7 +255,7 @@ GLASSHIVE_NATIVE_CAPABILITY_INVENTORY = """Native capability discovery (choose w
 - For deep research and document-generation work, use available research, browser, spreadsheet, PDF, document, deck, notebook, rendering, or verification tools when they materially improve the result. Prefer loading or invoking capabilities on demand instead of assuming a fixed skill catalog.
 - Before writing scripts that import non-stdlib packages or call optional CLIs, verify the package/tool is available in this worker environment; otherwise use an available alternative or report the concrete dependency blocker.
 - Do not overfit to examples, force a specific provider/tool/workflow, invent installed skills, or replace the worker's own planning and review with host-authored workflows.
-"""
+""")
 GLASSHIVE_WORKER_PROJECT_CONTRACT = f"""# GlassHive Worker Contract
 
 - You are a general intelligent worker. Less is more: preserve the user's real goal, constraints, files, MCP/tool capabilities, and context without inventing project goals, success criteria, provider lists, forced artifacts, output schemas, rankings, or workflow steps.
@@ -245,6 +273,8 @@ GLASSHIVE_WORKER_PROJECT_CONTRACT = f"""# GlassHive Worker Contract
 """
 DEFAULT_ENTERPRISE_WORKER_ENV_KEYS = {
     GLASSHIVE_CAPABILITY_BROKER_TOKEN_ENV,
+    GLASSHIVE_PROVIDER_SESSION_MODE_ENV,
+    GLASSHIVE_PROVIDER_SESSION_EPOCH_ENV,
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_API_BASE",
@@ -408,6 +438,40 @@ def _split_viventium_feeling_capsules(value: Any) -> tuple[str, list[str]]:
         part.strip() for part in clean_parts if part.strip()
     ), capsules
 
+
+def _is_exact_conversation_feeling_mirror(
+    bundle: JsonDict, capsules: list[str]
+) -> bool:
+    """Accept only the three non-projected mirrors produced for a native conversation."""
+
+    if bundle.get("run_mode") != "conversation":
+        return False
+    field_capsules: dict[str, list[str]] = {}
+    field_clean: dict[str, str] = {}
+    for field in (
+        "application_developer_instructions",
+        "developer_instructions",
+        "declared_developer_instruction_tail",
+    ):
+        clean, found = _split_viventium_feeling_capsules(bundle.get(field))
+        field_clean[field] = clean
+        field_capsules[field] = found
+    if sum(len(found) for found in field_capsules.values()) != len(capsules):
+        return False
+    tail_capsules = field_capsules["declared_developer_instruction_tail"]
+    if (
+        len(tail_capsules) != 1
+        or field_clean["declared_developer_instruction_tail"]
+        or any(len(field_capsules[field]) != 1 for field in field_capsules)
+    ):
+        return False
+    capsule = tail_capsules[0]
+    return (
+        all(found == [capsule] for found in field_capsules.values())
+        and _instruction_text(bundle.get("developer_instructions")).endswith(capsule)
+    )
+
+
 @worker_prompt_layer_producer("viventium_feeling_state")
 def canonicalize_viventium_feeling_projection(bundle: JsonDict) -> JsonDict:
     """Materialize one eligible capsule in AGENTS.md, or zero when scope is off."""
@@ -429,11 +493,14 @@ def canonicalize_viventium_feeling_projection(bundle: JsonDict) -> JsonDict:
 
     projection = canonical.get("viventium_feelings_projection")
     if not isinstance(projection, dict):
-        if len(capsules) > 1:
+        if len(capsules) > 1 and not _is_exact_conversation_feeling_mirror(
+            bundle, capsules
+        ):
             raise ValueError("Conflicting Viventium Feeling state instruction blocks")
         # Legacy native conversation authority has no projection envelope. It
-        # may retain one structurally valid capsule in its original declared
-        # field; duplication is still rejected.
+        # may retain one structurally valid capsule, or the exact three-field
+        # storage mirror used to reconstruct its sole projected developer
+        # instruction. Any extra or conflicting capsule remains rejected.
         return dict(bundle)
     expected_fields = {
         "version",

@@ -100,6 +100,14 @@ Current behavior:
 - broker/client config is additive over native worker capability: Codex/Claude host and workstation
   launches must not drop browser, computer/desktop, shell, file, or MCP capabilities just because
   GlassHive projected a broker MCP
+- host Codex projection includes the installed, enabled unified browser/computer MCP alongside
+  supported legacy native tools. Native stdio tool processes retain the signed-in OS owner’s
+  home for existing app services, unless that server explicitly sets another home. Worker
+  conversation state and configuration remain isolated; this does not grant OS permissions.
+  Acceptance requires an actual tool invocation from that worker.
+  Cached but disabled plugins and explicit server disables stay
+  disabled; the host plugin denylist remains enforced. Native startup, environment and nested tool
+  settings are preserved without adding a second browser or computer-control runtime.
 
 ## Claude Code on Amazon Bedrock
 
@@ -140,6 +148,9 @@ callable by LibreChat or any ordinary Chat Completions client:
   their existing response and streaming behavior.
 - `/v1/requests/{request_id}/activity` and `/cancel` add resumable activity and explicit lifecycle
   control without making those extensions prerequisites for a standard client
+- Cancelling a provider turn that awaits input settles only that turn after its compute is released.
+  Repeating cancellation finishes an interrupted request-to-run handoff and preserves later turns.
+  Cancellation follows the saved run's worker when recovery has rebound the conversation session.
 - provider, MCP, capability-broker, and runtime administrator credentials are separate
 - streamable-HTTP MCP requires its configured MCP service credential in local and enterprise
   deployments; stdio remains process-local and does not add an HTTP authentication layer

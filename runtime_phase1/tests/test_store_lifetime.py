@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from workers_projects_runtime.api import create_app
 from workers_projects_runtime.openclaw_runtime import StubRuntime
+from workers_projects_runtime.service import WorkersProjectsService
 from workers_projects_runtime.store import Store
 
 
@@ -131,6 +132,83 @@ def test_short_lived_store_finalizer_closes_forgotten_keeper(tmp_path: Path) -> 
 
     assert store_reference() is None
     _assert_connection_closed(keeper)
+
+
+def test_api_accepts_health_while_owned_worker_recovery_is_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GLASSHIVE_BACKGROUND_CONSUMERS_ENABLED", "true")
+    entered = Event()
+    release = Event()
+    ready = Event()
+    calls: list[str] = []
+    errors: list[BaseException] = []
+
+    def reconcile(_service) -> None:
+        calls.append("workers")
+        entered.set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(WorkersProjectsService, "reconcile_all_workers", reconcile)
+    monkeypatch.setattr(
+        WorkersProjectsService,
+        "reconcile_host_run_leases",
+        lambda _service: calls.append("leases"),
+    )
+    app = create_app(
+        str(tmp_path / "runtime.db"),
+        runtime_backend="stub",
+        runtime=StubRuntime(),
+        reconcile_on_startup=True,
+    )
+
+    def serve() -> None:
+        try:
+            with TestClient(app) as client:
+                assert client.get("/health").status_code == 200
+                ready.set()
+                release.wait(timeout=5)
+        except BaseException as exc:
+            errors.append(exc)
+
+    owner = Thread(target=serve)
+    owner.start()
+    try:
+        assert entered.wait(timeout=2)
+        assert ready.wait(timeout=1), "retained worker recovery blocked API startup"
+        assert calls == ["leases", "workers"]
+    finally:
+        release.set()
+        owner.join(timeout=5)
+    assert not owner.is_alive()
+    assert not errors
+    assert not app.state.service._startup_recovery_thread.is_alive()
+
+
+def test_worker_reconciliation_stops_between_rows_on_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GLASSHIVE_BACKGROUND_CONSUMERS_ENABLED", "false")
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), reconcile_on_startup=False)
+    seen: list[str] = []
+    monkeypatch.setattr(store, "reconcile_invalid_running_runs", lambda: None)
+    monkeypatch.setattr(service, "reconcile_terminal_artifact_observations", lambda: None)
+    monkeypatch.setattr(store, "list_all_workers", lambda: [{"worker_id": "first"}, {"worker_id": "next"}])
+
+    def reconcile(worker) -> None:
+        seen.append(worker["worker_id"])
+        service._shutdown_event.set()
+
+    monkeypatch.setattr(service, "_reconcile_worker_row", reconcile)
+    try:
+        service.reconcile_all_workers()
+        assert seen == ["first"]
+    finally:
+        service.shutdown()
+        store.close()
 
 
 def test_store_keeper_survives_concurrent_event_poll_reads_and_writes(tmp_path: Path) -> None:

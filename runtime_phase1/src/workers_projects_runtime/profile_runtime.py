@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .secret_redaction import CREDENTIAL_REDACTIONS, RedactionRule
+from . import native_input
+
 import json
 import base64
 import hashlib
@@ -10,9 +13,11 @@ import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
+import uuid
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 compatibility
@@ -23,12 +28,15 @@ from threading import Event, Lock, Thread
 from typing import Callable
 
 from .agent_builder_control import conversation_output_schema
-from .auth import multi_user_security_enabled
+from .auth import multi_user_security_enabled, native_installed_owner_id, require_native_installed_owner
 from .bootstrap import (
     GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
     GLASSHIVE_NATIVE_CAPABILITY_INVENTORY,
+    GLASSHIVE_PROVIDER_SESSION_MODE_ENV,
+    GLASSHIVE_PROVIDER_SESSION_EPOCH_ENV,
     GLASSHIVE_SAFETY_CHECKPOINT_RULE,
     GLASSHIVE_WORKER_COMPLETION_CONTRACT,
+    _worker_prompt,
     bootstrap_env_for,
     claude_project_mcp_payload_for_bundle,
     glasshive_project_claude_md,
@@ -39,6 +47,10 @@ from .bootstrap import (
     resolve_bootstrap_source_path,
 )
 from .docker_sandbox import DockerSandboxManager
+from .deliverables import (
+    capture_native_media, _native_media_snapshot, NATIVE_IMAGE_SUFFIXES,
+    NATIVE_MEDIA_MAX_ITEMS, NATIVE_MEDIA_MAX_BYTES, NATIVE_MEDIA_MAX_TOTAL_BYTES,
+)
 from .failure_classification import (
     FailureClassification,
     classify_cli_failure,
@@ -64,17 +76,19 @@ from .openclaw_runtime import (
     RuntimeErrorBase,
     RuntimeDependencyMissingError,
     RuntimeInfo,
+    WorkerDetachedError,
     WorkerInterruptedError,
     WorkerPausedError,
     WorkerRuntime,
     WorkerTerminatedError,
     _PROVIDER_ENV_KEYS,
     notify_runtime_started,
+    notify_runtime_info,
     runtime_start_boundary,
 )
 from .openclaw_release import reviewed_openclaw_env
 from .provider_accounts import ProviderAccountHomeManager
-from .runtime_requirements import host_runtime_requirement_issue
+from .runtime_requirements import CLAUDE_CODE_EFFORT_LEVELS, host_runtime_requirement_issue
 from .run_evidence import (
     build_constraint_ledger,
     build_run_evidence,
@@ -97,7 +111,7 @@ import tempfile
 
 from contextlib import contextmanager
 
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from .agent_builder_control import graph_transfer_output_schema
 
@@ -136,6 +150,7 @@ from .openclaw_runtime import (
     RuntimeDependencyMissingError,
     RuntimeInfo,
     RunStartupRejectedError,
+    WorkerDetachedError,
     WorkerInterruptedError,
     WorkerPausedError,
     WorkerRuntime,
@@ -153,6 +168,9 @@ from .run_evidence import (
 
 
 logger = logging.getLogger(__name__)
+
+_ACTIVE_SESSION_EXPECTATION_UNSET = object()
+_HOST_SLOT_EXPECTATION_UNSET = object()
 
 def _declared_long_mission(worker: dict) -> bool:
     try:
@@ -591,7 +609,7 @@ finally:
 '''
 
 _CODEX_MCP_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
-_HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl")
+_HOST_CODEX_NATIVE_MCP_ALLOWLIST = ("computer-use", "node_repl", "cua_repl")
 _CODEX_STALE_THREAD_ERROR = "thread/resume failed: no rollout found for thread id"
 _CLAUDE_STALE_SESSION_ERROR = "No conversation found with session ID:"
 _PERSONAL_ACCOUNT_RECONNECT_MARKER = "_glasshive_personal_account_reconnect_required"
@@ -605,6 +623,20 @@ _CODEX_NATIVE_WEB_LOCKDOWN_FEATURES = (
     "plugins",
     "remote_plugin",
 )
+_CODEX_RESTRICTED_NATIVE_FEATURES = (
+    *_CODEX_NATIVE_WEB_LOCKDOWN_FEATURES,
+    "shell_tool",
+    "multi_agent",
+    "image_generation",
+    "view_image",
+    "hooks",
+)
+
+
+def _native_tools_disabled(bundle: dict[str, object]) -> bool:
+    capabilities = bundle.get("provider_capabilities")
+    return isinstance(capabilities, dict) and capabilities.get("native_tools") is False
+
 
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off", "none", "disabled"}
 _CODEX_BROKER_CONFLICTING_ENV = {
@@ -818,7 +850,6 @@ def _claude_effort_help_supports(help_text: str, effort: str) -> bool:
     if effort != "xhigh":
         return True
     return re.search(r"\bxhigh\b", help_text[marker : marker + 320], flags=re.IGNORECASE) is not None
-_CLAUDE_AUTH_REFRESH_LOCK = Lock()
 
 
 _CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
@@ -899,13 +930,37 @@ def _claude_cli_managed_auth_available(
         return False
     return isinstance(payload, dict) and payload.get("loggedIn") is True
 
+def _native_cli_status_env() -> dict[str, str]:
+    """A status probe needs the CLI owner selectors, never service credentials."""
+    names = {"HOME", "CODEX_HOME", "PATH", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"}
+    return {name: value for name, value in os.environ.items() if name in names}
+
+
+def _native_cli_managed_auth_env(env: dict[str, str]) -> dict[str, str]:
+    """Select the installed CLI's auth owner without reading its credentials."""
+    result = dict(env)
+    home = Path(str(os.environ.get("HOME") or ""))
+    if not home.is_absolute() or home.is_symlink() or not home.is_dir():
+        raise RuntimeErrorBase("Installed native login home is unavailable")
+    result["HOME"] = str(home)
+    # Native credential storage is independent of the worker session directory.
+    # Empty selects the default owner keychain/file store without copying credentials.
+    result["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = ""
+    for name in (
+        "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+        "CLAUDE_CODE_OAUTH_SCOPES", "ANTHROPIC_API_KEY",
+    ):
+        result.pop(name, None)
+    return result
+
+
 def _claude_owner_managed_auth_env() -> dict[str, str]:
     """Return the trusted parent environment used only to verify owner-managed auth."""
     env = dict(os.environ)
     env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
     env.pop("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", None)
-    # CLAUDE_CONFIG_DIR is a complete auth boundary in Claude Code. The owner's
-    # normal login is resolved only from the default owner HOME location.
+    # This owner-only status probe uses the default owner configuration.
+    # Worker launches select credential and session storage independently below.
     env.pop("CLAUDE_CONFIG_DIR", None)
     return env
 
@@ -915,6 +970,11 @@ def _claude_host_auth_available(
     child_env: dict[str, str] | None = None,
     subprocess_runner=None,
 ) -> bool:
+    if native_installed_owner_id() is not None:
+        return _claude_cli_managed_auth_available(
+            binary, child_env=_native_cli_managed_auth_env(child_env or _native_cli_status_env()),
+            subprocess_runner=subprocess_runner,
+        )
     if child_env and _usable_claude_oauth_token(child_env.get("CLAUDE_CODE_OAUTH_TOKEN")):
         return True
     if _usable_explicit_claude_oauth_token():
@@ -1184,27 +1244,11 @@ def _toml_table_name(name: str) -> str:
 def _render_codex_mcp_server_from_json(name: str, config: object, manifest_dir: Path) -> str:
     if not isinstance(config, dict):
         return ""
-    root_lines = [f"[mcp_servers.{_toml_table_name(name)}]"]
-    nested: list[tuple[str, dict[str, object]]] = []
-    for key, value in config.items():
-        key_text = str(key).strip()
-        if not key_text:
-            continue
-        if isinstance(value, dict):
-            nested.append((key_text, value))
-            continue
-        rendered = _toml_value(value, manifest_dir=manifest_dir, key=key_text)
-        if rendered is not None:
-            root_lines.append(f"{_toml_table_name(key_text)} = {rendered}")
-    for nested_key, nested_values in nested:
-        nested_lines = [f"[mcp_servers.{_toml_table_name(name)}.{_toml_table_name(nested_key)}]"]
-        for key, value in nested_values.items():
-            rendered = _toml_value(value)
-            if rendered is not None:
-                nested_lines.append(f"{_toml_table_name(str(key))} = {rendered}")
-        if len(nested_lines) > 1:
-            root_lines.extend(["", *nested_lines])
-    return "\n".join(root_lines).strip()
+    # Reuse the native TOML serializer so nested tool settings survive projection too.
+    projected = dict(config)
+    if projected.get("cwd") == ".":
+        projected["cwd"] = str(manifest_dir)
+    return "\n\n".join(_render_toml_table(["mcp_servers", name], projected)).strip()
 
 
 def _render_toml_document(data: dict[str, object]) -> str:
@@ -1270,6 +1314,15 @@ def _host_codex_conversation_project_instructions() -> str:
             "Host Codex conversation project instructions must be inherit or exclude"
         )
     return mode
+
+
+def _host_claude_conversation_auto_memory() -> bool | None:
+    configured = os.environ.get("WPR_CLAUDE_CODE_CONVERSATION_AUTO_MEMORY", "").strip().lower()
+    if not configured:
+        return None
+    if configured not in {"true", "false"}:
+        raise RuntimeErrorBase("Host Claude conversation auto-memory must be true or false")
+    return configured == "true"
 
 
 def _host_native_web_access() -> str:
@@ -1444,7 +1497,7 @@ def _sanitize_codex_source_config(config_text: str, preserve_names: set[str], ap
 # instruction wrapper. The constants live here so future edits do not require spelunking through the
 # host runtime implementation.
 _COMPLETION_CONTRACT = GLASSHIVE_WORKER_COMPLETION_CONTRACT
-HOST_NATIVE_HARNESS_PROMPT = f"""# GlassHive Host-Native Harness
+HOST_NATIVE_HARNESS_PROMPT = _worker_prompt("worker.host_native_harness", f"""# GlassHive Host-Native Harness
 
 You are running directly on the user's main computer, not inside a sandbox.
 You may use the local browser, filesystem, shell, and installed OS tools.
@@ -1455,16 +1508,15 @@ Default execution is no-approval/full-access for this worker class.
 Operational requirements:
 - Treat the workspace directory as the primary project root.
 - Keep `work-log.md` current with concise progress, blockers, and completion notes.
-- Write files for the task inside the workspace unless the project definition explicitly requires another path.
-- Before destructive host changes, stop and emit a clear checkpoint request instead of guessing.
-- Destructive host changes include writes outside the workspace, git push, global installs, launch agents, cron, SSH/keychain/browser credentials, killing unrelated processes, and broad network exfiltration.
+- Write task files inside the workspace by default; use another location when the user's request or applicable prior authorization calls for it. The workspace is a working location, not an additional permission boundary.
+- Apply the safety boundary below to the action's effects and existing authorization. A path outside the workspace does not by itself make an action destructive.
 - Do not print credentials, tokens, cookies, personal data, or private local paths unless absolutely required for the local operator.
-- When invoking local `.sh` helper scripts from mounted or downloaded tool folders, run them through `bash /path/to/script.sh ...` so macOS quarantine/provenance metadata cannot block direct execution.
-- For screen evidence on macOS, prefer the workspace helper `glasshive-host-tools/capture-front-window.sh` and invoke it with `bash`.
+- Respect OS permissions and quarantine. If a helper is blocked, report the required supported approval or setup; do not invoke it through another interpreter or remove security metadata to evade that denial.
+- For screen evidence on macOS, the workspace helper `glasshive-host-tools/capture-front-window.sh` is available when authorized and supported.
 - For web research or document-generation tasks, prefer `python3 glasshive-host-tools/content-hygiene.py readable <html-file>` before putting page text into structured files, and run `python3 glasshive-host-tools/content-hygiene.py check <csv-or-json-file>...` before final delivery when the output contains sourced research fields.
 - If you create research plans, specs, subagent prompts, or delegation notes, carry the user's source/date/auth/scope constraints forward exactly instead of widening, weakening, or rewriting them.
 - Keep source publication/evidence dates distinct from retrieval/access timestamps; an access date must not widen or replace a user-limited source window.
-- When `glasshive-run/constraint-ledger.json` exists, treat it as the canonical constraint reminder for this run and compare plans, delegated prompts, artifacts, and the final report against it before final delivery.
+- When `glasshive-run/constraint-ledger.json` exists, use its original admitted request, continuation context, and typed authority as input. Interpret the user’s goals and constraints yourself; the runtime does not extract semantic requirements from prose.
 - `glasshive-run/` is internal harness evidence, not a user-facing artifact directory.
 - For host browser or desktop tasks, first use the user's existing local app/session when the task asks for the main computer, Chrome, browser profile, local files, or installed OS tools. Do not claim host control is unavailable until you have checked the available local shell/desktop/browser automation paths.
 
@@ -1482,7 +1534,12 @@ Required context files in this workspace:
 - agents.md (compatibility mirror)
 - CLAUDE.md / claude.md (Claude Code compatibility; should import or mirror AGENTS.md when possible)
 - CODEX.md / codex.md (legacy compatibility mirror only)
-"""
+""", variables={
+    "critical_operating_instructions": GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
+    "native_capability_inventory": GLASSHIVE_NATIVE_CAPABILITY_INVENTORY,
+    "completion_contract": GLASSHIVE_WORKER_COMPLETION_CONTRACT,
+    "safety_checkpoint": GLASSHIVE_SAFETY_CHECKPOINT_RULE,
+})
 HOST_DEFAULT_AGENTS_MD = (
     "Follow these AGENTS.md project instructions and keep `work-log.md` updated.\n"
     "When the task involves the host browser, desktop, files, shell, or installed apps, operate on the real local machine session unless the project definition explicitly says sandbox.\n"
@@ -1688,13 +1745,14 @@ class ProfiledWorkerRuntime:
         self,
         base_dir: str | None = None,
         provider_account_db_path: str | None = None,
+        *, create_directories: bool = True,
     ) -> None:
-        self.openclaw = OpenClawWorkstationRuntime(base_dir=base_dir)
-        self.codex = CodexCliRuntime(base_dir=base_dir)
-        self.claude = ClaudeCodeRuntime(base_dir=base_dir)
-        self.host_openclaw = HostOpenClawRuntime(base_dir=base_dir)
-        self.host_codex = HostCodexCliRuntime(base_dir=base_dir)
-        self.host_claude = HostClaudeCodeRuntime(base_dir=base_dir)
+        self.openclaw = OpenClawWorkstationRuntime(base_dir=base_dir, create_directories=create_directories)
+        self.codex = CodexCliRuntime(base_dir=base_dir, create_directories=create_directories)
+        self.claude = ClaudeCodeRuntime(base_dir=base_dir, create_directories=create_directories)
+        self.host_openclaw = HostOpenClawRuntime(base_dir=base_dir, create_directories=create_directories)
+        self.host_codex = HostCodexCliRuntime(base_dir=base_dir, create_directories=create_directories)
+        self.host_claude = HostClaudeCodeRuntime(base_dir=base_dir, create_directories=create_directories)
         self._provider_log_cache: dict[tuple[str, str], dict[str, object]] = {}
         self._provider_log_cache_lock = Lock()
         provider_home_root = Path(
@@ -1821,6 +1879,14 @@ class ProfiledWorkerRuntime:
                 self._revoke_active_capability_grant(worker)
             finally:
                 self._revoke_active_inference_grant(worker)
+
+    def detach_worker(self, worker: dict, run_id: str | None = None) -> bool:
+        """End only this process's wait on the exact live generation; never stop it."""
+        runtime = self._runtime_for_worker(worker)
+        detach = getattr(runtime, "detach_worker", None)
+        if not callable(detach):
+            return False
+        return bool(detach(worker, run_id=run_id))
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
         runtime = self._runtime_for_worker(worker)
@@ -2435,6 +2501,19 @@ class ProfiledWorkerRuntime:
         projection = resolver(worker)
         return dict(projection) if isinstance(projection, dict) else {}
 
+    def provider_native_image_output(self, worker: dict, run: dict, output: str):
+        runtime = self._runtime_for_worker(worker)
+        resolver = getattr(runtime, "provider_native_image_output", None)
+        return resolver(worker, run, output) if callable(resolver) else (output, [])
+
+    def provider_tool_evidence_log(self, worker: dict, run_id: str, *, instruction_sha256: str = "") -> tuple[str, str]:
+        profile, stdout = self.provider_activity_log(worker, run_id)
+        runtime = self._runtime_for_worker(worker)
+        reader = getattr(runtime, "provider_rollout_tool_log", None)
+        if callable(reader):
+            stdout += "\n" + reader(worker, run_id, instruction_sha256=instruction_sha256)
+        return profile, stdout
+
     def provider_activity_log(self, worker: dict, run_id: str) -> tuple[str, str]:
         """Return the private native JSONL log used for provider activity normalization."""
 
@@ -2863,6 +2942,16 @@ class ProfiledWorkerRuntime:
             if callable(setter):
                 setter(observer)
 
+    def pending_native_input(self, worker: dict, *, run_id: str) -> dict | None:
+        method = getattr(self._runtime_for_worker(worker), "pending_native_input", None)
+        return method(worker, run_id=run_id) if callable(method) else None
+
+    def respond_native_input(self, worker: dict, **kwargs) -> dict:
+        method = getattr(self._runtime_for_worker(worker), "respond_native_input", None)
+        if not callable(method):
+            raise RuntimeErrorBase("native_input_unavailable")
+        return method(worker, **kwargs)
+
     def host_process_identity(self, worker: dict, run_id: str) -> dict[str, object] | None:
         runtime = self._runtime_for_worker(worker)
         reader = getattr(runtime, "host_process_identity", None)
@@ -3050,18 +3139,19 @@ class BaseCliWorkerRuntime:
     binary_env_var = ""
     binary_name = ""
 
-    def __init__(self, base_dir: str | None = None) -> None:
+    def __init__(self, base_dir: str | None = None, *, create_directories: bool = True) -> None:
         self.base_dir = Path(base_dir) if base_dir else Path(__file__).resolve().parents[2] / "data"
         self.runtime_root = self.base_dir / self.worker_root_name
         self.logs_dir = self.runtime_root / "logs"
         self.workers_dir = self.runtime_root / "workers"
-        self.runtime_root.mkdir(parents=True, exist_ok=True)
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-        self.workers_dir.mkdir(parents=True, exist_ok=True)
+        if create_directories:
+            self.runtime_root.mkdir(parents=True, exist_ok=True)
+            self.logs_dir.mkdir(parents=True, exist_ok=True)
+            self.workers_dir.mkdir(parents=True, exist_ok=True)
         self.binary = os.environ.get(self.binary_env_var, self.binary_name)
         self._process_lock = Lock()
         self._active_processes: dict[str, subprocess.Popen[str]] = {}
-        self._stop_reasons: dict[tuple[str, str | None], str] = {}
+        self._stop_reasons: dict[tuple[str, str | None, str], str] = {}
         self._live_telemetry_lock = Lock()
         self._live_telemetry_cache: dict[tuple[str, str], dict[str, object]] = {}
         self._host_process_observer = None
@@ -3073,7 +3163,7 @@ class BaseCliWorkerRuntime:
         ] = {}
         self._provider_route_evidence_lock = Lock()
         self._provider_route_evidence: dict[str, dict[str, object]] = {}
-        self.sandbox = DockerSandboxManager(base_dir=str(self.base_dir))
+        self.sandbox = DockerSandboxManager(base_dir=str(self.base_dir), create_directories=create_directories)
 
     def resolve_model(self, profile: str) -> str:
         raise NotImplementedError
@@ -3212,10 +3302,47 @@ class BaseCliWorkerRuntime:
         value = str(data.get("session_key") or "").strip()
         return value or None
 
-    def _write_session_key(self, worker_id: str, session_key: str) -> None:
+    def _write_session_key(self, worker_id: str, session_key: str, *, context_epoch: str | None = None) -> None:
         path = self._session_meta_path(worker_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"session_key": session_key}, indent=2))
+        if context_epoch is None:
+            try:
+                context_epoch = str(json.loads(path.read_text()).get("context_epoch") or "")
+            except (OSError, ValueError, AttributeError):
+                context_epoch = ""
+        _atomic_write_private_text(path, json.dumps({"session_key": session_key, "context_epoch": context_epoch}, indent=2))
+
+    def _read_provider_session_key(self, worker: dict) -> str | None:
+        epoch = self._bootstrap_env_value(worker, GLASSHIVE_PROVIDER_SESSION_EPOCH_ENV)
+        if epoch:
+            try:
+                data = json.loads(self._session_meta_path(worker["worker_id"]).read_text())
+                if str(data.get("context_epoch") or "") != epoch:
+                    return None
+            except (OSError, ValueError, AttributeError):
+                return None
+        return self._read_session_key(worker["worker_id"])
+
+    def _provider_session_starts_fresh(self, worker: dict) -> bool:
+        return self._provider_session_is_stateless(worker) or bool(
+            self._bootstrap_env_value(worker, GLASSHIVE_PROVIDER_SESSION_EPOCH_ENV)
+            and not self._read_provider_session_key(worker)
+        )
+
+    def _provider_session_is_stateless(self, worker: dict) -> bool:
+        return (
+            self._bootstrap_env_value(worker, GLASSHIVE_PROVIDER_SESSION_MODE_ENV)
+            == "stateless"
+        )
+
+    def _remember_native_session_key(
+        self, worker: dict, session_key: str | None
+    ) -> None:
+        """Persist native continuity only for persistent provider turns."""
+
+        if session_key and not self._provider_session_is_stateless(worker):
+            self._write_session_key(str(worker["worker_id"]), session_key,
+                context_epoch=self._bootstrap_env_value(worker, GLASSHIVE_PROVIDER_SESSION_EPOCH_ENV))
 
     def _read_active_session(self, worker_id: str) -> dict[str, object] | None:
         path = self._active_session_meta_path(worker_id)
@@ -3254,8 +3381,11 @@ class BaseCliWorkerRuntime:
             "heartbeat_path": str(data.get("heartbeat_path") or "").strip(),
             "timeout_seconds": data.get("timeout_seconds"),
             "instruction_redacted": bool(data.get("instruction_redacted")),
+            "workspace_dir": str(data.get("workspace_dir") or "").strip(),
             "run_mode": str(data.get("run_mode") or "").strip(),
             "native_session_id": str(data.get("native_session_id") or "").strip(),
+            "native_image_scope": data.get("native_image_scope"),
+            "host_slot_token": str(data.get("host_slot_token") or ""),
             "termination_unconfirmed": bool(data.get("termination_unconfirmed")),
             "container_id": str(data.get("container_id") or "").strip(),
             "startup_token_digest": str(
@@ -3490,6 +3620,16 @@ class BaseCliWorkerRuntime:
     def _session_name_for_run_id(self, run_id: str) -> str:
         return f"job-{run_id[:12]}"
 
+    def _read_native_image_scope(self, worker_id: str, run_id: str) -> dict:
+        try:
+            data = _native_media_snapshot(
+                self._run_root(worker_id, run_id), Path("native-image-scope.json"), 128 * 1024
+            )
+            scope = json.loads(data)
+            return scope if isinstance(scope, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
     def _run_payload(
         self,
         worker_id: str,
@@ -3505,6 +3645,7 @@ class BaseCliWorkerRuntime:
             "run_id": run_id,
             "attempt_id": clean_attempt_id,
             "stdout_path": str(run_root / "stdout.log"),
+            "native_image_scope": self._read_native_image_scope(worker_id, run_id),
             "stderr_path": str(run_root / "stderr.log"),
             "exit_path": str(run_root / "exit_code"),
         }
@@ -3611,17 +3752,60 @@ class BaseCliWorkerRuntime:
                 return process.pid
             return None
 
-    def _note_stop_reason(self, worker_id: str, reason: str, run_id: str | None = None) -> None:
+    def _note_stop_reason(
+        self,
+        worker_id: str,
+        reason: str,
+        run_id: str | None = None,
+        *,
+        attempt_id: str = "",
+    ) -> None:
         with self._process_lock:
-            self._stop_reasons[(worker_id, run_id)] = reason
+            self._stop_reasons[(worker_id, run_id, str(attempt_id or ""))] = reason
 
-    def _pop_stop_reason(self, worker_id: str, run_id: str | None = None) -> str | None:
+    def _pop_stop_reason(
+        self,
+        worker_id: str,
+        run_id: str | None = None,
+        *,
+        attempt_id: str = "",
+    ) -> str | None:
         with self._process_lock:
+            clean_attempt_id = str(attempt_id or "")
+            if run_id is not None and clean_attempt_id:
+                return self._stop_reasons.pop(
+                    (worker_id, run_id, clean_attempt_id), None
+                )
             if run_id is not None:
-                reason = self._stop_reasons.pop((worker_id, run_id), None)
+                reason = self._stop_reasons.pop((worker_id, run_id, ""), None)
                 if reason:
                     return reason
-            return self._stop_reasons.pop((worker_id, None), None)
+            return self._stop_reasons.pop((worker_id, None, ""), None)
+
+    def _peek_stop_reason(self, worker_id: str, run_id: str | None = None) -> str | None:
+        with self._process_lock:
+            if run_id is not None:
+                reason = self._stop_reasons.get((worker_id, run_id, ""))
+                if reason:
+                    return reason
+            return self._stop_reasons.get((worker_id, None, ""))
+
+    def detach_worker(self, worker: dict, run_id: str | None = None) -> bool:
+        """Leave the exact live session running; only this process's wait on it ends.
+
+        Unlike ``interrupt_worker`` this never signals the run's processes, never stops the
+        screen session, and never clears the active-session record, so a restarted service
+        can verify the same generation identity and collect its transcript exactly once.
+        """
+        worker_id = str(worker.get("worker_id") or "").strip()
+        active_run_id = str(run_id or worker.get("_active_run_id") or "").strip() or None
+        if not worker_id or not active_run_id:
+            return False
+        active_session = self._read_active_session(worker_id)
+        if not active_session or str(active_session.get("run_id") or "") != active_run_id:
+            return False
+        self._note_stop_reason(worker_id, "detached", run_id=active_run_id)
+        return True
 
     def _register_process(self, worker_id: str, process: subprocess.Popen[str]) -> None:
         with self._process_lock:
@@ -3699,9 +3883,14 @@ class BaseCliWorkerRuntime:
     def _runtime_info(self, worker: dict, *, pid: int | None = None) -> RuntimeInfo:
         worker_id = worker["worker_id"]
         self._ensure_dirs(worker_id)
-        session_key = self._read_session_key(worker_id) or worker.get("session_key") or self._default_session_key(worker)
-        if session_key:
-            self._write_session_key(worker_id, session_key)
+        session_key = None
+        if not self._provider_session_starts_fresh(worker):
+            session_key = (
+                self._read_session_key(worker_id)
+                or worker.get("session_key")
+                or self._default_session_key(worker)
+            )
+            self._remember_native_session_key(worker, session_key)
         return RuntimeInfo(
             runtime=self.runtime_name,
             model=worker.get("model") or self.resolve_model(worker.get("profile", "")),
@@ -3733,9 +3922,7 @@ class BaseCliWorkerRuntime:
         if active_run_id or self._active_pid(worker_id):
             self._note_stop_reason(worker_id, "interrupted", run_id=active_run_id)
             self._stop_active_process(worker_id, worker=worker, run_id=active_run_id)
-        sandbox = self.sandbox.inspect(worker["worker_id"])
-        pid = sandbox.pid if sandbox and sandbox.state == "running" else None
-        return self._runtime_info(worker, pid=pid)
+        return self._runtime_info(worker, pid=None)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
         worker_id = worker["worker_id"]
@@ -3816,6 +4003,11 @@ class BaseCliWorkerRuntime:
             completed_exit_code = self._read_completed_exit_code(exit_path)
             if completed_exit_code is not None:
                 return completed_exit_code
+            if self._peek_stop_reason(worker_id, run_id=run_id) == "detached":
+                self._pop_stop_reason(worker_id, run_id=run_id)
+                raise WorkerDetachedError(
+                    "Worker run detached for a managed restart; its generation keeps running"
+                )
             if stdout_path and self._stdout_has_complete_response(stdout_path):
                 now = time.monotonic()
                 if completed_seen_at is None:
@@ -4000,6 +4192,45 @@ class BaseCliWorkerRuntime:
                 pass
         return [self.runtime_name]
 
+    def _route_failure_evidence_for_collected_run(
+        self,
+        *,
+        worker: dict,
+        run_id: str,
+        classification,
+    ) -> dict[str, object] | None:
+        """Provider-native structured capacity evidence for a collected (non-host) run.
+
+        Mirrors the host process-exit path so a docker/base run that exhausts its provider quota
+        also records route health and can switch to the configured fallback worker.
+        """
+        if not (
+            classification.structured
+            and classification.failure_class in {"provider_quota_exhausted", "provider_rate_limited"}
+            and classification.provider_event_source
+        ):
+            return None
+        evidence_material = json.dumps(
+            {
+                "worker_id": str(worker.get("worker_id") or ""),
+                "run_id": str(run_id or ""),
+                "runtime": self.runtime_name,
+                "source": classification.provider_event_source,
+                "failure_class": classification.failure_class,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return {
+            "version": 1,
+            "failure_class": classification.failure_class,
+            "failure_structured": True,
+            "retry_at": "",
+            "retry_after_s": classification.retry_after_s,
+            "evidence_kind": classification.provider_event_source,
+            "evidence_id": hashlib.sha256(evidence_material.encode("utf-8")).hexdigest(),
+        }
+
     def collect_completed_run(
         self,
         worker: dict,
@@ -4021,12 +4252,18 @@ class BaseCliWorkerRuntime:
         if exit_code is None:
             if not self._stdout_has_complete_response(stdout_path):
                 return None
+            effective_run_id = str(run_id or active_session.get("run_id") or "").strip()
+            if self._stop_active_process(
+                worker["worker_id"], worker=worker, run_id=effective_run_id
+            ) is False:
+                # A final response is not proof that its native generation stopped.
+                # Do not publish a synthetic exit marker that a later collector could trust.
+                return None
             try:
                 exit_path.write_text("0")
             except OSError:
                 return None
             exit_code = 0
-            self._stop_active_process(worker["worker_id"], worker=worker, run_id=run_id)
         stdout = stdout_path.read_text() if stdout_path.exists() else ""
         stderr = stderr_path.read_text() if stderr_path.exists() else ""
         effective_run_id = str(run_id or active_session.get("run_id") or "").strip()
@@ -4037,6 +4274,11 @@ class BaseCliWorkerRuntime:
                 stderr=stderr,
                 runtime_name=self.runtime_name,
                 exit_code=exit_code,
+            )
+            route_failure_evidence = self._route_failure_evidence_for_collected_run(
+                worker=worker,
+                run_id=effective_run_id,
+                classification=classification,
             )
             failure_fields = classification.as_store_fields()
             if classification.personal_account_reconnect:
@@ -4050,7 +4292,7 @@ class BaseCliWorkerRuntime:
                 )
             else:
                 detail = _redact_text((stderr or stdout or "").strip(), max_chars=2000)
-            return {
+            recovered = {
                 "state": "failed",
                 "output_text": "",
                 "error_text": _redact_text(f"{self.runtime_name} exited with code {exit_code}: {detail}"),
@@ -4058,6 +4300,14 @@ class BaseCliWorkerRuntime:
                 "telemetry": telemetry,
                 **failure_fields,
             }
+            if route_failure_evidence is not None:
+                self._issue_provider_route_failure_evidence(
+                    worker=worker,
+                    run_id=effective_run_id,
+                    source=recovered,
+                    evidence=route_failure_evidence,
+                )
+            return recovered
         info = self.reconcile_worker(worker)
         try:
             session_key, output = self._parse_output(worker, stdout, stderr, info)
@@ -4069,14 +4319,17 @@ class BaseCliWorkerRuntime:
                 "usage": usage,
                 "telemetry": telemetry,
             }
-        if session_key:
-            self._write_session_key(worker["worker_id"], session_key)
+        self._remember_native_session_key(worker, session_key)
         workspace = Path(str(info.workspace_dir or self._workspace_dir(worker["worker_id"])))
         warning_message = ""
         run_mode = str(active_session.get("run_mode") or "").strip().lower()
         conversation_recovery = run_mode == "conversation" or bool(
             getattr(self, "_conversation_mode_from_worker", lambda _worker: False)(worker)
         )
+        if conversation_recovery and isinstance(self, HostNativeCliMixin):
+            output = _redact_text(self._project_native_image_output(
+                worker, info, output, active_session.get("native_image_scope"), effective_run_id
+            ))
         if not conversation_recovery:
             try:
                 _status, warning_message = _ensure_recovered_success_evidence(
@@ -4114,8 +4367,16 @@ class BaseCliWorkerRuntime:
             "telemetry": telemetry,
         }
 
-    def _finalize_stop_reason(self, worker_id: str, run_id: str | None = None) -> None:
-        reason = self._pop_stop_reason(worker_id, run_id=run_id)
+    def _finalize_stop_reason(
+        self,
+        worker_id: str,
+        run_id: str | None = None,
+        *,
+        attempt_id: str = "",
+    ) -> None:
+        reason = self._pop_stop_reason(
+            worker_id, run_id=run_id, attempt_id=attempt_id
+        )
         if reason == "paused":
             raise WorkerPausedError("Worker was paused while a run was active")
         if reason == "interrupted":
@@ -4130,8 +4391,43 @@ class BaseCliWorkerRuntime:
             "_active_run_id": effective_run_id,
             "_glasshive_task_run": True,
         }
+        clean_room = self._uses_parallel_clean_room(worker_for_run)
         attempt_id = str(worker_for_run.get("_run_attempt_id") or "").strip()
         info = self.ensure_worker_ready(worker_for_run)
+        run_secret_paths: dict[str, str] | None = None
+        run_secret_container_id = ""
+        if clean_room:
+            run_sandbox_inspection = self.sandbox.inspect_fresh(
+                worker_for_run["worker_id"]
+            )
+            run_sandbox = run_sandbox_inspection.sandbox
+            if (
+                run_sandbox_inspection.status != "present"
+                or run_sandbox is None
+                or not str(run_sandbox.container_id or "").strip()
+            ):
+                raise RuntimeErrorBase(
+                    "Parallel clean-room sandbox generation is unavailable for run authority"
+                )
+            run_secret_container_id = str(run_sandbox.container_id or "").strip()
+            binding = worker_for_run.get("_run_local_capability_binding")
+            bound_container_id = str(
+                binding.get("containerGenerationId")
+                if isinstance(binding, dict)
+                else ""
+            ).strip()
+            if (
+                not re.fullmatch(r"[a-f0-9]{64}", bound_container_id)
+                or bound_container_id != run_secret_container_id
+            ):
+                raise RuntimeErrorBase(
+                    "The run-local capability grant does not match the exact sandbox generation"
+                )
+            secret_root = f"/run/glasshive/{effective_run_id}"
+            run_secret_paths = {
+                "env_file": f"{secret_root}/secret-runtime.env",
+                "keys_file": f"{secret_root}/secret-runtime.keys",
+            }
         refresh_runtime_env_for_worker(
             self._home_dir(worker_for_run["worker_id"]),
             worker_for_run,
@@ -4214,6 +4510,7 @@ class BaseCliWorkerRuntime:
             [
                 "#!/usr/bin/env bash",
                 "set -o pipefail",
+                "umask 077",
                 f"mkdir -p {shlex.quote(container_run_root)}",
                 (
                     "write_exit() { "
@@ -4222,24 +4519,84 @@ class BaseCliWorkerRuntime:
                     "fi; "
                     "}"
                 ),
-                "abort_run() { write_exit \"${1:-130}\"; exit \"${1:-130}\"; }",
+                (
+                    "GLASSHIVE_SECRET_ENV_KEYS_FILE="
+                    + shlex.quote(str(run_secret_paths["keys_file"]))
+                    if run_secret_paths is not None
+                    else 'GLASSHIVE_SECRET_ENV_KEYS_FILE="$HOME/.glasshive/secret-runtime.keys"'
+                ),
+                (
+                    "GLASSHIVE_SECRET_ENV_FILE="
+                    + shlex.quote(str(run_secret_paths["env_file"]))
+                    if run_secret_paths is not None
+                    else 'GLASSHIVE_SECRET_ENV_FILE="$HOME/.glasshive/secret-runtime.env"'
+                ),
+                (
+                    "GLASSHIVE_SECRET_ENV_DIR="
+                    + shlex.quote(str(Path(run_secret_paths["env_file"]).parent))
+                    if run_secret_paths is not None
+                    else "GLASSHIVE_SECRET_ENV_DIR=''"
+                ),
+                (
+                    "scrub_run_secrets() { "
+                    'if [ -f "$GLASSHIVE_SECRET_ENV_KEYS_FILE" ]; then '
+                    'while IFS= read -r key; do [ -n "$key" ] && unset "$key"; done '
+                    '< "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; fi; '
+                    'rm -f "$GLASSHIVE_SECRET_ENV_FILE" "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; '
+                    'if [ -n "$GLASSHIVE_SECRET_ENV_DIR" ]; then '
+                    'rmdir "$GLASSHIVE_SECRET_ENV_DIR" 2>/dev/null || true; fi; '
+                    "}"
+                ),
+                "abort_run() { scrub_run_secrets; write_exit \"${1:-130}\"; exit \"${1:-130}\"; }",
                 "trap 'abort_run 130' HUP INT TERM",
                 f"cd {shlex.quote(self.sandbox.workspace_mount)} || exit 1",
-                'if [ -f "$HOME/.glasshive/runtime.env" ]; then set -a; source "$HOME/.glasshive/runtime.env"; set +a; fi',
-                'GLASSHIVE_SECRET_ENV_KEYS_FILE="$HOME/.glasshive/secret-runtime.keys"',
-                'GLASSHIVE_SECRET_ENV_FILE="$HOME/.glasshive/secret-runtime.env"',
-                'if [ -f "$GLASSHIVE_SECRET_ENV_FILE" ]; then set -a; source "$GLASSHIVE_SECRET_ENV_FILE"; set +a; rm -f "$GLASSHIVE_SECRET_ENV_FILE"; fi',
-                'if [ -f "$HOME/.wpr-openclaw/openclaw.env" ]; then set -a; source "$HOME/.wpr-openclaw/openclaw.env"; set +a; fi',
                 f"export GLASSHIVE_ACTIVE_RUN_ID={shlex.quote(effective_run_id)}",
                 f"export GLASSHIVE_RUN_ID={shlex.quote(effective_run_id)}",
                 f"export GLASSHIVE_ACTIVE_WORKER_ID={shlex.quote(worker_for_run['worker_id'])}",
+                'if [ -f "$HOME/.glasshive/runtime.env" ]; then set -a; source "$HOME/.glasshive/runtime.env"; set +a; fi',
+                'if [ -f "$GLASSHIVE_SECRET_ENV_FILE" ]; then set -a; source "$GLASSHIVE_SECRET_ENV_FILE"; set +a; rm -f "$GLASSHIVE_SECRET_ENV_FILE"; fi',
+                *(
+                    [
+                        ': "${GLASSHIVE_CAPABILITY_BROKER_TOKEN:?missing run capability grant}"',
+                        'export OPENAI_API_KEY="$GLASSHIVE_CAPABILITY_BROKER_TOKEN"',
+                        'export ANTHROPIC_API_KEY="$GLASSHIVE_CAPABILITY_BROKER_TOKEN"',
+                        'export ANTHROPIC_AUTH_TOKEN="$GLASSHIVE_CAPABILITY_BROKER_TOKEN"',
+                        (
+                            "export OPENAI_BASE_URL="
+                            + shlex.quote(
+                                self._parallel_clean_room_provider_base_url(
+                                    worker_for_run, "openai"
+                                )
+                            )
+                        ),
+                        (
+                            "export ANTHROPIC_BASE_URL="
+                            + shlex.quote(
+                                self._parallel_clean_room_provider_base_url(
+                                    worker_for_run, "anthropic"
+                                )
+                            )
+                        ),
+                    ]
+                    if clean_room
+                    else []
+                ),
+                'if [ -f "$HOME/.wpr-openclaw/openclaw.env" ]; then set -a; source "$HOME/.wpr-openclaw/openclaw.env"; set +a; fi',
                 f"{command_invocation} > >(tee -a {shlex.quote(container_stdout)}) 2> >(tee -a {shlex.quote(container_stderr)} >&2)",
                 "status=$?",
-                "unset " + " ".join(_RUN_SCOPED_CREDENTIAL_ENV_KEYS),
-                'if [ -f "$GLASSHIVE_SECRET_ENV_KEYS_FILE" ]; then while IFS= read -r key; do [ -n "$key" ] && unset "$key"; done < "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; rm -f "$GLASSHIVE_SECRET_ENV_KEYS_FILE"; fi',
+                "scrub_run_secrets",
                 "write_exit \"$status\"",
-                "printf '\\n[glasshive] run finished with exit code %s. Interactive shell remains open for takeover.\\n' \"$status\"",
-                "exec bash --noprofile --norc",
+                *(
+                    [
+                        "printf '\\n[glasshive] run finished with exit code %s; credential-free session exiting.\\n' \"$status\"",
+                        'exit "$status"',
+                    ]
+                    if clean_room
+                    else [
+                        "printf '\\n[glasshive] run finished with exit code %s. Interactive shell remains open for takeover.\\n' \"$status\"",
+                        "exec bash --noprofile --norc",
+                    ]
+                ),
             ]
         )
         host_script.write_text(script + "\n")
@@ -4259,17 +4616,45 @@ class BaseCliWorkerRuntime:
             worker=worker_for_run,
         )
 
+        run_authority_projected = False
         with runtime_start_boundary(worker_for_run):
             self._stop_active_process(worker_for_run["worker_id"], worker=worker_for_run)
-            start_result = self.sandbox.start_screen_session(
-                worker_for_run["worker_id"],
-                self.runtime_name,
-                session_name,
-                ["bash", "--noprofile", "--norc", container_script],
-                env=env,
-                worker=worker_for_run,
-            )
+            if clean_room:
+                projected_paths = self.sandbox.project_parallel_clean_room_run_secrets(
+                    worker_for_run["worker_id"],
+                    expected_container_id=run_secret_container_id,
+                    run_id=effective_run_id,
+                    env=bootstrap_env_for(worker_for_run),
+                )
+                if projected_paths != run_secret_paths:
+                    raise RuntimeErrorBase(
+                        "Parallel clean-room run authority projection path is invalid"
+                    )
+                run_authority_projected = True
+            try:
+                start_result = self.sandbox.start_screen_session(
+                    worker_for_run["worker_id"],
+                    self.runtime_name,
+                    session_name,
+                    ["bash", "--noprofile", "--norc", container_script],
+                    env=env,
+                    worker=worker_for_run,
+                )
+            except Exception:
+                if run_authority_projected:
+                    self.sandbox.clear_parallel_clean_room_run_secrets(
+                        worker_for_run["worker_id"],
+                        expected_container_id=run_secret_container_id,
+                        run_id=effective_run_id,
+                    )
+                raise
             if start_result.returncode != 0:
+                if run_authority_projected:
+                    self.sandbox.clear_parallel_clean_room_run_secrets(
+                        worker_for_run["worker_id"],
+                        expected_container_id=run_secret_container_id,
+                        run_id=effective_run_id,
+                    )
                 detail = (start_result.stderr or start_result.stdout or "").strip()[-1600:]
                 raise RuntimeErrorBase(f"Failed to start attached {self.runtime_name} session: {detail}")
             process_pid = self.sandbox.screen_session_pid(
@@ -4362,6 +4747,7 @@ class BaseCliWorkerRuntime:
                 effective_run_id,
                 str(worker_for_run.get("_run_attempt_id") or ""),
                 native_session_initial_offset,
+                worker_for_run,
             ),
             name=f"glasshive-docker-native-session-{effective_run_id[:12]}",
             daemon=True,
@@ -4400,6 +4786,8 @@ class BaseCliWorkerRuntime:
                 stdout_path=host_stdout,
             )
         except Exception as exc:
+            if isinstance(exc, WorkerDetachedError):
+                raise
             stdout = host_stdout.read_text() if host_stdout.exists() else ""
             stderr = host_stderr.read_text() if host_stderr.exists() else ""
             self._record_run_metrics(worker_for_run["worker_id"], effective_run_id, stdout)
@@ -4454,6 +4842,12 @@ class BaseCliWorkerRuntime:
                         ),
                         None,
                     )
+            if run_authority_projected:
+                self.sandbox.clear_parallel_clean_room_run_secrets(
+                    worker_for_run["worker_id"],
+                    expected_container_id=run_secret_container_id,
+                    run_id=effective_run_id,
+                )
         if authority_receipt is not None and (
             self.native_provider_authority_receipt(worker_for_run, effective_run_id)
             != authority_receipt
@@ -4591,8 +4985,7 @@ class BaseCliWorkerRuntime:
             raise error
 
         session_key, output = self._parse_output(worker_for_run, stdout, stderr, info)
-        if session_key:
-            self._write_session_key(worker_for_run["worker_id"], session_key)
+        self._remember_native_session_key(worker_for_run, session_key)
         evidence_path = _write_evidence_for_run(
             worker=worker_for_run,
             run_id=effective_run_id,
@@ -4717,9 +5110,24 @@ class BaseCliWorkerRuntime:
             return None
         with self._provider_route_evidence_lock:
             record = self._provider_route_evidence.pop(capability, None)
+        if not isinstance(record, dict):
+            return None
+        issued_source = record.get("source")
+        if isinstance(source, dict):
+            # A collected-run result is a plain dict that outer layers legitimately re-wrap
+            # (`{**recovered, ...}`) before the service records route health. The unguessable
+            # capability token stamped on the issued dict is the proof of provenance, so accept
+            # the original dict or any copy that still carries that token, as long as the
+            # worker, run, and runtime identity match the issued record.
+            source_is_trusted = issued_source is source or (
+                isinstance(issued_source, dict)
+                and str(issued_source.get("_provider_route_health_capability") or "")
+                == capability
+            )
+        else:
+            source_is_trusted = issued_source is source
         if (
-            not isinstance(record, dict)
-            or record.get("source") is not source
+            not source_is_trusted
             or str(record.get("worker_id") or "")
             != str(worker.get("worker_id") or "")
             or str(record.get("run_id") or "") != str(run.get("run_id") or "")
@@ -5387,7 +5795,9 @@ class BaseCliWorkerRuntime:
             if not expected_container_id:
                 release_slot = getattr(self, "_release_host_slot", None)
                 if callable(release_slot):
-                    release_slot(worker_id)
+                    release_slot(worker_id, expected_slot_token=(
+                        str(expected_session.get("host_slot_token") or "").strip() or None
+                    ))
         except Exception as exc:
             self._mark_rejected_run_start_unconfirmed(
                 worker_id, expected_session
@@ -5584,6 +5994,8 @@ class BaseCliWorkerRuntime:
             return False
 
         current = self._read_active_session(worker_id)
+        current_matches_old = False
+        old_slot_token: str | None = None
         if current:
             try:
                 current_pid = int(
@@ -5611,14 +6023,20 @@ class BaseCliWorkerRuntime:
                     and str(current.get("session_name") or "")
                     == str(lease_identity.get("session_id") or "")
                 )
-            if current_matches_old and not self._clear_active_session(
-                worker_id, expected_session=current
-            ):
-                return False
-        if identity_kind == "host_process":
+            if current_matches_old:
+                old_slot_token = (
+                    str(current.get("host_slot_token") or "").strip() or None
+                )
+                if not self._clear_active_session(
+                    worker_id, expected_session=current
+                ):
+                    return False
+        if identity_kind == "host_process" and current_matches_old:
             release_slot = getattr(self, "_release_host_slot", None)
             if callable(release_slot):
-                release_slot(worker_id)
+                # A same-worker replacement can arrive after the old session's
+                # compare-delete. Its generation token must keep its slot.
+                release_slot(worker_id, expected_slot_token=old_slot_token)
         return True
 
     @staticmethod
@@ -5752,6 +6170,7 @@ class BaseCliWorkerRuntime:
         run_id: str | None = None,
         attempt_id: str | None = None,
         initial_offset: int = 0,
+        worker: dict | None = None,
     ) -> None:
         """Tail native JSONL and durably publish session identity as soon as it appears."""
 
@@ -5766,6 +6185,8 @@ class BaseCliWorkerRuntime:
             session_id = self._native_session_id_from_event_line(line)
             if session_id:
                 active_session = self._read_active_session(worker_id)
+                if active_session and run_id and active_session.get("run_id") != run_id:
+                    return
                 effective_receipt_run = str(
                     run_id or (active_session or {}).get("run_id") or ""
                 ).strip()
@@ -5797,7 +6218,10 @@ class BaseCliWorkerRuntime:
                     )
                     if not provider_event:
                         return
-                self._write_session_key(worker_id, session_id)
+                if worker is None:
+                    self._write_session_key(worker_id, session_id)
+                else:
+                    self._remember_native_session_key(worker, session_id)
                 if active_session and active_session.get("native_session_id") != session_id:
                     self._write_active_session(
                         worker_id,
@@ -5910,12 +6334,16 @@ class BaseCliWorkerRuntime:
             str(session.get("session_name") or ""),
             str(session.get("exit_path") or ""),
             session.get("process_pid"),
+            session.get("process_group"),
             str(session.get("process_start_identity") or ""),
+            str(session.get("process_identity_sha256") or ""),
             session.get("owner_pid"),
             session.get("lease_pid"),
+            session.get("lease_process_group"),
             str(session.get("lease_process_start_identity") or ""),
             str(session.get("container_id") or ""),
             str(session.get("startup_token_digest") or ""),
+            str(session.get("host_slot_token") or ""),
         )
 
     @staticmethod
@@ -6821,11 +7249,43 @@ class OpenClawWorkstationRuntime(BaseCliWorkerRuntime):
         return session_id, output
 
 
+def _codex_usage_from_output(stdout: str) -> dict[str, int]:
+    """Project terminal Codex counts into the existing disjoint run-usage buckets."""
+    latest = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(event, dict) and event.get("type") == "turn.completed":
+            latest = event.get("usage")
+    if not isinstance(latest, dict):
+        return {}
+    counts = {
+        "input_tokens": latest.get("input_tokens"),
+        "output_tokens": latest.get("output_tokens"),
+        "cache_read_input_tokens": latest.get("cached_input_tokens", 0),
+        "cache_creation_input_tokens": latest.get("cache_write_input_tokens", 0),
+    }
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts.values()):
+        return {}
+    # Codex input includes cache reads/writes; GlassHive sums four disjoint buckets.
+    # Reasoning tokens are likewise already part of output_tokens.
+    cached = counts["cache_read_input_tokens"] + counts["cache_creation_input_tokens"]
+    if cached > counts["input_tokens"]:
+        return {}
+    counts["input_tokens"] -= cached
+    return counts
+
+
 class CodexCliRuntime(BaseCliWorkerRuntime):
     runtime_name = "codex-cli"
     worker_root_name = "codex_cli_runtime"
     binary_name = "codex"
     _default_compatible_provider_disabled_features: tuple[str, ...] = ()
+
+    def _usage_from_output(self, stdout: str) -> dict[str, int]:
+        return _codex_usage_from_output(stdout)
 
     def resolve_model(self, profile: str) -> str:
         if profile == "codex-cli":
@@ -6976,22 +7436,9 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         allowed_efforts = self._compatible_provider_allowed_reasoning_efforts()
         fallback_reason = ""
         if reasoning_effort and reasoning_effort not in allowed_efforts:
-            reasoning_effort = self._compatible_provider_reasoning_effort_fallback(allowed_efforts)
-            fallback_reason = (
-                "xhigh_route_not_proven"
-                if requested_effort == "xhigh" and not self._codex_xhigh_route_proven()
-                else "requested_effort_not_allowed"
-            )
-            logger.warning(
-                "Codex CLI reasoning effort clamped to provider-route fallback",
-                extra={
-                    "worker_id": str(worker.get("worker_id") or ""),
-                    "profile": str(worker.get("profile") or "codex-cli"),
-                    "model": str(worker.get("model") or self.resolve_model(worker.get("profile", "codex-cli"))),
-                    "requested_effort": requested_effort,
-                    "effective_effort": reasoning_effort,
-                    "allowed_efforts": ",".join(sorted(allowed_efforts)),
-                },
+            raise RuntimeErrorBase(
+                f"Unsupported Codex provider-route effort: {reasoning_effort}; "
+                f"supported efforts: {', '.join(sorted(allowed_efforts))}"
             )
         if requested_effort or reasoning_effort:
             worker["_effort_projection"] = {
@@ -7030,22 +7477,36 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         *,
         include_reasoning_effort: bool = True,
     ) -> None:
+        clean_room = self._uses_parallel_clean_room(worker)
         projection = validated_codex_broker_projection(worker)
-        if not self._compatible_provider_enabled(worker):
+        if not clean_room and not self._compatible_provider_enabled(worker):
             return
-        base_url = self._compatible_provider_base_url(worker)
+        base_url = (
+            self._parallel_clean_room_provider_base_url(worker, "openai")
+            if clean_room
+            else self._compatible_provider_base_url(worker)
+        )
         if not base_url:
             return
-        provider_id = self._compatible_provider_id(worker)
+        provider_id = (
+            self._compatible_provider_id()
+            if clean_room
+            else self._compatible_provider_id(worker)
+        )
         provider_name = (
             "GlassHive run broker"
-            if projection is not None
+            if clean_room or projection is not None
             else os.environ.get("WPR_CODEX_CLI_PROVIDER_NAME", "GlassHive OpenAI-compatible").strip()
         )
         wire_api = (
             "responses"
-            if projection is not None
+            if clean_room or projection is not None
             else os.environ.get("WPR_CODEX_CLI_WIRE_API", "responses").strip() or "responses"
+        )
+        env_key = (
+            "GLASSHIVE_CAPABILITY_BROKER_TOKEN"
+            if clean_room
+            else self._compatible_provider_env_key(worker)
         )
         verbosity = os.environ.get("WPR_CODEX_CLI_MODEL_VERBOSITY", "medium").strip()
         for feature in self._compatible_provider_disabled_features():
@@ -7059,7 +7520,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
                 "-c",
                 f'model_providers.{provider_id}.base_url="{base_url}"',
                 "-c",
-                f'model_providers.{provider_id}.env_key="{self._compatible_provider_env_key(worker)}"',
+                f'model_providers.{provider_id}.env_key="{env_key}"',
                 "-c",
                 f'model_providers.{provider_id}.wire_api="{wire_api}"',
                 "-c",
@@ -7068,7 +7529,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
                 f"model_providers.{provider_id}.supports_websockets=false",
             ]
         )
-        if projection is not None:
+        if projection is not None and not clean_room:
             worker_id = _toml_string(str(projection["worker_id"]))
             run_id = _toml_string(str(projection["run_id"]))
             command.extend(
@@ -7097,7 +7558,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         is_resume = bool(session_key)
         dangerous_mode = os.environ.get("WPR_CODEX_DANGEROUS", "1").strip().lower() in {"1", "true", "yes", "on"}
         if is_resume:
-            command = [self.binary, "exec", "resume"]
+            command = [self.binary, "exec", "resume", "--json"]
         else:
             command = [self.binary, "exec", "--json", "--skip-git-repo-check", "-C", self.sandbox.workspace_mount]
         if model:
@@ -7108,7 +7569,9 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         self._append_codex_user_config_policy(command, worker)
         if attach_native_authority:
             command.extend(["-c", "project_doc_max_bytes=0"])
-        if not worker.get("_glasshive_provider_account_bound"):
+        if self._uses_parallel_clean_room(worker) or not worker.get(
+            "_glasshive_provider_account_bound"
+        ):
             self._append_codex_compatible_provider_config(
                 command,
                 worker,
@@ -7168,7 +7631,11 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         worker.pop("_glasshive_native_authority_commands", None)
         native_authority = self._materialize_direct_worker_native_authority(worker)
-        existing_session = self._read_session_key(worker["worker_id"])
+        existing_session = (
+            None
+            if self._provider_session_starts_fresh(worker)
+            else self._read_provider_session_key(worker)
+        )
         model = self._codex_model_for_worker(worker, "WPR_MODEL_CODEX_CLI")
         is_resume = bool(existing_session and not existing_session.startswith("codex-worker:"))
         command = self._codex_exec_command(
@@ -7211,7 +7678,8 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
                 provider_keys = [key for key in provider_keys if key.startswith("OPENAI_")]
             else:
                 provider_keys = []
-        env = self._container_env(
+        env = self._container_env_for_worker(
+            worker,
             *provider_keys,
             "HTTPS_PROXY",
             "HTTP_PROXY",
@@ -7220,7 +7688,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             "SSL_CERT_DIR",
         )
         projection = validated_codex_broker_projection(worker)
-        if projection is not None:
+        if projection is not None and not self._uses_parallel_clean_room(worker):
             for key in _CODEX_BROKER_CONFLICTING_ENV:
                 env.pop(key, None)
             env["OPENAI_API_KEY"] = str(projection["grant_token"])
@@ -7285,7 +7753,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         return (stdout.strip() or stderr.strip())[-4000:]
 
     def _parse_output(self, worker: dict, stdout: str, stderr: str, info: RuntimeInfo) -> tuple[str | None, str]:
-        session_key = self._read_session_key(worker["worker_id"]) or info.session_key
+        session_key = self._read_provider_session_key(worker) or info.session_key
         output_parts: list[str] = []
         for line in stdout.splitlines():
             line = line.strip()
@@ -7625,14 +8093,8 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
         )
         return ""
 
-    def provider_citation_sources(self, worker: dict, run_id: str) -> list[dict[str, str]]:
-        """Resolve cited public URLs from the private Codex rollout ledger.
-
-        ``codex exec --json`` exposes citation anchors in the assistant message but keeps the
-        corresponding URL/title records in its private session rollout. Export only that small
-        provenance tuple; snippets and other native-session content stay private.
-        """
-
+    def _codex_run_rollout_path(self, worker: dict, run_id: str) -> Path | None:
+        """Resolve the session emitted by this exact run's owned stdout."""
         clean_run_id = str(run_id or "").strip()
         if (
             not clean_run_id
@@ -7643,7 +8105,7 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
             raise ValueError("invalid run id")
         stdout_path = self._run_root(str(worker["worker_id"]), clean_run_id) / "stdout.log"
         if not stdout_path.is_file():
-            return []
+            return None
         thread_id = ""
         try:
             with stdout_path.open(errors="ignore") as handle:
@@ -7657,22 +8119,90 @@ class CodexCliRuntime(BaseCliWorkerRuntime):
                         if thread_id:
                             break
         except OSError:
-            return []
+            return None
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", thread_id):
-            return []
+            return None
 
         sessions_root = self._home_dir(str(worker["worker_id"])) / ".codex" / "sessions"
         if not sessions_root.is_dir():
-            return []
+            return None
         try:
             candidates = list(sessions_root.rglob(f"*{thread_id}.jsonl"))
         except OSError:
-            return []
+            return None
         if not candidates:
-            return []
+            return None
         try:
             rollout_path = max(candidates, key=lambda path: path.stat().st_mtime_ns)
         except OSError:
+            return None
+
+        if not rollout_path.resolve().is_relative_to(sessions_root.resolve()):
+            return None
+        return rollout_path
+
+    def provider_rollout_tool_log(self, worker: dict, run_id: str, *, instruction_sha256: str) -> str:
+        """Join native tool output to the exact admitted input and native turn."""
+        path = self._codex_run_rollout_path(worker, run_id)
+        unavailable = json.dumps({"type": "glasshive.tool_evidence_unavailable"})
+        if path is None:
+            return unavailable
+        instruction_path = self._run_root(str(worker["worker_id"]), run_id) / "instruction.stdin"
+        try:
+            instruction = instruction_path.read_text()
+            if not instruction or hashlib.sha256(instruction.encode("utf-8")).hexdigest() != instruction_sha256:
+                return unavailable
+            fingerprint = (path.stat().st_size, path.stat().st_mtime_ns)
+            # Select by native turn identity plus exact input bytes, never by timing,
+            # prose/tool-name matching, or the newest turn in a reused session.
+            turns: dict[str, list[dict]] = {}
+            matched: set[str] = set()
+            current = ""
+            retained_bytes = 0
+            with path.open() as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    payload = event.get("payload") if isinstance(event, dict) else None
+                    if not isinstance(payload, dict):
+                        continue
+                    if event.get("type") == "turn_context":
+                        current = str(payload.get("turn_id") or "")
+                        if current:
+                            turns.setdefault(current, [])
+                        continue
+                    if event.get("type") != "response_item" or not current:
+                        continue
+                    meta = payload.get("internal_chat_message_metadata_passthrough")
+                    if not isinstance(meta, dict) or meta.get("turn_id") != current:
+                        continue
+                    content = payload.get("content")
+                    if payload.get("type") == "message" and payload.get("role") == "user" and isinstance(content, list):
+                        texts = [part.get("text") for part in content if isinstance(part, dict) and part.get("type") == "input_text"]
+                        if texts == [instruction]:
+                            matched.add(current)
+                    if current in matched and payload.get("type") in {
+                        "custom_tool_call", "custom_tool_call_output", "function_call", "function_call_output"
+                    }:
+                        retained_bytes += len(line.encode("utf-8"))
+                        if retained_bytes > 8 * 1024 * 1024:
+                            return unavailable
+                        turns[current].append({"type": "response_item", "payload": payload})
+            if len(matched) != 1 or fingerprint != (path.stat().st_size, path.stat().st_mtime_ns):
+                return unavailable
+            if instruction_path.read_text() != instruction:
+                return unavailable
+            selected = turns[next(iter(matched))]
+            return "\n".join(json.dumps(item, ensure_ascii=False) for item in selected)
+        except (OSError, UnicodeError, ValueError):
+            return unavailable
+
+    def provider_citation_sources(self, worker: dict, run_id: str) -> list[dict[str, str]]:
+        """Export public citation tuples from the same worker-owned native rollout."""
+        rollout_path = self._codex_run_rollout_path(worker, run_id)
+        if rollout_path is None:
             return []
 
         sources: dict[str, dict[str, str]] = {}
@@ -7773,7 +8303,7 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         if str(worker.get("execution_mode") or "docker") != "docker":
             return
         effort = self._effort_for_worker(worker)
-        if effort not in {"max", "xhigh"}:
+        if not effort or effort == "default":
             return
         cache_key = (str(self.sandbox.image), self.binary, effort)
         if self._workspace_effort_support_cache.get(cache_key):
@@ -7886,7 +8416,11 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         worker.pop("_glasshive_native_authority_commands", None)
         native_authority = self._materialize_direct_worker_native_authority(worker)
-        session_key = self._read_session_key(worker["worker_id"])
+        session_key = (
+            None
+            if self._provider_session_starts_fresh(worker)
+            else self._read_provider_session_key(worker)
+        )
         model = self._provider_model_for_worker(worker)
         permission_mode = os.environ.get("WPR_CLAUDE_CODE_PERMISSION_MODE", "bypassPermissions")
         command = [
@@ -7905,19 +8439,10 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
         if self._chrome_enabled():
             command.insert(2, "--chrome")
         effort = self._effort_for_worker(worker)
-        if native_authority is not None and effort and effort != "default":
-            if effort not in {"low", "medium", "high", "xhigh", "max"}:
-                raise RuntimeErrorBase(
-                    "The direct Worker configured Claude effort is unsupported"
-                )
+        if effort and effort != "default":
+            if effort not in CLAUDE_CODE_EFFORT_LEVELS:
+                raise RuntimeErrorBase("The configured Claude effort is unsupported")
             command.extend(["--effort", effort])
-        elif effort in {"max", "xhigh"}:
-            command.extend(["--effort", effort])
-        elif effort and effort != "default":
-            logger.warning(
-                "Ignoring unsupported Claude Code effort",
-                extra={"worker_id": str(worker.get("worker_id") or ""), "effort": effort},
-            )
         if session_key and not session_key.startswith("claude-worker:"):
             resume_command = [*command, "--resume", session_key]
             if native_authority is not None:
@@ -8015,20 +8540,26 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
                 structured_parts or result_parts or assistant_parts
             )
             return session_key, selected or "The harness completed without a user-facing response."
-        try:
-            payload = json.loads(raw.splitlines()[-1])
-        except json.JSONDecodeError:
-            return info.session_key, raw[-4000:]
+        payload = self._terminal_result_payload(raw)
+        if not payload:
+            return info.session_key, ""
         session_key = str(payload.get("session_id") or info.session_key or "").strip() or None
-        result = str(payload.get("result") or raw).strip()
+        result = str(payload.get("result") or "").strip()
         return session_key, _select_user_facing_agent_output([result]) or result
 
+    @staticmethod
+    def _terminal_result_payload(stdout: str) -> dict:
+        for line in reversed(stdout.splitlines()):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and (event.get("type") == "result" or ("type" not in event and ("result" in event or "usage" in event))):
+                return event
+        return {}
+
     def _usage_from_output(self, stdout: str) -> dict[str, int]:
-        raw = stdout.strip()
-        try:
-            payload = json.loads(raw.splitlines()[-1]) if raw else {}
-        except json.JSONDecodeError:
-            payload = {}
+        payload = self._terminal_result_payload(stdout)
         source = payload.get("usage") if isinstance(payload, dict) else {}
         usage = source if isinstance(source, dict) else {}
         normalized: dict[str, int] = {}
@@ -8409,7 +8940,14 @@ class ClaudeCodeRuntime(BaseCliWorkerRuntime):
             return telemetry
 
 
-_SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+_LOCAL_MARKDOWN_CITATION = re.compile(
+    r"!?\[([^\]\r\n]+)\]\(\s*"
+    r"(?:<(?:file://)?(?:/(?:Users|home|root|Volumes|private/var)/|~/)[^>\r\n]*>"
+    r"|(?:file://)?(?:/(?:Users|home|root|Volumes|private/var)/|~/)(?:[^()\s]|\([^()\r\n]*\))*)"
+    r"\s*\)"
+)
+_SECRET_REDACTIONS: tuple[RedactionRule, ...] = (
+    *CREDENTIAL_REDACTIONS,
     (re.compile(r"/Users/[^/\s\"'`]+(?:/[^\s\"'`]*)*"), "[REDACTED_LOCAL_PATH]"),
     (re.compile(r"/(?:home|root|Volumes|private/var)/[^\s\"'`]+(?:/[^\s\"'`]*)*"), "[REDACTED_LOCAL_PATH]"),
     (re.compile(r"~/[^\s\"'`]+(?:/[^\s\"'`]*)*"), "[REDACTED_LOCAL_PATH]"),
@@ -8422,7 +8960,6 @@ _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"), "[REDACTED_JWT]"),
     (re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z ]+ )?PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
     (re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\s\S]*\Z"), "[REDACTED_PRIVATE_KEY]"),
-    (re.compile(r"\b[A-Za-z0-9_]{8,}:[A-Za-z0-9_./+=-]{20,}\b"), "[REDACTED_CREDENTIAL]"),
     (re.compile(r"(?i)data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{256,}"), "[REDACTED_IMAGE_BASE64]"),
     (re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{512,}={0,2}(?![A-Za-z0-9+/=])"), "[REDACTED_LONG_BASE64]"),
 )
@@ -8447,7 +8984,8 @@ def _select_user_facing_agent_output(output_parts: list[str]) -> str:
 
 
 def _redact_text(value: str, max_chars: int | None = None) -> str:
-    text = value
+    # A hidden host path cannot be a usable link; keep its label before masking raw paths.
+    text = _LOCAL_MARKDOWN_CITATION.sub(r"\1", value)
     for pattern, replacement in _SECRET_REDACTIONS:
         text = pattern.sub(replacement, text)
     if max_chars is not None and len(text) > max_chars:
@@ -8550,6 +9088,7 @@ def _write_evidence_for_run(
             ended_at=ended_at,
             transcript_paths=transcript_paths,
         )
+        evidence["native_media"] = capture_native_media(workspace, run_id, stdout_text)
         path = write_run_evidence(workspace, evidence, run_id)
         try:
             return path.relative_to(workspace).as_posix()
@@ -8618,11 +9157,20 @@ def _require_successful_run_evidence(
     run_id: str = "",
 ) -> tuple[str, str]:
     """Fail a successful worker process when its completion evidence is not usable."""
-    if not constraint_ledger_path:
-        raise RuntimeErrorBase("GlassHive evidence check failed: constraint ledger was not written")
     if not evidence_path:
         raise RuntimeErrorBase("GlassHive evidence check failed: run evidence was not written")
-    _read_valid_constraint_ledger(workspace, constraint_ledger_path, run_id=run_id)
+    if constraint_ledger_path:
+        _read_valid_constraint_ledger(workspace, constraint_ledger_path, run_id=run_id)
+    else:
+        # The runtime's prose-derived reminder is diagnostic, not an authorization
+        # receipt. Its generation failure must not erase an otherwise valid result.
+        evidence = _read_workspace_json_object(workspace, evidence_path)
+        if (
+            not evidence
+            or evidence.get("schema") != "glasshive.run.evidence.v1"
+            or (run_id and evidence.get("run_id") != run_id)
+        ):
+            raise RuntimeErrorBase("GlassHive evidence check failed: run evidence identity is invalid")
     result = _read_run_evidence_result(workspace, evidence_path)
     if not result:
         raise RuntimeErrorBase("GlassHive evidence check failed: run evidence was not readable")
@@ -8633,6 +9181,8 @@ def _require_successful_run_evidence(
         return status, _evidence_result_message(result, failed=False)
     if status != "pass":
         raise RuntimeErrorBase("GlassHive evidence check failed: run evidence result is missing or invalid")
+    if not constraint_ledger_path:
+        return "warn", "GlassHive evidence warning: internal constraint diagnostic was unavailable."
     return status, ""
 
 
@@ -8698,21 +9248,20 @@ def _ensure_recovered_success_evidence(
     if not run_id:
         raise RuntimeErrorBase("GlassHive evidence check failed: recovered run id was not available")
     constraint_ledger_path = str((active_session or {}).get("constraint_ledger_path") or "").strip()
-    if not constraint_ledger_path:
-        constraint_ledger_path = _default_constraint_ledger_path(run_id)
-    try:
+    default_ledger_path = _default_constraint_ledger_path(run_id)
+    if not constraint_ledger_path and (workspace / default_ledger_path).exists():
+        constraint_ledger_path = default_ledger_path
+    constraint_ledger = None
+    if constraint_ledger_path:
+        # A declared or present diagnostic must still belong to this exact run.
         constraint_ledger = _read_valid_constraint_ledger(workspace, constraint_ledger_path, run_id=run_id)
-    except RuntimeErrorBase as ledger_exc:
-        if not instruction.strip():
-            raise ledger_exc
+    elif instruction.strip():
         constraint_ledger, constraint_ledger_path = _write_constraint_ledger_for_run(
             worker=worker,
             instruction=instruction,
             workspace=workspace,
             run_id=run_id,
         )
-        if constraint_ledger is None or not constraint_ledger_path:
-            raise RuntimeErrorBase("GlassHive evidence check failed: constraint ledger was not written")
     evidence_path = _default_evidence_path(run_id)
     if not _read_run_evidence_result(workspace, evidence_path):
         transcript_paths = _transcript_paths_from_active_session(active_session)
@@ -8973,12 +9522,232 @@ class HostNativeCliMixin:
     execution_mode = "host"
     worker_root_name = "host_cli_runtime"
 
+    def _release_host_slot_locked(
+        self,
+        worker_id: str,
+        *,
+        expected_slot_token: str | None | object = _HOST_SLOT_EXPECTATION_UNSET,
+    ) -> bool:
+        current_slot_token = self._host_slot_tokens().get(worker_id)
+        if (
+            expected_slot_token is not _HOST_SLOT_EXPECTATION_UNSET
+            and current_slot_token != expected_slot_token
+        ):
+            if not (
+                current_slot_token is None
+                and self._host_slot_bookkeeping_is_absent_locked(worker_id)
+            ):
+                return False
+            return True
+        lane = self._host_worker_lanes().pop(worker_id, None)
+        self._host_slot_tokens().pop(worker_id, None)
+        if lane:
+            raw_active = self._host_active_slots().get(lane)
+            if isinstance(raw_active, set):
+                raw_active.discard(worker_id)
+                if not raw_active:
+                    self._host_active_slots().pop(lane, None)
+            elif raw_active == worker_id:
+                self._host_active_slots().pop(lane, None)
+        return True
+
+
+    def _finalize_owned_host_generation(
+        self,
+        worker_id: str,
+        *,
+        expected_process: subprocess.Popen[str] | None,
+        expected_session: dict[str, object] | None,
+        expected_slot_token: str | None,
+        clear_session: bool,
+    ) -> bool:
+        """Release one completed host generation only while both owners still match."""
+
+        session_path = self._active_session_meta_path(worker_id)
+        with self._active_session_file_lock(worker_id):
+            current_session = self._read_active_session(worker_id)
+            if current_session is None and session_path.exists():
+                return False
+            with self._process_lock:
+                current_process = self._active_processes.get(worker_id)
+                current_slot_token = self._host_slot_tokens().get(worker_id)
+                if (
+                    current_session is None
+                    and not session_path.exists()
+                    and current_process is None
+                    and self._host_slot_bookkeeping_is_absent_locked(worker_id)
+                ):
+                    return True
+                if self._active_session_fingerprint(
+                    current_session
+                ) != self._active_session_fingerprint(expected_session):
+                    return False
+                if current_process is not expected_process:
+                    return False
+                if current_slot_token != expected_slot_token and not (
+                    current_slot_token is None
+                    and self._host_slot_bookkeeping_is_absent_locked(worker_id)
+                ):
+                    return False
+                if clear_session and current_session is not None:
+                    try:
+                        session_path.unlink()
+                    except FileNotFoundError:
+                        return False
+                self._active_processes.pop(worker_id, None)
+                if not self._release_host_slot_locked(
+                    worker_id, expected_slot_token=expected_slot_token
+                ):
+                    return False
+        return True
+
+
+    def _confirmed_host_control_generation(
+        self,
+        worker: dict,
+        *,
+        run_id: str,
+        operation: str,
+    ) -> tuple[dict[str, object], dict[str, object] | None]:
+        """Return exact control identity plus the observed active-session generation."""
+
+        lease = worker.get("_host_run_lease")
+        if not isinstance(lease, dict):
+            raise RuntimeErrorBase(
+                "The exact host process identity is not confirmed"
+            )
+        worker_id = str(worker["worker_id"])
+        with self._active_session_file_lock(worker_id):
+            active_session = self._read_active_session(worker_id)
+            if isinstance(active_session, dict):
+                if not self._host_control_generation_matches(
+                    worker=worker,
+                    lease=lease,
+                    session=active_session,
+                    run_id=run_id,
+                ):
+                    raise RuntimeErrorBase(
+                        "The exact host process identity is not confirmed"
+                    )
+                captured = dict(active_session)
+                return captured, captured
+            if self._active_session_meta_path(worker_id).exists():
+                raise RuntimeErrorBase(
+                    "The exact host process identity is not confirmed"
+                )
+
+            receipt = self._read_host_control_receipt(worker_id)
+            receipt_session = (
+                receipt.get("session") if isinstance(receipt, dict) else None
+            )
+            if (
+                not isinstance(receipt, dict)
+                or not isinstance(receipt_session, dict)
+                or str(receipt.get("operation") or "") != operation
+                or str(receipt.get("status") or "") not in {"requested", "confirmed"}
+                or not self._host_control_generation_matches(
+                    worker=worker,
+                    lease=lease,
+                    session=receipt_session,
+                    run_id=run_id,
+                )
+            ):
+                raise RuntimeErrorBase(
+                    "The exact host process identity is not confirmed"
+                )
+            return dict(receipt_session), None
+
+
+    def _pidless_host_session_has_exact_terminal_proof(
+        self,
+        worker_id: str,
+        active_session: dict[str, object],
+    ) -> bool:
+        """Accept a PID-less host session as dead only from its canonical exit artifact."""
+
+        run_id = str(active_session.get("run_id") or "").strip()
+        attempt_id = str(active_session.get("attempt_id") or "").strip()
+        if (
+            not run_id
+            or str(active_session.get("session_name") or "").strip()
+            != self._session_name_for_run_id(run_id)
+        ):
+            return False
+        canonical_exit = self._attempt_run_root(
+            worker_id,
+            run_id,
+            attempt_id,
+        ) / "exit_code"
+        recorded_exit = Path(str(active_session.get("exit_path") or "").strip())
+        try:
+            if recorded_exit.resolve(strict=True) != canonical_exit.resolve(strict=True):
+                return False
+            raw_exit_code = canonical_exit.read_text().strip()
+            exit_code = int(raw_exit_code)
+        except (OSError, TypeError, ValueError):
+            return False
+        if str(exit_code) != raw_exit_code or not 0 <= exit_code <= 255:
+            return False
+        with self._process_lock:
+            process = self._active_processes.get(worker_id)
+        return not process or process.poll() is not None
+
+
+    def _host_slot_bookkeeping_is_absent_locked(self, worker_id: str) -> bool:
+        if (
+            worker_id in self._host_slot_tokens()
+            or worker_id in self._host_worker_lanes()
+        ):
+            return False
+        for raw_active in self._host_active_slots().values():
+            if isinstance(raw_active, (set, list, tuple)):
+                if worker_id in raw_active:
+                    return False
+            elif raw_active == worker_id:
+                return False
+        return True
+
+
+    def _host_slot_tokens(self) -> dict[str, str]:
+        tokens = self.__dict__.get("_viventium_host_slot_tokens")
+        if not isinstance(tokens, dict):
+            tokens = {}
+            self.__dict__["_viventium_host_slot_tokens"] = tokens
+        return tokens
+
+
     def _host_active_slots(self) -> dict[str, str]:
         slots = self.__dict__.get("_viventium_host_active_slots")
         if not isinstance(slots, dict):
             slots = {}
             self.__dict__["_viventium_host_active_slots"] = slots
         return slots
+
+    def _native_input_context(self, worker: dict) -> dict[str, object] | None:
+        return None
+
+    def pending_native_input(self, worker: dict, *, run_id: str) -> dict | None:
+        if not self.host_process_identity(worker, run_id):
+            return None
+        try:
+            return native_input.pending(self._run_root(str(worker["worker_id"]), run_id),
+                                        worker_id=str(worker["worker_id"]), run_id=run_id)
+        except FileNotFoundError:
+            return None
+        except native_input.NativeInputError as exc:
+            raise RuntimeErrorBase(str(exc)) from exc
+
+    def respond_native_input(self, worker: dict, *, run_id: str, request_id: str,
+                             request_fingerprint: str, action: str, content: dict | None = None,
+                             allow_new: bool = True) -> dict:
+        live = allow_new and bool(self.host_process_identity(worker, run_id))
+        try:
+            return native_input.respond(self._run_root(str(worker["worker_id"]), run_id),
+                                        worker_id=str(worker["worker_id"]), run_id=run_id,
+                                        request_id=request_id, request_fingerprint=request_fingerprint,
+                                        action=action, content=content, allow_new=live)
+        except (native_input.NativeInputError, FileNotFoundError) as exc:
+            raise RuntimeErrorBase(str(exc) if isinstance(exc, native_input.NativeInputError) else "native_input_stale") from exc
 
     def _durable_host_process_command(
         self,
@@ -8988,8 +9757,16 @@ class HostNativeCliMixin:
         exit_path: Path,
         timeout_sec: float | None = None,
         stdin_path: Path | None = None,
+        native_input_context: dict[str, object] | None = None,
     ) -> list[str]:
         """Wrap a native CLI so the surviving process owns its terminal marker."""
+        if native_input_context is not None:
+            context_path = run_root / "native-input-context.json"
+            native_input.publish(context_path, native_input_context)
+            relay_path = run_root / "native-input-relay.py"
+            relay_path.write_bytes(Path(native_input.__file__).read_bytes())
+            relay_path.chmod(0o700)
+            command = [sys.executable, str(relay_path), str(context_path), *command]
         wrapper_path = run_root / "native-process-supervisor.py"
         wrapper_path.write_text(
             """#!/usr/bin/env python3
@@ -9234,6 +10011,108 @@ raise SystemExit(exit_code)
             return str(instruction or "").strip()
         return self._instruction_with_completion_contract(instruction)
 
+    def _native_image_output_files(self, worker: dict, workspace_dir: str, scope: object, run_id: str):
+        if (
+            not self._conversation_mode_from_worker(worker)
+            or not isinstance(scope, dict) or not run_id or scope.get("run_id") != run_id
+            or scope.get("output_transport") != "artifact_sha256"
+            or scope.get("worker_id") != worker.get("worker_id")
+            or not worker.get("owner_id") or scope.get("owner_id") != worker.get("owner_id")
+            or scope.get("workspace_dir") != workspace_dir
+            or (worker.get("_run_attempt_id") and scope.get("attempt_id") != worker["_run_attempt_id"])
+        ):
+            return []
+        bundle = self._bootstrap_bundle_for_worker(worker)
+        scoped_worker = {**worker, "bootstrap_bundle_json": json.dumps({
+            **bundle, "native_input_images": scope.get("images", []),
+        })}
+        try:
+            return self._native_input_image_files(scoped_worker, workspace_dir)
+        except RuntimeErrorBase:
+            return []  # Existing privacy redaction keeps unavailable local paths hidden.
+
+    def provider_native_image_output(self, worker: dict, run: dict, output: str):
+        run_id = str(run.get("run_id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", run_id) or run.get("worker_id") != worker.get("worker_id"):
+            return output, []
+        scope = self._read_native_image_scope(str(worker["worker_id"]), run_id)
+        if str(scope.get("attempt_id") or "") != str(run.get("active_attempt_id") or ""):
+            return output, []
+        workspace_dir = str(worker.get("workspace_dir") or "")
+        images = self._native_image_output_files(worker, workspace_dir, scope, run_id)
+        return self._render_native_image_paths(output, images, workspace_dir), images
+
+    def _project_native_image_output(
+        self, worker: dict, info: RuntimeInfo, output: str, scope: object, run_id: str
+    ) -> str:
+        """Resolve only selected destinations when this provider owns the ref transport."""
+        if "](" not in output:
+            return output
+        images = self._native_image_output_files(worker, str(info.workspace_dir or ""), scope, run_id)
+        return self._render_native_image_paths(output, images, str(info.workspace_dir or ""))
+
+    @staticmethod
+    def _render_native_image_paths(output: str, images, workspace_dir: str) -> str:
+        workspace = Path(workspace_dir)
+        references: dict[str, str] = {}
+        for path, _mime_type, data in images:
+            reference = "artifact_sha256:" + hashlib.sha256(data).hexdigest()
+            relative = path.relative_to(workspace).as_posix()
+            for alias in (str(path), relative, "./" + relative):
+                references[alias] = reference
+
+        def render(match: re.Match[str]) -> str:
+            destination = match.group(2).strip()
+            if destination.startswith("<") and destination.endswith(">"):
+                destination = destination[1:-1]
+            destination = unquote(destination)
+            if destination.startswith("file://"):
+                try:
+                    parsed = urlsplit(destination)
+                except ValueError:
+                    return match.group(0)
+                if parsed.netloc not in {"", "localhost"} or parsed.query or parsed.fragment:
+                    return match.group(0)
+                destination = parsed.path
+            reference = references.get(destination)
+            return f"{match.group(1)}({reference})" if reference else match.group(0)
+
+        return re.sub(r"(!?\[(?:\\.|[^\]\r\n])*\])\((<[^>\r\n]*>|[^()\r\n]*)\)", render, output)
+
+    def _native_input_image_files(self, worker: dict, info: RuntimeInfo | str) -> list[tuple[Path, str, bytes]]:
+        if not self._conversation_mode_from_worker(worker):
+            return []
+        images = self._bootstrap_bundle_for_worker(worker).get("native_input_images", [])
+        if not isinstance(images, list) or len(images) > NATIVE_MEDIA_MAX_ITEMS:
+            raise RuntimeErrorBase("Native image input descriptor is invalid")
+        workspace = Path(info if isinstance(info, str) else str(info.workspace_dir or ""))
+        result = []
+        total_bytes = 0
+        for item in images:
+            try:
+                if not isinstance(item, dict):
+                    raise ValueError("Invalid image descriptor")
+                digest = item.get("sha256")
+                mime_type = item.get("type")
+                relative = Path(str(item.get("path") or ""))
+                if (
+                    not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest)
+                    or not isinstance(mime_type, str) or mime_type not in NATIVE_IMAGE_SUFFIXES
+                    or relative != Path("uploads/native-images") / (digest + NATIVE_IMAGE_SUFFIXES[mime_type])
+                    or not isinstance(item.get("bytes"), int) or isinstance(item.get("bytes"), bool)
+                ):
+                    raise ValueError("Invalid image identity")
+                data = _native_media_snapshot(workspace, relative, NATIVE_MEDIA_MAX_BYTES)
+                if len(data) != item.get("bytes") or hashlib.sha256(data).hexdigest() != digest:
+                    raise ValueError("Native image input bytes changed")
+                total_bytes += len(data)
+                if total_bytes > NATIVE_MEDIA_MAX_TOTAL_BYTES:
+                    raise ValueError("Native image input exceeds byte limit")
+                result.append((workspace / relative, mime_type, data))
+            except (OSError, ValueError) as exc:
+                raise RuntimeErrorBase("Native image input is unavailable or changed") from exc
+        return result
+
     def _run_mode_from_worker(self, worker: dict | None) -> str:
         if not isinstance(worker, dict):
             return "mission"
@@ -9294,14 +10173,95 @@ raise SystemExit(exit_code)
         )
         return Path(raw).expanduser()
 
+    def _admitted_host_workspace(self, worker: dict) -> Path | None:
+        """Read this worker's exact durable process admission, never model output."""
+        worker_id = str(worker["worker_id"])
+        active = self._read_active_session(worker_id) or {}
+        expected_run = str(worker.get("_active_run_id") or worker.get("last_run_id") or "")
+        run_id = str(active.get("run_id") or expected_run)
+        if not run_id or (expected_run and run_id != expected_run):
+            return None
+        # The private session must still refer to this worker/run's owned transcript.
+        expected_stdout = str(self._run_root(worker_id, run_id) / "stdout.log")
+        if active and str(active.get("stdout_path") or "") != expected_stdout:
+            return None
+        raw = str(active.get("workspace_dir") or "")
+        if raw:
+            return Path(raw) if Path(raw).is_absolute() else None
+        # Older admissions already record the process cwd in the action audit.
+        # Require the exact run and its matching runtime-authored heartbeat path.
+        try:
+            with self._action_audit_path(worker_id).open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                start = max(0, handle.tell() - 1024 * 1024)
+                handle.seek(start)
+                if start:
+                    handle.readline()
+                lines = handle.read().splitlines()
+        except OSError:
+            return None
+        for line in reversed(lines):
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(record, dict) or not (
+                record.get("kind") == "run.started"
+                and record.get("worker_id") == worker_id
+                and record.get("run_id") == run_id
+                and record.get("runtime") == self.runtime_name
+                and record.get("execution_mode") == "host"
+            ):
+                continue
+            raw = str(record.get("cwd") or "")
+            path = Path(raw)
+            if not path.is_absolute():
+                continue
+            heartbeat_path = _active_run_status_path(path, run_id)
+            if active:
+                if str(active.get("heartbeat_path") or "") == str(heartbeat_path):
+                    return path
+                continue
+            # Idle release clears active process metadata, not the run's durable
+            # admission. Require the owned heartbeat to agree before any path use.
+            try:
+                if heartbeat_path.stat().st_size > 128 * 1024:
+                    continue
+                heartbeat = json.loads(heartbeat_path.read_text())
+            except (OSError, ValueError):
+                continue
+            if (isinstance(heartbeat, dict)
+                    and heartbeat.get("schema") == "glasshive.active_run.v1"
+                    and heartbeat.get("run_id") == run_id
+                    and heartbeat.get("runtime") == self.runtime_name
+                    and isinstance(heartbeat.get("worker"), dict)
+                    and heartbeat["worker"].get("worker_id") == worker_id
+                    and isinstance(heartbeat.get("transcript_paths"), dict)
+                    and heartbeat["transcript_paths"].get("stdout") == expected_stdout):
+                return path
+        return None
+
     def _host_workspace_dir(self, worker: dict) -> Path:
+        admitted = self._admitted_host_workspace(worker)
+        if admitted is not None:
+            return admitted
         existing = str(worker.get("workspace_dir") or "").strip()
         if existing:
             return Path(existing).expanduser()
         root = self._host_workspace_root(worker)
         if self._conversation_mode_from_worker(worker):
             return root
-        date_prefix = datetime.now().strftime("%Y-%m-%d")
+        # A mission receives its run ID at acceptance, before runtime setup.
+        # Runtime identity, not queued work, proves an existing workspace.
+        worker_id = str(worker["worker_id"])
+        if worker.get("last_run_id") and (
+                worker.get("state_dir") or worker.get("session_key")
+                or self._active_session_meta_path(worker_id).exists()
+                or self._action_audit_path(worker_id).exists()):
+            raise RuntimeErrorBase("The existing native worker's admitted workspace is unavailable")
+        created_at = str(worker.get("created_at") or "").strip()
+        created = datetime.fromisoformat(created_at.replace("Z", "+00:00")) if created_at else datetime.now()
+        date_prefix = created.strftime("%Y-%m-%d")
         alias = str(worker.get("alias") or worker.get("name") or worker.get("worker_id") or "project")
         slug = _safe_slug(alias)
         worker_suffix = _safe_slug(str(worker.get("worker_id") or "worker"))
@@ -9441,6 +10401,9 @@ raise SystemExit(exit_code)
         return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
 
     def _copy_host_codex_auth(self, target_codex_home: Path) -> None:
+        if native_installed_owner_id() is not None:
+            self._link_native_codex_auth(target_codex_home)
+            return
         source_auth = self._source_host_codex_home() / "auth.json"
         if not source_auth.exists() or not source_auth.is_file():
             return
@@ -9448,6 +10411,32 @@ raise SystemExit(exit_code)
         target_auth = target_codex_home / "auth.json"
         shutil.copy2(source_auth, target_auth)
         target_auth.chmod(0o600)
+
+    def _link_native_codex_auth(self, target_codex_home: Path) -> None:
+        """Keep the CLI-owned credential file shared; worker authority stays isolated."""
+        source_home = self._source_host_codex_home()
+        source_auth = source_home / "auth.json"
+        try:
+            for directory in (source_home, target_codex_home):
+                metadata = directory.lstat()
+                if (not directory.is_absolute() or directory.resolve(strict=True) != directory
+                    or not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) != 0o700):
+                    raise ValueError("unsafe native auth directory")
+            metadata = source_auth.lstat()
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600):
+                raise ValueError("unsafe native auth file")
+            target_auth = target_codex_home / "auth.json"
+            if target_auth.is_symlink():
+                if target_auth.readlink() != source_auth:
+                    raise ValueError("unrelated native auth link")
+            elif target_auth.exists():
+                raise ValueError("worker retains a separate credential file")
+            else:
+                target_auth.symlink_to(source_auth)
+        except (OSError, ValueError) as exc:
+            raise RuntimeErrorBase("Installed Codex login is unavailable or unsafe; reconnect through the installed native owner.") from exc
 
     def _project_private_capability_directory(self, source: Path, target: Path) -> None:
         """Expose an installed, read-mostly capability catalog without copying it into LIFE.
@@ -9585,15 +10574,32 @@ raise SystemExit(exit_code)
             return Path(raw).expanduser()
         return self._source_host_codex_home() / "plugins" / "cache"
 
-    def _host_codex_bundled_mcp_config(self, names: set[str]) -> str:
+    def _host_codex_bundled_mcp_config(self, names: set[str], source_config: str = "") -> str:
         if not names:
             return ""
         cache_root = self._host_codex_plugin_cache_root()
         if not cache_root.exists():
             return ""
+        try:
+            selections = tomllib.loads(source_config).get("plugins", {})
+        except (TypeError, tomllib.TOMLDecodeError):
+            selections = {}
+        if not isinstance(selections, dict):
+            selections = {}
         blocks: list[str] = []
         found: set[str] = set()
         for manifest in sorted(cache_root.rglob(".mcp.json")):
+            # A cached package is not an enabled installation. Only project a native
+            # server from a plugin the user currently enabled in the source config.
+            parts = manifest.relative_to(cache_root).parts
+            if len(parts) < 4:
+                continue
+            plugin_id = f"{parts[1]}@{parts[0]}"
+            selected = selections.get(plugin_id)
+            if plugin_id in self._host_plugin_denylist():
+                continue
+            if not isinstance(selected, dict) or selected.get("enabled") is not True:
+                continue
             try:
                 payload = json.loads(manifest.read_text())
             except (OSError, json.JSONDecodeError):
@@ -9639,12 +10645,39 @@ raise SystemExit(exit_code)
         codex_config_append: str,
         *,
         developer_instructions: str | None = None,
+        capability_bundle: dict[str, object] | None = None,
     ) -> str:
+        if _native_tools_disabled(capability_bundle or {}):
+            broker = capability_bundle.get("glasshive_capability_broker")
+            env = capability_bundle.get("env")
+            if (not isinstance(broker, dict) or broker.get("version") != 1
+                or not isinstance(broker.get("name"), str) or not broker["name"].strip()
+                or not isinstance(broker.get("url"), str) or not broker["url"].strip()
+                or not isinstance(env, dict) or not env.get("GLASSHIVE_CAPABILITY_BROKER_TOKEN")):
+                raise RuntimeErrorBase("Restricted native execution requires its signed capability broker")
+            return _render_toml_document({
+                "developer_instructions": developer_instructions or "",
+                "sandbox_mode": "read-only",
+                "approval_policy": "never",
+                "web_search": "disabled",
+                "project_doc_max_bytes": 0,
+                # The tool engine forwards the signed broker's calls; it does not grant host tools.
+                "features": {"code_mode_host": True,
+                    **{name: False for name in _CODEX_RESTRICTED_NATIVE_FEATURES}},
+                "mcp_servers": {broker["name"]: {
+                    "url": broker["url"],
+                    # The signed broker owns the admitted operation's authorization.
+                    # Codex's annotation-based "auto" still prompts under read-only.
+                    "default_tools_approval_mode": "approve",
+                    "bearer_token_env_var": "GLASSHIVE_CAPABILITY_BROKER_TOKEN",
+                }},
+            })
         append = codex_config_append.strip()
         append_names = _codex_mcp_server_names(append)
         preserve_names = self._host_codex_native_mcp_allowlist() - append_names
         source_config_path = self._source_host_codex_home() / "config.toml"
         preserved = ""
+        source_config = ""
         if source_config_path.exists() and source_config_path.is_file():
             try:
                 source_config = source_config_path.read_text()
@@ -9652,7 +10685,9 @@ raise SystemExit(exit_code)
                 source_config = ""
             preserved = _sanitize_codex_source_config(source_config, preserve_names, append_names)
         preserved_names = _codex_mcp_server_names(preserved)
-        plugin_preserved = self._host_codex_bundled_mcp_config(preserve_names - preserved_names)
+        plugin_preserved = self._host_codex_bundled_mcp_config(
+            preserve_names - preserved_names, source_config
+        )
         plugin_names = _codex_mcp_server_names(plugin_preserved)
         known_native = self._host_codex_known_native_mcp_config(
             preserve_names - preserved_names - plugin_names
@@ -9660,6 +10695,17 @@ raise SystemExit(exit_code)
         native = "\n\n".join(
             part for part in (preserved, plugin_preserved, known_native) if part.strip()
         ).strip()
+        # Native stdio tools connect to services of the signed-in OS owner. Their
+        # default HOME must not become the worker's isolated conversation home.
+        # Preserve an explicitly configured server HOME; never change worker state.
+        native_payload = tomllib.loads(native) if native else {}
+        native_servers = native_payload.get("mcp_servers", {})
+        for name in preserve_names:
+            server = native_servers.get(name) if isinstance(native_servers, dict) else None
+            if not isinstance(server, dict) or not server.get("command") or server.get("enabled") is False:
+                continue
+            server.setdefault("env", {}).setdefault("HOME", str(Path.home()))
+        native = _render_toml_document(native_payload) if native_payload else ""
         personality = self._host_codex_personality()
         native = _apply_codex_personality(native, personality)
         native = _apply_codex_developer_instructions(native, developer_instructions)
@@ -9686,6 +10732,18 @@ raise SystemExit(exit_code)
             and "developer_instructions" in bundle
             else None
         )
+        if _native_tools_disabled(bundle):
+            config_path = self._host_codex_home(worker) / "config.toml"
+            expected = self._host_codex_worker_config(
+                "", developer_instructions=developer_instructions, capability_bundle=bundle,
+            )
+            try:
+                actual = config_path.read_text()
+            except OSError as exc:
+                raise RuntimeErrorBase("Restricted native policy is unavailable; refusing to launch") from exc
+            if actual.strip() != expected.strip():
+                raise RuntimeErrorBase("Restricted native policy changed; refusing to launch")
+            return
         if not denied_plugins and personality == "inherit" and developer_instructions is None:
             return
         config_path = self._host_codex_home(worker) / "config.toml"
@@ -9706,6 +10764,88 @@ raise SystemExit(exit_code)
             developer_instructions=developer_instructions,
         )
 
+    def _host_claude_project_mcp_payload(
+        self, bundle: dict[str, object], project_mcp: dict[str, object],
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        from .native_mcp_tool_filter import selected_filter
+
+        payload = claude_project_mcp_payload_for_bundle(bundle, project_mcp)
+        filters: dict[str, object] = {}
+        if (_native_tools_disabled(bundle)
+            or str(bundle.get("access_mode") or "full").strip().lower() != "full"):
+            return payload, filters
+        native = tomllib.loads(self._host_codex_worker_config(""))
+        servers = payload.setdefault("mcpServers", {})
+        for name, server in native.get("mcp_servers", {}).items():
+            if (name in servers or not isinstance(server, dict)
+                or server.get("enabled") is False or not server.get("command")):
+                continue
+            # Claude has no per-server cwd selector. Tool restrictions are enforced
+            # separately on the selected MCP child's stdio transport.
+            if server.get("cwd"):
+                logger.warning("Native MCP %s has settings unsupported by Claude; not projected", name)
+                continue
+            rule = selected_filter(server)
+            if rule is not None:
+                filters[name] = rule
+            env = dict(server.get("env") or {})
+            for key in server.get("env_vars") or []:
+                if key in os.environ:
+                    env.setdefault(key, os.environ[key])
+            servers[name] = {"type": "stdio", "command": server["command"],
+                             "args": list(server.get("args") or []), "env": env}
+        return payload, filters
+
+    def _write_host_claude_mcp_config(
+        self, worker: dict, target: Path, bundle: dict[str, object], project_mcp: dict,
+    ) -> None:
+        payload, filters = self._host_claude_project_mcp_payload(bundle, project_mcp)
+        state = self._state_dir(str(worker["worker_id"]))
+        state.mkdir(parents=True, exist_ok=True)
+        policies = {}
+        transport = Path(__file__).with_name("native_mcp_tool_filter.py")
+        for name, rule in filters.items():
+            server = payload["mcpServers"][name]
+            policy = state / ("native-mcp-tools-" + hashlib.sha256(name.encode()).hexdigest() + ".json")
+            data = (json.dumps({"command": server["command"], "args": server["args"],
+                "filter": rule}, sort_keys=True) + "\n").encode()
+            policy.write_bytes(data)
+            policy.chmod(0o600)
+            digest = hashlib.sha256(data).hexdigest()
+            server.update(command=sys.executable, args=[str(transport), str(policy), digest])
+            policies[name] = {"path": str(policy), "sha256": digest}
+        data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+        target.write_bytes(data)
+        target.chmod(0o600)
+        identity = state / "native-mcp-tool-policy.json"
+        identity.write_text(json.dumps({"mcp_path": str(target.resolve()),
+            "mcp_sha256": hashlib.sha256(data).hexdigest(), "policies": policies}, sort_keys=True) + "\n")
+        identity.chmod(0o600)
+
+    def _assert_host_claude_mcp_config(self, worker: dict, mcp_path: Path) -> None:
+        from .native_mcp_tool_filter import read_policy
+
+        identity = self._state_dir(str(worker["worker_id"])) / "native-mcp-tool-policy.json"
+        if not identity.exists():
+            if mcp_path.is_file():
+                raise RuntimeErrorBase("Claude native MCP tool policy is missing; prepare the workspace again")
+            return
+        try:
+            metadata = json.loads(identity.read_bytes())
+            if Path(metadata["mcp_path"]) != mcp_path.resolve():
+                raise ValueError("Native MCP policy points to a different config")
+            data = mcp_path.read_bytes()
+            if hashlib.sha256(data).hexdigest() != metadata["mcp_sha256"]:
+                raise ValueError("Native MCP config changed after materialization")
+            servers = json.loads(data)["mcpServers"]
+            transport = Path(__file__).with_name("native_mcp_tool_filter.py")
+            for name, policy in metadata["policies"].items():
+                read_policy(Path(policy["path"]), policy["sha256"])
+                if not transport.is_file() or servers[name]["command"] != sys.executable or servers[name]["args"] != [str(transport), policy["path"], policy["sha256"]]:
+                    raise ValueError("Native MCP transport does not match its selected policy")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeErrorBase("Claude native MCP tool policy is unavailable or stale") from exc
+
     def _write_host_project_mcp_files(self, worker: dict, workspace: Path, bundle: dict[str, object]) -> None:
         """Project scoped MCP/client config for host-native workers.
 
@@ -9719,12 +10859,17 @@ raise SystemExit(exit_code)
 
         Files are owner-only because they can contain scoped broker grants or local CLI config.
         """
+        require_native_installed_owner(worker.get("owner_id"))
         project_mcp = bundle.get("claude_project_mcp")
-        if isinstance(project_mcp, dict):
-            payload = claude_project_mcp_payload_for_bundle(bundle, project_mcp)
+        if isinstance(project_mcp, dict) or worker.get("profile") == "claude-code":
             target = workspace / ".mcp.json"
-            target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-            target.chmod(0o600)
+            if worker.get("profile") == "claude-code":
+                self._write_host_claude_mcp_config(
+                    worker, target, bundle, project_mcp if isinstance(project_mcp, dict) else {})
+            else:
+                payload = claude_project_mcp_payload_for_bundle(bundle, project_mcp)
+                target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+                target.chmod(0o600)
 
         settings_local = bundle.get("claude_settings_local")
         if isinstance(settings_local, dict):
@@ -9766,6 +10911,7 @@ raise SystemExit(exit_code)
     def _write_conversation_runtime_files(self, worker: dict, bundle: dict[str, object]) -> None:
         """Write harness configuration under private worker state, never inside LIFE."""
 
+        require_native_installed_owner(worker.get("owner_id"))
         profile = str(worker.get("profile") or "").strip()
         if profile == "codex-cli":
             codex_home = self._host_codex_home(worker)
@@ -9773,6 +10919,7 @@ raise SystemExit(exit_code)
             codex_home.chmod(0o700)
             codex_config = self._host_codex_worker_config(
                 str(bundle.get("codex_config_append") or ""),
+                capability_bundle=bundle,
                 developer_instructions=(
                     str(bundle.get("developer_instructions") or "")
                     if "developer_instructions" in bundle
@@ -9784,7 +10931,8 @@ raise SystemExit(exit_code)
             config_path.chmod(0o600)
             if not worker.get("_glasshive_provider_account_bound"):
                 self._copy_host_codex_auth(codex_home)
-            self._project_host_codex_capability_roots(codex_home)
+            if not _native_tools_disabled(bundle):
+                self._project_host_codex_capability_roots(codex_home)
             return
 
         if profile != "claude-code":
@@ -9816,15 +10964,8 @@ raise SystemExit(exit_code)
         except FileNotFoundError:
             pass
         mcp_path = state_dir / "conversation-mcp.json"
-        if isinstance(project_mcp, dict):
-            payload = claude_project_mcp_payload_for_bundle(bundle, project_mcp)
-            mcp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-            mcp_path.chmod(0o600)
-        else:
-            try:
-                mcp_path.unlink()
-            except FileNotFoundError:
-                pass
+        self._write_host_claude_mcp_config(
+            worker, mcp_path, bundle, project_mcp if isinstance(project_mcp, dict) else {})
 
     def _materialize_workspace(self, worker: dict, workspace: Path) -> None:
         root = self._host_workspace_root(worker)
@@ -9833,9 +10974,11 @@ raise SystemExit(exit_code)
             raise RuntimeErrorBase(f"Host workspace root is not writable: {root}")
         workspace.mkdir(parents=True, exist_ok=True)
         if self._conversation_mode_from_worker(worker):
+            bundle = self._bootstrap_bundle_for_worker(worker)
+            self._materialize_workspace_files(worker, workspace, bundle)
             self._write_conversation_runtime_files(
                 worker,
-                self._bootstrap_bundle_for_worker(worker),
+                bundle,
             )
             return
         bundle = self._bootstrap_bundle_for_worker(worker)
@@ -9998,6 +11141,7 @@ raise SystemExit(exit_code)
         path.chmod(0o600)
 
     def _host_env(self, worker: dict, run_id: str | None = None) -> dict[str, str]:
+        require_native_installed_owner(worker.get("owner_id"))
         env: dict[str, str] = {}
         # USER/LOGNAME are required for macOS Keychain-backed CLIs (e.g. claude-code's
         # subscription auth resolves the keychain item by user); without them the worker
@@ -10048,9 +11192,14 @@ raise SystemExit(exit_code)
 
     def _host_runtime_info(self, worker: dict, *, pid: int | None = None) -> RuntimeInfo:
         worker_id = worker["worker_id"]
-        session_key = self._read_session_key(worker_id) or worker.get("session_key") or self._default_session_key(worker)
-        if session_key:
-            self._write_session_key(worker_id, session_key)
+        session_key = None
+        if not self._provider_session_starts_fresh(worker):
+            session_key = (
+                self._read_session_key(worker_id)
+                or worker.get("session_key")
+                or self._default_session_key(worker)
+            )
+            self._remember_native_session_key(worker, session_key)
         workspace = self._host_workspace_dir(worker)
         return RuntimeInfo(
             runtime=self.runtime_name,
@@ -10096,6 +11245,11 @@ raise SystemExit(exit_code)
         self._state_dir(worker_id).mkdir(parents=True, exist_ok=True)
         self._home_dir(worker_id).mkdir(parents=True, exist_ok=True)
         workspace = self._host_workspace_dir(worker)
+        worker = {**worker, "workspace_dir": str(workspace)}
+        info = self._host_runtime_info(worker, pid=self._active_pid(worker_id))
+        # Keep the selected path durable if materialization is interrupted.
+        with runtime_start_boundary(worker):
+            notify_runtime_info(worker, info)
         self._materialize_workspace(worker, workspace)
         self._write_action_audit(
             worker,
@@ -10106,7 +11260,7 @@ raise SystemExit(exit_code)
                 "message": f"Host-native {self.runtime_name} workspace ready.",
             },
         )
-        return self._host_runtime_info(worker, pid=self._active_pid(worker_id))
+        return info
 
     def prepare_worker_workspace(self, worker: dict) -> RuntimeInfo:
         """Materialize a host workspace without launching an agent process."""
@@ -10114,6 +11268,7 @@ raise SystemExit(exit_code)
         self._state_dir(worker_id).mkdir(parents=True, exist_ok=True)
         self._home_dir(worker_id).mkdir(parents=True, exist_ok=True)
         workspace = self._host_workspace_dir(worker)
+        worker = {**worker, "workspace_dir": str(workspace)}
         self._materialize_workspace(worker, workspace)
         return self._host_runtime_info(worker, pid=None)
 
@@ -10159,7 +11314,7 @@ raise SystemExit(exit_code)
         run_id = str(active_session.get("run_id") or "").strip()
         if not run_id:
             return
-        workspace = Path(str(worker.get("workspace_dir") or self._host_workspace_dir(worker)))
+        workspace = self._host_workspace_dir(worker)
         raw_stdout_path = str(active_session.get("stdout_path") or "").strip()
         raw_stderr_path = str(active_session.get("stderr_path") or "").strip()
         raw_exit_path = str(active_session.get("exit_path") or "").strip()
@@ -10227,58 +11382,232 @@ raise SystemExit(exit_code)
         )
 
     def pause_worker(self, worker: dict) -> RuntimeInfo:
-        active_session = self._read_active_session(worker["worker_id"])
-        active_run_id = str(worker.get("_active_run_id") or "").strip() or None
-        if not active_run_id and active_session and self._active_pid(worker["worker_id"]):
-            active_run_id = str(active_session.get("run_id") or "").strip() or None
-        if active_run_id:
-            self._note_stop_reason(worker["worker_id"], "paused", run_id=active_run_id)
-        self._stop_active_process(worker["worker_id"], worker=worker, run_id=active_run_id)
+        run_id = str(worker.get("_active_run_id") or "").strip()
+        active_session, expected_session = self._confirmed_host_control_generation(
+            worker, run_id=run_id, operation="pause_run"
+        )
+        attempt_id = str(active_session.get("attempt_id") or "").strip()
+        self._write_host_control_receipt(
+            worker,
+            active_session=active_session,
+            run_id=run_id,
+            operation="pause_run",
+            confirmed=False,
+        )
+        self._note_stop_reason(
+            worker["worker_id"],
+            "paused",
+            run_id=run_id,
+            attempt_id=attempt_id,
+        )
+        try:
+            confirmed = self._stop_active_process(
+                worker["worker_id"],
+                worker=worker,
+                run_id=run_id,
+                expected_session=expected_session,
+                control_session=active_session,
+            )
+        except Exception:
+            self._pop_stop_reason(
+                worker["worker_id"], run_id=run_id, attempt_id=attempt_id
+            )
+            raise
+        if not confirmed:
+            self._pop_stop_reason(
+                worker["worker_id"], run_id=run_id, attempt_id=attempt_id
+            )
+            raise RuntimeErrorBase("Host run termination could not be confirmed")
+        self._write_host_control_receipt(
+            worker,
+            active_session=active_session,
+            run_id=run_id,
+            operation="pause_run",
+            confirmed=True,
+        )
         self._write_stopped_active_run_evidence(
             worker,
             active_session=active_session,
             stop_reason="paused",
             error_text="Worker was paused by the operator",
         )
-        self._clear_active_session(worker["worker_id"])
         self._append_work_log(worker, "Worker paused by operator.")
         return self._host_runtime_info(worker, pid=None)
 
     def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
-        active_session = self._read_active_session(worker["worker_id"])
-        if active_session and run_id and active_session.get("run_id") != run_id:
-            active_session = None
-        active_run_id = str(run_id or worker.get("_active_run_id") or "").strip() or None
-        if not active_run_id and active_session and self._active_pid(worker["worker_id"]):
-            active_run_id = str(active_session.get("run_id") or "").strip() or None
-        if active_run_id or self._active_pid(worker["worker_id"]):
-            self._note_stop_reason(worker["worker_id"], "interrupted", run_id=active_run_id)
-            self._stop_active_process(worker["worker_id"], worker=worker, run_id=active_run_id)
+        exact_run_id = str(run_id or worker.get("_active_run_id") or "").strip()
+        operation = (
+            "steer_run"
+            if str(worker.get("compute_release_kind") or "") == "steer_run"
+            else "interrupt_run"
+        )
+        active_session, expected_session = self._confirmed_host_control_generation(
+            worker, run_id=exact_run_id, operation=operation
+        )
+        attempt_id = str(active_session.get("attempt_id") or "").strip()
+        self._write_host_control_receipt(
+            worker,
+            active_session=active_session,
+            run_id=exact_run_id,
+            operation=operation,
+            confirmed=False,
+        )
+        self._note_stop_reason(
+            worker["worker_id"],
+            "interrupted",
+            run_id=exact_run_id,
+            attempt_id=attempt_id,
+        )
+        try:
+            confirmed = self._stop_active_process(
+                worker["worker_id"],
+                worker=worker,
+                run_id=exact_run_id,
+                expected_session=expected_session,
+                control_session=active_session,
+            )
+        except Exception:
+            self._pop_stop_reason(
+                worker["worker_id"],
+                run_id=exact_run_id,
+                attempt_id=attempt_id,
+            )
+            raise
+        if not confirmed:
+            self._pop_stop_reason(
+                worker["worker_id"],
+                run_id=exact_run_id,
+                attempt_id=attempt_id,
+            )
+            raise RuntimeErrorBase("Host run termination could not be confirmed")
+        self._write_host_control_receipt(
+            worker,
+            active_session=active_session,
+            run_id=exact_run_id,
+            operation=operation,
+            confirmed=True,
+        )
         self._write_stopped_active_run_evidence(
             worker,
             active_session=active_session,
             stop_reason="interrupted",
             error_text="Worker run was interrupted by the operator",
         )
-        self._clear_active_session(worker["worker_id"])
         self._append_work_log(worker, "Active run interrupted by operator.")
-        return self._host_runtime_info(worker, pid=None)
+        pending_pid = None
+        return self._host_runtime_info(worker, pid=pending_pid)
 
     def terminate_worker(self, worker: dict) -> RuntimeInfo:
+        run_id = str(worker.get("_active_run_id") or "").strip()
+        operation = str(worker.get("compute_release_kind") or "").strip() or "terminate_worker"
         active_session = self._read_active_session(worker["worker_id"])
-        active_run_id = str(worker.get("_active_run_id") or "").strip() or None
-        if not active_run_id and active_session and self._active_pid(worker["worker_id"]):
-            active_run_id = str(active_session.get("run_id") or "").strip() or None
-        if active_run_id:
-            self._note_stop_reason(worker["worker_id"], "terminated", run_id=active_run_id)
-        self._stop_active_process(worker["worker_id"], worker=worker, run_id=active_run_id)
+        expected_session: dict[str, object] | None = (
+            dict(active_session) if isinstance(active_session, dict) else None
+        )
+        control_session: dict[str, object] | None = active_session
+        if run_id and isinstance(worker.get("_host_run_lease"), dict):
+            active_session, expected_session = self._confirmed_host_control_generation(
+                worker, run_id=run_id, operation=operation
+            )
+            control_session = active_session
+        elif run_id:
+            active_status = self.host_active_process_status(worker)
+            if not active_session:
+                if active_status.get("state") != "absent":
+                    raise RuntimeErrorBase(
+                        "The exact host process identity is not confirmed"
+                    )
+            elif (
+                str(active_session.get("run_id") or "").strip() != run_id
+                or str(active_status.get("run_id") or "").strip() != run_id
+                or active_status.get("state") != "absent"
+            ):
+                raise RuntimeErrorBase(
+                    "The exact host process identity is not confirmed"
+                )
+            else:
+                with self._process_lock:
+                    inactive_process = self._active_processes.get(
+                        worker["worker_id"]
+                    )
+                if inactive_process is not None and inactive_process.poll() is None:
+                    raise RuntimeErrorBase(
+                        "The exact host process identity is not confirmed"
+                    )
+                if not self._finalize_owned_host_generation(
+                    worker["worker_id"],
+                    expected_process=inactive_process,
+                    expected_session=active_session,
+                    expected_slot_token=(
+                        str(active_session.get("host_slot_token") or "").strip()
+                        or None
+                    ),
+                    clear_session=True,
+                ):
+                    raise RuntimeErrorBase(
+                        "Host run ownership changed during exact-run cleanup"
+                    )
+                active_session = None
+                expected_session = None
+                control_session = None
+        if not run_id and active_session:
+            raise RuntimeErrorBase(
+                "The exact host process identity is not confirmed"
+            )
+        if run_id and active_session:
+            self._write_host_control_receipt(
+                worker,
+                active_session=active_session,
+                run_id=run_id,
+                operation=operation,
+                confirmed=False,
+            )
+        stop_attempt_id = str((active_session or {}).get("attempt_id") or "").strip()
+        if run_id and active_session:
+            self._note_stop_reason(
+                worker["worker_id"],
+                "terminated",
+                run_id=run_id,
+                attempt_id=stop_attempt_id,
+            )
+        try:
+            confirmed = self._stop_active_process(
+                worker["worker_id"],
+                worker=worker,
+                run_id=run_id or None,
+                expected_session=expected_session,
+                control_session=control_session,
+            )
+        except Exception:
+            if run_id and active_session:
+                self._pop_stop_reason(
+                    worker["worker_id"],
+                    run_id=run_id,
+                    attempt_id=stop_attempt_id,
+                )
+            raise
+        if not confirmed:
+            if run_id and active_session:
+                self._pop_stop_reason(
+                    worker["worker_id"],
+                    run_id=run_id,
+                    attempt_id=stop_attempt_id,
+                )
+            raise RuntimeErrorBase("Host run termination could not be confirmed")
+        if run_id and active_session:
+            self._write_host_control_receipt(
+                worker,
+                active_session=active_session,
+                run_id=run_id,
+                operation=operation,
+                confirmed=True,
+            )
         self._write_stopped_active_run_evidence(
             worker,
             active_session=active_session,
             stop_reason="terminated",
             error_text="Worker was terminated by the operator",
         )
-        self._clear_active_session(worker["worker_id"])
         self._append_work_log(worker, "Worker terminated by operator.")
         return self._host_runtime_info(worker, pid=None)
 
@@ -10380,33 +11709,77 @@ raise SystemExit(exit_code)
         *,
         worker: dict | None = None,
         run_id: str | None = None,
+        expected_session: dict[str, object] | None | object = (
+            _ACTIVE_SESSION_EXPECTATION_UNSET
+        ),
+        control_session: dict[str, object] | None = None,
     ) -> bool:
-        active_session = self._read_active_session(worker_id)
         lease = worker.get("_host_run_lease") if isinstance(worker, dict) else None
+        session_path = self._active_session_meta_path(worker_id)
+
+        with self._active_session_file_lock(worker_id):
+            active_session = self._read_active_session(worker_id)
+            if active_session is None and session_path.exists():
+                return False
+            if expected_session is _ACTIVE_SESSION_EXPECTATION_UNSET:
+                expected_snapshot = (
+                    dict(active_session) if isinstance(active_session, dict) else None
+                )
+            else:
+                expected_snapshot = (
+                    dict(expected_session)
+                    if isinstance(expected_session, dict)
+                    else None
+                )
+            if self._active_session_fingerprint(
+                active_session
+            ) != self._active_session_fingerprint(expected_snapshot):
+                return False
+
+        captured_control_session = (
+            dict(control_session)
+            if isinstance(control_session, dict)
+            else (dict(active_session) if isinstance(active_session, dict) else None)
+        )
         if (
             active_session
-            and run_id
-            and str(active_session.get("run_id") or "") != run_id
+            and captured_control_session
+            and self._active_session_fingerprint(active_session)
+            != self._active_session_fingerprint(captured_control_session)
         ):
             return False
-        if (
-            isinstance(lease, dict)
-            and run_id
-            and str(lease.get("run_id") or "") != run_id
-        ):
-            return False
+        for candidate in (active_session, captured_control_session):
+            if (
+                candidate
+                and run_id
+                and str(candidate.get("run_id") or "") != run_id
+            ):
+                return False
+        if isinstance(lease, dict):
+            if not run_id or str(lease.get("run_id") or "") != run_id:
+                return False
+            lease_session = active_session or captured_control_session
+            if not lease_session or not self._host_control_generation_matches(
+                worker=worker or {},
+                lease=lease,
+                session=lease_session,
+                run_id=run_id,
+            ):
+                return False
+
         with self._process_lock:
             process = self._active_processes.get(worker_id)
         local_process = process if process and process.poll() is None else None
 
+        identity_session = active_session or captured_control_session
         try:
             recorded_pid = int(
-                (active_session or {}).get("process_pid")
+                (identity_session or {}).get("process_pid")
                 or (lease or {}).get("pid")
                 or 0
             )
             recorded_group = int(
-                (active_session or {}).get("process_group")
+                (identity_session or {}).get("process_group")
                 or (lease or {}).get("process_group")
                 or 0
             )
@@ -10414,84 +11787,164 @@ raise SystemExit(exit_code)
             recorded_pid = 0
             recorded_group = 0
         recorded_identity = str(
-            (active_session or {}).get("process_start_identity")
+            (identity_session or {}).get("process_start_identity")
             or (lease or {}).get("process_start_identity")
             or ""
         ).strip()
+        expected_slot_token = (
+            str((identity_session or {}).get("host_slot_token") or "").strip()
+            or None
+        )
 
         if local_process is not None:
-            target_pid = local_process.pid
-            target_identity = recorded_identity or self._process_start_identity(target_pid)
+            try:
+                local_pid = int(local_process.pid)
+            except (TypeError, ValueError):
+                return False
+            if (
+                not (active_session or lease)
+                or recorded_pid <= 0
+                or recorded_pid != local_pid
+                or not recorded_identity
+                or recorded_group <= 0
+            ):
+                return False
+            current_identity = self._process_start_identity(local_pid)
+            if not current_identity or current_identity != recorded_identity:
+                return False
+            target_pid = local_pid
+            target_identity = recorded_identity
         elif recorded_pid > 0 and recorded_identity:
             if not self._recorded_process_is_running(recorded_pid, recorded_identity):
-                if active_session and not self._clear_active_session(
-                    worker_id, expected_session=active_session
-                ):
-                    raise RuntimeErrorBase(
-                        "Host run ownership changed during exact-run stop"
-                    )
-                self._release_host_slot(worker_id)
-                return True
+                return self._finalize_owned_host_generation(
+                    worker_id,
+                    expected_process=process,
+                    expected_session=expected_snapshot,
+                    expected_slot_token=expected_slot_token,
+                    clear_session=True,
+                )
+            if recorded_group <= 0:
+                return False
             target_pid = recorded_pid
             target_identity = recorded_identity
-        elif active_session or lease:
+        elif active_session or captured_control_session or lease:
             # A foreign process may only act on a persisted PID when the PID's
             # start identity is present. Legacy PID-only records fail closed.
             return False
         else:
+            with self._process_lock:
+                current_process = self._active_processes.get(worker_id)
+                if current_process and current_process.poll() is None:
+                    return False
             return True
 
-        def signal_process_group(sig: signal.Signals) -> None:
-            try:
-                process_group = recorded_group or os.getpgid(target_pid)
-                if process_group != os.getpgrp():
-                    os.killpg(process_group, sig)
-                else:
-                    os.kill(target_pid, sig)
-            except OSError:
-                pass
+        def signal_exact_generation(sig: signal.Signals) -> str:
+            """Signal only while durable and in-memory ownership is still exact."""
 
-        try:
-            signal_process_group(signal.SIGTERM)
-            if local_process is not None:
-                try:
-                    local_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    signal_process_group(signal.SIGKILL)
+            with self._active_session_file_lock(worker_id):
+                current_session = self._read_active_session(worker_id)
+                if current_session is None and session_path.exists():
+                    return "changed"
+                if self._active_session_fingerprint(
+                    current_session
+                ) != self._active_session_fingerprint(expected_snapshot):
+                    return "changed"
+                signal_session = current_session or captured_control_session
+                if isinstance(lease, dict):
+                    if (
+                        not signal_session
+                        or not run_id
+                        or not self._host_control_generation_matches(
+                            worker=worker or {},
+                            lease=lease,
+                            session=signal_session,
+                            run_id=run_id,
+                        )
+                    ):
+                        return "changed"
+                with self._process_lock:
+                    current_process = self._active_processes.get(worker_id)
+                    if local_process is not None:
+                        if current_process is not local_process:
+                            return "changed"
+                        if local_process.poll() is not None:
+                            return "gone"
+                    elif current_process and current_process.poll() is None:
+                        return "changed"
+
+                    current_identity = self._process_start_identity(target_pid)
+                    if current_identity != target_identity:
+                        if local_process is not None:
+                            return "uncertain"
+                        if current_identity or self._recorded_pid_is_proven_gone(
+                            target_pid, target_identity
+                        ):
+                            return "gone"
+                        return "uncertain"
+                    try:
+                        if recorded_group != os.getpgrp():
+                            os.killpg(recorded_group, sig)
+                        else:
+                            os.kill(target_pid, sig)
+                    except ProcessLookupError:
+                        return "gone"
+                    except OSError:
+                        return "uncertain"
+                    return "sent"
+
+        signal_state = signal_exact_generation(signal.SIGTERM)
+        if signal_state in {"changed", "uncertain"}:
+            return False
+        if signal_state == "gone":
+            confirmed = True
+        elif local_process is not None:
+            try:
+                local_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                kill_state = signal_exact_generation(signal.SIGKILL)
+                if kill_state in {"changed", "uncertain"}:
+                    confirmed = False
+                elif kill_state == "gone":
+                    confirmed = True
+                else:
                     try:
                         local_process.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         pass
-                confirmed = local_process.poll() is not None
+                    confirmed = local_process.poll() is not None
             else:
-                confirmed = self._wait_for_recorded_process_exit(
-                    target_pid, target_identity, timeout=5
-                )
-                if not confirmed:
-                    signal_process_group(signal.SIGKILL)
+                confirmed = local_process.poll() is not None
+        else:
+            confirmed = self._wait_for_recorded_process_exit(
+                target_pid, target_identity, timeout=5
+            )
+            if not confirmed:
+                kill_state = signal_exact_generation(signal.SIGKILL)
+                if kill_state in {"changed", "uncertain"}:
+                    confirmed = False
+                elif kill_state == "gone":
+                    confirmed = True
+                else:
                     confirmed = self._wait_for_recorded_process_exit(
                         target_pid, target_identity, timeout=2
                     )
-        finally:
-            if local_process is not None and local_process.poll() is not None:
-                self._clear_process(worker_id, expected_process=local_process)
-        if not confirmed:
-            raise RuntimeErrorBase(
-                f"Host process {target_pid} remained alive after TERM/KILL"
-            )
         if confirmed:
-            if active_session and not self._clear_active_session(
-                worker_id, expected_session=active_session
+            if not self._finalize_owned_host_generation(
+                worker_id,
+                expected_process=process,
+                expected_session=expected_snapshot,
+                expected_slot_token=expected_slot_token,
+                clear_session=True,
             ):
                 raise RuntimeErrorBase(
                     "Host run ownership changed during exact-run stop"
                 )
-            self._release_host_slot(worker_id)
         return confirmed
 
-    def _acquire_host_slot(self, worker: dict) -> None:
+    def _acquire_host_slot(self, worker: dict) -> str:
         worker_id = worker["worker_id"]
         lane = self._host_capacity_lane(worker)
+        slot_token = secrets.token_hex(16)
         with self._process_lock:
             error = self._host_capacity_error_locked(worker_id, lane)
             if error is not None:
@@ -10508,6 +11961,8 @@ raise SystemExit(exit_code)
             workers.add(worker_id)
             self._host_active_slots()[lane] = workers
             self._host_worker_lanes()[worker_id] = lane
+            self._host_slot_tokens()[worker_id] = slot_token
+        return slot_token
 
     def _host_capacity_error_locked(
         self,
@@ -10553,17 +12008,16 @@ raise SystemExit(exit_code)
                 self._host_capacity_lane(worker),
             )
 
-    def _release_host_slot(self, worker_id: str) -> None:
+    def _release_host_slot(
+        self,
+        worker_id: str,
+        *,
+        expected_slot_token: str | None | object = _HOST_SLOT_EXPECTATION_UNSET,
+    ) -> bool:
         with self._process_lock:
-            lane = self._host_worker_lanes().pop(worker_id, None)
-            if lane:
-                raw_active = self._host_active_slots().get(lane)
-                if isinstance(raw_active, set):
-                    raw_active.discard(worker_id)
-                    if not raw_active:
-                        self._host_active_slots().pop(lane, None)
-                elif raw_active == worker_id:
-                    self._host_active_slots().pop(lane, None)
+            return self._release_host_slot_locked(
+                worker_id, expected_slot_token=expected_slot_token
+            )
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         raise NotImplementedError
@@ -10586,6 +12040,22 @@ raise SystemExit(exit_code)
             return None
         return parsed if parsed > 0 else None
 
+    def _finish_host_run_generation(
+        self, worker: dict, run_id: str, process, session: dict | None,
+        slot_token: str, *, clear_session: bool,
+    ) -> bool:
+        """Clean up only the invocation's captured process, session, and capacity slot."""
+        if process is not None and process.poll() is None:
+            return self._stop_active_process(
+                str(worker["worker_id"]), worker=worker, run_id=run_id,
+                expected_session=session, control_session=session,
+            )
+        return self._finalize_owned_host_generation(
+            str(worker["worker_id"]), expected_process=process,
+            expected_session=session, expected_slot_token=slot_token,
+            clear_session=clear_session,
+        )
+
     def _run_conversation_task(
         self,
         worker: dict,
@@ -10598,7 +12068,17 @@ raise SystemExit(exit_code)
         effective_run_id = (run_id or secrets.token_hex(8)).strip()
         worker = {**worker, "_active_run_id": effective_run_id, "_glasshive_conversation_run": True}
         info = self.ensure_worker_ready(worker)
+        worker = {**worker, "workspace_dir": info.workspace_dir}
         command, env = self._build_command(worker, instruction, info)
+        native_image_bundle = self._bootstrap_bundle_for_worker(worker)
+        native_output_capabilities = native_image_bundle.get("provider_capabilities")
+        native_image_scope = {
+            "run_id": effective_run_id, "worker_id": worker["worker_id"],
+            "owner_id": worker.get("owner_id"), "workspace_dir": info.workspace_dir,
+            "images": native_image_bundle.get("native_input_images", []),
+            "attempt_id": str(worker.get("_run_attempt_id") or ""),
+            "output_transport": native_output_capabilities.get("native_image_output") if isinstance(native_output_capabilities, dict) else None,
+        }
         authority_receipt = self._native_provider_authority_receipt(
             worker,
             command=command,
@@ -10610,11 +12090,14 @@ raise SystemExit(exit_code)
         env["GLASSHIVE_RUN_MODE"] = "conversation"
         workspace = Path(str(info.workspace_dir or self._host_workspace_dir(worker)))
         workspace_side_effect_state = self._conversation_workspace_side_effect_state(workspace)
-        self._acquire_host_slot(worker)
+        host_slot_token = self._acquire_host_slot(worker)
 
         run_root = self._run_root(str(worker["worker_id"]), effective_run_id)
         run_root.mkdir(parents=True, exist_ok=True)
         run_root.chmod(0o700)
+        _atomic_write_private_text(
+            run_root / "native-image-scope.json", json.dumps(native_image_scope, sort_keys=True)
+        )
         raw_stdout = run_root / "stdout.log"
         raw_stderr = run_root / "stderr.log"
         host_stdin = run_root / "instruction.stdin"
@@ -10636,6 +12119,10 @@ raise SystemExit(exit_code)
         )
         run_timeout_sec = self._host_run_timeout_sec(timeout_sec)
         process: subprocess.Popen[str] | None = None
+        owned_session: dict[str, object] | None = None
+        startup_cleanup_unconfirmed = False
+        native_session_stop = Event()
+        native_session_thread: Thread | None = None
         try:
             with raw_stdout.open("w") as stdout_handle, raw_stderr.open("w") as stderr_handle:
                 raw_stdout.chmod(0o600)
@@ -10664,6 +12151,9 @@ raise SystemExit(exit_code)
                     {
                         "session_name": f"conversation-{effective_run_id[:12]}",
                         "run_id": effective_run_id,
+                        "attempt_id": str(worker.get("_run_attempt_id") or ""),
+                        "host_slot_token": host_slot_token,
+                        "workspace_dir": str(workspace),
                         "stdout_path": str(raw_stdout),
                         "stderr_path": str(raw_stderr),
                         "exit_path": str(exit_path),
@@ -10674,9 +12164,14 @@ raise SystemExit(exit_code)
                         "timeout_seconds": run_timeout_sec,
                         "instruction": instruction,
                         "run_mode": "conversation",
+                        "native_image_scope": native_image_scope,
                     },
+                    publish_run_start=callable(self._run_start_observer),
+                    worker=worker,
+                    spawned_process=process,
                 )
                 active_session = self._read_active_session(str(worker["worker_id"]))
+                owned_session = dict(active_session) if active_session else None
                 if not active_session:
                     self._stop_active_process(
                         str(worker["worker_id"]),
@@ -10686,6 +12181,16 @@ raise SystemExit(exit_code)
                     raise RuntimeErrorBase(
                         "Host-native process metadata was not durably recorded before launch"
                     )
+                native_session_thread = Thread(
+                    target=self._observe_native_session_events,
+                    args=(
+                        str(worker["worker_id"]), raw_stdout, native_session_stop,
+                        effective_run_id, str(worker.get("_run_attempt_id") or ""), 0, worker,
+                    ),
+                    name=f"glasshive-conversation-session-{effective_run_id[:12]}",
+                    daemon=True,
+                )
+                native_session_thread.start()
                 with runtime_start_boundary(worker):
                     self._release_durable_host_process(active_session)
                     notify_runtime_started(worker)
@@ -10706,12 +12211,24 @@ raise SystemExit(exit_code)
                 try:
                     exit_code = process.wait()
                 except subprocess.TimeoutExpired as exc:
-                    self._note_stop_reason(str(worker["worker_id"]), "terminated", run_id=effective_run_id)
-                    self._stop_active_process(str(worker["worker_id"]), worker=worker, run_id=effective_run_id)
+                    if not self._stop_active_process(
+                        str(worker["worker_id"]), worker=worker, run_id=effective_run_id,
+                        expected_session=owned_session, control_session=owned_session,
+                    ):
+                        raise RuntimeErrorBase("Host conversation ownership changed during timeout cleanup") from exc
                     raise RuntimeErrorBase(f"{self.runtime_name} timed out after {run_timeout_sec:g}s") from exc
+        except RunStartupRejectedError as exc:
+            startup_cleanup_unconfirmed = not exc.termination_confirmed
+            raise
         finally:
-            self._clear_process(str(worker["worker_id"]))
-            self._release_host_slot(str(worker["worker_id"]))
+            native_session_stop.set()
+            if native_session_thread:
+                native_session_thread.join(timeout=1)
+            if not startup_cleanup_unconfirmed and not self._finish_host_run_generation(
+                worker, effective_run_id, process, owned_session, host_slot_token,
+                clear_session=True,
+            ):
+                raise RuntimeErrorBase("Host conversation ownership changed during cleanup")
             try:
                 self._cleanup_conversation_workspace_side_effects(
                     workspace,
@@ -10730,7 +12247,8 @@ raise SystemExit(exit_code)
         exit_code = self._final_host_exit_code(exit_path, exit_code)
         stdout = raw_stdout.read_text() if raw_stdout.exists() else ""
         stderr = raw_stderr.read_text() if raw_stderr.exists() else ""
-        self._finalize_stop_reason(str(worker["worker_id"]), run_id=effective_run_id)
+        self._finalize_stop_reason(str(worker["worker_id"]), run_id=effective_run_id,
+                                   attempt_id=str((owned_session or {}).get("attempt_id") or ""))
         if exit_code != 0:
             detail = (_redact_text(stderr, max_chars=2000) or _redact_text(stdout, max_chars=2000)).strip()
             self._write_action_audit(
@@ -10745,8 +12263,10 @@ raise SystemExit(exit_code)
             raise RuntimeErrorBase(f"{self.runtime_name} exited with code {exit_code}: {detail}")
 
         session_key, output = self._parse_output(worker, stdout, stderr, info)
-        if session_key:
-            self._write_session_key(str(worker["worker_id"]), session_key)
+        self._remember_native_session_key(worker, session_key)
+        output = self._project_native_image_output(
+            worker, info, str(output or ""), native_image_scope, effective_run_id
+        )
         redacted_output = _redact_text(str(output or "").strip())
         if len(redacted_output) > _HOST_RUN_OUTPUT_MAX_CHARS:
             redacted_output = f"{redacted_output[: _HOST_RUN_OUTPUT_MAX_CHARS - 3].rstrip()}..."
@@ -10767,6 +12287,20 @@ raise SystemExit(exit_code)
         return redacted_output
 
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
+        binding = worker.get("_run_local_capability_binding")
+        if binding is not None:
+            lease_id = str(worker.get("_run_startup_token_digest") or "")
+            if (
+                not isinstance(binding, dict)
+                or "containerGenerationId" in binding
+                or not re.fullmatch(r"[a-f0-9]{64}", lease_id)
+                or binding.get("hostStartupLeaseId") != lease_id
+                or binding.get("runId") != run_id
+                or binding.get("workerId") != worker.get("worker_id")
+            ):
+                raise RuntimeErrorBase(
+                    "Host run capability authority does not match the exact startup lease"
+                )
         if self._conversation_mode_from_worker(worker):
             return self._run_conversation_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
         effective_run_id = (run_id or secrets.token_hex(8)).strip()
@@ -10776,6 +12310,7 @@ raise SystemExit(exit_code)
             "_glasshive_task_run": True,
         }
         info = self.ensure_worker_ready(worker)
+        worker = {**worker, "workspace_dir": info.workspace_dir}
         command, env = self._build_command(worker, instruction, info)
         stdin_text = self._command_stdin_text(worker, instruction, info)
         env["GLASSHIVE_RUN_ID"] = effective_run_id
@@ -10786,7 +12321,7 @@ raise SystemExit(exit_code)
             workspace=workspace,
             run_id=effective_run_id,
         )
-        self._acquire_host_slot(worker)
+        host_slot_token = self._acquire_host_slot(worker)
 
         run_root = self._run_root(worker["worker_id"], effective_run_id)
         run_root.mkdir(parents=True, exist_ok=True)
@@ -10833,140 +12368,177 @@ raise SystemExit(exit_code)
         heartbeat_path = _active_run_status_path(workspace, effective_run_id)
         heartbeat_stop = Event()
         heartbeat_thread: Thread | None = None
-        with raw_stdout.open("w") as stdout_handle, raw_stderr.open("w") as stderr_handle:
-            raw_stdout.chmod(0o600)
-            raw_stderr.chmod(0o600)
-            process_command = self._durable_host_process_command(
-                command,
-                run_root=run_root,
-                exit_path=exit_path,
-                timeout_sec=run_timeout_sec,
-                stdin_path=host_stdin if stdin_text is not None else None,
-            )
-            process = subprocess.Popen(
-                process_command,
-                cwd=str(workspace),
-                env=env,
-                text=True,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                start_new_session=True,
-            )
-            self._register_process(worker["worker_id"], process)
-            process_pid = process.pid
-            self._wait_for_durable_host_supervisor(process, run_root=run_root)
-            self._write_active_session(
-                worker["worker_id"],
-                {
-                    "session_name": f"host-{effective_run_id[:12]}",
-                    "run_id": effective_run_id,
-                    "stdout_path": str(raw_stdout),
-                    "stderr_path": str(raw_stderr),
-                    "exit_path": str(exit_path),
-                    "constraint_ledger_path": constraint_ledger_path,
-                    "model": str(info.model or ""),
-                    "argv_for_evidence_json": json.dumps([_redact_command_arg(part) for part in command]),
-                    "started_at": started_at_iso,
-                    "process_pid": process.pid,
-                    "heartbeat_path": str(heartbeat_path),
-                    "timeout_seconds": run_timeout_sec,
-                    "instruction": instruction,
-                },
-            )
-            active_session = self._read_active_session(str(worker["worker_id"]))
-            if not active_session:
-                self._stop_active_process(
-                    str(worker["worker_id"]),
-                    worker=worker,
-                    run_id=effective_run_id,
+        native_session_stop = Event()
+        native_session_thread: Thread | None = None
+        process: subprocess.Popen[str] | None = None
+        owned_session: dict[str, object] | None = None
+        startup_cleanup_unconfirmed = False
+        try:
+            with raw_stdout.open("w") as stdout_handle, raw_stderr.open("w") as stderr_handle:
+                raw_stdout.chmod(0o600)
+                raw_stderr.chmod(0o600)
+                process_command = self._durable_host_process_command(
+                    command,
+                    run_root=run_root,
+                    exit_path=exit_path,
+                    timeout_sec=run_timeout_sec,
+                    stdin_path=host_stdin if stdin_text is not None else None,
+                    native_input_context=self._native_input_context(worker),
                 )
-                raise RuntimeErrorBase(
-                    "Host-native process metadata was not durably recorded before launch"
-                )
-            with runtime_start_boundary(worker):
-                self._release_durable_host_process(active_session)
-                notify_runtime_started(worker)
-            _write_active_run_status(
-                path=heartbeat_path,
-                worker=worker,
-                run_id=effective_run_id,
-                runtime_name=self.runtime_name,
-                model=str(info.model or ""),
-                state="running",
-                transcript_paths=transcript_paths,
-                started_at=started_at_iso,
-                process_pid=process.pid,
-                timeout_seconds=run_timeout_sec,
-            )
-            heartbeat_thread = _start_active_run_heartbeat(
-                path=heartbeat_path,
-                worker=worker,
-                run_id=effective_run_id,
-                runtime_name=self.runtime_name,
-                model=str(info.model or ""),
-                transcript_paths=transcript_paths,
-                started_at=started_at_iso,
-                process_pid=process.pid,
-                timeout_seconds=run_timeout_sec,
-                stop_event=heartbeat_stop,
-            )
-            try:
-                exit_code = process.wait()
-            except subprocess.TimeoutExpired:
-                self._note_stop_reason(worker["worker_id"], "terminated", run_id=effective_run_id)
-                self._stop_active_process(worker["worker_id"], worker=worker, run_id=effective_run_id)
-                try:
-                    stdout_handle.flush()
-                    stderr_handle.flush()
-                except OSError:
-                    pass
-                timeout_stdout = raw_stdout.read_text() if raw_stdout.exists() else ""
-                timeout_stderr = raw_stderr.read_text() if raw_stderr.exists() else ""
-                self._record_run_metrics(worker["worker_id"], effective_run_id, timeout_stdout)
-                evidence_path = _write_evidence_for_run(
-                    worker=worker,
-                    run_id=effective_run_id,
-                    runtime_name=self.runtime_name,
-                    model=str(info.model or ""),
-                    command=command,
+                process = subprocess.Popen(
+                    process_command,
+                    cwd=str(workspace),
                     env=env,
-                    workspace=workspace,
-                    stdout_text=timeout_stdout,
-                    stderr_text=timeout_stderr,
-                    output_text="",
-                    error_text=f"{self.runtime_name} timed out after {run_timeout_sec:g}s",
-                    exit_code=None,
-                    timeout_seconds=run_timeout_sec,
-                    stop_reason="timeout",
-                    constraint_ledger=constraint_ledger,
-                    transcript_paths=transcript_paths,
-                    started_at=started_at,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    start_new_session=True,
                 )
-                _stop_active_run_heartbeat(heartbeat_stop, heartbeat_thread)
+                self._register_process(worker["worker_id"], process)
+                process_pid = process.pid
+                self._wait_for_durable_host_supervisor(process, run_root=run_root)
+                self._write_active_session(
+                    worker["worker_id"],
+                    {
+                        "session_name": f"host-{effective_run_id[:12]}",
+                        "run_id": effective_run_id,
+                        "attempt_id": str(worker.get("_run_attempt_id") or ""),
+                        "host_slot_token": host_slot_token,
+                        "workspace_dir": str(workspace),
+                        "stdout_path": str(raw_stdout),
+                        "stderr_path": str(raw_stderr),
+                        "exit_path": str(exit_path),
+                        "constraint_ledger_path": constraint_ledger_path,
+                        "model": str(info.model or ""),
+                        "argv_for_evidence_json": json.dumps([_redact_command_arg(part) for part in command]),
+                        "started_at": started_at_iso,
+                        "process_pid": process.pid,
+                        "heartbeat_path": str(heartbeat_path),
+                        "timeout_seconds": run_timeout_sec,
+                        "instruction": instruction,
+                    },
+                    publish_run_start=callable(self._run_start_observer),
+                    worker=worker,
+                    spawned_process=process,
+                )
+                active_session = self._read_active_session(str(worker["worker_id"]))
+                owned_session = dict(active_session) if active_session else None
+                if not active_session:
+                    self._stop_active_process(
+                        str(worker["worker_id"]),
+                        worker=worker,
+                        run_id=effective_run_id,
+                    )
+                    raise RuntimeErrorBase(
+                        "Host-native process metadata was not durably recorded before launch"
+                    )
+                with runtime_start_boundary(worker):
+                    self._release_durable_host_process(active_session)
+                    notify_runtime_started(worker)
                 _write_active_run_status(
                     path=heartbeat_path,
                     worker=worker,
                     run_id=effective_run_id,
                     runtime_name=self.runtime_name,
                     model=str(info.model or ""),
-                    state="timeout",
+                    state="running",
                     transcript_paths=transcript_paths,
                     started_at=started_at_iso,
                     process_pid=process.pid,
                     timeout_seconds=run_timeout_sec,
-                    stop_reason="timeout",
-                    evidence_path=evidence_path,
                 )
-                self._append_work_log(
-                    worker,
-                    f"Run {effective_run_id} exceeded configured host timeout after {run_timeout_sec:g}s.",
+                heartbeat_thread = _start_active_run_heartbeat(
+                    path=heartbeat_path,
+                    worker=worker,
+                    run_id=effective_run_id,
+                    runtime_name=self.runtime_name,
+                    model=str(info.model or ""),
+                    transcript_paths=transcript_paths,
+                    started_at=started_at_iso,
+                    process_pid=process.pid,
+                    timeout_seconds=run_timeout_sec,
+                    stop_event=heartbeat_stop,
                 )
-                raise RuntimeErrorBase(f"{self.runtime_name} timed out after {run_timeout_sec:g}s")
-            finally:
-                _stop_active_run_heartbeat(heartbeat_stop, heartbeat_thread)
-                self._clear_process(worker["worker_id"])
-                self._release_host_slot(worker["worker_id"])
+                try:
+                    native_session_thread = Thread(
+                        target=self._observe_native_session_events,
+                        args=(
+                            worker["worker_id"], raw_stdout, native_session_stop,
+                            effective_run_id, str(worker.get("_run_attempt_id") or ""), 0, worker,
+                        ),
+                        name=f"glasshive-host-native-session-{effective_run_id[:12]}",
+                        daemon=True,
+                    )
+                    native_session_thread.start()
+                    exit_code = process.wait()
+                except subprocess.TimeoutExpired:
+                    if not self._stop_active_process(
+                        worker["worker_id"], worker=worker, run_id=effective_run_id,
+                        expected_session=owned_session, control_session=owned_session,
+                    ):
+                        raise RuntimeErrorBase("Host mission ownership changed during timeout cleanup")
+                    try:
+                        stdout_handle.flush()
+                        stderr_handle.flush()
+                    except OSError:
+                        pass
+                    timeout_stdout = raw_stdout.read_text() if raw_stdout.exists() else ""
+                    timeout_stderr = raw_stderr.read_text() if raw_stderr.exists() else ""
+                    self._record_run_metrics(worker["worker_id"], effective_run_id, timeout_stdout)
+                    evidence_path = _write_evidence_for_run(
+                        worker=worker,
+                        run_id=effective_run_id,
+                        runtime_name=self.runtime_name,
+                        model=str(info.model or ""),
+                        command=command,
+                        env=env,
+                        workspace=workspace,
+                        stdout_text=timeout_stdout,
+                        stderr_text=timeout_stderr,
+                        output_text="",
+                        error_text=f"{self.runtime_name} timed out after {run_timeout_sec:g}s",
+                        exit_code=None,
+                        timeout_seconds=run_timeout_sec,
+                        stop_reason="timeout",
+                        constraint_ledger=constraint_ledger,
+                        transcript_paths=transcript_paths,
+                        started_at=started_at,
+                    )
+                    _stop_active_run_heartbeat(heartbeat_stop, heartbeat_thread)
+                    _write_active_run_status(
+                        path=heartbeat_path,
+                        worker=worker,
+                        run_id=effective_run_id,
+                        runtime_name=self.runtime_name,
+                        model=str(info.model or ""),
+                        state="timeout",
+                        transcript_paths=transcript_paths,
+                        started_at=started_at_iso,
+                        process_pid=process.pid,
+                        timeout_seconds=run_timeout_sec,
+                        stop_reason="timeout",
+                        evidence_path=evidence_path,
+                    )
+                    self._append_work_log(
+                        worker,
+                        f"Run {effective_run_id} exceeded configured host timeout after {run_timeout_sec:g}s.",
+                    )
+                    raise RuntimeErrorBase(f"{self.runtime_name} timed out after {run_timeout_sec:g}s")
+                finally:
+                    native_session_stop.set()
+                    if native_session_thread is not None:
+                        native_session_thread.join(timeout=2.0)
+                    _stop_active_run_heartbeat(heartbeat_stop, heartbeat_thread)
+        except RunStartupRejectedError as exc:
+            startup_cleanup_unconfirmed = not exc.termination_confirmed
+            raise
+        finally:
+            if not startup_cleanup_unconfirmed and not self._finish_host_run_generation(
+                worker, effective_run_id, process, owned_session, host_slot_token,
+                clear_session=False,
+            ):
+                raise RuntimeErrorBase("Host mission ownership changed during cleanup")
 
         exit_code = self._final_host_exit_code(exit_path, exit_code)
         stdout = raw_stdout.read_text() if raw_stdout.exists() else ""
@@ -11000,7 +12572,8 @@ raise SystemExit(exit_code)
 
         self._record_run_metrics(worker["worker_id"], effective_run_id, stdout)
         try:
-            self._finalize_stop_reason(worker["worker_id"], run_id=effective_run_id)
+            self._finalize_stop_reason(worker["worker_id"], run_id=effective_run_id,
+                                       attempt_id=str((owned_session or {}).get("attempt_id") or ""))
         except RuntimeErrorBase as exc:
             if isinstance(exc, WorkerPausedError):
                 active_state = "paused"
@@ -11095,8 +12668,7 @@ raise SystemExit(exit_code)
             raise RuntimeErrorBase(f"{self.runtime_name} exited with code {exit_code}: {detail}")
 
         session_key, output = self._parse_output(worker, stdout, stderr, info)
-        if session_key:
-            self._write_session_key(worker["worker_id"], session_key)
+        self._remember_native_session_key(worker, session_key)
         if _FINAL_REPORT_PATTERN.search(stdout) and not _FINAL_REPORT_PATTERN.search(output):
             output = f"FINAL REPORT:\n{output.strip()}"
         redacted_output = _redact_text(output.strip())
@@ -11265,25 +12837,47 @@ raise SystemExit(exit_code)
 
 
     def host_active_process_status(self, worker: dict) -> dict[str, object]:
-        active_session = self._read_active_session(
-            str(worker.get("worker_id") or "")
-        )
+        worker_id = str(worker.get("worker_id") or "")
+        active_session = self._read_active_session(worker_id)
         if not active_session:
+            with self._process_lock:
+                process = self._active_processes.get(worker_id)
+            if process and process.poll() is None:
+                return {"state": "uncertain", "run_id": ""}
             return {"state": "absent"}
-        try:
-            pid = int(active_session.get("process_pid") or 0)
-        except (TypeError, ValueError):
-            pid = 0
         start_identity = str(
             active_session.get("process_start_identity") or ""
         ).strip()
         run_id = str(active_session.get("run_id") or "").strip()
-        # The oldest host-session format did not record a PID. With no process
-        # target to verify, it cannot represent a live host mission forever.
-        # Positive live PIDs still fail closed unless identity evidence below
-        # proves that the PID belongs to a later process generation.
+        raw_pid = active_session.get("process_pid")
+        if raw_pid is None or raw_pid == "":
+            pid = 0
+        elif isinstance(raw_pid, bool):
+            return {"state": "uncertain", "run_id": run_id}
+        elif isinstance(raw_pid, int):
+            pid = raw_pid
+        elif isinstance(raw_pid, str) and re.fullmatch(
+            r"(?:0|[1-9][0-9]*)", raw_pid
+        ):
+            pid = int(raw_pid)
+        else:
+            return {"state": "uncertain", "run_id": run_id}
+        if pid < 0:
+            return {"state": "uncertain", "run_id": run_id}
         if pid <= 0:
-            return {"state": "absent", "run_id": run_id}
+            if self._pidless_host_session_has_exact_terminal_proof(
+                worker_id,
+                active_session,
+            ):
+                return {"state": "absent", "run_id": run_id}
+            with self._process_lock:
+                process = self._active_processes.get(worker_id)
+            live_in_process_handle = bool(process and process.poll() is None)
+            return {
+                "state": "uncertain",
+                "run_id": run_id,
+                "historical_record_only": not live_in_process_handle,
+            }
         if not self._pid_is_live(pid) or self._pid_is_zombie(pid):
             return {"state": "absent", "run_id": run_id}
         current_identity = self._process_start_identity(pid)
@@ -11472,46 +13066,14 @@ raise SystemExit(exit_code)
         run_id: str,
         operation: str,
     ) -> dict[str, object]:
-        """Bind a host control to the service-confirmed lease and session file."""
+        """Compatibility wrapper for callers that need only the control identity."""
 
-        lease = worker.get("_host_run_lease")
-        active_session = self._read_active_session(str(worker["worker_id"]))
-        if not isinstance(lease, dict):
-            raise RuntimeErrorBase(
-                "The exact host process identity is not confirmed"
-            )
-        if isinstance(active_session, dict):
-            if not self._host_control_generation_matches(
-                worker=worker,
-                lease=lease,
-                session=active_session,
-                run_id=run_id,
-            ):
-                raise RuntimeErrorBase(
-                    "The exact host process identity is not confirmed"
-                )
-            return active_session
-
-        receipt = self._read_host_control_receipt(str(worker["worker_id"]))
-        receipt_session = (
-            receipt.get("session") if isinstance(receipt, dict) else None
+        session, _expected_session = self._confirmed_host_control_generation(
+            worker,
+            run_id=run_id,
+            operation=operation,
         )
-        if (
-            not isinstance(receipt, dict)
-            or not isinstance(receipt_session, dict)
-            or str(receipt.get("operation") or "") != operation
-            or str(receipt.get("status") or "") not in {"requested", "confirmed"}
-            or not self._host_control_generation_matches(
-                worker=worker,
-                lease=lease,
-                session=receipt_session,
-                run_id=run_id,
-            )
-        ):
-            raise RuntimeErrorBase(
-                "The exact host process identity is not confirmed"
-            )
-        return dict(receipt_session)
+        return session
 
     def host_process_identity(self, worker: dict, run_id: str) -> dict[str, object] | None:
         active_session = self._read_active_session(str(worker.get("worker_id") or ""))
@@ -11544,23 +13106,51 @@ raise SystemExit(exit_code)
     def cleanup_orphaned_run(self, worker: dict, run_id: str) -> RuntimeInfo:
         worker_id = str(worker["worker_id"])
         active_session = self._read_active_session(worker_id)
-        if str((active_session or {}).get("run_id") or "").strip() != str(run_id):
+        if not active_session:
+            if self.host_active_process_status(worker).get("state") != "absent":
+                raise RuntimeErrorBase(
+                    "The orphaned host process identity is not confirmed"
+                )
             return self._host_runtime_info(worker, pid=None)
-        try:
-            process_pid = int((active_session or {}).get("process_pid") or 0)
-        except (TypeError, ValueError):
-            process_pid = 0
-        if process_pid > 0 and process_pid != os.getpid() and self._pid_is_live(process_pid):
-            try:
-                process_group = os.getpgid(process_pid)
-                if process_group != os.getpgrp():
-                    os.killpg(process_group, signal.SIGTERM)
-                else:
-                    os.kill(process_pid, signal.SIGTERM)
-            except OSError:
-                pass
-        self._clear_active_session(worker_id, expected_session=active_session)
-        self._release_host_slot(worker_id)
+        if str(active_session.get("run_id") or "").strip() != str(run_id):
+            raise RuntimeErrorBase(
+                "The orphaned host run does not own the active session"
+            )
+        active_status = self.host_active_process_status(worker)
+        if active_status.get("state") == "uncertain":
+            raise RuntimeErrorBase(
+                "The orphaned host process identity is not confirmed"
+            )
+        if active_status.get("state") == "active":
+            if not self._stop_active_process(
+                worker_id,
+                worker=worker,
+                run_id=str(run_id),
+                expected_session=active_session,
+                control_session=active_session,
+            ):
+                raise RuntimeErrorBase(
+                    "Orphaned host run termination could not be confirmed"
+                )
+            return self._host_runtime_info(worker, pid=None)
+        with self._process_lock:
+            inactive_process = self._active_processes.get(worker_id)
+        if inactive_process is not None and inactive_process.poll() is None:
+            raise RuntimeErrorBase(
+                "The orphaned host process identity is not confirmed"
+            )
+        if not self._finalize_owned_host_generation(
+            worker_id,
+            expected_process=inactive_process,
+            expected_session=active_session,
+            expected_slot_token=(
+                str(active_session.get("host_slot_token") or "").strip() or None
+            ),
+            clear_session=True,
+        ):
+            raise RuntimeErrorBase(
+                "Host run ownership changed during orphan cleanup"
+            )
         return self._host_runtime_info(worker, pid=None)
 
     def _native_provider_authority_receipt(
@@ -11720,8 +13310,6 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
         return info
 
     def _codex_reasoning_effort_for_worker(self, worker: dict) -> str:
-        if not self._conversation_mode_from_worker(worker):
-            return super()._codex_reasoning_effort_for_worker(worker)
         requested = (
             self._bootstrap_env_value(worker, "WPR_CODEX_CLI_REASONING_EFFORT")
             or os.environ.get("WPR_CODEX_CLI_REASONING_EFFORT", "")
@@ -11730,7 +13318,7 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
         allowed = {"low", "medium", "high", "xhigh", "max", "ultra"}
         if requested and requested not in allowed:
             raise RuntimeErrorBase(
-                f"Unsupported native Codex conversation effort: {requested}"
+                f"Unsupported native Codex effort: {requested}"
             )
         if requested:
             worker["_effort_projection"] = {
@@ -11747,7 +13335,8 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
         worker: dict,
         workspace: str,
     ) -> tuple[str, str]:
-        if (
+        restricted = _native_tools_disabled(self._bootstrap_bundle_for_worker(worker))
+        if not restricted and (
             not self._conversation_mode_from_worker(worker)
             or _host_codex_conversation_project_instructions() == "inherit"
         ):
@@ -11755,11 +13344,16 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
         primary = self._state_dir(str(worker["worker_id"])) / "conversation-workspace"
         primary.mkdir(parents=True, exist_ok=True)
         primary.chmod(0o700)
-        return str(primary), workspace
+        return str(primary), "" if restricted else workspace
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
         self._assert_host_codex_worker_policy(worker)
-        existing_session = self._read_session_key(worker["worker_id"])
+        restricted = _native_tools_disabled(self._bootstrap_bundle_for_worker(worker))
+        existing_session = (
+            None
+            if restricted or self._provider_session_starts_fresh(worker)
+            else self._read_provider_session_key(worker)
+        )
         model = self._codex_model_for_worker(worker, "WPR_MODEL_HOST_CODEX_CLI")
         is_resume = bool(existing_session and not existing_session.startswith("codex-worker:"))
         dangerous_mode = os.environ.get("WPR_CODEX_DANGEROUS", "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -11792,7 +13386,8 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
                 command.extend(["-c", f'model="{model}"'])
             else:
                 command.extend(["-m", model])
-        self._append_codex_user_config_policy(command, worker)
+        if not restricted:
+            self._append_codex_user_config_policy(command, worker)
         if validated_codex_broker_projection(worker) is not None:
             self._append_codex_compatible_provider_config(
                 command,
@@ -11800,7 +13395,13 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
                 include_reasoning_effort=False,
             )
         self._append_codex_reasoning_effort_config(command, worker)
-        if dangerous_mode:
+        if restricted:
+            command.extend(["--strict-config", "--ignore-rules", "--enable", "code_mode_host", "-s", "read-only",
+                "-c", 'approval_policy="never"', "-c", 'web_search="disabled"',
+                "-c", "project_doc_max_bytes=0"])
+            for feature in _CODEX_RESTRICTED_NATIVE_FEATURES:
+                command.extend(["--disable", feature])
+        elif dangerous_mode:
             if is_resume:
                 command.append("--dangerously-bypass-approvals-and-sandbox")
             else:
@@ -11819,6 +13420,10 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
         output_schema_path = self._conversation_output_schema_path(worker)
         if output_schema_path:
             command.extend(["--output-schema", str(output_schema_path)])
+        if native_installed_owner_id() is not None:
+            command.extend(["-c", 'cli_auth_credentials_store="file"'])
+        for image_path, _mime_type, _data in self._native_input_image_files(worker, info):
+            command.extend(["--image", str(image_path)])
         if is_resume:
             command.append(existing_session)
         command.append("-")
@@ -11839,8 +13444,8 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
         return command, env
 
 
-    def __init__(self, base_dir: str | None = None) -> None:
-        super().__init__(base_dir=base_dir)
+    def __init__(self, base_dir: str | None = None, *, create_directories: bool = True) -> None:
+        super().__init__(base_dir=base_dir, create_directories=create_directories)
         self._provider_control_cache_lock = Lock()
         self._provider_control_cache: dict[
             tuple[str, str], tuple[float, tuple[dict[str, object], dict[str, object]]]
@@ -11936,7 +13541,7 @@ class HostCodexCliRuntime(HostNativeCliMixin, CodexCliRuntime):
 
         try:
             process = subprocess.Popen(
-                [self.binary, "app-server", "--stdio"],
+                [self.binary, "app-server", "--stdio", *(["-c", 'cli_auth_credentials_store="file"'] if native_installed_owner_id() is not None else [])],
                 env=env,
                 text=True,
                 stdin=subprocess.PIPE,
@@ -12160,128 +13765,109 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
                 ),
             )
 
-    def _inject_private_subscription_auth(self, env: dict[str, str]) -> None:
-        """Give an isolated Claude config the host subscription without copying user config."""
-        def read_macos_keychain_oauth() -> dict[str, object]:
-            if sys.platform != "darwin" or not shutil.which("security"):
-                return {}
-            completed = subprocess.run(
-                [
-                    "security",
-                    "find-generic-password",
-                    "-s",
-                    "Claude Code-credentials",
-                    "-w",
-                ],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=5,
-            )
-            credential = json.loads(completed.stdout) if completed.returncode == 0 else {}
-            oauth = credential.get("claudeAiOauth") if isinstance(credential, dict) else {}
-            return oauth if isinstance(oauth, dict) else {}
-
-        def unpack_oauth(oauth: dict[str, object]) -> tuple[str, str, str, int]:
-            raw_scopes = oauth.get("scopes")
-            if isinstance(raw_scopes, list):
-                scope_text = " ".join(
-                    str(scope).strip() for scope in raw_scopes if str(scope).strip()
+    def _inject_private_subscription_auth(self, env: dict[str, str]) -> str:
+        """Project access-only auth or select the owner's managed local login boundary."""
+        if native_installed_owner_id() is not None:
+            selected = _native_cli_managed_auth_env(env)
+            if not _claude_cli_managed_auth_available(self.binary, child_env=selected):
+                raise ProviderAuthenticationMissingError(
+                    "Installed Claude Code login is unavailable; reconnect through the installed native owner.",
+                    binary=self.binary, runtime_name=self.runtime_name, profile="claude-code",
+                    execution_mode="host", dependency_label="Claude Code authentication",
+                    recovery_hint="Reconnect the installed Claude Code login, then retry the same request.",
                 )
-            else:
-                scope_text = str(raw_scopes or "").strip()
-            try:
-                expiry = int(oauth.get("expiresAt") or 0)
-            except (TypeError, ValueError):
-                expiry = 0
-            return (
-                str(oauth.get("accessToken") or "").strip(),
-                str(oauth.get("refreshToken") or "").strip(),
-                scope_text,
-                expiry,
-            )
-
-        access_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
-        refresh_token = os.environ.get("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "").strip()
-        scopes = os.environ.get("CLAUDE_CODE_OAUTH_SCOPES", "").strip()
-        expires_at_ms = 0
-        explicit_auth = bool(access_token or refresh_token)
-        if not access_token and sys.platform == "darwin" and shutil.which("security"):
-            try:
-                access_token, refresh_token, scopes, expires_at_ms = unpack_oauth(
-                    read_macos_keychain_oauth()
-                )
-            except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-                return
-        token_expires_soon = bool(
-            access_token
-            and expires_at_ms
-            and expires_at_ms <= int(time.time() * 1000) + 300_000
+            env.clear()
+            env.update(selected)
+            return "owner_managed"
+        env.pop("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", None)
+        projected_access_token = _usable_claude_oauth_token(
+            env.get("CLAUDE_CODE_OAUTH_TOKEN")
         )
-        if token_expires_soon and refresh_token and scopes and not explicit_auth:
-            login_env = dict(env)
-            # Refresh the canonical host credential in place. Never rotate the host refresh token
-            # into a one-off worker-specific Keychain service.
-            login_env.pop("CLAUDE_CONFIG_DIR", None)
-            login_env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
-            login_env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] = refresh_token
-            login_env["CLAUDE_CODE_OAUTH_SCOPES"] = scopes
-            try:
-                with _CLAUDE_AUTH_REFRESH_LOCK:
-                    completed = subprocess.run(
-                        [self.binary, "auth", "login"],
-                        check=False,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        env=login_env,
-                        timeout=30,
-                    )
-            except (OSError, subprocess.TimeoutExpired):
-                completed = None
-            if completed is None or completed.returncode != 0:
-                raise RuntimeErrorBase(
-                    "Claude Code isolated worker authentication refresh failed; run `claude auth login` "
-                    "on the GlassHive host or configure a long-lived CLAUDE_CODE_OAUTH_TOKEN."
-                )
-            try:
-                access_token, refresh_token, scopes, expires_at_ms = unpack_oauth(
-                    read_macos_keychain_oauth()
-                )
-            except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
-                raise RuntimeErrorBase(
-                    "Claude Code refreshed the host login but GlassHive could not read the refreshed credential."
-                ) from exc
-            if not access_token or (
-                expires_at_ms and expires_at_ms <= int(time.time() * 1000) + 60_000
+        if projected_access_token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = projected_access_token
+            return "projected_access_token"
+
+        # Scope metadata belongs to the selected token, not an earlier projection.
+        env.pop("CLAUDE_CODE_OAUTH_SCOPES", None)
+        explicit_access_token = _usable_explicit_claude_oauth_token()
+        if explicit_access_token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = explicit_access_token
+            return "explicit_access_token"
+
+        keychain_oauth = _read_claude_keychain_oauth()
+        if _claude_keychain_access_token_is_fresh(keychain_oauth):
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = str(keychain_oauth.get("accessToken") or "").strip()
+            scopes = keychain_oauth.get("scopes")
+            # Preserve the native granted scopes without splitting one stored
+            # OAuth scope-token (RFC 6749 §3.3) into additional grants.
+            if isinstance(scopes, list) and scopes and all(
+                isinstance(scope, str)
+                and re.fullmatch(r"[\x21\x23-\x5b\x5d-\x7e]+", scope)
+                for scope in scopes
             ):
-                raise RuntimeErrorBase(
-                    "Claude Code host authentication refresh did not produce a usable access token."
-                )
-        if access_token:
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = access_token
-        if refresh_token:
-            env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] = refresh_token
-        if scopes:
-            env["CLAUDE_CODE_OAUTH_SCOPES"] = scopes
+                env["CLAUDE_CODE_OAUTH_SCOPES"] = " ".join(scopes)
+            return "keychain_access_token"
+
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        if _claude_cli_managed_auth_available(self.binary, child_env=env):
+            return "isolated_managed"
+
+        owner_env = _native_cli_managed_auth_env(env)
+        if _claude_cli_managed_auth_available(self.binary, child_env=owner_env):
+            # Verify the exact native split before selecting it: the owner supplies
+            # login storage while the retained worker supplies its own sessions.
+            env.clear()
+            env.update(owner_env)
+            return "owner_managed"
+        raise ProviderAuthenticationMissingError(
+            "Claude Code authentication is unavailable for this host worker. "
+            "Run `claude auth login` for managed local authentication or provision a supported "
+            "headless token with `claude setup-token`, then try again.",
+            binary=self.binary,
+            runtime_name=self.runtime_name,
+            profile="claude-code",
+            execution_mode="host",
+            dependency_label="Claude Code authentication",
+            recovery_hint=(
+                "Reconnect the configured Claude Code account, then retry the same request."
+            ),
+        )
+
+    def _command_stdin_text(self, worker: dict, instruction: str, info: RuntimeInfo) -> str | None:
+        text = super()._command_stdin_text(worker, instruction, info)
+        images = self._native_input_image_files(worker, info)
+        if not images:
+            return text
+        # Conversation mode has no duplex mission wrapper. These bytes go directly
+        # to the CLI's documented JSONL user frame, not through a text re-wrapper.
+        content = [{"type": "text", "text": str(text or "")}]
+        content.extend({"type": "image", "source": {"type": "base64", "media_type": mime_type,
+            "data": base64.b64encode(data).decode("ascii")}} for _path, mime_type, data in images)
+        return json.dumps({"type": "user", "session_id": "", "parent_tool_use_id": None,
+            "uuid": str(uuid.uuid4()), "message": {"role": "user", "content": content}}, separators=(",", ":")) + "\n"
+
+    def _native_input_context(self, worker: dict) -> dict[str, object] | None:
+        if self._conversation_mode_from_worker(worker):
+            return None
+        return {"version": 1, "workerId": str(worker["worker_id"]),
+                "runId": str(worker["_active_run_id"]), "contextToken": secrets.token_hex(32)}
 
     def _build_command(self, worker: dict, instruction: str, info: RuntimeInfo) -> tuple[list[str], dict[str, str]]:
-        session_key = self._read_session_key(worker["worker_id"])
+        session_key = (
+            None
+            if self._provider_session_starts_fresh(worker)
+            else self._read_provider_session_key(worker)
+        )
         model = self._provider_model_for_worker(worker)
         permission_mode = os.environ.get("WPR_CLAUDE_CODE_PERMISSION_MODE", "bypassPermissions")
+        bundle = self._bootstrap_bundle_for_worker(worker)
         if self._conversation_mode_from_worker(worker):
-            bundle = self._bootstrap_bundle_for_worker(worker)
             permission_mode = (
                 "bypassPermissions"
                 if str(bundle.get("access_mode") or "full").strip().lower() == "full"
                 else "acceptEdits"
             )
-        output_format = (
-            "stream-json"
-            if self._conversation_mode_from_worker(worker)
-            else "json"
-        )
+        output_format = "stream-json"
         command = [
             self.binary,
             "-p",
@@ -12292,11 +13878,21 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
             "--model",
             model,
         ]
-        settings: dict[str, object] = {}
+        if not self._conversation_mode_from_worker(worker):
+            command.extend(["--input-format", "stream-json", "--verbose"])
+        elif self._native_input_image_files(worker, info):
+            command.extend(["--input-format", "stream-json"])
+        # Only explicit per-run settings cross the managed-login boundary.
+        settings: dict[str, object] = json.loads(json.dumps(bundle.get("claude_settings_local") or {}))
+        if self._conversation_mode_from_worker(worker):
+            auto_memory = _host_claude_conversation_auto_memory()
+            if auto_memory is not None:
+                settings["autoMemoryEnabled"] = auto_memory
         denied_plugins = self._host_plugin_denylist()
         if denied_plugins:
             settings["enabledPlugins"] = {
-                plugin_id: False for plugin_id in denied_plugins
+                **(settings.get("enabledPlugins") or {}),
+                **{plugin_id: False for plugin_id in denied_plugins},
             }
         if self._conversation_mode_from_worker(worker):
             command.append("--verbose")
@@ -12326,8 +13922,8 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
                     )
                 command.extend(["--append-system-prompt-file", str(authority_path)])
             mcp_path = self._state_dir(str(worker["worker_id"])) / "conversation-mcp.json"
-            if mcp_path.is_file():
-                command.extend(["--mcp-config", str(mcp_path), "--strict-mcp-config"])
+            mcp_config = str(mcp_path) if mcp_path.is_file() else '{"mcpServers":{}}'
+            command.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
             bundle = self._bootstrap_bundle_for_worker(worker)
             if str(bundle.get("access_mode") or "full").strip().lower() == "workspace":
                 workspace = str(Path(str(info.workspace_dir or ".")).resolve())
@@ -12345,6 +13941,13 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
                         },
                     }
                 )
+        if not self._conversation_mode_from_worker(worker):
+            # Keep the already-materialized mission broker explicit when the CLI
+            # uses the owner's managed login; no ambient owner MCPs may load.
+            mcp_path = Path(str(info.workspace_dir)) / ".mcp.json"
+            mcp_config = str(mcp_path) if mcp_path.is_file() else '{"mcpServers":{}}'
+            command.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
+        self._assert_host_claude_mcp_config(worker, mcp_path)
         if settings:
             command.extend(
                 ["--settings", json.dumps(settings, separators=(",", ":"))]
@@ -12372,11 +13975,6 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
         if session_key and not session_key.startswith("claude-worker:"):
             command.extend(["--resume", session_key])
         env = self._host_env(worker)
-        if self._conversation_mode_from_worker(worker):
-            env["CLAUDE_CONFIG_DIR"] = str(
-                self._home_dir(str(worker["worker_id"])) / ".claude"
-            )
-            self._inject_private_subscription_auth(env)
         use_api_key = os.environ.get("WPR_CLAUDE_CODE_USE_API_KEY", "0").strip().lower() in {"1", "true", "yes", "on"}
         if not use_api_key:
             env.pop("ANTHROPIC_API_KEY", None)
@@ -12386,6 +13984,40 @@ class HostClaudeCodeRuntime(HostNativeCliMixin, ClaudeCodeRuntime):
             env,
             runtime_name=self.runtime_name,
         )
+        selection = mission_provider_account_selection(worker)
+        use_host_auth = selection is None or (
+            selection.policy == "personal_preferred"
+            and worker.get("_glasshive_provider_account_preferred_fallback")
+        )
+        env.pop("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", None)
+        if use_host_auth and not self._bedrock_enabled():
+            enterprise_mode = any(
+                str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+                for name in ("GLASSHIVE_ENTERPRISE_MODE", "WPR_ENTERPRISE_MODE")
+            )
+            if not enterprise_mode and not (
+                use_api_key and str(env.get("ANTHROPIC_API_KEY") or "").strip()
+            ):
+                auth_source = self._inject_private_subscription_auth(env)
+                if auth_source == "owner_managed":
+                    # Select the native login without inheriting the owner's runtime settings.
+                    command.extend(["--setting-sources", ""])
+            elif not (
+                _usable_claude_oauth_token(env.get("CLAUDE_CODE_OAUTH_TOKEN"))
+                or (use_api_key and str(env.get("ANTHROPIC_API_KEY") or "").strip())
+            ):
+                raise ProviderAuthenticationMissingError(
+                    "Enterprise host worker server-owned Claude Code authentication is unavailable.",
+                    binary=self.binary,
+                    runtime_name=self.runtime_name,
+                    profile=str(worker.get("profile") or "claude-code"),
+                    execution_mode="host",
+                    dependency_label="Claude Code authentication",
+                    recovery_hint=(
+                        "Reconnect or reproject the server-owned Claude provider authority, then "
+                        "retry the same request."
+                    ),
+                )
         return command, env
 
 

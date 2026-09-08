@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import re
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,51 @@ DEFAULT_OWNER_IDENTITY_CLAIMS = ("user_id",)
 INTERNAL_ASSERTION_HEADER = "x-glasshive-user-assertion"
 INTERNAL_ASSERTION_REQUIRED_SCOPE = "runtime:access"
 INTERNAL_ASSERTION_ROLES = {"member", "viewer", "tenant_admin", "service"}
+
+
+class NativeOwnerUnavailableError(RuntimeError):
+    """The installed identity owner needs recovery before provider admission."""
+
+
+def native_installed_owner_id() -> str | None:
+    """Read the installed instance's existing protected first-admin authority."""
+    selected = os.environ.get("VIVENTIUM_NATIVE_FIRST_ADMIN_STATE")
+    if selected is None:
+        return None
+    path = Path(selected)
+    try:
+        metadata = path.lstat()
+        if (
+            not path.is_absolute()
+            or path.is_symlink()
+            or path.resolve(strict=True) != path
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or multi_user_security_enabled()
+        ):
+            raise ValueError("unsafe native owner authority")
+        with path.open(encoding="utf-8") as handle:
+            opened = os.fstat(handle.fileno())
+            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise ValueError("native owner authority changed")
+            value = json.load(handle)
+        owner = value.get("admin_user_id")
+        if (
+            value.get("schema_version") != 1 or value.get("status") != "closed"
+            or "token" in value or not isinstance(owner, str)
+            or re.fullmatch(r"[a-fA-F0-9]{24}", owner) is None
+        ):
+            raise ValueError("native owner setup is incomplete")
+        return owner
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        raise NativeOwnerUnavailableError("Installed native owner authority is unavailable; complete owner recovery.") from exc
+
+
+def require_native_installed_owner(owner_id: object) -> None:
+    installed_owner = native_installed_owner_id()
+    if installed_owner is not None and owner_id != installed_owner:
+        raise GlassHiveAuthError("Only the authenticated installed owner can use the native provider login.")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:

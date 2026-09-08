@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
-from workers_projects_runtime.openclaw_runtime import StubRuntime
+from workers_projects_runtime.openclaw_runtime import HostCapacityError, StubRuntime
 from workers_projects_runtime.service import WorkersProjectsService
 from workers_projects_runtime.store import Store
 
@@ -621,5 +621,294 @@ def test_authorized_fallback_already_in_cooldown_is_never_selected(
         assert payload["reason"] == "fallback_in_cooldown"
         assert payload["fallbackProfile"] == "claude-code"
         assert payload["fallbackCooldownUntil"] == fallback_retry_at
+    finally:
+        service.shutdown()
+
+
+def _production_evidence_runtime(runtime):
+    """Bind the production route-failure evidence issuer/consumer onto the test stub."""
+    import threading
+
+    from workers_projects_runtime.profile_runtime import BaseCliWorkerRuntime
+
+    runtime.runtime_name = "codex-cli"
+    runtime._provider_route_evidence = {}
+    runtime._provider_route_evidence_lock = threading.Lock()
+    runtime._issue_provider_route_failure_evidence = (
+        BaseCliWorkerRuntime._issue_provider_route_failure_evidence.__get__(runtime)
+    )
+    runtime.consume_provider_route_failure_evidence = (
+        BaseCliWorkerRuntime.consume_provider_route_failure_evidence.__get__(runtime)
+    )
+    return runtime
+
+
+def _collected_quota_evidence(run_id: str) -> dict:
+    return {
+        "version": 1,
+        "failure_class": "provider_quota_exhausted",
+        "failure_structured": True,
+        "retry_at": "",
+        "retry_after_s": 1800,
+        "evidence_kind": "provider_native",
+        "evidence_id": f"collected:{run_id}",
+    }
+
+
+def test_collected_quota_failure_survives_result_rewrapping_and_switches_to_fallback(
+    tmp_path, monkeypatch
+):
+    """Regression: a collected (docker) run's structured quota evidence is stamped on the
+    collected result dict, but the service re-wraps that dict (`{**recovered, ...}`) before it
+    records route health. The copied result must still be trusted so the run records route
+    health and continues on the authorized fallback worker instead of failing silently."""
+    store = Store(str(tmp_path / "collected-quota-rewrap.sqlite3"))
+    worker = _scheduled_provider_worker(
+        store, owner_id="scheduled-owner", fallback_profile="claude-code"
+    )
+    service = _service(store, monkeypatch)
+    runtime = _production_evidence_runtime(service.runtime)
+    try:
+        running = _running_run(
+            store,
+            service,
+            worker,
+            instruction="Continue on the authorized fallback after a copied quota result.",
+            runtime_family="codex-cli",
+        )
+        recovered = _structured_provider_quota_failure()
+        runtime._issue_provider_route_failure_evidence(
+            worker=worker,
+            run_id=str(running["run_id"]),
+            source=recovered,
+            evidence=_collected_quota_evidence(str(running["run_id"])),
+        )
+        rewrapped = {
+            **recovered,
+            "_terminal_generation": service._terminal_generation_for_run(running),
+        }
+        assert rewrapped is not recovered
+        service._apply_recovered_run(worker, running, rewrapped)
+        route_health = store.get_provider_route_health(**service._provider_route(worker))
+        assert route_health is not None
+        assert route_health["failure_class"] == "provider_quota_exhausted"
+        assert route_health["last_run_id"] == str(running["run_id"])
+        switched = store.get_run(str(running["run_id"]))
+        assert switched is not None
+        assert switched["provider_route_decision"] == "fallback_selected"
+        assert switched["provider_route_profile"] == "claude-code"
+        assert store.get_worker(str(worker["worker_id"]))["profile"] == "claude-code"
+        assert runtime._provider_route_evidence == {}
+    finally:
+        service.shutdown()
+
+
+def test_collected_quota_evidence_copy_without_issued_token_is_rejected(tmp_path, monkeypatch):
+    """A copy that lost the issued capability token, or carries a forged one, must not record
+    route health: the run fails with the fallback explicitly unavailable."""
+    store = Store(str(tmp_path / "collected-quota-forged.sqlite3"))
+    worker = _scheduled_provider_worker(
+        store, owner_id="scheduled-owner", fallback_profile="claude-code"
+    )
+    service = _service(store, monkeypatch)
+    runtime = _production_evidence_runtime(service.runtime)
+    try:
+        running = _running_run(
+            store,
+            service,
+            worker,
+            instruction="Never trust a forged capability token.",
+            runtime_family="codex-cli",
+        )
+        recovered = _structured_provider_quota_failure()
+        runtime._issue_provider_route_failure_evidence(
+            worker=worker,
+            run_id=str(running["run_id"]),
+            source=recovered,
+            evidence=_collected_quota_evidence(str(running["run_id"])),
+        )
+        forged = {
+            **recovered,
+            "_provider_route_health_capability": "forged-token",
+            "_terminal_generation": service._terminal_generation_for_run(running),
+        }
+        service._apply_recovered_run(worker, running, forged)
+        assert store.get_provider_route_health(**service._provider_route(worker)) is None
+        terminal = store.get_run(str(running["run_id"]))
+        assert terminal is not None
+        assert terminal["state"] == "failed"
+        # Without trusted evidence no route health exists, so no fallback switch is attempted.
+        assert terminal["provider_route_decision"] != "fallback_selected"
+        assert store.get_worker(str(worker["worker_id"]))["profile"] == "codex-cli"
+    finally:
+        service.shutdown()
+
+
+def test_fallback_switch_survives_transient_host_capacity_during_preflight(tmp_path, monkeypatch):
+    """A transient host capacity or Docker probe state during the fallback preflight is not a
+    fallback configuration problem: the run still switches to the authorized fallback, whose
+    requeued attempt is re-admitted by the same capacity gate."""
+    store = Store(str(tmp_path / "fallback-transient-capacity.sqlite3"))
+    worker = _scheduled_provider_worker(
+        store, owner_id="scheduled-owner", fallback_profile="claude-code"
+    )
+    service = _service(store, monkeypatch)
+    runtime = _production_evidence_runtime(service.runtime)
+    probes: list[str] = []
+
+    def _probe_unavailable(profile, execution_mode, **_kwargs):
+        probes.append(profile)
+        if profile == "claude-code":
+            raise HostCapacityError(
+                "Host resource admission is waiting for a healthy resource probe.",
+                capacity_class="resource_probe_unavailable",
+            )
+        return {}
+
+    monkeypatch.setattr(service, "_reserved_runtime_preflight", _probe_unavailable)
+    try:
+        running = _running_run(
+            store,
+            service,
+            worker,
+            instruction="Switch even while the host probe is briefly unavailable.",
+            runtime_family="codex-cli",
+        )
+        recovered = _structured_provider_quota_failure()
+        runtime._issue_provider_route_failure_evidence(
+            worker=worker,
+            run_id=str(running["run_id"]),
+            source=recovered,
+            evidence=_collected_quota_evidence(str(running["run_id"])),
+        )
+        service._apply_recovered_run(
+            worker,
+            running,
+            {**recovered, "_terminal_generation": service._terminal_generation_for_run(running)},
+        )
+        assert "claude-code" in probes
+        switched = store.get_run(str(running["run_id"]))
+        assert switched is not None
+        assert switched["provider_route_decision"] == "fallback_selected"
+        assert switched["provider_route_profile"] == "claude-code"
+        assert store.get_worker(str(worker["worker_id"]))["profile"] == "claude-code"
+        events = [event["event_type"] for event in store.list_events(str(worker["worker_id"]))]
+        assert "run.provider_route_switched" in events
+        assert "run.provider_fallback_unavailable" not in events
+    finally:
+        service.shutdown()
+
+
+def test_fallback_preflight_non_capacity_failure_still_preserves_the_primary_failure(tmp_path, monkeypatch):
+    store = Store(str(tmp_path / "fallback-preflight-broken.sqlite3"))
+    worker = _scheduled_provider_worker(
+        store, owner_id="scheduled-owner", fallback_profile="claude-code"
+    )
+    service = _service(store, monkeypatch)
+    runtime = _production_evidence_runtime(service.runtime)
+
+    def _broken(profile, execution_mode, **_kwargs):
+        if profile == "claude-code":
+            raise RuntimeError("fallback runtime misconfigured")
+        return {}
+
+    monkeypatch.setattr(service, "_reserved_runtime_preflight", _broken)
+    try:
+        running = _running_run(
+            store,
+            service,
+            worker,
+            instruction="Keep the primary failure when the fallback preflight is broken.",
+            runtime_family="codex-cli",
+        )
+        recovered = _structured_provider_quota_failure()
+        runtime._issue_provider_route_failure_evidence(
+            worker=worker,
+            run_id=str(running["run_id"]),
+            source=recovered,
+            evidence=_collected_quota_evidence(str(running["run_id"])),
+        )
+        service._apply_recovered_run(
+            worker,
+            running,
+            {**recovered, "_terminal_generation": service._terminal_generation_for_run(running)},
+        )
+        terminal = store.get_run(str(running["run_id"]))
+        assert terminal is not None
+        assert terminal["state"] == "failed"
+        assert terminal["provider_route_decision"] == "fallback_unavailable"
+        assert store.get_worker(str(worker["worker_id"]))["profile"] == "codex-cli"
+        unavailable = [
+            json.loads(event["payload_json"] or "{}")
+            for event in store.list_events(str(worker["worker_id"]))
+            if event["event_type"] == "run.provider_fallback_unavailable"
+        ]
+        assert unavailable and unavailable[-1]["reason"] == "fallback_preflight_failed"
+    finally:
+        service.shutdown()
+
+
+def test_fresh_partial_html_after_a_provider_failure_is_delivered_without_claiming_completion(
+    tmp_path, monkeypatch
+):
+    """A file that appeared before the provider ended the worker is a partial artifact, not a result."""
+    store = Store(str(tmp_path / "partial-html.sqlite3"))
+    _project, worker = _worker(store, owner_id="owner-a", label="Partial HTML")
+    workspace = tmp_path / "workspace"
+    (workspace / "deliverables").mkdir(parents=True)
+    store.update_worker(worker["worker_id"], workspace_dir=str(workspace))
+    worker = store.get_worker(worker["worker_id"])
+    service = _service(store, monkeypatch)
+    try:
+        running = _running_run(store, service, worker, instruction="Build a countdown card")
+        artifact = workspace / "deliverables" / "countdown-card.html"
+        artifact.write_text("<html><body><h1>Countdown</h1><!-- unfinished")
+        deliverable = {
+            "kind": "file",
+            "label": "countdown-card.html",
+            "workspace_path": "deliverables/countdown-card.html",
+        }
+        monkeypatch.setattr(
+            service, "_completion_deliverable", lambda *_args, **_kwargs: dict(deliverable)
+        )
+        # The stub runtime reports no workspace on refresh; keep the durable worker record so the
+        # artifact freshness check sees the real workspace root, as the docker runtime would.
+        monkeypatch.setattr(
+            service, "_refresh_runtime_info", lambda worker_id, **_kwargs: store.get_worker(worker_id)
+        )
+        assert service._fresh_user_artifact_deliverable(
+            worker, {**running, "failure_class": "provider_response_failed"}, deliverable
+        )
+        recovered = {
+            "state": "failed",
+            "output_text": "",
+            "error_text": "The model provider ended the worker continuation unexpectedly.",
+            "failure_class": "provider_response_failed",
+            "failure_retryable": 1,
+            "failure_structured": 1,
+            "failure_user_message": "The model provider ended the worker continuation unexpectedly before it could finish.",
+            "failure_recommended_recovery": "Use workspace_continue to resume from the same durable workspace.",
+            "failure_diagnostic_summary": "Synthetic terminal provider error.",
+            "_terminal_generation": service._terminal_generation_for_run(running),
+        }
+
+        service._apply_recovered_run(worker, running, recovered)
+
+        terminal = store.get_run(str(running["run_id"]))
+        assert terminal is not None and terminal["state"] == "failed"
+        assert terminal["failure_class"] == "provider_response_failed"
+        callbacks = store.list_callback_outbox_for_run(
+            str(running["run_id"]), tenant_id="local", owner_id="owner-a"
+        )
+        assert [json.loads(str(c["payload_json"]))["event"] for c in callbacks] == ["run.failed"]
+        payload = json.loads(str(callbacks[0]["payload_json"]))
+        assert payload["result_state"] == "failed"
+        assert payload["deliverable"]["workspace_path"] == "deliverables/countdown-card.html"
+        assert "partial artifact" in payload["message"]
+        assert "did not complete" in payload["message"]
+        assert "FINAL REPORT" not in payload["message"]
+        events = {event["event_type"] for event in store.list_events(worker["worker_id"])}
+        assert "run.failed" in events and "run.partial_artifact_preserved" in events
+        assert "run.completed" not in events
     finally:
         service.shutdown()

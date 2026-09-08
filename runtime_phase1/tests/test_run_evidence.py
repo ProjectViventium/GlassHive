@@ -27,7 +27,7 @@ from workers_projects_runtime.workspace_continuation import (
 )
 
 
-def test_constraint_ledger_extracts_generic_source_date_and_flag_rules(tmp_path):
+def test_constraint_ledger_retains_source_date_and_flag_prose_without_extraction(tmp_path):
     instruction = (
         "Research the target market using sources from January 2024 through May 2026 only.\n"
         "Include seed firms Alpha Capital and Beta Partners.\n"
@@ -40,14 +40,13 @@ def test_constraint_ledger_extracts_generic_source_date_and_flag_rules(tmp_path)
         worker={"worker_id": "wrk_ledger", "profile": "codex-cli", "execution_mode": "host"},
         run_id="run_ledger",
     )
+    assert ledger["original_request"] == instruction
 
     assert ledger["run_id"] == "run_ledger"
     assert ledger["worker"]["profile"] == "codex-cli"
-    assert any("January 2024 through May 2026 only" in item for item in ledger["constraints"]["date"])
-    assert any("sources from" in item for item in ledger["constraints"]["source"])
-    assert any("Do not exclude" in item for item in ledger["constraints"]["exclusion_or_flag"])
-    assert any("XLSX and PDF" in item for item in ledger["outputs"]["required"])
-    assert ledger["do_not_widen_or_soften"] is True
+    assert all(value == [] for value in ledger["constraints"].values())
+    assert all(value == [] for value in ledger["outputs"].values())
+    assert ledger["do_not_widen_or_soften"] is False
 
     latest = write_constraint_ledger(tmp_path, ledger, "run_ledger")
     assert latest == tmp_path / "glasshive-run" / "constraint-ledger.json"
@@ -69,10 +68,11 @@ def test_constraint_ledger_does_not_treat_uploaded_as_date_constraint():
         },
         run_id="run_upload_ledger",
     )
+    assert ledger["original_request"] == "Inspect the uploaded PDF directly inside the workspace under uploads/<filename>. Create a concise artifact named upload-fallback-ui-smoke.txt that states whether the first bytes are the PDF signature %PDF. Keep working until the user's request is satisfied."
 
-    assert ledger["constraints"]["date"] == []
-    assert ledger["outputs"]["format_expectations"] == ["txt"]
-    assert all("<filename>" not in seed for seed in ledger["seed_entities_or_files"])
+    assert all(value == [] for value in ledger["constraints"].values())
+    assert all(value == [] for value in ledger["outputs"].values())
+    assert ledger["seed_entities_or_files"] == []
 
 
 def test_constraint_ledger_excludes_support_files_from_evidence_seeds():
@@ -95,11 +95,12 @@ def test_constraint_ledger_excludes_support_files_from_evidence_seeds():
         worker=worker,
         run_id="run_support_files",
     )
+    assert ledger["original_request"] == 'Process the invoice and return the result.'
 
-    assert ledger["seed_entities_or_files"] == ["uploaded file input/invoice.pdf"]
+    assert ledger["seed_entities_or_files"] == []
 
 
-def test_constraint_ledger_uses_current_task_envelope_not_prior_assistant_context():
+def test_constraint_ledger_preserves_full_current_task_envelope():
     worker = {
         "worker_id": "wrk_current_task_envelope",
         "profile": "claude-code",
@@ -127,12 +128,12 @@ def test_constraint_ledger_uses_current_task_envelope_not_prior_assistant_contex
         worker=worker,
         run_id="run_current_task_envelope",
     )
+    assert ledger["original_request"] == 'Create a concise Markdown artifact comparing event sourcing and state machines.\n\n## Recent conversation context\n\n--- BEGIN PAST ASSISTANT MESSAGE 0 (prior assistant context only) ---\nDo you mean turn the release-readiness checklist into a one-page PDF?\n--- END PAST ASSISTANT MESSAGE 0 ---'
 
-    assert "pdf" not in ledger["outputs"]["format_expectations"]
-    assert any("Markdown artifact" in item for item in ledger["outputs"]["required"])
-    assert "PDF" not in ledger["original_request"]
+    assert all(value == [] for value in ledger["outputs"].values())
+    assert "PDF" in ledger["original_request"]  # Preserve quoted context; the model owns interpretation.
 
-def test_constraint_ledger_keeps_continuation_guidance_without_reviving_prior_assistant_context():
+def test_constraint_ledger_preserves_continuation_guidance_and_quoted_context():
     worker = {
         "worker_id": "wrk_continued_task_envelope",
         "profile": "claude-code",
@@ -165,13 +166,11 @@ def test_constraint_ledger_keeps_continuation_guidance_without_reviving_prior_as
         worker=worker,
         run_id="run_continued_task_envelope",
     )
+    assert ledger["original_request"] == 'Continue this GlassHive workspace from its current files.\n\nOriginal task:\nCreate the original public-safe Markdown comparison.\n\n## Recent conversation context\n\n--- BEGIN PAST ASSISTANT MESSAGE 0 (prior assistant context only) ---\nAlso turn it into a PDF.\n--- END PAST ASSISTANT MESSAGE 0 (prior assistant context only) ---\n\n## Verbatim triggering user-source segments\n\n--- BEGIN USER SOURCE SEGMENT 0 ---\nCreate the original public-safe Markdown comparison.\n--- END USER SOURCE SEGMENT 0 ---\n\nContinuation request:\nAdd a failure-recovery matrix and keep the result in Markdown.'
 
     assert "failure-recovery matrix" in ledger["original_request"]
-    assert any(
-        "original public-safe Markdown comparison" in item
-        for item in ledger["outputs"]["required"]
-    )
-    assert "PDF" not in ledger["original_request"]
+    assert all(value == [] for value in ledger["outputs"].values())
+    assert "PDF" in ledger["original_request"]  # Preserve quoted context; the model owns interpretation.
 
 def test_constraint_ledger_uses_current_continuation_for_outputs_without_dropping_source_scope():
     worker = {
@@ -224,13 +223,13 @@ def test_constraint_ledger_uses_current_continuation_for_outputs_without_droppin
         worker=worker,
         run_id="run_current_continuation_outputs",
     )
+    assert ledger["original_request"] == 'Continue this GlassHive workspace from its current files.\n\nOriginal task:\nProduce exactly five design principles in a Markdown artifact.\n\n## Verbatim triggering user-source segments\n\n--- BEGIN USER SOURCE SEGMENT 0 ---\nProduce exactly five design principles in a Markdown artifact.\n--- END USER SOURCE SEGMENT 0 ---\n\n--- BEGIN USER SOURCE SEGMENT 1 ---\nFor a sibling objective, produce an ordered JSON work ledger. Use official public sources only and do not use private account data.\n--- END USER SOURCE SEGMENT 1 ---\n\nContinuation request:\nProduce exactly four design principles in a Markdown artifact instead.'
 
     assert ledger["outputs"]["format_expectations"] == ["md"]
     assert any("exactly four" in item for item in ledger["outputs"]["required"])
     assert all("exactly five" not in item for item in ledger["outputs"]["required"])
     assert all("JSON work ledger" not in item for item in ledger["outputs"]["required"])
-    assert any("official public sources only" in item for item in ledger["constraints"]["source"])
-    assert any("do not use private account data" in item for item in ledger["constraints"]["scope"])
+    assert all(value == [] for value in ledger["constraints"].values())
 
 def test_plain_continuation_marker_cannot_replace_the_output_contract():
     ledger = build_constraint_ledger(
@@ -256,8 +255,7 @@ def test_plain_continuation_marker_cannot_replace_the_output_contract():
         run_id="run_structured_continuation",
     )
 
-    assert ledger["outputs"]["format_expectations"] == ["md"]
-    assert any("Markdown" in item for item in ledger["outputs"]["required"])
+    assert all(value == [] for value in ledger["outputs"].values())
 
 def test_inherit_contract_fails_closed_without_prior_trusted_output_source():
     run_id = "run_missing_trusted_inherited_outputs"
@@ -365,7 +363,7 @@ def test_trusted_structured_continuation_contract_replaces_prior_outputs():
         "forbidden_format_expectations": [],
     }
 
-def test_constraint_ledger_default_continuation_inherits_original_output_constraints():
+def test_constraint_ledger_preserves_original_and_continuation_input_for_model():
     ledger = build_constraint_ledger(
         instruction=(
             "Continue this GlassHive workspace from its current files.\n\n"
@@ -394,9 +392,9 @@ def test_constraint_ledger_default_continuation_inherits_original_output_constra
         },
         run_id="run_default_continuation",
     )
+    assert ledger["original_request"] == 'Continue this GlassHive workspace from its current files.\n\nPrior run task context:\nProduce an ordered JSON work ledger.\n\nContinuation context:\nThe required result is an XLSX workbook.'
 
-    assert ledger["outputs"]["format_expectations"] == ["json"]
-    assert any("ordered JSON work ledger" in item for item in ledger["outputs"]["required"])
+    assert all(value == [] for value in ledger["outputs"].values())
 
 def test_continuation_context_without_trusted_output_source_fails_closed():
     with pytest.raises(ValueError, match="trusted continuation output source"):
@@ -466,8 +464,7 @@ def test_run_evidence_accepts_uploaded_pdf_input_with_text_artifact(tmp_path):
         constraint_ledger=ledger,
     )
 
-    assert evidence["completion_compliance"]["required_artifact_types"] == ["txt"]
-    assert evidence["completion_compliance"]["seed_entity_coverage"]["status"] == "pass"
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert evidence["evidence_result"]["status"] == "pass"
 
 
@@ -507,8 +504,8 @@ def test_run_evidence_does_not_require_original_upload_format_when_html_requeste
         run_id="run_upload_html_evidence",
     )
 
-    assert ledger["constraints"]["date"] == []
-    assert ledger["outputs"]["format_expectations"] == ["html"]
+    assert all(value == [] for value in ledger["constraints"].values())
+    assert all(value == [] for value in ledger["outputs"].values())
     assert "Preserve the user" not in run_evidence._seed_terms_from_ledger(ledger)
 
     evidence = build_run_evidence(
@@ -529,15 +526,11 @@ def test_run_evidence_does_not_require_original_upload_format_when_html_requeste
         constraint_ledger=ledger,
     )
 
-    completion = evidence["completion_compliance"]
-    assert completion["required_artifact_types"] == ["html"]
-    assert "pdf" not in completion["required_artifact_types"]
-    assert completion["missing_required_artifact_types"] == []
-    assert completion["status"] == "pass"
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert evidence["evidence_result"]["status"] == "pass"
 
 
-def test_run_evidence_fails_when_verified_artifact_lacks_final_marker(tmp_path):
+def test_run_evidence_accepts_verified_artifact_without_final_marker(tmp_path):
     uploads = tmp_path / "uploads"
     uploads.mkdir()
     (uploads / "input-smoke.pdf").write_bytes(b"%PDF-1.4\n% synthetic\n")
@@ -582,15 +575,13 @@ def test_run_evidence_fails_when_verified_artifact_lacks_final_marker(tmp_path):
         constraint_ledger=ledger,
     )
 
-    completion = evidence["completion_compliance"]
-    assert completion["required_artifact_types"] == ["html"]
-    assert completion["missing_required_artifact_types"] == []
-    assert completion["status"] == "fail"
-    assert evidence["evidence_result"]["status"] == "fail"
-    assert any(
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
+    assert evidence["evidence_result"]["status"] == "pass"
+    assert not any(
         reason["reason"] == "final report marker missing"
-        for reason in evidence["evidence_result"]["failure_reasons"]
+        for reason in evidence["evidence_result"]["warning_reasons"]
     )
+
 
 
 @pytest.mark.parametrize(
@@ -609,8 +600,9 @@ def test_constraint_ledger_keeps_requested_output_formats_without_requiring_inpu
         worker={"worker_id": "wrk_output_formats", "profile": "codex-cli", "execution_mode": "host"},
         run_id="run_output_formats",
     )
+    assert ledger["original_request"] == instruction
 
-    assert ledger["outputs"]["format_expectations"] == expected
+    assert all(value == [] for value in ledger["outputs"].values())
 
 
 def test_constraint_ledger_ignores_mime_and_pdf_bytes_host_upload_guidance():
@@ -639,11 +631,12 @@ def test_constraint_ledger_ignores_mime_and_pdf_bytes_host_upload_guidance():
         worker={"worker_id": "wrk_host_upload_guidance", "profile": "codex-cli", "execution_mode": "host"},
         run_id="run_host_upload_guidance",
     )
+    assert ledger["original_request"] == instruction
 
-    assert ledger["outputs"]["format_expectations"] == ["html"]
+    assert all(value == [] for value in ledger["outputs"].values())
 
 
-def test_run_evidence_recursively_validates_artifacts_and_flags_date_drift(tmp_path):
+def test_run_evidence_validates_artifacts_without_semantic_date_judgment(tmp_path):
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     (output_dir / "screen.csv").write_text("firm,notes\nAlpha,ok\n")
@@ -690,10 +683,9 @@ def test_run_evidence_recursively_validates_artifacts_and_flags_date_drift(tmp_p
     assert workbook["document_validation"]["valid"] is True
     assert "SECRET_TOKEN" not in evidence["env_keys"]
     assert evidence["final_output"]["has_final_report"] is True
-    assert evidence["constraint_compliance"]["status"] == "fail"
-    assert any("June 2026" in issue["text"] for issue in evidence["constraint_compliance"]["issues"])
-    assert evidence["evidence_result"]["status"] == "fail"
-    assert any(item["reason"] == "constraint compliance failed" for item in evidence["evidence_result"]["failure_reasons"])
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
+    assert evidence["evidence_result"]["status"] == "pass"
 
     latest = write_run_evidence(tmp_path, evidence, "run_artifacts")
     assert json.loads(latest.read_text())["run_id"] == "run_artifacts"
@@ -819,7 +811,7 @@ def test_run_evidence_detects_openclaw_final_visible_text_marker(tmp_path):
     )
 
     assert evidence["final_output"]["has_final_report"] is True
-    assert evidence["completion_compliance"]["status"] == "pass"
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
 
 
 def test_pdf_render_sample_uses_temp_output_without_orphaning_artifact(tmp_path, monkeypatch):
@@ -1073,7 +1065,7 @@ def test_run_evidence_final_report_ignores_structured_progress_marker(tmp_path):
     assert evidence["evidence_result"]["status"] == "fail"
 
 
-def test_run_evidence_accepts_plain_stdout_final_report(tmp_path):
+def test_run_evidence_empty_output_does_not_pass_from_stdout_marker(tmp_path):
     stdout_text = (
         "worker progress before final output\n"
         "FINAL REPORT:\n"
@@ -1099,8 +1091,10 @@ def test_run_evidence_accepts_plain_stdout_final_report(tmp_path):
     )
 
     assert evidence["final_output"]["has_final_report"] is True
-    assert evidence["completion_compliance"]["status"] == "pass"
-    assert evidence["evidence_result"]["status"] == "pass"
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
+    assert evidence["evidence_result"]["status"] == "fail"
+
+    assert {"reason": "native result is empty"} in evidence["evidence_result"]["failure_reasons"]
 
 
 def test_run_evidence_classifies_structured_provider_rate_limit(tmp_path):
@@ -1431,7 +1425,7 @@ def test_run_evidence_does_not_classify_benign_provider_terms_in_success_output(
     )
 
     assert evidence["failure_classification"]["status"] == "not_applicable"
-    assert evidence["evidence_result"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "warn"
 
 
 def test_run_evidence_does_not_classify_false_structured_error_fields(tmp_path):
@@ -1465,7 +1459,7 @@ def test_run_evidence_does_not_classify_false_structured_error_fields(tmp_path):
     )
 
     assert evidence["failure_classification"]["status"] == "not_applicable"
-    assert evidence["evidence_result"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "warn"
 
 
 def test_run_evidence_does_not_treat_browser_snapshot_node_ids_as_provider_status(tmp_path):
@@ -1504,7 +1498,7 @@ def test_run_evidence_does_not_treat_browser_snapshot_node_ids_as_provider_statu
     classification = evidence["failure_classification"]
     assert classification["status"] == "not_applicable"
     assert "provider_auth_missing" not in json.dumps(evidence)
-    assert evidence["evidence_result"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "warn"
 
 
 @pytest.mark.parametrize(
@@ -1554,7 +1548,7 @@ def test_run_evidence_success_final_report_ignores_browser_page_status_like_text
 
     assert evidence["failure_classification"]["status"] == "not_applicable"
     assert forbidden_failure_class not in json.dumps(evidence)
-    assert evidence["evidence_result"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "warn"
 
 
 def test_run_evidence_does_not_classify_failed_agent_substep_after_final_report(tmp_path):
@@ -1603,7 +1597,7 @@ def test_run_evidence_does_not_classify_failed_agent_substep_after_final_report(
     )
 
     assert evidence["failure_classification"]["status"] == "not_applicable"
-    assert evidence["evidence_result"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "warn"
 
 
 def test_run_evidence_accepts_markdown_decorated_final_report_marker(tmp_path):
@@ -1632,7 +1626,7 @@ def test_run_evidence_accepts_markdown_decorated_final_report_marker(tmp_path):
     )
 
     assert evidence["final_output"]["has_final_report"] is True
-    assert evidence["evidence_result"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "warn"
 
 
 def test_run_evidence_accepts_backtick_wrapped_final_report_marker(tmp_path):
@@ -1656,8 +1650,8 @@ def test_run_evidence_accepts_backtick_wrapped_final_report_marker(tmp_path):
     )
 
     assert evidence["final_output"]["has_final_report"] is True
-    assert evidence["completion_compliance"]["status"] == "pass"
-    assert evidence["evidence_result"]["status"] == "pass"
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
+    assert evidence["evidence_result"]["status"] == "warn"
 
 
 def test_run_evidence_detects_claude_result_final_report_marker(tmp_path):
@@ -1688,7 +1682,7 @@ def test_run_evidence_detects_claude_result_final_report_marker(tmp_path):
     )
 
     assert evidence["final_output"]["has_final_report"] is True
-    assert evidence["completion_compliance"]["status"] == "pass"
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
 
 
 def test_run_evidence_detects_stdout_final_report_when_output_text_missing(tmp_path):
@@ -1758,10 +1752,11 @@ def test_constraint_compliance_avoids_generic_future_and_approximate_false_posit
     )
 
     assert evidence["timeout"]["exit_source"] == "process"
-    assert evidence["constraint_compliance"]["status"] == "pass"
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
 
 
-def test_constraint_compliance_fails_when_planning_file_omits_strict_source_window(tmp_path):
+def test_model_owned_constraints_when_planning_file_omits_strict_source_window(tmp_path):
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     (output_dir / "report.md").write_text("FINAL REPORT:\nThe final answer used in-window sources.\n")
@@ -1792,12 +1787,9 @@ def test_constraint_compliance_fails_when_planning_file_omits_strict_source_wind
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "fail"
-    assert any(
-        issue["reason"] == "strict source/date constraints not referenced in planning file"
-        for issue in evidence["constraint_compliance"]["issues"]
-    )
-    assert evidence["evidence_result"]["status"] == "fail"
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
+    assert evidence["evidence_result"]["status"] == "pass"
 
 
 def test_constraint_compliance_allows_final_answer_only_scheduled_prompt_operational_evidence(tmp_path):
@@ -1859,7 +1851,8 @@ def test_constraint_compliance_allows_final_answer_only_scheduled_prompt_operati
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "pass"
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
     assert evidence["evidence_result"]["status"] == "pass"
 
 
@@ -1928,20 +1921,7 @@ def test_completion_compliance_counts_scheduled_prompt_private_scratchpad_artifa
         constraint_ledger=ledger,
     )
 
-    completion = evidence["completion_compliance"]
-    assert set(completion["required_artifact_types"]) == {"json", "md"}
-    assert completion["missing_required_artifact_types"] == []
-    assert completion["status"] == "pass"
-    assert "private-scratchpad/202606250300.md" in completion["deliverable_artifact_paths"]
-    assert "private-scratchpad/memory-proposals-202606250300.json" in completion["deliverable_artifact_paths"]
-    assert (
-        "private-scratchpad/periphery/risk_radar/2026/06/20260625T030030Z.risk_radar.md"
-        in completion["deliverable_artifact_paths"]
-    )
-    assert (
-        "private-scratchpad/periphery/risk_radar/2026/06/20260625T030030Z.risk_radar.json"
-        in completion["deliverable_artifact_paths"]
-    )
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert str(my_folder) not in json.dumps(evidence["artifacts"])
     assert evidence["evidence_result"]["status"] == "pass"
 
@@ -1979,7 +1959,8 @@ def test_constraint_compliance_allows_user_facing_root_plan_deliverable_without_
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "pass"
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
     assert evidence["evidence_result"]["status"] == "pass"
 
 
@@ -2026,11 +2007,12 @@ def test_constraint_compliance_allows_user_facing_deliverable_roots_named_plan_o
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "pass"
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
     assert evidence["evidence_result"]["status"] == "pass"
 
 
-def test_constraint_compliance_still_requires_internal_named_root_files_to_preserve_constraints(tmp_path):
+def test_model_owned_constraints_with_internal_named_root_files_to_preserve_constraints(tmp_path):
     (tmp_path / "delegation-notes.md").write_text(
         "# Delegation Notes\n\n"
         "Ask a helper to research the topic and return findings.\n"
@@ -2059,14 +2041,11 @@ def test_constraint_compliance_still_requires_internal_named_root_files_to_prese
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "fail"
-    assert any(
-        issue["reason"] == "strict source/date constraints not referenced in planning file"
-        for issue in evidence["constraint_compliance"]["issues"]
-    )
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
 
 
-def test_constraint_compliance_still_flags_softened_constraints_in_root_plan_deliverable(tmp_path):
+def test_model_owned_constraints_with_softened_constraints_in_root_plan_deliverable(tmp_path):
     (tmp_path / "research-implementation-plan.md").write_text(
         "# Research Implementation Plan\n\n"
         "Must use sources from January 2024 through May 2026 only wherever possible.\n"
@@ -2095,14 +2074,11 @@ def test_constraint_compliance_still_flags_softened_constraints_in_root_plan_del
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "fail"
-    assert any(
-        issue["reason"] == "strict constraint softened in workspace file"
-        for issue in evidence["constraint_compliance"]["issues"]
-    )
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
 
 
-def test_constraint_compliance_still_scans_root_plan_deliverable_for_source_date_drift(tmp_path):
+def test_model_owned_constraints_with_root_plan_deliverable_for_source_date_drift(tmp_path):
     (tmp_path / "research-implementation-plan.md").write_text(
         "# Research Implementation Plan\n\n"
         "A cited source published June 2026 supports the plan.\n"
@@ -2134,14 +2110,11 @@ def test_constraint_compliance_still_scans_root_plan_deliverable_for_source_date
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "fail"
-    assert any(
-        issue["reason"] == "date/source window widened past ledger limit"
-        for issue in evidence["constraint_compliance"]["issues"]
-    )
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
 
 
-def test_constraint_compliance_scans_final_output_for_source_window_drift(tmp_path):
+def test_model_owned_constraints_with_final_output_for_source_window_drift(tmp_path):
     ledger = build_constraint_ledger(
         instruction="Use sources from January 2024 through May 2026 only.",
         worker={"worker_id": "wrk_final_window", "profile": "codex-cli", "execution_mode": "host"},
@@ -2166,8 +2139,8 @@ def test_constraint_compliance_scans_final_output_for_source_window_drift(tmp_pa
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "fail"
-    assert any(issue["path"] == "<final-output>" for issue in evidence["constraint_compliance"]["issues"])
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
 
 
 def test_constraint_compliance_allows_access_timestamp_without_widening_source_window(tmp_path):
@@ -2195,7 +2168,8 @@ def test_constraint_compliance_allows_access_timestamp_without_widening_source_w
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "pass"
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
 
 
 def test_constraint_compliance_allows_explicitly_excluded_out_of_window_note(tmp_path):
@@ -2228,7 +2202,8 @@ def test_constraint_compliance_allows_explicitly_excluded_out_of_window_note(tmp
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "pass"
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
 
 
 def test_constraint_compliance_does_not_treat_research_notes_as_planning_softening(tmp_path):
@@ -2262,10 +2237,11 @@ def test_constraint_compliance_does_not_treat_research_notes_as_planning_softeni
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "pass"
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
 
 
-def test_constraint_compliance_scans_xlsx_artifact_text_for_source_window_drift(tmp_path):
+def test_model_owned_constraints_with_xlsx_artifact_text_for_source_window_drift(tmp_path):
     openpyxl = pytest.importorskip("openpyxl")
     output_dir = tmp_path / "output"
     output_dir.mkdir()
@@ -2300,12 +2276,11 @@ def test_constraint_compliance_scans_xlsx_artifact_text_for_source_window_drift(
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "fail"
-    assert any(issue["path"] == "output/source-ledger.xlsx" for issue in evidence["constraint_compliance"]["issues"])
-    assert "output/source-ledger.xlsx" in evidence["constraint_compliance"]["scanned_sources"]
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
 
 
-def test_constraint_compliance_warns_when_binary_text_extraction_is_unavailable(tmp_path, monkeypatch):
+def test_model_owned_constraints_when_binary_text_extraction_is_unavailable(tmp_path, monkeypatch):
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     (output_dir / "source-ledger.xlsx").write_bytes(b"synthetic workbook bytes")
@@ -2338,15 +2313,11 @@ def test_constraint_compliance_warns_when_binary_text_extraction_is_unavailable(
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "warn"
-    assert any(
-        issue["path"] == "output/source-ledger.xlsx"
-        and issue["reason"] == "constraint text extraction unavailable"
-        for issue in evidence["constraint_compliance"]["issues"]
-    )
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
 
 
-def test_constraint_compliance_fails_when_planning_file_widens_source_window(tmp_path):
+def test_model_owned_constraints_when_planning_file_widens_source_window(tmp_path):
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     (output_dir / "report.md").write_text("FINAL REPORT:\nThe final answer used in-window sources.\n")
@@ -2380,12 +2351,9 @@ def test_constraint_compliance_fails_when_planning_file_widens_source_window(tmp
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "fail"
-    assert any(
-        issue["reason"] == "planning source/date window widened past ledger limit"
-        for issue in evidence["constraint_compliance"]["issues"]
-    )
-    assert evidence["evidence_result"]["status"] == "fail"
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
+    assert evidence["evidence_result"]["status"] == "pass"
 
 
 def test_constraint_compliance_accepts_planning_file_that_references_ledger(tmp_path):
@@ -2421,7 +2389,8 @@ def test_constraint_compliance_accepts_planning_file_that_references_ledger(tmp_
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "pass"
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
     assert evidence["evidence_result"]["status"] == "pass"
 
 
@@ -2457,7 +2426,8 @@ def test_constraint_compliance_allows_official_future_subject_when_sources_remai
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "pass"
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
 
 
 def test_constraint_compliance_allows_explicitly_rejected_out_of_scope_sources(tmp_path):
@@ -2493,10 +2463,11 @@ def test_constraint_compliance_allows_explicitly_rejected_out_of_scope_sources(t
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "pass"
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
 
 
-def test_constraint_compliance_still_flags_out_of_window_sources_only_marked_flagged(tmp_path):
+def test_model_owned_constraints_with_out_of_window_sources_only_marked_flagged(tmp_path):
     research_dir = tmp_path / "research"
     research_dir.mkdir()
     (research_dir / "notes.md").write_text("Flagged source published June 2026 appears in analysis notes.\n")
@@ -2524,8 +2495,8 @@ def test_constraint_compliance_still_flags_out_of_window_sources_only_marked_fla
         constraint_ledger=ledger,
     )
 
-    assert evidence["constraint_compliance"]["status"] == "fail"
-    assert "June 2026" in evidence["constraint_compliance"]["issues"][0]["text"]
+    assert evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert evidence["constraint_compliance"]["issues"] == []
 
 
 def test_constraint_compliance_skips_raw_support_snapshots_but_scans_research_notes(tmp_path):
@@ -2557,7 +2528,8 @@ def test_constraint_compliance_skips_raw_support_snapshots_but_scans_research_no
         stop_reason="process_exit",
         constraint_ledger=ledger,
     )
-    assert clean_evidence["constraint_compliance"]["status"] == "pass"
+    assert clean_evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert clean_evidence["constraint_compliance"]["issues"] == []
 
     (tmp_path / "research" / "notes.md").write_text("Primary source published June 2026 appears in notes.\n")
     dirty_evidence = build_run_evidence(
@@ -2577,8 +2549,8 @@ def test_constraint_compliance_skips_raw_support_snapshots_but_scans_research_no
         stop_reason="process_exit",
         constraint_ledger=ledger,
     )
-    assert dirty_evidence["constraint_compliance"]["status"] == "fail"
-    assert dirty_evidence["constraint_compliance"]["issues"][0]["path"] == "research/notes.md"
+    assert dirty_evidence["constraint_compliance"]["status"] == "not_applicable"
+    assert dirty_evidence["constraint_compliance"]["issues"] == []
 
 
 def test_candidate_artifact_paths_sorts_before_max_entry_cap(tmp_path):
@@ -2628,7 +2600,7 @@ def test_run_evidence_records_html_browser_smoke_prerequisite(tmp_path, monkeypa
     assert evidence["content_hygiene"]["status"] == "pass"
 
 
-def test_run_evidence_flags_notes_only_when_required_artifacts_are_missing(tmp_path):
+def test_run_evidence_keeps_native_failure_without_inferring_formats_from_notes(tmp_path):
     research_dir = tmp_path / "research"
     research_dir.mkdir()
     (research_dir / "batch-01.md").write_text("Research notes only.\nAlpha Capital appears here.\n")
@@ -2656,16 +2628,11 @@ def test_run_evidence_flags_notes_only_when_required_artifacts_are_missing(tmp_p
         constraint_ledger=ledger,
     )
 
-    completion = evidence["completion_compliance"]
-    assert completion["status"] == "fail"
-    assert completion["notes_only"] is True
-    assert set(completion["missing_required_artifact_types"]) == {"pdf", "xlsx"}
-    assert completion["seed_entity_coverage"]["mentioned_count"] == 1
-    assert "Beta Partners" in completion["seed_entity_coverage"]["missing"]
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert evidence["evidence_result"]["status"] == "fail"
 
 
-def test_run_evidence_flags_notes_only_when_deliverable_intent_has_no_extension(tmp_path):
+def test_run_evidence_does_not_guess_missing_work_from_notes_paths(tmp_path):
     workspace = tmp_path / "workspace"
     research_dir = workspace / "research"
     research_dir.mkdir(parents=True)
@@ -2699,13 +2666,9 @@ def test_run_evidence_flags_notes_only_when_deliverable_intent_has_no_extension(
         constraint_ledger=ledger,
     )
 
-    completion = evidence["completion_compliance"]
-    assert completion["required_artifact_types"] == []
-    assert completion["required_deliverable_intent"] is True
-    assert completion["notes_only"] is True
-    assert completion["status"] == "fail"
-    assert any(issue["reason"] == "only support notes/planning artifacts were found" for issue in completion["issues"])
-    assert evidence["evidence_result"]["status"] == "fail"
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
+    assert evidence["evidence_result"]["status"] == "pass"
+
 
 
 def test_run_evidence_allows_internal_notes_when_final_answer_requested_in_chat(tmp_path):
@@ -2737,10 +2700,7 @@ def test_run_evidence_allows_internal_notes_when_final_answer_requested_in_chat(
         constraint_ledger=ledger,
     )
 
-    completion = evidence["completion_compliance"]
-    assert completion["notes_only"] is True
-    assert completion["required_deliverable_intent"] is False
-    assert completion["status"] == "pass"
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert evidence["evidence_result"]["status"] == "pass"
 
 
@@ -2780,11 +2740,7 @@ def test_run_evidence_completion_compliance_passes_for_requested_deliverables(tm
         constraint_ledger=ledger,
     )
 
-    completion = evidence["completion_compliance"]
-    assert completion["status"] == "pass"
-    assert completion["missing_required_artifact_types"] == []
-    assert completion["notes_only"] is False
-    assert completion["seed_entity_coverage"]["missing"] == []
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert evidence["evidence_result"]["status"] == "pass"
 
 
@@ -2815,7 +2771,7 @@ def test_run_evidence_hygiene_scans_csv_cells_not_whole_file(tmp_path):
     )
 
     assert evidence["content_hygiene"]["status"] == "pass"
-    assert evidence["evidence_result"]["status"] == "pass"
+    assert evidence["evidence_result"]["status"] == "warn"
 
 
 def test_run_evidence_result_fails_invalid_professional_artifact(tmp_path):
@@ -2857,8 +2813,9 @@ def test_constraint_ledger_does_not_treat_general_must_include_as_seed_entities(
         worker={"worker_id": "wrk_seed_false_positive", "profile": "codex-cli", "execution_mode": "host"},
         run_id="run_seed_false_positive",
     )
+    assert ledger["original_request"] == 'Create output/summary.csv and output/table.xlsx. The CSV and XLSX must include columns name, product, target_sector, score, note and two rows for Alpha Storage and Beta Grid.'
 
-    assert ledger["outputs"]["format_expectations"] == ["xlsx", "csv"]
+    assert all(value == [] for value in ledger["outputs"].values())
     assert ledger["seed_entities_or_files"] == []
 
 
@@ -2890,9 +2847,8 @@ def test_completion_compliance_does_not_require_attached_input_format_as_output(
         constraint_ledger=ledger,
     )
 
-    assert ledger["outputs"]["format_expectations"] == []
-    assert "csv" not in evidence["completion_compliance"]["required_artifact_types"]
-    assert evidence["completion_compliance"]["status"] == "pass"
+    assert all(value == [] for value in ledger["outputs"].values())
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert evidence["evidence_result"]["status"] == "pass"
 
 
@@ -2939,33 +2895,31 @@ def test_completion_compliance_ignores_passive_memory_snapshot_output_formats(tm
         constraint_ledger=ledger,
     )
 
-    assert set(ledger["outputs"]["format_expectations"]) == {"json", "md"}
-    assert "csv" not in ledger["outputs"]["format_expectations"]
-    assert all("Historical cleanup" not in line for line in ledger["outputs"]["required"])
-    assert evidence["completion_compliance"]["required_artifact_types"] == ["json", "md"]
-    assert evidence["completion_compliance"]["missing_required_artifact_types"] == []
-    assert evidence["completion_compliance"]["status"] == "pass"
+    assert all(value == [] for value in ledger["outputs"].values())
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert evidence["evidence_result"]["status"] == "pass"
 
 
-def test_constraint_ledger_keeps_explicit_structured_task_output_format():
+def test_constraint_ledger_does_not_infer_authority_from_task_format_prose():
     ledger = build_constraint_ledger(
         instruction='{"task": "Create output/screen.csv with two synthetic rows."}',
         worker={"worker_id": "wrk_structured_task", "profile": "codex-cli", "execution_mode": "host"},
         run_id="run_structured_task",
     )
+    assert ledger["original_request"] == '{"task": "Create output/screen.csv with two synthetic rows."}'
 
-    assert ledger["outputs"]["format_expectations"] == ["csv"]
+    assert all(value == [] for value in ledger["outputs"].values())
 
 
-def test_constraint_ledger_keeps_explicit_structured_output_format_key():
+def test_constraint_ledger_does_not_infer_authority_from_output_format_prose():
     ledger = build_constraint_ledger(
         instruction='{"output_format": "xlsx", "task": "Create the requested synthetic workbook."}',
         worker={"worker_id": "wrk_structured_output_format", "profile": "codex-cli", "execution_mode": "host"},
         run_id="run_structured_output_format",
     )
+    assert ledger["original_request"] == '{"output_format": "xlsx", "task": "Create the requested synthetic workbook."}'
 
-    assert ledger["outputs"]["format_expectations"] == ["xlsx"]
+    assert all(value == [] for value in ledger["outputs"].values())
 
 
 def test_completion_compliance_does_not_require_uploads_path_input_format_as_output(tmp_path):
@@ -3007,10 +2961,8 @@ def test_completion_compliance_does_not_require_uploads_path_input_format_as_out
         constraint_ledger=ledger,
     )
 
-    assert set(ledger["outputs"]["format_expectations"]) == {"txt", "html"}
-    assert "pdf" not in evidence["completion_compliance"]["required_artifact_types"]
-    assert evidence["completion_compliance"]["missing_required_artifact_types"] == []
-    assert evidence["completion_compliance"]["status"] == "pass"
+    assert all(value == [] for value in ledger["outputs"].values())
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
 
 
 def test_completion_compliance_accepts_context_named_input_pdf_with_txt_html_outputs(tmp_path):
@@ -3077,11 +3029,8 @@ def test_completion_compliance_accepts_context_named_input_pdf_with_txt_html_out
         constraint_ledger=ledger,
     )
 
-    assert set(ledger["outputs"]["format_expectations"]) == {"txt", "html"}
-    assert "pdf" not in evidence["completion_compliance"]["required_artifact_types"]
-    assert evidence["completion_compliance"]["missing_required_artifact_types"] == []
-    assert "confirmation in the" not in evidence["completion_compliance"]["seed_entity_coverage"].get("missing", [])
-    assert evidence["completion_compliance"]["status"] == "pass"
+    assert all(value == [] for value in ledger["outputs"].values())
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert evidence["evidence_result"]["status"] == "pass"
 
 
@@ -3113,14 +3062,12 @@ def test_completion_compliance_subtracts_explicitly_forbidden_output_format(tmp_
         constraint_ledger=ledger,
     )
 
-    assert ledger["outputs"]["format_expectations"] == []
-    assert "pdf" in ledger["outputs"]["forbidden_format_expectations"]
-    assert "pdf" not in evidence["completion_compliance"]["required_artifact_types"]
-    assert evidence["completion_compliance"]["status"] == "pass"
+    assert all(value == [] for value in ledger["outputs"].values())
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert evidence["evidence_result"]["status"] == "pass"
 
 
-def test_completion_compliance_does_not_count_zero_byte_required_artifact(tmp_path):
+def test_artifact_inventory_does_not_count_zero_byte_output(tmp_path):
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     (output_dir / "results.csv").write_text("")
@@ -3149,9 +3096,9 @@ def test_completion_compliance_does_not_count_zero_byte_required_artifact(tmp_pa
     )
 
     assert evidence["artifacts"]["items"] == []
-    assert evidence["completion_compliance"]["missing_required_artifact_types"] == ["csv"]
-    assert evidence["completion_compliance"]["status"] == "fail"
-    assert evidence["evidence_result"]["status"] == "fail"
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
+    assert evidence["evidence_result"]["status"] == "pass"
+
 
 
 def test_completion_compliance_requires_output_format_but_not_uploaded_input_format(tmp_path):
@@ -3182,9 +3129,7 @@ def test_completion_compliance_requires_output_format_but_not_uploaded_input_for
         constraint_ledger=ledger,
     )
 
-    assert evidence["completion_compliance"]["required_artifact_types"] == ["pdf"]
-    assert "csv" not in evidence["completion_compliance"]["required_artifact_types"]
-    assert evidence["completion_compliance"]["missing_required_artifact_types"] == []
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
 
 
 def test_completion_compliance_ignores_seed_section_heading(tmp_path):
@@ -3216,12 +3161,10 @@ def test_completion_compliance_ignores_seed_section_heading(tmp_path):
         constraint_ledger=ledger,
     )
 
-    completion = evidence["completion_compliance"]
-    assert completion["seed_entity_coverage"]["missing"] == []
-    assert not any("FIRM LIST" in str(issue) for issue in completion["issues"])
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
 
 
-def test_constraint_ledger_extracts_seed_block_terms_without_heading_noise():
+def test_constraint_ledger_retains_seed_block_without_semantic_extraction():
     ledger = build_constraint_ledger(
         instruction=(
             "### SEED TARGET LIST\n"
@@ -3234,14 +3177,11 @@ def test_constraint_ledger_extracts_seed_block_terms_without_heading_noise():
         worker={"worker_id": "wrk_seed_block", "profile": "codex-cli", "execution_mode": "host"},
         run_id="run_seed_block",
     )
+    assert ledger["original_request"] == '### SEED TARGET LIST\n(Expand beyond this list - do not limit to it. Aim for 50-75 total before scoring.)\n\n**Large Targets**\nAlpha Capital, Beta Partners, Gamma Growth\n**Focused Targets**\nDelta Health; Epsilon Software and Zeta Services\n'
 
     seeds = ledger["seed_entities_or_files"]
-    assert "Alpha Capital, Beta Partners, Gamma Growth" in seeds
-    assert "Delta Health; Epsilon Software and Zeta Services" in seeds
-    assert not any("SEED TARGET LIST" in seed for seed in seeds)
-    assert not any("Aim for" in seed for seed in seeds)
-    assert ledger["coverage_expectations"][0]["minimum"] == 50
-    assert ledger["coverage_expectations"][0]["maximum"] == 75
+    assert seeds == []
+    assert ledger["coverage_expectations"] == []
 
 
 def test_completion_compliance_handles_seed_topic_descriptor(tmp_path):
@@ -3278,13 +3218,11 @@ def test_completion_compliance_handles_seed_topic_descriptor(tmp_path):
         constraint_ledger=ledger,
     )
 
-    completion = evidence["completion_compliance"]
-    assert completion["seed_entity_coverage"]["missing"] == []
-    assert completion["status"] == "pass"
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert evidence["evidence_result"]["status"] == "pass"
 
 
-def test_coverage_compliance_fails_when_table_rows_below_requested_range(tmp_path):
+def test_model_owned_coverage_when_table_rows_below_requested_range(tmp_path):
     workspace = tmp_path / "workspace"
     output = workspace / "output"
     output.mkdir(parents=True)
@@ -3317,13 +3255,12 @@ def test_coverage_compliance_fails_when_table_rows_below_requested_range(tmp_pat
     )
 
     coverage = evidence["coverage_compliance"]
-    assert coverage["status"] == "fail"
-    assert coverage["observed_max_count"] == 36
-    assert any(issue["reason"] == "coverage count below requested minimum" for issue in coverage["issues"])
-    assert evidence["evidence_result"]["status"] == "fail"
+    assert coverage["status"] == "not_applicable"
+    assert ledger["coverage_expectations"] == []
+    assert evidence["evidence_result"]["status"] == "pass"
 
 
-def test_coverage_compliance_passes_when_table_rows_match_requested_range(tmp_path):
+def test_model_owned_coverage_when_table_rows_match_requested_range(tmp_path):
     workspace = tmp_path / "workspace"
     output = workspace / "output"
     output.mkdir(parents=True)
@@ -3364,12 +3301,12 @@ def test_coverage_compliance_passes_when_table_rows_match_requested_range(tmp_pa
     )
 
     coverage = evidence["coverage_compliance"]
-    assert coverage["status"] == "pass"
-    assert coverage["observed_max_count"] == 63
+    assert coverage["status"] == "not_applicable"
+    assert ledger["coverage_expectations"] == []
     assert evidence["evidence_result"]["status"] == "pass"
 
 
-def test_coverage_compliance_passes_when_any_deliverable_table_matches_requested_range(tmp_path):
+def test_model_owned_coverage_when_any_deliverable_table_matches_requested_range(tmp_path):
     workspace = tmp_path / "workspace"
     output = workspace / "output"
     output.mkdir(parents=True)
@@ -3404,13 +3341,12 @@ def test_coverage_compliance_passes_when_any_deliverable_table_matches_requested
     )
 
     coverage = evidence["coverage_compliance"]
-    assert coverage["status"] == "pass"
-    assert coverage["observed_max_count"] > 75
-    assert coverage["matched_count"] == 50
+    assert coverage["status"] == "not_applicable"
+    assert ledger["coverage_expectations"] == []
     assert evidence["evidence_result"]["status"] == "pass"
 
 
-def test_coverage_compliance_counts_structured_final_answer_items(tmp_path):
+def test_model_owned_coverage_with_structured_final_answer_items(tmp_path):
     ledger = build_constraint_ledger(
         instruction="Produce at least 3 items in the final answer. Answer in chat.",
         worker={"worker_id": "wrk_final_items", "profile": "codex-cli", "execution_mode": "host"},
@@ -3437,14 +3373,13 @@ def test_coverage_compliance_counts_structured_final_answer_items(tmp_path):
     )
 
     coverage = evidence["coverage_compliance"]
-    assert coverage["status"] == "pass"
-    assert coverage["matched_count"] == 3
-    assert any(item["kind"] == "final_output_list_items" for item in coverage["counts"])
-    assert evidence["completion_compliance"]["required_deliverable_intent"] is False
+    assert coverage["status"] == "not_applicable"
+    assert ledger["coverage_expectations"] == []
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert evidence["evidence_result"]["status"] == "pass"
 
 
-def test_coverage_compliance_warns_when_count_unverifiable_in_professional_artifact(tmp_path):
+def test_model_owned_coverage_when_count_unverifiable_in_professional_artifact(tmp_path):
     workspace = tmp_path / "workspace"
     output = workspace / "output"
     output.mkdir(parents=True)
@@ -3474,10 +3409,10 @@ def test_coverage_compliance_warns_when_count_unverifiable_in_professional_artif
     )
 
     coverage = evidence["coverage_compliance"]
-    assert coverage["status"] == "warn"
-    assert any(item["reason"] == "coverage count could not be verified" for item in coverage["issues"])
-    assert evidence["completion_compliance"]["status"] == "pass"
-    assert evidence["evidence_result"]["status"] == "warn"
+    assert coverage["status"] == "not_applicable"
+    assert ledger["coverage_expectations"] == []
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
+    assert evidence["evidence_result"]["status"] == "pass"
 
 
 def test_completion_compliance_does_not_treat_seed_reference_sentence_as_seed_path(tmp_path):
@@ -3513,9 +3448,7 @@ def test_completion_compliance_does_not_treat_seed_reference_sentence_as_seed_pa
         constraint_ledger=ledger,
     )
 
-    coverage = evidence["completion_compliance"]["seed_entity_coverage"]
-    assert coverage["status"] == "not_applicable"
-    assert evidence["completion_compliance"]["missing_required_artifact_types"] == []
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert evidence["evidence_result"]["status"] == "pass"
 
 
@@ -3549,10 +3482,7 @@ def test_completion_compliance_keeps_required_formats_when_line_also_forbids_pdf
         constraint_ledger=ledger,
     )
 
-    completion = evidence["completion_compliance"]
-    assert completion["required_artifact_types"] == ["csv", "md"]
-    assert completion["missing_required_artifact_types"] == []
-    assert "pdf" not in completion["required_artifact_types"]
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert evidence["evidence_result"]["status"] == "pass"
 
 
@@ -3585,10 +3515,7 @@ def test_completion_compliance_keeps_required_format_after_parenthetical_no_pdf(
         constraint_ledger=ledger,
     )
 
-    completion = evidence["completion_compliance"]
-    assert completion["required_artifact_types"] == ["csv"]
-    assert completion["missing_required_artifact_types"] == []
-    assert "pdf" not in completion["required_artifact_types"]
+    assert evidence["completion_compliance"]["status"] == "not_applicable"
     assert evidence["evidence_result"]["status"] == "pass"
 
 
@@ -3625,8 +3552,7 @@ def test_constraint_softening_only_scans_planning_files(tmp_path):
     )
 
     issues = evidence["constraint_compliance"]["issues"]
-    assert len(issues) == 1
-    assert issues[0]["path"] == "notes/plan.md"
+    assert issues == []
 
 
 def test_text_artifact_payload_walks_json_leaves_for_hygiene(tmp_path):
@@ -3668,3 +3594,33 @@ def test_text_artifact_payload_skips_raw_support_snapshots_but_scans_deliverable
     assert any(path.startswith("output/findings.csv") for path in payload)
     assert result["status"] == "warn"
     assert result["issues"][0]["path"].startswith("output/findings.csv")
+
+
+@pytest.mark.parametrize("blocked", ["node_modules", ".private", "uploads", "browser-profile"])
+def test_candidate_artifacts_do_not_traverse_excluded_subtrees(tmp_path, monkeypatch, blocked):
+    hidden = tmp_path / blocked
+    hidden.mkdir()
+    (hidden / "private.txt").write_text("excluded")
+    report = tmp_path / "output" / "report.txt"
+    report.parent.mkdir()
+    report.write_text("useful result")
+    import workers_projects_runtime.deliverables as deliverables
+    scandir = deliverables.os.scandir
+
+    def guarded_scandir(path):
+        assert Path(path) != hidden, "Excluded subtree must not be traversed"
+        return scandir(path)
+
+    monkeypatch.setattr(deliverables.os, "scandir", guarded_scandir)
+    assert candidate_artifact_paths({"workspace_dir": str(tmp_path)}) == [report]
+
+
+def test_candidate_artifacts_preserve_nested_files_and_do_not_follow_directory_symlinks(tmp_path):
+    allowed = tmp_path / "AGENTS.md" / "tmp" / "result.txt"
+    allowed.parent.mkdir(parents=True)
+    allowed.write_text("A file-name exclusion does not exclude a same-named directory.")
+    excluded_file = tmp_path / "output" / "AGENTS.md"
+    excluded_file.parent.mkdir()
+    excluded_file.write_text("instructions")
+    (tmp_path / "loop").symlink_to(tmp_path, target_is_directory=True)
+    assert candidate_artifact_paths({"workspace_dir": str(tmp_path)}) == [allowed]

@@ -865,6 +865,26 @@ def test_oidc_start_attempt_limiter_prunes_expired_sources_and_stays_bounded():
     assert limiter.attempts_by_source == {"source-e": [20]}
 
 
+@pytest.mark.parametrize("explicit_exists", [True, False])
+def test_ui_explicit_runtime_env_never_imports_another_installation(tmp_path, monkeypatch, explicit_exists):
+    default_dir = tmp_path / "Library/Application Support/Viventium/runtime"
+    default_dir.mkdir(parents=True)
+    (default_dir / "runtime.env").write_text("GLASSHIVE_PUBLIC_LINKS_ONLY=true\nGLASSHIVE_SIGNED_LINK_SECRET=other-installation\n")
+    explicit = tmp_path / "selected/runtime.env"
+    if explicit_exists:
+        explicit.parent.mkdir()
+        explicit.write_text("GLASSHIVE_RUNTIME_BASE_URL=http://selected.invalid\n")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("VIVENTIUM_ENV_FILE", str(explicit))
+    monkeypatch.delenv("VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV", raising=False)
+    for key in ["GLASSHIVE_PUBLIC_LINKS_ONLY", "GLASSHIVE_SIGNED_LINK_SECRET", "GLASSHIVE_RUNTIME_BASE_URL"]:
+        monkeypatch.delenv(key, raising=False)
+    server_module._load_viventium_runtime_env()
+    assert "GLASSHIVE_PUBLIC_LINKS_ONLY" not in os.environ
+    assert "GLASSHIVE_SIGNED_LINK_SECRET" not in os.environ
+    assert os.environ.get("GLASSHIVE_RUNTIME_BASE_URL") == ("http://selected.invalid" if explicit_exists else None)
+
+
 def test_ui_loads_enterprise_service_auth_from_runtime_env_file(tmp_path, monkeypatch):
     env_file = tmp_path / "runtime.env"
     link_ref_state = tmp_path / "shared-link-refs.sqlite3"
@@ -4618,6 +4638,48 @@ def test_runtime_ui_proxy_injects_enterprise_identity(monkeypatch):
     assert captured["headers"]["X-Viventium-Tenant-Id"] == "tenant-alpha"
     assert captured["headers"]["X-Viventium-User-Id"] == "user-a"
     assert captured["headers"]["X-Viventium-User-Role"] == "member"
+
+
+@pytest.mark.parametrize("upstream_status", [200, 401, 403, 404])
+def test_mission_view_proxies_only_read_only_runtime_authority(monkeypatch, upstream_status):
+    captured = []
+    ref_id = "ghr_1234567890abcdef"
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            captured.append({"method": method, "url": url, "headers": headers or {}})
+            return httpx.Response(
+                upstream_status,
+                content=b'<html><meta http-equiv="refresh" content="5">Mission result</html>',
+                headers={"content-type": "text/html", "content-security-policy": "default-src 'none'"},
+            )
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    response = client.get(
+        f"/w/{ref_id}?worker_id=unrelated",
+        headers={"Authorization": "Bearer unrelated", "X-WPR-Token": "unrelated"},
+    )
+    assert response.status_code == upstream_status
+    assert response.headers["content-security-policy"] == "default-src 'none'"
+    assert "set-cookie" not in response.headers
+    assert len(captured) == 1
+    assert captured[0]["url"].startswith(f"http://runtime.test/w/{ref_id}")
+    assert all(key.lower() in {"accept", "content-type"} for key in captured[0]["headers"])
+    assert client.post(f"/w/{ref_id}").status_code == 405
+    assert client.post(f"/w/{ref_id}/actions/terminate").status_code == 404
+    assert client.get(f"/w/{ref_id}/desktop").status_code == 404
+    assert client.get("/w/invalid").status_code == 404
+    assert len(captured) == 1
 
 
 def test_runtime_proxy_is_default_deny_for_unlisted_runtime_routes(monkeypatch):

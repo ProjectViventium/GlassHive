@@ -13,13 +13,18 @@ import time
 import tomllib
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
 import workers_projects_runtime.profile_runtime as profile_runtime_module
 from workers_projects_runtime.bootstrap import GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS, GLASSHIVE_SAFETY_CHECKPOINT_RULE
-from workers_projects_runtime.failure_classification import classify_cli_failure, classify_runtime_error
+from workers_projects_runtime.failure_classification import (
+    classify_cli_failure,
+    classify_runtime_error,
+    is_user_resumable_failure,
+)
 from workers_projects_runtime.openclaw_runtime import RuntimeDependencyMissingError, RuntimeErrorBase, WorkerTerminatedError
 from workers_projects_runtime.profile_runtime import BaseCliWorkerRuntime, ClaudeCodeRuntime, CodexCliRuntime, HostClaudeCodeRuntime, HostCodexCliRuntime, HostOpenClawRuntime, OpenClawWorkstationRuntime, ProfiledWorkerRuntime, _redact_text
 from workers_projects_runtime.run_evidence import build_constraint_ledger, write_constraint_ledger
@@ -75,7 +80,63 @@ def _write_pass_evidence(runtime, worker_id: str, run_id: str) -> None:
         )
         + "\n"
     )
-    (evidence_dir / "evidence.json").write_text(json.dumps({"evidence_result": {"status": "pass"}}) + "\n")
+    (evidence_dir / "evidence.json").write_text(json.dumps({"schema": "glasshive.run.evidence.v1", "run_id": run_id, "evidence_result": {"status": "pass"}}) + "\n")
+
+
+def test_stateless_codex_turn_does_not_resume_or_replace_native_session(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "private-state"))
+    worker = {
+        "worker_id": "wrk_stateless_codex",
+        "name": "Stateless Codex",
+        "profile": "codex-cli",
+        "execution_mode": "docker",
+        "trusted_run_lane": "conversation",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "run_mode": "conversation",
+                "env": {"GLASSHIVE_PROVIDER_SESSION_MODE": "stateless"},
+            }
+        ),
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_session_key(worker["worker_id"], "prior-native-session")
+
+    info = runtime._runtime_info(worker)
+    command, _ = runtime._build_command(worker, "Answer this turn.", info)
+
+    assert info.session_key is None
+    assert "resume" not in command
+    runtime._remember_native_session_key(worker, "new-native-session")
+    assert runtime._read_session_key(worker["worker_id"]) == "prior-native-session"
+
+
+def test_pidless_host_session_is_historical_ambiguity_without_terminal_proof(
+    tmp_path,
+):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "private-state"))
+    worker = {
+        "worker_id": "wrk_pidless_history",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+    }
+    run_id = "run_pidless_history"
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_active_session(
+        worker["worker_id"],
+        {
+            "session_name": runtime._session_name_for_run_id(run_id),
+            "run_id": run_id,
+            "attempt_id": "attempt-pidless",
+            "process_pid": None,
+            "process_start_identity": "",
+        },
+    )
+
+    assert runtime.host_active_process_status(worker) == {
+        "state": "uncertain",
+        "run_id": run_id,
+        "historical_record_only": True,
+    }
 
 
 def test_terminal_target_uses_inferred_job_session_when_metadata_missing(tmp_path):
@@ -237,20 +298,24 @@ def test_host_runtime_stop_failure_preserves_process_and_active_session(tmp_path
             "exit_path": str(tmp_path / "exit_code"),
             "model": "gpt-5.6-sol",
             "process_pid": process.pid,
+            "process_group": process.pid,
+            "process_start_identity": "synthetic-stubborn-generation",
             "started_at": datetime.now().astimezone().isoformat(),
         },
     )
     runtime._host_active_slots()["mission"] = worker_id
     runtime._host_worker_lanes()[worker_id] = "mission"
-    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.killpg", lambda _pgid, _signal: None)
+    monkeypatch.setattr(runtime, "_process_start_identity", lambda _pid: "synthetic-stubborn-generation")
+    signals = []
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.killpg", lambda pgid, sig: signals.append((pgid, sig)))
     runtime._wait_for_host_process_group_exit = lambda _pgid, _timeout: False  # type: ignore[attr-defined]
 
-    with pytest.raises(RuntimeError, match="remained alive"):
-        runtime._stop_active_process(
-            worker_id,
-            worker={"worker_id": worker_id, "execution_mode": "host"},
-            run_id="run_stop_failure",
-        )
+    assert runtime._stop_active_process(
+        worker_id,
+        worker={"worker_id": worker_id, "execution_mode": "host"},
+        run_id="run_stop_failure",
+    ) is False
+    assert signals == [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)]
 
     assert runtime._read_active_session(worker_id) is not None
     assert runtime._active_processes[worker_id] is process
@@ -778,7 +843,8 @@ def test_collect_completed_run_recovers_from_latest_run_artifacts(tmp_path):
     assert json.loads(runtime._session_meta_path(worker["worker_id"]).read_text())["session_key"] == "thread_123"
 
 
-def test_collect_completed_run_fails_when_recovered_success_missing_constraint_ledger(tmp_path):
+@pytest.mark.parametrize("summarized_evidence", [False, True])
+def test_collect_completed_run_preserves_success_when_internal_diagnostic_was_unavailable(tmp_path, summarized_evidence):
     runtime = CodexCliRuntime(base_dir=str(tmp_path))
     worker = {
         "worker_id": "wrk_missing_ledger",
@@ -798,15 +864,24 @@ def test_collect_completed_run_fails_when_recovered_success_missing_constraint_l
     (run_root / "exit_code").write_text("0")
     _write_pass_evidence(runtime, worker["worker_id"], run_id)
     (runtime._workspace_dir(worker["worker_id"]) / "glasshive-run" / "runs" / run_id / "constraint-ledger.json").unlink()
+    if summarized_evidence:
+        from workers_projects_runtime.run_evidence import summarize_run_evidence_result
+
+        evidence_path = runtime._workspace_dir(worker["worker_id"]) / "glasshive-run" / "runs" / run_id / "evidence.json"
+        evidence = json.loads(evidence_path.read_text())
+        evidence["constraint_compliance"] = {"status": "not_available", "issues": []}
+        evidence["evidence_result"] = summarize_run_evidence_result(evidence)
+        assert evidence["evidence_result"]["status"] == "warn"
+        assert {"reason": "internal constraint diagnostic was unavailable"} in evidence["evidence_result"]["warning_reasons"]
+        evidence_path.write_text(json.dumps(evidence))
 
     runtime.reconcile_worker = lambda worker: runtime._runtime_info(worker, pid=1234)  # type: ignore[method-assign]
 
     recovered = runtime.collect_completed_run(worker, run_id=run_id)
     assert recovered is not None
-    assert recovered["state"] == "failed"
-    assert "constraint ledger was not readable" in recovered["error_text"]
-    assert recovered["failure_class"] == "glasshive_evidence_check_failed"
-    assert recovered["failure_retryable"] == 1
+    assert recovered["state"] == "completed"
+    assert recovered["output_text"].startswith("Done")
+    assert "internal constraint diagnostic was unavailable" in recovered["output_text"]
 
 
 def test_collect_completed_run_preserves_evidence_warning(tmp_path):
@@ -919,7 +994,7 @@ def test_collect_completed_run_classifies_and_redacts_provider_rate_limit(tmp_pa
     assert "PUBLIC_FAKE_TOKEN_VALUE" not in recovered["error_text"]
 
 
-def test_cli_failure_classifies_codex_usage_quota_as_provider_rate_limit():
+def test_cli_failure_classifies_codex_usage_quota_as_structured_provider_quota():
     stdout = "\n".join(
         [
             json.dumps(
@@ -942,10 +1017,139 @@ def test_cli_failure_classifies_codex_usage_quota_as_provider_rate_limit():
         exit_code=1,
     )
 
-    assert failure.failure_class == "provider_rate_limited"
+    # The Codex usage-limit exhaustion is a structured provider quota signal (from the CLI's own
+    # terminal error event), so it is failover-eligible and drives the configured fallback worker.
+    assert failure.failure_class == "provider_quota_exhausted"
     assert failure.retryable is True
-    assert "quota or rate limit" in failure.user_message
-    assert "provider-reported reset" in failure.recommended_recovery
+    assert failure.structured is True
+    assert failure.provider_event_source == "provider_native"
+    assert "configured fallback" in failure.recommended_recovery
+
+
+def test_cli_failure_classifies_codex_usage_limit_turn_failed_as_structured_quota():
+    # The real Codex CLI emits a trusted `turn.failed` control event carrying the usage-limit
+    # exhaustion in its own error message. That must be structured provider evidence so the
+    # configured fallback worker can take over automatically (failover keys on structured
+    # provider_quota_exhausted / provider_rate_limited evidence, never on task text).
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "t"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "You've hit your usage limit. Visit the usage page or try again later.",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {
+                        "message": "You've hit your usage limit. Visit the usage page or try again later.",
+                    },
+                }
+            ),
+        ]
+    )
+
+    failure = classify_cli_failure(
+        stdout=stdout, stderr="", runtime_name="codex-cli", exit_code=1
+    )
+
+    assert failure.failure_class == "provider_quota_exhausted"
+    assert failure.retryable is True
+    assert failure.structured is True
+    assert failure.provider_event_source == "provider_native"
+    assert "configured fallback" in failure.recommended_recovery
+
+
+def test_cli_failure_classifies_codex_usage_limit_top_level_error_as_structured_quota():
+    # The Codex CLI can also report the usage-limit exhaustion as a top-level stream error event and
+    # then exit without a turn.failed event. That top-level `error` is the CLI's own provider report
+    # (task text is carried under assistant/item events), so it is structured quota evidence too.
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "t"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "You've hit your usage limit. Visit the usage page or try again later.",
+                }
+            ),
+        ]
+    )
+
+    failure = classify_cli_failure(
+        stdout=stdout, stderr="", runtime_name="codex-cli", exit_code=1
+    )
+
+    assert failure.failure_class == "provider_quota_exhausted"
+    assert failure.structured is True
+    assert failure.provider_event_source == "provider_native"
+
+
+def test_runtime_error_classifies_codex_usage_limit_raw_exit_as_structured_quota():
+    # The live host worker-exit path raises a raw error whose message embeds the provider's terminal
+    # JSONL, then classifies it with classify_runtime_error. That path must also recognize the
+    # usage-limit exhaustion (from the provider's own trusted terminal events) as structured quota so
+    # the configured fallback worker takes over automatically.
+    from workers_projects_runtime.failure_classification import classify_runtime_error
+
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "t"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "You've hit your usage limit. Visit the usage page or try again later.",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "You've hit your usage limit. Visit the usage page or try again later."},
+                }
+            ),
+        ]
+    )
+    exc = RuntimeError(f"codex-cli exited with code 1: {stdout}")
+    failure = classify_runtime_error(exc, runtime_name="codex-cli")
+
+    assert failure.failure_class == "provider_quota_exhausted"
+    assert failure.structured is True
+    assert failure.provider_event_source == "provider_native"
+
+
+def test_runtime_error_keeps_generic_worker_exit_without_provider_capacity_event():
+    from workers_projects_runtime.failure_classification import classify_runtime_error
+
+    exc = RuntimeError("codex-cli exited with code 1: internal parser crash, no provider event")
+    failure = classify_runtime_error(exc, runtime_name="codex-cli")
+    assert failure.failure_class == "runtime_error"
+
+
+def test_cli_failure_does_not_treat_assistant_usage_limit_prose_as_structured_quota():
+    # Assistant/task output that merely mentions a usage limit must never be trusted as a provider
+    # capacity failure; only the provider's own trusted terminal event counts as structured.
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "Your plan usage limit resets monthly."}]},
+                }
+            ),
+            json.dumps({"type": "turn.completed"}),
+        ]
+    )
+
+    failure = classify_cli_failure(
+        stdout=stdout, stderr="", runtime_name="codex-cli", exit_code=1
+    )
+
+    assert failure.structured is False
 
 
 def test_classify_cli_failure_maps_structured_provider_overload():
@@ -976,6 +1180,39 @@ def test_classify_cli_failure_does_not_treat_unstructured_overloaded_prose_as_pr
     failure = classify_cli_failure(
         stdout="",
         stderr="The worker wrote a draft saying the market is overloaded with generic options.",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "unknown"
+    assert failure.retryable is False
+
+
+def test_classify_cli_failure_maps_provider_egress_413_to_resumable_context_limit():
+    failure = classify_cli_failure(
+        stdout="",
+        stderr=(
+            "ERROR: Reconnecting... 5/5\n"
+            "ERROR: unexpected status 413 Payload Too Large: Unknown error, "
+            "url: http://provider-egress:8080/openai/v1/responses\n"
+        ),
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_context_limit_exceeded"
+    assert failure.retryable is False
+    assert failure.structured is True
+    assert is_user_resumable_failure(
+        failure_class=failure.failure_class,
+        retryable=failure.retryable,
+    )
+
+
+def test_classify_cli_failure_does_not_trust_unscoped_payload_too_large_prose():
+    failure = classify_cli_failure(
+        stdout="",
+        stderr="The task notes say ERROR: unexpected status 413 Payload Too Large.",
         runtime_name="codex-cli",
         exit_code=1,
     )
@@ -1530,6 +1767,47 @@ def test_openclaw_collect_completed_run_recovers_final_json_without_exit_file(tm
     assert terminated == [run_id]
 
 
+@pytest.mark.parametrize("explicit_run_id", [False, True])
+def test_host_completed_output_cannot_finalize_until_exact_process_stop_succeeds(tmp_path, explicit_run_id):
+    runtime = HostOpenClawRuntime(base_dir=str(tmp_path))
+    worker = {"worker_id": "wrk_stop_recovery", "profile": "openclaw-general", "model": "openai/gpt-5.2"}
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_stop_recovery"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    stdout_path = run_root / "stdout.log"
+    stdout_path.write_text(json.dumps({
+        "finalAssistantVisibleText": "FINAL REPORT:\nRecovered result.",
+        "completion": {"stopReason": "stop"},
+    }))
+    (run_root / "stderr.log").write_text("")
+    runtime._write_active_session(worker["worker_id"], {
+        "session_name": runtime._session_name_for_run_id(run_id), "run_id": run_id,
+        "stdout_path": str(stdout_path), "stderr_path": str(run_root / "stderr.log"),
+        "exit_path": str(run_root / "exit_code"),
+    })
+    _write_pass_evidence(runtime, worker["worker_id"], run_id)
+    original_session = runtime._active_session_meta_path(worker["worker_id"]).read_bytes()
+    stopped = []
+    stop_succeeds = False
+    def stop(worker_id, *, worker, run_id):
+        stopped.append((worker_id, run_id))
+        return stop_succeeds
+    runtime._stop_active_process = stop
+    runtime.reconcile_worker = lambda worker: runtime._runtime_info(worker, pid=4321)
+    options = {"run_id": run_id} if explicit_run_id else {}
+    for _ in range(2):
+        assert runtime.collect_completed_run(worker, **options) is None
+        assert not (run_root / "exit_code").exists()
+        assert runtime._active_session_meta_path(worker["worker_id"]).read_bytes() == original_session
+    stop_succeeds = True
+    recovered = runtime.collect_completed_run(worker, **options)
+    assert recovered is not None and recovered["state"] == "completed"
+    assert recovered["output_text"] == "Recovered result."
+    assert (run_root / "exit_code").read_text() == "0"
+    assert stopped == [(worker["worker_id"], run_id)] * 3
+
+
 def test_interrupt_worker_stops_exact_run_session_when_metadata_is_missing(tmp_path):
     runtime = CodexCliRuntime(base_dir=str(tmp_path))
     worker = {
@@ -1556,7 +1834,8 @@ def test_interrupt_worker_stops_exact_run_session_when_metadata_is_missing(tmp_p
     )
     runtime.sandbox.inspect = lambda worker_id: type("SandboxInfo", (), {"pid": 4321, "state": "running"})()  # type: ignore[method-assign]
 
-    runtime.interrupt_worker(worker, run_id=run_id)
+    info = runtime.interrupt_worker(worker, run_id=run_id)
+    assert info.pid is None
     assert stopped == [runtime._session_name_for_run_id(run_id)]
     assert terminated == [run_id]
 
@@ -1679,7 +1958,7 @@ def test_host_codex_runtime_materializes_required_workspace_files(tmp_path, monk
     workspace_dir = workspace / next(workspace.iterdir()).name
     assert (workspace_dir / "project-definition.md").read_text() == "# Project\n\nBuild the launch app."
     assert "main computer" in (workspace_dir / "harness-prompt.md").read_text()
-    assert "bash /path/to/script.sh" in (workspace_dir / "harness-prompt.md").read_text()
+    assert profile_runtime_module.HOST_NATIVE_HARNESS_PROMPT.rstrip() in (workspace_dir / "harness-prompt.md").read_text()
     assert GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS in (workspace_dir / "harness-prompt.md").read_text()
     assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in (workspace_dir / "harness-prompt.md").read_text()
     assert (workspace_dir / "work-log.md").exists()
@@ -1946,7 +2225,7 @@ def test_codex_cli_provider_config_honors_per_run_reasoning_effort(tmp_path, mon
     assert 'model_reasoning_effort="medium"' not in joined
 
 
-def test_codex_cli_provider_config_clamps_xhigh_without_route_proof(tmp_path, monkeypatch, caplog):
+def test_codex_cli_provider_config_rejects_xhigh_without_route_proof(tmp_path, monkeypatch, caplog):
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
     monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "xhigh")
@@ -1954,19 +2233,10 @@ def test_codex_cli_provider_config_clamps_xhigh_without_route_proof(tmp_path, mo
     command: list[str] = []
     worker = {"worker_id": "wrk_effort", "profile": "codex-cli"}
     caplog.set_level(logging.WARNING, logger="workers_projects_runtime.profile_runtime")
-    runtime._append_codex_compatible_provider_config(command, worker)
-
-    joined = "\n".join(command)
-    assert 'model_reasoning_effort="medium"' in joined
-    assert 'model_reasoning_effort="xhigh"' not in joined
-    assert worker["_effort_projection"] == {
-        "requested": "xhigh",
-        "effective": "medium",
-        "allowed": ["high", "low", "medium", "none"],
-        "route_proven": False,
-        "fallback_reason": "xhigh_route_not_proven",
-    }
-    assert any(record.message == "Codex CLI reasoning effort clamped to provider-route fallback" for record in caplog.records)
+    with pytest.raises(RuntimeErrorBase, match="Unsupported Codex provider-route effort"):
+        runtime._append_codex_compatible_provider_config(command, worker)
+    assert "_effort_projection" not in worker
+    assert not any("model_reasoning_effort" in item for item in command)
 
 
 def test_codex_cli_provider_config_disables_web_search_for_minimal_effort(tmp_path, monkeypatch):
@@ -1988,7 +2258,7 @@ def test_codex_cli_provider_config_disables_web_search_for_minimal_effort(tmp_pa
     assert "--disable\nweb_search" not in joined
 
 
-def test_codex_cli_provider_config_clamps_minimal_without_route_allowlist(tmp_path, monkeypatch):
+def test_codex_cli_provider_config_rejects_minimal_without_route_allowlist(tmp_path, monkeypatch):
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
     worker = {
@@ -1998,19 +2268,10 @@ def test_codex_cli_provider_config_clamps_minimal_without_route_allowlist(tmp_pa
     }
 
     command: list[str] = []
-    runtime._append_codex_compatible_provider_config(command, worker)
-
-    joined = "\n".join(command)
-    assert 'model_reasoning_effort="medium"' in joined
-    assert 'model_reasoning_effort="minimal"' not in joined
-    assert 'web_search="disabled"' not in joined
-    assert worker["_effort_projection"] == {
-        "requested": "minimal",
-        "effective": "medium",
-        "allowed": ["high", "low", "medium", "none"],
-        "route_proven": False,
-        "fallback_reason": "requested_effort_not_allowed",
-    }
+    with pytest.raises(RuntimeErrorBase, match="Unsupported Codex provider-route effort"):
+        runtime._append_codex_compatible_provider_config(command, worker)
+    assert "_effort_projection" not in worker
+    assert not any("model_reasoning_effort" in item for item in command)
 
 
 def test_codex_cli_provider_config_supports_none_reasoning_effort(tmp_path, monkeypatch):
@@ -2029,7 +2290,7 @@ def test_codex_cli_provider_config_supports_none_reasoning_effort(tmp_path, monk
     assert 'web_search="disabled"' not in joined
 
 
-def test_codex_effort_projection_reports_requested_and_effective_values(tmp_path, monkeypatch):
+def test_codex_effort_projection_rejects_unsupported_request(tmp_path, monkeypatch):
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     worker = {
         "worker_id": "wrk_effort",
@@ -2039,11 +2300,9 @@ def test_codex_effort_projection_reports_requested_and_effective_values(tmp_path
         ),
     }
 
-    projection = runtime.effort_projection_for_worker(worker)
-
-    assert projection["requested"] == "xhigh"
-    assert projection["effective"] == "medium"
-    assert projection["fallback_reason"] == "xhigh_route_not_proven"
+    with pytest.raises(RuntimeErrorBase, match="Unsupported Codex provider-route effort"):
+        runtime.effort_projection_for_worker(worker)
+    assert "_effort_projection" not in worker
 
 
 def test_profiled_runtime_delegates_codex_effort_projection(tmp_path, monkeypatch):
@@ -2065,7 +2324,7 @@ def test_profiled_runtime_delegates_codex_effort_projection(tmp_path, monkeypatc
     assert projection["fallback_reason"] == ""
 
 
-def test_codex_cli_provider_config_coerces_unsupported_reasoning_effort(tmp_path, monkeypatch):
+def test_codex_cli_provider_config_rejects_unsupported_reasoning_effort(tmp_path, monkeypatch):
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
     monkeypatch.setenv("WPR_CODEX_CLI_ALLOWED_REASONING_EFFORTS", "medium")
@@ -2075,15 +2334,13 @@ def test_codex_cli_provider_config_coerces_unsupported_reasoning_effort(tmp_path
     }
 
     command: list[str] = []
-    runtime._append_codex_compatible_provider_config(command, worker)
-
-    joined = "\n".join(command)
-    assert 'model_reasoning_effort="medium"' in joined
-    assert 'model_reasoning_effort="minimal"' not in joined
-    assert 'web_search="disabled"' not in joined
+    with pytest.raises(RuntimeErrorBase, match="Unsupported Codex provider-route effort"):
+        runtime._append_codex_compatible_provider_config(command, worker)
+    assert "_effort_projection" not in worker
+    assert not any("model_reasoning_effort" in item for item in command)
 
 
-def test_codex_cli_provider_config_coerces_high_effort_when_route_allows_medium_only(
+def test_codex_cli_provider_config_rejects_high_effort_when_route_allows_medium_only(
     tmp_path,
     monkeypatch,
     caplog,
@@ -2101,23 +2358,13 @@ def test_codex_cli_provider_config_coerces_high_effort_when_route_allows_medium_
 
     command: list[str] = []
     caplog.set_level(logging.WARNING, logger="workers_projects_runtime.profile_runtime")
-    runtime._append_codex_compatible_provider_config(command, worker)
-
-    joined = "\n".join(command)
-    assert 'model_reasoning_effort="medium"' in joined
-    assert 'model_reasoning_effort="high"' not in joined
-    clamp_records = [
-        record
-        for record in caplog.records
-        if record.message == "Codex CLI reasoning effort clamped to provider-route fallback"
-    ]
-    assert len(clamp_records) == 1
-    assert clamp_records[0].requested_effort == "high"
-    assert clamp_records[0].effective_effort == "medium"
-    assert clamp_records[0].allowed_efforts == "medium"
+    with pytest.raises(RuntimeErrorBase, match="Unsupported Codex provider-route effort"):
+        runtime._append_codex_compatible_provider_config(command, worker)
+    assert "_effort_projection" not in worker
+    assert not any("model_reasoning_effort" in item for item in command)
 
 
-def test_codex_cli_provider_config_honors_reasoning_effort_fallback(tmp_path, monkeypatch):
+def test_codex_cli_provider_config_does_not_apply_reasoning_effort_fallback(tmp_path, monkeypatch):
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.setenv("WPR_CODEX_CLI_BASE_URL", "https://provider.example.com/v1")
     monkeypatch.setenv("WPR_CODEX_CLI_ALLOWED_REASONING_EFFORTS", "medium,high")
@@ -2128,11 +2375,10 @@ def test_codex_cli_provider_config_honors_reasoning_effort_fallback(tmp_path, mo
     }
 
     command: list[str] = []
-    runtime._append_codex_compatible_provider_config(command, worker)
-
-    joined = "\n".join(command)
-    assert 'model_reasoning_effort="high"' in joined
-    assert 'model_reasoning_effort="minimal"' not in joined
+    with pytest.raises(RuntimeErrorBase, match="Unsupported Codex provider-route effort"):
+        runtime._append_codex_compatible_provider_config(command, worker)
+    assert "_effort_projection" not in worker
+    assert not any("model_reasoning_effort" in item for item in command)
 
 
 def test_codex_cli_provider_config_ignores_invalid_allowed_reasoning_efforts(tmp_path, monkeypatch):
@@ -2265,7 +2511,8 @@ def test_host_cli_run_writes_constraint_ledger_and_evidence(tmp_path, monkeypatc
     evidence = json.loads((workspace / "glasshive-run" / "evidence.json").read_text())
     active_status = json.loads((workspace / "glasshive-run" / "runs" / "run_evidence" / "active-run.json").read_text())
     assert ledger["run_id"] == "run_evidence"
-    assert any("May 2026" in item for item in ledger["constraints"]["date"])
+    assert ledger["constraints"]["date"] == []
+    assert "May 2026" in ledger["original_request"]
     assert evidence["run_id"] == "run_evidence"
     assert evidence["worker"]["profile"] == "codex-cli"
     assert evidence["final_output"]["has_final_report"] is True
@@ -2275,7 +2522,7 @@ def test_host_cli_run_writes_constraint_ledger_and_evidence(tmp_path, monkeypatc
     assert active_status["run_id"] == "run_evidence"
     assert active_status["process_pid"] == 12345
     assert active_status["transcript_paths"]["stdout"].endswith("/stdout.log")
-    assert active_status["evidence_path"] == "glasshive-run/evidence.json"
+    assert active_status["evidence_path"] == "glasshive-run/runs/run_evidence/evidence.json"
 
 
 def test_host_cli_run_fails_when_evidence_contract_fails(tmp_path, monkeypatch):
@@ -2323,6 +2570,12 @@ def test_host_cli_run_fails_when_evidence_contract_fails(tmp_path, monkeypatch):
         "workspace_dir": str(workspace),
     }
 
+    worker["bootstrap_bundle_json"] = json.dumps({"viventium_continuation_contract": {
+        "version": 1, "run_id": 'run_evidence_fail',
+        "source": {"source_event_id": "event_output", "source_revision": 1, "surface": "web"},
+        "output": {"mode": "replace", "required": [], "forbidden": [], "formats": ["pdf"], "forbidden_formats": []},
+    }})
+
     with pytest.raises(RuntimeErrorBase, match="GlassHive evidence check failed"):
         runtime.run_task(worker, "Deliver a PDF report.", run_id="run_evidence_fail")
 
@@ -2337,6 +2590,7 @@ def test_host_cli_run_fails_when_evidence_contract_fails(tmp_path, monkeypatch):
 def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
+    monkeypatch.setattr(runtime, "_process_start_identity", lambda pid: f"ps-lstart:synthetic-{pid}")
     recorded_metrics: list[tuple[str, str, str]] = []
 
     def record_metrics(worker_id, run_id, stdout):
@@ -2433,6 +2687,7 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
 def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
+    monkeypatch.setattr(runtime, "_process_start_identity", lambda pid: f"ps-lstart:synthetic-{pid}")
     _patch_host_codex_requirement_probe(monkeypatch)
     workspace = tmp_path / "workspace"
     processes: list[object] = []
@@ -2595,6 +2850,7 @@ def test_host_codex_run_sends_instruction_via_stdin_not_argv(tmp_path, monkeypat
 def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "/bin/echo"
+    monkeypatch.setattr(runtime, "_process_start_identity", lambda pid: f"ps-lstart:synthetic-{pid}")
     recorded_metrics: list[tuple[str, str, str]] = []
 
     def record_metrics(worker_id, run_id, stdout):
@@ -2685,6 +2941,15 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
     while runtime._read_active_session(worker["worker_id"]) is None and time.time() < deadline:
         time.sleep(0.01)
 
+    session = runtime._read_active_session(worker["worker_id"])
+    worker["_active_run_id"] = "run_interrupt_evidence"
+    worker["_host_run_lease"] = {
+        "worker_id": worker["worker_id"], "run_id": "run_interrupt_evidence",
+        "status": "active", "startup_state": "confirmed", "startup_identity_kind": "host_process",
+        "pid": session["process_pid"], "process_group": session["process_group"],
+        "process_start_identity": session["process_start_identity"],
+        "startup_session_id": session["session_name"],
+    }
     runtime.interrupt_worker(worker, run_id="run_interrupt_evidence")
     thread.join(timeout=3)
 
@@ -2743,7 +3008,8 @@ def test_host_codex_runtime_default_prompts_require_final_report(tmp_path, monke
         content = (workspace_dir / filename).read_text()
         assert "FINAL REPORT:" in content
         assert "inspect" in content.lower()
-        assert "request and success criteria" in content.lower()
+        assert "user's request" in content.lower()
+        assert "success criteria" in content.lower()
         if filename in {"harness-prompt.md", "agents.md", "AGENTS.md"}:
             assert GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS in content
             assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in content
@@ -2880,6 +3146,51 @@ def test_host_runtime_materializes_project_mcp_bootstrap_with_owner_only_files(t
     assert stat.S_IMODE((workspace_dir / ".codex" / "config.toml").stat().st_mode) == 0o600
     assert stat.S_IMODE((worker_codex_home / "config.toml").stat().st_mode) == 0o600
     assert stat.S_IMODE((worker_codex_home / "auth.json").stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("enabled, denied", [(True, False), (False, False), (None, False), (True, True)])
+def test_host_codex_projects_enabled_modern_native_cua_without_reenabling_legacy(tmp_path, monkeypatch, enabled, denied):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    plugin_selection = (f'[plugins."unified-computer-use@openai-bundled"]\nenabled = {str(enabled).lower()}\n'
+                        if enabled is not None else "")
+    (source_home / "config.toml").write_text(
+        plugin_selection + '[mcp_servers.computer-use]\ncommand = "/legacy/computer-use"\nenabled = false\n'
+    )
+    manifest = source_home / "plugins/cache/openai-bundled/unified-computer-use/1.0.0/.mcp.json"
+    manifest.parent.mkdir(parents=True)
+    recipe = {
+        "command": "/native/node", "args": ["/native/cua/launch.mjs"], "enabled": True,
+        "enabled_tools": ["js", "js_reset"], "omit_tools_from": ["code_mode", "deferred"],
+        "startup_timeout_sec": 120, "tools": {"js": {"output_token_limit": 25000}},
+        "env": {"CUA_REPL_ENABLED_SURFACES": "browser,computer", "CODEX_HOME": "/native/home"},
+    }
+    manifest.write_text(json.dumps({"mcpServers": {"cua_repl": recipe, "private-mail": {"url": "https://private.example.test"}}}))
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setenv("GLASSHIVE_HOST_PLUGIN_DENYLIST", "unified-computer-use@openai-bundled" if denied else "")
+    monkeypatch.delenv("WPR_HOST_PLUGIN_DENYLIST", raising=False)
+    monkeypatch.delenv("GLASSHIVE_HOST_CODEX_NATIVE_MCP_ALLOWLIST", raising=False)
+    monkeypatch.delenv("WPR_HOST_CODEX_NATIVE_MCP_ALLOWLIST", raising=False)
+    config = tomllib.loads(runtime._host_codex_worker_config(""))
+    assert config["mcp_servers"]["computer-use"]["enabled"] is False
+    assert "private-mail" not in config["mcp_servers"]
+    if enabled is True and not denied:
+        assert config["mcp_servers"]["cua_repl"] == {**recipe, "env": {**recipe["env"], "HOME": str(Path.home())}}
+    else:
+        assert "cua_repl" not in config["mcp_servers"]
+
+
+def test_host_codex_preserves_explicit_modern_cua_disable(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text('[mcp_servers.cua_repl]\ncommand = "/native/node"\nenabled = false\n')
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.delenv("GLASSHIVE_HOST_CODEX_NATIVE_MCP_ALLOWLIST", raising=False)
+    monkeypatch.delenv("WPR_HOST_CODEX_NATIVE_MCP_ALLOWLIST", raising=False)
+    config = tomllib.loads(runtime._host_codex_worker_config(""))
+    assert config["mcp_servers"]["cua_repl"]["enabled"] is False
 
 
 def test_host_codex_preserves_known_computer_use_client_when_manifest_is_absent(tmp_path, monkeypatch):
@@ -4630,8 +4941,22 @@ def test_docker_cli_runtime_sources_runtime_and_openclaw_env_files(tmp_path):
         assert "GLASSHIVE_RUN_ID=run_capture" in script
         assert "GLASSHIVE_ACTIVE_WORKER_ID=wrk_capture" in script
         assert "unset " in script
-        assert "OPENAI_API_KEY" in script
-        assert "CLAUDE_CODE_OAUTH_TOKEN" in script
+        # The current owner scrubs declared secret keys rather than a fixed provider list.
+        scrub = next(line for line in script.splitlines() if line.startswith("scrub_run_secrets()"))
+        secret_keys = run_root / "synthetic-secret.keys"
+        secret_env = run_root / "synthetic-secret.env"
+        secret_keys.write_text("OPENAI_API_KEY\nCLAUDE_CODE_OAUTH_TOKEN\nCUSTOM_BROKER_TOKEN\n")
+        secret_env.write_text("synthetic private grant")
+        checked = subprocess.run(
+            ["bash", "-c", scrub + '\nscrub_run_secrets\n' +
+             '[[ -z "${OPENAI_API_KEY+x}${CLAUDE_CODE_OAUTH_TOKEN+x}${CUSTOM_BROKER_TOKEN+x}" ]]'],
+            env={**os.environ, "GLASSHIVE_SECRET_ENV_KEYS_FILE": str(secret_keys),
+                 "GLASSHIVE_SECRET_ENV_FILE": str(secret_env), "GLASSHIVE_SECRET_ENV_DIR": "",
+                 "OPENAI_API_KEY": "synthetic", "CLAUDE_CODE_OAUTH_TOKEN": "synthetic",
+                 "CUSTOM_BROKER_TOKEN": "synthetic"}, capture_output=True, text=True,
+        )
+        assert checked.returncode == 0
+        assert not secret_keys.exists() and not secret_env.exists()
         (run_root / "stdout.log").write_text("FINAL REPORT:\nok")
         (run_root / "stderr.log").write_text("")
         (run_root / "exit_code").write_text("0")
@@ -4654,7 +4979,7 @@ def test_docker_cli_runtime_sources_runtime_and_openclaw_env_files(tmp_path):
     assert active_status["heartbeat_sequence"] >= 1
     assert active_status["transcript_progress"]["files"]["stdout"]["exists"] is True
     assert active_status["transcript_progress"]["files"]["stdout"]["bytes"] > 0
-    assert active_status["evidence_path"] == "glasshive-run/evidence.json"
+    assert active_status["evidence_path"] == f"glasshive-run/runs/{run_id}/evidence.json"
     active_session_text = runtime._active_session_meta_path(worker["worker_id"]).read_text()
     assert "do it" not in active_session_text
     active_session = json.loads(active_session_text)
@@ -4720,7 +5045,7 @@ def test_docker_cli_run_writes_timeout_active_run_status(tmp_path, monkeypatch):
     assert active_status["stop_reason"] == "timeout"
     assert active_status["process_pid"] == 9876
     assert active_status["transcript_progress"]["files"]["stdout"]["exists"] is True
-    assert active_status["evidence_path"] == "glasshive-run/evidence.json"
+    assert active_status["evidence_path"] == f"glasshive-run/runs/{run_id}/evidence.json"
     assert recorded_metrics == [
         ("wrk_docker_timeout", run_id, "Started but still working.\n")
     ]
@@ -4820,6 +5145,12 @@ def test_docker_cli_run_fails_when_evidence_contract_fails(tmp_path):
     _install_fake_successful_docker_run(runtime, run_id, "FINAL REPORT:\nDone\n")
     worker = {"worker_id": "wrk_docker_evidence_fail", "name": "Capture Worker", "profile": "openclaw-general"}
 
+    worker["bootstrap_bundle_json"] = json.dumps({"viventium_continuation_contract": {
+        "version": 1, "run_id": 'run_docker_evidence_fail',
+        "source": {"source_event_id": "event_output", "source_revision": 1, "surface": "web"},
+        "output": {"mode": "replace", "required": [], "forbidden": [], "formats": ["pdf"], "forbidden_formats": []},
+    }})
+
     with pytest.raises(RuntimeErrorBase, match="GlassHive evidence check failed"):
         runtime.run_task(worker, "Deliver a PDF report.", run_id=run_id)
 
@@ -4855,7 +5186,7 @@ def test_docker_cli_run_fails_when_success_evidence_cannot_be_written(tmp_path, 
         runtime.run_task(worker, "Do the work.", run_id=run_id)
 
 
-def test_docker_cli_run_fails_when_success_constraint_ledger_cannot_be_written(tmp_path, monkeypatch):
+def test_docker_cli_run_preserves_success_when_internal_constraint_diagnostic_cannot_be_written(tmp_path, monkeypatch):
     class CaptureRuntime(BaseCliWorkerRuntime):
         runtime_name = "openclaw"
         worker_root_name = "capture_runtime"
@@ -4878,8 +5209,9 @@ def test_docker_cli_run_fails_when_success_constraint_ledger_cannot_be_written(t
     )
     worker = {"worker_id": "wrk_docker_ledger_write_fail", "name": "Capture Worker", "profile": "openclaw-general"}
 
-    with pytest.raises(RuntimeErrorBase, match="constraint ledger was not written"):
-        runtime.run_task(worker, "Do the work.", run_id=run_id)
+    result = runtime.run_task(worker, "Do the work.", run_id=run_id)
+    assert result.startswith("Done")
+    assert "constraint diagnostic warning" in result
 
 
 def test_docker_codex_command_appends_completion_contract(tmp_path):
@@ -4952,7 +5284,7 @@ def test_docker_codex_stale_resume_replays_same_instruction_as_fresh_task(tmp_pa
     assert "no rollout found" not in completed.stderr
     calls = calls_path.read_text().splitlines()
     assert len(calls) == 2
-    assert "exec resume" in calls[0]
+    assert "exec resume --json" in calls[0]
     assert "exec --json" in calls[1]
     assert all("Install the official native plugins." in call for call in calls)
 
@@ -5271,6 +5603,176 @@ def test_bound_docker_codex_subscription_does_not_use_deployment_provider(tmp_pa
     assert env["CODEX_HOME"] == "/workspace/.wpr-home/.codex"
     assert "OPENAI_API_KEY" not in env
     assert "OPENAI_BASE_URL" not in env
+
+
+def test_bound_clean_room_codex_subscription_uses_run_broker_route(tmp_path, monkeypatch):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_personal_clean_room",
+        "name": "Personal Clean Room Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.6-sol",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "execution_policy": "parallel-clean-room-v1",
+                "provider_account": {
+                    "policy": "personal_required",
+                    "account_id": "acct_personal",
+                },
+                "env": {
+                    "GLASSHIVE_CAPABILITY_BROKER_TOKEN": "synthetic-run-grant",
+                },
+            }
+        ),
+        "_glasshive_provider_account_bound": True,
+        "_glasshive_provider_account_env": {
+            "CODEX_HOME": "/workspace/.wpr-home/.codex",
+        },
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    monkeypatch.setenv("WPR_PARALLEL_CLEAN_ROOM_NETWORK", "glasshive-parallel-clean-room")
+    monkeypatch.setenv(
+        "WPR_PARALLEL_CLEAN_ROOM_PROVIDER_PROXY_URL",
+        "http://provider-egress:8080",
+    )
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://deployment-gateway.example.test/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-deployment-key")
+
+    command, env = runtime._build_command(
+        worker,
+        "Use my subscription through the run broker.",
+        runtime._runtime_info(worker),
+    )
+
+    joined = "\n".join(command)
+    assert 'model_provider="glasshive_openai_compatible"' in command
+    assert (
+        'model_providers.glasshive_openai_compatible.base_url="http://provider-egress:8080/openai/v1"'
+        in command
+    )
+    assert (
+        'model_providers.glasshive_openai_compatible.env_key="GLASSHIVE_CAPABILITY_BROKER_TOKEN"'
+        in command
+    )
+    assert "model_providers.glasshive_openai_compatible.supports_websockets=false" in command
+    assert "deployment-gateway.example.test" not in joined
+    assert "synthetic-run-grant" not in joined
+    assert "synthetic-run-grant" not in env.values()
+    assert env["CODEX_HOME"] == "/workspace/.wpr-home/.codex"
+    assert "OPENAI_API_KEY" not in env
+    assert "OPENAI_BASE_URL" not in env
+
+
+def test_parallel_clean_room_run_projects_grant_into_exact_sandbox(tmp_path, monkeypatch):
+    class CaptureRuntime(BaseCliWorkerRuntime):
+        runtime_name = "codex-cli"
+        worker_root_name = "parallel_clean_room_capture"
+
+        def resolve_model(self, profile: str) -> str:
+            return "capture/model"
+
+        def _build_command(self, worker, instruction, info):
+            return ["printf", "ok"], self._container_env_for_worker(worker)
+
+        def _parse_output(self, worker, stdout, stderr, info):
+            return None, stdout.strip()
+
+    monkeypatch.setenv(
+        "WPR_PARALLEL_CLEAN_ROOM_NETWORK", "glasshive-parallel-clean-room"
+    )
+    monkeypatch.setenv(
+        "WPR_PARALLEL_CLEAN_ROOM_PROVIDER_PROXY_URL",
+        "http://provider-egress:8080",
+    )
+    runtime = CaptureRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
+    run_id = "run_clean_room_grant"
+    worker = {
+        "worker_id": "wrk_clean_room_grant",
+        "name": "Clean Room Worker",
+        "profile": "codex-cli",
+        "execution_mode": "docker",
+        "bootstrap_profile": "clean-room",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "execution_policy": "parallel-clean-room-v1",
+                "env": {
+                    "GLASSHIVE_CAPABILITY_BROKER_TOKEN": "synthetic-run-grant"
+                },
+            }
+        ),
+        "_run_local_capability_binding": {
+            "containerGenerationId": "d" * 64,
+        },
+    }
+
+    class FakeSandbox:
+        container_name = "wpr-clean-room-grant"
+        container_id = "d" * 64
+        pid = 123
+        state = "running"
+
+    runtime.sandbox.ensure_ready = lambda *_args, **_kwargs: FakeSandbox()  # type: ignore[method-assign]
+    runtime.sandbox.inspect = lambda *_args, **_kwargs: FakeSandbox()  # type: ignore[method-assign]
+    runtime.sandbox.inspect_fresh = lambda *_args, **_kwargs: SimpleNamespace(  # type: ignore[method-assign]
+        status="present", sandbox=FakeSandbox()
+    )
+    runtime.sandbox.list_screen_sessions = lambda *_args, **_kwargs: []  # type: ignore[method-assign]
+    runtime.sandbox.ensure_container_writable_paths = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    projected: list[dict] = []
+    cleared: list[dict] = []
+
+    def project_run_secrets(worker_id, **kwargs):
+        projected.append({"worker_id": worker_id, **kwargs})
+        return {
+            "env_file": f"/run/glasshive/{run_id}/secret-runtime.env",
+            "keys_file": f"/run/glasshive/{run_id}/secret-runtime.keys",
+        }
+
+    runtime.sandbox.project_parallel_clean_room_run_secrets = project_run_secrets  # type: ignore[method-assign]
+    runtime.sandbox.clear_parallel_clean_room_run_secrets = (  # type: ignore[method-assign]
+        lambda worker_id, **kwargs: cleared.append(
+            {"worker_id": worker_id, **kwargs}
+        )
+    )
+
+    def fake_start_screen_session(
+        worker_id, runtime_name, session_name, command, *, env=None, worker=None
+    ):
+        script = runtime._attempt_run_root(worker_id, run_id, "") / "run.sh"
+        script_text = script.read_text()
+        assert f"/run/glasshive/{run_id}/secret-runtime.env" in script_text
+        assert ': "${GLASSHIVE_CAPABILITY_BROKER_TOKEN:?missing run capability grant}"' in script_text
+        assert "synthetic-run-grant" not in script_text
+        assert "credential-free session exiting" in script_text
+        (script.parent / "stdout.log").write_text("FINAL REPORT:\nok")
+        (script.parent / "stderr.log").write_text("")
+        (script.parent / "exit_code").write_text("0")
+        return subprocess.CompletedProcess(
+            ["screen"], returncode=0, stdout="", stderr=""
+        )
+
+    runtime.sandbox.start_screen_session = fake_start_screen_session  # type: ignore[method-assign]
+    runtime.sandbox.screen_session_pid = lambda *_args, **_kwargs: 4321  # type: ignore[method-assign]
+
+    assert runtime.run_task(worker, "Do it.", run_id=run_id) == "FINAL REPORT:\nok"
+    assert projected == [
+        {
+            "worker_id": "wrk_clean_room_grant",
+            "expected_container_id": "d" * 64,
+            "run_id": run_id,
+            "env": {
+                "GLASSHIVE_CAPABILITY_BROKER_TOKEN": "synthetic-run-grant"
+            },
+        }
+    ]
+    assert cleared == [
+        {
+            "worker_id": "wrk_clean_room_grant",
+            "expected_container_id": "d" * 64,
+            "run_id": run_id,
+        }
+    ]
 
 
 def test_codex_cli_provider_can_explicitly_lock_down_user_config_and_native_features(tmp_path, monkeypatch):
@@ -6540,6 +7042,27 @@ def test_redact_text_masks_common_host_paths_and_credential_families():
         assert forbidden not in redacted
 
 
+@pytest.mark.parametrize("destination", [
+    "</Users/synthetic/Project Folder/private-report.md>",
+    "/home/synthetic/private-report.md",
+    "<file:///Users/synthetic/Project Folder/private-report.md>",
+    "/Volumes/Private/private-report.md",
+    "~/private-report.md",
+    "/root/reports/private-report(2).md",
+])
+def test_redact_text_keeps_local_citation_label_without_a_broken_link(destination):
+    raw = f"See [Project report]({destination}) for details. [Public source](https://example.org/docs)"
+    redacted = _redact_text(raw)
+    assert redacted == "See Project report for details. [Public source](https://example.org/docs)"
+    assert "private-report" not in redacted
+    assert _redact_text(redacted) == redacted
+
+
+def test_redact_text_keeps_private_image_label_and_redacts_secret_labels():
+    raw = "![Sketch](</home/synthetic/private-image.png>) [token=synthetic-secret-value](~/private.txt)"
+    assert _redact_text(raw) == "Sketch token=[REDACTED]"
+
+
 def test_redact_text_fails_closed_for_an_unterminated_private_key():
     private_key_body = "A" * 120
     redacted = _redact_text(
@@ -6595,6 +7118,30 @@ def test_host_conversation_mode_uses_exact_workspace_without_scaffolding(tmp_pat
     assert sorted(path.name for path in life.iterdir()) == ["AGENTS.md"]
     for forbidden in ("CLAUDE.md", "CODEX.md", "project-definition.md", "work-log.md", "harness-prompt.md", ".git", "glasshive-run"):
         assert not (life / forbidden).exists()
+
+
+@pytest.mark.parametrize("runtime_class,profile", [(HostCodexCliRuntime, "codex-cli"), (HostClaudeCodeRuntime, "claude-code")])
+def test_host_conversation_materializes_declared_uploads_in_exact_workspace(tmp_path, monkeypatch, runtime_class, profile):
+    from workers_projects_runtime.upload_projection import project_upload_files
+
+    uploads = tmp_path / "uploads"
+    source = uploads / "owner-a" / "audio-id__request.m4a"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"original-audio-bytes")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads))
+    monkeypatch.setenv("WPR_BOOTSTRAP_SOURCE_ROOTS", str(uploads))
+    life = tmp_path / "Life"
+    life.mkdir()
+    (life / "AGENTS.md").write_text("User workspace instructions.")
+    files = project_upload_files({"selected_uploads": [{"file_id": "audio-id", "filename": "request.m4a"}]}, owner_id="owner-a")
+    worker = {"worker_id": "wrk_current_audio", "owner_id": "owner-a", "profile": profile,
+              "execution_mode": "host", "trusted_run_lane": "conversation", "workspace_root": str(life),
+              "bootstrap_bundle_json": json.dumps({"run_mode": "conversation", "files": files})}
+    runtime = runtime_class(base_dir=str(tmp_path / "state"))
+    runtime._materialize_workspace(worker, life)
+    assert (life / files[0]["path"]).read_bytes() == source.read_bytes()
+    assert (life / "AGENTS.md").read_text() == "User workspace instructions."
+    assert not (life / "project-definition.md").exists()
 
 
 def test_host_codex_conversation_can_exclude_workspace_project_instructions(
@@ -6694,6 +7241,7 @@ def test_provider_activity_log_reads_incrementally_and_marks_a_bounded_tail(tmp_
 
 
 def test_host_conversation_broker_config_stays_in_private_worker_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_CONVERSATION_AUTO_MEMORY", "false")
     monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
     source_codex_home = tmp_path / "source-codex"
     (source_codex_home / "skills").mkdir(parents=True)
@@ -6774,7 +7322,12 @@ def test_host_conversation_broker_config_stays_in_private_worker_state(tmp_path,
 
     assert mcp_path.is_file()
     assert claude_command[claude_command.index("--mcp-config") + 1] == str(mcp_path)
-    assert "--strict-mcp-config" in claude_command
+    assert claude_command.count("--strict-mcp-config") == 1
+    settings = json.loads(claude_command[claude_command.index("--settings") + 1])
+    assert settings["autoMemoryEnabled"] is False
+    assert json.loads(mcp_path.read_text())["mcpServers"]["synthetic"]["url"] == (
+        "http://127.0.0.1.invalid/mcp"
+    )
     authority_path = (
         claude_runtime._state_dir(claude_worker["worker_id"])
         / "developer-instructions.txt"
@@ -7206,10 +7759,12 @@ def test_host_codex_workspace_access_limits_writes_without_full_bypass(tmp_path)
     assert "--dangerously-bypass-approvals-and-sandbox" not in resumed_command
 
 
-def test_host_claude_conversation_mode_uses_native_stream_json_without_changing_mission_mode(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("chrome_enabled", ["0", "1"])
+def test_host_claude_conversation_and_mission_keep_distinct_native_stream_inputs(
+    tmp_path, monkeypatch, chrome_enabled
 ):
-    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_CONVERSATION_AUTO_MEMORY", "false")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", chrome_enabled)
     runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
     life = tmp_path / "Life"
     life.mkdir()
@@ -7246,8 +7801,21 @@ def test_host_claude_conversation_mode_uses_native_stream_json_without_changing_
     assert conversation_command[conversation_command.index("--output-format") + 1] == "stream-json"
     assert "--verbose" in conversation_command
     assert "--include-partial-messages" in conversation_command
-    assert mission_command[mission_command.index("--output-format") + 1] == "json"
-    assert "--verbose" not in mission_command
+    settings = json.loads(conversation_command[conversation_command.index("--settings") + 1])
+    assert settings["autoMemoryEnabled"] is False
+    assert "--strict-mcp-config" in conversation_command
+    assert json.loads(conversation_command[conversation_command.index("--mcp-config") + 1]) == {
+        "mcpServers": {}
+    }
+    if "--settings" in mission_command:
+        mission_settings = json.loads(mission_command[mission_command.index("--settings") + 1])
+        assert "autoMemoryEnabled" not in mission_settings
+    assert "--strict-mcp-config" in mission_command
+    assert ("--chrome" in conversation_command) == (chrome_enabled == "1")
+    assert ("--chrome" in mission_command) == (chrome_enabled == "1")
+    assert mission_command[mission_command.index("--output-format") + 1] == "stream-json"
+    assert mission_command[mission_command.index("--input-format") + 1] == "stream-json"
+    assert "--verbose" in mission_command
     assert "--include-partial-messages" not in mission_command
 
 
@@ -7385,6 +7953,95 @@ def test_host_claude_conversation_preserves_preexisting_workspace_content(tmp_pa
     assert user_file.read_text() == "preserve me\n"
 
 
+def test_host_conversation_publishes_exact_startup_identity(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "private-state"))
+    life = tmp_path / "Life"
+    life.mkdir()
+    worker = {
+        "worker_id": "wrk_conversation_startup_identity",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "trusted_run_lane": "conversation",
+        "workspace_root": str(life),
+        "model": "gpt-5.6-sol",
+        "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
+    }
+    observed: list[dict[str, object]] = []
+
+    class SuccessfulProcess:
+        pid = 12345
+        returncode = 0
+
+        def __init__(self, command, **kwargs):
+            _mark_fake_host_supervisor_ready(list(command), self.pid)
+            stdout = kwargs["stdout"]
+            stdout.write(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "thread.started",
+                                "thread_id": "thread-startup-identity",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "item.completed",
+                                "item": {
+                                    "type": "agent_message",
+                                    "text": "READY",
+                                },
+                            }
+                        ),
+                        json.dumps({"type": "turn.completed"}),
+                    ]
+                )
+                + "\n"
+            )
+            stdout.flush()
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    runtime.ensure_worker_ready = lambda _worker: runtime._host_runtime_info(worker)  # type: ignore[method-assign]
+    runtime._build_command = lambda _worker, _instruction, _info: (["codex"], {})  # type: ignore[method-assign]
+    runtime.set_run_start_observer(observed.append)
+    monkeypatch.setattr(runtime, "_process_identity_sha256", lambda _pid: "1" * 64)
+    monkeypatch.setattr(runtime, "_process_group_identity", lambda pid: pid)
+    monkeypatch.setattr(
+        runtime,
+        "_process_start_identity",
+        lambda _pid: "ps-lstart:Mon Jan 01 00:00:00 2024",
+    )
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.subprocess.Popen",
+        SuccessfulProcess,
+    )
+
+    result = runtime.run_task(
+        worker,
+        "Reply with only READY.",
+        run_id="run_conversation_startup_identity",
+    )
+
+    assert result == "READY"
+    assert observed == [
+        {
+            "worker_id": worker["worker_id"],
+            "run_id": "run_conversation_startup_identity",
+            "identity_kind": "host_process",
+            "pid": SuccessfulProcess.pid,
+            "process_group": SuccessfulProcess.pid,
+            "process_start_identity": "ps-lstart:Mon Jan 01 00:00:00 2024",
+            "container_id": "",
+            "session_id": "conversation-run_conversa",
+        }
+    ]
+
+
 @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
 def test_host_claude_conversation_mode_honors_each_declared_effort(
     tmp_path, monkeypatch, effort
@@ -7459,10 +8116,13 @@ def test_host_claude_workspace_access_fails_closed_into_native_sandbox(tmp_path,
     assert settings["sandbox"]["filesystem"]["allowRead"] == [str(life.resolve())]
 
 
+@pytest.mark.parametrize("chrome_enabled", ["0", "1"])
 def test_host_claude_private_config_receives_subscription_auth_without_copying_user_config(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, chrome_enabled
 ):
-    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_CONVERSATION_AUTO_MEMORY", "false")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", chrome_enabled)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_SCOPES", "synthetic:unselected-parent")
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", raising=False)
     monkeypatch.setattr(
@@ -7482,8 +8142,8 @@ def test_host_claude_private_config_receives_subscription_auth_without_copying_u
                     "claudeAiOauth": {
                         "accessToken": "synthetic-access-token",
                         "refreshToken": "synthetic-refresh-token",
-                        "scopes": ["user:profile", "user:inference"],
-                        "expiresAt": int(time.time() * 1000) + 3_600_000,
+                        "expiresAt": int((time.time() + 3600) * 1000),
+                        "scopes": ["user:profile", "user:inference", "synthetic:future"],
                     }
                 }
             ),
@@ -7498,9 +8158,9 @@ def test_host_claude_private_config_receives_subscription_auth_without_copying_u
     life.mkdir()
     worker = {
         "worker_id": "wrk_claude_private_auth",
+        "trusted_run_lane": "conversation",
         "profile": "claude-code",
         "execution_mode": "host",
-        "trusted_run_lane": "conversation",
         "workspace_root": str(life),
         "model": "opus",
         "bootstrap_bundle_json": json.dumps(
@@ -7508,17 +8168,72 @@ def test_host_claude_private_config_receives_subscription_auth_without_copying_u
         ),
     }
 
-    _, env = runtime._build_command(
+    command, env = runtime._build_command(
         worker,
         "Talk naturally.",
         runtime._host_runtime_info(worker),
     )
 
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-access-token"
-    assert env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] == "synthetic-refresh-token"
-    assert env["CLAUDE_CODE_OAUTH_SCOPES"] == "user:profile user:inference"
+    assert env["CLAUDE_CODE_OAUTH_SCOPES"] == "user:profile user:inference synthetic:future"
+    assert "CLAUDE_CODE_OAUTH_REFRESH_TOKEN" not in env
     assert env["CLAUDE_CONFIG_DIR"].startswith(str(tmp_path / "private-state"))
+    assert ("--chrome" in command) == (chrome_enabled == "1")
+    assert "--strict-mcp-config" in command
+    assert json.loads(command[command.index("--settings") + 1])["autoMemoryEnabled"] is False
     assert not (life / ".claude").exists()
+
+
+@pytest.mark.parametrize(
+    ("scopes", "expected"),
+    [
+        (None, None),
+        ([], None),
+        ("user:profile user:inference", None),
+        (["user:profile", 1], None),
+        ([""], None),
+        (["user:inference user:profile"], None),
+        ([" user:profile"], None),
+        (["user:profile\n"], None),
+        (["user:profile\x00"], None),
+        (["user:pr\u00f6file"], None),
+        (["user:inference"], "user:inference"),
+        (["synthetic:unknown"], "synthetic:unknown"),
+        (["user:profile", "user:inference"], "user:profile user:inference"),
+    ],
+)
+def test_host_claude_fresh_access_projects_only_valid_same_record_scopes(
+    tmp_path, monkeypatch, scopes, expected
+):
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_SCOPES", "synthetic:unselected-parent")
+    monkeypatch.setattr(
+        profile_runtime_module,
+        "_read_claude_keychain_oauth",
+        lambda: {
+            "accessToken": "synthetic-selected-access",
+            "expiresAt": int((time.time() + 3600) * 1000),
+            "scopes": scopes,
+        },
+    )
+
+    def reject_managed_probe(*_args, **_kwargs):
+        raise AssertionError("Fresh selected auth must not invoke another native boundary")
+
+    monkeypatch.setattr(
+        profile_runtime_module, "_claude_cli_managed_auth_available", reject_managed_probe
+    )
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    env = {
+        "CLAUDE_CODE_OAUTH_SCOPES": "synthetic:orphaned-metadata",
+        "CLAUDE_CODE_OAUTH_REFRESH_TOKEN": "synthetic-unselected-refresh",
+    }
+
+    assert runtime._inject_private_subscription_auth(env) == "keychain_access_token"
+
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-selected-access"
+    assert env.get("CLAUDE_CODE_OAUTH_SCOPES") == expected
+    assert "CLAUDE_CODE_OAUTH_REFRESH_TOKEN" not in env
 
 
 def test_host_claude_private_auth_prefers_explicit_environment_tokens(tmp_path, monkeypatch):
@@ -7534,12 +8249,15 @@ def test_host_claude_private_auth_prefers_explicit_environment_tokens(tmp_path, 
     runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
     worker = {
         "worker_id": "wrk_claude_env_auth",
+        "trusted_run_lane": "conversation",
         "profile": "claude-code",
         "execution_mode": "host",
-        "trusted_run_lane": "conversation",
         "workspace_root": str(tmp_path / "Life"),
         "model": "opus",
-        "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
+        "bootstrap_bundle_json": json.dumps({
+            "run_mode": "conversation",
+            "env": {"CLAUDE_CODE_OAUTH_SCOPES": "synthetic:unselected-bootstrap"},
+        }),
     }
 
     _, env = runtime._build_command(
@@ -7549,80 +8267,507 @@ def test_host_claude_private_auth_prefers_explicit_environment_tokens(tmp_path, 
     )
 
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-env-access"
-    assert env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] == "synthetic-env-refresh"
+    assert "CLAUDE_CODE_OAUTH_SCOPES" not in env
+    assert "CLAUDE_CODE_OAUTH_REFRESH_TOKEN" not in env
 
 
-def test_host_claude_private_auth_refreshes_expired_keychain_token_into_isolated_config(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("session_key", [None, "synthetic-resume-session"])
+@pytest.mark.parametrize("use_api_key", [False, True])
+def test_host_claude_expired_keychain_token_uses_managed_auth_without_stale_override(
+    tmp_path, monkeypatch, session_key, use_api_key
 ):
     monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_USE_API_KEY", "1" if use_api_key else "0")
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", raising=False)
-    monkeypatch.delenv("CLAUDE_CODE_OAUTH_SCOPES", raising=False)
-    monkeypatch.setattr(
-        "workers_projects_runtime.profile_runtime.sys.platform", "darwin"
-    )
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.sys.platform", "darwin")
     monkeypatch.setattr(
         "workers_projects_runtime.profile_runtime.shutil.which", lambda binary: f"/usr/bin/{binary}"
     )
-    calls = []
+    status_envs: list[dict[str, str]] = []
 
     def fake_run(command, **kwargs):
-        calls.append((command, kwargs))
-        if command[0] == "security":
-            refreshed = len([call for call, _ in calls if call[0] == "security"]) > 1
+        if command[:4] == ["security", "find-generic-password", "-s", "Claude Code-credentials"]:
             return subprocess.CompletedProcess(
                 command,
                 returncode=0,
                 stdout=json.dumps(
                     {
                         "claudeAiOauth": {
-                            "accessToken": (
-                                "synthetic-refreshed-access"
-                                if refreshed
-                                else "synthetic-expired-access"
-                            ),
-                            "refreshToken": "synthetic-refresh-token",
-                            "scopes": ["user:profile", "user:inference"],
-                            "expiresAt": int(time.time() * 1000) + (3_600_000 if refreshed else -1),
+                            "accessToken": "synthetic-expired-access",
+                            "refreshToken": "synthetic-valid-refresh",
+                            "expiresAt": int((time.time() - 60) * 1000),
                         }
                     }
                 ),
                 stderr="",
             )
-        assert command[-2:] == ["auth", "login"]
-        login_env = kwargs["env"]
-        assert "CLAUDE_CONFIG_DIR" not in login_env
-        assert "CLAUDE_CODE_OAUTH_TOKEN" not in login_env
-        assert login_env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] == "synthetic-refresh-token"
-        assert login_env["CLAUDE_CODE_OAUTH_SCOPES"] == "user:profile user:inference"
-        return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+        assert command == ["/usr/bin/claude", "auth", "status"]
+        status_envs.append(dict(kwargs["env"]))
+        return subprocess.CompletedProcess(
+            command,
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "loggedIn": ("ANTHROPIC_API_KEY" in kwargs["env"]) is use_api_key,
+                    "authMethod": "claude.ai",
+                }
+            ),
+            stderr="",
+        )
 
-    monkeypatch.setattr(
-        "workers_projects_runtime.profile_runtime.subprocess.run", fake_run
-    )
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
     runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    monkeypatch.setattr(runtime, "_read_session_key", lambda _worker_id: session_key)
     worker = {
-        "worker_id": "wrk_claude_expired_auth",
+        "worker_id": "wrk_claude_expired_managed",
+        "trusted_run_lane": "conversation",
         "profile": "claude-code",
         "execution_mode": "host",
-        "trusted_run_lane": "conversation",
         "workspace_root": str(tmp_path / "Life"),
         "model": "opus",
-        "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "run_mode": "conversation",
+                "env": {"ANTHROPIC_API_KEY": "synthetic-anthropic-key"},
+            }
+        ),
     }
 
-    _, env = runtime._build_command(
+    command, env = runtime._build_command(
         worker,
         "Talk naturally.",
         runtime._host_runtime_info(worker),
     )
 
-    assert len(calls) == 3
-    assert calls[1][0][-2:] == ["auth", "login"]
-    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-refreshed-access"
-    assert env["CLAUDE_CODE_OAUTH_REFRESH_TOKEN"] == "synthetic-refresh-token"
-    assert env["CLAUDE_CODE_OAUTH_SCOPES"] == "user:profile user:inference"
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "CLAUDE_CODE_OAUTH_REFRESH_TOKEN" not in env
+    assert ("--resume" in command) is bool(session_key)
+    assert status_envs == ([] if use_api_key else [env])
+    assert (env.get("ANTHROPIC_API_KEY") == "synthetic-anthropic-key") is use_api_key
+    assert env["CLAUDE_CONFIG_DIR"].startswith(str(tmp_path / "private-state"))
+    assert ("ANTHROPIC_API_KEY" in env) is use_api_key
+
+
+
+def test_host_claude_expired_keychain_token_without_managed_auth_fails_before_run(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.shutil.which", lambda binary: f"/usr/bin/{binary}"
+    )
+    status_envs: list[dict[str, str]] = []
+
+    def fake_run(command, **kwargs):
+        if command[0] == "security":
+            return subprocess.CompletedProcess(
+                command,
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "claudeAiOauth": {
+                            "accessToken": "synthetic-expired-access",
+                            "refreshToken": "synthetic-refresh",
+                            "expiresAt": int((time.time() - 60) * 1000),
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        status_envs.append(dict(kwargs["env"]))
+        return subprocess.CompletedProcess(
+            command,
+            returncode=1,
+            stdout=json.dumps({"loggedIn": False}),
+            stderr="",
+        )
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    worker = {
+        "worker_id": "wrk_claude_expired_unmanaged",
+        "trusted_run_lane": "conversation",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "Life"),
+        "model": "opus",
+        "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
+    }
+
+    with pytest.raises(RuntimeErrorBase) as exc_info:
+        runtime._build_command(worker, "Talk naturally.", runtime._host_runtime_info(worker))
+
+    message = str(exc_info.value)
+    assert "claude setup-token" in message
+    assert "claude auth login" in message
+    assert "synthetic-expired-access" not in message
+    assert "synthetic-refresh" not in message
+    failure = classify_runtime_error(exc_info.value, runtime_name="claude-code")
+    assert failure.failure_class == "provider_auth_missing"
+    assert failure.structured is True
+    assert len(status_envs) == 2
+    assert status_envs[0]["CLAUDE_CONFIG_DIR"].startswith(str(tmp_path / "private-state"))
+    assert status_envs[1]["CLAUDE_CONFIG_DIR"] == status_envs[0]["CLAUDE_CONFIG_DIR"]
+    assert status_envs[1]["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == ""
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in status_envs[0]
+    assert "CLAUDE_CODE_OAUTH_REFRESH_TOKEN" not in status_envs[0]
+    assert "CLAUDE_CODE_OAUTH_REFRESH_TOKEN" not in status_envs[1]
+
+
+
+@pytest.mark.parametrize("keychain_payload", ["not-json", json.dumps({})])
+def test_host_claude_unusable_keychain_payload_fails_closed_without_managed_auth(
+    tmp_path, monkeypatch, keychain_payload
+):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.shutil.which", lambda binary: f"/usr/bin/{binary}"
+    )
+
+    def fake_run(command, **_kwargs):
+        if command[0] == "security":
+            return subprocess.CompletedProcess(
+                command,
+                returncode=0,
+                stdout=keychain_payload,
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            command,
+            returncode=1,
+            stdout=json.dumps({"loggedIn": False}),
+            stderr="",
+        )
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    worker = {
+        "worker_id": "wrk_claude_unusable_keychain",
+        "trusted_run_lane": "conversation",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "Life"),
+        "model": "opus",
+        "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
+    }
+
+    with pytest.raises(RuntimeErrorBase, match="claude setup-token"):
+        runtime._build_command(worker, "Talk naturally.", runtime._host_runtime_info(worker))
+
+
+
+def test_host_claude_malformed_managed_auth_status_fails_closed_under_child_env(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.shutil.which", lambda binary: f"/usr/bin/{binary}"
+    )
+    status_envs: list[dict[str, str]] = []
+
+    def fake_run(command, **kwargs):
+        if command[0] == "security":
+            return subprocess.CompletedProcess(command, returncode=1, stdout="", stderr="")
+        status_envs.append(dict(kwargs["env"]))
+        return subprocess.CompletedProcess(
+            command,
+            returncode=0,
+            stdout="not-json",
+            stderr="",
+        )
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    worker = {
+        "worker_id": "wrk_claude_malformed_managed_auth",
+        "trusted_run_lane": "conversation",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "Life"),
+        "model": "opus",
+        "bootstrap_bundle_json": json.dumps({"run_mode": "conversation"}),
+    }
+
+    with pytest.raises(RuntimeErrorBase, match="claude setup-token"):
+        runtime._build_command(worker, "Talk naturally.", runtime._host_runtime_info(worker))
+
+    assert len(status_envs) == 2
+    assert status_envs[0]["CLAUDE_CONFIG_DIR"].startswith(str(tmp_path / "private-state"))
+    assert status_envs[1]["CLAUDE_CONFIG_DIR"] == status_envs[0]["CLAUDE_CONFIG_DIR"]
+    assert status_envs[1]["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == ""
+
+
+
+@pytest.mark.parametrize("session_key", [None, "synthetic-resume-session"])
+@pytest.mark.parametrize("mcp_present", [False, True])
+def test_host_claude_expired_access_uses_owner_managed_refresh_without_refresh_token(
+    tmp_path, monkeypatch, session_key, mcp_present
+):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_CONVERSATION_AUTO_MEMORY", "false")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "1")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "high")
+    (tmp_path / "owner-home").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "owner-home"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-parent-only-key")
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(tmp_path / "unselected-home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", raising=False)
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.shutil.which", lambda binary: f"/usr/bin/{binary}"
+    )
+    status_envs: list[dict[str, str]] = []
+
+    def fake_run(command, **kwargs):
+        if command[0] == "security":
+            return subprocess.CompletedProcess(
+                command,
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "claudeAiOauth": {
+                            "accessToken": "synthetic-expired-access",
+                            "refreshToken": "synthetic-owner-refresh",
+                            "expiresAt": int((time.time() - 60) * 1000),
+                            "scopes": ["user:profile", "user:inference"],
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        assert command[-2:] == ["auth", "status"]
+        status_envs.append(dict(kwargs["env"]))
+        return subprocess.CompletedProcess(
+            command,
+            returncode=0 if len(status_envs) == 2 else 1,
+            stdout=json.dumps({"loggedIn": len(status_envs) == 2}),
+            stderr="",
+        )
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    monkeypatch.setattr(runtime, "_effort_supported", lambda _effort: True)
+    monkeypatch.setattr(runtime, "_read_session_key", lambda _worker_id: session_key)
+    instructions = "Synthetic application authority."
+    worker = {
+        "worker_id": "wrk_claude_owner_managed_refresh",
+        "trusted_run_lane": "conversation",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "Life"),
+        "model": "opus",
+        "bootstrap_bundle_json": json.dumps({
+            "developer_instructions": instructions,
+            "env": {"CLAUDE_CODE_OAUTH_SCOPES": "synthetic:unselected-bootstrap"},
+        }),
+    }
+    state_dir = runtime._state_dir(worker["worker_id"])
+    state_dir.mkdir(parents=True, exist_ok=True)
+    authority_path = state_dir / "developer-instructions.txt"
+    authority_path.write_text(instructions)
+    mcp_path = state_dir / "conversation-mcp.json"
+    if mcp_present:
+        runtime._write_host_claude_mcp_config(worker, mcp_path, {"native_tools": False}, {})
+
+    command, env = runtime._build_command(
+        worker, "Talk naturally.", runtime._host_runtime_info(worker)
+    )
+
+    assert env["HOME"] == str(tmp_path / "owner-home")
+    assert env["CLAUDE_CONFIG_DIR"] == status_envs[0]["CLAUDE_CONFIG_DIR"]
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "CLAUDE_CODE_OAUTH_SCOPES" not in env
+    assert "CLAUDE_CODE_OAUTH_REFRESH_TOKEN" not in env
+    assert command[command.index("--setting-sources") + 1] == ""
+    assert "--chrome" in command
+    assert "--strict-mcp-config" in command
+    assert command[command.index("--mcp-config") + 1] == (
+        str(mcp_path) if mcp_present else '{"mcpServers":{}}'
+    )
+    assert json.loads(command[command.index("--settings") + 1])["autoMemoryEnabled"] is False
+    assert command[command.index("--model") + 1] == "opus"
+    assert command[command.index("--effort") + 1] == "high"
+    assert command[command.index("--append-system-prompt-file") + 1] == str(authority_path)
+    assert ("--resume" in command) is bool(session_key)
+    assert status_envs[0]["CLAUDE_CONFIG_DIR"].startswith(str(tmp_path / "private-state"))
+    assert status_envs[1]["HOME"] == str(tmp_path / "owner-home")
+    assert status_envs[1]["CLAUDE_CONFIG_DIR"] == status_envs[0]["CLAUDE_CONFIG_DIR"]
+    assert "CLAUDE_CODE_OAUTH_REFRESH_TOKEN" not in status_envs[1]
+    assert "CLAUDE_CODE_OAUTH_SCOPES" not in status_envs[0]
+    assert "CLAUDE_CODE_OAUTH_SCOPES" not in status_envs[1]
+    assert "ANTHROPIC_API_KEY" not in status_envs[1]
+    assert status_envs[1]["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == ""
+    assert status_envs[1] == env
+
+
+
+@pytest.mark.parametrize("session_key", [None, "synthetic-resume-session"])
+def test_host_claude_signed_bootstrap_access_token_wins_without_auth_discovery(
+    tmp_path, monkeypatch, session_key
+):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-ambient-access")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_SCOPES", "synthetic:unselected-parent")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "synthetic-ambient-refresh")
+
+    def reject_auth_discovery(*_args, **_kwargs):
+        raise AssertionError("Signed bootstrap auth must not query Keychain or Claude auth status")
+
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime.subprocess.run", reject_auth_discovery
+    )
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    monkeypatch.setattr(runtime, "_read_session_key", lambda _worker_id: session_key)
+    worker = {
+        "worker_id": "wrk_claude_signed_bootstrap_auth",
+        "trusted_run_lane": "conversation",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "Life"),
+        "model": "opus",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "run_mode": "conversation",
+                "env": {
+                    "CLAUDE_CODE_OAUTH_TOKEN": "synthetic-signed-bootstrap-access",
+                    "CLAUDE_CODE_OAUTH_SCOPES": "user:inference",
+                },
+            }
+        ),
+    }
+
+    command, env = runtime._build_command(
+        worker,
+        "Talk naturally.",
+        runtime._host_runtime_info(worker),
+    )
+
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-signed-bootstrap-access"
+    assert env["CLAUDE_CODE_OAUTH_SCOPES"] == "user:inference"
+    assert "CLAUDE_CODE_OAUTH_REFRESH_TOKEN" not in env
+    assert ("--resume" in command) is bool(session_key)
+
+
+@pytest.mark.parametrize("validated", [False, True])
+def test_host_claude_bound_account_is_resolved_before_owner_auth(tmp_path, monkeypatch, validated):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_CONVERSATION_AUTO_MEMORY", "false")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    account_home = str(tmp_path / "bound-account")
+    worker = {
+        "worker_id": "wrk_claude_bound_account",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "trusted_run_lane": "conversation",
+        "workspace_root": str(tmp_path / "Life"),
+        "model": "opus",
+        "bootstrap_bundle_json": json.dumps({
+            "provider_account": {"policy": "personal_required", "account_id": "acct_synthetic"},
+            "env": {"CLAUDE_CODE_OAUTH_SCOPES": "synthetic:unselected-bootstrap"},
+        }),
+        "_glasshive_provider_account_bound": validated,
+        "_glasshive_provider_account_env": {
+            "CLAUDE_CONFIG_DIR": account_home,
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR": account_home,
+        },
+    }
+
+    def reject_owner_auth(_env):
+        raise AssertionError("A selected account must not consult unrelated owner credentials")
+
+    monkeypatch.setattr(runtime, "_inject_private_subscription_auth", reject_owner_auth)
+    if not validated:
+        with pytest.raises(RuntimeErrorBase, match="was not validated"):
+            runtime._build_command(worker, "Use the selected account.", runtime._host_runtime_info(worker))
+        return
+
+    command, env = runtime._build_command(
+        worker, "Use the selected account.", runtime._host_runtime_info(worker)
+    )
+    assert env["CLAUDE_CONFIG_DIR"] == account_home
+    assert env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == account_home
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "CLAUDE_CODE_OAUTH_SCOPES" not in env
+    assert "CLAUDE_CODE_OAUTH_REFRESH_TOKEN" not in env
+    assert "--strict-mcp-config" in command
+    assert json.loads(command[command.index("--settings") + 1])["autoMemoryEnabled"] is False
+
+
+@pytest.mark.parametrize("authority", ["missing", "access_token", "api_key"])
+def test_host_claude_enterprise_conversation_never_consults_owner_auth(tmp_path, monkeypatch, authority):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_SCOPES", "synthetic:unselected-parent")
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_USE_API_KEY", "1" if authority == "api_key" else "0")
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    projected = {
+        "access_token": {"CLAUDE_CODE_OAUTH_TOKEN": "synthetic-server-access"},
+        "api_key": {"ANTHROPIC_API_KEY": "synthetic-server-key"},
+    }.get(authority, {})
+    worker = {
+        "worker_id": "wrk_claude_enterprise_auth",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "trusted_run_lane": "conversation",
+        "workspace_root": str(tmp_path / "Life"),
+        "model": "opus",
+        "bootstrap_bundle_json": json.dumps({"env": projected}),
+    }
+
+    def reject_owner_auth(_env):
+        raise AssertionError("Enterprise conversation auth must remain server-owned")
+
+    monkeypatch.setattr(runtime, "_inject_private_subscription_auth", reject_owner_auth)
+    if authority == "missing":
+        with pytest.raises(RuntimeErrorBase) as exc_info:
+            runtime._build_command(worker, "Answer.", runtime._host_runtime_info(worker))
+        assert classify_runtime_error(exc_info.value, runtime_name="claude-code").failure_class == "provider_auth_missing"
+        return
+
+    _, env = runtime._build_command(worker, "Answer.", runtime._host_runtime_info(worker))
+    for key, value in projected.items():
+        assert env[key] == value
+    assert "CLAUDE_CODE_OAUTH_SCOPES" not in env
+    assert "CLAUDE_CODE_OAUTH_REFRESH_TOKEN" not in env
+
+
+def test_host_claude_bedrock_conversation_does_not_discover_subscription_auth(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    worker = {
+        "worker_id": "wrk_claude_bedrock_auth",
+        "profile": "claude-code",
+        "execution_mode": "host",
+        "trusted_run_lane": "conversation",
+        "workspace_root": str(tmp_path / "Life"),
+        "model": "synthetic-bedrock-model",
+        "bootstrap_bundle_json": json.dumps({
+            "env": {"CLAUDE_CODE_OAUTH_TOKEN": "synthetic-competing-access"},
+        }),
+    }
+
+    def reject_subscription_auth(_env):
+        raise AssertionError("Configured Bedrock must not discover subscription credentials")
+
+    monkeypatch.setattr(runtime, "_inject_private_subscription_auth", reject_subscription_auth)
+    command, env = runtime._build_command(worker, "Answer.", runtime._host_runtime_info(worker))
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert command[command.index("--model") + 1] == "synthetic-bedrock-model"
 
 
 def test_host_mission_mode_retains_workspace_and_completion_contract(tmp_path):
@@ -7647,3 +8792,293 @@ def test_host_mission_mode_retains_workspace_and_completion_contract(tmp_path):
     assert (workspace / "work-log.md").exists()
     assert (workspace / "AGENTS.md").exists()
     assert "FINAL REPORT" in instruction
+
+
+@pytest.mark.parametrize("runtime_class,profile,events", [
+    (HostCodexCliRuntime, "codex-cli", [
+        {"type": "thread.started", "thread_id": "native-mission-thread"},
+        {"type": "item.completed", "item": {"type": "command_execution", "status": "completed", "exit_code": 0}},
+    ]),
+    (HostClaudeCodeRuntime, "claude-code", [
+        {"type": "system", "session_id": "native-mission-thread"},
+        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "done"}]}},
+    ]),
+])
+def test_host_mission_publishes_native_progress_before_exit(tmp_path, monkeypatch, runtime_class, profile, events):
+    runtime = runtime_class(base_dir=str(tmp_path / "private-state"))
+    worker = {
+        "worker_id": "wrk_live_mission", "profile": profile, "execution_mode": "host",
+        "workspace_root": str(tmp_path / "missions"), "model": "configured-model",
+        "_run_attempt_id": "attempt-live-mission",
+        "bootstrap_bundle_json": json.dumps({"run_mode": "mission"}),
+    }
+    observed = []
+    progress = threading.Event()
+    before_exit = []
+
+    def record(observation):
+        observed.append(observation)
+        if observation["kind"] == "meaningful_progress":
+            progress.set()
+
+    class InterruptedProcess:
+        pid = 12345
+        returncode = None
+
+        def __init__(self, command, **kwargs):
+            _mark_fake_host_supervisor_ready(list(command), self.pid)
+            kwargs["stdout"].write("\n".join(json.dumps(event) for event in events) + "\n")
+            kwargs["stdout"].flush()
+
+        def wait(self, timeout=None):
+            before_exit.append(progress.wait(timeout=1))
+            self.returncode = 130
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(runtime, "ensure_worker_ready", lambda _: runtime._host_runtime_info(worker))
+    monkeypatch.setattr(runtime, "_build_command", lambda *_: ([profile], {}))
+    monkeypatch.setattr(runtime, "_process_identity_sha256", lambda _: "1" * 64)
+    monkeypatch.setattr(runtime, "_process_group_identity", lambda pid: pid)
+    monkeypatch.setattr(runtime, "_process_start_identity", lambda _: "synthetic-process-identity")
+    monkeypatch.setattr(profile_runtime_module.subprocess, "Popen", InterruptedProcess)
+    runtime.set_provider_liveness_observer(record)
+
+    with pytest.raises(RuntimeErrorBase, match="exited with code 130"):
+        runtime.run_task(worker, "Complete the assigned work.", run_id="run_live_mission")
+
+    assert before_exit == [True]
+    assert len(observed) == 1
+    assert observed[0]["kind"] == "meaningful_progress"
+    assert observed[0]["worker_id"] == worker["worker_id"]
+    assert observed[0]["run_id"] == "run_live_mission"
+    assert observed[0]["attempt_id"] == worker["_run_attempt_id"]
+    assert observed[0]["model"] == worker["model"]
+    assert observed[0]["runtime"] == profile
+    assert runtime._read_session_key(worker["worker_id"]) == "native-mission-thread"
+    assert not any(thread.is_alive() and thread.name == "glasshive-host-native-session-run_live_mis" for thread in threading.enumerate())
+
+
+def test_collect_completed_run_issues_route_failure_evidence_for_quota_exhaustion(tmp_path):
+    # A docker/base worker that exhausts its provider quota must record provider-native route
+    # evidence like the host path does, so route health and the configured fallback can engage.
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {"worker_id": "wrk_quota", "name": "Worker", "profile": "codex-cli", "model": "gpt-5.6-sol"}
+    runtime._ensure_dirs(worker["worker_id"])
+    run_id = "run_quota12345"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "t"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps({"type": "error", "message": "You've hit your usage limit. Try again later."}),
+                json.dumps({"type": "turn.failed", "error": {"message": "You've hit your usage limit."}}),
+            ]
+        )
+        + "\n"
+    )
+    (run_root / "stderr.log").write_text("")
+    (run_root / "exit_code").write_text("1")
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+
+    assert recovered is not None
+    assert recovered["failure_class"] == "provider_quota_exhausted"
+    assert recovered["failure_structured"] == 1
+    evidence = runtime.consume_provider_route_failure_evidence(worker, {"run_id": run_id}, recovered)
+    assert evidence is not None
+    assert evidence["failure_structured"] is True
+    assert evidence["failure_class"] == "provider_quota_exhausted"
+    assert evidence["evidence_kind"] == "provider_native"
+
+
+@pytest.mark.parametrize("stateless", [False, True])
+def test_interrupted_host_conversation_retains_early_native_identity(tmp_path, monkeypatch, stateless):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "private-state"))
+    life = tmp_path / "Life"
+    life.mkdir()
+    worker = {
+        "worker_id": "wrk_interrupted_conversation", "profile": "codex-cli",
+        "execution_mode": "host", "trusted_run_lane": "conversation",
+        "workspace_root": str(life), "model": "gpt-5.6-sol",
+        "bootstrap_bundle_json": json.dumps({
+            "run_mode": "conversation", "provider_model": "gpt-5.6-sol",
+            "env": {"GLASSHIVE_PROVIDER_SESSION_MODE": "stateless" if stateless else "persistent"},
+        }),
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    if stateless:
+        runtime._write_session_key(worker["worker_id"], "unrelated-prior-session")
+    build_command = runtime._build_command
+    observed = threading.Event()
+    remembered_before_exit = []
+    remember = runtime._remember_native_session_key
+
+    def observe_identity(current_worker, session_key):
+        remember(current_worker, session_key)
+        if session_key == "interrupted-native-thread":
+            observed.set()
+
+    class InterruptedProcess:
+        pid = 12345
+        returncode = None
+
+        def __init__(self, command, **kwargs):
+            _mark_fake_host_supervisor_ready(list(command), self.pid)
+            kwargs["stdout"].write(json.dumps({
+                "type": "thread.started", "thread_id": "interrupted-native-thread",
+            }) + "\n")
+            kwargs["stdout"].flush()
+
+        def wait(self, timeout=None):
+            remembered_before_exit.append(observed.wait(timeout=2))
+            self.returncode = 130
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(runtime, "ensure_worker_ready", lambda _worker: runtime._host_runtime_info(worker))
+    monkeypatch.setattr(runtime, "_build_command", lambda *_args: (["codex"], {}))
+    monkeypatch.setattr(runtime, "_remember_native_session_key", observe_identity)
+    monkeypatch.setattr(runtime, "_process_identity_sha256", lambda _pid: "1" * 64)
+    monkeypatch.setattr(runtime, "_process_group_identity", lambda pid: pid)
+    monkeypatch.setattr(runtime, "_process_start_identity", lambda _pid: "synthetic-process-identity")
+    monkeypatch.setattr(profile_runtime_module.subprocess, "Popen", InterruptedProcess)
+    instruction = "[message 1 user]\nPrepare the requested acceptance plan."
+    with pytest.raises(RuntimeErrorBase, match="exited with code 130"):
+        runtime.run_task(worker, instruction, run_id="run_interrupted_identity")
+
+    assert remembered_before_exit == [True]
+    expected = "unrelated-prior-session" if stateless else "interrupted-native-thread"
+    assert runtime._read_session_key(worker["worker_id"]) == expected
+    continuation = instruction + "\n[message 2 user]\nContinue"
+    info = runtime._host_runtime_info(worker)
+    resumed, _ = build_command(worker, continuation, info)
+    assert runtime._command_stdin_text(worker, continuation, info) == continuation
+    assert ("resume" in resumed) is not stateless
+    if not stateless:
+        assert "interrupted-native-thread" in resumed
+    original_stdin = runtime._run_root(worker["worker_id"], "run_interrupted_identity") / "instruction.stdin"
+    assert original_stdin.read_text() == instruction
+    assert not any(
+        thread.is_alive() and thread.name == "glasshive-conversation-session-run_interrup"
+        for thread in threading.enumerate()
+    )
+
+
+def test_native_session_observer_preserves_newer_active_run_identity(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "private-state"))
+    worker = {"worker_id": "wrk_session_generation", "profile": "codex-cli"}
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_session_key(worker["worker_id"], "newer-native-thread")
+    stdout = tmp_path / "older-stdout.jsonl"
+    stdout.write_text(json.dumps({"type": "thread.started", "thread_id": "older-native-thread"}) + "\n")
+    monkeypatch.setattr(runtime, "_read_active_session", lambda _: {
+        "session_name": "newer-session", "run_id": "newer-run",
+    })
+    stopped = threading.Event()
+    stopped.set()
+
+    runtime._observe_native_session_events(
+        worker["worker_id"], stdout, stopped, run_id="older-run", worker=worker,
+    )
+
+    assert runtime._read_session_key(worker["worker_id"]) == "newer-native-thread"
+
+
+@pytest.mark.parametrize("configured,lane,resume,expected", [
+    (None, "conversation", False, None),
+    (None, "conversation", True, None),
+    ("false", "conversation", False, False),
+    ("false", "conversation", True, False),
+    ("true", "conversation", True, True),
+    ("false", "mission", False, None),
+])
+def test_host_claude_conversation_auto_memory_preserves_native_scope(
+    tmp_path, monkeypatch, configured, lane, resume, expected
+):
+    policy_env = "WPR_CLAUDE_CODE_CONVERSATION_AUTO_MEMORY"
+    monkeypatch.delenv(policy_env, raising=False)
+    if configured is not None:
+        monkeypatch.setenv(policy_env, configured)
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "default")
+    monkeypatch.delenv("GLASSHIVE_HOST_PLUGIN_DENYLIST", raising=False)
+    monkeypatch.delenv("WPR_HOST_PLUGIN_DENYLIST", raising=False)
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "private-state"))
+    monkeypatch.setattr(runtime, "_inject_private_subscription_auth", lambda env: None)
+    monkeypatch.setattr(runtime, "_read_session_key", lambda worker_id: "native-session" if resume else None)
+    worker = {
+        "worker_id": "wrk_memory_scope", "profile": "claude-code", "execution_mode": "host",
+        "trusted_run_lane": lane, "model": "opus",
+        "bootstrap_bundle_json": json.dumps({"run_mode": "conversation", "provider_model": "opus", "access_mode": "full"}),
+    }
+    memory = runtime._home_dir(worker["worker_id"]) / ".claude" / "projects" / "synthetic" / "memory" / "MEMORY.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_bytes(b"Original native file; preserve this evidence.\n")
+    before = memory.read_bytes()
+    command, env = runtime._build_command(worker, "Current user goal.", runtime._host_runtime_info(worker))
+    settings = json.loads(command[command.index("--settings") + 1]) if "--settings" in command else {}
+    assert settings.get("autoMemoryEnabled") is expected
+    assert ("--resume" in command) is resume
+    assert command[command.index("--model") + 1] == "opus"
+    assert "--bare" not in command and "--tools" not in command
+    assert memory.read_bytes() == before
+    assert env["CLAUDE_CONFIG_DIR"] == str(runtime._home_dir(worker["worker_id"]) / ".claude")
+
+
+def test_host_native_mcp_uses_owner_home_without_changing_worker_or_broker_home(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    owner_home = tmp_path / "owner-home"
+    source_home = owner_home / ".codex"
+    source_home.mkdir(parents=True)
+    (source_home / "config.toml").write_text(
+        '[mcp_servers.cua_repl]\ncommand = "/native/cua"\n'
+        '[mcp_servers.node_repl]\ncommand = "/native/node"\n'
+        '[mcp_servers.node_repl.env]\nHOME = "/explicit/native/home"\n'
+    )
+    monkeypatch.setenv("HOME", str(owner_home))
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.delenv("GLASSHIVE_HOST_CODEX_NATIVE_MCP_ALLOWLIST", raising=False)
+    monkeypatch.delenv("WPR_HOST_CODEX_NATIVE_MCP_ALLOWLIST", raising=False)
+    config = tomllib.loads(runtime._host_codex_worker_config(
+        '[mcp_servers.glasshive-user-capabilities]\nurl = "http://127.0.0.1:3080/mcp"\n'
+    ))
+    assert config["mcp_servers"]["cua_repl"]["env"]["HOME"] == str(owner_home)
+    assert config["mcp_servers"]["node_repl"]["env"]["HOME"] == "/explicit/native/home"
+    assert "env" not in config["mcp_servers"]["glasshive-user-capabilities"]
+    worker = {"worker_id": "wrk_native_home", "profile": "codex-cli", "execution_mode": "host"}
+    child_env = runtime._host_env(worker)
+    assert child_env["HOME"] != str(owner_home)
+    assert child_env["CODEX_HOME"] == str(Path(child_env["HOME"]) / ".codex")
+
+
+@pytest.mark.parametrize("runtime_class", [HostCodexCliRuntime, HostClaudeCodeRuntime])
+def test_native_branch_epoch_keeps_new_session_across_restart_without_reusing_sibling(runtime_class, tmp_path):
+    state = tmp_path / "state"
+    runtime = runtime_class(base_dir=str(state))
+    worker = {"worker_id":"wrk_branch", "bootstrap_bundle_json":json.dumps({"env":{}})}
+    runtime._remember_native_session_key(worker,"old-sibling-session")
+    assert runtime._read_provider_session_key(worker) == "old-sibling-session"
+    worker["bootstrap_bundle_json"] = json.dumps({"env":{"GLASSHIVE_PROVIDER_SESSION_EPOCH":"a" * 64}})
+    assert runtime._provider_session_starts_fresh(worker)
+    assert runtime._read_provider_session_key(worker) is None
+    info = runtime._runtime_info(worker)
+    assert info.session_key is None
+    failed_session, _ = runtime._parse_output(worker, "", "Native admission unavailable", info)
+    assert failed_session is None
+    runtime._remember_native_session_key(worker,"selected-branch-session")
+    restarted = runtime_class(base_dir=str(state))
+    assert restarted._read_provider_session_key(worker) == "selected-branch-session"
+    assert not restarted._provider_session_starts_fresh(worker)
+    # The early event observer may have only the worker ID; it preserves the active branch epoch.
+    restarted._write_session_key("wrk_branch","selected-branch-session")
+    assert restarted._read_provider_session_key(worker) == "selected-branch-session"
+    worker["bootstrap_bundle_json"] = json.dumps({"env":{"GLASSHIVE_PROVIDER_SESSION_EPOCH":"b" * 64}})
+    assert restarted._provider_session_starts_fresh(worker)
+    assert restarted._read_provider_session_key(worker) is None

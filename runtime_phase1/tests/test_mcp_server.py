@@ -401,6 +401,106 @@ class RecordingWorkersProjectsApiClient(mcp_server.WorkersProjectsApiClient):
         return {"ok": True}
 
 
+def test_runtime_client_create_delegation_sends_atomic_headers(monkeypatch):
+    captured: dict = {}
+
+    class CapturingResponseClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def request(self, method, url, *, json=None, headers=None):
+            captured.update(
+                {
+                    "method": method,
+                    "url": url,
+                    "json": json,
+                    "headers": dict(headers or {}),
+                }
+            )
+            request = httpx.Request(method, url)
+            return httpx.Response(
+                201,
+                json={"workRef": "work_atomic_1", "state": "queued"},
+                request=request,
+            )
+
+    monkeypatch.setattr(mcp_server.httpx, "Client", CapturingResponseClient)
+    monkeypatch.setattr(mcp_server, "_require_enterprise_mcp_service_auth", lambda _headers: None)
+    monkeypatch.setattr(mcp_server, "_request_headers", lambda: {})
+    monkeypatch.setattr(mcp_server, "load_viventium_runtime_env", lambda _required: None)
+    monkeypatch.setattr(mcp_server, "mint_service_assertion", lambda *_args, **_kwargs: "assertion-test")
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET", "secret-test")
+    monkeypatch.delenv("GLASSHIVE_SECURITY_MODE", raising=False)
+    monkeypatch.delenv("GLASSHIVE_AUTH_MODE", raising=False)
+    client = mcp_server.WorkersProjectsApiClient(
+        base_url="http://glasshive.example.test",
+        api_token="api-test-token",
+    )
+
+    result = client.create_delegation(
+        tenant_id="tenant-alpha",
+        owner_id="owner-alpha",
+        idempotency_key="delegation-key-1",
+        payload={"title": "Atomic mission"},
+    )
+
+    assert result == {"workRef": "work_atomic_1", "state": "queued"}
+    assert captured == {
+        "method": "POST",
+        "url": "http://glasshive.example.test/v1/delegations",
+        "json": {"title": "Atomic mission"},
+        "headers": {
+            "Authorization": "Bearer api-test-token",
+            mcp_server.SERVICE_ASSERTION_HEADER: "assertion-test",
+            "Idempotency-Key": "delegation-key-1",
+        },
+    }
+
+
+@pytest.mark.parametrize("status,code,retryable", [
+    (503, "host_capacity", True),
+    (429, "provider_rate_limit", True),
+    (409, "delegation_idempotency_conflict", False),
+    (403, "owner_scope_denied", False),
+])
+def test_runtime_client_preserves_typed_account_rejection(monkeypatch, status, code, retryable):
+    response = httpx.Response(
+        status,
+        json={"detail": {"code": code, "message": "The request is not accepted."}},
+        headers={"Retry-After": "4"},
+        request=httpx.Request("POST", "http://runtime.test/v1/delegations"),
+    )
+    class ResponseClient:
+        def __init__(self, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def request(self, *args, **kwargs): return response
+
+    monkeypatch.setattr(mcp_server.httpx, "Client", ResponseClient)
+    monkeypatch.setattr(mcp_server, "_require_enterprise_mcp_service_auth", lambda _: None)
+    monkeypatch.setattr(mcp_server, "_request_headers", lambda: {})
+    monkeypatch.delenv("GLASSHIVE_SECURITY_MODE", raising=False)
+    monkeypatch.delenv("GLASSHIVE_AUTH_MODE", raising=False)
+    client = mcp_server.WorkersProjectsApiClient(base_url="http://runtime.test", api_token="")
+    with pytest.raises(mcp_server.GlassHiveBlockedError) as caught:
+        client._request("POST", "/v1/delegations", json_body={})
+    result = mcp_server._blocked_dispatch_result(
+        caught.value.payload, profile="codex-cli", execution_mode="host",
+    )
+    assert result["status"] == "blocked"
+    assert result["failure_class"] == code
+    assert result["failure_retryable"] is retryable
+    assert result["retry_after"] == "4"
+    assert not result["callback_ready"]
+    assert not result["view_steer_url"]
+
+
 def test_runtime_client_preserves_safe_closed_workspace_detail(monkeypatch):
     class ClosedResponseClient:
         def __init__(self, *args, **kwargs):
@@ -1752,7 +1852,8 @@ def test_workspace_launch_projects_saved_claude_max_effort(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_workspace_launch_projects_saved_claude_xhigh_effort(monkeypatch):
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+def test_workspace_launch_projects_native_claude_effort(monkeypatch, effort):
     monkeypatch.setenv("GLASSHIVE_ALLOWED_WORKER_PROFILES", "claude-code")
     api = PreferenceApiClient()
     server = create_mcp_server(api_client=api)
@@ -1761,9 +1862,9 @@ def test_workspace_launch_projects_saved_claude_xhigh_effort(monkeypatch):
         async with Client(server) as client:
             saved = await client.call_tool(
                 "workspace_preferences_set",
-                {"default_worker_profile": "claude-code", "claude_effort": "xhigh"},
+                {"default_worker_profile": "claude-code", "claude_effort": effort},
             )
-            assert _tool_json(saved)["claude_effort"] == "xhigh"
+            assert _tool_json(saved)["claude_effort"] == effort
 
             launched = await client.call_tool(
                 "workspace_launch",
@@ -1774,9 +1875,9 @@ def test_workspace_launch_projects_saved_claude_xhigh_effort(monkeypatch):
                 },
             )
             payload = _tool_json(launched)
-            assert payload["effort"] == "xhigh"
+            assert payload["effort"] == effort
             bundle = api.find_or_resume_payloads[-1]["bootstrap_bundle"]
-            assert bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == "xhigh"
+            assert bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == effort
 
     asyncio.run(scenario())
 
@@ -2329,6 +2430,66 @@ def test_worker_delegate_once_creates_resumes_and_runs_without_listing(monkeypat
     assert "do not mark the workspace blocked" in assigned_instruction
     assert "report only blockers observable from inside this worker workspace" in assigned_instruction
     assert assigned_instruction.count("Host-side GlassHive orchestration checks") == 1
+
+
+def test_worker_delegate_once_uses_existing_atomic_delegation_receipt(monkeypatch):
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "owner-alpha",
+            "X-Viventium-Message-Id": "message-alpha",
+            "X-Viventium-Surface": "telegram",
+        },
+    )
+
+    class AtomicApi(TrackingApiClient):
+        def __init__(self):
+            super().__init__()
+            self.delegations = []
+
+        def create_delegation(self, **kwargs):
+            self.calls.append("create_delegation")
+            self.delegations.append(kwargs)
+            return {
+                "workRef": "work_atomic_1",
+                "state": "queued",
+                "viewRef": "/r/ghr_atomic_1",
+                "resourceClass": "light",
+                "idempotentReplay": False,
+            }
+
+    api = AtomicApi()
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = _tool_json(
+                await client.call_tool(
+                    "worker_delegate_once",
+                    {
+                        "title": "Atomic mission",
+                        "goal": "Finish the mission",
+                        "instruction": "Create the requested HTML artifact.",
+                        "profile": "codex-cli",
+                        "execution_mode": "docker",
+                        "resource_class": "light",
+                    },
+                )
+            )
+        assert delegated["status"] == "dispatched"
+        assert delegated["work_ref"] == "work_atomic_1"
+        assert delegated["resource_class"] == "light"
+
+    asyncio.run(scenario())
+
+    assert api.calls == ["create_delegation"]
+    assert api.delegations[0]["tenant_id"] == "tenant-alpha"
+    assert api.delegations[0]["owner_id"] == "owner-alpha"
+    assert api.delegations[0]["payload"]["originSurface"] == "telegram"
+    assert api.delegations[0]["idempotency_key"].startswith("ghd_")
 
 
 def test_worker_delegate_once_blocks_missing_host_cli_before_api_calls(monkeypatch):
@@ -6392,6 +6553,26 @@ def test_multi_user_security_mode_rejects_cross_user_virtual_upload_without_lega
     assert mcp_server._diagnostic_payloads_enabled() is False
 
 
+@pytest.mark.parametrize("explicit_exists", [True, False])
+def test_explicit_runtime_env_never_imports_another_installation(monkeypatch, tmp_path, explicit_exists):
+    from workers_projects_runtime import runtime_env
+
+    default_dir = tmp_path / "Library/Application Support/Viventium/runtime"
+    default_dir.mkdir(parents=True)
+    (default_dir / "runtime.env").write_text("GLASSHIVE_SIGNED_LINK_SECRET=other-installation\n")
+    explicit = tmp_path / "selected/runtime.env"
+    if explicit_exists:
+        explicit.parent.mkdir()
+        explicit.write_text("GLASSHIVE_RUNTIME_BASE_URL=http://selected.invalid\n")
+    monkeypatch.setattr(runtime_env.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("VIVENTIUM_ENV_FILE", str(explicit))
+    monkeypatch.delenv("VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV", raising=False)
+    monkeypatch.delenv("GLASSHIVE_SIGNED_LINK_SECRET", raising=False)
+    assert runtime_env._candidate_env_files() == [explicit]
+    runtime_env.load_viventium_runtime_env({"GLASSHIVE_SIGNED_LINK_SECRET"})
+    assert "GLASSHIVE_SIGNED_LINK_SECRET" not in os.environ
+
+
 def test_runtime_env_repairs_missing_upload_root_to_local_checkout(monkeypatch, tmp_path):
     fallback_root = tmp_path / "repo-uploads"
     fallback_root.mkdir()
@@ -6535,3 +6716,17 @@ def test_merge_request_context_projects_extracted_upload_text(monkeypatch):
     assert bundle is not None
     assert bundle["files"][0]["path"] == "uploads/brief.txt"
     assert bundle["files"][0]["content"] == "Use this brief."
+
+
+def test_deferred_callback_tool_registry_names_only_registered_dispatch_tools():
+    import asyncio
+
+    from workers_projects_runtime.mcp_tool_registry import DEFERRED_CALLBACK_TOOLS
+
+    server = create_mcp_server(api_client=FakeApiClient())
+    registered = {tool.name for tool in asyncio.run(server.list_tools())}
+    missing = sorted(DEFERRED_CALLBACK_TOOLS - registered)
+    assert missing == [], f"registry names unregistered tools: {missing}"
+    # Request/response tools stay outside the registry so they never arm long host polling.
+    for name in ("workspace_status", "workspace_wait", "run_get", "project_get", "workers_list"):
+        assert name in registered and name not in DEFERRED_CALLBACK_TOOLS

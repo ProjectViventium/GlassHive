@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Any
 
 
+# Native CLI values; launch-time help checks retain compatibility with installed versions.
+CLAUDE_CODE_EFFORT_LEVELS = ("default", "low", "medium", "high", "xhigh", "max")
+
+
 DEFAULT_HOST_RUNTIME_REQUIREMENTS: dict[str, list[dict[str, Any]]] = {
     "codex-cli": [
         {

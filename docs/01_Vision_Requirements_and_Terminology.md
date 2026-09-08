@@ -34,6 +34,21 @@ Glass Hive should provide:
     explicit success conditions without inventing plans, rubrics, artifacts, provider lists, or tool
     results for the worker
 
+## Completion evidence boundary
+
+The runtime records process, run, transcript and artifact identity. A structured provider or
+process failure, an empty result, an unmet explicitly typed output format, invalid document bytes,
+or corrupt/foreign evidence remains a failed result. These checks do not replace authority,
+workspace, capability or owner controls.
+
+Prose-derived constraint, coverage and completion diagnostics are advisory. Their missing report
+marker, inferred date/format/count or unavailable internal ledger must not discard useful native
+output. The runtime authors these diagnostics; the model does not have to create an internal ledger
+or a planning artifact. The result retains a visible warning and private diagnostic detail. Recovery
+uses the same boundary and never invents missing historical evidence. Declared or present evidence
+still has to be readable and belong to the exact run. An unavailable internal diagnostic names
+that missing diagnostic in the warning; it must not emit an unexplained empty warning.
+
 ## Core Worker Operating Instructions
 
 The public source of truth is `docs/requirements_and_learnings/48_GlassHive_Workstation_Sandbox_Runtime.md`.

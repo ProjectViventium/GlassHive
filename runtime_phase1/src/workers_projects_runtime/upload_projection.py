@@ -1,12 +1,53 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 import os
 import re
 from pathlib import Path
 from typing import Any, Iterable
 
 from .bootstrap import BOOTSTRAP_SOURCE_TOKEN_KEY, sign_bootstrap_source_path
+
+
+def project_inline_image_files(messages: Iterable[Any]) -> list[dict[str, Any]]:
+    """Project typed inline image bytes into the existing request file owner."""
+    from .deliverables import _native_image_bytes, NATIVE_MEDIA_MAX_ITEMS, NATIVE_MEDIA_MAX_TOTAL_BYTES
+
+    files = []
+    seen = set()
+    total_bytes = 0
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") not in {"image_url", "input_image"}:
+                continue
+            url = block.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            if not isinstance(url, str) or not url.startswith("data:"):
+                continue  # Existing uploaded-file projection owns non-inline inputs.
+            header, separator, encoded = url.partition(",")
+            if not separator or not header.endswith(";base64"):
+                raise ValueError("Inline image requires base64 data")
+            mime_type = header[5:-7]
+            data, suffix = _native_image_bytes(mime_type, encoded)
+            digest = hashlib.sha256(data).hexdigest()
+            if digest in seen:
+                continue
+            if len(files) >= NATIVE_MEDIA_MAX_ITEMS or total_bytes + len(data) > NATIVE_MEDIA_MAX_TOTAL_BYTES:
+                raise ValueError("Inline image input exceeds the native media limit")
+            seen.add(digest)
+            total_bytes += len(data)
+            files.append({
+                "scope": "workspace", "path": f"uploads/native-images/{digest}{suffix}",
+                "type": mime_type, "sha256": digest, "bytes": len(data),
+                "encoding": "base64", "content_base64": base64.b64encode(data).decode("ascii"),
+            })
+    return files
 
 
 _UPLOAD_LEDGER_PUBLIC_KEYS = (

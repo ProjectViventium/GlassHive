@@ -48,6 +48,25 @@ Design principle:
 - all worker profiles should share the same project/run/lifecycle API whether they execute in a
   Docker workstation sandbox or in host-native mode
 
+### Native generation and restart ownership
+
+A native control operation targets the recorded run, lease, process identity, attempt and host-slot
+identity. A stale Stop, timeout, rejected-start cleanup or old process `finally` must not signal,
+clear or release a replacement generation, including a replacement for the same run. Missing PID
+metadata alone is not proof that native work stopped. Historical results and deadline cleanup use
+the worker recorded on the run even if the conversation session now points to another worker.
+
+Managed shutdown stops the exact owned generation and proves it absent before releasing its lease
+for retry. Failed cleanup or unknown absence retains the lease. Processor exit cannot release that
+shutdown-owned fence. Configured live-generation restart adoption keeps its separate ownership path.
+Recovery from a complete native response without an exit marker must confirm the exact process
+stopped before writing a synthetic exit marker. Failed or unknown stop leaves recovery pending.
+
+Automatic crash/capacity retry projects worker readiness in the same database transaction that reads
+durable Pause intent. A committed Pause or paused run remains paused even if a crash left the worker
+row stale. Retry recovery cannot override a Work Stop, compute-release claim, termination boundary or
+concurrently admitted generation.
+
 ## 3. Execution Substrate
 
 Current phase-1 substrate:
