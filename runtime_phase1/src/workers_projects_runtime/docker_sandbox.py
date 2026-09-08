@@ -870,12 +870,13 @@ class DockerSandboxManager:
     _default_image = "workers-projects-runtime-workstation:phase1-node22-docs8-openclaw2026.7.1-6"
     _provider_account_mount_target = "/workspace/.provider-account"
 
-    def __init__(self, base_dir: str | None = None) -> None:
+    def __init__(self, base_dir: str | None = None, *, create_directories: bool = True) -> None:
         self.base_dir = Path(base_dir) if base_dir else Path(__file__).resolve().parents[2] / "data"
         self.runtime_root = self.base_dir / "docker_sandboxes"
         self.build_root = self.runtime_root / "build"
-        self.runtime_root.mkdir(parents=True, exist_ok=True)
-        self.build_root.mkdir(parents=True, exist_ok=True)
+        if create_directories:
+            self.runtime_root.mkdir(parents=True, exist_ok=True)
+            self.build_root.mkdir(parents=True, exist_ok=True)
         self.image = os.environ.get("WPR_SANDBOX_IMAGE", self._default_image)
         self._managed_image = not bool(str(os.environ.get("WPR_SANDBOX_IMAGE") or "").strip())
         self.base_image = AI_WORKER_BASE_IMAGE
@@ -1619,11 +1620,22 @@ class DockerSandboxManager:
         sandbox = self.fast_sandbox_from_worker(resolved_worker) or self.inspect(worker_id)
         if sandbox is None:
             return None
-        self._ensure_screen_runtime_dir(
-            sandbox.container_name,
-            clean_room=getattr(sandbox, "execution_policy", "")
-            == PARALLEL_CLEAN_ROOM_EXECUTION_POLICY,
-        )
+        try:
+            self._ensure_screen_runtime_dir(
+                sandbox.container_name,
+                clean_room=getattr(sandbox, "execution_policy", "")
+                == PARALLEL_CLEAN_ROOM_EXECUTION_POLICY,
+            )
+        except RuntimeError as exc:
+            # This lookup is read-only. A running session already proves its socket tree
+            # is usable; re-preparing it (for example a chmod the hardened clean-room
+            # user may no longer perform after start) must not hide a live generation
+            # from restart identity verification. ``screen -ls`` below stays authoritative.
+            logger.debug(
+                "Screen runtime directory preparation skipped for pid lookup in %s: %s",
+                sandbox.container_name,
+                exc,
+            )
         script = r"""
 target="$1"
 screen -ls | awk -v target="$target" '
@@ -4458,6 +4470,7 @@ screen -ls | awk -v target="$target" '
                     raise RuntimeError(
                         "Parallel clean-room worker generation could not be inspected"
                     )
+                self._ensure_parallel_clean_room_mission_network(worker_container)
                 self._remove_parallel_clean_room_mission_network(
                     worker_container,
                     network_name=network_name,

@@ -1736,6 +1736,27 @@ def test_all_agents_feeling_projection_rejects_forged_prompt_field_duplicate(tmp
             copy_tree=lambda source, target: None,
         )
 
+
+def test_legacy_conversation_accepts_exact_feeling_authority_mirrors():
+    capsule = (
+        "<viventium_feeling_state>\n"
+        "synthetic request-pinned state\n"
+        "</viventium_feeling_state>"
+    )
+    application_authority = f"Stable application authority.\n\n{capsule}"
+    developer_authority = f"Structural broker authority.\n\n{application_authority}"
+    bundle = {
+        "run_mode": "conversation",
+        "application_developer_instructions": application_authority,
+        "developer_instructions": developer_authority,
+        "declared_developer_instruction_tail": capsule,
+    }
+
+    assert (
+        bootstrap_module.canonicalize_viventium_feeling_projection(bundle) == bundle
+    )
+
+
 def test_direct_worker_rejects_enabled_conscious_agent_feeling_projection(tmp_path):
     capsule = (
         "<viventium_feeling_state>\n"

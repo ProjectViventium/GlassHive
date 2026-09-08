@@ -1214,88 +1214,123 @@ def test_parallel_clean_room_network_capacity_reclaims_orphans_then_retries(
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     container_name = "wpr-worker-network-recovery"
     mission_network = manager._parallel_clean_room_mission_network_name(container_name)
+    orphan_worker = "wpr-worker-network-orphan"
+    orphan_network = manager._parallel_clean_room_mission_network_name(orphan_worker)
     provider = "glasshive-provider-egress"
     broker = "glasshive-capability-broker-proxy"
     ids = {provider: "a" * 64, broker: "b" * 64}
     create_attempts = 0
-    repaired = False
+    networks = {
+        orphan_network: {"exists": True, "worker": orphan_worker, "connected": set()},
+        mission_network: {"exists": False, "worker": container_name, "connected": set()},
+    }
+    calls: list[list[str]] = []
+
+    def network_payload(network_name):
+        state = networks[network_name]
+        return json.dumps(
+            [
+                {
+                    "Name": network_name,
+                    "Driver": "bridge",
+                    "Internal": True,
+                    "Labels": {
+                        "com.viventium.parallel-clean-room.policy": (
+                            PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+                        ),
+                        "com.viventium.parallel-clean-room.role": "mission-network",
+                        "com.viventium.parallel-clean-room.worker-container": state[
+                            "worker"
+                        ],
+                    },
+                    "Containers": {
+                        ids[name]: {"Name": name}
+                        for name in sorted(state["connected"])
+                    },
+                }
+            ]
+        )
 
     def fake_docker(args, **_kwargs):
         nonlocal create_attempts
-        if args == ["network", "inspect", mission_network]:
-            if create_attempts < 2:
+        calls.append(args)
+        if args[0:2] == ["network", "ls"]:
+            listed = [name for name, state in networks.items() if state["exists"]]
+            return subprocess.CompletedProcess(args, 0, "\n".join(listed), "")
+        if args[0:2] == ["network", "inspect"] and args[-1] in networks:
+            state = networks[args[-1]]
+            if not state["exists"]:
                 return subprocess.CompletedProcess(args, 1, "", "not found")
-            return subprocess.CompletedProcess(
-                args,
-                0,
-                json.dumps(
-                    [
-                        {
-                            "Name": mission_network,
-                            "Driver": "bridge",
-                            "Internal": True,
-                            "Labels": {
-                                "com.viventium.parallel-clean-room.policy": (
-                                    PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
-                                ),
-                                "com.viventium.parallel-clean-room.role": "mission-network",
-                                "com.viventium.parallel-clean-room.worker-container": container_name,
-                            },
-                            "Containers": {
-                                ids[provider]: {"Name": provider},
-                                ids[broker]: {"Name": broker},
-                            },
-                        }
-                    ]
-                ),
-                "",
-            )
+            return subprocess.CompletedProcess(args, 0, network_payload(args[-1]), "")
         if args[0:2] == ["network", "create"]:
+            assert args[-1] == mission_network
             create_attempts += 1
-            if create_attempts == 1:
+            if networks[orphan_network]["exists"]:
                 return subprocess.CompletedProcess(
                     args,
                     1,
                     "",
                     "all predefined address pools have been fully subnetted",
                 )
-            assert repaired is True
+            networks[mission_network]["exists"] = True
             return subprocess.CompletedProcess(args, 0, mission_network, "")
-        if args == ["inspect", provider]:
-            aliases = [provider, "provider-egress"]
-        elif args == ["inspect", broker]:
-            aliases = [broker, "host.docker.internal"]
-        else:
-            raise AssertionError(args)
-        return subprocess.CompletedProcess(
-            args,
-            0,
-            json.dumps(
-                [
-                    {
-                        "Id": ids[args[-1]],
-                        "NetworkSettings": {
-                            "Networks": {mission_network: {"Aliases": aliases}}
-                        },
-                    }
-                ]
-            ),
-            "",
-        )
-
-    def repair_orphans():
-        nonlocal repaired
-        repaired = True
-        return ()
+        if args == ["inspect", orphan_worker]:
+            return subprocess.CompletedProcess(args, 1, "", "No such object")
+        if args[0:2] == ["network", "connect"]:
+            networks[args[-2]]["connected"].add(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[0:3] == ["network", "disconnect", "-f"]:
+            networks[args[-2]]["connected"].remove(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[0:2] == ["network", "rm"]:
+            assert not networks[args[-1]]["connected"]
+            networks[args[-1]]["exists"] = False
+            return subprocess.CompletedProcess(args, 0, args[-1], "")
+        if args in (["inspect", provider], ["inspect", broker]):
+            proxy = args[-1]
+            role = "provider-proxy" if proxy == provider else "broker-proxy"
+            alias = (
+                "provider-egress"
+                if proxy == provider
+                else "host.docker.internal"
+            )
+            attachments = {
+                name: {"Aliases": [proxy, alias]}
+                for name, state in networks.items()
+                if state["exists"] and proxy in state["connected"]
+            }
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                json.dumps(
+                    [
+                        {
+                            "Id": ids[proxy],
+                            "Config": {
+                                "Labels": {
+                                    "com.viventium.parallel-clean-room.policy": (
+                                        PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+                                    ),
+                                    "com.viventium.parallel-clean-room.role": role,
+                                }
+                            },
+                            "NetworkSettings": {"Networks": attachments},
+                        }
+                    ]
+                ),
+                "",
+            )
+        raise AssertionError(args)
 
     manager._docker = fake_docker  # type: ignore[method-assign]
-    manager.repair_parallel_clean_room_mission_networks = repair_orphans  # type: ignore[method-assign]
 
     assert manager._ensure_parallel_clean_room_mission_network(container_name) == (
         mission_network
     )
     assert create_attempts == 2
-    assert repaired is True
+    assert networks[orphan_network]["exists"] is False
+    assert networks[mission_network]["connected"] == {provider, broker}
+    assert ["network", "rm", orphan_network] in calls
 
 def test_parallel_clean_room_repairs_missing_proxy_attachments_after_proxy_restart(
     tmp_path, monkeypatch
@@ -1481,50 +1516,98 @@ def test_parallel_clean_room_repair_removes_attested_orphan_mission_network(
     manager = DockerSandboxManager(base_dir=str(tmp_path))
     worker = "wpr-worker-stale"
     network = manager._parallel_clean_room_mission_network_name(worker)
-    removed: list[tuple[str, str | None]] = []
+    provider = "glasshive-provider-egress"
+    broker = "glasshive-capability-broker-proxy"
+    ids = {provider: "a" * 64, broker: "b" * 64}
+    connected: set[str] = set()
+    network_exists = True
+    calls: list[list[str]] = []
+
+    def network_payload():
+        return json.dumps(
+            [
+                {
+                    "Name": network,
+                    "Driver": "bridge",
+                    "Internal": True,
+                    "Labels": {
+                        "com.viventium.parallel-clean-room.policy": (
+                            PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+                        ),
+                        "com.viventium.parallel-clean-room.role": "mission-network",
+                        "com.viventium.parallel-clean-room.worker-container": worker,
+                    },
+                    "Containers": {
+                        ids[name]: {"Name": name} for name in sorted(connected)
+                    },
+                }
+            ]
+        )
 
     def fake_docker(args, **_kwargs):
+        nonlocal network_exists
+        calls.append(args)
         if args[0:2] == ["network", "ls"]:
-            return subprocess.CompletedProcess(args, 0, f"{network}\n", "")
+            listed = f"{network}\n" if network_exists else ""
+            return subprocess.CompletedProcess(args, 0, listed, "")
         if args == ["network", "inspect", network]:
+            if not network_exists:
+                return subprocess.CompletedProcess(args, 1, "", "No such network")
+            return subprocess.CompletedProcess(args, 0, network_payload(), "")
+        if args == ["inspect", worker]:
+            return subprocess.CompletedProcess(args, 1, "", "No such object")
+        if args[0:2] == ["network", "connect"]:
+            connected.add(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[0:3] == ["network", "disconnect", "-f"]:
+            connected.remove(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args == ["network", "rm", network]:
+            assert connected == set()
+            network_exists = False
+            return subprocess.CompletedProcess(args, 0, network, "")
+        if args in (["inspect", provider], ["inspect", broker]):
+            proxy = args[-1]
+            role = "provider-proxy" if proxy == provider else "broker-proxy"
+            alias = (
+                "provider-egress"
+                if proxy == provider
+                else "host.docker.internal"
+            )
+            attachments = (
+                {network: {"Aliases": [proxy, alias]}}
+                if proxy in connected
+                else {}
+            )
             return subprocess.CompletedProcess(
                 args,
                 0,
                 json.dumps(
                     [
                         {
-                            "Name": network,
-                            "Driver": "bridge",
-                            "Internal": True,
-                            "Labels": {
-                                "com.viventium.parallel-clean-room.policy": (
-                                    PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
-                                ),
-                                "com.viventium.parallel-clean-room.role": "mission-network",
-                                "com.viventium.parallel-clean-room.worker-container": worker,
+                            "Id": ids[proxy],
+                            "Config": {
+                                "Labels": {
+                                    "com.viventium.parallel-clean-room.policy": (
+                                        PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+                                    ),
+                                    "com.viventium.parallel-clean-room.role": role,
+                                }
                             },
-                            "Containers": {},
+                            "NetworkSettings": {"Networks": attachments},
                         }
                     ]
                 ),
                 "",
             )
-        if args == ["inspect", worker]:
-            return subprocess.CompletedProcess(args, 1, "", "No such object")
         raise AssertionError(args)
 
     manager._docker = fake_docker  # type: ignore[method-assign]
-    manager._remove_parallel_clean_room_mission_network = (  # type: ignore[method-assign]
-        lambda container_name, network_name=None: removed.append(
-            (container_name, network_name)
-        )
-    )
-    manager._ensure_parallel_clean_room_mission_network = (  # type: ignore[method-assign]
-        lambda _worker: pytest.fail("an orphan mission network must not be repaired")
-    )
 
     assert manager.repair_parallel_clean_room_mission_networks() == ()
-    assert removed == [(worker, network)]
+    assert network_exists is False
+    assert connected == set()
+    assert ["network", "rm", network] in calls
 
 def test_parallel_clean_room_repair_ignores_stale_foreign_namespace_network(
     tmp_path, monkeypatch
@@ -5680,6 +5763,40 @@ def test_screen_session_pid_reads_matching_screen_socket(tmp_path):
 
     assert manager.screen_session_pid("wrk_test", "codex-cli", "job-run_123456") == 12345
     assert any("mkdir -p /run/screen" in command[-1] for command in calls)
+
+
+def test_screen_session_pid_survives_refused_runtime_dir_preparation(tmp_path):
+    """A live clean-room session must stay identifiable after start even when the container
+    user can no longer chmod /run/screen: the pid lookup is read-only and ``screen -ls`` is
+    the authority."""
+    manager = DockerSandboxManager(base_dir=str(tmp_path))
+    calls: list[list[str]] = []
+
+    class FakeSandbox:
+        container_name = "wpr-clean"
+        execution_policy = PARALLEL_CLEAN_ROOM_EXECUTION_POLICY
+
+    manager.inspect = lambda worker_id: FakeSandbox()  # type: ignore[method-assign]
+
+    def refused_prepare(container_name, *, clean_room=False):
+        raise RuntimeError(
+            f"Failed to prepare screen runtime directory in {container_name}: "
+            "chmod: changing permissions of '/run/screen': Operation not permitted"
+        )
+
+    manager._ensure_screen_runtime_dir = refused_prepare  # type: ignore[method-assign]
+
+    def fake_docker_exec(container_name, command, *, env=None, cwd=None, detach=False, fire_and_forget=False, user=None):
+        calls.append(command)
+        if command[:2] == ["bash", "-lc"]:
+            assert command[-1] == "job-run_654321"
+            return subprocess.CompletedProcess(["docker"], returncode=0, stdout="543\n", stderr="")
+        return subprocess.CompletedProcess(["docker"], returncode=0, stdout="", stderr="")
+
+    manager._docker_exec = fake_docker_exec  # type: ignore[method-assign]
+
+    assert manager.screen_session_pid("wrk_clean", "claude-code", "job-run_654321") == 543
+    assert calls and calls[-1][:2] == ["bash", "-lc"]
 
 
 def test_exact_release_session_probe_never_ensures_or_repairs_container(tmp_path):

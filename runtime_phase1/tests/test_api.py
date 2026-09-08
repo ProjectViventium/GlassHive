@@ -11,7 +11,7 @@ import sqlite3
 import time
 import uuid
 import zipfile
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -101,8 +101,7 @@ def test_runtime_signed_link_sqlite_state_is_private(tmp_path, monkeypatch):
     state_path = tmp_path / "private-state" / "link-refs.sqlite3"
     monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(state_path))
 
-    connection = signed_links_module._link_ref_conn()
-    try:
+    with signed_links_module._link_ref_conn() as connection:
         connection.execute(
             "INSERT INTO signed_link_refs "
             "(ref_id, kind, token, target_url, expires_at, created_at) "
@@ -118,8 +117,63 @@ def test_runtime_signed_link_sqlite_state_is_private(tmp_path, monkeypatch):
         ):
             if candidate.exists():
                 assert os.stat(candidate).st_mode & 0o077 == 0
-    finally:
-        connection.close()
+
+
+def test_signed_link_helpers_close_sqlite_connections_deterministically(
+    tmp_path, monkeypatch
+):
+    runtime_db = tmp_path / "runtime.db"
+    link_ref_db = tmp_path / "link-refs.sqlite3"
+    real_connect = sqlite3.connect
+    with closing(real_connect(runtime_db)) as conn:
+        conn.execute(
+            "CREATE TABLE workers (worker_id TEXT PRIMARY KEY, state TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO workers (worker_id, state) VALUES (?, ?)",
+            ("wrk_connection_lifetime", "active"),
+        )
+        conn.commit()
+
+    opened: list[sqlite3.Connection] = []
+
+    def tracked_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setenv("WPR_DB_PATH", str(runtime_db))
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(link_ref_db))
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    monkeypatch.setattr(signed_links_module.sqlite3, "connect", tracked_connect)
+
+    token = sign_link_token(
+        kind="artifact_download",
+        worker_id="wrk_connection_lifetime",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="outputs/report.html",
+    )
+    ref_id = create_signed_link_ref(token=token)
+    assert ref_id.startswith("ghr_")
+    with closing(real_connect(runtime_db)) as conn:
+        conn.execute(
+            "UPDATE workers SET state = ? WHERE worker_id = ?",
+            ("terminated", "wrk_connection_lifetime"),
+        )
+        conn.commit()
+    assert signed_links_module._worker_is_terminated_in_runtime_db(
+        "wrk_connection_lifetime"
+    )
+    assert not signed_links_module.is_worker_signed_link_revoked(
+        "wrk_connection_lifetime"
+    )
+    assert resolve_signed_link_ref(ref_id) is not None
+
+    assert len(opened) == 4
+    for connection in opened:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
 
 
 def write_minimal_docx(path: Path) -> None:
@@ -6366,20 +6420,24 @@ def test_assign_run_effort_updates_claude_worker_bootstrap_bundle(tmp_path):
 
     rejected = client.post(
         f"/v1/workers/{worker['worker_id']}/assign",
-        json={"instruction": "Invalid effort should fail.", "effort": "high"},
+        json={"instruction": "Invalid effort should fail.", "effort": "ultra"},
     )
     assert rejected.status_code == 400
     assert "Claude effort" in rejected.json()["detail"]
 
 
-def test_assign_run_effort_accepts_claude_xhigh(tmp_path):
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+def test_assign_run_effort_accepts_native_claude_levels(tmp_path, effort):
     db_path = tmp_path / "runtime.db"
     client = TestClient(create_app(str(db_path), runtime_backend="stub"))
+    preference = client.patch("/v1/preferences", json={"claude_effort": effort})
+    assert preference.status_code == 200
+    assert preference.json()["claude_effort"] == effort
     project = client.post(
         "/v1/projects",
         json={
             "owner_id": "demo-owner",
-            "title": "Claude xhigh effort",
+            "title": "Claude native effort",
             "goal": "Verify the current Claude CLI effort handoff.",
             "default_worker_profile": "claude-code",
         },
@@ -6398,14 +6456,14 @@ def test_assign_run_effort_accepts_claude_xhigh(tmp_path):
 
     run = client.post(
         f"/v1/workers/{worker['worker_id']}/assign",
-        json={"instruction": "Continue with an xhigh effort pass.", "effort": "xhigh"},
+        json={"instruction": "Continue with an xhigh effort pass.", "effort": effort},
     )
 
     assert run.status_code == 202
-    assert run.json()["effort"] == "xhigh"
+    assert run.json()["effort"] == effort
     stored_worker = Store(str(db_path)).get_worker(worker["worker_id"])
     bundle = json.loads(stored_worker["bootstrap_bundle_json"])
-    assert bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == "xhigh"
+    assert bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == effort
 
 
 def test_signed_worker_view_is_limited_to_read_and_narrow_communication(tmp_path, monkeypatch):
@@ -10124,14 +10182,15 @@ def test_runtime_error_recovers_codex_failure_metadata_and_artifacts(tmp_path, m
     assert any(item["path"] == "reports/partial_result.csv" for item in artifacts["items"])
 
 
-def test_provider_failure_after_fresh_artifact_is_delivered_as_completed(tmp_path, monkeypatch):
+def test_provider_failure_after_fresh_artifact_is_delivered_as_a_partial_artifact(tmp_path, monkeypatch):
+    """A fresh file is preserved and delivered with the typed failure; it never completes the run."""
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
     db_path = tmp_path / "runtime.db"
     runtime = RuntimeErrorWithDeliverableArtifactRuntime(tmp_path / "workers")
     client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
     project = client.post(
         "/v1/projects",
-        json={"owner_id": "demo-owner", "title": "Recovered deliverable", "goal": "Promote real artifacts."},
+        json={"owner_id": "demo-owner", "title": "Recovered deliverable", "goal": "Preserve real artifacts."},
     ).json()
     worker = client.post(
         f"/v1/projects/{project['project_id']}/workers",
@@ -10139,19 +10198,24 @@ def test_provider_failure_after_fresh_artifact_is_delivered_as_completed(tmp_pat
     ).json()
 
     run = client.post(f"/v1/workers/{worker['worker_id']}/assign", json={"instruction": "research and build report"}).json()
-    completed = wait_for_run(client, run["run_id"])
+    failed = wait_for_run(client, run["run_id"])
 
-    assert completed["state"] == "completed"
-    assert completed["failure_class"] == ""
-    assert "finished_report.md" in completed["output_text"]
+    assert failed["state"] == "failed"
+    assert failed["failure_class"] == "provider_response_failed"
     wait_until(
         lambda: any(
-            item["event_type"] == "run.completed"
+            item["event_type"] == "run.partial_artifact_preserved"
             for item in client.get(f"/v1/workers/{worker['worker_id']}/events").json()["items"]
         )
     )
     events = client.get(f"/v1/workers/{worker['worker_id']}/events").json()["items"]
-    assert any(item["event_type"] == "run.completed" for item in events)
+    assert any(item["event_type"] == "run.failed" for item in events)
+    assert any(
+        item["event_type"] == "run.partial_artifact_preserved"
+        and item["message"] == "artifacts/finished_report.md"
+        for item in events
+    )
+    assert not any(item["event_type"] == "run.completed" for item in events)
     artifacts = client.get(f"/v1/workers/{worker['worker_id']}/artifacts").json()
     assert any(item["path"] == "artifacts/finished_report.md" for item in artifacts["items"])
 
@@ -10222,14 +10286,15 @@ def test_evidence_failure_is_not_recovered_as_completed(tmp_path, monkeypatch):
     assert not any(item["event_type"] == "run.completed" for item in events)
 
 
-def test_provider_failure_after_fresh_nested_index_is_delivered_as_completed(tmp_path, monkeypatch):
+def test_provider_failure_after_fresh_nested_index_stays_failed_with_the_partial_page(tmp_path, monkeypatch):
+    """Any fresh HTML page used to complete the run; it is a partial artifact until evidence says otherwise."""
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
     db_path = tmp_path / "runtime.db"
     runtime = RuntimeErrorWithNestedIndexRuntime(tmp_path / "workers")
     client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
     project = client.post(
         "/v1/projects",
-        json={"owner_id": "demo-owner", "title": "Nested HTML", "goal": "Promote generated HTML."},
+        json={"owner_id": "demo-owner", "title": "Nested HTML", "goal": "Preserve generated HTML."},
     ).json()
     worker = client.post(
         f"/v1/projects/{project['project_id']}/workers",
@@ -10237,10 +10302,22 @@ def test_provider_failure_after_fresh_nested_index_is_delivered_as_completed(tmp
     ).json()
 
     run = client.post(f"/v1/workers/{worker['worker_id']}/assign", json={"instruction": "build the HTML report"}).json()
-    completed = wait_for_run(client, run["run_id"])
+    failed = wait_for_run(client, run["run_id"])
 
-    assert completed["state"] == "completed"
-    assert "site/index.html" in completed["output_text"]
+    assert failed["state"] == "failed"
+    assert failed["failure_class"] == "provider_response_failed"
+    wait_until(
+        lambda: any(
+            item["event_type"] == "run.partial_artifact_preserved"
+            for item in client.get(f"/v1/workers/{worker['worker_id']}/events").json()["items"]
+        )
+    )
+    events = client.get(f"/v1/workers/{worker['worker_id']}/events").json()["items"]
+    assert any(
+        item["event_type"] == "run.partial_artifact_preserved" and item["message"] == "site/index.html"
+        for item in events
+    )
+    assert not any(item["event_type"] == "run.completed" for item in events)
 
 
 def test_provider_failure_does_not_complete_for_stale_artifact(tmp_path, monkeypatch):
@@ -10264,14 +10341,14 @@ def test_provider_failure_does_not_complete_for_stale_artifact(tmp_path, monkeyp
     assert failed["failure_class"] == "provider_response_failed"
 
 
-def test_runtime_io_failure_after_fresh_artifact_is_delivered_as_completed(tmp_path, monkeypatch):
+def test_runtime_io_failure_after_fresh_artifact_stays_failed_with_the_partial_artifact(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
     db_path = tmp_path / "runtime.db"
     runtime = RuntimeIoFailureWithDeliverableArtifactRuntime(tmp_path / "workers")
     client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
     project = client.post(
         "/v1/projects",
-        json={"owner_id": "demo-owner", "title": "Runtime I/O deliverable", "goal": "Promote completed user files."},
+        json={"owner_id": "demo-owner", "title": "Runtime I/O deliverable", "goal": "Preserve user files."},
     ).json()
     worker = client.post(
         f"/v1/projects/{project['project_id']}/workers",
@@ -10279,11 +10356,18 @@ def test_runtime_io_failure_after_fresh_artifact_is_delivered_as_completed(tmp_p
     ).json()
 
     run = client.post(f"/v1/workers/{worker['worker_id']}/assign", json={"instruction": "create a report"}).json()
-    completed = wait_for_run(client, run["run_id"])
+    failed = wait_for_run(client, run["run_id"])
 
-    assert completed["state"] == "completed"
-    assert completed["failure_class"] == ""
-    assert "finished_report.md" in completed["output_text"]
+    assert failed["state"] == "failed"
+    assert failed["failure_class"] == "runtime_io_failed"
+    wait_until(
+        lambda: any(
+            item["event_type"] == "run.partial_artifact_preserved"
+            for item in client.get(f"/v1/workers/{worker['worker_id']}/events").json()["items"]
+        )
+    )
+    events = client.get(f"/v1/workers/{worker['worker_id']}/events").json()["items"]
+    assert not any(item["event_type"] == "run.completed" for item in events)
 
 
 def test_prepared_codex_worker_uses_codex_runtime_label(tmp_path):
@@ -10345,7 +10429,7 @@ def test_worker_terminated_error_recovers_completed_artifacts(tmp_path):
         service.shutdown()
 
 
-def test_worker_interrupted_error_recovers_completed_artifacts(tmp_path):
+def test_worker_interrupted_error_preserves_operator_interrupt(tmp_path):
     db_path = tmp_path / "runtime.db"
     store = Store(str(db_path))
     runtime = InterruptedButCompletedRuntime()
@@ -10368,18 +10452,18 @@ def test_worker_interrupted_error_recovers_completed_artifacts(tmp_path):
             refreshed_worker = store.get_worker(worker["worker_id"])
             if (
                 refreshed
-                and refreshed["state"] == "completed"
+                and refreshed["state"] == "interrupted"
                 and refreshed_worker
                 and refreshed_worker["state"] == "ready"
             ):
                 break
             time.sleep(0.05)
         else:
-            raise AssertionError("Run did not recover completed artifacts")
+            raise AssertionError("Run did not preserve the operator interrupt")
 
-        assert store.get_run(run["run_id"])["output_text"] == "Recovered final answer"
+        assert store.get_run(run["run_id"])["output_text"] == ""
         assert store.get_worker(worker["worker_id"])["state"] == "ready"
-        assert runtime.collect_run_ids == [run["run_id"]]
+        assert runtime.collect_run_ids == []
     finally:
         service.shutdown()
 

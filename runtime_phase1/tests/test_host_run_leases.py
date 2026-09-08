@@ -1048,6 +1048,249 @@ def test_provider_liveness_attention_recovers_compute_and_callback_after_restart
     assert callbacks[0]["event_type"] == "run.needs_input"
 
 
+def test_managed_shutdown_release_keeps_run_out_of_provider_attention_and_requeues_same_run(
+    tmp_path,
+):
+    store = Store(str(tmp_path / "managed-shutdown.sqlite3"))
+    _project, worker, run = _active_worker_and_run(
+        store,
+        "managed-shutdown",
+        execution_mode="host",
+        run_state="running",
+    )
+    _other_project, _other_worker, other_run = _active_worker_and_run(
+        store,
+        "managed-shutdown-other",
+        execution_mode="host",
+        run_state="running",
+    )
+    run_id = str(run["run_id"])
+    attempt_id = str(run["active_attempt_id"])
+    lease = store.get_active_host_run_lease_for_run(run_id)
+    assert lease is not None
+    anchor = datetime.fromisoformat(str(run["liveness_started_at"]))
+    runtime = StubRuntime()
+    runtime.host_process_absence = lambda worker, run_id: True
+    service = WorkersProjectsService(
+        store,
+        runtime,
+        reconcile_on_startup=False,
+        start_background_consumers=False,
+    )
+    # Own the lease exactly as the executor that dispatched this run.
+    service._executor_id = str(lease["executor_id"])
+    try:
+        assert service.release_owned_host_run_leases() == 1
+        # Idempotent: nothing this executor owns is still active.
+        assert service.release_owned_host_run_leases() == 0
+
+        released = store.get_host_run_lease(str(lease["lease_id"]))
+        assert released is not None
+        assert released["status"] == "released"
+        assert released["release_reason"] == "managed_shutdown"
+        foreign = store.get_active_host_run_lease_for_run(str(other_run["run_id"]))
+        assert foreign is not None and foreign["status"] == "active"
+
+        # The same monitor pass still classifies the genuinely silent foreign
+        # lease, but a managed stop is not a stalled provider.
+        transitioned = store.transition_stalled_provider_liveness_runs(
+            now=(anchor + timedelta(seconds=3600)).isoformat(),
+            inactivity_seconds=900,
+        )
+        assert [item["run_id"] for item in transitioned] == [str(other_run["run_id"])]
+        still_running = store.get_run(run_id)
+        assert still_running is not None
+        assert still_running["state"] == "running"
+        assert not str(still_running["failure_class"] or "")
+        assert store.list_provider_liveness_events(run_id) == []
+        assert (
+            store.list_lifecycle_operation_effects(
+                worker_id=str(worker["worker_id"]), status="pending"
+            )
+            == []
+        )
+
+        # Startup reconciliation re-queues the same run with restart wording.
+        assert store.reconcile_invalid_running_runs() == 1
+    finally:
+        service.shutdown()
+
+    requeued = store.get_run(run_id)
+    assert requeued is not None
+    assert requeued["run_id"] == run_id
+    assert requeued["state"] == "queued"
+    assert requeued["active_attempt_id"] == ""
+    assert requeued["runtime_invoked_at"] is None
+    assert requeued["failure_retryable"] == 1
+    assert (
+        requeued["failure_user_message"]
+        == store_module.MANAGED_RESTART_FAILURE_USER_MESSAGE
+    )
+    assert (
+        requeued["failure_recommended_recovery"]
+        == store_module.MANAGED_RESTART_FAILURE_RECOMMENDED_RECOVERY
+    )
+    attempt = store.get_run_attempt(attempt_id)
+    assert attempt is not None
+    assert attempt["state"] == "retry_queued"
+    assert store.get_worker(str(worker["worker_id"]))["state"] == "starting"
+
+
+def test_service_shutdown_releases_owned_host_run_leases_as_managed_shutdown(tmp_path):
+    store = Store(str(tmp_path / "managed-shutdown-wiring.sqlite3"))
+    _project, _worker, run = _active_worker_and_run(
+        store,
+        "managed-shutdown-wiring",
+        execution_mode="host",
+        run_state="running",
+    )
+    lease = store.get_active_host_run_lease_for_run(str(run["run_id"]))
+    assert lease is not None
+    class GenerationStoppingRuntime(StubRuntime):
+        def __init__(self):
+            super().__init__()
+            self.stopped: list[tuple[str, str | None]] = []
+
+        def reconcile_worker(self, worker):
+            info = super().reconcile_worker(worker)
+            # A live native process of the old generation.
+            return info.__class__(**{**info.__dict__, "pid": 4242})
+
+        def host_process_absence(self, worker, run_id):
+            return (str(worker["worker_id"]), run_id) in self.stopped
+
+        def interrupt_worker(self, worker, run_id=None):
+            self.stopped.append((str(worker["worker_id"]), run_id))
+            return super().pause_worker(worker)
+
+    runtime = GenerationStoppingRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    service._executor_id = str(lease["executor_id"])
+
+    service.shutdown()
+
+    released = store.get_host_run_lease(str(lease["lease_id"]))
+    assert released is not None
+    assert released["status"] == "released"
+    assert released["release_reason"] == "managed_shutdown"
+    # The released lease fences the old generation's late result; the old generation's native
+    # process is stopped before this process exits so it cannot keep making external effects.
+    assert runtime.stopped == [(str(_worker["worker_id"]), str(run["run_id"]))]
+    # Shutdown only hands back ownership; the run itself is untouched until
+    # startup reconciliation re-queues it.
+    assert store.get_run(str(run["run_id"]))["state"] == "running"
+    assert service.release_owned_host_run_leases() == 0
+
+
+def test_lifespan_shutdown_releases_owned_leases_before_service_shutdown(
+    tmp_path, monkeypatch
+):
+    from fastapi.testclient import TestClient
+
+    from workers_projects_runtime.api import create_app
+
+    runtime = StubRuntime()
+    runtime.host_process_absence = lambda worker, run_id: True
+    app = create_app(
+        str(tmp_path / "lifespan-managed-shutdown.sqlite3"),
+        runtime=runtime,
+        reconcile_on_startup=False,
+    )
+    store = app.state.store
+    service = app.state.service
+    lease_ids: list[str] = []
+    seen_at_shutdown: list[dict] = []
+    original_shutdown = service.shutdown
+
+    def spying_shutdown(*args, **kwargs):
+        seen_at_shutdown.append(store.get_host_run_lease(lease_ids[0]) or {})
+        return original_shutdown(*args, **kwargs)
+
+    monkeypatch.setattr(service, "shutdown", spying_shutdown)
+    with TestClient(app):
+        _project, _worker, run = _active_worker_and_run(
+            store,
+            "lifespan-managed-shutdown",
+            execution_mode="host",
+            run_state="running",
+        )
+        lease = store.get_active_host_run_lease_for_run(str(run["run_id"]))
+        assert lease is not None
+        lease_ids.append(str(lease["lease_id"]))
+        service._executor_id = str(lease["executor_id"])
+
+    # The lifespan released the lease before service.shutdown() even started,
+    # so a preempted shutdown still leaves a typed managed_shutdown release.
+    assert len(seen_at_shutdown) == 1
+    assert seen_at_shutdown[0]["status"] == "released"
+    assert seen_at_shutdown[0]["release_reason"] == "managed_shutdown"
+
+
+def test_needs_input_callback_payload_carries_failure_guidance(tmp_path, monkeypatch):
+    store = Store(str(tmp_path / "needs-input-guidance.sqlite3"))
+    _project, worker, run = _active_worker_and_run(
+        store,
+        "needs-input-guidance",
+        execution_mode="host",
+        run_state="running",
+    )
+    store.update_worker(
+        str(worker["worker_id"]),
+        bootstrap_bundle_json=json.dumps(
+            {"callbacks": {"url": "https://example.invalid/callback"}}
+        ),
+    )
+    attempt_id = str(run["active_attempt_id"])
+    transitioned = None
+    for sequence in range(1, 4):
+        transitioned = store.observe_provider_liveness(
+            run_id=str(run["run_id"]),
+            expected_attempt_id=attempt_id,
+            kind="internal_retry",
+            failure_class="provider_internal_retry",
+            runtime="codex-cli",
+            model="test",
+            source_sequence=sequence,
+            source_digest=hashlib.sha256(f"guidance-{sequence}".encode()).hexdigest(),
+            retry_limit=3,
+        )
+    assert transitioned is not None
+    assert transitioned["state"] == "needs_input"
+    fields = Store._provider_liveness_failure_fields()
+
+    monkeypatch.setattr(
+        WorkersProjectsService,
+        "_deliver_callback_record",
+        lambda *_args, **_kwargs: None,
+    )
+    service = WorkersProjectsService(
+        store,
+        StubRuntime(),
+        reconcile_on_startup=False,
+        start_background_consumers=False,
+    )
+    try:
+        service._replay_pending_lifecycle_effects()
+    finally:
+        service.shutdown()
+
+    callbacks = store.list_callback_outbox_for_run(
+        str(run["run_id"]), tenant_id="local", owner_id="owner-a"
+    )
+    assert len(callbacks) == 1
+    assert callbacks[0]["event_type"] == "run.needs_input"
+    payload = json.loads(str(callbacks[0]["payload_json"]))
+    assert payload["event"] == "run.needs_input"
+    assert payload["failure_class"] == "provider_progress_stalled"
+    assert payload["failure_retryable"] is False
+    assert payload["failure_user_message"] == fields["failure_user_message"]
+    assert (
+        payload["failure_recommended_recovery"]
+        == fields["failure_recommended_recovery"]
+    )
+    assert payload["message"].startswith(str(fields["failure_user_message"]))
+
+
 def test_provider_attention_resume_keeps_exact_route_during_cooldown(
     tmp_path, monkeypatch
 ):
@@ -2048,6 +2291,9 @@ def test_orchestration_readiness_stays_available_when_docker_capacity_is_unknown
     # hide an existing board while another mission consumes the resource budget.
     assert capabilities == {
         "policyVersion": 1,
+        "nativeParallelReady": False,
+        "nativeParallelReason": "native_parallel_not_authorized",
+        "sharedHostDesktop": False,
         "isolatedParallelReady": True,
         "isolatedParallelReason": "",
         "hostMissionsAllowed": False,
@@ -2131,6 +2377,9 @@ def test_orchestration_readiness_fails_closed_until_existing_host_mission_is_ter
         blocked = service.orchestration_capabilities()
         assert blocked == {
             "policyVersion": 1,
+            "nativeParallelReady": False,
+            "nativeParallelReason": "native_parallel_not_authorized",
+            "sharedHostDesktop": False,
             "isolatedParallelReady": False,
             "isolatedParallelReason": "host_missions_active",
             "hostMissionsAllowed": False,
@@ -2146,6 +2395,9 @@ def test_orchestration_readiness_fails_closed_until_existing_host_mission_is_ter
         ready = service.orchestration_capabilities()
         assert ready == {
             "policyVersion": 1,
+            "nativeParallelReady": False,
+            "nativeParallelReason": "native_parallel_not_authorized",
+            "sharedHostDesktop": False,
             "isolatedParallelReady": True,
             "isolatedParallelReason": "",
             "hostMissionsAllowed": False,
@@ -2154,6 +2406,71 @@ def test_orchestration_readiness_fails_closed_until_existing_host_mission_is_ter
         }
     finally:
         service.shutdown()
+
+
+def test_orchestration_readiness_ignores_exact_terminal_history_only(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_ISOLATED_PARALLEL_POLICY", "1")
+    store = Store(str(tmp_path / "terminal-history.sqlite3"))
+    terminal_run_by_worker: dict[str, str] = {}
+    for index in range(256):
+        worker, run = _running_host_run(store, f"historical-{index}")
+        finalized = store.finalize_run(
+            run["run_id"],
+            state=("completed", "failed", "cancelled", "interrupted")[index % 4],
+            output_text="done",
+            **_exact_terminal_generation(store, run["run_id"]),
+        )
+        assert finalized is not None
+        terminal_run_by_worker[worker["worker_id"]] = run["run_id"]
+
+    class RuntimeWithHistoricalRecords(StubRuntime):
+        def host_active_process_status(self, worker):
+            return {
+                "state": "uncertain",
+                "run_id": terminal_run_by_worker[worker["worker_id"]],
+                "historical_record_only": True,
+            }
+
+        def isolated_parallel_readiness(self):
+            return {"ready": True, "reason": ""}
+
+    service = WorkersProjectsService(
+        store,
+        RuntimeWithHistoricalRecords(),
+        reconcile_on_startup=False,
+    )
+    try:
+        capabilities = service.orchestration_capabilities()
+    finally:
+        service.shutdown()
+
+    assert capabilities["isolatedParallelReady"] is True
+    assert capabilities["isolatedParallelReason"] == ""
+    assert capabilities["hostMissionsActive"] == 0
+
+
+def test_unknown_host_run_state_remains_a_readiness_blocker(tmp_path):
+    store = Store(str(tmp_path / "future-run-state.sqlite3"))
+    worker, terminal_run = _running_host_run(store, "terminal-plus-future")
+    assert store.finalize_run(
+        terminal_run["run_id"],
+        state="completed",
+        output_text="done",
+        **_exact_terminal_generation(store, terminal_run["run_id"]),
+    )
+    future_run = store.create_run(
+        worker["worker_id"], worker["project_id"], "Future state"
+    )
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE runs SET state = ? WHERE run_id = ?",
+            ("future_recovery_state", future_run["run_id"]),
+        )
+
+    assert store.active_host_mission_worker_ids() == {worker["worker_id"]}
+    assert store.conclusively_terminal_host_mission_history() == set()
 
 
 @pytest.mark.parametrize("process_state", ["active", "uncertain"])
@@ -2439,10 +2756,12 @@ def test_heartbeat_pass_logs_store_error_and_remains_callable(
         with caplog.at_level(logging.ERROR):
             service._heartbeat_host_run_leases_once()
             service._heartbeat_host_run_leases_once()
+        # Two heartbeat passes read the lease table twice; shutdown's own
+        # managed-release sweep is counted separately below.
+        assert calls == 2
     finally:
         service.shutdown()
 
-    assert calls == 2
     assert "Host lease heartbeat pass failed" in caplog.text
 
 
@@ -3843,6 +4162,7 @@ def test_worker_processor_enters_running_only_at_runtime_invocation(
             timeout_sec=None,
             run_id=None,
         ):
+            super().run_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
             durable = store.get_run(str(run_id)) or {}
             lease = store.get_active_host_run_lease_for_run(str(run_id)) or {}
             self.observed = {
@@ -3926,7 +4246,7 @@ def test_runtime_return_keeps_exact_lease_until_terminal_cas(
             timeout_sec=None,
             run_id=None,
         ):
-            _ = instruction, timeout_sec, run_id
+            super().run_task(worker, instruction, timeout_sec=timeout_sec, run_id=run_id)
             bundle = json.loads(str(worker.get("bootstrap_bundle_json") or "{}"))
             self.bearers.append(
                 str(
@@ -4855,18 +5175,59 @@ def test_structural_waits_do_not_consume_a_later_execution_retry_budget(
 
     assert exhausted["state"] == "failed"
     assert exhausted["retry_attempts"] == 1
+    assert exhausted["failure_retryable"] == 1
+    assert exhausted["failure_class"] == "provider_temporarily_unavailable"
+    assert "capacity" not in exhausted["failure_user_message"].lower()
+    assert exhausted["failure_user_message"] == "This work could not finish. You can retry it."
+    assert "after 1 attempts for provider_temporarily_unavailable" in exhausted["failure_diagnostic_summary"]
+    # Terminal state owns automatic scheduling, independently of manual Retry.
+    for generation in (51, 52):
+        runtime = StubRuntime()
+        invocations = []
+        def unexpected_invocation(*args, **kwargs):
+            invocations.append(args)
+            raise AssertionError("An exhausted failed run must not restart automatically")
+        runtime.run_task = unexpected_invocation
+        recovered = WorkersProjectsService(
+            store, runtime, reconcile_on_startup=False, start_background_consumers=False
+        )
+        with recovered._processors_lock:
+            recovered._active_processors.add(worker["worker_id"])
+            recovered._processor_generations[worker["worker_id"]] = generation
+        try:
+            recovered._process_worker_queue(worker["worker_id"], generation)
+            assert invocations == []
+            assert store.get_run(run["run_id"])["state"] == "failed"
+            assert store.peek_next_queued_run(worker["worker_id"]) is None
+            assert store.get_run(run["run_id"])["retry_attempts"] == 1
+        finally:
+            recovered.shutdown()
 
 
 class _ReconcilingRuntime(StubRuntime):
     def __init__(self):
         self.identities: dict[str, dict[str, object]] = {}
         self.observer = None
+        # Stop-and-confirm seams: cleanup succeeds only for runs listed in ``cleanable`` and
+        # absence is provable only for runs listed in ``absent``. Every call is recorded.
+        self.cleanable: set[str] = set()
+        self.absent: set[str] = set()
+        self.cleanup_calls: list[tuple[str, dict[str, object]]] = []
+        self.absence_calls: list[str] = []
 
     def set_host_process_observer(self, observer):
         self.observer = observer
 
     def host_process_identity(self, worker: dict, run_id: str):
         return self.identities.get(run_id)
+
+    def cleanup_unconfirmed_run_start(self, worker: dict, run_id: str, lease_identity: dict[str, object]) -> bool:
+        self.cleanup_calls.append((run_id, dict(lease_identity)))
+        return run_id in self.cleanable
+
+    def host_process_absence(self, worker: dict, run_id: str) -> bool:
+        self.absence_calls.append(run_id)
+        return run_id in self.absent
 
     def reconcile_worker(self, worker: dict) -> RuntimeInfo:
         identity = self.identities.get(str(worker.get("_active_run_id") or "")) or {}
@@ -5715,6 +6076,8 @@ def test_stale_lease_reconciliation_keeps_verified_process_and_releases_dead_own
         "process_start_identity": "ps-lstart:live",
         "verified": True,
     }
+    # The dead owner's recorded generation is proven absent by exact cleanup before release.
+    runtime.cleanable.add(dead_run["run_id"])
     service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
     try:
         result = service.reconcile_host_run_leases(stale_after_s=0)
@@ -5722,6 +6085,8 @@ def test_stale_lease_reconciliation_keeps_verified_process_and_releases_dead_own
         service.shutdown()
 
     assert result == {"renewed": 1, "released": 1, "unchanged": 0}
+    assert [call[0] for call in runtime.cleanup_calls] == [dead_run["run_id"]]
+    assert runtime.cleanup_calls[0][1]["process_start_identity"] == "ps-lstart:dead"
     assert store.get_host_run_lease(live_lease["lease_id"])["status"] == "active"
     assert store.get_host_run_lease(live_lease["lease_id"])["process_start_identity"] == "ps-lstart:live"
     assert store.get_host_run_lease(dead_lease["lease_id"])["status"] == "released"
@@ -6337,3 +6702,782 @@ def test_termination_unconfirmed_retries_exact_cleanup_and_requeues_once_proven(
         (worker["worker_id"], run["run_id"], cleanup_identity),
         (worker["worker_id"], run["run_id"], cleanup_identity),
     ]
+
+
+def test_managed_shutdown_stops_the_live_generation_without_finalizing_the_run(tmp_path, monkeypatch):
+    """One generation, one external effect: shutdown releases the lease, stops the live native
+    process of the running run, and the old generation's interrupted exit leaves the run running
+    for the restarted service to requeue instead of becoming a terminal state or a callback."""
+    import threading
+
+    from workers_projects_runtime.openclaw_runtime import (
+        WorkerInterruptedError,
+        notify_runtime_started,
+        runtime_start_boundary,
+    )
+
+    store = Store(str(tmp_path / "managed-shutdown-generation.sqlite3"))
+    started = threading.Event()
+    release = threading.Event()
+
+    class LiveGenerationRuntime(StubRuntime):
+        def __init__(self):
+            super().__init__()
+            self.stopped: list[tuple[str, str | None]] = []
+
+        def run_task(self, worker, instruction, timeout_sec=None, run_id=None):
+            with runtime_start_boundary(worker):
+                notify_runtime_started(worker)
+            started.set()
+            release.wait(timeout=10)
+            raise WorkerInterruptedError("native process stopped by managed shutdown")
+
+        def reconcile_worker(self, worker):
+            info = super().reconcile_worker(worker)
+            return info.__class__(**{**info.__dict__, "pid": 4242 if started.is_set() and not release.is_set() else None})
+
+        def host_process_absence(self, worker, run_id):
+            return release.is_set()
+
+        def cleanup_unconfirmed_run_start(self, worker, run_id, identity):
+            self.interrupt_worker(worker, run_id=run_id)
+            return self.host_process_absence(worker, run_id)
+
+        def interrupt_worker(self, worker, run_id=None):
+            self.stopped.append((str(worker["worker_id"]), run_id))
+            release.set()
+            return super().pause_worker(worker)
+
+    runtime = LiveGenerationRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    service._emit_callback = lambda *_args, **_kwargs: None
+    monkeypatch.setattr(
+        service_module,
+        "host_resource_usage",
+        lambda _leases: HostResourceUsage(
+            child_processes=0,
+            threads=0,
+            available_memory_bytes=16 * 1024**3,
+            available_disk_bytes=64 * 1024**3,
+        ),
+    )
+    project = store.create_project("owner-a", "Generation seam", "Prove one generation", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner-a",
+        name="Generation worker",
+        role="worker",
+        profile="codex-cli",
+        backend="codex-cli",
+        runtime="codex-cli",
+        model="test",
+        execution_mode="docker",
+    )
+    store.update_worker_state(worker["worker_id"], "ready")
+    run = service.assign_run(worker["worker_id"], "Do durable work.", start_processor=False)
+    assert run is not None
+    generation = 1
+    with service._processors_lock:
+        service._active_processors.add(worker["worker_id"])
+        service._processor_generations[worker["worker_id"]] = generation
+    processor = threading.Thread(
+        target=service._process_worker_queue, args=(worker["worker_id"], generation), daemon=True
+    )
+    processor.start()
+    assert started.wait(timeout=10)
+    lease = store.get_active_host_run_lease_for_run(str(run["run_id"]))
+    assert lease is not None and lease["status"] == "active"
+    service._executor_id = str(lease["executor_id"])
+    service.shutdown()
+    processor.join(timeout=10)
+    assert not processor.is_alive()
+    assert runtime.stopped == [(str(worker["worker_id"]), str(run["run_id"]))]
+    released = store.get_host_run_lease(str(lease["lease_id"]))
+    assert released["status"] == "released"
+    assert released["release_reason"] == "managed_shutdown"
+    durable = store.get_run(str(run["run_id"]))
+    assert durable["state"] == "running"
+    events = [event["event_type"] for event in store.list_events(str(worker["worker_id"]))]
+    assert "run.interrupted" not in events
+    assert "run.failed" not in events
+
+
+def _stamp_docker_session_identity(store: Store, lease_id: str, *, run_id: str, container_id: str, session_id: str) -> None:
+    """Model the identity the docker adapter publishes when its screen session starts."""
+    identity = f"docker:{container_id}:{session_id}:{run_id}:4242"
+    with store._connect() as conn:
+        conn.execute(
+            """
+            UPDATE host_run_leases
+            SET startup_state = 'confirmed', startup_identity_kind = 'docker_session',
+                startup_container_id = ?, startup_session_id = ?,
+                process_start_identity = ?, pid = 4242, process_group = 4242
+            WHERE lease_id = ?
+            """,
+            (container_id, session_id, identity, lease_id),
+        )
+
+
+def test_managed_shutdown_retains_verified_docker_generation_and_restart_adopts_it(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_RESTART_SURVIVOR_ADOPTION", "1")
+    """Seam: a managed restart must not stop a live docker Worker generation or release its
+    lease early. Shutdown detaches only this process's wait, extends the same lease for the
+    restart window, and leaves the run running; the restarted service adopts the survivor and
+    collects exactly one terminal result, so one generation yields one effect and one
+    completion callback."""
+    import threading
+
+    from workers_projects_runtime.openclaw_runtime import (
+        WorkerDetachedError,
+        notify_runtime_started,
+        runtime_start_boundary,
+    )
+
+    monkeypatch.setenv("WPR_SURVIVOR_MONITOR_INTERVAL_S", "0.02")
+    store = Store(str(tmp_path / "managed-restart-adoption.sqlite3"))
+    started = threading.Event()
+    release = threading.Event()
+    container_id = "a" * 64
+    session_id = "job-retained"
+
+    class RetainedGenerationRuntime(StubRuntime):
+        def __init__(self):
+            super().__init__()
+            self.stopped: list[tuple[str, str | None]] = []
+            self.detached: list[tuple[str, str | None]] = []
+            self.cleared_grants: list[str] = []
+            self.alive = True
+            self.completed = False
+
+        def run_task(self, worker, instruction, timeout_sec=None, run_id=None):
+            with runtime_start_boundary(worker):
+                notify_runtime_started(worker)
+            started.set()
+            release.wait(timeout=10)
+            raise WorkerDetachedError("detached for managed restart")
+
+        def reconcile_worker(self, worker):
+            info = super().reconcile_worker(worker)
+            return info.__class__(**{**info.__dict__, "pid": 4242 if self.alive else None})
+
+        def host_process_identity(self, worker, run_id):
+            if not self.alive:
+                return None
+            return {
+                "identity_kind": "docker_session",
+                "pid": 4242,
+                "process_group": 4242,
+                "process_start_identity": f"docker:{container_id}:{session_id}:{run_id}:4242",
+                "container_id": container_id,
+                "session_id": session_id,
+                "verified": True,
+            }
+
+        def detach_worker(self, worker, run_id=None):
+            self.detached.append((str(worker["worker_id"]), run_id))
+            release.set()
+            return True
+
+        def interrupt_worker(self, worker, run_id=None):
+            self.stopped.append((str(worker["worker_id"]), run_id))
+            release.set()
+            return super().pause_worker(worker)
+
+        def clear_run_local_capability_grant(self, worker):
+            self.cleared_grants.append(str(worker["worker_id"]))
+
+        def collect_completed_run(self, worker, run_id=None, instruction=""):
+            if not self.completed:
+                return None
+            self.alive = False
+            return {"state": "completed", "output_text": "retained generation finished once"}
+
+    runtime = RetainedGenerationRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    first_callbacks: list[str] = []
+    service._emit_callback = lambda _worker, event, *args, **kwargs: first_callbacks.append(str(event))
+    monkeypatch.setattr(
+        service_module,
+        "host_resource_usage",
+        lambda _leases: HostResourceUsage(
+            child_processes=0,
+            threads=0,
+            available_memory_bytes=16 * 1024**3,
+            available_disk_bytes=64 * 1024**3,
+        ),
+    )
+    project = store.create_project("owner-a", "Retained generation", "Adopt across restart", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner-a",
+        name="Retained worker",
+        role="worker",
+        profile="codex-cli",
+        backend="codex-cli",
+        runtime="codex-cli",
+        model="test",
+        execution_mode="docker",
+    )
+    store.update_worker_state(worker["worker_id"], "ready")
+    run = service.assign_run(worker["worker_id"], "Do durable work once.", start_processor=False)
+    assert run is not None
+    generation = 1
+    with service._processors_lock:
+        service._active_processors.add(worker["worker_id"])
+        service._processor_generations[worker["worker_id"]] = generation
+    processor = threading.Thread(
+        target=service._process_worker_queue, args=(worker["worker_id"], generation), daemon=True
+    )
+    processor.start()
+    assert started.wait(timeout=10)
+    lease = store.get_active_host_run_lease_for_run(str(run["run_id"]))
+    assert lease is not None and lease["status"] == "active"
+    _stamp_docker_session_identity(
+        store, str(lease["lease_id"]), run_id=str(run["run_id"]), container_id=container_id, session_id=session_id
+    )
+    service._executor_id = str(lease["executor_id"])
+    before_shutdown = datetime.now(timezone.utc)
+    service.shutdown()
+    processor.join(timeout=10)
+    assert not processor.is_alive()
+
+    assert runtime.detached == [(str(worker["worker_id"]), str(run["run_id"]))]
+    assert runtime.stopped == []
+    # The retained generation keeps its run-local provider authority.
+    assert runtime.cleared_grants == []
+    retained = store.get_host_run_lease(str(lease["lease_id"]))
+    assert (retained["status"], retained["release_reason"]) == ("active", "")
+    assert retained["release_reason"] in ("", None)
+    assert datetime.fromisoformat(str(retained["expires_at"])) >= before_shutdown + timedelta(seconds=120)
+    durable = store.get_run(str(run["run_id"]))
+    assert durable["state"] == "running"
+    events = [event["event_type"] for event in store.list_events(str(worker["worker_id"]))]
+    assert "run.generation_retained" in events
+    assert "run.interrupted" not in events
+    assert "run.failed" not in events
+    assert "run.requeued" not in events
+    assert "run.completed" not in first_callbacks
+    assert "run.interrupted" not in first_callbacks
+
+    restarted = WorkersProjectsService(store, runtime, reconcile_on_startup=True)
+    restart_callbacks: list[str] = []
+    restarted._emit_callback = lambda _worker, event, *args, **kwargs: restart_callbacks.append(str(event))
+    try:
+        deadline = time.monotonic() + 2
+        while (
+            not restarted._local_processor_owns(worker["worker_id"])
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert restarted._local_processor_owns(worker["worker_id"])
+        assert store.get_run(str(run["run_id"]))["state"] == "running"
+        runtime.completed = True
+        deadline = time.monotonic() + 3
+        while (
+            store.get_run(str(run["run_id"]))["state"] != "completed"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+    finally:
+        restarted.shutdown()
+
+    final = store.get_run(str(run["run_id"]))
+    assert final["state"] == "completed"
+    assert final["output_text"] == "retained generation finished once"
+    assert final["run_id"] == run["run_id"]
+    events = [event["event_type"] for event in store.list_events(str(worker["worker_id"]))]
+    assert events.count("run.started") == 1
+    assert events.count("run.completed") == 1
+    assert "run.requeued" not in events
+    assert "run.interrupted" not in events
+    assert restart_callbacks.count("run.completed") == 1
+    assert "run.started" not in restart_callbacks
+    released = store.get_host_run_lease(str(lease["lease_id"]))
+    assert released["status"] == "released"
+    # The terminal CAS releases the adopted lease in the same transaction; the survivor
+    # monitor's own release is the fallback when a collection lands outside that CAS.
+    assert released["release_reason"] in {"run_terminal:completed", "survivor_terminal"}
+
+
+def test_managed_shutdown_keeps_stop_and_release_without_a_verifiable_generation(tmp_path, monkeypatch):
+    """Without a verified docker session identity the shutdown contract is unchanged: the
+    generation is stopped and the lease released for restart requeue."""
+    import threading
+
+    from workers_projects_runtime.openclaw_runtime import (
+        WorkerInterruptedError,
+        notify_runtime_started,
+        runtime_start_boundary,
+    )
+
+    store = Store(str(tmp_path / "managed-shutdown-unverified.sqlite3"))
+    started = threading.Event()
+    release = threading.Event()
+
+    class UnverifiableRuntime(StubRuntime):
+        def __init__(self):
+            super().__init__()
+            self.stopped: list[tuple[str, str | None]] = []
+            self.detached: list[tuple[str, str | None]] = []
+
+        def run_task(self, worker, instruction, timeout_sec=None, run_id=None):
+            with runtime_start_boundary(worker):
+                notify_runtime_started(worker)
+            started.set()
+            release.wait(timeout=10)
+            raise WorkerInterruptedError("stopped by managed shutdown")
+
+        def reconcile_worker(self, worker):
+            info = super().reconcile_worker(worker)
+            return info.__class__(**{**info.__dict__, "pid": 4242 if started.is_set() and not release.is_set() else None})
+
+        def host_process_identity(self, worker, run_id):
+            return None
+
+        def detach_worker(self, worker, run_id=None):
+            self.detached.append((str(worker["worker_id"]), run_id))
+            return True
+
+        def host_process_absence(self, worker, run_id):
+            return release.is_set()
+
+        def cleanup_unconfirmed_run_start(self, worker, run_id, identity):
+            self.interrupt_worker(worker, run_id=run_id)
+            return self.host_process_absence(worker, run_id)
+
+        def interrupt_worker(self, worker, run_id=None):
+            self.stopped.append((str(worker["worker_id"]), run_id))
+            release.set()
+            return super().pause_worker(worker)
+
+    runtime = UnverifiableRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    service._emit_callback = lambda *_args, **_kwargs: None
+    monkeypatch.setattr(
+        service_module,
+        "host_resource_usage",
+        lambda _leases: HostResourceUsage(
+            child_processes=0,
+            threads=0,
+            available_memory_bytes=16 * 1024**3,
+            available_disk_bytes=64 * 1024**3,
+        ),
+    )
+    project = store.create_project("owner-a", "Unverified generation", "Stop and release", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner-a",
+        name="Unverified worker",
+        role="worker",
+        profile="codex-cli",
+        backend="codex-cli",
+        runtime="codex-cli",
+        model="test",
+        execution_mode="docker",
+    )
+    store.update_worker_state(worker["worker_id"], "ready")
+    run = service.assign_run(worker["worker_id"], "Do work.", start_processor=False)
+    assert run is not None
+    generation = 1
+    with service._processors_lock:
+        service._active_processors.add(worker["worker_id"])
+        service._processor_generations[worker["worker_id"]] = generation
+    processor = threading.Thread(
+        target=service._process_worker_queue, args=(worker["worker_id"], generation), daemon=True
+    )
+    processor.start()
+    assert started.wait(timeout=10)
+    lease = store.get_active_host_run_lease_for_run(str(run["run_id"]))
+    assert lease is not None
+    _stamp_docker_session_identity(
+        store, str(lease["lease_id"]), run_id=str(run["run_id"]), container_id="b" * 64, session_id="job-unverified"
+    )
+    service._executor_id = str(lease["executor_id"])
+    service.shutdown()
+    processor.join(timeout=10)
+    assert not processor.is_alive()
+    assert runtime.detached == []
+    assert runtime.stopped == [(str(worker["worker_id"]), str(run["run_id"]))]
+    released = store.get_host_run_lease(str(lease["lease_id"]))
+    assert released["status"] == "released"
+    assert released["release_reason"] == "managed_shutdown"
+    assert store.get_run(str(run["run_id"]))["state"] == "running"
+
+
+def test_stale_lease_collects_file_published_terminal_result_before_declaring_the_owner_dead(tmp_path, monkeypatch):
+    monkeypatch.setenv("WPR_RESTART_SURVIVOR_ADOPTION", "1")
+    """A generation that finished while no executor watched it (a restart gap) leaves its
+    terminal transcript behind. Stale-lease reconciliation must collect that single result
+    under the still-active lease instead of requeueing the exact run into a duplicate."""
+
+    class FinishedSurvivorRuntime(StubRuntime):
+        def host_process_identity(self, worker, run_id):
+            return None
+
+        def collect_completed_run(self, worker, run_id=None, instruction=""):
+            return {"state": "completed", "output_text": "finished during the restart gap"}
+
+    store = Store(str(tmp_path / "stale-lease-collect.sqlite3"))
+    _project, worker, run = _active_worker_and_run(store, "stale-collect", run_state="running")
+    # The lease expired during the restart gap; terminal evidence still wins over a requeue.
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE host_run_leases SET expires_at = ? WHERE run_id = ?",
+            ("2000-01-01T00:00:00+00:00", str(run["run_id"])),
+        )
+    service = WorkersProjectsService(
+        store,
+        FinishedSurvivorRuntime(),
+        reconcile_on_startup=False,
+        start_background_consumers=False,
+    )
+    callbacks: list[str] = []
+    service._emit_callback = lambda _worker, event, *args, **kwargs: callbacks.append(str(event))
+    try:
+        result = service.reconcile_host_run_leases(stale_after_s=0)
+    finally:
+        service.shutdown()
+    assert result["released"] == 1
+    final = store.get_run(str(run["run_id"]))
+    assert final["state"] == "completed"
+    assert final["output_text"] == "finished during the restart gap"
+    assert callbacks.count("run.completed") == 1
+    assert "run.requeued" not in callbacks
+    lease = store.get_active_host_run_lease_for_run(str(run["run_id"]))
+    assert lease is None
+    events = [event["event_type"] for event in store.list_events(str(worker["worker_id"]))]
+    assert "run.completed" in events
+    assert "run.requeued" not in events
+
+
+def _expire_lease(store: Store, run_id: str) -> dict:
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE host_run_leases SET expires_at = ?, heartbeat_at = ? WHERE run_id = ? AND status = 'active'",
+            ("2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00", run_id),
+        )
+    lease = store.get_active_host_run_lease_for_run(run_id)
+    assert lease is not None
+    return lease
+
+
+class _VerifiedSurvivorRuntime(StubRuntime):
+    """Models a docker generation that outlived its executor and its lease."""
+
+    def __init__(self, lease: dict, *, run_id: str, mismatch: bool = False):
+        super().__init__()
+        self._lease = lease
+        self._run_id = run_id
+        self._mismatch = mismatch
+        self.alive = True
+        self.completed = False
+
+    def reconcile_worker(self, worker):
+        info = super().reconcile_worker(worker)
+        return RuntimeInfo(**{**info.__dict__, "pid": 4242 if self.alive else None})
+
+    def host_process_identity(self, worker, run_id):
+        if not self.alive:
+            return None
+        identity = str(self._lease["process_start_identity"])
+        if self._mismatch:
+            identity = identity.rsplit(":", 1)[0] + ":replacement"
+        return {
+            "identity_kind": "docker_session",
+            "pid": 4242,
+            "process_group": 4242,
+            "process_start_identity": identity,
+            "container_id": str(self._lease["startup_container_id"]),
+            "session_id": str(self._lease["startup_session_id"]),
+            "verified": True,
+        }
+
+    def collect_completed_run(self, worker, run_id=None, instruction=""):
+        if not self.completed:
+            return None
+        self.alive = False
+        return {"state": "completed", "output_text": "survivor finished after the executor died"}
+
+
+def test_expired_lease_with_verified_matching_survivor_is_revived_and_adopted(tmp_path, monkeypatch):
+    monkeypatch.setenv("WPR_RESTART_SURVIVOR_ADOPTION", "1")
+    """Seam: a launcher restart kills the executor (no graceful shutdown) and outlasts the lease
+    TTL while the docker generation keeps running. Startup must revive the exact lease from the
+    verified live identity, keep the run running, adopt the survivor, and complete it once,
+    instead of downgrading it into a duplicate generation."""
+    monkeypatch.setenv("WPR_SURVIVOR_MONITOR_INTERVAL_S", "0.02")
+    store = Store(str(tmp_path / "expired-survivor-revive.sqlite3"))
+    _project, worker, run = _active_worker_and_run(store, "revive", run_state="running")
+    lease = _expire_lease(store, str(run["run_id"]))
+    assert lease["startup_identity_kind"] == "docker_session"
+    runtime = _VerifiedSurvivorRuntime(lease, run_id=str(run["run_id"]))
+    service = WorkersProjectsService(
+        store, runtime, reconcile_on_startup=False, start_background_consumers=False
+    )
+    callbacks: list[str] = []
+    service._emit_callback = lambda _worker, event, *args, **kwargs: callbacks.append(str(event))
+    try:
+        result = service.reconcile_host_run_leases(stale_after_s=3600)
+        assert result["renewed"] == 1
+        assert result["released"] == 0
+        revived = store.get_host_run_lease(str(lease["lease_id"]))
+        assert revived["status"] == "active"
+        assert str(revived["expires_at"]) > store_module.utc_now()
+        assert revived["reconciled_at"]
+        # The exact generation is provable again: startup does not downgrade the run.
+        assert store.reconcile_invalid_running_runs() == 0
+        assert store.get_run(str(run["run_id"]))["state"] == "running"
+
+        service.reconcile_all_workers()
+        deadline = time.monotonic() + 2
+        while not service._local_processor_owns(worker["worker_id"]) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert service._local_processor_owns(worker["worker_id"])
+        runtime.completed = True
+        deadline = time.monotonic() + 3
+        while store.get_run(str(run["run_id"]))["state"] != "completed" and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        service.shutdown()
+    final = store.get_run(str(run["run_id"]))
+    assert final["state"] == "completed"
+    assert final["output_text"] == "survivor finished after the executor died"
+    assert final["active_attempt_id"] == run["active_attempt_id"]
+    events = [event["event_type"] for event in store.list_events(str(worker["worker_id"]))]
+    assert events.count("run.completed") == 1
+    assert "run.requeued" not in events
+    assert "run.interrupted" not in events
+    assert callbacks.count("run.completed") == 1
+    assert "run.started" not in callbacks
+
+
+def test_expired_lease_is_not_revived_for_a_replacement_generation(tmp_path, monkeypatch):
+    monkeypatch.setenv("WPR_RESTART_SURVIVOR_ADOPTION", "1")
+    """A live session whose identity differs from the lease's recorded identity is not the
+    fenced generation; the expired lease stays fenced and the run is downgraded as before."""
+    store = Store(str(tmp_path / "expired-survivor-mismatch.sqlite3"))
+    _project, _worker, run = _active_worker_and_run(store, "mismatch", run_state="running")
+    lease = _expire_lease(store, str(run["run_id"]))
+    runtime = _VerifiedSurvivorRuntime(lease, run_id=str(run["run_id"]), mismatch=True)
+    service = WorkersProjectsService(
+        store, runtime, reconcile_on_startup=False, start_background_consumers=False
+    )
+    try:
+        result = service.reconcile_host_run_leases(stale_after_s=3600)
+        assert result["renewed"] == 0
+        assert result["released"] == 0
+        assert result["unchanged"] == 1
+        stale = store.get_host_run_lease(str(lease["lease_id"]))
+        assert stale["status"] == "active"
+        assert str(stale["expires_at"]) < store_module.utc_now()
+        assert store.reconcile_invalid_running_runs() == 1
+        assert store.get_run(str(run["run_id"]))["state"] == "queued"
+    finally:
+        service.shutdown()
+
+
+def test_retained_run_keeps_its_armed_capability_revocation(tmp_path):
+    """The processor unwind revokes the run-local grant by explicit run id; a run retained for
+    restart must keep its revocation armed so the live generation keeps its provider authority."""
+    store = Store(str(tmp_path / "retained-revocation.sqlite3"))
+    _project, worker, run = _active_worker_and_run(store, "retained-grant", run_state="running")
+    revocation = store.enqueue_capability_grant_revocation(
+        {
+            "authorizationRef": "gha_retained",
+            "originRef": "ghi_retained",
+            "workRef": "work_retained",
+            "workerId": str(worker["worker_id"]),
+            "runId": str(run["run_id"]),
+            "grantId": "ghcb_retained",
+            "containerGenerationId": "c" * 64,
+        }
+    )
+    revocation_id = str(revocation["revocation_id"])
+    assert revocation["status"] == "armed"
+    service = WorkersProjectsService(
+        store, StubRuntime(), reconcile_on_startup=False, start_background_consumers=False
+    )
+    try:
+        with service._processors_lock:
+            service._retained_restart_run_ids.add(str(run["run_id"]))
+        admitted = {**worker, "_run_local_capability_revocation_id": revocation_id}
+        def revocation_status() -> str:
+            rows = [
+                row for row in store.list_capability_grant_revocations()
+                if str(row.get("revocation_id") or "") == revocation_id
+            ]
+            assert len(rows) == 1
+            return str(rows[0].get("status") or "")
+
+        service._revoke_run_local_capability_grant(admitted, run_id=str(run["run_id"]))
+        assert revocation_status() == "armed"
+        # An unrelated run still revokes as before.
+        with service._processors_lock:
+            service._retained_restart_run_ids.discard(str(run["run_id"]))
+        service._revoke_run_local_capability_grant(admitted, run_id=str(run["run_id"]))
+        assert revocation_status() != "armed"
+    finally:
+        service.shutdown()
+
+
+def test_survivor_adoption_is_off_by_default_so_the_retry_path_owns_restart_recovery(tmp_path, monkeypatch):
+    """Default recovery shape: an expired lease with a verified live survivor is not revived; the
+    run is downgraded to queued and its retry resumes the same provider session."""
+    monkeypatch.delenv("WPR_RESTART_SURVIVOR_ADOPTION", raising=False)
+    store = Store(str(tmp_path / "adoption-default-off.sqlite3"))
+    _project, _worker, run = _active_worker_and_run(store, "default-off", run_state="running")
+    lease = _expire_lease(store, str(run["run_id"]))
+    runtime = _VerifiedSurvivorRuntime(lease, run_id=str(run["run_id"]))
+    service = WorkersProjectsService(
+        store, runtime, reconcile_on_startup=False, start_background_consumers=False
+    )
+    try:
+        result = service.reconcile_host_run_leases(stale_after_s=3600)
+        assert result["renewed"] == 0
+        assert store.reconcile_invalid_running_runs() == 1
+        assert store.get_run(str(run["run_id"]))["state"] == "queued"
+    finally:
+        service.shutdown()
+
+
+def test_stale_lease_requeues_only_after_its_generation_is_stopped_and_proven_absent(tmp_path):
+    """No duplicate execution: an unverifiable generation keeps its fence until it is proven dead.
+
+    A launcher restart kills the executor before its lease heartbeat expires while the container
+    screen session it started keeps working. The stale-lease pass must stop that exact generation
+    and prove absence before the run is requeued; ambiguity keeps the run fenced for the next pass.
+    Survivor adoption stays off throughout (nothing is collected or revived).
+    """
+
+    store = Store(str(tmp_path / "runtime.sqlite3"))
+    runtime = _ReconcilingRuntime()
+    worker, run = _running_host_run(store, "fence")
+    old = datetime.now(timezone.utc) - timedelta(minutes=5)
+    lease = store.acquire_host_run_lease(
+        runtime_family="codex",
+        lane="mission",
+        tenant_id="tenant-a",
+        owner_id="owner-a",
+        worker_id=worker["worker_id"],
+        run_id=run["run_id"],
+        executor_id="dead-executor-fence",
+        conversation_limit=2,
+        mission_limit=3,
+        account_mission_limit=4,
+        tenant_mission_limit=12,
+        lease_ttl_s=30,
+    )
+    run = _admit_and_invoke(store, run, lease)
+    assert store.confirm_host_run_start(
+        worker_id=worker["worker_id"],
+        run_id=run["run_id"],
+        run_started_at=str(run["started_at"]),
+        lease_id=lease["lease_id"],
+        startup_token=lease["startup_token"],
+        executor_id=lease["executor_id"],
+        identity_kind="host_process",
+        pid=779,
+        process_group=779,
+        process_start_identity="ps-lstart:fence",
+        container_id="",
+        session_id="host-fence",
+    )
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE host_run_leases SET heartbeat_at = ?, expires_at = ? WHERE lease_id = ?",
+            (old.isoformat(), old.isoformat(), lease["lease_id"]),
+        )
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        assert service._restart_survivor_adoption_enabled() is False
+        # Pass 1: identity unreadable, cleanup cannot confirm, absence unproven -> fenced.
+        first = service.reconcile_host_run_leases(stale_after_s=0)
+        assert first == {"renewed": 0, "released": 0, "unchanged": 1}
+        assert store.get_host_run_lease(lease["lease_id"])["status"] == "active"
+        assert store.get_run(run["run_id"])["state"] == "running"
+        assert [call[0] for call in runtime.cleanup_calls] == [run["run_id"]]
+        assert runtime.cleanup_calls[0][1]["identity_kind"] == "host_process"
+        assert runtime.cleanup_calls[0][1]["pid"] == 779
+        assert runtime.absence_calls == [run["run_id"]]
+
+        # Pass 2: the exact recorded generation is stopped and proven gone -> requeue.
+        runtime.cleanable.add(run["run_id"])
+        second = service.reconcile_host_run_leases(stale_after_s=0)
+        assert second == {"renewed": 0, "released": 1, "unchanged": 0}
+    finally:
+        service.shutdown()
+
+    released = store.get_host_run_lease(lease["lease_id"])
+    assert released["status"] == "released"
+    assert released["release_reason"] == "stale_owner_no_verified_process"
+    requeued = store.get_run(run["run_id"])
+    assert requeued["state"] == "queued"
+    # Retry starts only after the stop was confirmed: the cleanup preceded the release.
+    assert [call[0] for call in runtime.cleanup_calls] == [run["run_id"], run["run_id"]]
+
+
+@pytest.mark.parametrize("evidence", [
+    {},
+    {"runtime_invoked_at": None},
+    {"started_at": None},
+    {"runtime_invoked_at": "2026-01-01T00:00:00+00:00", "started_at": None},
+    {"runtime_invoked_at": None, "started_at": "2026-01-01T00:00:00+00:00"},
+    {"runtime_invoked_at": "", "started_at": None},
+])
+def test_old_processor_failure_requires_explicit_no_start_evidence(evidence):
+    from workers_projects_runtime.failure_classification import is_user_resumable_failure
+    assert not is_user_resumable_failure(
+        failure_class="service_processor_unexpected", retryable=0, **evidence
+    )
+    # A stored explicit retryability decision keeps its existing semantics.
+    assert is_user_resumable_failure(
+        failure_class="service_processor_unexpected", retryable=1, **evidence
+    )
+
+
+@pytest.mark.parametrize("proof", ["unknown", "cleanup_error", "absent"])
+def test_managed_shutdown_retains_exact_lease_until_generation_absence_is_proven(tmp_path, proof):
+    store = Store(str(tmp_path / "shutdown-proof.sqlite3"))
+    _project, worker, run = _active_worker_and_run(store, "shutdown-proof", run_state="running")
+    lease = store.get_active_host_run_lease_for_run(run["run_id"])
+    runtime = _ReconcilingRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False,
+                                     start_background_consumers=False)
+    service._executor_id = lease["executor_id"]
+    captured = service._reserved_start_identity(lease)
+    assert captured is not None
+    cleanup = runtime.cleanup_unconfirmed_run_start
+
+    def inspect_fence(target, run_id, identity):
+        # A processor unwinding during shutdown must not release the lease before proof.
+        assert store.get_host_run_lease(lease["lease_id"])["status"] == "active"
+        assert service._released_for_managed_shutdown(run, {"expected_lease_id": lease["lease_id"]})
+        service._release_host_run_lease(run_id, reason="processor_exit")
+        assert store.get_host_run_lease(lease["lease_id"])["status"] == "active"
+        assert identity == captured
+        if proof == "cleanup_error":
+            raise RuntimeError("Synthetic stop failed")
+        return cleanup(target, run_id, identity)
+
+    runtime.cleanup_unconfirmed_run_start = inspect_fence
+    if proof == "absent":
+        runtime.cleanable.add(run["run_id"])
+    try:
+        assert service.release_owned_host_run_leases() == (1 if proof == "absent" else 0)
+        assert store.get_run(run["run_id"])["state"] == "running"
+        current = store.get_host_run_lease(lease["lease_id"])
+        assert current["status"] == ("released" if proof == "absent" else "active")
+        if proof != "absent":
+            assert store.reconcile_invalid_running_runs() == 0
+            assert store.get_run(run["run_id"])["active_attempt_id"] == run["active_attempt_id"]
+            runtime.cleanup_unconfirmed_run_start = cleanup
+            runtime.cleanable.add(run["run_id"])
+            assert service.release_owned_host_run_leases() == 1
+        assert service.release_owned_host_run_leases() == 0
+        assert store.reconcile_invalid_running_runs() == 1
+        assert store.get_run(run["run_id"])["state"] == "queued"
+    finally:
+        service.shutdown()
+        store.close()

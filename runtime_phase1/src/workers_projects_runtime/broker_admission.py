@@ -22,6 +22,7 @@ _BODY_KEYS = {
     "workRef",
     "workerId",
 }
+_HOST_BODY_KEYS = (_BODY_KEYS - {"containerGenerationId"}) | {"hostStartupLeaseId"}
 _SCHEDULED_PREPARE_BODY_KEYS = {
     "containerGenerationId",
     "originRef",
@@ -30,7 +31,6 @@ _SCHEDULED_PREPARE_BODY_KEYS = {
     "workRef",
     "workerId",
 }
-_REVOCATION_BODY_KEYS = _BODY_KEYS | {"grantId"}
 _SUCCESS_KEYS = _BODY_KEYS | {
     "status",
     "scopeFingerprint",
@@ -85,7 +85,8 @@ class BrokerAdmissionGrant:
     allowed_host_tools: tuple[str, ...]
     scopes: dict[str, object]
     max_expires_at: str
-    container_generation_id: str
+    container_generation_id: str = ""
+    host_startup_lease_id: str = ""
 
     def broker_projection(self) -> dict[str, object]:
         return {
@@ -115,9 +116,23 @@ class ScheduledProviderAuthorization:
     max_expires_at: str
 
 
+def _binding_keys(body: dict[str, str], *, revoke: bool = False) -> set[str]:
+    suffix = {"grantId"} if revoke else set()
+    for keys in (_BODY_KEYS, _HOST_BODY_KEYS):
+        expected = keys | suffix
+        if isinstance(body, dict) and set(body) == expected:
+            return expected
+    raise BrokerAdmissionError(
+        "broker_admission_request_invalid",
+        "The broker admission request binding is invalid.",
+    )
+
+
 def _canonical_body(
-    body: dict[str, str], *, expected_keys: set[str] | frozenset[str] = _BODY_KEYS
+    body: dict[str, str], *, expected_keys: set[str] | frozenset[str] | None = None
 ) -> bytes:
+    if expected_keys is None:
+        expected_keys = _binding_keys(body)
     if not isinstance(body, dict) or set(body) != expected_keys:
         raise BrokerAdmissionError(
             "broker_admission_request_invalid",
@@ -133,7 +148,7 @@ def _canonical_body(
             )
         normalized[key] = value
     if not _CONTAINER_GENERATION_ID.fullmatch(
-        normalized["containerGenerationId"]
+        normalized.get("containerGenerationId", normalized.get("hostStartupLeaseId", ""))
     ):
         raise BrokerAdmissionError(
             "broker_admission_request_invalid",
@@ -157,7 +172,7 @@ def mint_admission_header(
     secret: str,
     timestamp: int | None = None,
     nonce: str | None = None,
-    expected_keys: set[str] | frozenset[str] = _BODY_KEYS,
+    expected_keys: set[str] | frozenset[str] | None = None,
 ) -> str:
     """Sign Core's exact, replay-protected deferred-admission envelope."""
 
@@ -472,11 +487,11 @@ def admit_capability_grant(
     cache_control = str(response.headers.get("cache-control") or "").lower()
     if (
         "no-store" not in cache_control
-        or set(payload) != _SUCCESS_KEYS
+        or set(payload) != (set(body) | (_SUCCESS_KEYS - _BODY_KEYS))
         or payload.get("status") != "authorized"
     ):
         raise _invalid_response()
-    for key in _BODY_KEYS:
+    for key in body:
         if payload.get(key) != body[key]:
             raise _invalid_response()
     scope_fingerprint = _safe_string(payload.get("scopeFingerprint"), maximum=256)
@@ -517,7 +532,8 @@ def admit_capability_grant(
         allowed_host_tools=allowed_host_tools,
         scopes=scopes,
         max_expires_at=max_expiry[0],
-        container_generation_id=body["containerGenerationId"],
+        container_generation_id=body.get("containerGenerationId", ""),
+        host_startup_lease_id=body.get("hostStartupLeaseId", ""),
     )
 
 
@@ -654,9 +670,10 @@ def revoke_capability_grant(
             "Broker revocation is not configured.",
         )
     revoke_url = parsed._replace(path=f"{parsed.path[:-6]}/revoke").geturl()
-    encoded = _canonical_body(body, expected_keys=_REVOCATION_BODY_KEYS)
+    expected_keys = _binding_keys(body, revoke=True)
+    encoded = _canonical_body(body, expected_keys=expected_keys)
     header = mint_admission_header(
-        body, secret=secret, expected_keys=_REVOCATION_BODY_KEYS
+        body, secret=secret, expected_keys=expected_keys
     )
     try:
         response = httpx.post(

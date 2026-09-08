@@ -27,6 +27,7 @@ from workers_projects_runtime.service import (
 from workers_projects_runtime.service_assertions import verify_service_assertion
 from workers_projects_runtime.signed_links import sign_link_params
 from workers_projects_runtime.openclaw_runtime import HostCapacityError, StubRuntime
+from workers_projects_runtime.run_evidence import build_constraint_ledger
 from workers_projects_runtime.store import Store
 
 
@@ -483,6 +484,126 @@ def test_conversation_orchestrator_delegation_rejects_host_execution(account_cli
     assert rejected.json()["detail"]["code"] == "parallel_execution_isolation_required"
     with sqlite3.connect(account_client.app.state.store.db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM delegations").fetchone()[0] == 0
+
+
+
+def native_orchestrator_payload(title):
+    payload = delegation_payload(title=title)
+    payload["executionMode"] = "host"
+    payload["bootstrapBundle"] = {
+        "viventium_launch_authority": {
+            "version": 1,
+            "kind": "conversation_orchestrator",
+            "execution_mode": "host",
+            "fallback_worker_profile": "claude-code",
+        },
+    }
+    return payload
+
+
+def enable_native_orchestration(monkeypatch):
+    monkeypatch.setenv("VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE", "host")
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ALLOW_FULL_ACCESS", "true")
+    monkeypatch.delenv("VIVENTIUM_GLASSHIVE_ISOLATED_PARALLEL_POLICY", raising=False)
+
+
+def test_native_parallel_roots_preserve_siblings_and_exact_owner_controls(account_client, monkeypatch):
+    enable_native_orchestration(monkeypatch)
+    store = account_client.app.state.store
+    work = []
+    for title in ("Registration preparation", "Research summary"):
+        response = account_client.post(
+            "/v1/delegations",
+            headers=account_headers(idempotency_key=title.replace(" ", "-")),
+            json=native_orchestrator_payload(title),
+        )
+        assert response.status_code == 202, response.text
+        work.append(response.json()["workRef"])
+    first, sibling = [store.get_delegation(ref, tenant_id="tenant-a", owner_id="owner-a") for ref in work]
+    assert first["worker_id"] != sibling["worker_id"]
+    assert first["project_id"] != sibling["project_id"]
+    assert store.get_worker(first["worker_id"])["execution_mode"] == "host"
+    sibling_run = store.get_run(sibling["current_run_id"])
+    wrong_owner = account_client.post(
+        f"/v1/work/{work[0]}/actions",
+        headers=account_headers(owner_id="owner-b"),
+        json={"action": "steer", "instruction": "Replace the goal", "idempotencyKey": "wrong-owner"},
+    )
+    assert wrong_owner.status_code == 404
+    steer = account_client.post(
+        f"/v1/work/{work[0]}/actions",
+        headers=account_headers(),
+        json={"action": "steer", "instruction": "Use the public admission category and stop before payment", "idempotencyKey": "steer-first"},
+    )
+    assert steer.status_code == 202, steer.text
+    current = store.get_delegation(work[0], tenant_id="tenant-a", owner_id="owner-a")
+    assert current["worker_id"] == first["worker_id"]
+    assert current["current_run_id"] != first["current_run_id"]
+    assert store.get_delegation(work[1], tenant_id="tenant-a", owner_id="owner-a") == sibling
+    assert store.get_run(sibling["current_run_id"]) == sibling_run
+    assert store.get_worker(first["worker_id"])["trusted_run_lane"] == "mission"
+    service = account_client.app.state.service
+    first_worker = store.get_worker(first["worker_id"])
+    assert service._host_mutation_scope(first_worker) == ""
+    assert service._host_mutation_scope({**first_worker, "owner_id": "owner-b"})
+    assert service._host_mutation_scope({**first_worker, "worker_id": "manual-spoofed-worker"})
+    assert service._trusted_parallel_fallback_profile(first_worker, preflight=False) == "claude-code"
+    assert service._trusted_parallel_fallback_profile({**first_worker, "worker_id": "manual-spoofed-worker"}, preflight=False) == ""
+
+
+
+@pytest.mark.parametrize("disabled_setting", ["GLASSHIVE_HOST_WORKERS_ENABLED", "GLASSHIVE_PROVIDER_ALLOW_FULL_ACCESS"])
+def test_native_parallel_requires_existing_host_authority(account_client, monkeypatch, disabled_setting):
+    enable_native_orchestration(monkeypatch)
+    monkeypatch.setenv(disabled_setting, "false")
+    response = account_client.post(
+        "/v1/delegations",
+        headers=account_headers(idempotency_key="unauthorized-native"),
+        json=native_orchestrator_payload("Use the local desktop"),
+    )
+    assert response.status_code == 409, response.text
+    assert account_client.app.state.store.list_all_workers() == []
+
+
+
+def test_native_parallel_revoked_full_access_blocks_resume_but_focused_does_not(account_client, monkeypatch):
+    enable_native_orchestration(monkeypatch)
+    accepted = account_client.post(
+        "/v1/delegations", headers=account_headers(idempotency_key="revocation-lifecycle"),
+        json=native_orchestrator_payload("Prepare a local document"),
+    )
+    assert accepted.status_code == 202, accepted.text
+    work_ref = accepted.json()["workRef"]
+    pause = account_client.post(
+        f"/v1/work/{work_ref}/actions", headers=account_headers(),
+        json={"action": "pause", "idempotencyKey": "pause-before-revocation"},
+    )
+    assert pause.status_code == 202, pause.text
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ALLOW_FULL_ACCESS", "false")
+    rejected = account_client.post(
+        f"/v1/work/{work_ref}/actions", headers=account_headers(),
+        json={"action": "resume", "idempotencyKey": "revoked-resume"},
+    )
+    assert rejected.status_code == 409, rejected.text
+    monkeypatch.setenv("GLASSHIVE_PROVIDER_ALLOW_FULL_ACCESS", "true")
+    monkeypatch.setenv("VIVENTIUM_PARALLEL_WORK_DEFAULT_MODE", "focused")
+    resumed = account_client.post(
+        f"/v1/work/{work_ref}/actions", headers=account_headers(),
+        json={"action": "resume", "idempotencyKey": "focused-resume"},
+    )
+    assert resumed.status_code == 202, resumed.text
+
+
+def test_native_parallel_rejects_unsigned_launch_before_rows(account_client, monkeypatch):
+    enable_native_orchestration(monkeypatch)
+    response = account_client.post(
+        "/v1/delegations",
+        headers={"Authorization": f"Bearer {API_TOKEN}"},
+        json=native_orchestrator_payload("Use the local desktop"),
+    )
+    assert response.status_code == 401
+    assert account_client.app.state.store.list_all_workers() == []
 
 
 def test_conversation_orchestrator_derives_server_owned_clean_room_policy(
@@ -972,7 +1093,7 @@ def test_orchestration_capability_scope_is_owner_invariant_and_not_caller_overri
     }
 
 
-def test_delegation_capacity_rejection_is_typed_and_commits_no_rows(
+def test_delegation_capacity_shortage_accepts_durable_queued_work(
     account_client,
 ):
     available_memory = int(4.3 * 1024**3)
@@ -996,51 +1117,15 @@ def test_delegation_capacity_rejection_is_typed_and_commits_no_rows(
         json=delegation_payload(title="Capacity API blocked"),
     )
 
-    assert response.status_code == 503
-    assert response.headers["Retry-After"]
-    assert response.json()["detail"] == {
-        "code": "host_capacity",
-        "message": "Host resource headroom is below its configured admission guard.",
-        "capacityClass": "resource_pressure",
-        "available": {
-            "childProcesses": 64,
-            "threads": 2048,
-            "memoryBytes": available_memory,
-            "diskBytes": 64 * 1024**3,
-        },
-        "required": {
-            "childProcesses": 21,
-            "threads": 513,
-            "memoryBytes": 5 * 1024**3,
-            "diskBytes": 8 * 1024**3,
-        },
-        "shortage": {
-            "childProcesses": 0,
-            "threads": 0,
-            "memoryBytes": 5 * 1024**3 - available_memory,
-            "diskBytes": 0,
-        },
-        "reservation": {
-            "childProcesses": 20,
-            "threads": 512,
-            "memoryBytes": 3 * 1024**3,
-            "diskBytes": 4 * 1024**3,
-        },
-        "nextRetryAt": response.json()["detail"]["nextRetryAt"],
-        "retryAfter": int(response.headers["Retry-After"]),
-    }
-    assert response.json()["detail"]["nextRetryAt"]
+    assert response.status_code == 202, response.text
+    accepted = response.json()
     store = account_client.app.state.store
+    record = store.get_delegation(accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a")
+    assert store.get_run(record["current_run_id"])["state"] == "queued"
     with store._connect() as conn:
-        assert {
-            table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-            for table in ("projects", "workers", "runs", "delegations", "host_run_leases")
-        } == {
-            "projects": 0,
-            "workers": 0,
-            "runs": 0,
-            "delegations": 0,
-            "host_run_leases": 0,
+        assert {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("projects", "workers", "runs", "delegations", "host_run_leases")} == {
+            "projects": 1, "workers": 1, "runs": 1, "delegations": 1, "host_run_leases": 0,
         }
 
 
@@ -2263,7 +2348,7 @@ def test_recent_terminal_work_is_pinned_then_ages_into_history(account_client, m
         "Completed mission",
     ]
     assert roster.json()["work"][0]["state"] == "failed"
-    assert roster.json()["work"][0]["actions"] == ["retry", "dismiss"]
+    assert roster.json()["work"][0]["actions"] == ["retry", "queue", "message", "dismiss"]
     assert roster.json()["work"][1]["delivery"]["unreadTerminal"] is True
 
     old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
@@ -2756,7 +2841,18 @@ def test_non_horizon_needs_input_is_not_misreported_as_reauthorization(
     assert detail.json()["attention"]["code"] == failure_code
 
 
-def test_active_work_retry_requires_retryable_failure_and_updates_current_run(account_client):
+@pytest.mark.parametrize("failure_class,retryable,invoked,allowed", [
+    ("provider_temporarily_unavailable", 1, False, True),
+    ("service_processor_unexpected", 0, False, True),
+    ("service_processor_unexpected", 0, True, False),
+    ("capability_authorization_revoked", 0, False, False),
+    ("provider_request_rejected", 0, False, False),
+    ("approval_required", 0, False, False),
+    ("unknown", 0, False, False),
+])
+def test_active_work_retry_requires_retryable_failure_and_updates_current_run(
+    account_client, failure_class, retryable, invoked, allowed
+):
     accepted = account_client.post(
         "/v1/delegations",
         headers=account_headers(idempotency_key="delegation-retry"),
@@ -2764,22 +2860,37 @@ def test_active_work_retry_requires_retryable_failure_and_updates_current_run(ac
     ).json()
     store = account_client.app.state.store
     before = store.get_delegation(accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a")
+    if invoked:
+        _truthfully_invoke_run(store, before["current_run_id"], suffix="prior-provider-start")
     store.finalize_run(
         before["current_run_id"],
         "failed",
         error_text="Temporary outage",
-        failure_class="provider_temporarily_unavailable",
-        failure_retryable=1,
+        failure_class=failure_class,
+        failure_retryable=retryable,
         failure_structured=1,
         failure_user_message="Temporary outage",
     )
 
+    roster = account_client.get("/v1/active-work", headers=account_headers()).json()
+    assert ("retry" in roster["work"][0]["actions"]) is allowed
+    foreign = account_client.post(
+        f"/v1/work/{accepted['workRef']}/actions",
+        headers=account_headers(owner_id="owner-b"),
+        json={"action": "retry", "idempotencyKey": "foreign-retry"},
+    )
+    assert foreign.status_code == 404
     retried = account_client.post(
         f"/v1/work/{accepted['workRef']}/actions",
         headers=account_headers(),
         json={"action": "retry", "idempotencyKey": "action-retry-once"},
     )
 
+    if not allowed:
+        assert retried.status_code == 409
+        after = store.get_delegation(accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a")
+        assert after["current_run_id"] == before["current_run_id"]
+        return
     assert retried.status_code == 202
     assert retried.json()["state"] == "queued"
     after = store.get_delegation(accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a")
@@ -3199,7 +3310,7 @@ def test_active_work_provider_auth_failure_is_user_resumable_after_reconnect(
         f"/v1/work/{accepted['workRef']}", headers=account_headers()
     )
     assert detail.status_code == 200
-    assert detail.json()["actions"] == ["retry", "dismiss"]
+    assert detail.json()["actions"] == ["retry", "queue", "message", "dismiss"]
 
     retried = account_client.post(
         f"/v1/work/{accepted['workRef']}/actions",
@@ -3236,6 +3347,57 @@ def test_instruction_actions_require_a_nonempty_instruction(account_client, acti
 
     assert response.status_code == 400
     assert response.json()["detail"]["code"] == "active_work_instruction_required"
+
+
+def test_active_work_steer_preserves_original_task_for_run_evidence(account_client):
+    original_instruction = "Create one responsive HTML status page and save the HTML artifact."
+    steer_instruction = "Add a Coverage Gaps section with exactly three bullets."
+    accepted = account_client.post(
+        "/v1/delegations",
+        headers=account_headers(idempotency_key="delegation-steer-evidence-source"),
+        json=delegation_payload(
+            title="Steer evidence source",
+            instruction=original_instruction,
+        ),
+    ).json()
+
+    response = account_client.post(
+        f"/v1/work/{accepted['workRef']}/actions",
+        headers=account_headers(),
+        json={
+            "action": "steer",
+            "instruction": steer_instruction,
+            "idempotencyKey": "action-steer-evidence-source",
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    service = account_client.app.state.service
+    store = account_client.app.state.store
+    current = store.get_delegation(
+        accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a"
+    )
+    replacement = store.get_run(current["current_run_id"])
+    assert json.loads(replacement["continuation_context_json"]) == {
+        "version": 1,
+        "base_instruction": original_instruction,
+        "guidance": [steer_instruction],
+    }
+
+    runtime_worker = service._run_local_worker(
+        store.get_worker(current["worker_id"]), replacement
+    )
+    runtime_bundle = json.loads(runtime_worker["bootstrap_bundle_json"])
+    assert runtime_bundle["viventium_constraint_source"] == {
+        "version": 1,
+        "instruction": original_instruction,
+    }
+    ledger = build_constraint_ledger(
+        instruction=replacement["instruction"],
+        worker=runtime_worker,
+        run_id=replacement["run_id"],
+    )
+    assert ledger["outputs"]["format_expectations"] == ["html"]
 
 
 def test_active_work_queue_persists_a_followup_without_interrupting_current_run(account_client):
@@ -3344,9 +3506,11 @@ def test_active_work_queue_persists_event_time_origin_and_output_authority(accou
 
 
 @pytest.mark.parametrize("action", ["queue", "message"])
-def test_active_work_reuses_completed_mission_for_follow_up(
+@pytest.mark.parametrize("terminal_state", ["completed", "failed", "cancelled", "interrupted"])
+def test_active_work_reuses_terminal_mission_for_follow_up(
     account_client,
     action,
+    terminal_state,
 ):
     accepted = account_client.post(
         "/v1/delegations",
@@ -3358,7 +3522,12 @@ def test_active_work_reuses_completed_mission_for_follow_up(
         accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a"
     )
     source_run_id = record["current_run_id"]
-    store.finalize_run(source_run_id, "completed", output_text="Done")
+    store.finalize_run(
+        source_run_id, terminal_state, output_text="Earlier partial work",
+        failure_class="unknown" if terminal_state == "failed" else "",
+        failure_retryable=0,
+    )
+    prior_worker = store.get_worker(record["worker_id"])
     store.update_worker_state(record["worker_id"], "ready")
 
     detail = account_client.get(
@@ -3367,6 +3536,18 @@ def test_active_work_reuses_completed_mission_for_follow_up(
     assert detail.status_code == 200, detail.text
     assert detail.json()["actions"] == ["queue", "message", "dismiss"]
 
+    foreign = account_client.post(
+        f"/v1/work/{accepted['workRef']}/actions",
+        headers=account_headers(owner_id="owner-b"),
+        json={"action": action, "instruction": "Foreign continuation", "idempotencyKey": "foreign-follow-up"},
+    )
+    assert foreign.status_code == 404
+    missing = account_client.post(
+        f"/v1/work/{accepted['workRef']}/actions",
+        headers=account_headers(),
+        json={"action": action, "idempotencyKey": "empty-follow-up"},
+    )
+    assert missing.status_code == 400
     response = account_client.post(
         f"/v1/work/{accepted['workRef']}/actions",
         headers=account_headers(),
@@ -3380,7 +3561,8 @@ def test_active_work_reuses_completed_mission_for_follow_up(
     assert response.status_code == 202, response.text
     runs = store.list_runs_for_worker(record["worker_id"])
     assert len(runs) == 2
-    assert store.get_run(source_run_id)["state"] == "completed"
+    assert store.get_run(source_run_id)["state"] == terminal_state
+    assert store.get_run(source_run_id)["output_text"] == "Earlier partial work"
     current = store.get_delegation(
         accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a"
     )
@@ -3388,6 +3570,74 @@ def test_active_work_reuses_completed_mission_for_follow_up(
     assert follow_up["run_id"] != source_run_id
     assert follow_up["state"] == "queued"
     assert "Continue in this exact workspace." in follow_up["instruction"]
+
+    after_worker = store.get_worker(record["worker_id"])
+    for key in ("worker_id", "workspace_dir", "state_dir", "profile", "model", "bootstrap_bundle_json"):
+        assert after_worker[key] == prior_worker[key]
+    replay = account_client.post(
+        f"/v1/work/{accepted['workRef']}/actions",
+        headers=account_headers(),
+        json={"action": action, "instruction": "Continue in this exact workspace.",
+              "idempotencyKey": f"terminal-{action}-follow-up"},
+    )
+    assert replay.status_code == 202, replay.text
+    assert replay.json() == {**response.json(), "idempotentReplay": True}
+    assert len(store.list_runs_for_worker(record["worker_id"])) == 2
+    if action == "message":
+        assert json.loads(follow_up["continuation_context_json"])["base_instruction"] == "Research alpha deeply"
+
+
+@pytest.mark.parametrize('action', ['queue', 'message'])
+@pytest.mark.parametrize('operator_paused', [False, True])
+def test_completed_mission_followup_wakes_idle_compute_but_preserves_operator_pause(
+    account_client, monkeypatch, action, operator_paused,
+):
+    accepted = account_client.post(
+        '/v1/delegations', headers=account_headers(idempotency_key='idle-followup'),
+        json=delegation_payload(title='Continue a completed review'),
+    ).json()
+    service = account_client.app.state.service
+    store = service.store
+    record = store.get_delegation(accepted['workRef'], tenant_id='tenant-a', owner_id='owner-a')
+    source_run_id = record['current_run_id']
+    store.finalize_run(source_run_id, 'completed', output_text='The first review is complete.')
+    store.update_worker_state(record['worker_id'], 'ready')
+    monkeypatch.setattr(service, '_idle_terminate_after_s', lambda: 1)
+    monkeypatch.setattr(service, '_worker_idle_seconds', lambda _worker: 2)
+    assert service.reap_idle_workers_once()
+    worker = store.get_worker(record['worker_id'])
+    assert worker['state'] == 'paused' and worker['compute_released_at']
+    if operator_paused:
+        service.pause_worker(record['worker_id'])
+        assert store.has_active_operator_pause(record['worker_id'])
+    response = account_client.post(
+        f"/v1/work/{accepted['workRef']}/actions", headers=account_headers(),
+        json={'action': action, 'instruction': 'Review the revised source.',
+              'idempotencyKey': 'continue-idle-review'},
+    )
+    assert response.status_code == 202, response.text
+    assert store.get_worker(record['worker_id'])['state'] == ('paused' if operator_paused else 'starting')
+    assert store.get_run(source_run_id)['state'] == 'completed'
+    assert len(store.list_runs_for_worker(record['worker_id'])) == 2
+
+
+def test_startup_recovers_already_queued_idle_followup_without_replacing_it(account_client):
+    accepted = account_client.post(
+        '/v1/delegations', headers=account_headers(idempotency_key='idle-recovery'),
+        json=delegation_payload(title='Recover pending review'),
+    ).json()
+    service = account_client.app.state.service
+    store = service.store
+    record = store.get_delegation(accepted['workRef'], tenant_id='tenant-a', owner_id='owner-a')
+    store.update_worker(record['worker_id'], state='paused', compute_released_at=datetime.now(timezone.utc).isoformat())
+    store.add_event(record['project_id'], record['worker_id'], None, 'worker.idle_terminated', 'Idle compute released')
+    started = []
+    service._ensure_worker_processor = started.append
+    service._reconcile_worker_row(store.get_worker(record['worker_id']))
+    assert started == [record['worker_id']]
+    assert store.get_worker(record['worker_id'])['state'] == 'starting'
+    assert store.get_run(record['current_run_id'])['state'] == 'queued'
+    assert len(store.list_runs_for_worker(record['worker_id'])) == 1
 
 
 def test_active_work_rejects_steer_after_mission_completed(account_client):
@@ -6098,6 +6348,7 @@ def test_public_view_ref_is_absolute_read_only_and_cannot_control_workspace(acco
     )
 
     assert view.status_code == 200
+    assert '<meta http-equiv="refresh" content="5">' in view.text
     assert "Read-only mission view" in view.text
     assert "Mission state" in view.text
     assert "Worker state" in view.text
@@ -6126,6 +6377,84 @@ def test_public_view_ref_is_absolute_read_only_and_cannot_control_workspace(acco
     assert "attachment" in downloaded.headers["content-disposition"]
     assert terminate.status_code == 403
     assert desktop_action.status_code == 403
+
+    # A read-only view follows active work without another click, then stops reloading.
+    run_id = store.list_runs_for_worker(worker["worker_id"])[0]["run_id"]
+    for state in ("running", "completed", "failed", "cancelled"):
+        # This fixture exercises rendering, not the separately tested provider admission lifecycle.
+        with store._connect() as conn:
+            conn.execute("UPDATE runs SET state = ? WHERE run_id = ?", (state, run_id))
+        current = account_client.get(parsed.path)
+        assert current.status_code == 200
+        assert ('<meta http-equiv="refresh" content="5">' in current.text) == (state == "running")
+        assert f"<dd>{state.title()}</dd>" in current.text
+        assert "To change this work, return to your chat or open Active work." in current.text
+
+
+@pytest.mark.parametrize("state", ["completed", "failed", "cancelled", "running", "queued"])
+def test_mission_view_shows_current_written_result_with_honest_lifecycle(account_client, state):
+    accepted = account_client.post(
+        "/v1/delegations",
+        headers=account_headers(idempotency_key=f"written-result-{state}"),
+        json=delegation_payload(title="Read-only recovery review"),
+    ).json()
+    store = account_client.app.state.store
+    delegation = store.get_delegation(accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a")
+    result = (
+        "The supported recovery is to run doctor, then start.\n"
+        "Evidence: [startup.py:12](/Users/example/work/startup.py:12).\n"
+        "<script>unsafeResult()</script> bearer synthetic-token-0123456789"
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE runs SET state = ?, output_text = ?, failure_user_message = ? WHERE run_id = ?",
+            (state, result, "The connection was interrupted." if state == "failed" else "", delegation["current_run_id"]),
+        )
+        # View must follow the mission even if the reusable worker's pointer changes.
+        conn.execute("UPDATE workers SET last_run_id = NULL WHERE worker_id = ?", (delegation["worker_id"],))
+    view = account_client.get(urlsplit(accepted["viewRef"]).path)
+    assert view.status_code == 200
+    assert f"<dd>{state.title()}</dd>" in view.text
+    terminal = state in {"completed", "failed", "cancelled"}
+    assert ("supported recovery is to run doctor" in view.text) == terminal
+    assert ("Progress before interruption" in view.text) == (state in {"failed", "cancelled"})
+    assert ('<meta http-equiv="refresh" content="5">' in view.text) == (not terminal)
+    assert "/Users/example" not in view.text
+    assert "synthetic-token-0123456789" not in view.text
+    assert "<script>unsafeResult()" not in view.text
+    if terminal:
+        assert "startup.py:12" in view.text
+        assert "&lt;script&gt;unsafeResult()&lt;/script&gt;" in view.text
+    if state == "failed":
+        assert "The connection was interrupted." in view.text
+    # Reads do not complete, rerun, or otherwise rewrite the mission.
+    assert store.get_run(delegation["current_run_id"])["state"] == state
+    assert len(store.list_runs_for_worker(delegation["worker_id"])) == 1
+
+
+@pytest.mark.parametrize("other_owner", [False, True])
+def test_mission_view_rejects_a_current_run_from_another_worker(account_client, other_owner):
+    accepted = account_client.post(
+        "/v1/delegations",
+        headers=account_headers(idempotency_key="written-result-owner"),
+        json=delegation_payload(),
+    ).json()
+    other = account_client.post(
+        "/v1/delegations",
+        headers=account_headers(owner_id="owner-b" if other_owner else "owner-a", idempotency_key="other-written-result"),
+        json=delegation_payload(title="Other mission"),
+    ).json()
+    store = account_client.app.state.store
+    delegation = store.get_delegation(accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a")
+    other_delegation = store.get_delegation(other["workRef"], tenant_id="tenant-a", owner_id="owner-b" if other_owner else "owner-a")
+    with store._connect() as conn:
+        conn.execute("UPDATE runs SET state = 'completed', output_text = ? WHERE run_id = ?", ("Unrelated result must stay private", other_delegation["current_run_id"]))
+        conn.execute("UPDATE delegations SET current_run_id = ? WHERE work_ref = ?", (other_delegation["current_run_id"], delegation["work_ref"]))
+    view = account_client.get(urlsplit(accepted["viewRef"]).path)
+    assert view.status_code == 200
+    assert "Unrelated result must stay private" not in view.text
+    assert "No result is available yet." in view.text
+    assert "<dd>Completed</dd>" not in view.text
 
 
 def test_active_work_view_allows_an_explicit_client_reachable_origin_override(
@@ -6238,3 +6567,454 @@ def test_active_work_history_is_owner_scoped_terminal_and_read_only(account_clie
     assert history.json()["work"][0]["actions"] == []
     assert foreign.status_code == 200
     assert foreign.json()["work"] == []
+
+
+@pytest.mark.parametrize("terminal_state", ["completed", "failed", "cancelled"])
+def test_active_work_exposes_existing_signed_artifact_links_for_the_exact_owner(
+    account_client, monkeypatch, terminal_state, tmp_path,
+):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "synthetic-artifact-link-secret")
+    accepted = account_client.post(
+        "/v1/delegations",
+        headers=account_headers(idempotency_key="artifact-mission"),
+        json=delegation_payload(title="Document delivery"),
+    ).json()
+    store = account_client.app.state.store
+    record = store.get_delegation(accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a")
+    worker = store.get_worker(record["worker_id"])
+    workspace = tmp_path / "mission-workspace"
+    store.update_worker(worker["worker_id"], workspace_dir=str(workspace))
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "result.pdf").write_bytes(b"%PDF-1.4\nSynthetic test document\n")
+    (workspace / ".mcp.json").write_text("private configuration")
+    outside = workspace.parent / "outside-private.txt"
+    outside.write_text("must-not-leak")
+    (workspace / "outside-link.txt").symlink_to(outside)
+    store.finalize_run(record["current_run_id"], terminal_state, output_text="Document available")
+
+    roster = account_client.get("/v1/active-work", headers=account_headers()).json()
+    item = next(item for item in roster["work"] if item["workRef"] == accepted["workRef"])
+    artifacts = item["artifactLinks"]
+    assert artifacts["status"] == "ok"
+    assert artifacts["scope"] == "workspace"
+    assert artifacts["truncated"] is False
+    assert artifacts["workspaceUrl"] == item["viewRef"]
+    assert [item["path"] for item in artifacts["items"]] == ["result.pdf"]
+    file = artifacts["items"][0]
+    assert file["sizeBytes"] == len((workspace / "result.pdf").read_bytes())
+    assert file["openUrl"].startswith("http://testserver/v1/link-refs/ghr_")
+    assert file["downloadUrl"].startswith("http://testserver/v1/link-refs/ghr_")
+    downloaded = account_client.get(file["downloadUrl"])
+    assert downloaded.status_code == 200
+    assert downloaded.content == (workspace / "result.pdf").read_bytes()
+    assert account_client.get(
+        f"/v1/work/{accepted['workRef']}", headers=account_headers(owner_id="owner-b"),
+    ).status_code == 404
+    serialized = json.dumps(item)
+    for private_value in (record["worker_id"], record["current_run_id"], str(workspace), "outside-link", ".mcp.json"):
+        assert private_value not in serialized
+    repeated = account_client.get(
+        f"/v1/work/{accepted['workRef']}", headers=account_headers(),
+    ).json()
+    assert repeated["artifactLinks"]["items"] == artifacts["items"]
+
+
+def test_active_work_artifact_inventory_is_bounded_and_does_not_claim_completeness(
+    account_client, monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "synthetic-artifact-link-secret")
+    accepted = account_client.post(
+        "/v1/delegations", headers=account_headers(idempotency_key="artifact-overflow"),
+        json=delegation_payload(),
+    ).json()
+    store = account_client.app.state.store
+    record = store.get_delegation(accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a")
+    workspace = tmp_path / "mission-workspace"
+    store.update_worker(record["worker_id"], workspace_dir=str(workspace))
+    workspace.mkdir(parents=True, exist_ok=True)
+    for index in range(30):
+        (workspace / f"file-{index:02}.txt").write_text(f"File {index}")
+    store.finalize_run(record["current_run_id"], "completed", output_text="Files available")
+    item = account_client.get(f"/v1/work/{accepted['workRef']}", headers=account_headers()).json()
+    assert len(item["artifactLinks"]["items"]) == 5
+    assert item["artifactLinks"]["truncated"] is True
+    assert item["artifactLinks"]["workspaceUrl"] == item["viewRef"]
+
+
+def test_active_work_artifact_links_fail_closed_if_worker_binding_changes(account_client, monkeypatch):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "synthetic-artifact-link-secret")
+    accepted = account_client.post(
+        "/v1/delegations", headers=account_headers(idempotency_key="artifact-binding"),
+        json=delegation_payload(),
+    ).json()
+    store = account_client.app.state.store
+    record = store.get_delegation(accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a")
+    store.finalize_run(record["current_run_id"], "completed", output_text="Done")
+    get_worker = store.get_worker
+    monkeypatch.setattr(store, "get_worker", lambda worker_id: {
+        **get_worker(worker_id), "owner_id": "owner-b",
+    })
+    item = account_client.get(f"/v1/work/{accepted['workRef']}", headers=account_headers()).json()
+    assert item["artifactLinks"] == {"status": "unavailable", "items": []}
+
+
+def test_active_work_never_exposes_unsigned_internal_artifact_routes(account_client, monkeypatch, tmp_path):
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "synthetic-artifact-link-secret")
+    accepted = account_client.post(
+        "/v1/delegations", headers=account_headers(idempotency_key="artifact-signer"),
+        json=delegation_payload(),
+    ).json()
+    store = account_client.app.state.store
+    record = store.get_delegation(accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a")
+    workspace = tmp_path / "mission-workspace"
+    workspace.mkdir()
+    (workspace / "result.txt").write_text("File content")
+    store.update_worker(record["worker_id"], workspace_dir=str(workspace))
+    store.finalize_run(record["current_run_id"], "completed", output_text="Done")
+    sign_link = api_module.sign_link_token
+    monkeypatch.setattr(api_module, "sign_link_token", lambda **values: (
+        sign_link(**values) if values["kind"] == "worker_view" else ""
+    ))
+    response = account_client.get(f"/v1/work/{accepted['workRef']}", headers=account_headers())
+    assert response.status_code == 200
+    assert response.json()["artifactLinks"] == {"status": "unavailable", "items": []}
+    assert "/v1/workers/" not in response.text
+
+
+@pytest.mark.parametrize("action", ["steer", "pause", "resume"])
+def test_active_work_finish_replays_concurrent_same_executor_receipt(
+    tmp_path, monkeypatch, action,
+):
+    """Recovery finishing after reservation must not turn success into a 409."""
+
+    monkeypatch.setenv("WPR_API_TOKEN", API_TOKEN)
+    monkeypatch.setenv("VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET", ASSERTION_SECRET)
+    runtime = StubRuntime()
+    app = create_app(
+        db_path=str(tmp_path / "same-owner-finish.sqlite3"),
+        runtime_backend="stub", runtime=runtime, reconcile_on_startup=False,
+    )
+    app.state.service.start_assigned_run = lambda _worker_id: None
+    app.state.service._ensure_worker_processor = lambda _worker_id: None
+    with TestClient(app) as client:
+        accepted = client.post(
+            "/v1/delegations",
+            headers=account_headers(idempotency_key="finish-race-delegation"),
+            json=delegation_payload(title="Concurrent action completion"),
+        ).json()
+        store = app.state.store
+        record = store.get_delegation(
+            accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a",
+        )
+        if action == "resume":
+            _truthfully_pause_run(store, record["current_run_id"], suffix="finish-race")
+        else:
+            _truthfully_invoke_run(store, record["current_run_id"], suffix="finish-race")
+        original_finish = store.finish_active_work_action
+        first_receipts = []
+
+        def concurrent_finish(action_use_id, **kwargs):
+            if not first_receipts:
+                # The recovery owner commits between the API's reservation and
+                # finalization. Its canonical receipt wins; the loser cannot
+                # rewrite it or advance the current run a second time.
+                durable = original_finish(action_use_id, **kwargs)
+                assert durable is not None
+                first_receipts.append(durable)
+                kwargs = {**kwargs, "response": {**kwargs["response"], "state": "stale"}}
+            return original_finish(action_use_id, **kwargs)
+
+        monkeypatch.setattr(store, "finish_active_work_action", concurrent_finish)
+        body = {"action": action, "idempotencyKey": "finish-race-action"}
+        if action == "steer":
+            body["instruction"] = "Use the corrected objective."
+        response = client.post(
+            f"/v1/work/{accepted['workRef']}/actions",
+            headers=account_headers(), json=body,
+        )
+        assert response.status_code == 202, response.text
+        first = first_receipts[0]
+        canonical = json.loads(first["response_json"])
+        assert response.json() == canonical
+        assert store.get_active_work_action(first["action_use_id"]) == first
+        replay = client.post(
+            f"/v1/work/{accepted['workRef']}/actions",
+            headers=account_headers(), json=body,
+        )
+        assert replay.status_code == 202, replay.text
+        assert replay.json() == {**canonical, "idempotentReplay": True}
+        assert store.get_active_work_action(first["action_use_id"]) == first
+        assert original_finish(
+            first["action_use_id"], response={"state": "forged"},
+            executor_id="different-executor",
+        ) is None
+        assert original_finish(
+            first["action_use_id"], response={"state": "unbound"},
+        ) is None
+        assert store.get_active_work_action(first["action_use_id"]) == first
+
+
+@pytest.mark.parametrize("action", ["queue", "message"])
+@pytest.mark.parametrize("closed_state", ["terminating", "terminated", "termination_failed"])
+def test_terminal_follow_up_does_not_reopen_closed_workspace(account_client, action, closed_state):
+    accepted = account_client.post(
+        "/v1/delegations", headers=account_headers(idempotency_key="closed-follow-up"),
+        json=delegation_payload(title="Closed review"),
+    ).json()
+    store = account_client.app.state.store
+    record = store.get_delegation(accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a")
+    store.finalize_run(record["current_run_id"], "failed", failure_class="unknown", failure_retryable=0)
+    store.update_worker_state(record["worker_id"], closed_state)
+    response = account_client.post(
+        f"/v1/work/{accepted['workRef']}/actions", headers=account_headers(),
+        json={"action": action, "instruction": "Review revised source.", "idempotencyKey": "closed-correction"},
+    )
+    assert response.status_code == 409, response.text
+    assert len(store.list_runs_for_worker(record["worker_id"])) == 1
+    assert store.get_worker(record["worker_id"])["state"] == closed_state
+
+
+@pytest.mark.parametrize("output_mode", ["inherit", "replace"])
+def test_queue_projects_trusted_prior_output_source_without_rewriting_new_goal(account_client, output_mode):
+    original = "Create the requested HTML report. Preserve the original data."
+    correction = "Shorten the explanation."
+    accepted = account_client.post(
+        "/v1/delegations", headers=account_headers(idempotency_key="queue-output-source"),
+        json=delegation_payload(title="Existing report", instruction=original),
+    ).json()
+    service = account_client.app.state.service
+    store = service.store
+    record = store.get_delegation(accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a")
+    store.finalize_run(record["current_run_id"], "completed", output_text="Prior report")
+    store.update_worker_state(record["worker_id"], "ready")
+    output = {"mode": output_mode, "required": [], "forbidden": [], "formats": [], "forbiddenFormats": []}
+    if output_mode == "replace":
+        output.update(required=["Create the revised PDF report."], formats=["pdf"])
+    result = account_client.post(
+        f"/v1/work/{accepted['workRef']}/actions", headers=account_headers(),
+        json={"action": "queue", "instruction": correction, "idempotencyKey": "queue-correction",
+              "sourceContext": {"version": 1, "originRef": "origin-corrected-report",
+                                "sourceEventId": "event-corrected-report", "sourceRevision": 1,
+                                "surface": "web", "outputContract": output}},
+    )
+    assert result.status_code == 202, result.text
+    current = store.get_delegation(accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a")
+    run = store.get_run(current["current_run_id"])
+    runtime_worker = service._run_local_worker(store.get_worker(current["worker_id"]), run)
+    ledger = build_constraint_ledger(instruction=run["instruction"], worker=runtime_worker, run_id=run["run_id"])
+    assert run["instruction"] == correction
+    assert ledger["outputs"]["format_expectations"] == (["html"] if output_mode == "inherit" else ["pdf"])
+    assert json.loads(run["continuation_context_json"]) == {
+        "version": 1, "base_instruction": original, "guidance": [correction],
+    }
+
+
+def test_native_input_requires_exact_signed_web_body_and_preserves_run(account_client, monkeypatch):
+    from workers_projects_runtime.service_assertions import mint_service_assertion
+    accepted=account_client.post('/v1/delegations',headers=account_headers(idempotency_key='native-input-delegation'),json=delegation_payload()).json()
+    store=account_client.app.state.store;service=account_client.app.state.service
+    record=store.get_delegation(accepted['workRef'],tenant_id='tenant-a',owner_id='owner-a')
+    _truthfully_invoke_run(store,record['current_run_id'],suffix='native-input')
+    calls=[]
+    def respond(worker,**values):
+        calls.append((worker['worker_id'],values));return {'status':'accepted'}
+    monkeypatch.setattr(service.runtime,'respond_native_input',respond,raising=False)
+    monkeypatch.setattr(service.runtime,'pending_native_input',lambda worker,**kw:{'version':1,'requestId':'native-request','requestFingerprint':'a'*64,'kind':'elicitation','mode':'form','state':'pending','message':'Synthetic input','mcpServerName':'fixture','requestedSchema':{'type':'object','properties':{}}},raising=False)
+    body={'action':'resume','idempotencyKey':'native-input-response','nativeInput':{'version':1,'requestId':'native-request','requestFingerprint':'a'*64,'action':'decline'}}
+    raw=json.dumps(body,separators=(',',':')).encode()
+    path=f"/v1/work/{accepted['workRef']}/actions"
+    untrusted=account_client.post(path,headers={**account_headers(),'Content-Type':'application/json'},content=raw)
+    assert untrusted.status_code==403,untrusted.text
+    def headers(data=raw,owner='owner-a'):
+        token=mint_service_assertion(ASSERTION_SECRET,tenant_id='tenant-a',owner_id=owner,native_input_digest=hashlib.sha256(data).hexdigest())
+        return {**account_headers(assertion=token),'Content-Type':'application/json'}
+    tampered=account_client.post(path,headers=headers(b'wrong'),content=raw)
+    assert tampered.status_code==403,tampered.text
+    foreign=account_client.post(path,headers=headers(owner='owner-b'),content=raw)
+    assert foreign.status_code==404,foreign.text
+    detail=account_client.get(f"/v1/work/{accepted['workRef']}",headers=account_headers())
+    assert detail.json()['pendingNativeInput']['requestId']=='native-request'
+    assert detail.json()['state']=='needs_input'
+    result=account_client.post(path,headers=headers(),content=raw)
+    assert result.status_code==202,result.text
+    repeated=account_client.post(path,headers=headers(),content=raw)
+    assert repeated.status_code==202,repeated.text
+    assert repeated.json()['idempotentReplay'] is True
+    changed=json.dumps({**body,'nativeInput':{**body['nativeInput'],'action':'accept'}},separators=(',',':')).encode()
+    conflict=account_client.post(path,headers=headers(changed),content=changed)
+    assert conflict.status_code==409,conflict.text
+    assert len(calls)==1
+    assert calls[0][1]['action']=='decline'
+    assert store.get_run(record['current_run_id'])['state']=='running'
+    assert len(store.list_runs_for_worker(record['worker_id']))==1
+
+
+
+def test_native_input_response_receipt_recovers_after_run_finishes(account_client,monkeypatch,tmp_path):
+    from workers_projects_runtime import native_input
+    from workers_projects_runtime.models import NativeInputResponseRequest
+    from workers_projects_runtime.service_assertions import mint_service_assertion
+    accepted=account_client.post('/v1/delegations',headers=account_headers(idempotency_key='native-input-recovery'),json=delegation_payload()).json()
+    store=account_client.app.state.store;service=account_client.app.state.service
+    record=store.get_delegation(accepted['workRef'],tenant_id='tenant-a',owner_id='owner-a')
+    run_id=record['current_run_id'];_truthfully_invoke_run(store,run_id,suffix='native-input-recovery')
+    record=store.get_delegation(accepted['workRef'],tenant_id='tenant-a',owner_id='owner-a')
+    root=tmp_path/'input';root.mkdir()
+    native_input.publish(root/'native-input-context.json',{'version':1,'workerId':record['worker_id'],'runId':run_id,'contextToken':'context-a'})
+    native_input.publish(native_input.request_path(root,'request-a'),{'requestId':'request-a','requestFingerprint':'a'*64,'state':'pending','contextToken':'context-a','mode':'form','requestedSchema':{'type':'object','properties':{}}})
+    def respond(worker,**values):
+        return native_input.respond(root,worker_id=worker['worker_id'],**values)
+    monkeypatch.setattr(service.runtime,'respond_native_input',respond,raising=False)
+    answer={'version':1,'requestId':'request-a','requestFingerprint':'a'*64,'action':'decline'}
+    parsed=NativeInputResponseRequest(**answer).model_dump()
+    action_request={'action':'resume','instruction':'','capabilityReauthorization':None,'nativeInput':parsed}
+    reservation=store.reserve_active_work_action(tenant_id='tenant-a',owner_id='owner-a',work_ref=accepted['workRef'],idempotency_key='native-response-recovery',action='resume',payload_digest=native_input.digest(action_request),expected_current_run_id=run_id,expected_source_run_id=run_id,expected_source_state=record['run_state'],expected_source_started_at=record.get('run_started_at') or '',executor_id=service.executor_id)
+    initial=service.execute_active_work_action(record,action='resume',instruction='',idempotency_key='native-response-recovery',action_use_id=reservation['action_use_id'],native_input=parsed)
+    assert initial['status']=='accepted'
+    assert store.finalize_run_if_state(run_id,'running','completed',output_text='Useful result after owner response.',**_exact_terminal_generation(store,run_id))
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute('UPDATE active_work_action_uses SET lease_expires_at = ? WHERE action_use_id = ?',('2000-01-01T00:00:00+00:00',reservation['action_use_id']))
+    # A recovered API executor takes over the expired action, with the native reply already durable.
+    monkeypatch.setattr(service,'_executor_id','recovered-native-input-executor')
+    body={'action':'resume','idempotencyKey':'native-response-recovery','nativeInput':answer};raw=json.dumps(body,separators=(',',':')).encode()
+    token=mint_service_assertion(ASSERTION_SECRET,tenant_id='tenant-a',owner_id='owner-a',native_input_digest=hashlib.sha256(raw).hexdigest())
+    result=account_client.post(f"/v1/work/{accepted['workRef']}/actions",headers={**account_headers(assertion=token),'Content-Type':'application/json'},content=raw)
+    assert result.status_code==202,result.text
+    assert result.json()['status']=='already_accepted'
+    assert result.json()['state']=='completed'
+    assert result.json()['idempotentReplay'] is True
+    assert store.get_run(run_id)['output_text']=='Useful result after owner response.'
+    assert len(store.list_runs_for_worker(record['worker_id']))==1
+
+
+def test_invalid_native_form_returns_editable_client_error(account_client,monkeypatch):
+    from workers_projects_runtime.openclaw_runtime import RuntimeErrorBase
+    from workers_projects_runtime.service_assertions import mint_service_assertion
+    accepted=account_client.post('/v1/delegations',headers=account_headers(idempotency_key='native-input-invalid'),json=delegation_payload()).json()
+    store=account_client.app.state.store;service=account_client.app.state.service
+    record=store.get_delegation(accepted['workRef'],tenant_id='tenant-a',owner_id='owner-a')
+    _truthfully_invoke_run(store,record['current_run_id'],suffix='native-invalid')
+    def invalid(*args,**kwargs):raise RuntimeErrorBase('native_input_invalid')
+    monkeypatch.setattr(service.runtime,'respond_native_input',invalid,raising=False)
+    body={'action':'resume','idempotencyKey':'native-input-invalid-response','nativeInput':{'version':1,'requestId':'request-a','requestFingerprint':'a'*64,'action':'accept','content':{'value':'invalid'}}}
+    raw=json.dumps(body,separators=(',',':')).encode()
+    token=mint_service_assertion(ASSERTION_SECRET,tenant_id='tenant-a',owner_id='owner-a',native_input_digest=hashlib.sha256(raw).hexdigest())
+    result=account_client.post(f"/v1/work/{accepted['workRef']}/actions",headers={**account_headers(assertion=token),'Content-Type':'application/json'},content=raw)
+    assert result.status_code==400,result.text
+    assert store.get_run(record['current_run_id'])['state']=='running'
+
+
+@pytest.mark.parametrize("action", ["queue", "message"])
+@pytest.mark.parametrize("source_state", ["queued", "completed"])
+def test_follow_up_is_durable_under_capacity_pressure(account_client, monkeypatch, action, source_state):
+    accepted = account_client.post(
+        "/v1/delegations", headers=account_headers(idempotency_key="capacity-follow-up"),
+        json=delegation_payload(title="Existing objective"),
+    ).json()
+    service = account_client.app.state.service
+    store = service.store
+    record = store.get_delegation(accepted["workRef"], tenant_id="tenant-a", owner_id="owner-a")
+    if source_state == "completed":
+        store.finalize_run(record["current_run_id"], "completed", output_text="Prior result")
+        store.update_worker_state(record["worker_id"], "ready")
+    def no_capacity(*_args, **_kwargs):
+        raise HostCapacityError("The mission lane is full.", capacity_class="family_lane")
+    monkeypatch.setattr(service, "_reserved_runtime_preflight", no_capacity)
+    request = {"action": action, "instruction": "Preserve the original goal and add source dates.", "idempotencyKey": "capacity-guidance"}
+    response = account_client.post(f"/v1/work/{accepted['workRef']}/actions", headers=account_headers(), json=request)
+    assert response.status_code == 202, response.text
+    replay = account_client.post(f"/v1/work/{accepted['workRef']}/actions", headers=account_headers(), json=request)
+    assert replay.status_code == 202, replay.text
+    runs = store.list_runs_for_worker(record["worker_id"])
+    assert len(runs) == 2
+    queued = [run for run in runs if run["state"] == "queued"]
+    assert len(queued) == (2 if source_state == "queued" and action == "queue" else 1)
+    assert any(request["instruction"] in run["instruction"] for run in queued)
+
+
+def test_work_action_capacity_failure_keeps_typed_cause(account_client, monkeypatch):
+    accepted = account_client.post(
+        "/v1/delegations", headers=account_headers(idempotency_key="typed-capacity"),
+        json=delegation_payload(title="Capacity cause"),
+    ).json()
+    def capacity(*args, **kwargs):
+        raise HostCapacityError("The configured lane is full.", capacity_class="host")
+    monkeypatch.setattr(account_client.app.state.service, "execute_active_work_action", capacity)
+    response = account_client.post(
+        f"/v1/work/{accepted['workRef']}/actions", headers=account_headers(),
+        json={"action": "message", "instruction": "Keep the original scope.", "idempotencyKey": "capacity-action"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "host_capacity"
+    assert int(response.headers["Retry-After"]) >= 1
+    replay = account_client.post(
+        f"/v1/work/{accepted['workRef']}/actions", headers=account_headers(),
+        json={"action": "message", "instruction": "Keep the original scope.", "idempotencyKey": "capacity-action"},
+    )
+    assert replay.status_code == 503
+    assert replay.json() == response.json()
+    assert replay.headers["Retry-After"] == response.headers["Retry-After"]
+
+
+@pytest.mark.parametrize("execution_mode", ["host", "docker"])
+def test_background_preferences_persist_exact_model_effort_and_fallback(account_client, monkeypatch, execution_mode):
+    if execution_mode == "host":
+        enable_native_orchestration(monkeypatch)
+        payload = native_orchestrator_payload("Exact background route")
+    else:
+        monkeypatch.setenv("VIVENTIUM_GLASSHIVE_ISOLATED_PARALLEL_POLICY", "1")
+        payload = conversation_orchestrator_payload(title="Exact background route")
+    authority = payload["bootstrapBundle"]["viventium_launch_authority"]
+    authority.update({
+        "worker_model": "codex-cli:gpt-6-astra",
+        "worker_reasoning_effort": "medium",
+        "fallback_worker_model": "claude-code:claude-opus-5",
+        "fallback_worker_reasoning_effort": "medium",
+    })
+    response = account_client.post("/v1/delegations", headers=account_headers(idempotency_key="exact-background"), json=payload)
+    assert response.status_code == 202, response.text
+    store = account_client.app.state.store
+    service = account_client.app.state.service
+    record = store.get_delegation(response.json()["workRef"], tenant_id="tenant-a", owner_id="owner-a")
+    worker = store.get_worker(record["worker_id"])
+    bundle = json.loads(worker["bootstrap_bundle_json"])
+    assert worker["model"] == bundle["provider_model"] == "gpt-6-astra"
+    assert bundle["env"]["WPR_CODEX_CLI_REASONING_EFFORT"] == "medium"
+    assert bundle["viventium_launch_authority"] == authority
+    # Exercise the same resolved fallback and atomic store transition used by both recovery paths.
+    model, fallback_bundle = service._configured_parallel_worker_route("claude-code", execution_mode, bundle, fallback=True)
+    run = _truthfully_invoke_run(store, record["current_run_id"], suffix="exact-fallback")
+    # A capability refresh between route selection and switch must survive the transaction.
+    current_bundle = {**bundle, "project_definition": "Updated accepted context"}
+    store.update_worker(worker["worker_id"], bootstrap_bundle_json=json.dumps(current_bundle))
+    switched = store.switch_worker_profile_and_requeue_run(
+        worker_id=worker["worker_id"], run_id=run["run_id"], expected_profile="codex-cli",
+        fallback_profile="claude-code", fallback_backend="claude-code", fallback_runtime="claude-code",
+        fallback_model=model, fallback_bootstrap_bundle=fallback_bundle,
+        retry_after=datetime.now(timezone.utc).isoformat(), error_text="Synthetic quota failure",
+    )
+    assert switched is not None
+    refreshed = store.get_worker(worker["worker_id"])
+    effective = service._refresh_worker_model_for_profile(refreshed)
+    assert effective["model"] == "claude-opus-5"
+    persisted = json.loads(effective["bootstrap_bundle_json"])
+    assert persisted["provider_model"] == "claude-opus-5"
+    assert persisted["project_definition"] == "Updated accepted context"
+    assert persisted["env"]["WPR_CLAUDE_CODE_EFFORT"] == "medium"
+    assert store.get_run(run["run_id"])["state"] == "queued"
+
+
+@pytest.mark.parametrize("preferences", [
+    {"worker_model": "codex-cli:unknown"},
+    {"worker_model": "claude-code:claude-opus-5"},
+    {"worker_model": "codex-cli:gpt-6-astra", "worker_reasoning_effort": "none"},
+    {"fallback_worker_model": "claude-code:claude-opus-5", "fallback_worker_reasoning_effort": "ultra"},
+])
+def test_background_preferences_reject_unknown_or_incompatible_before_admission(account_client, monkeypatch, preferences):
+    enable_native_orchestration(monkeypatch)
+    payload = native_orchestrator_payload("Invalid background route")
+    payload["bootstrapBundle"]["viventium_launch_authority"].update(preferences)
+    response = account_client.post("/v1/delegations", headers=account_headers(idempotency_key="invalid-background"), json=payload)
+    assert response.status_code == 400, response.text
+    with sqlite3.connect(account_client.app.state.store.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM delegations").fetchone()[0] == 0

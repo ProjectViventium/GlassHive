@@ -91,7 +91,7 @@ def test_schema_migration_lock_serializes_competing_versions(tmp_path) -> None:
 @pytest.mark.parametrize(
     ("component", "factory", "unexpected_table", "newer_version"),
     [
-        ("runtime_store", Store, "projects", 8),
+        ("runtime_store", Store, "projects", 9),
         ("control_plane", ControlPlaneStore, "provider_accounts", 5),
     ],
 )
@@ -142,8 +142,8 @@ def test_failed_store_migration_rolls_back_ledger_and_retries_safely(tmp_path, m
     assert require_compatible_schema(
         verified,
         component="runtime_store",
-        target_version=7,
-    ) == 7
+        target_version=8,
+    ) == 8
 
 
 @pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX permission contract")
@@ -242,18 +242,16 @@ def test_runtime_accepts_prepared_root_owned_group_state_file_without_chmod(
 ) -> None:
     state_file = tmp_path / "runtime.db"
     state_file.touch()
-    chmod_calls: list[tuple[int, int]] = []
-    opened: dict[str, object] = {}
+    chmod_calls: list[tuple[object, int]] = []
 
-    def fake_open(path, flags):
-        opened.update(path=path, flags=flags)
-        return 93
+    def refuse_open(path, flags, *args, **kwargs):
+        raise AssertionError(f"state hardening must not open a descriptor on {path}")
 
     monkeypatch.setenv("GLASSHIVE_STATE_FILE_MODE", "0660")
-    monkeypatch.setattr(state_permissions_module.os, "open", fake_open)
+    monkeypatch.setattr(state_permissions_module.os, "open", refuse_open)
     monkeypatch.setattr(
         state_permissions_module.os,
-        "fstat",
+        "lstat",
         lambda value: SimpleNamespace(
             st_mode=stat.S_IFREG | 0o660,
             st_uid=0,
@@ -265,16 +263,12 @@ def test_runtime_accepts_prepared_root_owned_group_state_file_without_chmod(
     monkeypatch.setattr(state_permissions_module.os, "getgroups", lambda: [2200])
     monkeypatch.setattr(
         state_permissions_module.os,
-        "fchmod",
-        lambda value, mode: chmod_calls.append((value, mode)),
+        "chmod",
+        lambda value, mode, **kwargs: chmod_calls.append((value, mode)),
     )
-    monkeypatch.setattr(state_permissions_module.os, "close", lambda value: None)
 
     state_permissions_module.secure_state_file(state_file)
 
-    assert opened["path"] == state_file
-    assert int(opened["flags"]) & getattr(state_permissions_module.os, "O_NOFOLLOW", 0)
-    assert int(opened["flags"]) & getattr(state_permissions_module.os, "O_NONBLOCK", 0)
     assert chmod_calls == []
 
 
@@ -285,10 +279,9 @@ def test_runtime_rejects_root_owned_state_file_outside_process_group(
     state_file = tmp_path / "runtime.db"
     state_file.touch()
     monkeypatch.setenv("GLASSHIVE_STATE_FILE_MODE", "0660")
-    monkeypatch.setattr(state_permissions_module.os, "open", lambda path, flags: 94)
     monkeypatch.setattr(
         state_permissions_module.os,
-        "fstat",
+        "lstat",
         lambda value: SimpleNamespace(
             st_mode=stat.S_IFREG | 0o660,
             st_uid=0,
@@ -298,7 +291,6 @@ def test_runtime_rejects_root_owned_state_file_outside_process_group(
     monkeypatch.setattr(state_permissions_module.os, "geteuid", lambda: 1200)
     monkeypatch.setattr(state_permissions_module.os, "getegid", lambda: 1200)
     monkeypatch.setattr(state_permissions_module.os, "getgroups", lambda: [2200])
-    monkeypatch.setattr(state_permissions_module.os, "close", lambda value: None)
 
     with pytest.raises(PermissionError, match="prepared state file"):
         state_permissions_module.secure_state_file(state_file)
@@ -329,3 +321,89 @@ def test_state_permissions_reject_unsafe_or_invalid_modes(tmp_path, monkeypatch,
             state_directory_mode()
         else:
             state_file_mode()
+
+
+def test_parallel_schema_replaces_stale_callback_trace_triggers(tmp_path) -> None:
+    """A database from a runtime without the run-id guard keeps its old triggers under IF NOT EXISTS.
+
+    The installed runtime hit exactly this: `worker.resumed_by_alias` on pre-run alias reuse is a
+    runless lifecycle callback, and the stale trace trigger inserted a NULL run into the NOT NULL
+    trace fence, failing `POST /workers/find-or-resume` with a 500 on a scheduled journey.
+    """
+
+    import re
+
+    from workers_projects_runtime import parallel_orchestration_schema as schema_module
+
+    db_path = tmp_path / "legacy-triggers.sqlite3"
+    store = Store(str(db_path))
+    project = store.create_project("owner-a", "Legacy triggers", "Goal", "codex-cli")
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner-a",
+        name="Legacy worker",
+        role="worker",
+        profile="codex-cli",
+        backend="codex-cli",
+        runtime="codex-cli",
+        model="test",
+        execution_mode="host",
+    )
+    stale_bodies: dict[str, str] = {}
+    for name in schema_module.RECONCILED_TRIGGERS:
+        expected = schema_module.expected_trigger_statement(name)
+        stale = re.sub(
+            r"\)\s*WHERE NEW\.run_id IS NOT NULL AND NEW\.run_id <> '';", ");", expected
+        )
+        assert stale != expected
+        stale_bodies[name] = stale
+    with store._connect() as conn:
+        for name, stale in stale_bodies.items():
+            conn.execute(f"DROP TRIGGER {name}")
+            conn.execute(stale)
+
+    def runless_callback(target: Store, callback_id: str):
+        return target.upsert_callback_outbox(
+            callback_id=callback_id,
+            project_id=project["project_id"],
+            worker_id=worker["worker_id"],
+            run_id=None,
+            event_type="worker.resumed_by_alias",
+            url="https://callbacks.example/hook",
+            payload_json="{}",
+        )
+
+    # Legacy shape reproduced: the pre-run lifecycle callback trips the trace fence.
+    with pytest.raises(sqlite3.IntegrityError):
+        runless_callback(store, "cb-legacy")
+
+    reopened = Store(str(db_path))
+    with reopened._connect() as conn:
+        for name in schema_module.RECONCILED_TRIGGERS:
+            installed = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?", (name,)
+            ).fetchone()[0]
+            assert schema_module.normalized_trigger_sql(
+                installed
+            ) == schema_module.normalized_trigger_sql(
+                schema_module.expected_trigger_statement(name)
+            )
+        # Deterministic: a second pass finds nothing to replace.
+        assert schema_module.reconcile_stale_triggers(conn) == []
+
+    record = runless_callback(reopened, "cb-runless")
+    assert record["event_type"] == "worker.resumed_by_alias"
+    assert record["run_id"] is None
+    with reopened._connect() as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM callback_trace_events WHERE callback_id = ?",
+                ("cb-runless",),
+            ).fetchone()[0]
+            == 0
+        )
+        # The update trigger was replaced too: delivery bookkeeping on the runless row succeeds.
+        conn.execute(
+            "UPDATE callback_outbox SET attempts = attempts + 1, updated_at = updated_at WHERE callback_id = ?",
+            ("cb-runless",),
+        )

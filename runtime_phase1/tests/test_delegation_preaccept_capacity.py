@@ -60,7 +60,7 @@ def _capacity_policy(monkeypatch):
     )
 
 
-def test_delegation_is_not_accepted_when_4_3_gib_cannot_cover_5_gib(tmp_path):
+def test_delegation_is_queued_when_4_3_gib_cannot_cover_5_gib(tmp_path):
     available_memory = int(4.3 * 1024**3)
 
     class MeasuredRuntime(StubRuntime):
@@ -82,23 +82,19 @@ def test_delegation_is_not_accepted_when_4_3_gib_cannot_cover_5_gib(tmp_path):
     service = WorkersProjectsService(store, MeasuredRuntime(), reconcile_on_startup=False)
     service.start_assigned_run = lambda _worker_id: None  # type: ignore[method-assign]
     try:
-        with pytest.raises(HostCapacityError) as captured:
-            service.reserve_delegation(**_delegation_kwargs("blocked"))
+        accepted = service.reserve_delegation(**_delegation_kwargs("blocked"))
+        replay = service.reserve_delegation(**_delegation_kwargs("blocked"))
     finally:
         service.shutdown()
 
-    error = captured.value
-    assert error.capacity_class == "resource_pressure"
-    assert error.available["memoryBytes"] == available_memory
-    assert error.required["memoryBytes"] == 5 * 1024**3
-    assert error.shortage["memoryBytes"] == 5 * 1024**3 - available_memory
-    assert error.reservation["memoryBytes"] == 3 * 1024**3
-    assert error.next_retry_at
+    assert replay["initial_run_id"] == accepted["initial_run_id"]
+    assert replay["idempotent_replay"] is True
+    assert store.get_run(accepted["initial_run_id"])["state"] == "queued"
     assert _row_counts(store) == {
-        "projects": 0,
-        "workers": 0,
-        "runs": 0,
-        "delegations": 0,
+        "projects": 1,
+        "workers": 1,
+        "runs": 1,
+        "delegations": 1,
         "host_run_leases": 0,
     }
 
@@ -241,7 +237,7 @@ def test_expired_preflight_reservation_blocks_cli_and_acceptance(tmp_path, monke
     }
 
 
-def test_two_processes_cannot_both_accept_the_last_capacity_reservation(tmp_path):
+def test_two_processes_accept_both_objectives_but_only_one_capacity_reservation(tmp_path):
     database = str(tmp_path / "concurrent.sqlite3")
     probe_barrier = Barrier(2)
     available_memory = int(7.5 * 1024**3)
@@ -286,16 +282,13 @@ def test_two_processes_cannot_both_accept_the_last_capacity_reservation(tmp_path
 
     accepted = [result for result in results if isinstance(result, dict)]
     blocked = [result for result in results if isinstance(result, HostCapacityError)]
-    assert len(accepted) == 1
-    assert len(blocked) == 1
-    assert blocked[0].capacity_class == "resource_pressure"
-    assert blocked[0].shortage["memoryBytes"] == int(0.5 * 1024**3)
-    assert blocked[0].next_retry_at
+    assert len(accepted) == 2
+    assert blocked == []
     assert _row_counts(Store(database)) == {
-        "projects": 1,
-        "workers": 1,
-        "runs": 1,
-        "delegations": 1,
+        "projects": 2,
+        "workers": 2,
+        "runs": 2,
+        "delegations": 2,
         "host_run_leases": 1,
     }
 
@@ -661,3 +654,44 @@ def test_preflight_reservation_renews_and_ownership_loss_kills_exact_probe(
     finally:
         finish_probe.set()
         service.shutdown()
+
+
+def test_capacity_queued_objective_runs_after_restart_without_resubmission(tmp_path):
+    class RecoveringRuntime(StubRuntime):
+        preflight_uses_cli_subprocess = True
+        memory = 1024**3
+        preflight_calls = 0
+
+        def preflight_worker_profile(self, *_args, **_kwargs):
+            self.preflight_calls += 1
+
+        def isolated_resource_usage(self, *, cached_only=False):
+            return {**super().isolated_resource_usage(), "available_memory_bytes": self.memory}
+
+    runtime = RecoveringRuntime()
+    store = Store(str(tmp_path / "queued-restart.sqlite3"))
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    service.start_assigned_run = lambda _worker_id: None
+    try:
+        accepted = service.reserve_delegation(**_delegation_kwargs("restart-queued"))
+        assert runtime.preflight_calls == 0
+        assert store.get_active_host_run_lease_for_run(accepted["initial_run_id"]) is None
+    finally:
+        service.shutdown()
+
+    runtime.memory = 16 * 1024**3
+    restarted = WorkersProjectsService(store, runtime, reconcile_on_startup=True)
+    try:
+        import time
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            run = store.get_run(accepted["initial_run_id"])
+            if run["state"] in {"completed", "failed", "cancelled"}:
+                break
+            time.sleep(0.02)
+        assert run["state"] == "completed", run
+        assert run["output_text"] == "STUB_OK: Create one synthetic artifact."
+        assert _row_counts(store)["runs"] == 1
+        assert _row_counts(store)["delegations"] == 1
+    finally:
+        restarted.shutdown()

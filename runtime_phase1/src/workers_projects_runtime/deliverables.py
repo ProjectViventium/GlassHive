@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import os
+import base64
+import binascii
+import hashlib
+import json
 import re
+import stat
+import uuid
 import zipfile
 from pathlib import Path
 from urllib.parse import quote
@@ -63,6 +69,11 @@ USER_DELIVERABLE_DIR_PRIORITY = {
     "output": 2,
 }
 SUPPORT_ARTIFACT_DIR_NAMES = {"research", "planning", "specs", "notes"}
+NATIVE_MEDIA_PREFIX = Path("artifacts/native-media")
+NATIVE_MEDIA_MAX_ITEMS = 24
+NATIVE_MEDIA_MAX_BYTES = 8 * 1024 * 1024
+NATIVE_MEDIA_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+NATIVE_IMAGE_SUFFIXES = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
 PROFESSIONAL_ARTIFACT_EXTENSIONS = {
     ".doc",
     ".docx",
@@ -87,7 +98,9 @@ OLE_ARTIFACT_EXTENSIONS = {".doc", ".ppt", ".xls"}
 OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
-def is_user_deliverable_relative_path(relative_path: Path | str) -> bool:
+def is_user_deliverable_relative_path(
+    relative_path: Path | str, *, is_directory: bool = False
+) -> bool:
     try:
         rel = Path(str(relative_path))
     except TypeError:
@@ -104,7 +117,7 @@ def is_user_deliverable_relative_path(relative_path: Path | str) -> bool:
         return False
     if any(part.startswith(".") for part in lowered_parts):
         return False
-    return rel.name.lower() not in NON_DELIVERABLE_FILE_NAMES
+    return is_directory or rel.name.lower() not in NON_DELIVERABLE_FILE_NAMES
 
 
 def candidate_html_paths(worker: dict, max_entries: int = 20) -> list[Path]:
@@ -141,21 +154,24 @@ def candidate_artifact_paths(worker: dict, max_entries: int = 50) -> list[Path]:
     if not root.exists():
         return []
     candidates: list[Path] = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        try:
-            rel = path.relative_to(root)
-        except ValueError:
-            continue
-        try:
-            if path.stat().st_size <= 0:
+    for directory, subdirectories, filenames in os.walk(root, followlinks=False):
+        relative_directory = Path(directory).relative_to(root)
+        subdirectories[:] = [
+            name for name in subdirectories
+            if is_user_deliverable_relative_path(relative_directory / name, is_directory=True)
+            and relative_directory / name != NATIVE_MEDIA_PREFIX
+        ]
+        for name in filenames:
+            rel = relative_directory / name
+            if not is_user_deliverable_relative_path(rel):
                 continue
-        except OSError:
-            continue
-        if not is_user_deliverable_relative_path(rel):
-            continue
-        candidates.append(path)
+            path = root / rel
+            try:
+                if not path.is_file() or path.stat().st_size <= 0:
+                    continue
+            except OSError:
+                continue
+            candidates.append(path)
 
     def priority(path: Path) -> tuple[int, float, str]:
         try:
@@ -169,6 +185,205 @@ def candidate_artifact_paths(worker: dict, max_entries: int = 50) -> list[Path]:
         return (directory_priority, -path.stat().st_mtime, rel.as_posix())
 
     return sorted(candidates, key=priority)[:max_entries]
+
+
+def _native_tool_images(stdout: str):
+    """Read typed tool results, never user uploads or image-like prose."""
+    calls: dict[str, str] = {}
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        message = event.get("message")
+        blocks = message.get("content") if isinstance(message, dict) else None
+        if event.get("type") == "assistant" and isinstance(blocks, list):
+            for block in blocks:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    call_id = block.get("id")
+                    if isinstance(call_id, str) and 0 < len(call_id) <= 200:
+                        calls[call_id] = str(block.get("name") or "")[:200]
+        results = []
+        if event.get("type") == "user" and isinstance(blocks, list):
+            for block in blocks:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                call_id = block.get("tool_use_id")
+                if isinstance(call_id, str) and call_id in calls:
+                    results.append((call_id, calls[call_id], block.get("content")))
+        item = event.get("item")
+        if (
+            event.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "mcp_tool_call"
+            and isinstance(item.get("id"), str)
+            and 0 < len(item["id"]) <= 200
+            and isinstance(item.get("result"), dict)
+        ):
+            results.append((item["id"], str(item.get("tool") or "")[:200], item["result"].get("content")))
+        for call_id, tool_name, content in results:
+            if not isinstance(content, list):
+                continue
+            for index, block in enumerate(content):
+                if not isinstance(block, dict) or block.get("type") != "image":
+                    continue
+                source = block.get("source")
+                if isinstance(source, dict):
+                    yield call_id, tool_name, index, source.get("media_type"), source.get("data") if source.get("type") == "base64" else None
+                else:
+                    yield call_id, tool_name, index, block.get("mimeType"), block.get("data")
+
+
+def _native_image_bytes(mime_type: object, encoded: object) -> tuple[bytes, str]:
+    if not isinstance(mime_type, str) or mime_type not in NATIVE_IMAGE_SUFFIXES or not isinstance(encoded, str):
+        raise ValueError("Unsupported native inline image")
+    if len(encoded) > ((NATIVE_MEDIA_MAX_BYTES + 2) // 3) * 4:
+        raise ValueError("Native inline image exceeds byte limit")
+    data = base64.b64decode(encoded, validate=True)
+    matches = {
+        "image/png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg": data.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9"),
+        "image/gif": data.startswith((b"GIF87a", b"GIF89a")),
+        "image/webp": data.startswith(b"RIFF") and data[8:12] == b"WEBP",
+    }
+    if not data or len(data) > NATIVE_MEDIA_MAX_BYTES or not matches[mime_type]:
+        raise ValueError("Invalid native inline image bytes")
+    return data, NATIVE_IMAGE_SUFFIXES[mime_type]
+
+
+def _publish_native_media(workspace: Path, relative: Path, data: bytes) -> None:
+    # Reuse the existing no-follow workspace directory owner. Publish a complete new
+    # inode, so a worker-created symlink/hardlink is never followed or truncated.
+    from .bootstrap import _sandbox_parent_descriptor
+
+    with _sandbox_parent_descriptor(workspace, relative) as (parent_fd, filename):
+        temporary = ".native-media-" + uuid.uuid4().hex
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent_fd)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, filename, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+
+
+def capture_native_media(workspace: Path, run_id: str, stdout: str) -> dict[str, object]:
+    """Preserve native image observations without choosing a user deliverable."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", run_id):
+        raise ValueError("Invalid native media run identity")
+    observations = []
+    seen = set()
+    total_bytes = 0
+    omitted = 0
+    for call_id, tool_name, index, mime_type, encoded in _native_tool_images(stdout):
+        try:
+            data, suffix = _native_image_bytes(mime_type, encoded)
+            digest = hashlib.sha256(data).hexdigest()
+            identity = (call_id, index, digest)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if len(observations) >= NATIVE_MEDIA_MAX_ITEMS or total_bytes + len(data) > NATIVE_MEDIA_MAX_TOTAL_BYTES:
+                omitted += 1
+                continue
+            relative = NATIVE_MEDIA_PREFIX / run_id / (digest + suffix)
+            _publish_native_media(workspace, relative, data)
+            observations.append({
+                "kind": "image", "source": "native_tool_result", "artifact_ref": "artifact_sha256:" + digest,
+                "run_id": run_id, "tool_call_id": call_id, "tool_name": tool_name, "content_index": index,
+                "mime_type": mime_type, "bytes": len(data), "sha256": digest, "workspace_path": relative.as_posix(),
+            })
+            total_bytes += len(data)
+        except (OSError, ValueError, binascii.Error):
+            omitted += 1
+    return {"observations": observations, "omitted_count": omitted}
+
+
+def _native_media_snapshot(workspace: Path, relative: Path, max_bytes: int) -> bytes:
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptors = [os.open(workspace, directory_flags)]
+    try:
+        for part in relative.parts[:-1]:
+            descriptors.append(os.open(part, directory_flags, dir_fd=descriptors[-1]))
+        fd = os.open(relative.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), dir_fd=descriptors[-1])
+        descriptors.append(fd)
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > max_bytes:
+            raise ValueError("Native media source is not a bounded regular file")
+        with os.fdopen(os.dup(fd), "rb") as handle:
+            data = handle.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError("Native media source exceeds byte limit")
+        return data
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def native_media_observations(worker: dict, run: dict) -> dict[str, object]:
+    """Resolve only hash-verified observations from the exact terminal run evidence."""
+    empty = {"observations": [], "omitted_count": 0}
+    run_id = str(run.get("run_id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", run_id) or not worker.get("workspace_dir"):
+        return empty
+    workspace = Path(worker["workspace_dir"])
+    try:
+        evidence = json.loads(_native_media_snapshot(workspace, Path("glasshive-run/runs") / run_id / "evidence.json", 4 * 1024 * 1024))
+        if evidence.get("run_id") != run_id or evidence.get("schema") != "glasshive.run.evidence.v1" or evidence.get("worker", {}).get("worker_id") != worker.get("worker_id"):
+            return empty
+        media = evidence.get("native_media", {})
+        items = media.get("observations", [])
+        if not isinstance(items, list):
+            return empty
+        omitted = media.get("omitted_count", 0)
+        omitted = omitted if isinstance(omitted, int) and not isinstance(omitted, bool) and omitted >= 0 else 0
+        verified = []
+        total_bytes = 0
+        for item in items[:NATIVE_MEDIA_MAX_ITEMS]:
+            try:
+                if not isinstance(item, dict) or item.get("run_id") != run_id or item.get("source") != "native_tool_result" or item.get("kind") != "image":
+                    raise ValueError("Invalid native media observation")
+                digest = item.get("sha256")
+                relative = Path(str(item.get("workspace_path") or ""))
+                mime_type = item.get("mime_type")
+                call_id = item.get("tool_call_id")
+                index = item.get("content_index")
+                if (
+                    not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest)
+                    or relative.parent != NATIVE_MEDIA_PREFIX / run_id or relative.stem != digest
+                    or item.get("artifact_ref") != "artifact_sha256:" + digest
+                    or not isinstance(mime_type, str) or mime_type not in NATIVE_IMAGE_SUFFIXES
+                    or relative.suffix != NATIVE_IMAGE_SUFFIXES[mime_type]
+                    or not isinstance(call_id, str) or not 0 < len(call_id) <= 200
+                    or not isinstance(index, int) or isinstance(index, bool) or not 0 <= index <= 4096
+                    or not isinstance(item.get("bytes"), int) or isinstance(item.get("bytes"), bool)
+                ):
+                    raise ValueError("Invalid native media artifact identity")
+                data = _native_media_snapshot(workspace, relative, NATIVE_MEDIA_MAX_BYTES)
+                if len(data) != item.get("bytes") or hashlib.sha256(data).hexdigest() != digest:
+                    raise ValueError("Native media artifact changed")
+                if total_bytes + len(data) > NATIVE_MEDIA_MAX_TOTAL_BYTES:
+                    raise ValueError("Native media observations exceed byte limit")
+                total_bytes += len(data)
+                tool_name = item.get("tool_name")
+                verified.append({
+                    "kind": "image", "source": "native_tool_result", "artifact_ref": "artifact_sha256:" + digest,
+                    "run_id": run_id, "tool_call_id": call_id, "tool_name": tool_name[:200] if isinstance(tool_name, str) else "",
+                    "content_index": index, "mime_type": mime_type, "bytes": len(data), "sha256": digest,
+                    "workspace_path": relative.as_posix(),
+                })
+            except (OSError, ValueError):
+                omitted += 1
+        return {"observations": verified, "omitted_count": omitted + max(0, len(items) - NATIVE_MEDIA_MAX_ITEMS)}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return empty
 
 
 def is_valid_professional_artifact(path: Path) -> bool:

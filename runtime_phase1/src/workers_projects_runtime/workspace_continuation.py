@@ -60,6 +60,35 @@ def _validated_continuation_context(value: object) -> dict[str, Any] | None:
         "guidance": [str(item).strip() for item in guidance],
     }
 
+
+def accepted_run_input(run: dict[str, Any]) -> dict[str, Any]:
+    """Project the durable accepted input without rendering or parsing prose."""
+    instruction = run.get("instruction")
+    run_id = run.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip() or not isinstance(instruction, str):
+        raise ValueError("Invalid accepted run input")
+    raw_context = run.get("continuation_context_json")
+    if isinstance(raw_context, str):
+        try:
+            raw_context = json.loads(raw_context or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("Invalid workspace continuation context") from exc
+    validated = _validated_continuation_context(raw_context)
+    result: dict[str, Any] = {
+        "version": 1,
+        "run_id": run_id,
+        "instruction": instruction,
+    }
+    if validated is not None:
+        # Validation shares the admission contract; preserve accepted bytes,
+        # including whitespace and the ordered guidance, in the wire projection.
+        result["continuation_context"] = {
+            "version": 1,
+            "base_instruction": raw_context["base_instruction"],
+            "guidance": list(raw_context["guidance"]),
+        }
+    return result
+
 def build_workspace_continuation_context(
     *,
     previous_run: dict[str, Any],

@@ -42,7 +42,7 @@ from .mcp_oauth import McpOAuthConfigurationError, oauth_from_env
 from .mcp_internal_assertions import McpInternalAssertionError, signed_runtime_assertion
 from .models import CLOSED_WORKER_STATES
 from .release_provenance import release_provenance
-from .runtime_requirements import host_runtime_requirement_issue
+from .runtime_requirements import CLAUDE_CODE_EFFORT_LEVELS, host_runtime_requirement_issue
 from .runtime_env import load_viventium_runtime_env
 from .runtime_identity import derive_legacy_backend_label
 from .workspace_continuation import (
@@ -748,8 +748,8 @@ def _apply_effort_to_bundle(bundle: dict[str, Any], *, profile: str, effort: str
         next_bundle["env"] = env
         return next_bundle
     if profile == "claude-code":
-        if clean_effort not in {"default", "max", "xhigh"}:
-            raise ValueError("Claude effort must be default, max, or xhigh")
+        if clean_effort not in CLAUDE_CODE_EFFORT_LEVELS:
+            raise ValueError("Claude effort must be default, low, medium, high, xhigh, or max")
         if clean_effort == "default":
             return next_bundle
         env = dict(next_bundle.get("env") or {})
@@ -3269,7 +3269,14 @@ class WorkersProjectsApiClient:
             raise ValueError("GlassHive API path contains an invalid empty or relative segment")
         return clean
 
-    def _request(self, method: str, path: str, *, json_body: dict[str, Any] | None = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> Any:
         path = self._validated_request_path(path)
         url = f"{self.base_url}{path}"
         headers: dict[str, str] = {}
@@ -3302,6 +3309,11 @@ class WorkersProjectsApiClient:
                 value = _header_value(request_headers, name)
                 if value:
                     headers[name] = value
+        for name, value in (extra_headers or {}).items():
+            if name.lower() not in {"idempotency-key", SERVICE_ASSERTION_HEADER.lower()}:
+                raise ValueError("Unsupported GlassHive account API request header")
+            if str(value or "").strip():
+                headers[name] = str(value).strip()
         with httpx.Client(timeout=self.timeout_sec) as client:
             response = client.request(method, url, json=json_body, headers=headers)
             if response.status_code >= 400:
@@ -3312,6 +3324,19 @@ class WorkersProjectsApiClient:
                 if isinstance(payload, dict) and payload.get("failure_class"):
                     raise GlassHiveBlockedError(payload)
                 detail = payload.get("detail") if isinstance(payload, dict) else None
+                if (
+                    isinstance(detail, dict)
+                    and isinstance(detail.get("code"), str)
+                    and re.fullmatch(r"[a-z0-9_.:-]{1,120}", detail["code"])
+                ):
+                    # Preserve the account API's typed rejection across MCP. A
+                    # temporary capacity rejection is not a permanent tool error.
+                    raise GlassHiveBlockedError({
+                        "failure_class": detail["code"],
+                        "failure_user_message": str(detail.get("message") or "")[:1000],
+                        "failure_retryable": response.status_code in {429, 502, 503, 504},
+                        "retry_after": response.headers.get("retry-after"),
+                    })
                 if 400 <= response.status_code < 500 and isinstance(detail, str) and detail.strip():
                     raise GlassHiveApiError(response.status_code, detail)
             response.raise_for_status()
@@ -4186,7 +4211,7 @@ def create_mcp_server(
         ] = None,
         claude_effort: Annotated[
             str | None,
-            Field(description="Optional Claude Code default effort: max, xhigh, or empty/default to use deployment default."),
+            Field(description="Optional Claude Code default effort: low, medium, high, xhigh, max, or empty/default to use deployment default."),
         ] = None,
         openclaw_effort: Annotated[
             str | None,
@@ -4704,7 +4729,7 @@ def create_mcp_server(
                 description=(
                     "Optional per-run effort override. Codex accepts none/low/medium/high/xhigh; "
                     "minimal is for explicitly allowlisted deployments only. "
-                    "Claude Code accepts max/xhigh; OpenClaw accepts high/max. Omit to use the user's saved default. "
+                    "Claude Code accepts default/low/medium/high/xhigh/max; OpenClaw accepts high/max. Omit to use the user's saved default. "
                     + HIGH_EFFORT_SELECTION_GUIDANCE
                 )
             ),
@@ -4716,6 +4741,26 @@ def create_mcp_server(
         require_callback: bool = False,
         expose_diagnostics: bool = False,
     ) -> dict[str, Any]:
+        signed_launch_payload = {
+            "title": title,
+            "instruction": instruction,
+            "goal": goal,
+            "project_id": project_id,
+            "owner_id": owner_id,
+            "worker_name": worker_name,
+            "worker_role": worker_role,
+            "alias": alias,
+            "reuse_existing_workspace": reuse_existing_workspace,
+            "profile": profile,
+            "backend": backend,
+            "execution_mode": execution_mode,
+            "workspace_root": workspace_root,
+            "bootstrap_profile": bootstrap_profile,
+            "connected_account_content_intent": connected_account_content_intent,
+            "effort": effort,
+            "require_callback": require_callback,
+            "expose_diagnostics": expose_diagnostics,
+        }
         expose_diagnostics = _effective_diagnostics_requested(
             expose_diagnostics,
             tool_name="worker_delegate_once",
@@ -4730,7 +4775,7 @@ def create_mcp_server(
         resolved_profile = _resolve_profile_from_preferences(profile, preferences)
         resolved_effort = _resolve_effort_for_profile(resolved_profile, effort, preferences)
         clean_title = title.strip() or "GlassHive task"
-        clean_goal = (goal or instruction).strip()
+        clean_goal = (goal or clean_title).strip()
         clean_instruction = instruction.strip()
         if not clean_instruction:
             raise ValueError("instruction is required")
@@ -4828,6 +4873,113 @@ def create_mcp_server(
                 "callback_ready": False,
                 "missing_callback_fields": missing_callback_fields,
             }
+
+        atomic_delegate = getattr(client, "create_delegation", None)
+        if callable(atomic_delegate) and not project_id and not reuse_existing_workspace and not favorite:
+            tenant_id, account_owner_id = _account_request_scope(resolved_owner_id)
+            request_surface = _header_value(_request_headers(), HEADER_SURFACE).lower()
+            origin_surface = (
+                request_surface
+                if request_surface in {"telegram", "voice", "web", "workbench", "scheduler"}
+                else "web"
+            )
+            delegation_payload = {
+                "title": clean_title,
+                "goal": clean_goal,
+                "instruction": worker_instruction,
+                "profile": resolved_profile,
+                "executionMode": resolved_execution_mode,
+                "resourceClass": resource_class,
+                "workerName": (worker_name or clean_title).strip(),
+                "workerRole": (worker_role or "General intelligent worker").strip(),
+                "workspaceRoot": workspace_root,
+                "bootstrapProfile": bootstrap_profile,
+                "bootstrapBundle": bundle,
+                "originSurface": origin_surface,
+            }
+            idempotency_key = _trusted_operation_idempotency_key(
+                "ghd",
+                tenant_id=tenant_id,
+                owner_id=account_owner_id,
+                payload=delegation_payload,
+                signed_launch_payload=signed_launch_payload,
+            )
+            try:
+                accepted = atomic_delegate(
+                    tenant_id=tenant_id,
+                    owner_id=account_owner_id,
+                    idempotency_key=idempotency_key,
+                    payload=delegation_payload,
+                )
+            except GlassHiveBlockedError as exc:
+                return _blocked_dispatch_result(
+                    exc.payload,
+                    profile=resolved_profile,
+                    execution_mode=resolved_execution_mode,
+                    effort=resolved_effort,
+                    alias=resolved_alias,
+                )
+            work_ref = str(accepted.get("workRef") or "").strip()
+            if not work_ref:
+                raise ValueError("GlassHive atomic delegation did not return workRef")
+            view_steer_url = str(accepted.get("viewRef") or "").strip()
+            operator_base = (
+                os.environ.get("GLASSHIVE_OPERATOR_BASE_URL", "").strip()
+                or os.environ.get("WPR_OPERATOR_BASE_URL", "").strip()
+            ).rstrip("/")
+            if view_steer_url.startswith("/") and operator_base:
+                view_steer_url = f"{operator_base}{view_steer_url}"
+            state = str(accepted.get("state") or "queued")
+            result: dict[str, Any] = {
+                "status": "dispatched",
+                "work_ref": work_ref,
+                "run_state": state,
+                "resource_class": str(accepted.get("resourceClass") or resource_class),
+                "callback_ready": callback_ready,
+                "callback_delivery": (
+                    "optional"
+                    if callback_ready
+                    else "not_configured_standalone_polling_available"
+                ),
+                **(
+                    {"callback_delivery_deadline_seconds": _callback_delivery_deadline_seconds()}
+                    if callback_ready
+                    else {}
+                ),
+                "missing_callback_fields": missing_callback_fields,
+                "idempotent_replay": bool(accepted.get("idempotentReplay")),
+                "result_tools": {
+                    "roster": "active_work_list",
+                    "status": "active_work_list",
+                    "control": "active_work_action",
+                },
+                "view_steer": _view_steer_link(
+                    task=clean_title,
+                    url=view_steer_url,
+                    terminal=state.strip().lower()
+                    in {"completed", "failed", "cancelled", "interrupted", "stopped"},
+                ),
+            }
+            if view_steer_url:
+                result["view_steer_url"] = view_steer_url
+            if runtime_recovery:
+                result["runtime_recovery"] = runtime_recovery
+            if expose_diagnostics:
+                result.update(
+                    {
+                        "execution_mode": resolved_execution_mode,
+                        "profile": resolved_profile,
+                        "effort": resolved_effort,
+                        "alias": resolved_alias,
+                        "submitted_instruction": worker_instruction,
+                        "delegation_audit": {
+                            "title": _audit_preview(clean_title, max_chars=180),
+                            "goal": _audit_preview(clean_goal, max_chars=360),
+                            "instruction_preview": _audit_preview(worker_instruction),
+                        },
+                    }
+                )
+            return result
 
         existing_workspace = None
         if reuse_existing_workspace and not project_id and alias:
@@ -5094,7 +5246,7 @@ def create_mcp_server(
                 description=(
                     "Optional per-run effort override. Codex accepts none/low/medium/high/xhigh; "
                     "minimal is for explicitly allowlisted deployments only. "
-                    "Claude Code accepts max/xhigh; OpenClaw accepts high/max. Omit to use saved user preferences or deployment default. "
+                    "Claude Code accepts default/low/medium/high/xhigh/max; OpenClaw accepts high/max. Omit to use saved user preferences or deployment default. "
                     + HIGH_EFFORT_SELECTION_GUIDANCE
                 )
             ),
@@ -6864,7 +7016,7 @@ def create_mcp_server(
                 description=(
                     "Optional effort override for this continuation. Codex accepts none/low/medium/high/xhigh; "
                     "minimal is for explicitly allowlisted deployments only. "
-                    "Claude Code accepts max/xhigh; OpenClaw accepts high/max. Omit to use the user's saved default. "
+                    "Claude Code accepts default/low/medium/high/xhigh/max; OpenClaw accepts high/max. Omit to use the user's saved default. "
                     + HIGH_EFFORT_SELECTION_GUIDANCE
                 )
             ),

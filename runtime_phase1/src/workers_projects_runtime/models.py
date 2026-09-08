@@ -319,6 +319,18 @@ class CallbackAssociationVerifyRequest(BaseModel):
     worker_id: str = Field(alias="workerId", min_length=8, max_length=192)
     run_id: str = Field(alias="runId", min_length=8, max_length=192)
 
+class TerminalCallbackRecoveryRequest(CallbackAssociationVerifyRequest):
+    callback_id: str = Field(alias="callbackId", pattern=r"^cb_terminal_[a-f0-9]{64}$")
+    result_revision: int = Field(alias="resultRevision", ge=1, strict=True)
+    result_digest: str = Field(alias="resultDigest", pattern=r"^sha256:[a-f0-9]{64}$")
+
+
+class LifecycleCallbackRecoveryRequest(CallbackAssociationVerifyRequest):
+    callback_ref: str = Field(alias="callbackRef", pattern=r"^callback_sha256:[a-f0-9]{64}$")
+    payload_sha256: str = Field(alias="payloadSha256", pattern=r"^sha256:[a-f0-9]{64}$")
+    authority_sha256: str = Field(alias="authoritySha256", pattern=r"^sha256:[a-f0-9]{64}$")
+
+
 class CapabilityReauthorizationRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
@@ -386,6 +398,16 @@ class ActiveWorkSourceContextRequest(BaseModel):
     ]
     output_contract: ContinuationOutputContractRequest = Field(alias="outputContract")
 
+class NativeInputResponseRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    version: Literal[1]
+    request_id: str = Field(alias="requestId", min_length=1, max_length=512)
+    request_fingerprint: str = Field(alias="requestFingerprint", pattern=r"^[a-f0-9]{64}$")
+    action: Literal["accept", "decline", "cancel"]
+    content: dict[str, object] | None = None
+
+
 class ActiveWorkActionRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
@@ -399,6 +421,7 @@ class ActiveWorkActionRequest(BaseModel):
         "retry",
         "dismiss",
     ]
+    native_input: NativeInputResponseRequest | None = Field(default=None, alias="nativeInput")
     instruction: str | None = Field(default=None, max_length=100000)
     capability_reauthorization: CapabilityReauthorizationRequest | None = Field(
         default=None, alias="capabilityReauthorization"
@@ -415,6 +438,10 @@ class ActiveWorkActionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_source_context_action(self) -> "ActiveWorkActionRequest":
+        if self.native_input is not None and (
+            self.action != "resume" or self.capability_reauthorization is not None or self.source_context is not None
+        ):
+            raise ValueError("Native input is valid only for an explicit input response")
         if self.source_context is not None and self.action not in {
             "queue", "message", "steer", "retry"
         }:

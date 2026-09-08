@@ -651,14 +651,12 @@ def test_two_standard_delegations_have_one_capacity_winner_at_5_62_gib(
         resource_class="standard",
     )
 
-    assert len(accepted) == 1
-    assert len(blocked) == 1
-    assert blocked[0].capacity_class == "resource_pressure"
-    assert blocked[0].reservation["memoryBytes"] == STANDARD_MEMORY_BYTES
-    assert blocked[0].required["memoryBytes"] == (
-        HEADROOM_MEMORY_BYTES + STANDARD_MEMORY_BYTES
-    )
-    assert len(Store(database).list_all_workers()) == 1
+    assert len(accepted) == 2
+    assert blocked == []
+    store = Store(database)
+    assert len(store.list_all_workers()) == 2
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM host_run_leases WHERE status = 'active'").fetchone()[0] == 1
 
 
 def _claimed_worker_run(store: Store, suffix: str) -> tuple[dict, dict]:

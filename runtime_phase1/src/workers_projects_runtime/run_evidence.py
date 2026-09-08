@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .secret_redaction import CREDENTIAL_REDACTIONS
+
 import json
 import csv
 import hashlib
@@ -46,16 +48,19 @@ _SECRET_KEY_MARKERS = (
     "CREDENTIAL",
     "AUTH",
 )
-_SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+_LOCAL_PATH_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"/Users/[^/\s\"'`]+(?:/[^\s\"'`]+)+"), "[REDACTED_LOCAL_PATH]"),
     (re.compile(r"~/[^\s\"'`]+(?:/[^\s\"'`]+)+"), "[REDACTED_LOCAL_PATH]"),
     (re.compile(r"/Users/[^/\s\"']+"), "~"),
+)
+_OWNER_SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)((?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s\"']{6,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)([?&](?:gh_token|gh_sig|gh_exp|gh_kind)=)([^&#\s\"']+)"), r"\1[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
-    (re.compile(r"\b[A-Za-z0-9_]{8,}:[A-Za-z0-9_./+=-]{20,}\b"), "[REDACTED_CREDENTIAL]"),
+    *CREDENTIAL_REDACTIONS,
 )
+_SECRET_REDACTIONS = (*_LOCAL_PATH_REDACTIONS, *_OWNER_SECRET_REDACTIONS)
 _FINAL_REPORT_RE = re.compile(
     r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*)?"
     r"(?:(?:[*_]{1,3}|`{1,3})[ \t]*)?FINAL REPORT\s*:\s*"
@@ -523,14 +528,11 @@ def _constraint_instruction(worker: dict[str, object], fallback: str) -> str:
 
     The durable worker bundle can preserve the launch-time source as a fallback, but it cannot
     describe later Message/Queue continuations.  The run instruction is therefore authoritative
-    after removing the host's explicitly labelled recent-conversation projection.  Verbatim
-    triggering user segments and later continuation guidance remain in the ledger.
+    without parsing headings or prose. Verbatim triggering user segments and later
+    continuation guidance remain in the retained input.
     """
 
-    current_run_instruction = _without_projected_context_section(
-        str(fallback or ""),
-        heading="## Recent conversation context",
-    )
+    current_run_instruction = str(fallback or "")
     if current_run_instruction:
         return current_run_instruction
 
@@ -546,10 +548,9 @@ def _constraint_instruction(worker: dict[str, object], fallback: str) -> str:
     instruction = source.get("instruction")
     if source.get("version") != 1 or not isinstance(instruction, str):
         return fallback
-    clean = instruction.strip()
-    if not clean or len(clean.encode("utf-8")) > 128 * 1024:
-        return str(fallback or "").strip()
-    return clean
+    if not instruction.strip() or len(instruction.encode("utf-8")) > 128 * 1024:
+        return str(fallback or "")
+    return instruction
 
 def _constraint_source_instruction(worker: dict[str, object]) -> str:
     try:
@@ -566,7 +567,7 @@ def _constraint_source_instruction(worker: dict[str, object]) -> str:
         or not isinstance(source.get("instruction"), str)
     ):
         return ""
-    instruction = str(source["instruction"]).strip()
+    instruction = str(source["instruction"])
     if not instruction or len(instruction.encode("utf-8")) > 128 * 1024:
         return ""
     return instruction
@@ -609,8 +610,8 @@ def _trusted_continuation_context(worker: dict[str, object]) -> dict[str, object
         raise ValueError("Invalid trusted continuation context")
     return {
         "version": 1,
-        "base_instruction": base_instruction.strip(),
-        "guidance": [str(item).strip() for item in guidance],
+        "base_instruction": base_instruction,
+        "guidance": list(guidance),
     }
 
 def _trusted_continuation_output_contract(
@@ -679,7 +680,7 @@ def _trusted_continuation_output_contract(
             )
         ):
             raise ValueError("Invalid trusted continuation output declaration")
-        return [str(item).strip() for item in value]
+        return list(value)
 
     mode = output.get("mode")
     if mode not in {"inherit", "replace"}:
@@ -852,61 +853,29 @@ def build_constraint_ledger(
         and not trusted_output_source
     ):
         raise ValueError("Missing trusted continuation output source")
-    deliverable_instruction_text = (
-        trusted_output_source
-        if continuation_context is not None or continuation_output is not None
-        else trusted_output_source or instruction_text
-    )
-    source_lines: list[str] = []
-    date_lines: list[str] = []
-    auth_lines: list[str] = []
-    scope_lines: list[str] = []
-    exclusion_lines: list[str] = []
-    required_output_lines: list[str] = []
-    forbidden_output_lines: list[str] = []
-    seed_lines: list[str] = []
-    memory_write_mode_off = _memory_write_mode_is_off(instruction_text)
+    # No runtime interpretation of natural-language goals. Preserve the admitted
+    # input and explicitly typed continuation authority for the worker model.
+    def owner_text(value: str) -> str:
+        text = value
+        for pattern, replacement in _OWNER_SECRET_REDACTIONS:
+            text = pattern.sub(replacement, text)
+        return text
 
-    for line in _lines(instruction_text):
-        if _line_is_passive_structured_context(line):
-            continue
-        lower = line.lower()
-        if _line_has_date_constraint_context(line):
-            date_lines.append(line)
-        if _contains_any(lower, ("source", "citation", "primary", "official", "public source", "web source", "evidence")):
-            source_lines.append(line)
-        if _contains_any(lower, ("auth", "login", "signed", "credential", "token", "session", "account")):
-            auth_lines.append(line)
-        if _contains_any(lower, ("only", "scope", "in scope", "out of scope", "do not", "must", "exclude", "include", "flag", "local", "cloud")):
-            scope_lines.append(line)
-        if _contains_any(lower, ("exclude", "do not exclude", "flag", "forbid", "forbidden", "must not", "not allowed")):
-            exclusion_lines.append(line)
-        if _contains_any(lower, ("seed", "seed file", "seed entity", "input file", "uploaded file")) and not _is_seed_block_heading(line):
-            seed_lines.append(line)
-    if continuation_output is None or continuation_output["mode"] == "inherit":
-        for line in _lines(deliverable_instruction_text):
-            if _line_is_passive_structured_context(line):
-                continue
-            if _line_has_required_output_context(line) and not (
-                memory_write_mode_off
-                and _line_is_memory_proposal_output_context(line)
-            ):
-                required_output_lines.append(line)
-            if _line_forbids_output(line):
-                forbidden_output_lines.extend(_forbidden_output_fragments(line))
+    def owner_value(value: object) -> object:
+        if isinstance(value, str):
+            return owner_text(value)
+        if isinstance(value, list):
+            return [owner_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: owner_value(item) for key, item in value.items()}
+        return value
 
-    def unique_redacted(values: list[str]) -> list[str]:
-        return list(dict.fromkeys(_redact_text(item) for item in values))
-
-    seeds = unique_redacted([*seed_lines, *_seed_block_lines(instruction_text), *_bootstrap_seed_files(worker)])
-    do_not_widen_or_soften = bool(
-        date_lines
-        or source_lines
-        or any(
-            _contains_any(line.lower(), ("only", "do not", "must", "no later than", "through", "until", "scope", "flag"))
-            for line in _lines(instruction_text)
-        )
-    )
+    outputs = {
+        "required": [], "forbidden": [],
+        "format_expectations": [], "forbidden_format_expectations": [],
+    }
+    if continuation_output is not None and continuation_output["mode"] == "replace":
+        outputs = {key: list(continuation_output[key]) for key in outputs}
     return {
         "schema": "glasshive.run.constraint-ledger.v1",
         "run_id": run_id,
@@ -918,45 +887,15 @@ def build_constraint_ledger(
             "runtime": str(worker.get("runtime") or ""),
             "backend": _derived_legacy_backend(worker),
         },
-        "original_request": _redact_text(instruction_text),
-        "constraints": {
-            "date": unique_redacted(date_lines),
-            "source": unique_redacted(source_lines),
-            "auth": unique_redacted(auth_lines),
-            "scope": unique_redacted(scope_lines),
-            "exclusion_or_flag": unique_redacted(exclusion_lines),
-        },
-        "outputs": (
-            {
-                "required": unique_redacted(required_output_lines),
-                "forbidden": unique_redacted(forbidden_output_lines),
-                "format_expectations": _required_output_formats(
-                    required_output_lines,
-                ),
-                "forbidden_format_expectations": _output_formats(
-                    forbidden_output_lines
-                ),
-            }
-            if continuation_output is None
-            or continuation_output["mode"] == "inherit"
-            else {
-                "required": unique_redacted(
-                    list(continuation_output["required"])
-                ),
-                "forbidden": unique_redacted(
-                    list(continuation_output["forbidden"])
-                ),
-                "format_expectations": list(
-                    continuation_output["format_expectations"]
-                ),
-                "forbidden_format_expectations": list(
-                    continuation_output["forbidden_format_expectations"]
-                ),
-            }
-        ),
-        "seed_entities_or_files": seeds,
-        "coverage_expectations": _coverage_expectations(deliverable_instruction_text),
-        "do_not_widen_or_soften": do_not_widen_or_soften,
+        "original_request": owner_text(instruction_text),
+        "original_output_source": owner_text(trusted_output_source),
+        "continuation_context": owner_value(continuation_context),
+        "typed_output_contract": owner_value(continuation_output),
+        "constraints": {key: [] for key in ("date", "source", "auth", "scope", "exclusion_or_flag")},
+        "outputs": owner_value(outputs),
+        "seed_entities_or_files": [],
+        "coverage_expectations": [],
+        "do_not_widen_or_soften": False,
     }
 
 
@@ -2176,73 +2115,9 @@ def _planning_file_preserves_source_date_constraints(text: str, constraint_lines
 
 
 def _constraint_compliance(workspace_dir: Path, ledger: dict[str, object] | None, *, output_text: str = "") -> dict[str, object]:
-    if not ledger:
-        return {"status": "not_available", "issues": []}
-    issues: list[dict[str, str]] = []
-    warnings: list[dict[str, str]] = []
-    latest_limit = _extract_latest_date_limit(ledger)
-    strict = bool(ledger.get("do_not_widen_or_soften"))
-    strict_source_date_lines = _source_date_constraint_lines(ledger) if strict else []
-    scanned_sources: list[str] = []
-    scan_entries, scan_warnings = _constraint_scan_texts(workspace_dir, output_text)
-    warnings.extend(scan_warnings)
-    for rel, text in scan_entries:
-        scanned_sources.append(rel)
-        if (
-            strict_source_date_lines
-            and _is_constraint_propagation_file(rel)
-            and not _planning_file_preserves_source_date_constraints(text, strict_source_date_lines)
-        ):
-            issues.append(
-                {
-                    "path": rel,
-                    "reason": "strict source/date constraints not referenced in planning file",
-                    "text": "Planning/spec/delegation file should reference constraint-ledger or restate strict source/date constraints.",
-                }
-            )
-        if latest_limit:
-            for year, month, mention, line in _month_year_mentions_with_context(text):
-                out_of_window = (
-                    (year, month) > latest_limit
-                    and not _is_rejected_or_out_of_scope_line(line)
-                    and not _is_access_timestamp_only_line(line)
-                )
-                if out_of_window and _line_uses_date_as_source_evidence(line, mention):
-                    issues.append(
-                        {
-                            "path": rel,
-                            "reason": "date/source window widened past ledger limit",
-                            "text": _redact_text(line.strip() or mention),
-                        }
-                    )
-                elif (
-                    strict
-                    and out_of_window
-                    and _is_constraint_propagation_file(rel)
-                    and _CONSTRAINT_CONTEXT_RE.search(line)
-                ):
-                    issues.append(
-                        {
-                            "path": rel,
-                            "reason": "planning source/date window widened past ledger limit",
-                            "text": _redact_text(line.strip() or mention),
-                        }
-                    )
-        if strict:
-            for line in _softening_lines(text, rel_path=rel):
-                issues.append(
-                    {
-                        "path": rel,
-                        "reason": "strict constraint softened in workspace file",
-                        "text": _redact_text(line, max_chars=240),
-                    }
-                )
-        if len(issues) >= 100:
-            break
     return {
-        "status": "fail" if issues else "warn" if warnings else "pass",
-        "issues": [*issues, *warnings][:100],
-        "scanned_sources": scanned_sources[:100],
+        "status": "not_applicable" if ledger else "not_available", "issues": [],
+        "reason": "Semantic constraints are interpreted by the worker model from the admitted input.",
     }
 
 
@@ -2466,61 +2341,27 @@ def _seed_entity_coverage(workspace_dir: Path, ledger: dict[str, object] | None,
 
 
 def _completion_compliance(
-    workspace_dir: Path,
     artifacts: dict[str, object],
-    ledger: dict[str, object] | None,
-    *,
-    has_final_report: bool,
-    output_text: str,
+    output_contract: dict[str, object] | None,
 ) -> dict[str, object]:
-    required = _required_artifact_types(ledger)
-    deliverable_intent = _has_required_deliverable_intent(ledger)
-    delivered = _delivered_artifact_types(artifacts)
-    delivered_set = set(delivered)
-    missing = [fmt for fmt in required if not (_format_aliases(fmt) & delivered_set)]
-    path_summary = _artifact_path_summary(artifacts)
-    seed_coverage = _seed_entity_coverage(workspace_dir, ledger, output_text)
-    notes_only = bool(path_summary["notes_only"])
-    issues: list[dict[str, object]] = []
-    if not has_final_report:
-        issues.append({"reason": "final report marker missing"})
-    if missing:
-        issues.append(
-            {
-                "reason": "required artifact types missing",
-                "missing_required_artifact_types": missing,
-            }
-        )
-    if notes_only and (required or deliverable_intent or not has_final_report):
-        issues.append({"reason": "only support notes/planning artifacts were found"})
-    if seed_coverage.get("status") == "warn":
-        issues.append(
-            {
-                "reason": "seed entities/files were not all found in scanned outputs",
-                "missing": seed_coverage.get("missing") or [],
-            }
-        )
+    """Check declared output formats against observed workspace artifacts.
 
-    fail_reasons = {
-        "final report marker missing",
-        "required artifact types missing",
-        "only support notes/planning artifacts were found",
-    }
-    status = "pass"
-    if any(str(issue.get("reason") or "") in fail_reasons for issue in issues):
-        status = "fail"
-    elif issues:
-        status = "warn"
+    Prose-derived ledgers cannot establish requirements or prove missing work.
+    The inventory remains workspace-scoped; native tool results own evidence for
+    authorized actions elsewhere on the host.
+    """
+    applicable = bool(output_contract and output_contract.get("mode") == "replace")
+    required = list(output_contract.get("format_expectations") or []) if applicable else []
+    delivered = _delivered_artifact_types(artifacts)
+    missing = [fmt for fmt in required if not (_format_aliases(fmt) & set(delivered))]
     return {
-        "status": status,
+        "status": ("fail" if missing else "pass") if applicable else "not_applicable",
+        "basis": "typed_output_contract" if applicable else "no_typed_output_contract",
+        "inventory_scope": "workspace",
         "required_artifact_types": required,
-        "required_deliverable_intent": deliverable_intent,
         "delivered_artifact_types": delivered,
         "missing_required_artifact_types": missing,
-        "notes_only": notes_only,
-        **path_summary,
-        "seed_entity_coverage": seed_coverage,
-        "issues": issues[:100],
+        "issues": [{"reason": "typed output formats missing", "formats": missing}] if missing else [],
     }
 
 
@@ -2569,34 +2410,36 @@ def summarize_run_evidence_result(evidence: dict[str, object]) -> dict[str, obje
 
     completion = evidence.get("completion_compliance")
     final_output = evidence.get("final_output")
-    if isinstance(final_output, dict) and not final_output.get("has_final_report"):
-        failure_reasons.append({"reason": "final report marker missing"})
+    if isinstance(final_output, dict):
+        if final_output.get("error_present") or final_output.get("status") == "failed":
+            failure_reasons.append({"reason": "native result reports failure"})
+        if final_output.get("output_chars") == 0:
+            failure_reasons.append({"reason": "native result is empty"})
 
     if isinstance(completion, dict):
-        completion_status = str(completion.get("status") or "").lower()
-        issues = completion.get("issues") if isinstance(completion.get("issues"), list) else []
-        if completion_status == "fail":
-            failure_reasons.append({"reason": "completion compliance failed", "issues": issues[:10]})
-        elif completion_status == "warn":
-            warning_reasons.append({"reason": "completion compliance warning", "issues": issues[:10]})
+        contract = evidence.get("typed_output_contract")
+        if isinstance(contract, dict) and contract.get("mode") == "replace":
+            delivered = set(completion.get("delivered_artifact_types") or [])
+            missing = [
+                fmt for fmt in contract.get("format_expectations", [])
+                if not (_format_aliases(fmt) & delivered)
+            ]
+            if missing:
+                failure_reasons.append({"reason": "typed output formats missing", "formats": missing})
 
     coverage = evidence.get("coverage_compliance")
     if isinstance(coverage, dict):
         coverage_status = str(coverage.get("status") or "").lower()
         issues = coverage.get("issues") if isinstance(coverage.get("issues"), list) else []
-        if coverage_status == "fail":
-            failure_reasons.append({"reason": "coverage compliance failed", "issues": issues[:10]})
-        elif coverage_status == "warn":
-            warning_reasons.append({"reason": "coverage compliance warning", "issues": issues[:10]})
+        if coverage_status in {"fail", "warn"}:
+            warning_reasons.append({"reason": "coverage diagnostic warning", "issues": issues[:10]})
 
     constraint = evidence.get("constraint_compliance")
     if isinstance(constraint, dict):
         constraint_status = str(constraint.get("status") or "").lower()
         issues = constraint.get("issues") if isinstance(constraint.get("issues"), list) else []
-        if constraint_status == "fail":
-            failure_reasons.append({"reason": "constraint compliance failed", "issues": issues[:10]})
-        elif constraint_status == "warn":
-            warning_reasons.append({"reason": "constraint compliance warning", "issues": issues[:10]})
+        if constraint_status in {"fail", "warn", "not_available"}:
+            warning_reasons.append({"reason": "constraint diagnostic warning", "issues": issues[:10]})
 
     invalid_artifacts = _invalid_professional_artifacts(
         evidence.get("artifacts") if isinstance(evidence.get("artifacts"), dict) else {}
@@ -2703,6 +2546,7 @@ def build_run_evidence(
         "status": "ok" if exit_code == 0 and not str(error_text or "").strip() else "failed",
     }
     effective_effort = _effective_effort(worker, command, env)
+    output_contract = _trusted_continuation_output_contract(worker, run_id=run_id)
     evidence: dict[str, object] = {
         "schema": "glasshive.run.evidence.v1",
         "run_id": run_id,
@@ -2741,19 +2585,14 @@ def build_run_evidence(
         "visual_render_evidence": _visual_render_summary(artifacts),
         "content_hygiene": check_content_hygiene(_text_artifact_payload(workspace)),
         "constraint_compliance": _constraint_compliance(workspace, constraint_ledger, output_text=output_text),
+        "typed_output_contract": output_contract,
         "coverage_compliance": _coverage_compliance(
             workspace,
             artifacts,
             constraint_ledger,
             output_text=output_text,
         ),
-        "completion_compliance": _completion_compliance(
-            workspace,
-            artifacts,
-            constraint_ledger,
-            has_final_report=has_final_report,
-            output_text=output_text,
-        ),
+        "completion_compliance": _completion_compliance(artifacts, output_contract),
         "final_output": final_output,
         "failure_classification": _failure_classification_summary(
             stdout_text=stdout_text,
@@ -2776,6 +2615,8 @@ def write_run_evidence(workspace_dir: Path | str, evidence: dict[str, object], r
     latest_path.parent.mkdir(parents=True, exist_ok=True)
     per_run_path.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(evidence, indent=2, sort_keys=True)
-    latest_path.write_text(body + "\n")
-    per_run_path.write_text(body + "\n")
-    return latest_path
+    # Completion consumers need immutable run identity, not the mutable latest alias.
+    with _EVIDENCE_WRITE_LOCK:
+        _atomic_write_text(per_run_path, body + "\n")
+        _atomic_write_text(latest_path, body + "\n")
+    return per_run_path

@@ -42,3 +42,7 @@ har/
 *.mov
 *.webm
 *.har
+
+# Merge and patch recovery files stay in private recovery storage.
+*.orig
+*.rej

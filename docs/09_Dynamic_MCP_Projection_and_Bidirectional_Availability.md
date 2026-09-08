@@ -408,6 +408,36 @@ Suggested payload fields:
 7. `artifact_refs`
 8. a scoped `actionCapabilities` item when the runtime can prove a retryable failed or active run
 
+### Accepted Run Input
+
+Terminal callbacks preserve `run_input` separately from result text: version 1, the exact
+`run_id` and accepted `instruction`, plus the existing versioned `continuation_context`
+when present. That context retains the original `base_instruction` and ordered accepted
+`guidance` from follow-up, queue and steer actions. The host can give Main the current
+request and retained constraints without parsing worker prose or clipping them as output.
+
+The producer rereads the durable run and the existing outbox transaction verifies this
+input against the same run as the terminal result. Caller-supplied or stale input cannot
+replace it. Replay preserves the accepted payload, including older callbacks without this
+optional field. This adds no prompt rule, semantic selector or new authority source.
+
+### Native Image Observations
+
+Typed native tool image results are preserved by the existing per-run evidence writer. Each
+observation binds the exact run, tool call, content index, MIME type, byte count and SHA-256 to an
+owner-scoped artifact. These observations are excluded from automatic deliverable selection.
+Terminal callbacks carry `native_media.observations` with existing signed artifact links and an
+explicit `omitted_count`; they carry neither base64 bytes nor local paths. The existing callback
+outbox retains the accepted links and result identity on replay.
+
+The host verifies the signed image bytes before giving ordinary image content to Main for its
+own selection. GlassHive projects authenticated inline image inputs through its existing file
+owner: Codex receives native `--image` inputs and Claude receives typed JSONL image blocks.
+Caller-supplied image paths cannot grant a read, remote URLs are not fetched here, and changed
+or unavailable input bytes fail truthfully. The bounded transport accepts PNG, JPEG, GIF and
+WebP: at most 24 observations, 8 MiB per image and 32 MiB per request. This adds no screenshot
+selector, forced file, prompt rule or new permission owner.
+
 ## C. Telegram To Worker Routing
 
 ### The Correct Place To Implement It
@@ -481,6 +511,34 @@ label, and changing it replaces an existing conversation session before reuse. A
 `WPR_HOST_NATIVE_WEB_ACCESS` value takes precedence over the standalone
 `GLASSHIVE_HOST_NATIVE_WEB_ACCESS` fallback; the alias is consulted only when the compiled value is
 absent.
+
+Host Claude missions keep native stream input open for MCP elicitation under the existing durable
+process supervisor. The exact live worker/run exposes a pending form or URL request through account
+Active Work. Only an authenticated owner control with a signed digest of the exact HTTP request body
+can answer it; model work-action tools cannot accept requests. The response binds the native request
+fingerprint and supports explicit accept, decline, or cancel. Form values are validated against the
+requested schema, including supported formats and array bounds, before publication. Invalid answers
+leave the request pending. Complete private response bytes are published once; identical retries reuse
+the receipt and conflicting answers fail. Stop and the configured timeout retain the existing process
+group boundary, cancel pending requests, and never free admission merely because input is pending.
+The relay preserves native settings/hooks, selected MCP restrictions, model/effort, and retained
+session. The existing selected MCP stdio courier carries the native session observed in Claude's
+initialization event and the UUID of the actual user frame emitted by this relay. The private context
+is bound to this invocation and expires when it ends; caller-supplied context cannot replace it.
+These are the worker's own native identities, never a borrowed Codex session or completed run.
+The MCP turn metadata remains a typed object: encoding it as a JSON string hides the task identity
+from the native permission persistence service even when individual app calls still work.
+Unrelated MCP metadata and policy responses remain intact. Typed server method/display metadata is
+projected through Claude's existing `anthropic/permissionDisplay` envelope only when the server has
+not already supplied that envelope. Elicitation and ElicitationResult hooks still see and govern the
+request/response path. When the native service offers persistence scopes, the courier exposes only
+those supported scopes as an optional form choice, with no default. It restores an explicit accepted
+choice to native response metadata after result hooks run; decline, cancel and unchanged native hook
+metadata remain authoritative. The courier does not grant or store permissions itself.
+App/browser policy and native grant persistence remain owned by the native services. In-app-browser
+availability can require its own issued Codex session and must not be claimed through another
+harness's identity. Native terminal JSON determines result text; control frames and empty terminal results are not useful
+answers. Real app approval, useful completion, and reload are separate acceptance gates.
 
 Do not start with generic “bidirectional MCP federation.”
 

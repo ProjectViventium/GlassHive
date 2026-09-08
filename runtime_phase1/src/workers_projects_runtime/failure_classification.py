@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .secret_redaction import CREDENTIAL_REDACTIONS
+
 import json
 import re
 from dataclasses import dataclass
@@ -19,7 +21,13 @@ USER_RESUMABLE_FAILURE_CLASSES = frozenset(
     }
 )
 
-def is_user_resumable_failure(*, failure_class: object, retryable: object) -> bool:
+def is_user_resumable_failure(
+    *,
+    failure_class: object,
+    retryable: object,
+    runtime_invoked_at: object = ...,
+    started_at: object = ...,
+) -> bool:
     """Return whether an explicit user Retry may continue the durable workspace.
 
     Authentication repair is not an automatic retry condition: it needs a real
@@ -28,8 +36,19 @@ def is_user_resumable_failure(*, failure_class: object, retryable: object) -> bo
     existing workspace behind a Dismiss-only terminal card.
     """
 
-    return bool(retryable) or str(failure_class or "").strip().lower() in (
-        USER_RESUMABLE_FAILURE_CLASSES
+    normalized_class = str(failure_class or "").strip().lower()
+    # Earlier retry exhaustion cleared retryability. Recover only when the
+    # canonical run explicitly records no provider invocation or actual start;
+    # absent metadata is unknown, and post-start failures keep their own policy.
+    pre_execution_processor_failure = (
+        normalized_class == "service_processor_unexpected"
+        and runtime_invoked_at is None
+        and started_at is None
+    )
+    return (
+        bool(retryable)
+        or normalized_class in USER_RESUMABLE_FAILURE_CLASSES
+        or pre_execution_processor_failure
     )
 
 @dataclass(frozen=True)
@@ -78,6 +97,23 @@ def classify_cli_failure(
         stderr,
     )
 
+    if _has_provider_egress_payload_limit(stderr):
+        return FailureClassification(
+            failure_class="provider_context_limit_exceeded",
+            retryable=False,
+            user_message=(
+                "The worker's model request exceeded the provider context capacity before it "
+                "could finish."
+            ),
+            recommended_recovery=(
+                "Resume the same durable workspace with a focused continuation instruction; "
+                "GlassHive preserved its files and completed work."
+            ),
+            diagnostic_summary=diagnostic_summary,
+            structured=True,
+            provider_event_source="provider_native",
+        )
+
     if "content_filter" in lowered or "content filter" in lowered:
         return FailureClassification(
             failure_class="provider_content_filter",
@@ -90,6 +126,30 @@ def classify_cli_failure(
                 "success criteria, or adjust the request if the filter was expected."
             ),
             diagnostic_summary=diagnostic_summary,
+        )
+    trusted_capacity_class = _trusted_terminal_capacity_class(stdout, stderr)
+    if trusted_capacity_class == "provider_quota_exhausted":
+        return FailureClassification(
+            failure_class="provider_quota_exhausted",
+            retryable=True,
+            user_message=(
+                "The selected model provider quota was exhausted before the worker could finish."
+            ),
+            recommended_recovery=(
+                "Continue the same untouched mission on the explicitly configured fallback worker, "
+                "or restore provider quota; GlassHive preserved its files and completed work."
+            ),
+            diagnostic_summary=diagnostic_summary,
+            structured=True,
+            provider_event_source="provider_native",
+        )
+    # A final native `result` control event that reports an API error is the provider's own typed
+    # verdict for the attempt; classify it before any prose heuristic so a terminal post-artifact
+    # provider error is never demoted to an unclassified exit.
+    terminal_result = _terminal_native_provider_error(stdout, stderr)
+    if terminal_result is not None:
+        return _classify_terminal_native_provider_error(
+            terminal_result, diagnostic_summary=diagnostic_summary
         )
     if _looks_like_rate_limit_failure(lowered):
         return FailureClassification(
@@ -312,6 +372,27 @@ def classify_runtime_error(
             diagnostic_summary=message,
             structured=True,
         )
+    if not structured_failure_class:
+        # A raw worker-exit error carries the provider's terminal JSONL in its message. Recognize a
+        # usage/quota exhaustion only from the provider's own trusted terminal events so the run
+        # becomes structured provider_quota_exhausted and the configured fallback worker can take
+        # over automatically instead of failing as a generic runtime error.
+        trusted_capacity_class = _trusted_terminal_capacity_class(message)
+        if trusted_capacity_class == "provider_quota_exhausted":
+            return FailureClassification(
+                failure_class="provider_quota_exhausted",
+                retryable=True,
+                user_message=(
+                    "The selected model provider quota was exhausted before the worker could finish."
+                ),
+                recommended_recovery=(
+                    "Continue the same untouched mission on the explicitly configured fallback worker, "
+                    "or restore provider quota; GlassHive preserved its files and completed work."
+                ),
+                diagnostic_summary=message,
+                structured=True,
+                provider_event_source="provider_native",
+            )
     structured_provider_failures = {
         "provider_unavailable": (
             True,
@@ -509,6 +590,22 @@ def _collect_structured_failure_evidence(text: str) -> list[str]:
         if isinstance(item, dict):
             evidence.extend(_extract_failure_strings(item))
     return evidence
+
+
+def _has_provider_egress_payload_limit(stderr: str) -> bool:
+    """Recognize only the native provider proxy's exact 413 transport failure."""
+
+    for line in str(stderr or "").splitlines():
+        lowered = " ".join(line.strip().lower().split())
+        if not lowered.startswith("error:"):
+            continue
+        if "unexpected status 413" not in lowered or "payload too large" not in lowered:
+            continue
+        if "url: http://provider-egress:" not in lowered:
+            continue
+        if "/openai/v1/responses" in lowered or "/anthropic/v1/messages" in lowered:
+            return True
+    return False
 
 
 def _has_structured_authentication_failed(*texts: str) -> bool:
@@ -760,6 +857,70 @@ def _structured_provider_capacity_class(*texts: str) -> str:
         return "provider_response_failed"
     return ""
 
+
+def _trusted_terminal_capacity_class(*texts: str) -> str:
+    """Capacity class from a provider's own trusted terminal event message.
+
+    Some providers (for example the Codex CLI) report a usage/quota or rate-limit exhaustion only as
+    prose inside their trusted `turn.failed` / `response.failed` / api-error `result` control event,
+    with no typed code or HTTP status. Read that indication only from the trusted terminal control
+    event -- never from assistant/task output -- so a genuine provider capacity failure becomes
+    structured evidence that can drive the configured fallback. Task text is excluded because
+    `_trusted_provider_control_event` rejects non-terminal events.
+    """
+    for text in texts:
+        for line in str(text or "").splitlines():
+            raw = line.strip()
+            if not raw.startswith("{"):
+                continue
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            trusted = _trusted_provider_control_event(decoded)
+            if trusted is None:
+                # The Codex CLI can report a provider exhaustion as a top-level stream error event
+                # (`{"type": "error", "message": ...}`) and then exit without a `turn.failed`. That
+                # top-level error is the CLI's own provider/runtime report, not assistant/task
+                # output (task text is carried under assistant/item events), so it is a trusted
+                # terminal capacity source. Anything else is ignored.
+                if (
+                    isinstance(decoded, dict)
+                    and str(decoded.get("type") or "").strip().lower() == "error"
+                    and isinstance(decoded.get("message"), str)
+                ):
+                    trusted = decoded
+                else:
+                    continue
+            messages: list[str] = []
+            error = trusted.get("error")
+            if isinstance(error, dict):
+                for key in ("message", "detail", "description"):
+                    value = error.get(key)
+                    if isinstance(value, str):
+                        messages.append(value)
+            elif isinstance(error, str):
+                messages.append(error)
+            for key in ("message", "result", "detail"):
+                value = trusted.get(key)
+                if isinstance(value, str):
+                    messages.append(value)
+            joined = " ".join(messages).lower()
+            if not joined:
+                continue
+            if (
+                "usage limit" in joined
+                or "usage_limit" in joined
+                or "quota exceeded" in joined
+                or "quota_exceeded" in joined
+                or "quota exhausted" in joined
+                or "insufficient_quota" in joined
+                or "plan limit" in joined
+                or "weekly limit" in joined
+            ):
+                return "provider_quota_exhausted"
+    return ""
+
 def _structured_provider_auth_failure(*texts: str) -> bool:
     """Recognize provider authentication only from exact JSONL control fields."""
 
@@ -923,7 +1084,9 @@ def _classify_terminal_native_provider_error(
             structured=True,
             provider_event_source="provider_native",
         )
-    if codes & _STRUCTURED_PROVIDER_REQUEST_CODES:
+    # A bare HTTP 400 without a typed code is still the provider refusing the request shape:
+    # replaying it cannot succeed, and a fresh partial artifact must not turn it into completion.
+    if status == 400 or codes & _STRUCTURED_PROVIDER_REQUEST_CODES:
         return FailureClassification(
             failure_class="provider_request_rejected",
             retryable=False,
@@ -1288,7 +1451,7 @@ _FAILURE_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)((?:api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*)[^\s\"']{6,}"), r"\1[REDACTED]"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"), "sk-[REDACTED]"),
     (re.compile(r"\b(?:wrk|run|prj)_[A-Za-z0-9_-]{6,}\b"), "[glasshive-id]"),
-    (re.compile(r"\b[A-Za-z0-9_]{8,}:[A-Za-z0-9_./+=-]{20,}\b"), "[REDACTED_CREDENTIAL]"),
+    *CREDENTIAL_REDACTIONS,
     (re.compile(r"(?:~\/|\/Users\/|\/home\/|\/private\/var\/|\/var\/folders\/|[A-Za-z]:\\Users\\)[^\s`'\"<>]+"), "[local path]"),
     (re.compile(r"(?i)data:image/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{256,}"), "[REDACTED_IMAGE_BASE64]"),
     (re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{512,}={0,2}(?![A-Za-z0-9+/=])"), "[REDACTED_LONG_BASE64]"),
