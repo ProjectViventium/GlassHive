@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -35,6 +36,7 @@ from .bootstrap import (
     BOOTSTRAP_SOURCE_TOKEN_KEY,
     GLASSHIVE_CAPABILITY_BROKER_TOKEN_ENV,
     sign_bootstrap_source_path,
+    worker_prompt_layer_producer,
 )
 from .deliverables import is_user_deliverable_relative_path
 from .operator_urls import operator_base_url, surface_aware_watch_url, surface_can_open_operator_url
@@ -55,6 +57,14 @@ from .signed_links import (
     sign_link_token,
     signed_link_ref_url,
     signed_link_ttl_seconds,
+)
+from .store import canonical_parallel_clean_room_bootstrap
+from .upload_projection import (
+    intersect_upload_records,
+    merge_projected_upload_files,
+    project_upload_files as _project_request_upload_files,
+    public_upload_ledger,
+    trusted_selected_files,
 )
 
 import hashlib
@@ -460,24 +470,11 @@ def _host_profile_binary(profile: str) -> str:
     return os.environ.get("WPR_OPENCLAW_BIN", "").strip() or "openclaw"
 
 
-def _host_profile_runtime_name(profile: str) -> str:
-    clean = str(profile or "").strip()
-    if clean == "codex-cli":
-        return "codex-cli"
-    if clean == "claude-code":
-        return "claude-code"
-    return "openclaw"
-
-
 def _host_profile_available(profile: str) -> bool:
-    requirement_checker = globals().get("host_runtime_requirement_issue")
-    return (
-        shutil.which(_host_profile_binary(profile)) is not None
-        and (
-            not callable(requirement_checker)
-            or requirement_checker(profile, _host_profile_runtime_name(profile)) is None
-        )
-    )
+    # Status rendering is non-admitting and therefore must not execute a CLI.
+    # Exact version/help/auth checks run only behind the service's durable
+    # preflight-capacity reservation.
+    return shutil.which(_host_profile_binary(profile)) is not None
 
 
 def _runtime_dependency_blocked_payload(*, profile: str, execution_mode: str) -> dict[str, Any] | None:
@@ -523,22 +520,7 @@ def _runtime_dependency_blocked_payload(*, profile: str, execution_mode: str) ->
             "profile": profile,
             "execution_mode": execution_mode,
         }
-    issue = host_runtime_requirement_issue(profile, _host_profile_runtime_name(profile))
-    if issue is None:
-        return None
-    profile_hint = f" for `{profile}`" if profile else ""
-    return {
-        "status": "blocked",
-        "failure_class": "runtime_dependency_missing",
-        "failure_retryable": False,
-        "failure_user_message": issue.user_message.replace("selected host worker", f"selected host worker{profile_hint}", 1)
-        if profile_hint and "selected host worker for" not in issue.user_message
-        else issue.user_message,
-        "failure_recommended_recovery": issue.recommended_recovery,
-        "failure_diagnostic_summary": issue.diagnostic_summary,
-        "profile": profile,
-        "execution_mode": execution_mode,
-    }
+    return None
 
 
 def _worker_capability_summary() -> str:
@@ -606,6 +588,11 @@ HEADER_ALIASES = {
     HEADER_TELEGRAM_CHAT_ID: ("x-glasshive-telegram-chat-id",),
     HEADER_TELEGRAM_USER_ID: ("x-glasshive-telegram-user-id",),
     HEADER_TELEGRAM_MESSAGE_ID: ("x-glasshive-telegram-message-id",),
+    HEADER_LOGICAL_TURN_ID: ("x-glasshive-logical-turn-id", "x-librechat-logical-turn-id"),
+    HEADER_LOGICAL_TURN_REVISION: (
+        "x-glasshive-logical-turn-revision",
+        "x-librechat-logical-turn-revision",
+    ),
     HEADER_REQUEST_FILES: ("x-glasshive-request-files", "x-librechat-request-files"),
     HEADER_REQUEST_ATTACHMENTS: ("x-glasshive-request-attachments", "x-librechat-request-attachments"),
     HEADER_TOOL_RESOURCES: ("x-glasshive-tool-resources", "x-librechat-tool-resources"),
@@ -1051,16 +1038,24 @@ def _trusted_request_upload_scope() -> tuple[str | None, str | None, str | None]
         _header_value(headers, HEADER_STORAGE_USER_ID) or None,
     )
 
+
+
 def _request_owner_id(owner_id: str | None) -> str | None:
+    headers = _request_headers()
+    asserted_owner = _header_value(headers, HEADER_USER_ID)
     if _enterprise_mode_enabled():
-        headers = _request_headers()
         _require_enterprise_mcp_service_auth(headers)
         _require_enterprise_mcp_identity_assertion(headers)
-        return _header_value(headers, HEADER_USER_ID) or DEFAULT_OWNER_ID or None
+        return asserted_owner or DEFAULT_OWNER_ID or None
+    # A trusted transport identity always wins over model/tool arguments in
+    # local mode too. The caller cannot forge a sibling owner just because the
+    # deployment is personal rather than enterprise.
+    if asserted_owner:
+        return asserted_owner
     explicit = _sanitize_context_value(owner_id)
     if explicit:
         return explicit
-    return _header_value(_request_headers(), HEADER_USER_ID) or None
+    return None
 
 
 def _account_request_scope(owner_id: str | None = None) -> tuple[str, str]:
@@ -1075,6 +1070,7 @@ def _account_request_scope(owner_id: str | None = None) -> tuple[str, str]:
         or "demo-owner"
     )
     return tenant_id, resolved_owner
+
 
 def _delegation_launch_payload_digest(payload: dict[str, Any]) -> str:
     """Fingerprint the normalized launch controls that Core actually authorized.
@@ -1124,6 +1120,7 @@ def _delegation_launch_payload_digest(payload: dict[str, Any]) -> str:
         ensure_ascii=False,
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
 
 def _trusted_operation_idempotency_key(
     prefix: str,
@@ -1314,6 +1311,10 @@ def _trusted_operation_idempotency_key(
     ).encode("utf-8")
     return f"{prefix}_{hashlib.sha256(canonical).hexdigest()}"
 
+
+
+
+
 def _enterprise_request_scope() -> tuple[str, str]:
     headers = _request_headers()
     _require_enterprise_mcp_service_auth(headers)
@@ -1416,10 +1417,18 @@ def _require_mcp_service_auth(headers: dict[str, str]) -> None:
     if not expected:
         raise PermissionError("GlassHive MCP service authentication is not configured")
     auth_header = str(headers.get("authorization") or "").strip()
-    bearer = auth_header.removeprefix("Bearer ").strip() if auth_header.lower().startswith("bearer ") else ""
+    bearer = (
+        auth_header.removeprefix("Bearer ").strip()
+        if auth_header.lower().startswith("bearer ")
+        else ""
+    )
     header_token = _header_value(headers, HEADER_SERVICE_TOKEN)
-    if not (_token_matches(header_token, expected) or _token_matches(bearer, expected)):
+    if not (
+        _token_matches(header_token, expected) or _token_matches(bearer, expected)
+    ):
         raise PermissionError("GlassHive MCP service authentication is required")
+
+
 
 
 def _configured_enterprise_tenant_id() -> str:
@@ -1648,7 +1657,10 @@ def _trusted_virtual_upload_source(
         return ""
     if ".." in relative_path.split(os.path.sep):
         return ""
-    if _enterprise_mode_enabled():
+    asserted_owner_scope = bool(
+        _sanitize_context_value(owner_id) or _sanitize_context_value(storage_owner_id)
+    )
+    if asserted_owner_scope:
         allowed_owners = _upload_owner_path_components(owner_id, storage_owner_id)
         first_part = relative_path.split(os.path.sep, 1)[0]
         if not allowed_owners or first_part not in allowed_owners:
@@ -1820,6 +1832,11 @@ def _owner_recent_upload_entries(
         workspace_path = _dedupe_workspace_upload_path(filename, used_paths)
         source_path = os.fspath(candidate)
         token = sign_bootstrap_source_path(source_path, tenant_id=tenant_id, owner_id=owner_id)
+        upload_ref = ""
+        if "__" in candidate.name:
+            prefix = candidate.name.split("__", 1)[0]
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", prefix):
+                upload_ref = prefix
         projected.append(
             {
                 "scope": "workspace",
@@ -1827,10 +1844,10 @@ def _owner_recent_upload_entries(
                 "source_path": source_path,
                 **({BOOTSTRAP_SOURCE_TOKEN_KEY: token} if token else {}),
                 "filename": filename,
+                **({"file_id": upload_ref} if upload_ref else {}),
                 "bytes": size,
                 "source": "librechat_owner_recent_upload_compat",
                 "materialized_from": "librechat_owner_recent_upload_compat",
-                "storage_user_id": storage_owner_id,
             }
         )
     return projected
@@ -1887,6 +1904,8 @@ def _owner_scoped_upload_source_for_filename(
 
 
 def _signed_view_steer_url(worker: dict[str, Any], project_id: str | None, request_surface: str | None) -> str | None:
+    if str(worker.get("state") or "") == "terminated":
+        return None
     worker_id = str(worker.get("worker_id") or "").strip()
     if not worker_id:
         return None
@@ -1944,6 +1963,8 @@ def _clean_artifact_relative_path(path: str) -> str:
 
 
 def _signed_artifact_url(worker: dict[str, Any], path: str, *, kind: str, action: str) -> str | None:
+    if str(worker.get("state") or "") == "terminated":
+        return None
     worker_id = str(worker.get("worker_id") or "").strip()
     clean_path = _clean_artifact_relative_path(path)
     if not worker_id or not clean_path:
@@ -2181,6 +2202,7 @@ def _dispatch_follow_up_context(
     project_id: str,
     run: dict[str, Any],
     request_surface: str | None,
+    task: str,
     expose_diagnostics: bool = False,
     explicit_follow_up_required: bool = False,
 ) -> dict[str, Any]:
@@ -2202,11 +2224,12 @@ def _dispatch_follow_up_context(
             "response means the worker is healthy but not done yet; do not ask the user to say "
             "'keep waiting' merely because one wait chunk ended."
         ),
-        "view_steer": {
-            "label": "View / Steer GlassHive workspace",
-            "url": view_steer_url,
-            "include_in_response": bool(view_steer_url),
-        },
+        "view_steer": _view_steer_link(
+            task=task,
+            url=view_steer_url,
+            terminal=str(run.get("state") or "").strip().lower()
+            in {"completed", "failed", "cancelled", "interrupted", "stopped"},
+        ),
     }
     if view_steer_url:
         payload["view_steer_url"] = view_steer_url
@@ -2316,7 +2339,15 @@ def _project_upload_file_entry(
     )
     metadata = {
         key: file_obj.get(key)
-        for key in ("file_id", "filename", "source", "context", "type", "bytes")
+        for key in (
+            "file_id",
+            "filename",
+            "source",
+            "context",
+            "type",
+            "bytes",
+            "media_group_index",
+        )
         if file_obj.get(key) is not None
     }
     source_ref = ""
@@ -2385,45 +2416,18 @@ def _project_upload_files(
     owner_id: str | None = None,
     storage_owner_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    projected: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for file_obj in _iter_upload_file_objects(upload_context):
-        entry = _project_upload_file_entry(
-            file_obj,
-            len(projected) + 1,
-            tenant_id=tenant_id,
-            owner_id=owner_id,
-            storage_owner_id=storage_owner_id,
-        )
-        if not entry:
-            continue
-        key = (str(entry.get("file_id") or ""), str(entry.get("source_path") or entry.get("path") or ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        projected.append(entry)
-    return projected
+    # One canonical projector owns foreground conversation and durable mission uploads. This keeps
+    # owner/root checks, byte preservation, and same-name ordering identical across both paths.
+    return _project_request_upload_files(
+        upload_context,
+        tenant_id=tenant_id,
+        owner_id=owner_id,
+        storage_owner_id=storage_owner_id,
+    )
 
 
 def _merge_bundle_files(existing: Any, projected: list[dict[str, Any]]) -> list[Any]:
-    files = list(existing) if isinstance(existing, list) else []
-    seen_file_ids = {str(item.get("file_id")) for item in files if isinstance(item, dict) and item.get("file_id")}
-    seen_sources = {str(item.get("source_path")) for item in files if isinstance(item, dict) and item.get("source_path")}
-    seen_paths = {str(item.get("path")) for item in files if isinstance(item, dict) and item.get("path")}
-    for entry in projected:
-        file_id = str(entry.get("file_id") or "")
-        source_path = str(entry.get("source_path") or "")
-        path = str(entry.get("path") or "")
-        if (file_id and file_id in seen_file_ids) or (source_path and source_path in seen_sources) or (path and path in seen_paths):
-            continue
-        files.append(entry)
-        if file_id:
-            seen_file_ids.add(file_id)
-        if source_path:
-            seen_sources.add(source_path)
-        if path:
-            seen_paths.add(path)
-    return files
+    return merge_projected_upload_files(existing, projected)
 
 
 def _append_materialized_uploads_instruction(
@@ -2561,6 +2565,15 @@ def _normalize_bootstrap_bundle(value: Any) -> dict[str, Any] | None:
         raise ValueError("bootstrap_bundle_json must be a JSON object or JSON string")
     if not isinstance(parsed, dict):
         raise ValueError("bootstrap_bundle_json must decode to a JSON object")
+
+    # Host protocol state is never accepted from a public tool argument.  The trusted delegation
+    # courier may project it only after normalization has removed any caller-authored value.
+    parsed.pop("viventium_constraint_source", None)
+    parsed.pop("viventium_continuation_contract", None)
+    parsed.pop("viventium_continuation_context", None)
+
+    if isinstance(parsed.get("viventium_launch_authority"), dict):
+        parsed = canonical_parallel_clean_room_bootstrap(parsed)
 
     files = _coerce_bundle_file_entries(parsed.get("files"))
     if "files" in parsed:
@@ -3116,8 +3129,13 @@ def _merge_request_context(bundle: dict[str, Any] | None) -> dict[str, Any] | No
         "telegram_chat_id": _header_value(headers, HEADER_TELEGRAM_CHAT_ID),
         "telegram_user_id": _header_value(headers, HEADER_TELEGRAM_USER_ID),
         "telegram_message_id": _header_value(headers, HEADER_TELEGRAM_MESSAGE_ID),
+        "logical_turn_id": _header_value(headers, HEADER_LOGICAL_TURN_ID),
+        "logical_turn_revision": _header_value(headers, HEADER_LOGICAL_TURN_REVISION),
     }
     context = {key: value for key, value in context.items() if value}
+    public_context = {
+        key: value for key, value in context.items() if key != "storage_user_id"
+    }
     upload_context = {
         "request_files": _decode_json_header(_header_value(headers, HEADER_REQUEST_FILES)),
         "request_attachments": _decode_json_header(_header_value(headers, HEADER_REQUEST_ATTACHMENTS)),
@@ -3125,45 +3143,77 @@ def _merge_request_context(bundle: dict[str, Any] | None) -> dict[str, Any] | No
         "file_ids": _decode_json_header(_header_value(headers, HEADER_FILE_IDS)),
     }
     upload_context = {key: value for key, value in upload_context.items() if value not in (None, "", [], {})}
+    merged, selected_files = _apply_trusted_selected_file_scope(
+        dict(bundle or {})
+    )
     if not context and not callback_url and not upload_context:
-        return bundle
-    merged: dict[str, Any] = dict(bundle or {})
+        if selected_files is not None and merged.get("files"):
+            _append_materialized_uploads_instruction(merged, merged["files"])
+        return _without_internal_storage_authority(merged)
+    trusted_launch = isinstance(merged.get("viventium_delegation_identity"), dict) and isinstance(
+        merged.get("viventium_delegation_context"), dict
+    )
     existing_callbacks = merged.get("callbacks")
     has_existing_callbacks = isinstance(existing_callbacks, dict) and bool(existing_callbacks)
     callbacks = dict(existing_callbacks) if has_existing_callbacks else {}
+    if trusted_launch:
+        origin_ref = str(callbacks.get("origin_ref") or "").strip()
+        callbacks = {"origin_ref": origin_ref} if origin_ref else {}
     callback_context = dict(callbacks)
-    callback_context.update({key: value for key, value in context.items() if value})
+    if not trusted_launch:
+        callback_context.update(public_context)
     has_callback_anchor = all(
         str(callback_context.get(key) or "").strip() for key in CALLBACK_REQUIRED_CONTEXT_KEYS
     )
     should_auto_attach_callback = bool(callback_url and callback_secret and has_callback_anchor)
-    if has_existing_callbacks or should_auto_attach_callback:
-        callbacks.update({key: value for key, value in context.items() if value})
-    if should_auto_attach_callback:
+    if (has_existing_callbacks or should_auto_attach_callback) and not trusted_launch:
+        callbacks.update(public_context)
+    if should_auto_attach_callback and not trusted_launch:
         callbacks.setdefault("events_webhook_url", callback_url)
         callbacks.setdefault("hmac_secret", callback_secret)
-    if has_existing_callbacks or should_auto_attach_callback:
+    if callbacks:
         merged["callbacks"] = callbacks
-    if context:
-        merged.setdefault("glasshive_context", context)
-        merged.setdefault("viventium_context", context)
+    elif trusted_launch:
+        merged.pop("callbacks", None)
+    if public_context and not trusted_launch:
+        merged.setdefault("glasshive_context", public_context)
+        merged.setdefault("viventium_context", public_context)
+    elif trusted_launch:
+        merged.pop("glasshive_context", None)
+        merged.pop("viventium_context", None)
 
     projected: list[dict[str, Any]] = []
     if upload_context:
+        if selected_files is not None:
+            intersect_upload_records(
+                [merged.get("files"), upload_context],
+                selected_files,
+                require_all=True,
+            )
+        selected_records, upload_context = _selected_upload_context(
+            upload_context, selected_files
+        )
         projected = _project_upload_files(
-            upload_context,
+            {"selected_uploads": selected_records},
             tenant_id=context.get("tenant_id"),
             owner_id=context.get("user_id"),
             storage_owner_id=context.get("storage_user_id"),
         )
-    if not projected:
-        projected = _owner_recent_upload_entries(
+    if not projected and selected_files:
+        recent = _owner_recent_upload_entries(
             tenant_id=context.get("tenant_id"),
             owner_id=context.get("user_id"),
             storage_owner_id=context.get("storage_user_id"),
             conversation_id=context.get("conversation_id"),
             message_id=context.get("message_id"),
         )
+        if selected_files is not None:
+            intersect_upload_records(
+                [merged.get("files"), recent],
+                selected_files,
+                require_all=True,
+            )
+        projected = intersect_upload_records(recent, selected_files)
         if projected:
             LOGGER.info(
                 "GlassHive legacy LibreChat upload compatibility fallback materialized %d file(s); "
@@ -3180,7 +3230,6 @@ def _merge_request_context(bundle: dict[str, Any] | None) -> dict[str, Any] | No
                         "bytes",
                         "source",
                         "materialized_from",
-                        "storage_user_id",
                     )
                     if entry.get(key) is not None
                 }
@@ -3191,8 +3240,11 @@ def _merge_request_context(bundle: dict[str, Any] | None) -> dict[str, Any] | No
         merged["viventium_upload_context"] = upload_context
     if projected:
         merged["files"] = _merge_bundle_files(merged.get("files"), projected)
+    if selected_files is not None and merged.get("files"):
+        _append_materialized_uploads_instruction(merged, merged["files"])
+    elif projected:
         _append_materialized_uploads_instruction(merged, projected)
-    return merged
+    return _without_internal_storage_authority(merged)
 
 
 def _merge_explicit_uploaded_files(
@@ -3204,18 +3256,30 @@ def _merge_explicit_uploaded_files(
     storage_owner_id: str | None = None,
 ) -> dict[str, Any]:
     if uploaded_files in (None, "", [], {}):
-        return dict(bundle or {})
-    merged: dict[str, Any] = dict(bundle or {})
-    upload_context = {"tool_uploaded_files": uploaded_files}
+        merged, _selected = _apply_trusted_selected_file_scope(dict(bundle or {}))
+        return _without_internal_storage_authority(merged)
+    merged, selected_files = _apply_trusted_selected_file_scope(dict(bundle or {}))
+    if selected_files is not None:
+        intersect_upload_records(
+            [merged.get("files"), uploaded_files],
+            selected_files,
+            require_all=True,
+        )
+    selected_records = intersect_upload_records(uploaded_files, selected_files)
+    public_records = public_upload_ledger(selected_records)
+    upload_context = (
+        {"tool_uploaded_files": public_records} if public_records else {}
+    )
 
-    for key in ("glasshive_upload_context", "viventium_upload_context"):
-        existing = merged.get(key)
-        context = dict(existing) if isinstance(existing, dict) else {}
-        context["tool_uploaded_files"] = uploaded_files
-        merged[key] = context
+    if upload_context:
+        for key in ("glasshive_upload_context", "viventium_upload_context"):
+            existing = merged.get(key)
+            context = dict(existing) if isinstance(existing, dict) else {}
+            context.update(upload_context)
+            merged[key] = context
 
     projected = _project_upload_files(
-        upload_context,
+        {"tool_uploaded_files": selected_records},
         tenant_id=tenant_id,
         owner_id=owner_id,
         storage_owner_id=storage_owner_id,
@@ -3226,8 +3290,11 @@ def _merge_explicit_uploaded_files(
                 entry.setdefault("source", "model_context_uploaded_files")
                 entry.setdefault("materialized_from", "model_context_uploaded_files")
         merged["files"] = _merge_bundle_files(merged.get("files"), projected)
+    if selected_files is not None and merged.get("files"):
+        _append_materialized_uploads_instruction(merged, merged["files"])
+    elif projected:
         _append_materialized_uploads_instruction(merged, projected)
-    return merged
+    return _without_internal_storage_authority(merged)
 
 
 def _callback_missing_fields(bundle: dict[str, Any] | None) -> list[str]:
@@ -3248,6 +3315,27 @@ def _callback_missing_fields(bundle: dict[str, Any] | None) -> list[str]:
 def _callback_state(bundle: dict[str, Any] | None, *, required: bool) -> tuple[bool, list[str]]:
     callbacks = bundle.get("callbacks") if isinstance(bundle, dict) else None
     callback_configured = isinstance(callbacks, dict) and bool(callbacks)
+    trusted_launch = (
+        isinstance(bundle, dict)
+        and isinstance(bundle.get("viventium_delegation_identity"), dict)
+        and isinstance(bundle.get("viventium_delegation_context"), dict)
+        and isinstance(callbacks, dict)
+        and bool(str(callbacks.get("origin_ref") or "").strip())
+    )
+    if trusted_launch:
+        load_viventium_runtime_env()
+        missing: list[str] = []
+        if not (
+            os.environ.get("GLASSHIVE_EVENTS_WEBHOOK_URL", "").strip()
+            or os.environ.get("VIVENTIUM_GLASSHIVE_CALLBACK_URL", "").strip()
+        ):
+            missing.append("events_webhook_url")
+        if not (
+            os.environ.get("GLASSHIVE_EVENTS_HMAC_SECRET", "").strip()
+            or os.environ.get("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "").strip()
+        ):
+            missing.append("hmac_secret")
+        return not missing, missing
     if not callback_configured and not required:
         return False, []
     missing = _callback_missing_fields(bundle)
@@ -3321,6 +3409,8 @@ class WorkersProjectsApiClient:
                     payload = response.json()
                 except Exception:
                     payload = {}
+                if response.status_code == 422:
+                    raise GlassHiveBlockedError(_safe_request_validation_failure(payload))
                 if isinstance(payload, dict) and payload.get("failure_class"):
                     raise GlassHiveBlockedError(payload)
                 detail = payload.get("detail") if isinstance(payload, dict) else None
@@ -4672,6 +4762,7 @@ def create_mcp_server(
     def worker_delegate_once(
         title: str,
         instruction: str,
+        ctx: Context,
         goal: str | None = None,
         project_id: str | None = None,
         owner_id: str | None = None,
@@ -4823,21 +4914,34 @@ def create_mcp_server(
             )
 
         bundle = _normalize_bootstrap_bundle(bootstrap_bundle_json) or {}
-        bundle.setdefault(
-            "project_definition",
-            _default_project_definition(title=clean_title, goal=clean_goal, instruction=clean_instruction),
+        default_project_definition = _default_project_definition(
+            title=clean_title,
+            goal=clean_goal,
+            instruction=clean_instruction,
         )
+        if isinstance(bundle.get("viventium_delegation_packet"), dict):
+            bundle["project_definition"] = default_project_definition
+        else:
+            bundle.setdefault("project_definition", default_project_definition)
         bundle = _merge_request_context(bundle)
-        request_context = bundle.get("glasshive_context") if isinstance(bundle, dict) else None
-        context_tenant_id = request_context.get("tenant_id") if isinstance(request_context, dict) else None
-        context_owner_id = request_context.get("user_id") if isinstance(request_context, dict) else None
-        context_storage_owner_id = request_context.get("storage_user_id") if isinstance(request_context, dict) else None
+        bundle, worker_instruction = _project_trusted_triggering_source_segments(
+            bundle,
+            worker_instruction,
+            constraint_instruction=worker_instruction_body,
+        )
+        _validate_viventium_feelings_projection(
+            bundle,
+            required=isinstance(bundle.get("viventium_delegation_packet"), dict),
+        )
+        trusted_tenant_id, trusted_owner_id, trusted_storage_owner_id = (
+            _trusted_request_upload_scope()
+        )
         bundle = _merge_explicit_uploaded_files(
             bundle,
             uploaded_files,
-            tenant_id=context_tenant_id,
-            owner_id=context_owner_id or resolved_owner_id,
-            storage_owner_id=context_storage_owner_id,
+            tenant_id=trusted_tenant_id,
+            owner_id=trusted_owner_id,
+            storage_owner_id=trusted_storage_owner_id,
         )
         bundle = _apply_effort_to_bundle(bundle, profile=resolved_profile, effort=resolved_effort)
         provider_selection = _provider_account_selection(
@@ -5009,6 +5113,11 @@ def create_mcp_server(
                 default_worker_profile=resolved_profile,
             )
         )
+        project_owner = _sanitize_context_value(project.get("owner_id"))
+        if resolved_owner_id and project_owner != resolved_owner_id:
+            raise ValueError(
+                "The requested GlassHive project is not available to the authenticated owner."
+            )
         resolved_project_id = str(project.get("project_id") or project_id or "").strip()
         if not resolved_project_id:
             raise ValueError("GlassHive project creation did not return project_id")
@@ -5080,6 +5189,7 @@ def create_mcp_server(
             project_id=resolved_project_id,
             run=run,
             request_surface=request_surface,
+            task=clean_title,
             expose_diagnostics=expose_diagnostics,
             explicit_follow_up_required=not bool(
                 _recent_dispatch_scope_keys(
@@ -5137,7 +5247,7 @@ def create_mcp_server(
             "Its inputs intentionally mirror the documented GlassHive UI: description, optional success_criteria, and optional context. "
             "Use a short natural workspace name on the first line of description; keep the full request on following lines or in context. "
             "Do not shorten, summarize, paraphrase, or water down the user's request. Use description for the outcome, success_criteria for hard gates, and context for the full available background, constraints, examples, links, file references, exclusions, and any original wording that matters. "
-            "For connected-account facts or actions, include broker/tool availability as context and let the GlassHive worker choose how to satisfy the user's goal; do not turn tool choice into a success criterion unless the user explicitly asked for that. Browser or computer UI inspection remains available when MCP/tools are missing, unavailable, auth-blocked, explicitly required, or genuinely the better visual/manual QA route. "
+            "For connected-account facts or actions, include broker/tool availability as context and let the GlassHive worker choose how to satisfy the user's goal; do not turn tool choice into a success criterion unless the user explicitly asked for that. Missing, unavailable, revoked, approval-blocked, or auth-blocked broker authority must become a needs_input blocker when required; browser, computer, filesystem, shell, and native connectors cannot bypass that protected-provider boundary. A separately authorized user-explicit UI task remains valid only when it does not bypass connected-account authority. "
             "The host assistant must not fabricate MCP/tool results or force a downloadable artifact; only pass real data/capabilities and let the worker decide whether a file, chat answer, browser action, or other output is appropriate. "
             f"{HIGH_EFFORT_SELECTION_GUIDANCE} "
             "If the user did not specify acceptance criteria, omit success_criteria or use only the minimal value 'Satisfy the user's request as stated, preserving explicit constraints.' Do not invent provider lists, output schemas, artifacts, ranking rules, workflow steps, memory-derived priorities, active-thread/contact/deal lists, or guessed urgency rubrics. For vague user adjectives like urgent or important, pass the adjective through instead of defining a rubric unless the user defines it. "
@@ -5172,6 +5282,7 @@ def create_mcp_server(
                 )
             ),
         ],
+        ctx: Context,
         success_criteria: Annotated[
             str | None,
             Field(
@@ -5227,6 +5338,15 @@ def create_mcp_server(
         ] = False,
         profile: ProfileParam = "",
         execution_mode: ExecutionModeParam = None,
+        resource_class: Annotated[
+            Literal["standard", "light"],
+            Field(
+                description=(
+                    "Worker memory class. Use light for explicitly requested small, bounded jobs; "
+                    "omit for the standard class."
+                )
+            ),
+        ] = "standard",
         connected_account_content_intent: Annotated[
             bool,
             Field(
@@ -5369,6 +5489,7 @@ def create_mcp_server(
         return worker_delegate_once(
             title=title,
             instruction="\n".join(brief_sections),
+            ctx=ctx,
             goal=clean_success_criteria,
             alias=delegate_alias,
             reuse_existing_workspace=reuse_existing_workspace,
@@ -5547,16 +5668,15 @@ def create_mcp_server(
             _default_project_definition(title=title, goal=clean_success_criteria, instruction=scheduled_instruction),
         )
         bundle = _merge_request_context(bundle)
-        request_context = bundle.get("glasshive_context") if isinstance(bundle, dict) else None
-        context_tenant_id = request_context.get("tenant_id") if isinstance(request_context, dict) else None
-        context_owner_id = request_context.get("user_id") if isinstance(request_context, dict) else None
-        context_storage_owner_id = request_context.get("storage_user_id") if isinstance(request_context, dict) else None
+        trusted_tenant_id, trusted_owner_id, trusted_storage_owner_id = (
+            _trusted_request_upload_scope()
+        )
         bundle = _merge_explicit_uploaded_files(
             bundle,
             uploaded_files,
-            tenant_id=context_tenant_id,
-            owner_id=context_owner_id or resolved_owner_id,
-            storage_owner_id=context_storage_owner_id,
+            tenant_id=trusted_tenant_id,
+            owner_id=trusted_owner_id,
+            storage_owner_id=trusted_storage_owner_id,
         )
         bundle = _apply_effort_to_bundle(bundle, profile=resolved_profile, effort=resolved_effort)
         provider_selection = _provider_account_selection(
@@ -7100,6 +7220,10 @@ def create_mcp_server(
             project_id=str(worker.get("project_id") or previous_run.get("project_id") or ""),
             run=new_run,
             request_surface=request_surface,
+            task=(
+                str(worker.get("name") or "").strip()
+                or "Continue GlassHive workspace"
+            ),
             explicit_follow_up_required=not bool(
                 _recent_dispatch_scope_keys(
                     owner_id=str(worker.get("owner_id") or ""),

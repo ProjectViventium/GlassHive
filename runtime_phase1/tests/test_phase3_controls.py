@@ -112,6 +112,8 @@ def _worker_with_run(
 def _delegation_with_running_run(
     tmp_path,
     runtime: StubRuntime,
+    *,
+    start_background_consumers: bool = True,
 ) -> tuple[Store, WorkersProjectsService, dict, dict, dict]:
     store = Store(str(tmp_path / "delegation-runtime.db"))
     work = store.reserve_delegation(
@@ -181,7 +183,12 @@ def _delegation_with_running_run(
     )
     assert confirmed is not None
     store.update_worker_state(str(worker["worker_id"]), "running")
-    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    service = WorkersProjectsService(
+        store,
+        runtime,
+        reconcile_on_startup=False,
+        start_background_consumers=start_background_consumers,
+    )
     return (
         store,
         service,
@@ -769,7 +776,9 @@ def test_interrupted_steer_settles_exact_fence_and_bound_action_immediately(
     tmp_path,
 ):
     store, service, work, worker, run = _delegation_with_running_run(
-        tmp_path, _SteerControlFailureRuntime()
+        tmp_path,
+        _SteerControlFailureRuntime(),
+        start_background_consumers=False,
     )
     service._ensure_worker_processor = lambda _worker_id: None  # type: ignore[method-assign]
     reserved = store.reserve_active_work_action(
@@ -845,7 +854,9 @@ def test_scheduler_recovers_expired_steer_before_due_worker_retries(
 ):
     monkeypatch.setenv("WPR_SCHEDULER_INTERVAL_S", "3600")
     store, service, work, worker, run = _delegation_with_running_run(
-        tmp_path, _SteerControlFailureRuntime()
+        tmp_path,
+        _SteerControlFailureRuntime(),
+        start_background_consumers=False,
     )
     service._ensure_worker_processor = lambda _worker_id: None  # type: ignore[method-assign]
     reserved = store.reserve_active_work_action(

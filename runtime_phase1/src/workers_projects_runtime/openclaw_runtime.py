@@ -54,12 +54,16 @@ def _declared_long_mission(worker: dict) -> bool:
         == {"version": 1, "long_mission": True}
     )
 
-def _run_timeout_sec(timeout_sec: float | None = None) -> float | None:
-    raw = (
-        os.environ.get("GLASSHIVE_RUN_TIMEOUT_SEC", "").strip()
-        or os.environ.get("GLASSHIVE_MAX_RUN_DURATION_S", "").strip()
-        or os.environ.get("WPR_RUN_TIMEOUT_SEC", "").strip()
-    )
+def _run_timeout_sec(
+    timeout_sec: float | None = None,
+    *,
+    declared_long: bool = False,
+) -> float | None:
+    raw = os.environ.get("GLASSHIVE_RUN_TIMEOUT_SEC", "").strip()
+    if not raw and not declared_long:
+        raw = os.environ.get("GLASSHIVE_MAX_RUN_DURATION_S", "").strip()
+    if not raw:
+        raw = os.environ.get("WPR_RUN_TIMEOUT_SEC", "").strip()
     if not raw:
         return timeout_sec if timeout_sec and timeout_sec > 0 else None
     if raw.lower() in {"0", "none", "off", "false", "disabled"}:
@@ -69,6 +73,8 @@ def _run_timeout_sec(timeout_sec: float | None = None) -> float | None:
     except ValueError:
         return timeout_sec if timeout_sec and timeout_sec > 0 else None
     return parsed if parsed > 0 else None
+
+
 
 
 @dataclass
@@ -309,6 +315,12 @@ class WorkerRuntime(Protocol):
 
 
 class StubRuntime:
+    preflight_uses_cli_subprocess = False
+
+    # The deterministic test runtime has no external process/session identity.
+    # The service may therefore confirm its in-process generation before entry.
+    requires_run_start_identity = False
+
     def resolve_model(self, profile: str) -> str:
         return {
             "openclaw-codex": "stub/openai-codex",
@@ -607,7 +619,10 @@ class OpenClawRuntime:
         except httpx.HTTPStatusError as exc:
             raise RuntimeErrorBase(f"OpenClaw returned HTTP {exc.response.status_code}: {exc.response.text[:500]}") from exc
         except httpx.TimeoutException as exc:
-            effective_timeout = _run_timeout_sec(timeout_sec)
+            effective_timeout = _run_timeout_sec(
+                timeout_sec,
+                declared_long=_declared_long_mission(worker),
+            )
             raise RuntimeErrorBase(f"OpenClaw timed out after {effective_timeout}s") from exc
         except httpx.TransportError as exc:
             raise RuntimeErrorBase("OpenClaw response stream ended unexpectedly") from exc

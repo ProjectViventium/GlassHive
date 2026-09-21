@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import json
 import logging
 import mimetypes
@@ -12,8 +13,10 @@ import time
 from hashlib import sha256
 from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
@@ -52,6 +55,7 @@ from .deliverables import deliverable_payload, is_user_deliverable_relative_path
 from .failure_classification import classify_runtime_error
 from .inference_broker import GlassHiveInferenceBroker, InferenceBrokerError
 from .models import (
+    ActiveWorkActionRequest,
     AssignRunRequest,
     CreateRecurringScheduleRequest,
     CreateProjectRequest,
@@ -210,6 +214,7 @@ from .store import (
     WorkAdmissionError,
 )
 
+
 load_viventium_runtime_env()
 install_sensitive_url_log_filter()
 
@@ -297,15 +302,6 @@ def _build_runtime(runtime_backend: str, db_path: str, runtime: WorkerRuntime | 
         base_dir=str(Path(db_path).resolve().parent),
         provider_account_db_path=str(Path(db_path).resolve()),
     )
-
-
-def _workspace_link_auto_resume_enabled() -> bool:
-    return str(os.environ.get("GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
 
 
 def create_app(
@@ -662,6 +658,7 @@ def create_app(
             # Account Active Work view links are read-only. Legacy non-account
             # workspaces retain their existing signed message/steer surface.
             return None
+        # VIVENTIUM END: authoritative signed-link termination fence
         if not verify_signed_link(
             kind=kind,
             worker_id=worker_id,
@@ -905,8 +902,8 @@ def create_app(
                 )
             return Response(status_code=401, content="Unauthorized")
         try:
-            request.state.auth_context = auth_settings.context_from_headers(
-                {str(key).lower(): value for key, value in request.headers.items()}
+            request.state.auth_context = _service_auth_context_from_headers(
+                request.headers
             )
         except GlassHiveAuthError as exc:
             return JSONResponse(status_code=401, content={"detail": str(exc)})
@@ -944,13 +941,13 @@ def create_app(
         return value if isinstance(value, AuthContext) else AuthContext()
 
     def _tenant_filter(ctx: AuthContext) -> str | None:
-        return ctx.tenant_id if ctx.enterprise else None
+        return ctx.tenant_id if ctx.is_user_scoped else None
 
     def _owner_filter(ctx: AuthContext) -> str | None:
-        return ctx.owner_id if ctx.enterprise else None
+        return ctx.owner_id if ctx.is_user_scoped else None
 
     def _request_owner(ctx: AuthContext, requested: str) -> str:
-        return ctx.owner_id if ctx.enterprise else requested
+        return ctx.owner_id if ctx.is_user_scoped else requested
 
     def _configured_default_worker_profile() -> str:
         configured = os.environ.get("GLASSHIVE_DEFAULT_WORKER_PROFILE", "").strip()
@@ -995,7 +992,7 @@ def create_app(
         )
 
     def _preference_owner(ctx: AuthContext) -> str:
-        if ctx.enterprise:
+        if ctx.is_user_scoped:
             return ctx.owner_id
         return (
             os.environ.get("GLASSHIVE_DEFAULT_OWNER_ID", "").strip()
@@ -1082,7 +1079,7 @@ def create_app(
             project = service.require_project(project_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
-        if ctx.enterprise and (
+        if ctx.is_user_scoped and (
             project.get("tenant_id") != ctx.tenant_id or project.get("owner_id") != ctx.owner_id
         ):
             raise HTTPException(status_code=404, detail="Project not found")
@@ -1094,10 +1091,18 @@ def create_app(
             worker = service.require_worker(worker_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
-        if ctx.enterprise and (
+        if ctx.is_user_scoped and (
             worker.get("tenant_id") != ctx.tenant_id or worker.get("owner_id") != ctx.owner_id
         ):
             raise HTTPException(status_code=404, detail="Worker not found")
+        # VIVENTIUM START: authoritative signed-link termination fence
+        # A signed read must not heal/mutate worker state and must never rely
+        # on ambient WPR_DB_PATH to decide whether a terminal worker is live.
+        if ctx.auth_mode == "signed_link":
+            if str(worker.get("state") or "") == "terminated":
+                raise HTTPException(status_code=404, detail="Worker not found")
+            return worker
+        # VIVENTIUM END: authoritative signed-link termination fence
         service.heal_worker(worker_id)
         return service.require_worker(worker_id)
 
@@ -1115,7 +1120,7 @@ def create_app(
             run = service.require_run(run_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
-        if ctx.enterprise:
+        if ctx.is_user_scoped:
             worker = store.get_worker(str(run.get("worker_id") or ""))
             if not worker or worker.get("tenant_id") != ctx.tenant_id or worker.get("owner_id") != ctx.owner_id:
                 raise HTTPException(status_code=404, detail="Run not found")
@@ -1400,48 +1405,12 @@ def create_app(
             pending.extend(next_dirs)
         return items, False
 
-    def _workspace_items(worker: dict, max_entries: int = 120, max_depth: int = 3) -> list[dict[str, object]]:
-        raw_root = str(worker.get("workspace_dir") or "").strip()
-        if not raw_root:
-            return []
-        root = Path(raw_root)
-        if not root.exists():
-            return []
-        items: list[dict[str, object]] = []
-        pending: deque[Path] = deque([root])
-        while pending:
-            current_path = pending.popleft()
-            try:
-                entries = sorted(os.scandir(current_path), key=lambda entry: entry.name)
-            except OSError:
-                continue
-            next_dirs: list[Path] = []
-            for entry in entries:
-                path = Path(entry.path)
-                try:
-                    rel = path.relative_to(root)
-                except ValueError:
-                    continue
-                if not is_user_deliverable_relative_path(rel) or len(rel.parts) > max_depth:
-                    continue
-                try:
-                    is_dir = entry.is_dir(follow_symlinks=False)
-                    stat = entry.stat(follow_symlinks=False)
-                except OSError:
-                    continue
-                items.append(
-                    {
-                        "path": rel.as_posix(),
-                        "is_dir": is_dir,
-                        "size": None if is_dir else stat.st_size,
-                        "modified_at": stat.st_mtime,
-                    }
-                )
-                if len(items) >= max_entries:
-                    return items
-                if is_dir and len(rel.parts) < max_depth:
-                    next_dirs.append(path)
-            pending.extend(next_dirs)
+    def _workspace_items(
+        worker: dict, max_entries: int = 120, max_depth: int = 3
+    ) -> list[dict[str, object]]:
+        items, _truncated = _workspace_items_with_status(
+            worker, max_entries=max_entries, max_depth=max_depth
+        )
         return items
 
     def _latest_image_path(worker: dict) -> Path | None:
@@ -1632,6 +1601,8 @@ def create_app(
         return f"/v1/workers/{quote(worker_id)}/artifacts/{action}?path={quote(str(relative_path or ''), safe='')}"
 
     def _signed_artifact_action_url(worker: dict, relative_path: str, *, kind: str, fallback_action: str) -> str:
+        if str(worker.get("state") or "") == "terminated":
+            return ""
         worker_id = str(worker.get("worker_id") or "")
         token = sign_link_token(
             kind=kind,
@@ -1646,6 +1617,8 @@ def create_app(
         return _artifact_query_url(worker_id, fallback_action, relative_path)
 
     def _signed_watch_action_url(worker: dict) -> str:
+        if str(worker.get("state") or "") == "terminated":
+            return ""
         worker_id = str(worker.get("worker_id") or "")
         project_id = str(worker.get("project_id") or "")
         token = sign_link_token(
@@ -1783,10 +1756,31 @@ def create_app(
                 if truncated
                 else ""
             )
-            preview = f"""
-              {truncated_note}
-              <pre class="artifact-preview">{escape(text)}</pre>
-            """
+            if target.suffix.lower() in {".htm", ".html"} and not truncated:
+                preview = f"""
+                  <section class="rendered-preview">
+                    <div class="preview-heading">
+                      <h2>Rendered preview</h2>
+                      <span>Scripts, forms, downloads, pop-ups, and network access are blocked.</span>
+                    </div>
+                    <iframe
+                      class="html-preview"
+                      title="Rendered HTML artifact preview"
+                      sandbox
+                      referrerpolicy="no-referrer"
+                      srcdoc="{escape(text, quote=True)}"
+                    ></iframe>
+                  </section>
+                  <details class="source-preview">
+                    <summary>View source</summary>
+                    <pre class="artifact-preview">{escape(text)}</pre>
+                  </details>
+                """
+            else:
+                preview = f"""
+                  {truncated_note}
+                  <pre class="artifact-preview">{escape(text)}</pre>
+                """
         elif media_type.startswith("image/") and media_type != "image/svg+xml" and size <= 2 * 1024 * 1024:
             encoded = base64.b64encode(content).decode("ascii")
             preview = f'<img class="image-preview" src="data:{escape(media_type, quote=True)};base64,{encoded}" alt="{escape(target.name, quote=True)}" />'
@@ -3785,7 +3779,7 @@ def create_app(
     @app.get("/v1/preferences", response_model=UserPreferencesResponse)
     def get_preferences(request: Request) -> UserPreferencesResponse:
         ctx = _auth_context(request)
-        tenant_id = ctx.tenant_id if ctx.enterprise else "local"
+        tenant_id = ctx.tenant_id if ctx.is_user_scoped else "local"
         owner_id = _preference_owner(ctx)
         if ctx.enterprise and not owner_id:
             raise HTTPException(status_code=401, detail="Missing authenticated user assertion")
@@ -3795,7 +3789,7 @@ def create_app(
     @app.patch("/v1/preferences", response_model=UserPreferencesResponse)
     def update_preferences(payload: UpdateUserPreferencesRequest, request: Request) -> UserPreferencesResponse:
         ctx = _auth_context(request)
-        tenant_id = ctx.tenant_id if ctx.enterprise else "local"
+        tenant_id = ctx.tenant_id if ctx.is_user_scoped else "local"
         owner_id = _preference_owner(ctx)
         if ctx.enterprise and not owner_id:
             raise HTTPException(status_code=401, detail="Missing authenticated user assertion")
@@ -4611,7 +4605,7 @@ def create_app(
     def create_project(payload: CreateProjectRequest, request: Request) -> ProjectResponse:
         ctx = _auth_context(request)
         owner_id = _request_owner(ctx, payload.owner_id)
-        tenant_id = ctx.tenant_id if ctx.enterprise else "local"
+        tenant_id = ctx.tenant_id if ctx.is_user_scoped else "local"
         profile = payload.default_worker_profile.strip() or _configured_default_worker_profile()
         return ProjectResponse(**service.create_project(owner_id, payload.title, payload.goal, profile, tenant_id=tenant_id))
 
@@ -4660,9 +4654,17 @@ def create_app(
     @app.post("/v1/projects/{project_id}/workers", response_model=WorkerResponse, status_code=201)
     def create_worker(project_id: str, payload: CreateWorkerRequest, request: Request) -> WorkerResponse:
         ctx = _auth_context(request)
+        if _requests_prompt_workbench_scheduled_authority(payload):
+            raise ParallelExecutionIsolationError(
+                "Prompt Workbench scheduled authority is available only through "
+                "the authenticated find-or-resume boundary."
+            )
         project = require_project(project_id, request)
         owner_id = _request_owner(ctx, payload.owner_id)
-        tenant_id = str(project.get("tenant_id") or ctx.tenant_id if ctx.enterprise else "local")
+        tenant_id = str(
+            project.get("tenant_id")
+            or (ctx.tenant_id if ctx.is_user_scoped else "local")
+        )
         profile = _profile_for_project(project, payload.profile)
         execution_mode = _execution_mode_for_request(payload.execution_mode)
         worker = service.create_worker(
@@ -4690,12 +4692,39 @@ def create_app(
         ctx = _auth_context(request)
         project = require_project(project_id, request)
         owner_id = _request_owner(ctx, payload.owner_id)
-        tenant_id = str(project.get("tenant_id") or ctx.tenant_id if ctx.enterprise else "local")
+        tenant_id = str(
+            project.get("tenant_id")
+            or (ctx.tenant_id if ctx.is_user_scoped else "local")
+        )
         profile = _profile_for_project(project, payload.profile)
         execution_mode = _execution_mode_for_request(payload.execution_mode)
         alias = (payload.alias or payload.name or profile).strip()
-        if ctx.enterprise:
+        if ctx.is_user_scoped:
             alias = scoped_alias(ctx, alias)
+        bootstrap_profile = payload.bootstrap_profile
+        bootstrap_bundle = payload.bootstrap_bundle
+        scheduled_authority_fingerprint = ""
+        replace_bootstrap_bundle = False
+        if _requests_prompt_workbench_scheduled_authority(payload):
+            if ctx.auth_mode != "service":
+                raise ParallelExecutionIsolationError(
+                    "Prompt Workbench scheduled authority requires exact service authentication."
+                )
+            (
+                bootstrap_profile,
+                bootstrap_bundle,
+                scheduled_authority_fingerprint,
+            ) = service.derive_prompt_workbench_scheduled_bootstrap(
+                owner_id=owner_id,
+                profile=profile,
+                execution_mode=execution_mode,
+                bootstrap_profile=payload.bootstrap_profile,
+                bootstrap_bundle=payload.bootstrap_bundle,
+            )
+            alias = service.prompt_workbench_scheduled_alias(
+                alias, scheduled_authority_fingerprint
+            )
+            replace_bootstrap_bundle = True
         worker = service.find_or_create_worker(
             project_id=project_id,
             owner_id=owner_id,
@@ -4707,10 +4736,12 @@ def create_app(
             execution_mode=execution_mode,
             resource_class=payload.resource_class,
             workspace_root=payload.workspace_root,
-            bootstrap_profile=payload.bootstrap_profile,
-            bootstrap_bundle=payload.bootstrap_bundle,
+            bootstrap_profile=bootstrap_profile,
+            bootstrap_bundle=bootstrap_bundle,
             tenant_id=tenant_id,
             start_synchronously=payload.start_synchronously,
+            replace_bootstrap_bundle=replace_bootstrap_bundle,
+            scheduled_authority_fingerprint=scheduled_authority_fingerprint,
             workspace_kind=payload.workspace_kind,
             tags=payload.tags,
         )
@@ -5038,6 +5069,12 @@ def create_app(
                 _assign_effort_bundle(worker, payload.effort),
                 payload.bootstrap_bundle,
             ),
+            idempotency_key=str(
+                request.headers.get("x-glasshive-idempotency-key")
+                or request.headers.get("idempotency-key")
+                or ""
+            ).strip()
+            or None,
             continuation_context=(
                 payload.continuation_context.model_dump()
                 if payload.continuation_context is not None
@@ -5283,6 +5320,12 @@ def create_app(
     @app.post("/v1/workers/{worker_id}/view-opened", status_code=204)
     def worker_view_opened(worker_id: str, request: Request) -> Response:
         worker = require_worker(worker_id, request)
+        # VIVENTIUM START: authoritative operator-view revocation
+        # The UI uses this scoped runtime response as its final authorization
+        # gate, so terminal workers must fail before any redirect/cookie.
+        if str(worker.get("state") or "") == "terminated":
+            raise HTTPException(status_code=404, detail="Worker not found")
+        # VIVENTIUM END: authoritative operator-view revocation
         store.add_event(worker["project_id"], worker_id, None, "worker.view_opened", "Worker view opened")
         return Response(status_code=204)
 
@@ -5370,6 +5413,7 @@ def create_app(
 
     def _fresh_worker_view_token(payload: dict[str, object]) -> tuple[str, dict[str, object]]:
         worker_id = str(payload.get("worker_id") or "").strip()
+        _require_authoritative_signed_link_worker(worker_id)
         token = sign_link_token(
             kind="worker_view",
             worker_id=worker_id,
@@ -5384,9 +5428,7 @@ def create_app(
 
     def _open_verified_signed_link(payload: dict[str, object], request: Request) -> Response:
         worker_id = str(payload.get("worker_id") or "").strip()
-        worker = store.get_worker(worker_id)
-        if not worker:
-            raise HTTPException(status_code=404, detail="Worker not found")
+        worker = _require_authoritative_signed_link_worker(worker_id)
         tenant_id = str(payload.get("tenant_id") or "")
         owner_id = str(payload.get("owner_id") or "")
         if tenant_id != str(worker.get("tenant_id") or "") or owner_id != str(worker.get("owner_id") or ""):
@@ -5399,6 +5441,9 @@ def create_app(
         )
         kind = str(payload.get("kind") or "")
         if kind in {"artifact_download", "artifact_open"}:
+            # Re-read immediately before resolving/serving bytes so a token
+            # verified against an earlier live snapshot cannot outlive it.
+            worker = _require_authoritative_signed_link_worker(worker_id)
             path = str(payload.get("path") or "").strip().lstrip("/")
             target, content = _artifact_snapshot(worker, path)
             expired = service.local_qa_artifact_fault(
@@ -5459,13 +5504,13 @@ def create_app(
         )
         if not target_url:
             raise HTTPException(status_code=400, detail="Signed link reference has no target")
-        worker = service.require_worker(worker_id)
+        worker = _require_authoritative_signed_link_worker(worker_id)
+        if (
+            str(payload.get("tenant_id") or "") != str(worker.get("tenant_id") or "")
+            or str(payload.get("owner_id") or "") != str(worker.get("owner_id") or "")
+        ):
+            raise HTTPException(status_code=404, detail="GlassHive workspace link not found")
         store.add_event(worker["project_id"], worker_id, None, "worker.view_opened", "Worker view opened")
-        if _workspace_link_auto_resume_enabled():
-            try:
-                service.resume_worker(worker_id)
-            except Exception as exc:
-                logger.warning("Failed to auto-resume GlassHive workspace from short link for %s: %s", worker_id, exc)
         response = RedirectResponse(target_url, status_code=307)
         session_token, session_payload = _fresh_worker_view_token(payload)
         _set_signed_worker_cookie(
@@ -5488,7 +5533,7 @@ def create_app(
         worker_id = str(payload.get("worker_id") or "").strip()
         if not worker_id:
             raise HTTPException(status_code=401, detail="GlassHive workspace link is invalid or expired")
-        worker = service.require_worker(worker_id)
+        worker = _require_authoritative_signed_link_worker(worker_id)
         tenant_id = str(payload.get("tenant_id") or "")
         owner_id = str(payload.get("owner_id") or "")
         if tenant_id != str(worker.get("tenant_id") or "") or owner_id != str(worker.get("owner_id") or ""):
@@ -5660,108 +5705,100 @@ def create_app(
 
     @app.get("/w/{ref_id}", response_class=HTMLResponse)
     def open_ref_workspace_view(ref_id: str, request: Request) -> Response:
-        payload, worker = _require_worker_view_ref(ref_id, request)
+        _payload, worker = _require_worker_view_ref(ref_id, request)
         worker_id = str(worker.get("worker_id") or "")
         store.add_event(worker["project_id"], worker_id, None, "worker.view_opened", "Worker view opened")
         if _is_account_active_work_worker(worker):
             return _read_only_mission_view(worker)
         runtime_details = _runtime_details(worker)
-        external_view_url = str(runtime_details.get("view_url") or "").strip()
-        subtitle = escape(str(runtime_details.get("mode") or worker.get("runtime") or "worker view"))
-        openclaw_action_button = (
-            '<button onclick="desktopAction(\'openclaw\')">OpenClaw</button>'
-            if str(worker.get("profile") or "").startswith("openclaw")
-            else ""
+        run_id = str(worker.get("last_run_id") or "").strip()
+        run = store.get_run(run_id) if run_id else None
+        mission_state = str((run or {}).get("state") or "not started").replace("_", " ").title()
+        worker_state = str(worker.get("state") or "unknown").replace("_", " ").title()
+        runtime_mode = str(
+            runtime_details.get("mode") or worker.get("runtime") or "worker"
+        ).replace("_", " ")
+        workspace_items, workspace_truncated = _workspace_items_with_status(
+            worker,
+            max_entries=21,
+            max_depth=8,
         )
-        ref_route = f"/w/{escape(ref_id, quote=True)}"
-        desktop_route = f"{ref_route}/desktop"
-        desktop_frame_route = f"{ref_route}/desktop-frame"
-        if not external_view_url:
-            response = HTMLResponse(
-                f"""
-                <html>
-                  <head>
-                    <title>{escape(worker['name'])} live view</title>
-                    <style>
-                      body {{ font-family: system-ui, sans-serif; margin: 2rem; max-width: 900px; }}
-                      .card {{ border: 1px solid #ddd; border-radius: 12px; padding: 1rem; }}
-                    </style>
-                  </head>
-                  <body>
-                    <div class="card">
-                      <h1>{escape(worker['name'])}</h1>
-                      <p>{subtitle}</p>
-                      <p>No workstation desktop view is available for this worker right now.</p>
-                    </div>
-                  </body>
-                </html>
-                """
+        artifact_items = _artifact_items_with_action_urls(
+            worker,
+            workspace_items,
+            max_entries=20,
+        )
+        artifact_rows: list[str] = []
+        for item in artifact_items:
+            relative_path = str(item.get("path") or "").strip()
+            open_url = str(item.get("open_url") or "").strip()
+            download_url = str(item.get("download_url") or "").strip()
+            if (
+                not relative_path
+                or "/v1/link-refs/" not in open_url
+                or "/v1/link-refs/" not in download_url
+            ):
+                continue
+            size = item.get("size")
+            size_label = f"{int(size):,} bytes" if isinstance(size, int) else "File"
+            artifact_rows.append(
+                "<li>"
+                f'<div><strong>{escape(relative_path)}</strong><span>{escape(size_label)}</span></div>'
+                '<nav aria-label="Artifact actions">'
+                f'<a href="{escape(open_url, quote=True)}" aria-label="Open {escape(relative_path, quote=True)}" target="_blank" rel="noopener noreferrer">Open</a>'
+                f'<a href="{escape(download_url, quote=True)}" aria-label="Download {escape(relative_path, quote=True)}">Download</a>'
+                "</nav>"
+                "</li>"
             )
-            return _response_with_worker_view_cookie(response, request, payload=payload, worker_id=worker_id)
-        html = f"""
-        <html>
-          <head>
-            <title>{escape(worker['name'])} live view</title>
+        if artifact_rows:
+            artifact_content = f'<ul class="artifacts">{"".join(artifact_rows)}</ul>'
+            if workspace_truncated or len(artifact_items) > len(artifact_rows):
+                artifact_content += '<p class="muted">More files exist in this mission workspace.</p>'
+        else:
+            artifact_content = '<p class="empty">No result files are available yet.</p>'
+        # Public worker-view references are intentionally presentation-only.
+        # Control flows use owner-scoped service assertions or one-use exact-run
+        # action capabilities; a leaked view reference must never be upgraded.
+        return HTMLResponse(
+            f"""
+            <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(worker['name'])} mission view</title>
             <style>
-              body {{ font-family: system-ui, sans-serif; margin: 0; background: #0f172a; color: #e5e7eb; }}
-              header {{ padding: 1rem 1.25rem; border-bottom: 1px solid rgba(255,255,255,.12); display: flex; justify-content: space-between; gap: 1rem; align-items: center; flex-wrap: wrap; }}
-              a {{ color: #93c5fd; }}
-              .actions {{ display: flex; gap: .5rem; flex-wrap: wrap; }}
-              button {{ font: inherit; padding: .55rem .85rem; border-radius: 8px; border: 1px solid rgba(255,255,255,.14); background: #111827; color: #f9fafb; }}
-              .meta {{ color: #cbd5e1; font-size: .95rem; }}
-              iframe {{ width: 100%; height: calc(100vh - 98px); border: 0; background: #020617; }}
-            </style>
-          </head>
-          <body>
-            <header>
-              <div>
-                <div><strong>{escape(worker['name'])}</strong></div>
-                <div class="meta">{subtitle} · managed workspace</div>
-                <div class="meta"><a href="{desktop_route}" target="_blank" rel="noreferrer">Desktop directly</a></div>
-              </div>
-              <div class="actions">
-                <button onclick="action('resume')">Resume</button>
-                <button onclick="action('pause')">Pause</button>
-                <button onclick="action('interrupt')">Interrupt</button>
-                <button onclick="action('terminate')">Terminate</button>
-                <button onclick="pauseAndOpenDirect()">Pause + Open Desktop</button>
-                <button onclick="desktopAction('terminal')">Shell</button>
-                <button onclick="desktopAction('files')">Files</button>
-                <button onclick="desktopAction('browser')">Browser</button>
-                <button onclick="desktopAction('codex')">Codex</button>
-                <button onclick="desktopAction('claude')">Claude</button>
-                {openclaw_action_button}
-              </div>
-            </header>
-            <iframe src="{desktop_frame_route}" loading="eager"></iframe>
-            <script>
-              const refRoute = {ref_route!r};
-              const directDesktopUrl = {desktop_route!r};
-              async function action(name) {{
-                await fetch(`${{refRoute}}/actions/${{encodeURIComponent(name)}}`, {{ method: 'POST' }});
-              }}
-              async function pauseAndOpenDirect() {{
-                await action('pause');
-                window.open(directDesktopUrl, '_blank', 'noopener');
-              }}
-              async function desktopAction(name, url='') {{
-                const res = await fetch(`${{refRoute}}/desktop-action`, {{
-                  method: 'POST',
-                  headers: {{ 'Content-Type': 'application/json' }},
-                  body: JSON.stringify({{ action: name, url: url || undefined }})
-                }});
-                if (!res.ok) {{
-                  alert(await res.text());
-                  return;
-                }}
-                window.open(directDesktopUrl, '_blank', 'noopener');
-              }}
-            </script>
-          </body>
-        </html>
-        """
-        response = HTMLResponse(html)
-        return _response_with_worker_view_cookie(response, request, payload=payload, worker_id=worker_id)
+              :root {{ color-scheme:dark; font-family:ui-sans-serif,system-ui,-apple-system,sans-serif; background:#0b0d10; color:#f1f3f5; }}
+              * {{ box-sizing:border-box; }} body {{ margin:0; background:#0b0d10; }}
+              main {{ width:min(760px,calc(100% - 32px)); margin:48px auto; }}
+              .eyebrow {{ color:#aeb4bd; font-size:.78rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }}
+              h1 {{ margin:.5rem 0 1.5rem; font-size:clamp(1.65rem,4vw,2.35rem); line-height:1.1; overflow-wrap:anywhere; }}
+              dl {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1px; margin:0 0 2rem; background:#2a2f36; border:1px solid #2a2f36; border-radius:12px; overflow:hidden; }}
+              dl div {{ padding:14px; background:#12151a; }} dt {{ color:#aeb4bd; font-size:.78rem; }} dd {{ margin:.3rem 0 0; font-weight:650; overflow-wrap:anywhere; }}
+              .state-note {{ margin:-1rem 0 2rem; color:#aeb4bd; font-size:.9rem; line-height:1.5; }}
+              section {{ border-top:1px solid #2a2f36; padding-top:1.5rem; }} h2 {{ margin:0 0 1rem; font-size:1rem; }}
+              .artifacts {{ list-style:none; margin:0; padding:0; border-bottom:1px solid #2a2f36; }}
+              .artifacts li {{ display:flex; justify-content:space-between; align-items:center; gap:20px; padding:14px 0; border-top:1px solid #2a2f36; }}
+              .artifacts li div {{ min-width:0; }} .artifacts strong {{ display:block; overflow-wrap:anywhere; }} .artifacts span,.muted,.empty {{ color:#aeb4bd; font-size:.86rem; }}
+              nav {{ display:flex; gap:8px; flex:0 0 auto; }} a {{ display:inline-flex; min-height:44px; align-items:center; padding:0 14px; border:1px solid #3a414a; border-radius:8px; color:#f1f3f5; text-decoration:none; }} a:hover,a:focus-visible {{ border-color:#8b949e; outline:none; }}
+              .notice {{ color:#aeb4bd; margin-top:2rem; font-size:.86rem; }}
+              @media (max-width:620px) {{ dl {{ grid-template-columns:1fr; }} .artifacts li {{ align-items:flex-start; flex-direction:column; }} nav {{ width:100%; }} nav a {{ justify-content:center; flex:1; }} }}
+            </style></head><body><main><div class="card">
+              <div class="eyebrow">Read-only mission view</div>
+              <h1>{escape(worker['name'])}</h1>
+              <dl>
+                <div><dt>Mission state</dt><dd>{escape(mission_state)}</dd></div>
+                <div><dt>Worker state</dt><dd>{escape(worker_state)}</dd></div>
+                <div><dt>Runtime</dt><dd>{escape(runtime_mode)}</dd></div>
+              </dl>
+              <p class="state-note">Mission state describes this result. Worker state describes the reusable workspace after the mission.</p>
+              <section aria-labelledby="results-title"><h2 id="results-title">Result files</h2>{artifact_content}</section>
+              <p class="notice">Mission controls require an authenticated, action-scoped, one-use capability.</p>
+            </div></main></body></html>
+            """,
+            headers={
+                "Cache-Control": "no-store",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer",
+                "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            },
+        )
 
     @app.get("/w/{ref_id}/desktop", response_class=HTMLResponse)
     def open_ref_workspace_desktop(ref_id: str, request: Request) -> Response:
@@ -5876,11 +5913,45 @@ def create_app(
         worker = require_worker(worker_id, request)
         if cursor < 0 or not 1 <= limit <= 2_000:
             raise HTTPException(status_code=400, detail="Artifact pagination is out of range")
+        if "cursor" not in request.query_params and "limit" not in request.query_params:
+            # Preserve the original bounded response for existing clients.
+            # Callers that need the complete inventory opt into the cursor API.
+            workspace_items, truncated = _workspace_items_with_status(
+                worker, max_entries=500, max_depth=8
+            )
+            items = [
+                {
+                    **item,
+                    "open_url": _artifact_query_url(
+                        worker_id, "open", str(item["path"])
+                    ),
+                    "download_url": _artifact_query_url(
+                        worker_id, "download", str(item["path"])
+                    ),
+                }
+                for item in workspace_items
+                if not item.get("is_dir")
+            ]
+            store.add_event(
+                worker["project_id"],
+                worker_id,
+                None,
+                "worker.artifacts_listed",
+                "Workspace artifacts listed",
+            )
+            return {
+                "items": items,
+                "next_cursor": None,
+                "total": len(items),
+                "truncated": truncated,
+            }
         scan_limit = int(os.environ.get("GLASSHIVE_ARTIFACT_LIST_SCAN_MAX_ENTRIES", "50000"))
         if scan_limit < 1:
             raise HTTPException(status_code=500, detail="Artifact scan limit is invalid")
-        workspace_items = _workspace_items(worker, max_entries=scan_limit + 1, max_depth=8)
-        if len(workspace_items) > scan_limit:
+        workspace_items, scan_truncated = _workspace_items_with_status(
+            worker, max_entries=scan_limit, max_depth=8
+        )
+        if scan_truncated:
             raise HTTPException(status_code=413, detail="Worker workspace exceeds the artifact scan limit")
         files = [item for item in workspace_items if not item.get("is_dir")]
         page = files[cursor : cursor + limit]
@@ -5894,7 +5965,12 @@ def create_app(
         ]
         store.add_event(worker["project_id"], worker_id, None, "worker.artifacts_listed", "Workspace artifacts listed")
         next_cursor = cursor + len(page) if cursor + len(page) < len(files) else None
-        return {"items": items, "next_cursor": next_cursor, "total": len(files)}
+        return {
+            "items": items,
+            "next_cursor": next_cursor,
+            "total": len(files),
+            "truncated": next_cursor is not None,
+        }
 
     @app.get("/v1/workers/{worker_id}/artifacts/open")
     def open_worker_artifact(worker_id: str, path: str, request: Request) -> HTMLResponse:
@@ -7057,9 +7133,7 @@ def create_app(
                     await websocket.close(code=4401)
                     return
                 try:
-                    ctx = auth_settings.context_from_headers(
-                        {str(key).lower(): value for key, value in websocket.headers.items()}
-                    )
+                    ctx = _service_auth_context_from_headers(websocket.headers)
                 except GlassHiveAuthError:
                     await websocket.close(code=4401)
                     return
@@ -7075,8 +7149,8 @@ def create_app(
             return
         worker = store.get_worker(
             worker_id,
-            tenant_id=ctx.tenant_id if ctx.enterprise else None,
-            owner_id=ctx.owner_id if ctx.enterprise else None,
+            tenant_id=ctx.tenant_id if ctx.is_user_scoped else None,
+            owner_id=ctx.owner_id if ctx.is_user_scoped else None,
         )
         if not worker:
             await websocket.close(code=4404)
@@ -7087,8 +7161,8 @@ def create_app(
         target = _terminal_target(worker)
         current = store.get_worker(
             worker_id,
-            tenant_id=ctx.tenant_id if ctx.enterprise else None,
-            owner_id=ctx.owner_id if ctx.enterprise else None,
+            tenant_id=ctx.tenant_id if ctx.is_user_scoped else None,
+            owner_id=ctx.owner_id if ctx.is_user_scoped else None,
         )
         if current and str(current.get("state") or "") in {
             "terminating",
@@ -7114,6 +7188,3 @@ def create_app(
         )
 
     return app
-
-
-app = create_app()

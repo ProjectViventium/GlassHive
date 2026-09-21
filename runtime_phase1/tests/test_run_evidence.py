@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,10 @@ from workers_projects_runtime.run_evidence import (
     summarize_run_evidence_result,
     write_constraint_ledger,
     write_run_evidence,
+)
+from workers_projects_runtime.workspace_continuation import (
+    DEFAULT_CONTINUATION_REQUEST,
+    continuation_instruction,
 )
 
 from concurrent.futures import ThreadPoolExecutor
@@ -1104,6 +1109,7 @@ def test_run_evidence_classifies_structured_provider_rate_limit(tmp_path):
             "subtype": "success",
             "is_error": True,
             "api_error_status": 429,
+            "terminal_reason": "api_error",
             "result": "You've hit your session limit; resets later.",
         }
     )
@@ -1178,6 +1184,7 @@ def test_run_evidence_classifies_structured_provider_overload(tmp_path):
             "subtype": "success",
             "is_error": True,
             "api_error_status": 529,
+            "terminal_reason": "api_error",
             "result": "API Error: 529 Overloaded. This is usually temporary.",
         }
     )
@@ -1251,6 +1258,7 @@ def test_run_evidence_classifies_structured_provider_auth_missing(tmp_path):
             "subtype": "success",
             "is_error": True,
             "api_error_status": 401,
+            "terminal_reason": "api_error",
             "result": "Not logged in. Please run /login.",
         }
     )
@@ -1286,6 +1294,7 @@ def test_run_evidence_still_classifies_structured_provider_403_auth_missing(tmp_
             "subtype": "error",
             "is_error": True,
             "api_error_status": 403,
+            "terminal_reason": "api_error",
             "result": "403 Forbidden: provider credentials are not authorized.",
         }
     )
@@ -1357,6 +1366,7 @@ def test_run_evidence_classifies_zero_exit_structured_provider_error(tmp_path):
             "subtype": "success",
             "is_error": True,
             "api_error_status": 429,
+            "terminal_reason": "api_error",
             "result": "Too Many Requests",
         }
     )

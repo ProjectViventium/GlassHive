@@ -108,6 +108,22 @@ def test_replay_recovers_completed_publication_after_writer_loss(tmp_path):
     assert not (tmp_path/'.native-input-response-abandoned').exists()
 
 
+@pytest.mark.parametrize('failure', ['invalid_json', 'non_object', 'open_mode'])
+def test_invalid_single_link_response_fails_without_retry(tmp_path, failure):
+    path = tmp_path / 'native-input-request.response.json'
+    if failure == 'invalid_json':
+        path.write_text('{')
+        path.chmod(0o600)
+    elif failure == 'non_object':
+        path.write_text('[]')
+        path.chmod(0o600)
+    else:
+        path.write_text('{}')
+        path.chmod(0o644)
+    with pytest.raises((native_input.NativeInputError, json.JSONDecodeError)):
+        native_input.read_response(path)
+
+
 def test_dead_native_process_cannot_receive_a_new_response(tmp_path):
     fixture(tmp_path)
     with pytest.raises(native_input.NativeInputError,match='native_input_stale'):

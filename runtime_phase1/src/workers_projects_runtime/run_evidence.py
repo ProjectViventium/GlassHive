@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from threading import Lock
 from typing import Iterable
 
 from .deliverables import (
@@ -68,13 +69,7 @@ _FINAL_REPORT_RE = re.compile(
     re.I,
 )
 
-FINAL_REPORT_PATTERN = re.compile(
-    r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*)?"
-    r"(?P<final_report_emphasis>[*_]{1,3})?"
-    r"FINAL REPORT[ \t]*:[ \t]*"
-    r"(?(final_report_emphasis)(?P=final_report_emphasis))[ \t]*",
-    re.I,
-)
+FINAL_REPORT_PATTERN = _FINAL_REPORT_RE
 
 _MONTHS = {
     "jan": 1,
@@ -336,11 +331,11 @@ def _stdout_agent_has_final_report(stdout_text: str) -> bool:
         for item in iter_dicts(payload):
             for key in final_text_keys:
                 text = str(item.get(key) or "")
-                if _FINAL_REPORT_RE.search(text):
+                if FINAL_REPORT_PATTERN.search(text):
                     return True
         if str(payload.get("type") or "") == "result":
             result_text = str(payload.get("result") or "")
-            if _FINAL_REPORT_RE.search(result_text):
+            if FINAL_REPORT_PATTERN.search(result_text):
                 return True
         item = payload.get("item")
         if not isinstance(item, dict):
@@ -348,9 +343,9 @@ def _stdout_agent_has_final_report(stdout_text: str) -> bool:
         if str(item.get("type") or "") not in {"agent_message", "assistant_message"}:
             continue
         text = str(item.get("text") or "")
-        if _FINAL_REPORT_RE.search(text):
+        if FINAL_REPORT_PATTERN.search(text):
             return True
-    return bool(_FINAL_REPORT_RE.search(str(stdout_text or "")))
+    return bool(FINAL_REPORT_PATTERN.search(str(stdout_text or "")))
 
 
 def _safe_env_keys(env: dict[str, str] | None) -> list[str]:
@@ -1074,10 +1069,14 @@ def _is_forbidden_format_mention(line: str, match: re.Match[str]) -> bool:
     return bool(_OUTPUT_FORBIDDEN_RE.search(str(line or "")[start:end]))
 
 
-def _required_output_formats(lines: list[str]) -> list[str]:
+def _required_output_formats(
+    lines: list[str],
+    *,
+    explicit_declaration: bool = False,
+) -> list[str]:
     found: list[str] = []
     for line in lines:
-        if not _line_has_required_output_context(line):
+        if not explicit_declaration and not _line_has_required_output_context(line):
             continue
         scan_line = _OUTPUT_FORBIDDEN_CLAUSE_RE.sub(" ", str(line or ""))
         for suffix in _OUTPUT_FORMAT_SUFFIXES:
@@ -1096,8 +1095,9 @@ def write_constraint_ledger(workspace_dir: Path | str, ledger: dict[str, object]
     latest_path.parent.mkdir(parents=True, exist_ok=True)
     per_run_path.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(ledger, indent=2, sort_keys=True)
-    latest_path.write_text(body + "\n")
-    per_run_path.write_text(body + "\n")
+    with _EVIDENCE_WRITE_LOCK:
+        _atomic_write_text(latest_path, body + "\n")
+        _atomic_write_text(per_run_path, body + "\n")
     return latest_path
 
 
@@ -2538,7 +2538,7 @@ def build_run_evidence(
     else:
         exit_source = normalized_stop_reason or "unknown"
     has_final_report = bool(
-        _FINAL_REPORT_RE.search(output_text)
+        FINAL_REPORT_PATTERN.search(output_text)
         or _stdout_agent_has_final_report(stdout_text)
     )
     final_output = {

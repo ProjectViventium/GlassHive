@@ -2,31 +2,59 @@ from __future__ import annotations
 
 import hashlib
 import json
+import io
 import logging
 import os
+import re
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
 import threading
 import time
 import tomllib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
+import workers_projects_runtime.openclaw_runtime as openclaw_runtime_module
 import workers_projects_runtime.profile_runtime as profile_runtime_module
-from workers_projects_runtime.bootstrap import GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS, GLASSHIVE_SAFETY_CHECKPOINT_RULE
+from workers_projects_runtime.bootstrap import (
+    GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
+    GLASSHIVE_PROPORTIONAL_VERIFICATION_RULE,
+    GLASSHIVE_SAFETY_CHECKPOINT_RULE,
+    PARALLEL_CLEAN_ROOM_EXECUTION_POLICY,
+)
 from workers_projects_runtime.failure_classification import (
     classify_cli_failure,
     classify_runtime_error,
     is_user_resumable_failure,
 )
-from workers_projects_runtime.openclaw_runtime import RuntimeDependencyMissingError, RuntimeErrorBase, WorkerTerminatedError
-from workers_projects_runtime.profile_runtime import BaseCliWorkerRuntime, ClaudeCodeRuntime, CodexCliRuntime, HostClaudeCodeRuntime, HostCodexCliRuntime, HostOpenClawRuntime, OpenClawWorkstationRuntime, ProfiledWorkerRuntime, _redact_text
+from workers_projects_runtime.openclaw_runtime import (
+    RuntimeDependencyMissingError,
+    RuntimeErrorBase,
+    WorkerInterruptedError,
+    WorkerTerminatedError,
+)
+from workers_projects_runtime.profile_runtime import (
+    _CODEX_PROVIDER_CONTROL_CLIENT,
+    BaseCliWorkerRuntime,
+    ClaudeCodeRuntime,
+    CodexCliRuntime,
+    HostClaudeCodeRuntime,
+    HostCodexCliRuntime,
+    HostOpenClawRuntime,
+    OpenClawWorkstationRuntime,
+    ProfiledWorkerRuntime,
+    _atomic_write_private_text,
+    _host_native_web_access,
+    _provider_process_exit_error,
+    _redact_text,
+)
 from workers_projects_runtime.run_evidence import build_constraint_ledger, write_constraint_ledger
 
 
@@ -137,6 +165,260 @@ def test_pidless_host_session_is_historical_ambiguity_without_terminal_proof(
         "run_id": run_id,
         "historical_record_only": True,
     }
+
+
+def test_atomic_private_state_write_never_exposes_partial_replacement(tmp_path, monkeypatch):
+    target = tmp_path / "active-run.json"
+    target.write_text(json.dumps({"state": "running", "sequence": 1}))
+    real_replace = os.replace
+    state_seen_before_publish: list[dict[str, object]] = []
+
+    def inspect_then_replace(source, destination):
+        state_seen_before_publish.append(json.loads(target.read_text()))
+        real_replace(source, destination)
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.replace", inspect_then_replace)
+
+    _atomic_write_private_text(target, json.dumps({"state": "running", "sequence": 2}))
+
+    assert state_seen_before_publish == [{"state": "running", "sequence": 1}]
+    assert json.loads(target.read_text()) == {"state": "running", "sequence": 2}
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_provider_liveness_projects_only_exact_native_json_event_types(tmp_path):
+    codex = CodexCliRuntime(base_dir=str(tmp_path / "codex"))
+    claude = ClaudeCodeRuntime(base_dir=str(tmp_path / "claude"))
+
+    retry = codex._provider_liveness_observation(
+        json.dumps({"type": "error", "message": "synthetic localized text"}),
+        run_id="run-liveness",
+        line_sequence=3,
+        model="test-model",
+        observed_at="2026-08-27T12:00:00Z",
+    )
+    progress = codex._provider_liveness_observation(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "command_execution", "status": "completed"},
+            }
+        ),
+        run_id="run-liveness",
+        line_sequence=4,
+        model="test-model",
+        observed_at="2026-08-27T12:00:01Z",
+    )
+    claude_retry = claude._provider_liveness_observation(
+        json.dumps({"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}}),
+        run_id="run-liveness",
+        line_sequence=5,
+        model="test-model",
+        observed_at="2026-08-27T12:00:02Z",
+    )
+    claude_progress = claude._provider_liveness_observation(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "Synthetic progress"}]},
+            }
+        ),
+        run_id="run-liveness",
+        line_sequence=6,
+        model="test-model",
+        observed_at="2026-08-27T12:00:03Z",
+    )
+
+    assert retry is not None
+    assert retry["kind"] == "internal_retry"
+    assert retry["failure_class"] == "provider_internal_retry"
+    assert retry["event_ref"].startswith("provider_liveness_sha256:")
+    assert retry["source_sequence"] == 3
+    assert re.fullmatch(r"[0-9a-f]{64}", str(retry["source_digest"]))
+    assert progress is not None
+    assert progress["kind"] == "meaningful_progress"
+    assert progress["event_ref"] != retry["event_ref"]
+    assert claude_retry is not None
+    assert claude_retry["kind"] == "internal_retry"
+    assert claude_retry["failure_class"] == "provider_rate_limited"
+    assert claude_progress is not None
+    assert claude_progress["kind"] == "meaningful_progress"
+    assert claude._provider_liveness_observation(
+        json.dumps({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}}),
+        run_id="run-liveness",
+        line_sequence=7,
+        model="test-model",
+        observed_at="2026-08-27T12:00:04Z",
+    ) is None
+    assert claude._provider_liveness_observation(
+        json.dumps({"type": "assistant", "message": {"content": [{"type": "thinking"}]}}),
+        run_id="run-liveness",
+        line_sequence=8,
+        model="test-model",
+        observed_at="2026-08-27T12:00:05Z",
+    ) is None
+    assert codex._provider_liveness_observation(
+        json.dumps({"type": "item.completed", "item": {"type": "reasoning"}}),
+        run_id="run-liveness",
+        line_sequence=9,
+        model="test-model",
+        observed_at="2026-08-27T12:00:06Z",
+    ) is None
+    assert codex._provider_liveness_observation(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "command_execution", "status": "failed"},
+            }
+        ),
+        run_id="run-liveness",
+        line_sequence=10,
+        model="test-model",
+        observed_at="2026-08-27T12:00:07Z",
+    ) is None
+    assert codex._provider_liveness_observation(
+        "retrying in prose",
+        run_id="run-liveness",
+        line_sequence=11,
+        model="test-model",
+        observed_at="2026-08-27T12:00:08Z",
+    ) is None
+
+
+def test_native_jsonl_tail_publishes_exact_liveness_sequence_and_digest(
+    tmp_path, monkeypatch
+):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "codex-tail"))
+    worker_id = "wrk_native_liveness_tail"
+    run_id = "run_native_liveness_tail"
+    attempt_id = "attempt_native_liveness_tail"
+    model = "test-model"
+    lines = [
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "reasoning", "status": "completed"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "command_execution", "status": "completed"},
+            }
+        ),
+        json.dumps({"type": "error", "message": "synthetic localized text"}),
+        json.dumps({"type": "unknown", "status": "completed"}),
+    ]
+    stdout_path = tmp_path / "native-events.jsonl"
+    stdout_path.write_text("\n".join(lines) + "\n")
+    monkeypatch.setattr(
+        runtime,
+        "_read_active_session",
+        lambda _worker_id: {"run_id": run_id, "model": model},
+    )
+    observed: list[dict[str, object]] = []
+    runtime.set_provider_liveness_observer(observed.append)
+    stop = threading.Event()
+    stop.set()
+
+    runtime._observe_native_session_events(
+        worker_id,
+        stdout_path,
+        stop,
+        run_id=run_id,
+        attempt_id=attempt_id,
+    )
+
+    assert [item["source_sequence"] for item in observed] == [2, 3]
+    assert [item["kind"] for item in observed] == [
+        "meaningful_progress",
+        "internal_retry",
+    ]
+    assert [item["source_digest"] for item in observed] == [
+        hashlib.sha256(lines[1].encode("utf-8")).hexdigest(),
+        hashlib.sha256(lines[2].encode("utf-8")).hexdigest(),
+    ]
+    assert all(item["worker_id"] == worker_id for item in observed)
+    assert all(item["run_id"] == run_id for item in observed)
+    assert all(item["attempt_id"] == attempt_id for item in observed)
+    assert all(item["model"] == model for item in observed)
+    assert runtime._provider_liveness_observation(
+        json.dumps({"message": "retrying without a native event type"}),
+        run_id="run-liveness",
+        line_sequence=12,
+        model="test-model",
+        observed_at="2026-08-27T12:00:09Z",
+    ) is None
+    assert runtime._provider_liveness_observation(
+        json.dumps({"type": "turn.failed", "error": {"message": "terminal"}}),
+        run_id="run-liveness",
+        line_sequence=13,
+        model="test-model",
+        observed_at="2026-08-27T12:00:10Z",
+    ) is None
+
+
+def test_native_jsonl_tail_resumed_attempt_starts_at_existing_eof(
+    tmp_path, monkeypatch
+):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "codex-resumed-tail"))
+    worker_id = "wrk_resumed_native_tail"
+    run_id = "run_resumed_native_tail"
+    attempt_id = "attempt_b"
+    model = "test-model"
+    prior_attempt_lines = [
+        json.dumps({"type": "error", "message": f"attempt A retry {index}"})
+        for index in range(3)
+    ]
+    resumed_attempt_lines = [
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "command_execution", "status": "completed"},
+            }
+        ),
+        json.dumps({"type": "error", "message": "attempt B retry"}),
+    ]
+    stdout_path = tmp_path / "resumed-native-events.jsonl"
+    stdout_path.write_text("\n".join(prior_attempt_lines) + "\n")
+    resume_boundary = stdout_path.stat().st_size
+    monkeypatch.setattr(
+        runtime,
+        "_read_active_session",
+        lambda _worker_id: {"run_id": run_id, "model": model},
+    )
+    observed: list[dict[str, object]] = []
+    runtime.set_provider_liveness_observer(observed.append)
+    stop = threading.Event()
+    tail = threading.Thread(
+        target=runtime._observe_native_session_events,
+        args=(worker_id, stdout_path, stop, run_id, attempt_id, resume_boundary),
+        daemon=True,
+    )
+
+    tail.start()
+    time.sleep(0.1)
+    assert observed == []
+
+    with stdout_path.open("a") as handle:
+        handle.write("\n".join(resumed_attempt_lines) + "\n")
+    deadline = time.monotonic() + 2
+    while len(observed) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stop.set()
+    tail.join(timeout=2)
+
+    assert not tail.is_alive()
+    assert [item["attempt_id"] for item in observed] == [attempt_id, attempt_id]
+    assert [item["source_sequence"] for item in observed] == [1, 2]
+    assert [item["kind"] for item in observed] == [
+        "meaningful_progress",
+        "internal_retry",
+    ]
+    assert [item["source_digest"] for item in observed] == [
+        hashlib.sha256(line.encode("utf-8")).hexdigest()
+        for line in resumed_attempt_lines
+    ]
 
 
 def test_terminal_target_uses_inferred_job_session_when_metadata_missing(tmp_path):
@@ -973,7 +1255,16 @@ def test_collect_completed_run_classifies_and_redacts_provider_rate_limit(tmp_pa
         "\n".join(
             [
                 json.dumps({"type": "thread.started", "thread_id": "thread_rate"}),
-                json.dumps({"type": "response.failed", "error": {"message": "Too Many Requests"}}),
+                json.dumps(
+                    {
+                        "type": "response.failed",
+                        "error": {
+                            "message": "Too Many Requests",
+                            "status_code": 429,
+                            "headers": {"retry-after": "120"},
+                        },
+                    }
+                ),
                 json.dumps({"type": "turn.failed", "error": {"message": "response.failed event received"}}),
             ]
         )
@@ -990,6 +1281,7 @@ def test_collect_completed_run_classifies_and_redacts_provider_rate_limit(tmp_pa
     assert recovered["failure_retryable"] == 1
     assert "workspace_continue" in recovered["failure_recommended_recovery"]
     assert "Too Many Requests" in recovered["failure_diagnostic_summary"]
+    assert recovered["provider_retry_after_s"] == 120
     assert "PUBLIC_FAKE_API_KEY_VALUE" not in recovered["error_text"]
     assert "PUBLIC_FAKE_TOKEN_VALUE" not in recovered["error_text"]
 
@@ -1000,6 +1292,7 @@ def test_cli_failure_classifies_codex_usage_quota_as_structured_provider_quota()
             json.dumps(
                 {
                     "type": "error",
+                    "code": "usage_limit_reached",
                     "message": (
                         "You've hit your usage limit. To get more access now, "
                         "review your provider plan."
@@ -1038,6 +1331,7 @@ def test_cli_failure_classifies_codex_usage_limit_turn_failed_as_structured_quot
             json.dumps(
                 {
                     "type": "error",
+                    "code": "usage_limit_reached",
                     "message": "You've hit your usage limit. Visit the usage page or try again later.",
                 }
             ),
@@ -1074,6 +1368,7 @@ def test_cli_failure_classifies_codex_usage_limit_top_level_error_as_structured_
             json.dumps(
                 {
                     "type": "error",
+                    "code": "usage_limit_reached",
                     "message": "You've hit your usage limit. Visit the usage page or try again later.",
                 }
             ),
@@ -1103,6 +1398,7 @@ def test_runtime_error_classifies_codex_usage_limit_raw_exit_as_structured_quota
             json.dumps(
                 {
                     "type": "error",
+                    "code": "usage_limit_reached",
                     "message": "You've hit your usage limit. Visit the usage page or try again later.",
                 }
             ),
@@ -1160,6 +1456,7 @@ def test_classify_cli_failure_maps_structured_provider_overload():
                 "subtype": "success",
                 "is_error": True,
                 "api_error_status": 529,
+                "terminal_reason": "api_error",
                 "result": "API Error: 529 Overloaded. This is a server-side issue, usually temporary.",
             }
         )
@@ -1173,7 +1470,1451 @@ def test_classify_cli_failure_maps_structured_provider_overload():
     assert failure.retryable is True
     assert "workspace_continue" in failure.recommended_recovery
     assert "api_error_status: 529" in failure.diagnostic_summary
-    assert "Overloaded" in failure.diagnostic_summary
+    assert "Overloaded" not in failure.diagnostic_summary
+
+
+def test_classify_cli_failure_does_not_use_native_json_message_prose_as_quota_authority():
+    failure = classify_cli_failure(
+        stdout='{"type":"error","message":"You\'ve hit your usage limit. Try again after the reset."}\n'
+        '{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit."}}',
+        stderr="",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class != "provider_quota_exhausted"
+    assert failure.structured is False
+
+
+def _docker_codex_preauthoring_failure(thread_id: str) -> str:
+    return "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": thread_id}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "error", "message": "untrusted localized prose"}),
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "untrusted localized prose"},
+                }
+            ),
+        ]
+    )
+
+
+def _docker_codex_typed_quota_control(
+    thread_id: str,
+    reset_at: int,
+    *,
+    model_provider: str = "glasshive_openai_compatible",
+) -> str:
+    snapshot = {
+        "rateLimitReachedType": "workspace_member_usage_limit_reached",
+        "primary": {"usedPercent": 100, "resetsAt": reset_at},
+        "secondary": None,
+    }
+    return json.dumps(
+        {
+            "thread_result": {
+                "thread": {
+                    "id": thread_id,
+                    "modelProvider": model_provider,
+                    "turns": [
+                        {
+                            "id": "turn_docker_typed_quota",
+                            "status": "failed",
+                            "items": [{"id": "item_user", "type": "userMessage"}],
+                            "error": {
+                                "message": "ignored provider prose",
+                                "codexErrorInfo": "usageLimitExceeded",
+                            },
+                        }
+                    ],
+                }
+            },
+            "rate_limits_result": {
+                "rateLimits": snapshot,
+                "rateLimitsByLimitId": {"codex": snapshot},
+            },
+        },
+        separators=(",", ":"),
+    )
+
+
+def _prepare_docker_codex_provider_control(
+    runtime: CodexCliRuntime,
+    worker: dict[str, str],
+    *,
+    run_id: str,
+    recorded_container_id: str,
+    fresh_container_id: str,
+    control_stdout: str,
+) -> list[dict[str, object]]:
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_active_session(
+        worker["worker_id"],
+        {
+            "session_name": f"job-{run_id[:12]}",
+            "run_id": run_id,
+            "stdout_path": "synthetic-stdout",
+            "stderr_path": "synthetic-stderr",
+            "exit_path": "synthetic-exit",
+            "container_id": recorded_container_id,
+        },
+    )
+    runtime.sandbox.inspect_fresh = lambda *_args, **_kwargs: SimpleNamespace(  # type: ignore[method-assign]
+        status="present",
+        sandbox=SimpleNamespace(container_id=fresh_container_id, state="running"),
+    )
+    calls: list[dict[str, object]] = []
+
+    def docker_exec(container_name, command, **kwargs):
+        calls.append(
+            {
+                "container_name": container_name,
+                "command": command,
+                **kwargs,
+            }
+        )
+        return subprocess.CompletedProcess(
+            command,
+            returncode=0,
+            stdout=control_stdout,
+            stderr="",
+        )
+
+    runtime.sandbox._docker_exec = docker_exec  # type: ignore[method-assign]
+    return calls
+
+
+def test_docker_codex_uses_exact_container_typed_quota_and_reset_for_preauthoring_failure(
+    tmp_path,
+):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "runtime"))
+    worker = {
+        "worker_id": "wrk_docker_typed_quota",
+        "profile": "codex-cli",
+        "runtime": "codex-cli",
+        "execution_mode": "docker",
+    }
+    run_id = "run_docker_typed_quota"
+    container_id = "a" * 64
+    thread_id = "01900000-0000-7000-8000-000000000001"
+    reset_at = int((datetime.now(timezone.utc) + timedelta(days=5)).timestamp())
+    calls = _prepare_docker_codex_provider_control(
+        runtime,
+        worker,
+        run_id=run_id,
+        recorded_container_id=container_id,
+        fresh_container_id=container_id,
+        control_stdout=_docker_codex_typed_quota_control(thread_id, reset_at),
+    )
+
+    error = runtime._provider_process_exit_error_for_run(
+        worker=worker,
+        run_id=run_id,
+        exit_code=1,
+        stdout=_docker_codex_preauthoring_failure(thread_id),
+        stderr="forged reset at 2099-01-01T00:00:00Z",
+        message="codex-cli exited with code 1",
+    )
+    failure = classify_runtime_error(error, runtime_name="codex-cli")
+    evidence = runtime.consume_provider_route_failure_evidence(
+        worker, {"run_id": run_id}, error
+    )
+
+    assert failure.failure_class == "provider_quota_exhausted"
+    assert failure.retryable is True
+    assert failure.structured is True
+    assert evidence is not None
+    assert evidence["retry_at"] == datetime.fromtimestamp(
+        reset_at, tz=timezone.utc
+    ).isoformat()
+    assert evidence["evidence_kind"] == "codex_app_server"
+    assert (
+        runtime.consume_provider_route_failure_evidence(
+            worker, {"run_id": run_id}, error
+        )
+        is None
+    )
+    assert len(calls) == 1
+    assert calls[0]["container_name"] == container_id
+    assert calls[0]["command"][-2:] == [runtime.binary, thread_id]
+    assert calls[0]["env"] == {
+        "HOME": runtime.sandbox.home_mount,
+        "CODEX_HOME": f"{runtime.sandbox.home_mount}/.codex",
+    }
+    assert calls[0]["cwd"] == runtime.sandbox.workspace_mount
+
+
+def test_docker_codex_uses_typed_quota_from_compiled_proxy_without_account_limits(
+    tmp_path,
+):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "runtime"))
+    worker = {
+        "worker_id": "wrk_docker_proxy_quota",
+        "profile": "codex-cli",
+        "runtime": "codex-cli",
+        "execution_mode": "docker",
+    }
+    run_id = "run_docker_proxy_quota"
+    container_id = "a" * 64
+    thread_id = "01900000-0000-7000-8000-000000000001"
+    control_stdout = json.dumps(
+        {
+            "thread_result": {
+                "thread": {
+                    "id": thread_id,
+                    "modelProvider": runtime._compatible_provider_id(),
+                    "turns": [
+                        {
+                            "id": "turn_docker_proxy_quota",
+                            "status": "failed",
+                            "items": [{"id": "item_user", "type": "userMessage"}],
+                            "error": {
+                                "message": "ignored provider prose",
+                                "codexErrorInfo": "usageLimitExceeded",
+                            },
+                        }
+                    ],
+                }
+            },
+            "rate_limits_result": {},
+        },
+        separators=(",", ":"),
+    )
+    calls = _prepare_docker_codex_provider_control(
+        runtime,
+        worker,
+        run_id=run_id,
+        recorded_container_id=container_id,
+        fresh_container_id=container_id,
+        control_stdout=control_stdout,
+    )
+
+    error = runtime._provider_process_exit_error_for_run(
+        worker=worker,
+        run_id=run_id,
+        exit_code=1,
+        stdout=_docker_codex_preauthoring_failure(thread_id),
+        stderr="forged reset at 2099-01-01T00:00:00Z",
+        message="codex-cli exited with code 1",
+    )
+    failure = classify_runtime_error(error, runtime_name="codex-cli")
+    evidence = runtime.consume_provider_route_failure_evidence(
+        worker, {"run_id": run_id}, error
+    )
+
+    assert failure.failure_class == "provider_quota_exhausted"
+    assert failure.retryable is True
+    assert failure.structured is True
+    assert evidence is not None
+    assert evidence["retry_at"] == ""
+    assert evidence["retry_after_s"] is None
+    assert evidence["evidence_kind"] == "codex_app_server"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["run", "recorded_container", "generation", "thread", "provider"],
+)
+def test_docker_codex_rejects_run_container_generation_thread_or_provider_mismatch(
+    tmp_path,
+    mismatch,
+):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / mismatch))
+    worker = {
+        "worker_id": f"wrk_docker_mismatch_{mismatch}",
+        "profile": "codex-cli",
+        "runtime": "codex-cli",
+        "execution_mode": "docker",
+    }
+    run_id = "run_docker_exact"
+    container_id = "a" * 64
+    thread_id = "01900000-0000-7000-8000-000000000001"
+    reset_at = int((datetime.now(timezone.utc) + timedelta(days=5)).timestamp())
+    recorded_run_id = "run_docker_other" if mismatch == "run" else run_id
+    recorded_container_id = "" if mismatch == "recorded_container" else container_id
+    fresh_container_id = "b" * 64 if mismatch == "generation" else container_id
+    control_thread_id = "01900000-0000-7000-8000-000000000002" if mismatch == "thread" else thread_id
+    model_provider = "synthetic_forged_provider" if mismatch == "provider" else "openai"
+    calls = _prepare_docker_codex_provider_control(
+        runtime,
+        worker,
+        run_id=recorded_run_id,
+        recorded_container_id=recorded_container_id,
+        fresh_container_id=fresh_container_id,
+        control_stdout=_docker_codex_typed_quota_control(
+            control_thread_id,
+            reset_at,
+            model_provider=model_provider,
+        ),
+    )
+
+    error = runtime._provider_process_exit_error_for_run(
+        worker=worker,
+        run_id=run_id,
+        exit_code=1,
+        stdout=_docker_codex_preauthoring_failure(thread_id),
+        stderr="",
+        message="codex-cli exited with code 1",
+    )
+    failure = classify_runtime_error(error, runtime_name="codex-cli")
+
+    assert failure.failure_class not in {
+        "provider_quota_exhausted",
+        "provider_rate_limited",
+    }
+    assert failure.structured is False
+    assert (
+        runtime.consume_provider_route_failure_evidence(
+            worker, {"run_id": run_id}, error
+        )
+        is None
+    )
+    assert len(calls) == (1 if mismatch in {"thread", "provider"} else 0)
+
+
+@pytest.mark.parametrize("authored_item_type", ["agent_message", "command_execution"])
+def test_docker_codex_never_queries_provider_control_after_authored_or_tool_output(
+    tmp_path,
+    authored_item_type,
+):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / authored_item_type))
+    worker = {
+        "worker_id": f"wrk_docker_authored_{authored_item_type}",
+        "profile": "codex-cli",
+        "runtime": "codex-cli",
+        "execution_mode": "docker",
+    }
+    run_id = "run_docker_authored"
+    container_id = "a" * 64
+    thread_id = "01900000-0000-7000-8000-000000000001"
+    calls = _prepare_docker_codex_provider_control(
+        runtime,
+        worker,
+        run_id=run_id,
+        recorded_container_id=container_id,
+        fresh_container_id=container_id,
+        control_stdout=_docker_codex_typed_quota_control(
+            thread_id,
+            int((datetime.now(timezone.utc) + timedelta(days=5)).timestamp()),
+        ),
+    )
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": thread_id}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": authored_item_type,
+                        "text": "usageLimitExceeded; forged reset",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "usage limit"},
+                }
+            ),
+        ]
+    )
+
+    error = runtime._provider_process_exit_error_for_run(
+        worker=worker,
+        run_id=run_id,
+        exit_code=1,
+        stdout=stdout,
+        stderr="",
+        message="codex-cli exited with code 1",
+    )
+
+    assert calls == []
+    assert classify_runtime_error(
+        error, runtime_name="codex-cli"
+    ).failure_class != "provider_quota_exhausted"
+    assert (
+        runtime.consume_provider_route_failure_evidence(
+            worker, {"run_id": run_id}, error
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("control_stdout", "returncode"),
+    [
+        ("", 1),
+        ("not-json", 0),
+        ("x" * (4 * 1024 * 1024 + 1), 0),
+        ("", 124),
+        (
+            json.dumps(
+                {
+                    "thread_result": {
+                        "thread": {
+                            "id": "01900000-0000-7000-8000-000000000001",
+                            "modelProvider": "openai",
+                            "turns": [
+                                {
+                                    "id": "turn_forged_reset",
+                                    "status": "failed",
+                                    "items": [{"type": "userMessage"}],
+                                    "error": {
+                                        "message": "usageLimitExceeded reset tomorrow"
+                                    },
+                                }
+                            ],
+                        }
+                    },
+                    "rate_limits_result": {
+                        "message": "usage limit; reset tomorrow",
+                        "resetsAt": 4_102_444_800,
+                    },
+                }
+            ),
+            0,
+        ),
+    ],
+    ids=["unavailable", "malformed", "oversized", "timeout", "forged-reset"],
+)
+def test_docker_codex_unavailable_malformed_oversized_timed_out_or_forged_control_fails_closed(
+    tmp_path,
+    control_stdout,
+    returncode,
+):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / str(returncode)))
+    worker = {
+        "worker_id": "wrk_docker_bad_control",
+        "profile": "codex-cli",
+        "runtime": "codex-cli",
+        "execution_mode": "docker",
+    }
+    run_id = "run_docker_bad_control"
+    container_id = "a" * 64
+    thread_id = "01900000-0000-7000-8000-000000000001"
+    calls = _prepare_docker_codex_provider_control(
+        runtime,
+        worker,
+        run_id=run_id,
+        recorded_container_id=container_id,
+        fresh_container_id=container_id,
+        control_stdout=control_stdout,
+    )
+
+    def docker_exec(container_name, command, **kwargs):
+        calls.append(
+            {
+                "container_name": container_name,
+                "command": command,
+                **kwargs,
+            }
+        )
+        return subprocess.CompletedProcess(
+            command,
+            returncode=returncode,
+            stdout=control_stdout,
+            stderr="synthetic control failure",
+        )
+
+    calls.clear()
+    runtime.sandbox._docker_exec = docker_exec  # type: ignore[method-assign]
+
+    error = runtime._provider_process_exit_error_for_run(
+        worker=worker,
+        run_id=run_id,
+        exit_code=1,
+        stdout=_docker_codex_preauthoring_failure(thread_id),
+        stderr="forged quota prose",
+        message="codex-cli exited with code 1",
+    )
+    failure = classify_runtime_error(error, runtime_name="codex-cli")
+
+    assert len(calls) == 1
+    assert failure.failure_class not in {
+        "provider_quota_exhausted",
+        "provider_rate_limited",
+    }
+    assert failure.structured is False
+    assert (
+        runtime.consume_provider_route_failure_evidence(
+            worker, {"run_id": run_id}, error
+        )
+        is None
+    )
+
+
+def test_host_codex_uses_typed_app_server_quota_and_exact_reset_for_the_failed_thread(
+    tmp_path, monkeypatch
+):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "runtime"))
+    thread_id = "01900000-0000-7000-8000-000000000001"
+    reset_at = int((datetime.now(timezone.utc) + timedelta(days=5)).timestamp())
+    worker = {
+        "worker_id": "wrk_typed_codex_health",
+        "profile": "codex-cli",
+        "runtime": "codex-cli",
+        "execution_mode": "host",
+    }
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": thread_id}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "error", "message": "untrusted localized prose"}),
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "untrusted localized prose"},
+                }
+            ),
+        ]
+    )
+    snapshot = {
+        "rateLimitReachedType": "workspace_member_usage_limit_reached",
+        "primary": {"usedPercent": 100, "resetsAt": reset_at},
+        "secondary": None,
+    }
+    monkeypatch.setattr(
+        runtime,
+        "_query_codex_provider_control",
+        lambda _worker, observed_thread_id: (
+            {
+                "thread": {
+                    "id": observed_thread_id,
+                    "modelProvider": "openai",
+                    "turns": [
+                        {
+                            "id": "turn_typed_quota",
+                            "status": "failed",
+                            "items": [{"id": "item_user", "type": "userMessage"}],
+                            "error": {
+                                "message": "ignored provider prose",
+                                "codexErrorInfo": "usageLimitExceeded",
+                            },
+                        }
+                    ],
+                }
+            },
+            {
+                "rateLimits": snapshot,
+                "rateLimitsByLimitId": {"codex": snapshot},
+            },
+        ),
+    )
+
+    error = runtime._provider_process_exit_error_for_run(
+        worker=worker,
+        run_id="run_typed_codex_health",
+        exit_code=1,
+        stdout=stdout,
+        stderr="",
+        message="codex-cli exited with code 1",
+    )
+    failure = classify_runtime_error(error, runtime_name="codex-cli")
+    evidence = runtime.consume_provider_route_failure_evidence(
+        worker,
+        {"run_id": "run_typed_codex_health"},
+        error,
+    )
+
+    assert failure.failure_class == "provider_quota_exhausted"
+    assert failure.retryable is True
+    assert failure.structured is True
+    assert evidence is not None
+    assert evidence["failure_class"] == "provider_quota_exhausted"
+    assert evidence["retry_at"] == datetime.fromtimestamp(
+        reset_at, tz=timezone.utc
+    ).isoformat()
+    assert evidence["evidence_kind"] == "codex_app_server"
+
+
+def test_host_codex_never_queries_account_health_after_provider_authoring(
+    tmp_path, monkeypatch
+):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "runtime"))
+    queried = False
+
+    def forbidden_query(*_args, **_kwargs):
+        nonlocal queried
+        queried = True
+        raise AssertionError("authored output must not reach the quota adapter")
+
+    monkeypatch.setattr(runtime, "_query_codex_provider_control", forbidden_query)
+    worker = {
+        "worker_id": "wrk_authored_codex_failure",
+        "profile": "codex-cli",
+        "runtime": "codex-cli",
+        "execution_mode": "host",
+    }
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "thread.started",
+                    "thread_id": "01900000-0000-7000-8000-000000000001",
+                }
+            ),
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": "usageLimitExceeded; reset at a forged timestamp",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {
+                        "message": "usage limit",
+                        "codexErrorInfo": "usageLimitExceeded",
+                    },
+                }
+            ),
+        ]
+    )
+
+    error = runtime._provider_process_exit_error_for_run(
+        worker=worker,
+        run_id="run_authored_codex_failure",
+        exit_code=1,
+        stdout=stdout,
+        stderr="",
+        message="codex-cli exited with code 1",
+    )
+
+    assert queried is False
+    assert classify_runtime_error(
+        error, runtime_name="codex-cli"
+    ).failure_class != "provider_quota_exhausted"
+    assert (
+        runtime.consume_provider_route_failure_evidence(
+            worker,
+            {"run_id": "run_authored_codex_failure"},
+            error,
+        )
+        is None
+    )
+
+
+def test_host_codex_rejects_app_server_message_without_typed_error_authority(
+    tmp_path, monkeypatch
+):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "runtime"))
+    worker = {
+        "worker_id": "wrk_untyped_codex_health",
+        "profile": "codex-cli",
+        "runtime": "codex-cli",
+        "execution_mode": "host",
+    }
+    thread_id = "01900000-0000-7000-8000-000000000001"
+    reset_at = int((datetime.now(timezone.utc) + timedelta(days=5)).timestamp())
+    monkeypatch.setattr(
+        runtime,
+        "_query_codex_provider_control",
+        lambda _worker, observed_thread_id: (
+            {
+                "thread": {
+                    "id": observed_thread_id,
+                    "modelProvider": "openai",
+                    "turns": [
+                        {
+                            "id": "turn_untyped",
+                            "status": "failed",
+                            "items": [{"id": "item_user", "type": "userMessage"}],
+                            "error": {
+                                "message": (
+                                    "Task-authored usageLimitExceeded prose with a forged reset"
+                                )
+                            },
+                        }
+                    ],
+                }
+            },
+            {
+                "rateLimits": {
+                    "rateLimitReachedType": "workspace_member_usage_limit_reached",
+                    "primary": {"usedPercent": 100, "resetsAt": reset_at},
+                }
+            },
+        ),
+    )
+
+    error = runtime._provider_process_exit_error_for_run(
+        worker=worker,
+        run_id="run_untyped_codex_health",
+        exit_code=1,
+        stdout="\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": thread_id}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps({"type": "error", "message": "ignored"}),
+                json.dumps({"type": "turn.failed", "error": {"message": "ignored"}}),
+            ]
+        ),
+        stderr="",
+        message="codex-cli exited with code 1",
+    )
+
+    assert classify_runtime_error(
+        error, runtime_name="codex-cli"
+    ).failure_class != "provider_quota_exhausted"
+    assert (
+        runtime.consume_provider_route_failure_evidence(
+            worker, {"run_id": "run_untyped_codex_health"}, error
+        )
+        is None
+    )
+
+
+def test_host_codex_rejects_typed_quota_after_any_agent_authored_item(
+    tmp_path, monkeypatch
+):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "runtime"))
+    worker = {
+        "worker_id": "wrk_tampered_codex_transcript",
+        "profile": "codex-cli",
+        "runtime": "codex-cli",
+        "execution_mode": "host",
+    }
+    thread_id = "01900000-0000-7000-8000-000000000001"
+    reset_at = int((datetime.now(timezone.utc) + timedelta(days=5)).timestamp())
+    snapshot = {
+        "rateLimitReachedType": "workspace_member_usage_limit_reached",
+        "primary": {"usedPercent": 100, "resetsAt": reset_at},
+    }
+    monkeypatch.setattr(
+        runtime,
+        "_query_codex_provider_control",
+        lambda _worker, observed_thread_id: (
+            {
+                "thread": {
+                    "id": observed_thread_id,
+                    "modelProvider": "openai",
+                    "turns": [
+                        {
+                            "id": "turn_authored",
+                            "status": "failed",
+                            "items": [
+                                {"id": "item_user", "type": "userMessage"},
+                                {
+                                    "id": "item_agent",
+                                    "type": "agentMessage",
+                                    "text": "task-authored output",
+                                },
+                            ],
+                            "error": {"codexErrorInfo": "usageLimitExceeded"},
+                        }
+                    ],
+                }
+            },
+            {"rateLimits": snapshot},
+        ),
+    )
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": thread_id}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "error", "message": "ignored"}),
+            json.dumps({"type": "turn.failed", "error": {"message": "ignored"}}),
+        ]
+    )
+
+    error = runtime._provider_process_exit_error_for_run(
+        worker=worker,
+        run_id="run_tampered_codex_transcript",
+        exit_code=1,
+        stdout=stdout,
+        stderr="",
+        message="codex-cli exited with code 1",
+    )
+
+    assert classify_runtime_error(
+        error, runtime_name="codex-cli"
+    ).failure_class != "provider_quota_exhausted"
+    assert (
+        runtime.consume_provider_route_failure_evidence(
+            worker, {"run_id": "run_tampered_codex_transcript"}, error
+        )
+        is None
+    )
+
+
+def test_codex_provider_control_adapter_uses_exact_typed_protocol(tmp_path):
+    binary = tmp_path / "synthetic-codex"
+    binary.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, sys",
+                "for line in sys.stdin:",
+                "    request = json.loads(line)",
+                "    method = request.get('method')",
+                "    if method == 'initialize':",
+                "        print(json.dumps({'id': request['id'], 'result': {'userAgent': 'synthetic'}}), flush=True)",
+                "    elif method == 'thread/read':",
+                "        thread_id = request['params']['threadId']",
+                "        result = {'thread': {'id': thread_id, 'modelProvider': 'openai', 'turns': []}}",
+                "        print(json.dumps({'id': request['id'], 'result': result}), flush=True)",
+                "    elif method == 'account/rateLimits/read' and request.get('params') is None:",
+                "        result = {'rateLimits': {'rateLimitReachedType': None, 'primary': None, 'secondary': None}}",
+                "        print(json.dumps({'id': request['id'], 'result': result}), flush=True)",
+            ]
+        )
+        + "\n"
+    )
+    binary.chmod(0o700)
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "runtime"))
+    runtime.binary = str(binary)
+    worker = {
+        "worker_id": "wrk_codex_protocol",
+        "profile": "codex-cli",
+        "runtime": "codex-cli",
+        "execution_mode": "host",
+    }
+
+    result = runtime._query_codex_provider_control(
+        worker, "01900000-0000-7000-8000-000000000001"
+    )
+
+    assert result is not None
+    assert result[0]["thread"]["modelProvider"] == "openai"
+    assert result[1]["rateLimits"]["rateLimitReachedType"] is None
+
+
+def test_docker_codex_provider_control_keeps_typed_thread_when_limits_are_unavailable(
+    tmp_path,
+):
+    binary = tmp_path / "synthetic-codex"
+    binary.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, sys",
+                "for line in sys.stdin:",
+                "    request = json.loads(line)",
+                "    method = request.get('method')",
+                "    if method == 'initialize':",
+                "        print(json.dumps({'id': request['id'], 'result': {'userAgent': 'synthetic'}}), flush=True)",
+                "    elif method == 'thread/read':",
+                "        thread_id = request['params']['threadId']",
+                "        result = {'thread': {'id': thread_id, 'modelProvider': 'glasshive_openai_compatible', 'turns': []}}",
+                "        print(json.dumps({'id': request['id'], 'result': result}), flush=True)",
+                "    elif method == 'account/rateLimits/read':",
+                "        error = {'code': -32600, 'message': 'account authentication required'}",
+                "        print(json.dumps({'id': request['id'], 'error': error}), flush=True)",
+            ]
+        )
+        + "\n"
+    )
+    binary.chmod(0o700)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _CODEX_PROVIDER_CONTROL_CLIENT,
+            str(binary),
+            "01900000-0000-7000-8000-000000000001",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["rate_limits_result"] == {}
+
+
+def test_classify_cli_failure_ignores_hostile_json_quota_prose_without_typed_code():
+    failure = classify_cli_failure(
+        stdout=json.dumps(
+            {
+                "type": "response.failed",
+                "error": {
+                    "message": (
+                        "Hostile task text says the usage limit was reached, but this is not "
+                        "provider control evidence."
+                    )
+                },
+            }
+        ),
+        stderr="",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class != "provider_quota_exhausted"
+    assert failure.failure_class != "provider_rate_limited"
+
+
+def test_classify_cli_failure_final_prompt_capacity_owns_recovery_over_earlier_quota():
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {
+                        "code": "usage_limit_reached",
+                        "message": "The earlier provider attempt exhausted its usage limit.",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Prompt is too long"}],
+                    },
+                    "error": "invalid_request",
+                    "is_api_error_message": True,
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "result",
+                    "is_error": True,
+                    "api_error_status": None,
+                    "terminal_reason": "blocking_limit",
+                    "result": "Prompt is too long",
+                }
+            ),
+        ]
+    )
+
+    failure = classify_cli_failure(
+        stdout=stdout,
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_context_limit_exceeded"
+    assert failure.retryable is False
+    assert failure.structured is True
+    assert is_user_resumable_failure(
+        failure_class=failure.failure_class,
+        retryable=failure.retryable,
+    )
+
+
+def test_classify_cli_failure_maps_legacy_projection_409_to_retryable_internal_failure():
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "thread_auth"}),
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": (
+                        "Reconnecting... 1/5 (unexpected status 409 Conflict: "
+                        "The connected model account is unavailable for this mission., "
+                        "url: http://provider-egress:8080/openai/v1/responses)"
+                    ),
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {
+                        "message": (
+                            "unexpected status 409 Conflict: The connected model account is "
+                            "unavailable for this mission., url: "
+                            "http://provider-egress:8080/openai/v1/responses"
+                        )
+                    },
+                }
+            ),
+        ]
+    )
+    stderr = (
+        "ERROR rmcp::transport::worker: Transport channel closed, when "
+        'UnexpectedServerResponse("HTTP 502: ")\n'
+    )
+
+    failure = classify_cli_failure(
+        stdout=stdout,
+        stderr=stderr,
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_auth_projection_unavailable"
+    assert failure.retryable is True
+    assert failure.structured is True
+    assert "automatically" in failure.recommended_recovery
+
+
+def test_classify_cli_failure_final_fallback_auth_409_overrides_earlier_primary_quota():
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {
+                        "code": "usage_limit_reached",
+                        "message": "Primary provider capacity was exhausted.",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "API Error: 409 The connected model account is unavailable "
+                                    "for this mission."
+                                ),
+                            }
+                        ],
+                        "is_api_error_message": True,
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "result",
+                    "is_error": True,
+                    "api_error_status": 409,
+                    "terminal_reason": "api_error",
+                    "result": (
+                        "API Error: 409 The connected model account is unavailable for this mission."
+                    ),
+                }
+            ),
+        ]
+    )
+
+    failure = classify_cli_failure(
+        stdout=stdout,
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_auth_projection_unavailable"
+    assert failure.retryable is True
+    assert failure.structured is True
+
+
+def test_classify_cli_failure_final_fallback_generic_400_rejects_request():
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {
+                        "code": "usage_limit_reached",
+                        "message": "Primary provider capacity was exhausted.",
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": True,
+                    "api_error_status": 400,
+                    "terminal_reason": "api_error",
+                    "result": "API Error: Error response",
+                }
+            ),
+        ]
+    )
+
+    failure = classify_cli_failure(
+        stdout=stdout,
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_request_rejected"
+    assert failure.retryable is False
+    assert failure.structured is True
+    assert "workspace_continue" in failure.recommended_recovery
+
+
+@pytest.mark.parametrize(
+    ("earlier_code", "final_status", "final_code", "expected_class", "retryable"),
+    [
+        ("usage_limit_reached", 401, "authentication_error", "provider_auth_missing", False),
+        ("usage_limit_reached", 503, "service_unavailable", "provider_response_failed", True),
+        ("content_filter", 503, "service_unavailable", "provider_response_failed", True),
+        ("", 400, "", "provider_request_rejected", False),
+        ("usage_limit_reached", 400, "invalid_request_error", "provider_request_rejected", False),
+    ],
+)
+def test_classify_cli_failure_final_native_result_owns_recovery(
+    earlier_code,
+    final_status,
+    final_code,
+    expected_class,
+    retryable,
+):
+    events = []
+    if earlier_code:
+        events.append(
+            {
+                "type": "turn.failed",
+                "error": {"code": earlier_code, "message": "Earlier provider attempt failed."},
+            }
+        )
+    result = {
+        "type": "result",
+        "is_error": True,
+        "api_error_status": final_status,
+        "terminal_reason": "api_error",
+        "result": "The final provider attempt returned a native API error.",
+    }
+    if final_code:
+        result["error"] = {"code": final_code}
+    events.append(result)
+
+    failure = classify_cli_failure(
+        stdout="\n".join(json.dumps(event) for event in events),
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == expected_class
+    assert failure.retryable is retryable
+    assert failure.structured is True
+
+
+def test_classify_cli_failure_uses_only_the_last_codex_native_attempt():
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "primary"}),
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {"code": "usage_limit_reached", "message": "Primary exhausted."},
+                }
+            ),
+            json.dumps({"type": "thread.started", "thread_id": "fallback"}),
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {"code": "service_unavailable", "message": "Fallback unavailable."},
+                }
+            ),
+        ]
+    )
+
+    failure = classify_cli_failure(
+        stdout=stdout,
+        stderr="",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_response_failed"
+    assert failure.retryable is True
+
+
+def test_classify_cli_failure_keeps_final_multi_attempt_stderr_evidence():
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "primary"}),
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {"code": "usage_limit_reached", "message": "Primary exhausted."},
+                }
+            ),
+            json.dumps({"type": "thread.started", "thread_id": "fallback"}),
+        ]
+    )
+    stderr = json.dumps(
+        {
+            "type": "response.failed",
+            "error": {
+                "code": "authentication_error",
+                "type": "authentication_error",
+                "message": "The final provider rejected its credential.",
+            }
+        }
+    )
+
+    failure = classify_cli_failure(
+        stdout=stdout,
+        stderr=stderr,
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "provider_auth_missing"
+    assert failure.retryable is False
+    assert failure.structured is True
+
+
+@pytest.mark.parametrize(
+    ("failure_class", "retryable"),
+    [
+        ("provider_auth_projection_unavailable", True),
+        ("provider_connected_account_reconnect_required", False),
+        ("provider_unauthorized", False),
+        ("provider_upstream_unavailable", True),
+        ("provider_response_failed", True),
+        ("provider_request_rejected", False),
+        ("provider_content_filter", False),
+    ],
+)
+def test_runtime_error_preserves_all_structured_provider_classes(failure_class, retryable):
+    error = RuntimeErrorBase("structured provider failure")
+    error.failure_class = failure_class
+    error.failure_retryable = retryable
+
+    failure = classify_runtime_error(error, runtime_name="claude-code")
+
+    assert failure.failure_class == failure_class
+    assert failure.retryable is retryable
+    assert failure.structured is True
+
+
+def test_collect_completed_run_keeps_legacy_projection_failure_internal(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_auth_needed",
+        "name": "Auth Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.6-sol",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+
+    run_id = "run_auth_needed"
+    run_root = runtime._run_root(worker["worker_id"], run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "stdout.log").write_text(
+        json.dumps(
+            {
+                "type": "turn.failed",
+                "error": {
+                    "message": (
+                        "unexpected status 409 Conflict: The connected model account is "
+                        "unavailable for this mission., url: "
+                        "http://provider-egress:8080/openai/v1/responses"
+                    )
+                },
+            }
+        )
+        + "\n"
+    )
+    (run_root / "stderr.log").write_text(
+        'UnexpectedServerResponse("HTTP 502: ")\n'
+    )
+    (run_root / "exit_code").write_text("1")
+
+    recovered = runtime.collect_completed_run(worker, run_id=run_id)
+
+    assert recovered is not None
+    assert recovered["state"] == "failed"
+    assert recovered["failure_class"] == "provider_auth_projection_unavailable"
+    assert recovered["failure_retryable"] == 1
+    assert recovered["failure_structured"] == 1
+    assert "temporarily" in recovered["failure_user_message"]
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "expected_class", "retryable"),
+    [
+        (
+            409,
+            "Connect the configured model account, then resume this work.",
+            "provider_auth_missing",
+            False,
+        ),
+        (
+            409,
+            "Reconnect the connected model account, then resume this work.",
+            "provider_connected_account_reconnect_required",
+            False,
+        ),
+        (
+            409,
+            "The model provider rejected the configured credentials.",
+            "provider_unauthorized",
+            False,
+        ),
+        (
+            503,
+            "The model account authorization could not be read for this mission.",
+            "provider_auth_projection_unavailable",
+            True,
+        ),
+        (
+            502,
+            "The connected model provider is temporarily unavailable.",
+            "provider_upstream_unavailable",
+            True,
+        ),
+    ],
+)
+def test_classify_cli_failure_preserves_core_provider_failure_contract(
+    status,
+    message,
+    expected_class,
+    retryable,
+):
+    stdout = json.dumps(
+        {
+            "type": "result",
+            "is_error": True,
+            "api_error_status": status,
+            "terminal_reason": "api_error",
+            "result": f"API Error: {status} {message}",
+        }
+    )
+
+    failure = classify_cli_failure(
+        stdout=stdout,
+        stderr="",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == expected_class
+    assert failure.retryable is retryable
+    assert failure.structured is True
+
+
+def test_classify_cli_failure_does_not_infer_quota_from_prefixed_english_stderr():
+    failure = classify_cli_failure(
+        stdout="",
+        stderr=(
+            "INFO: starting native worker\n"
+            "ERROR: You've hit your usage limit. Try again after the reset.\n"
+        ),
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class != "provider_quota_exhausted"
+
+
+def test_classify_cli_failure_does_not_treat_unstructured_usage_limit_prose_as_quota():
+    failure = classify_cli_failure(
+        stdout="The user's document discusses usage limit policy as a domain fact.",
+        stderr="",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class != "provider_quota_exhausted"
+
+
+def test_classify_cli_failure_does_not_infer_capacity_from_unstructured_rate_limit_prose():
+    failure = classify_cli_failure(
+        stdout="",
+        stderr="The provider returned 429 Too Many Requests.",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class != "provider_rate_limited"
+    assert failure.retry_after_s is None
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected_class"),
+    [
+        ("rate_limit_error", "provider_rate_limited"),
+        ("resource_exhausted", "provider_rate_limited"),
+        ("insufficient_quota", "provider_quota_exhausted"),
+        ("usage_limit_reached", "provider_quota_exhausted"),
+    ],
+)
+def test_classify_cli_failure_uses_structured_provider_capacity_codes(
+    error_code,
+    expected_class,
+):
+    failure = classify_cli_failure(
+        stdout=json.dumps(
+            {
+                "type": "response.failed",
+                "error": {
+                    "error_code": error_code,
+                    "message": "Provider request could not proceed.",
+                },
+            }
+        ),
+        stderr="",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == expected_class
+    assert failure.retryable is True
+    assert failure.structured is True
+
+
+def test_classify_cli_failure_rejects_quota_code_inside_untrusted_tool_arguments():
+    failure = classify_cli_failure(
+        stdout=json.dumps(
+            {
+                "type": "mcp_tool_call",
+                "name": "synthetic_tool",
+                "arguments": {
+                    "error": {
+                        "code": "insufficient_quota",
+                        "status_code": 429,
+                        "retry_after_seconds": 86400,
+                    }
+                },
+            }
+        ),
+        stderr="",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert failure.failure_class not in {
+        "provider_quota_exhausted",
+        "provider_rate_limited",
+    }
+    assert failure.retry_after_s is None
+
+
+def test_classify_cli_failure_extracts_retry_after_only_from_structured_provider_json():
+    structured = classify_cli_failure(
+        stdout=json.dumps(
+            {
+                "type": "response.failed",
+                "error": {
+                    "status_code": 429,
+                    "message": "Too Many Requests",
+                    "retry_after_seconds": 75,
+                },
+            }
+        ),
+        stderr="",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+    prose = classify_cli_failure(
+        stdout="",
+        stderr="429 Too Many Requests; Retry-After: 99999",
+        runtime_name="codex-cli",
+        exit_code=1,
+    )
+
+    assert structured.failure_class == "provider_rate_limited"
+    assert structured.retry_after_s == 75
+    assert prose.failure_class != "provider_rate_limited"
+    assert prose.retry_after_s is None
 
 
 def test_classify_cli_failure_does_not_treat_unstructured_overloaded_prose_as_provider_outage():
@@ -1352,6 +3093,56 @@ def test_codex_parser_returns_latest_assistant_result_not_progress_chatter(tmp_p
     assert output == "The page is loaded. The result is visible."
 
 
+def test_claude_conversation_parser_returns_structured_output_envelope(tmp_path):
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_claude_structured",
+        "trusted_run_lane": "conversation",
+        "name": "Synthetic worker",
+        "profile": "claude-code",
+        "model": "opus",
+        "bootstrap_bundle_json": json.dumps(
+            {"run_mode": "conversation", "agent_builder_control": {"enabled": True}}
+        ),
+    }
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "Private schema work in progress."}
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "result",
+                    "session_id": "claude-session",
+                    "structured_output": {
+                        "type": "tool_call",
+                        "content": "",
+                        "tool_name": "lc_transfer_to_specialist",
+                    },
+                }
+            ),
+        ]
+    )
+
+    session_key, output = runtime._parse_output(
+        worker, stdout, "", runtime._runtime_info(worker)
+    )
+
+    assert session_key == "claude-session"
+    assert json.loads(output) == {
+        "type": "tool_call",
+        "content": "",
+        "tool_name": "lc_transfer_to_specialist",
+    }
+
+
 def test_codex_parser_prefers_final_report_section(tmp_path):
     runtime = CodexCliRuntime(base_dir=str(tmp_path))
     worker = {
@@ -1450,6 +3241,270 @@ def test_codex_parser_strips_plain_resume_final_report(tmp_path):
     assert output == "Made the background red."
 
 
+def _install_codex_native_child_lifecycle(
+    runtime: CodexCliRuntime,
+    worker_id: str,
+    *,
+    parent_thread_id: str,
+    child_thread_id: str,
+    child_terminal_event: str,
+) -> None:
+    codex_home = runtime._home_dir(worker_id) / ".codex"
+    sessions_dir = codex_home / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    parent_rollout = sessions_dir / f"rollout-{parent_thread_id}.jsonl"
+    child_rollout = sessions_dir / f"rollout-{child_thread_id}.jsonl"
+    parent_rollout.write_text(
+        json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}})
+        + "\n"
+    )
+    child_rollout.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {"type": "event_msg", "payload": {"type": "task_started"}}
+                ),
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {"type": child_terminal_event},
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    with sqlite3.connect(codex_home / "state_5.sqlite") as connection:
+        connection.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE thread_spawn_edges ("
+            "parent_thread_id TEXT NOT NULL, child_thread_id TEXT PRIMARY KEY, "
+            "status TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO threads(id, rollout_path) VALUES (?, ?)",
+            [
+                (
+                    parent_thread_id,
+                    f"/workspace/.wpr-home/.codex/sessions/{parent_rollout.name}",
+                ),
+                (
+                    child_thread_id,
+                    f"/workspace/.wpr-home/.codex/sessions/{child_rollout.name}",
+                ),
+            ],
+        )
+        connection.execute(
+            "INSERT INTO thread_spawn_edges(parent_thread_id, child_thread_id, status) "
+            "VALUES (?, ?, 'open')",
+            (parent_thread_id, child_thread_id),
+        )
+
+
+@pytest.mark.parametrize("child_terminal_event", ["task_started", "turn_aborted"])
+def test_codex_parser_rejects_final_report_when_spawned_child_is_unsettled(
+    tmp_path,
+    child_terminal_event,
+):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_aborted_native_child",
+        "name": "Parent Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    parent_thread_id = "synthetic-parent-thread"
+    _install_codex_native_child_lifecycle(
+        runtime,
+        worker["worker_id"],
+        parent_thread_id=parent_thread_id,
+        child_thread_id="synthetic-unsettled-child",
+        child_terminal_event=child_terminal_event,
+    )
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": parent_thread_id}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": "FINAL REPORT:\nDone before the child result.",
+                    },
+                }
+            ),
+        ]
+    )
+
+    with pytest.raises(RuntimeErrorBase, match="spawned child") as raised:
+        runtime._parse_output(worker, stdout, "", runtime._runtime_info(worker))
+
+    classification = classify_runtime_error(raised.value, runtime_name="codex-cli")
+    assert classification.failure_class == "glasshive_evidence_check_failed"
+    assert classification.retryable is True
+
+
+def test_codex_parser_allows_final_report_after_spawned_child_completes(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_completed_native_child",
+        "name": "Parent Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+    parent_thread_id = "synthetic-parent-thread"
+    _install_codex_native_child_lifecycle(
+        runtime,
+        worker["worker_id"],
+        parent_thread_id=parent_thread_id,
+        child_thread_id="synthetic-completed-child",
+        child_terminal_event="task_complete",
+    )
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": parent_thread_id}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": "FINAL REPORT:\nDone after the child result.",
+                    },
+                }
+            ),
+        ]
+    )
+
+    _session_key, output = runtime._parse_output(
+        worker, stdout, "", runtime._runtime_info(worker)
+    )
+
+    assert output == "Done after the child result."
+
+
+def test_codex_completion_contract_requires_joining_spawned_children(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path))
+    worker = {
+        "worker_id": "wrk_child_join_contract",
+        "name": "Parent Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.4",
+    }
+
+    stdin_text = runtime._command_stdin_text(
+        worker, "Create the requested artifact.", runtime._runtime_info(worker)
+    )
+
+    assert stdin_text is not None
+    assert (
+        "join every spawned child and incorporate its result before writing `FINAL REPORT:`"
+        in stdin_text
+    )
+
+
+def test_codex_retry_cold_starts_when_durable_session_is_missing_from_native_store(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "private-state"))
+    worker = {
+        "worker_id": "wrk_codex_missing_native_session",
+        "name": "Retry Worker",
+        "profile": "codex-cli",
+        "execution_mode": "docker",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_session_key(worker["worker_id"], "synthetic-missing-thread")
+    codex_home = runtime._home_dir(worker["worker_id"]) / ".codex"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(codex_home / "state_5.sqlite") as connection:
+        connection.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)"
+        )
+
+    command, _env = runtime._build_command(
+        worker,
+        "Retry the same objective in the durable workspace.",
+        runtime._runtime_info(worker),
+    )
+
+    assert command[1] == "exec"
+    assert "resume" not in command
+    assert "synthetic-missing-thread" not in command
+
+
+def test_codex_retry_resumes_when_native_store_and_rollout_still_exist(tmp_path):
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "private-state"))
+    worker = {
+        "worker_id": "wrk_codex_available_native_session",
+        "name": "Retry Worker",
+        "profile": "codex-cli",
+        "execution_mode": "docker",
+    }
+    session_key = "synthetic-available-thread"
+    runtime._ensure_dirs(worker["worker_id"])
+    runtime._write_session_key(worker["worker_id"], session_key)
+    codex_home = runtime._home_dir(worker["worker_id"]) / ".codex"
+    rollout_path = codex_home / "sessions" / f"rollout-{session_key}.jsonl"
+    rollout_path.parent.mkdir(parents=True, exist_ok=True)
+    rollout_path.write_text("{}\n")
+    with sqlite3.connect(codex_home / "state_5.sqlite") as connection:
+        connection.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO threads(id, rollout_path) VALUES (?, ?)",
+            (session_key, f"/home/seluser/.codex/sessions/{rollout_path.name}"),
+        )
+
+    command, _env = runtime._build_command(
+        worker,
+        "Continue the same objective in the durable workspace.",
+        runtime._runtime_info(worker),
+    )
+
+    assert command[1:4] == ["exec", "resume", "--json"]
+    assert session_key in command
+
+
+def test_provider_switch_does_not_resume_another_provider_native_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
+    base_dir = str(tmp_path / "profile-switch-state")
+    codex_runtime = CodexCliRuntime(base_dir=base_dir)
+    claude_runtime = ClaudeCodeRuntime(base_dir=base_dir)
+    worker = {
+        "worker_id": "wrk_provider_switch",
+        "profile": "claude-code",
+        "execution_mode": "docker",
+        "model": "claude-sonnet-4-6",
+    }
+
+    codex_runtime._write_session_key(worker["worker_id"], "codex-native-session")
+    claude_command, _ = claude_runtime._build_command(
+        worker,
+        "Continue in the same durable workspace.",
+        claude_runtime._runtime_info(worker),
+    )
+
+    assert "--resume" not in claude_command
+
+    claude_runtime._write_session_key(worker["worker_id"], "claude-native-session")
+    claude_resume_command, _ = claude_runtime._build_command(
+        worker,
+        "Continue in the same durable workspace.",
+        claude_runtime._runtime_info(worker),
+    )
+    assert claude_resume_command[claude_resume_command.index("--resume") + 1] == (
+        "claude-native-session"
+    )
+
+
+def test_claude_code_default_model_matches_the_supported_harness_profile(tmp_path, monkeypatch):
+    monkeypatch.delenv("WPR_MODEL_CLAUDE_CODE", raising=False)
+    runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "claude-default-model"))
+
+    assert runtime.resolve_model("claude-code") == "opus"
+
+
 def test_codex_parser_ignores_agent_message_after_final_report(tmp_path):
     runtime = CodexCliRuntime(base_dir=str(tmp_path))
     worker = {
@@ -1539,7 +3594,12 @@ def test_openclaw_command_uses_private_instruction_file_pointer(tmp_path):
     pointer = command[command.index("-m") + 1]
     assert "do the work" not in pointer
     assert "FINAL REPORT:" not in pointer
-    assert "/workspace/.wpr-home/.glasshive-runs/run_openclaw_contract/instruction.stdin" in pointer
+    assert "/workspace/.wpr-home/.glasshive/current-instruction.stdin" in pointer
+    assert "run_openclaw_contract" not in pointer
+    assert "wrk_openclaw_contract" not in pointer
+    private_pointer = runtime._home_dir(worker["worker_id"]) / ".glasshive" / "current-instruction.stdin"
+    assert private_pointer.read_text().startswith("do the work")
+    assert oct(private_pointer.stat().st_mode & 0o777) == "0o600"
     stdin_text = runtime._command_stdin_text(worker, "do the work", runtime._runtime_info(worker))
     assert stdin_text and stdin_text.startswith("do the work")
     assert "FINAL REPORT:" in stdin_text
@@ -1564,7 +3624,12 @@ def test_host_openclaw_command_uses_private_instruction_file_pointer(tmp_path):
     pointer = command[command.index("-m") + 1]
     assert "do the private work" not in pointer
     assert "FINAL REPORT:" not in pointer
-    assert "run_host_openclaw_contract/instruction.stdin" in pointer
+    assert ".glasshive/current-instruction.stdin" in pointer
+    assert "run_host_openclaw_contract" not in pointer
+    assert "wrk_host_openclaw_contract" not in pointer
+    private_pointer = Path(runtime._host_runtime_info(worker).workspace_dir) / ".glasshive" / "current-instruction.stdin"
+    assert private_pointer.read_text().startswith("do the private work")
+    assert oct(private_pointer.stat().st_mode & 0o777) == "0o600"
     stdin_text = runtime._command_stdin_text(worker, "do the private work", runtime._host_runtime_info(worker))
     assert stdin_text and stdin_text.startswith("do the private work")
     assert "FINAL REPORT:" in stdin_text
@@ -1572,6 +3637,7 @@ def test_host_openclaw_command_uses_private_instruction_file_pointer(tmp_path):
 
 def test_host_openclaw_run_writes_private_instruction_file_for_pointer(tmp_path, monkeypatch):
     runtime = HostOpenClawRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
     runtime.binary = "/bin/echo"
     monkeypatch.setattr("workers_projects_runtime.profile_runtime.host_runtime_requirement_issue", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -1635,7 +3701,9 @@ def test_host_openclaw_run_writes_private_instruction_file_for_pointer(tmp_path,
     assert Path(command[6]).read_text().startswith("Sensitive OpenClaw task.")
     pointer = command[command.index("-m") + 1]
     assert "Sensitive OpenClaw task" not in pointer
-    assert "run_host_openclaw_pointer/instruction.stdin" in pointer
+    assert ".glasshive/current-instruction.stdin" in pointer
+    assert "run_host_openclaw_pointer" not in pointer
+    assert "wrk_host_openclaw_run_pointer" not in pointer
     stdin_path = runtime._run_root(worker["worker_id"], "run_host_openclaw_pointer") / "instruction.stdin"
     assert stdin_path.exists()
     assert stdin_path.read_text().startswith("Sensitive OpenClaw task.")
@@ -1750,7 +3818,9 @@ def test_openclaw_collect_completed_run_recovers_final_json_without_exit_file(tm
         lambda worker_id, runtime_name, session_name, worker=None, missing_ok=False: stopped.append(session_name)
     )
     runtime.sandbox.terminate_run_processes = (  # type: ignore[method-assign]
-        lambda worker_id, runtime_name, run_id, worker=None: terminated.append(run_id)
+        lambda worker_id, runtime_name, run_id, worker=None, missing_ok=False: terminated.append(
+            run_id
+        )
     )
     runtime.sandbox.inspect = lambda worker_id: type("SandboxInfo", (), {"pid": 4321, "state": "running"})()  # type: ignore[method-assign]
 
@@ -1830,7 +3900,9 @@ def test_interrupt_worker_stops_exact_run_session_when_metadata_is_missing(tmp_p
         lambda worker_id, runtime_name, session_name, worker=None, missing_ok=False: stopped.append(session_name)
     )
     runtime.sandbox.terminate_run_processes = (  # type: ignore[method-assign]
-        lambda worker_id, runtime_name, run_id, worker=None: terminated.append(run_id)
+        lambda worker_id, runtime_name, run_id, worker=None, missing_ok=False: terminated.append(
+            run_id
+        )
     )
     runtime.sandbox.inspect = lambda worker_id: type("SandboxInfo", (), {"pid": 4321, "state": "running"})()  # type: ignore[method-assign]
 
@@ -2399,6 +4471,7 @@ def test_codex_cli_provider_config_ignores_invalid_allowed_reasoning_efforts(tmp
 
 def test_host_cli_run_gives_supervisor_private_instruction_file(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
     runtime.binary = "/bin/echo"
     _patch_host_codex_requirement_probe(monkeypatch)
     captured: dict[str, object] = {}
@@ -2453,6 +4526,7 @@ def test_host_cli_run_gives_supervisor_private_instruction_file(tmp_path, monkey
 
 def test_host_cli_run_writes_constraint_ledger_and_evidence(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
     runtime.binary = "/bin/echo"
     _patch_host_codex_requirement_probe(monkeypatch)
     workspace = tmp_path / "workspace"
@@ -2527,6 +4601,7 @@ def test_host_cli_run_writes_constraint_ledger_and_evidence(tmp_path, monkeypatc
 
 def test_host_cli_run_fails_when_evidence_contract_fails(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
     runtime.binary = "/bin/echo"
     _patch_host_codex_requirement_probe(monkeypatch)
     workspace = tmp_path / "workspace"
@@ -2589,6 +4664,7 @@ def test_host_cli_run_fails_when_evidence_contract_fails(tmp_path, monkeypatch):
 
 def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
     runtime.binary = "/bin/echo"
     monkeypatch.setattr(runtime, "_process_start_identity", lambda pid: f"ps-lstart:synthetic-{pid}")
     recorded_metrics: list[tuple[str, str, str]] = []
@@ -2686,6 +4762,7 @@ def test_host_cli_timeout_writes_truthful_evidence(tmp_path, monkeypatch):
 
 def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
     runtime.binary = "/bin/echo"
     monkeypatch.setattr(runtime, "_process_start_identity", lambda pid: f"ps-lstart:synthetic-{pid}")
     _patch_host_codex_requirement_probe(monkeypatch)
@@ -2773,6 +4850,7 @@ def test_host_cli_timeout_preserves_foreground_server_transcript(tmp_path, monke
 
 def test_host_codex_run_sends_instruction_via_stdin_not_argv(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
     runtime.binary = "/bin/echo"
     _patch_host_codex_requirement_probe(monkeypatch)
     workspace = tmp_path / "workspace"
@@ -2849,6 +4927,7 @@ def test_host_codex_run_sends_instruction_via_stdin_not_argv(tmp_path, monkeypat
 
 def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
     runtime.binary = "/bin/echo"
     monkeypatch.setattr(runtime, "_process_start_identity", lambda pid: f"ps-lstart:synthetic-{pid}")
     recorded_metrics: list[tuple[str, str, str]] = []
@@ -2864,21 +4943,28 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
 
     class BlockingProcess:
         pid = 12345
+        returncode = None
 
         def __init__(self, command, **kwargs):
             _mark_fake_host_supervisor_ready(list(command), self.pid)
             self.terminated = False
+            stdout_text = (
+                "working before interrupt\n"
+                "debug path /Users/example/private-workspace/tmp/preview.png\n"
+            )
+            kwargs["stdout"].write(stdout_text)
+            kwargs["stdout"].flush()
+            self.stdout = io.StringIO(stdout_text)
+            self.stderr = io.StringIO("")
+            self.stdin = io.StringIO()
             processes.append(self)
-            stdout = kwargs["stdout"]
-            stdout.write("working before interrupt\n")
-            stdout.write("debug path /Users/example/private-workspace/tmp/preview.png\n")
-            stdout.flush()
 
         def wait(self, timeout=None):
-            deadline = time.time() + 2
+            deadline = time.time() + 10
             while not self.terminated and time.time() < deadline:
                 time.sleep(0.01)
             if self.terminated:
+                self.returncode = -15
                 return -15
             raise subprocess.TimeoutExpired(["fake-codex"], timeout)
 
@@ -2887,7 +4973,9 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
             return None, None
 
         def poll(self):
-            return -15 if self.terminated else None
+            if self.terminated:
+                self.returncode = -15
+            return self.returncode
 
         def terminate(self):
             self.terminated = True
@@ -2915,6 +5003,11 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
     monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.Popen", BlockingProcess)
     monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.getpgid", lambda pid: pid)
     monkeypatch.setattr("workers_projects_runtime.profile_runtime.os.killpg", fake_killpg)
+    monkeypatch.setattr(
+        runtime,
+        "_process_start_identity",
+        lambda _pid: "ps-lstart:synthetic-interrupt-generation",
+    )
     worker = {
         "worker_id": "wrk_interrupt_evidence",
         "name": "Interrupt Evidence Worker",
@@ -2955,6 +5048,7 @@ def test_host_cli_interrupt_writes_run_evidence(tmp_path, monkeypatch):
 
     assert not thread.is_alive()
     assert errors
+    assert isinstance(errors[0], WorkerInterruptedError)
     evidence = json.loads((workspace / "glasshive-run" / "evidence.json").read_text())
     active_status = json.loads((workspace / "glasshive-run" / "runs" / "run_interrupt_evidence" / "active-run.json").read_text())
     assert evidence["run_id"] == "run_interrupt_evidence"
@@ -3011,10 +5105,86 @@ def test_host_codex_runtime_default_prompts_require_final_report(tmp_path, monke
         assert "user's request" in content.lower()
         assert "success criteria" in content.lower()
         if filename in {"harness-prompt.md", "agents.md", "AGENTS.md"}:
+            assert GLASSHIVE_PROPORTIONAL_VERIFICATION_RULE in content
             assert GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS in content
             assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in content
+        else:
+            assert "canonical GlassHive project instruction source" in content
     assert "canonical project instruction source" in (workspace_dir / "CLAUDE.md").read_text()
     assert "@AGENTS.md" in (workspace_dir / "CLAUDE.md").read_text()
+
+
+def test_host_codex_runtime_copies_auth_without_optional_bootstrap_bundle(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
+    source_codex_home = tmp_path / "source-codex-home"
+    source_codex_home.mkdir()
+    (source_codex_home / "auth.json").write_text(
+        '{"OPENAI_API_KEY":"synthetic-test-key"}'
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+
+    def fake_run(args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
+            stderr="",
+        )
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
+    worker = {
+        "worker_id": "wrk_host_auth_baseline",
+        "name": "Host Worker",
+        "role": "general",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+
+    runtime.ensure_worker_ready(worker)
+
+    target_auth = runtime._host_codex_home(worker) / "auth.json"
+    assert json.loads(target_auth.read_text()) == {
+        "OPENAI_API_KEY": "synthetic-test-key"
+    }
+    assert stat.S_IMODE(target_auth.stat().st_mode) == 0o600
+
+
+def test_host_codex_runtime_never_copies_host_auth_in_enterprise_mode(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    runtime.binary = "/bin/echo"
+    _patch_host_codex_requirement_probe(monkeypatch)
+    source_codex_home = tmp_path / "source-codex-home"
+    source_codex_home.mkdir()
+    (source_codex_home / "auth.json").write_text(
+        '{"OPENAI_API_KEY":"synthetic-test-key"}'
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+    monkeypatch.setenv("WPR_ENTERPRISE_MODE", "1")
+
+    def fake_run(args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args,
+            returncode=0,
+            stdout="codex-cli 0.144.1\n" if "--version" in args else "",
+            stderr="",
+        )
+
+    monkeypatch.setattr("workers_projects_runtime.profile_runtime.subprocess.run", fake_run)
+    worker = {
+        "worker_id": "wrk_host_auth_enterprise",
+        "name": "Enterprise Host Worker",
+        "role": "general",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(tmp_path / "workspaces"),
+    }
+
+    runtime.ensure_worker_ready(worker)
+
+    assert not (runtime._host_codex_home(worker) / "auth.json").exists()
 
 
 def test_host_runtime_materializes_project_mcp_bootstrap_with_owner_only_files(tmp_path, monkeypatch):
@@ -3413,8 +5583,8 @@ def test_host_runtime_live_description_refreshes_stale_prompt_files(tmp_path, mo
     assert details["prompt_paths"]["harness_prompt"] == str(workspace_dir / "harness-prompt.md")
     assert "FINAL REPORT:" in (workspace_dir / "harness-prompt.md").read_text()
     assert "FINAL REPORT:" in (workspace_dir / "AGENTS.md").read_text()
-    assert "inspect the concrete output" in (workspace_dir / "harness-prompt.md").read_text()
-    assert "inspect the concrete output" in (workspace_dir / "AGENTS.md").read_text()
+    assert GLASSHIVE_PROPORTIONAL_VERIFICATION_RULE in (workspace_dir / "harness-prompt.md").read_text()
+    assert GLASSHIVE_PROPORTIONAL_VERIFICATION_RULE in (workspace_dir / "AGENTS.md").read_text()
 
 
 def test_host_codex_runtime_rejects_untrusted_source_paths(tmp_path, monkeypatch):
@@ -3674,6 +5844,24 @@ def test_workspace_codex_command_ignores_host_binary_override(tmp_path, monkeypa
     assert runtime.binary == "codex"
     assert command[0] == "codex"
     assert "/Applications/Codex.app" not in " ".join(command)
+
+
+def test_host_codex_runtime_uses_canonical_binary_when_symlink_hides_companion(tmp_path, monkeypatch):
+    bundle_cli = tmp_path / "Codex.app" / "Contents" / "Resources" / "codex"
+    bundle_cli.parent.mkdir(parents=True)
+    bundle_cli.write_text("#!/usr/bin/env bash\nexit 0\n")
+    bundle_cli.chmod(0o755)
+    companion = bundle_cli.parent / "codex-code-mode-host"
+    companion.write_text("#!/usr/bin/env bash\nexit 0\n")
+    companion.chmod(0o755)
+    path_link = tmp_path / "bin" / "codex"
+    path_link.parent.mkdir()
+    path_link.symlink_to(bundle_cli)
+    monkeypatch.setenv("WPR_CODEX_BIN", str(path_link))
+
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+
+    assert runtime.binary == str(bundle_cli)
 
 
 def test_workspace_codex_command_honors_per_run_effort_without_custom_provider(tmp_path, monkeypatch):
@@ -4482,6 +6670,7 @@ def test_workspace_claude_xhigh_effort_preflight_rejects_older_effort_contract(t
 
 
 def test_host_claude_command_enables_chrome_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-test-access")
     fake_claude = tmp_path / "claude"
     fake_claude.write_text(
         "#!/usr/bin/env bash\n"
@@ -4565,6 +6754,7 @@ def test_host_claude_xhigh_effort_rejects_older_effort_contract(tmp_path, monkey
 
 
 def test_host_claude_chrome_can_be_explicitly_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-test-access")
     runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "claude"
     monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
@@ -4723,6 +6913,30 @@ def test_host_cli_runtime_honors_caller_timeout_when_no_env_override(tmp_path, m
     assert runtime._host_run_timeout_sec(42) == 42
 
 
+def test_declared_long_runtime_bypasses_only_the_ordinary_maximum(
+    tmp_path, monkeypatch
+):
+    host = HostCodexCliRuntime(base_dir=str(tmp_path / "host"))
+    docker = CodexCliRuntime(base_dir=str(tmp_path / "docker"))
+    monkeypatch.setenv("GLASSHIVE_MAX_RUN_DURATION_S", "10")
+    monkeypatch.delenv("GLASSHIVE_HOST_RUN_TIMEOUT_SEC", raising=False)
+    monkeypatch.delenv("WPR_HOST_RUN_TIMEOUT_SEC", raising=False)
+    monkeypatch.delenv("GLASSHIVE_RUN_TIMEOUT_SEC", raising=False)
+    monkeypatch.delenv("WPR_RUN_TIMEOUT_SEC", raising=False)
+
+    assert host._host_run_timeout_sec(declared_long=True) is None
+    assert docker._run_timeout_sec(declared_long=True) is None
+    assert openclaw_runtime_module._run_timeout_sec(declared_long=True) is None
+    assert host._host_run_timeout_sec(42, declared_long=True) == 42
+    assert docker._run_timeout_sec(42, declared_long=True) == 42
+    assert openclaw_runtime_module._run_timeout_sec(42, declared_long=True) == 42
+
+    monkeypatch.setenv("GLASSHIVE_RUN_TIMEOUT_SEC", "7")
+    assert host._host_run_timeout_sec(declared_long=True) == 7
+    assert docker._run_timeout_sec(declared_long=True) == 7
+    assert openclaw_runtime_module._run_timeout_sec(declared_long=True) == 7
+
+
 def test_docker_cli_runtime_accepts_no_default_run_timeout(tmp_path):
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     exit_path = tmp_path / "exit_code"
@@ -4805,7 +7019,7 @@ def test_docker_cli_runtime_throttles_wait_loop_inspect(tmp_path, monkeypatch):
     assert inspect_calls == 1
 
 
-def test_docker_cli_runtime_clears_active_session_after_stop(tmp_path):
+def test_docker_cli_runtime_clears_active_session_only_after_confirmed_stop(tmp_path):
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     worker_id = "wrk_stop_meta"
     runtime._ensure_dirs(worker_id)
@@ -4823,9 +7037,11 @@ def test_docker_cli_runtime_clears_active_session_after_stop(tmp_path):
     runtime.sandbox.stop_screen_session = lambda worker_id, runtime_name, session_name, **kwargs: calls.append(("screen", session_name))  # type: ignore[method-assign]
     runtime.sandbox.terminate_run_processes = lambda worker_id, runtime_name, run_id, **kwargs: calls.append(("terminate", run_id))  # type: ignore[method-assign]
 
-    runtime._stop_active_process(worker_id, worker={"worker_id": worker_id})
+    confirmed = runtime._stop_active_process(
+        worker_id, worker={"worker_id": worker_id}
+    )
 
-    assert calls == [("terminate", "run_stop_meta"), ("screen", "job-run_stop_meta")]
+    assert calls == [("screen", "job-run_stop_meta"), ("terminate", "run_stop_meta")]
     assert not runtime._active_session_meta_path(worker_id).exists()
 
 
@@ -4868,6 +7084,414 @@ def test_docker_cli_runtime_uses_configured_run_timeout(tmp_path, monkeypatch):
     assert runtime._run_timeout_sec() == 1200
 
 
+def test_parallel_clean_room_container_env_rejects_ambient_provider_authority(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-ambient-openai-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-ambient-anthropic-secret")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-ambient-oauth-secret")
+    monkeypatch.setenv("PORTKEY_API_KEY", "synthetic-ambient-portkey-secret")
+    monkeypatch.setenv("HTTP_PROXY", "http://ambient-proxy.example:8888")
+    monkeypatch.setenv("HTTPS_PROXY", "http://ambient-proxy.example:8888")
+    monkeypatch.setenv(
+        "WPR_PARALLEL_CLEAN_ROOM_NETWORK", "glasshive-parallel-clean-room"
+    )
+    monkeypatch.setenv(
+        "WPR_PARALLEL_CLEAN_ROOM_PROVIDER_PROXY_URL",
+        "http://provider-egress:8080",
+    )
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_clean_room_env",
+        "bootstrap_profile": "clean-room",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "execution_policy": PARALLEL_CLEAN_ROOM_EXECUTION_POLICY,
+                "env": {
+                    "GLASSHIVE_CAPABILITY_BROKER_TOKEN": "synthetic-run-grant"
+                },
+            }
+        ),
+    }
+
+    env = runtime._container_env_for_worker(
+        worker,
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "PORTKEY_API_KEY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+    )
+
+    assert env["HTTP_PROXY"] == "http://provider-egress:8080"
+    assert env["HTTPS_PROXY"] == "http://provider-egress:8080"
+    assert env["NO_PROXY"] == (
+        "provider-egress,host.docker.internal,localhost,127.0.0.1"
+    )
+    assert "OPENAI_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "PORTKEY_API_KEY" not in env
+    assert "GLASSHIVE_CAPABILITY_BROKER_TOKEN" not in env
+
+
+def test_parallel_clean_room_codex_uses_run_grant_for_the_attested_provider_route(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "WPR_PARALLEL_CLEAN_ROOM_NETWORK", "glasshive-parallel-clean-room"
+    )
+    monkeypatch.setenv(
+        "WPR_PARALLEL_CLEAN_ROOM_PROVIDER_PROXY_URL",
+        "http://provider-egress:8080",
+    )
+    for name in (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "OPENAI_REVERSE_PROXY",
+        "PORTKEY_API_KEY",
+        "PORTKEY_BASE_URL",
+        "WPR_CODEX_CLI_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_clean_room_codex_provider",
+        "profile": "codex-cli",
+        "bootstrap_profile": "clean-room",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "execution_policy": PARALLEL_CLEAN_ROOM_EXECUTION_POLICY,
+                "env": {
+                    "GLASSHIVE_CAPABILITY_BROKER_TOKEN": "synthetic-run-grant"
+                },
+            }
+        ),
+    }
+    info = SimpleNamespace(
+        runtime="codex-cli",
+        model="synthetic-model",
+        workspace_dir=str(tmp_path / "workspace"),
+        home_dir=str(tmp_path / "home"),
+        session_key=None,
+    )
+
+    command, env = runtime._build_command(worker, "Do it.", info)
+
+    assert (
+        'model_providers.glasshive_openai_compatible.base_url="http://provider-egress:8080/openai/v1"'
+        in command
+    )
+    assert (
+        'model_providers.glasshive_openai_compatible.env_key="GLASSHIVE_CAPABILITY_BROKER_TOKEN"'
+        in command
+    )
+    assert "synthetic-run-grant" not in command
+    assert "synthetic-run-grant" not in env.values()
+    assert "OPENAI_API_KEY" not in env
+
+
+def test_parallel_clean_room_run_rejects_replaced_generation_before_authority_projection(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "WPR_PARALLEL_CLEAN_ROOM_NETWORK", "glasshive-parallel-clean-room"
+    )
+    monkeypatch.setenv(
+        "WPR_PARALLEL_CLEAN_ROOM_PROVIDER_PROXY_URL",
+        "http://provider-egress:8080",
+    )
+    runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_replaced_after_grant",
+        "profile": "codex-cli",
+        "execution_mode": "docker",
+        "bootstrap_profile": "clean-room",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "execution_policy": PARALLEL_CLEAN_ROOM_EXECUTION_POLICY,
+                "env": {
+                    "GLASSHIVE_CAPABILITY_BROKER_TOKEN": "synthetic-run-grant"
+                },
+            }
+        ),
+        "_run_local_capability_binding": {
+            "containerGenerationId": "a" * 64,
+        },
+    }
+
+    class ReplacementSandbox:
+        container_name = "wpr-replaced-after-grant"
+        container_id = "b" * 64
+        pid = 123
+        state = "running"
+
+    runtime.sandbox.ensure_ready = lambda *_args, **_kwargs: ReplacementSandbox()  # type: ignore[method-assign]
+    runtime.sandbox.inspect_fresh = lambda *_args, **_kwargs: SimpleNamespace(  # type: ignore[method-assign]
+        status="present", sandbox=ReplacementSandbox()
+    )
+
+    with pytest.raises(
+        RuntimeErrorBase,
+        match="capability grant does not match the exact sandbox generation",
+    ):
+        runtime.run_task(worker, "Do it.", run_id="run-replaced-after-grant")
+
+
+@pytest.mark.parametrize("runtime_type", [CodexCliRuntime, OpenClawWorkstationRuntime])
+def test_parallel_clean_room_ready_check_never_uses_cached_fast_sandbox(
+    tmp_path, runtime_type
+):
+    runtime = runtime_type(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_clean_room_fresh_boundary",
+        "state": "running",
+        "profile": "codex-cli",
+        "container_id": "cached-container-generation",
+        "bootstrap_bundle_json": json.dumps(
+            {"execution_policy": PARALLEL_CLEAN_ROOM_EXECUTION_POLICY}
+        ),
+    }
+    cached = SimpleNamespace(pid=9911, state="running")
+    runtime.sandbox.fast_sandbox_from_worker = lambda _worker: cached  # type: ignore[method-assign]
+    runtime.sandbox.ensure_ready = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        RuntimeError("strict clean-room boundary unavailable")
+    )
+    if isinstance(runtime, OpenClawWorkstationRuntime):
+        runtime._write_gateway_config = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+        runtime._start_openclaw_gateway = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="strict clean-room boundary unavailable"):
+        runtime.ensure_worker_ready(worker)
+
+
+def test_parallel_clean_room_run_exits_after_secret_scrub_without_takeover_shell(
+    tmp_path, monkeypatch
+):
+    class CaptureRuntime(BaseCliWorkerRuntime):
+        runtime_name = "codex-cli"
+        worker_root_name = "parallel_clean_room_capture"
+
+        def resolve_model(self, profile: str) -> str:
+            return "capture/model"
+
+        def _build_command(self, worker, instruction, info):
+            return ["printf", "ok"], self._container_env_for_worker(
+                worker, "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"
+            )
+
+        def _parse_output(self, worker, stdout, stderr, info):
+            return None, stdout.strip()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-ambient-provider-secret")
+    monkeypatch.setenv(
+        "CLAUDE_CODE_OAUTH_TOKEN", "synthetic-ambient-subscription-secret"
+    )
+    monkeypatch.setenv(
+        "WPR_PARALLEL_CLEAN_ROOM_NETWORK", "glasshive-parallel-clean-room"
+    )
+    monkeypatch.setenv(
+        "WPR_PARALLEL_CLEAN_ROOM_PROVIDER_PROXY_URL",
+        "http://provider-egress:8080",
+    )
+    runtime = CaptureRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
+    run_id = "run_clean_room_exit"
+    worker = {
+        "worker_id": "wrk_clean_room_exit",
+        "name": "Clean Room Worker",
+        "profile": "codex-cli",
+        "execution_mode": "docker",
+        "bootstrap_profile": "clean-room",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "execution_policy": PARALLEL_CLEAN_ROOM_EXECUTION_POLICY,
+                "env": {
+                    "GLASSHIVE_CAPABILITY_BROKER_TOKEN": "synthetic-run-grant"
+                },
+            }
+        ),
+        "_run_local_capability_binding": {
+            "containerGenerationId": "d" * 64,
+        },
+    }
+    stale_run_root = runtime._run_root(worker["worker_id"], run_id)
+    stale_run_root.mkdir(parents=True, exist_ok=True)
+    (stale_run_root / "exit_code").write_text("1")
+
+    class FakeSandbox:
+        container_name = "wpr-clean-room-exit"
+        container_id = "d" * 64
+        pid = 123
+        state = "running"
+
+    runtime.sandbox.ensure_ready = lambda *_args, **_kwargs: FakeSandbox()  # type: ignore[method-assign]
+    runtime.sandbox.inspect = lambda *_args, **_kwargs: FakeSandbox()  # type: ignore[method-assign]
+    runtime.sandbox.inspect_fresh = lambda *_args, **_kwargs: SimpleNamespace(  # type: ignore[method-assign]
+        status="present", sandbox=FakeSandbox()
+    )
+    runtime.sandbox.list_screen_sessions = lambda *_args, **_kwargs: []  # type: ignore[method-assign]
+    runtime.sandbox._ensure_container_writable_paths = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    runtime.sandbox.ensure_container_writable_paths = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    projected: list[dict] = []
+    cleared: list[dict] = []
+
+    def project_run_secrets(worker_id, **kwargs):
+        projected.append({"worker_id": worker_id, **kwargs})
+        return {
+            "env_file": f"/run/glasshive/{run_id}/secret-runtime.env",
+            "keys_file": f"/run/glasshive/{run_id}/secret-runtime.keys",
+        }
+
+    runtime.sandbox.project_parallel_clean_room_run_secrets = project_run_secrets  # type: ignore[method-assign]
+    runtime.sandbox.clear_parallel_clean_room_run_secrets = (  # type: ignore[method-assign]
+        lambda worker_id, **kwargs: cleared.append(
+            {"worker_id": worker_id, **kwargs}
+        )
+    )
+
+    def fake_start_screen_session(
+        worker_id, runtime_name, session_name, command, *, env=None, worker=None
+    ):
+        run_root = runtime._run_root(worker_id, run_id)
+        assert (run_root / "exit_code").read_text() == ""
+        script = (run_root / "run.sh").read_text()
+        assert "exec bash --noprofile --norc" not in script
+        assert "Interactive shell remains open for takeover" not in script
+        assert "credential-free session exiting" in script
+        assert 'exit "$status"' in script
+        assert (
+            'export OPENAI_API_KEY="$GLASSHIVE_CAPABILITY_BROKER_TOKEN"'
+            in script
+        )
+        assert (
+            'export ANTHROPIC_AUTH_TOKEN="$GLASSHIVE_CAPABILITY_BROKER_TOKEN"'
+            in script
+        )
+        assert "synthetic-run-grant" not in script
+        assert f"/run/glasshive/{run_id}/secret-runtime.env" in script
+        assert '$HOME/.glasshive/secret-runtime.env' not in script
+        assert "scrub_run_secrets()" in script
+        assert 'abort_run() { scrub_run_secrets; write_exit "${1:-130}"' in script
+        assert env["HTTP_PROXY"] == "http://provider-egress:8080"
+        assert "OPENAI_API_KEY" not in env
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+        (run_root / "stdout.log").write_text("FINAL REPORT:\nok")
+        (run_root / "stderr.log").write_text("")
+        (run_root / "exit_code").write_text("0")
+        return subprocess.CompletedProcess(
+            ["screen"], returncode=0, stdout="", stderr=""
+        )
+
+    runtime.sandbox.start_screen_session = fake_start_screen_session  # type: ignore[method-assign]
+    runtime.sandbox.screen_session_pid = lambda *_args, **_kwargs: 4321  # type: ignore[method-assign]
+
+    assert runtime.run_task(worker, "Do it.", run_id=run_id) == "FINAL REPORT:\nok"
+    assert projected == [
+        {
+            "worker_id": "wrk_clean_room_exit",
+            "expected_container_id": "d" * 64,
+            "run_id": run_id,
+            "env": {
+                "GLASSHIVE_CAPABILITY_BROKER_TOKEN": "synthetic-run-grant"
+            },
+        }
+    ]
+    assert cleared == [
+        {
+            "worker_id": "wrk_clean_room_exit",
+            "expected_container_id": "d" * 64,
+            "run_id": run_id,
+        }
+    ]
+
+
+def test_profiled_runtime_prepares_authority_from_fresh_exact_clean_room_generation(
+    tmp_path,
+):
+    runtime = ProfiledWorkerRuntime(base_dir=str(tmp_path / "data"))
+    sandbox = SimpleNamespace(container_id="a" * 64, state="running")
+    calls: list[str] = []
+    ensured_workers: list[dict] = []
+    fake_sandbox = SimpleNamespace(
+        inspect_fresh=lambda worker_id: (
+            calls.append(f"inspect:{worker_id}")
+            or SimpleNamespace(status="present", sandbox=sandbox)
+        ),
+        _sandbox_matches_parallel_clean_room_policy=lambda candidate: candidate is sandbox,
+    )
+    fake_runtime = SimpleNamespace(
+        sandbox=fake_sandbox,
+        ensure_worker_ready=lambda worker: (
+            ensured_workers.append(dict(worker))
+            or calls.append(f"ensure:{worker['worker_id']}")
+        ),
+    )
+    runtime._runtime_for_worker = lambda _worker: fake_runtime  # type: ignore[method-assign]
+    worker = {
+        "worker_id": "wrk_generation_authority",
+        "execution_mode": "docker",
+        "profile": "codex-cli",
+        "bootstrap_bundle_json": json.dumps(
+            {"execution_policy": PARALLEL_CLEAN_ROOM_EXECUTION_POLICY}
+        ),
+    }
+
+    assert runtime.prepare_run_authority_context(worker, run_id="run-exact") == {
+        "container_generation_id": "a" * 64
+    }
+    assert calls == [
+        "ensure:wrk_generation_authority",
+        "inspect:wrk_generation_authority",
+    ]
+    assert ensured_workers == [
+        {
+            **worker,
+            "_pre_run_substrate_recreate_allowed": True,
+        }
+    ]
+    assert "_pre_run_substrate_recreate_allowed" not in worker
+
+
+@pytest.mark.parametrize(
+    ("status", "state", "container_id", "matches"),
+    [
+        ("unavailable", "running", "a" * 64, True),
+        ("present", "exited", "a" * 64, True),
+        ("present", "running", "not-an-exact-generation", True),
+        ("present", "running", "a" * 64, False),
+    ],
+)
+def test_profiled_runtime_refuses_unproven_generation_before_broker_admission(
+    tmp_path, status, state, container_id, matches
+):
+    runtime = ProfiledWorkerRuntime(base_dir=str(tmp_path / "data"))
+    sandbox = SimpleNamespace(container_id=container_id, state=state)
+    fake_runtime = SimpleNamespace(
+        sandbox=SimpleNamespace(
+            inspect_fresh=lambda _worker_id: SimpleNamespace(
+                status=status, sandbox=sandbox
+            ),
+            _sandbox_matches_parallel_clean_room_policy=lambda _candidate: matches,
+        ),
+        ensure_worker_ready=lambda _worker: None,
+    )
+    runtime._runtime_for_worker = lambda _worker: fake_runtime  # type: ignore[method-assign]
+    worker = {
+        "worker_id": "wrk_unproven_generation",
+        "execution_mode": "docker",
+        "profile": "codex-cli",
+        "bootstrap_bundle_json": json.dumps(
+            {"execution_policy": PARALLEL_CLEAN_ROOM_EXECUTION_POLICY}
+        ),
+    }
+
+    with pytest.raises(RuntimeErrorBase, match="exact mission container generation"):
+        runtime.prepare_run_authority_context(worker, run_id="run-unproven")
+
+
 def test_docker_cli_runtime_description_exposes_desktop_prime_marker(tmp_path):
     runtime = CodexCliRuntime(base_dir=str(tmp_path / "data"))
     worker = {"worker_id": "wrk_describe_prime", "name": "Prime Worker", "profile": "codex-cli"}
@@ -4908,6 +7532,7 @@ def test_docker_cli_runtime_sources_runtime_and_openclaw_env_files(tmp_path):
             return None, stdout.strip()
 
     runtime = CaptureRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
     worker = {"worker_id": "wrk_capture", "name": "Capture Worker", "profile": "openclaw-general"}
     run_id = "run_capture"
 
@@ -5069,6 +7694,7 @@ def test_docker_cli_runtime_redirects_private_instruction_from_stdin_file(tmp_pa
             return None, stdout.strip()
 
     runtime = StdinRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
     worker = {"worker_id": "wrk_docker_stdin", "name": "Stdin Worker", "profile": "codex-cli"}
     run_id = "run_docker_stdin"
 
@@ -5141,6 +7767,7 @@ def test_docker_cli_run_fails_when_evidence_contract_fails(tmp_path):
             return None, "Done"
 
     runtime = CaptureRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
     run_id = "run_docker_evidence_fail"
     _install_fake_successful_docker_run(runtime, run_id, "FINAL REPORT:\nDone\n")
     worker = {"worker_id": "wrk_docker_evidence_fail", "name": "Capture Worker", "profile": "openclaw-general"}
@@ -5174,6 +7801,7 @@ def test_docker_cli_run_fails_when_success_evidence_cannot_be_written(tmp_path, 
             return None, "Done"
 
     runtime = CaptureRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
     run_id = "run_docker_evidence_write_fail"
     _install_fake_successful_docker_run(runtime, run_id, "FINAL REPORT:\nDone\n")
     monkeypatch.setattr(
@@ -5201,6 +7829,7 @@ def test_docker_cli_run_preserves_success_when_internal_constraint_diagnostic_ca
             return None, "Done"
 
     runtime = CaptureRuntime(base_dir=str(tmp_path / "data"))
+    runtime.set_run_start_observer(lambda _payload: None)
     run_id = "run_docker_ledger_write_fail"
     _install_fake_successful_docker_run(runtime, run_id, "FINAL REPORT:\nDone\n")
     monkeypatch.setattr(
@@ -5231,6 +7860,8 @@ def test_docker_codex_command_appends_completion_contract(tmp_path):
     stdin_text = runtime._command_stdin_text(worker, "Make the page red.", runtime._runtime_info(worker))
     assert stdin_text and stdin_text.startswith("Make the page red.")
     assert "FINAL REPORT:" in stdin_text
+    assert "`glasshive-run/` is reserved for internal harness support evidence" in stdin_text
+    assert "outside `glasshive-run/`" in stdin_text
 
 
 def test_docker_codex_stale_resume_replays_same_instruction_as_fresh_task(tmp_path, monkeypatch):
@@ -5796,6 +8427,248 @@ def test_codex_cli_provider_can_explicitly_lock_down_user_config_and_native_feat
     assert "--disable\ncomputer_use" in joined
 
 
+def test_host_codex_native_web_access_policy_disables_unbrokered_search_on_native_route(
+    tmp_path, monkeypatch
+):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_native_web_locked",
+        "name": "Locked Native Web Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.6-sol",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    monkeypatch.setenv("WPR_HOST_NATIVE_WEB_ACCESS", "disabled")
+    monkeypatch.setenv("GLASSHIVE_HOST_NATIVE_WEB_ACCESS", "inherit")
+
+    command, _ = runtime._build_command(
+        worker,
+        "Use the assigned brokered research capability.",
+        runtime._runtime_info(worker),
+    )
+
+    assert 'web_search="disabled"' in command
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
+    assert "danger-full-access" not in command
+    assert 'sandbox_mode="workspace-write"' in command
+    assert 'approval_policy="never"' in command
+    assert "sandbox_workspace_write.network_access=false" in command
+    joined = "\n".join(command)
+    for native_escape in (
+        "apps",
+        "browser_use",
+        "browser_use_external",
+        "browser_use_full_cdp_access",
+        "computer_use",
+        "in_app_browser",
+        "plugins",
+        "remote_plugin",
+    ):
+        assert f"--disable\n{native_escape}" in joined
+    assert "--disable\nweb_search" not in "\n".join(command)
+
+
+def test_host_codex_native_web_lockdown_keeps_only_declared_broker_mcp(
+    tmp_path, monkeypatch
+):
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        'notify = ["synthetic-notifier"]\n\n'
+        "[apps.synthetic]\nenabled = true\n\n"
+        "[mcp_servers.node_repl]\ncommand = \"node-repl\"\n\n"
+        "[plugins.\"browser@openai-bundled\"]\nenabled = true\n"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setenv("WPR_HOST_NATIVE_WEB_ACCESS", "disabled")
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+
+    config = runtime._host_codex_worker_config(
+        "[mcp_servers.glasshive-user-capabilities]\n"
+        'url = "http://127.0.0.1:8180/api/viventium/glasshive/capabilities/mcp"'
+    )
+
+    assert "mcp_servers.glasshive-user-capabilities" in config
+    assert "mcp_servers.node_repl" not in config
+    assert "synthetic-notifier" not in config
+    assert "apps.synthetic" not in config
+    assert "plugins" not in config
+
+
+def test_host_codex_native_web_lockdown_launches_declared_loopback_broker_transport(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_HOST_NATIVE_WEB_ACCESS", "disabled")
+    life = tmp_path / "Life"
+    life.mkdir()
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "private-state"))
+    worker = {
+        "worker_id": "wrk_locked_loopback_broker",
+        "trusted_run_lane": "conversation",
+        "name": "Locked Loopback Broker Worker",
+        "profile": "codex-cli",
+        "execution_mode": "host",
+        "workspace_root": str(life),
+        "model": "gpt-5.6-sol",
+        "bootstrap_bundle_json": json.dumps(
+            {
+                "run_mode": "conversation",
+                "provider_model": "gpt-5.6-sol",
+                "access_mode": "full",
+                "codex_config_append": (
+                    "[mcp_servers.glasshive-user-capabilities]\n"
+                    'url = "http://127.0.0.1:18180/api/capabilities/mcp"'
+                ),
+            }
+        ),
+    }
+    workspace = runtime._host_workspace_dir(worker)
+    runtime._materialize_workspace(worker, workspace)
+
+    command, env = runtime._build_command(
+        worker,
+        "Use the declared read-only broker capability.",
+        runtime._host_runtime_info(worker),
+    )
+
+    config_path = runtime._host_codex_home(worker) / "config.toml"
+    config = config_path.read_text()
+    assert "mcp_servers.glasshive-user-capabilities" in config
+    assert "http://127.0.0.1:18180/api/capabilities/mcp" in config
+    assert env["CODEX_HOME"] == str(config_path.parent)
+    assert 'approval_policy="never"' in command
+    assert 'sandbox_mode="workspace-write"' in command
+    assert "sandbox_workspace_write.network_access=false" in command
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
+    assert "danger-full-access" not in command
+
+
+def test_host_native_web_access_uses_standalone_alias_only_without_compiled_policy(
+    tmp_path, monkeypatch
+):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_native_web_alias_fallback",
+        "name": "Standalone Locked Native Web Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.6-sol",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    monkeypatch.delenv("WPR_HOST_NATIVE_WEB_ACCESS", raising=False)
+    monkeypatch.setenv("GLASSHIVE_HOST_NATIVE_WEB_ACCESS", "disabled")
+
+    command, _ = runtime._build_command(
+        worker,
+        "Use the assigned brokered research capability.",
+        runtime._runtime_info(worker),
+    )
+
+    assert 'web_search="disabled"' in command
+
+
+@pytest.mark.parametrize(
+    ("compiled", "standalone", "expected"),
+    [
+        ("disabled", "inherit", "disabled"),
+        ("inherit", "disabled", "inherit"),
+        (None, "disabled", "disabled"),
+    ],
+)
+def test_host_native_web_access_resolver_honors_compiled_precedence(
+    compiled, standalone, expected, monkeypatch
+):
+    if compiled is None:
+        monkeypatch.delenv("WPR_HOST_NATIVE_WEB_ACCESS", raising=False)
+    else:
+        monkeypatch.setenv("WPR_HOST_NATIVE_WEB_ACCESS", compiled)
+    monkeypatch.setenv("GLASSHIVE_HOST_NATIVE_WEB_ACCESS", standalone)
+
+    assert _host_native_web_access() == expected
+
+
+def test_host_native_web_access_compiled_inherit_overrides_standalone_alias(
+    tmp_path, monkeypatch
+):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_native_web_compiled_inherit",
+        "name": "Compiled Full Native Web Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.6-sol",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    monkeypatch.setenv("WPR_HOST_NATIVE_WEB_ACCESS", "inherit")
+    monkeypatch.setenv("GLASSHIVE_HOST_NATIVE_WEB_ACCESS", "disabled")
+
+    command, _ = runtime._build_command(
+        worker,
+        "Research with the best available capability.",
+        runtime._runtime_info(worker),
+    )
+
+    assert 'web_search="disabled"' not in command
+
+
+def test_host_codex_native_web_access_defaults_to_inherit(tmp_path, monkeypatch):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_native_web_inherited",
+        "name": "Full Native Worker",
+        "profile": "codex-cli",
+        "model": "gpt-5.6-sol",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    monkeypatch.delenv("GLASSHIVE_HOST_NATIVE_WEB_ACCESS", raising=False)
+    monkeypatch.delenv("WPR_HOST_NATIVE_WEB_ACCESS", raising=False)
+
+    command, _ = runtime._build_command(
+        worker,
+        "Research with the best available capability.",
+        runtime._runtime_info(worker),
+    )
+
+    assert 'web_search="disabled"' not in command
+
+
+def test_host_claude_native_web_access_policy_disables_web_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-test-access")
+    runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
+    worker = {
+        "worker_id": "wrk_claude_native_web_locked",
+        "name": "Locked Native Web Worker",
+        "profile": "claude-code",
+        "model": "opus",
+    }
+    runtime._ensure_dirs(worker["worker_id"])
+    monkeypatch.setenv("WPR_HOST_NATIVE_WEB_ACCESS", "disabled")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "1")
+
+    command, _ = runtime._build_command(
+        worker,
+        "Use the assigned brokered research capability.",
+        runtime._runtime_info(worker),
+    )
+
+    assert "--disallowedTools" in command
+    denied_index = command.index("--disallowedTools")
+    assert command[denied_index + 1 : denied_index + 3] == ["WebSearch", "WebFetch"]
+    assert "--chrome" not in command
+    assert "--no-chrome" in command
+    sources_index = command.index("--setting-sources")
+    assert command[sources_index + 1] == ""
+    settings_index = command.index("--settings")
+    settings = json.loads(command[settings_index + 1])
+    assert settings["sandbox"] == {
+        "enabled": True,
+        "failIfUnavailable": True,
+        "allowUnsandboxedCommands": False,
+        "network": {
+            "allowedDomains": [],
+            "strictAllowlist": True,
+        },
+    }
+
+
 def test_claude_code_runtime_passes_gateway_headers(tmp_path, monkeypatch):
     runtime = ClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
     worker = {
@@ -5880,6 +8753,10 @@ def test_claude_code_runtime_uses_bedrock_provider_model_without_oauth(tmp_path,
 def test_host_env_strips_parent_secrets_and_keeps_minimal_runtime_context(tmp_path, monkeypatch):
     runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "data"))
     monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "callback-secret")
+    monkeypatch.setenv(
+        "VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET",
+        "service-assertion-secret",
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "fake-openai-key")
     monkeypatch.setenv("LIBRECHAT_SECRET", "librechat-secret")
     monkeypatch.setenv("GLASSHIVE_AUTO_DISCOVER_CODEX_WORKSPACE_DEPS", "false")
@@ -5900,6 +8777,7 @@ def test_host_env_strips_parent_secrets_and_keeps_minimal_runtime_context(tmp_pa
     assert env["GLASSHIVE_WORKER_ID"] == "wrk_host"
     assert env["GLASSHIVE_RUN_ID"] == "run-123"
     assert "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET" not in env
+    assert "VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET" not in env
     assert "OPENAI_API_KEY" not in env
     assert "LIBRECHAT_SECRET" not in env
     # USER/LOGNAME must pass through: macOS Keychain-backed CLIs (claude-code's
@@ -5909,7 +8787,7 @@ def test_host_env_strips_parent_secrets_and_keeps_minimal_runtime_context(tmp_pa
     assert env["LOGNAME"] == "testuser"
 
 
-def test_host_openclaw_missing_cli_reports_named_binary(tmp_path):
+def test_host_openclaw_reserved_preflight_reports_named_missing_binary(tmp_path):
     runtime = HostOpenClawRuntime(base_dir=str(tmp_path / "data"))
     runtime.binary = "definitely-missing-openclaw"
     worker = {
@@ -5921,7 +8799,7 @@ def test_host_openclaw_missing_cli_reports_named_binary(tmp_path):
     }
 
     with pytest.raises(RuntimeDependencyMissingError, match="definitely-missing-openclaw CLI is not installed") as captured:
-        runtime.ensure_worker_ready(worker)
+        runtime.preflight_worker_profile("openclaw-general", "host")
     assert captured.value.binary == "definitely-missing-openclaw"
     assert captured.value.profile == "openclaw-general"
     assert captured.value.execution_mode == "host"
@@ -6124,6 +9002,10 @@ def test_host_claude_preflight_allows_explicit_chrome_lockdown(tmp_path, monkeyp
     monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")
     monkeypatch.delenv("GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
     monkeypatch.delenv("WPR_HOST_RUNTIME_REQUIREMENTS_JSON", raising=False)
+    monkeypatch.setattr(
+        "workers_projects_runtime.profile_runtime._claude_cli_managed_auth_available",
+        lambda *_args, **_kwargs: True,
+    )
 
     runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "data"))
 
@@ -6217,6 +9099,8 @@ def test_cli_failure_classifies_not_logged_in_provider_session():
                 "type": "result",
                 "subtype": "success",
                 "is_error": True,
+                "api_error_status": 401,
+                "terminal_reason": "api_error",
                 "result": "Not logged in · Please run /login",
             }
         ),
@@ -6439,15 +9323,55 @@ def test_runtime_error_classifies_missing_executable_substrate():
     assert "missing, unavailable, or incompatible" in failure.user_message
 
 
-def test_runtime_error_classifies_not_logged_in_provider_session():
+def test_runtime_error_does_not_infer_authentication_from_provider_prose():
     failure = classify_runtime_error(
         RuntimeErrorBase('claude-code exited with code 1: {"result":"Not logged in · Please run /login"}'),
         runtime_name="claude-code",
     )
 
+    assert failure.failure_class == "runtime_error"
+
+
+def test_runtime_error_preserves_structured_provider_authentication_class():
+    error = RuntimeErrorBase("claude-code exited with a structured provider failure")
+    error.failure_class = "provider_auth_missing"
+
+    failure = classify_runtime_error(error, runtime_name="claude-code")
+
     assert failure.failure_class == "provider_auth_missing"
     assert failure.retryable is False
-    assert "CLI login" in failure.recommended_recovery
+    assert failure.structured is True
+
+
+def test_provider_process_exit_preserves_structured_authentication_class():
+    error = _provider_process_exit_error(
+        runtime_name="claude-code",
+        exit_code=1,
+        stdout=json.dumps(
+            {
+                "type": "result",
+                "is_error": True,
+                "api_error_status": 401,
+                "terminal_reason": "api_error",
+                "result": "localized provider diagnostic",
+            }
+        ),
+        stderr="",
+        message="claude-code exited with code 1",
+    )
+
+    assert error.failure_class == "provider_auth_missing"
+
+
+def test_cli_failure_does_not_infer_authentication_from_unstructured_prose():
+    failure = classify_cli_failure(
+        stdout="",
+        stderr="ERROR: unauthorized wording from a user-controlled provider response",
+        runtime_name="claude-code",
+        exit_code=1,
+    )
+
+    assert failure.failure_class == "unknown"
 
 
 def test_runtime_error_classifies_unsupported_runtime_configuration():
@@ -7287,7 +10211,8 @@ def test_host_conversation_broker_config_stays_in_private_worker_state(tmp_path,
     assert (codex_config.parent / "plugins" / "cache").resolve() == (
         source_codex_home / "plugins" / "cache"
     ).resolve()
-    assert codex_command[:4] == ["codex", "exec", "--json", "--skip-git-repo-check"]
+    assert Path(codex_command[0]).name == "codex"
+    assert codex_command[1:4] == ["exec", "--json", "--skip-git-repo-check"]
     assert not (life / ".codex").exists()
 
     claude_runtime = HostClaudeCodeRuntime(base_dir=str(tmp_path / "claude-private-state"))
@@ -7678,14 +10603,15 @@ def test_codex_resume_flags_change_only_for_conversation_mode(tmp_path):
         runtime._host_runtime_info(mission_worker),
     )
 
-    assert conversation_command[:5] == [
-        "codex",
+    assert Path(conversation_command[0]).name == "codex"
+    assert conversation_command[1:5] == [
         "exec",
         "resume",
         "--json",
         "--skip-git-repo-check",
     ]
-    assert mission_command[:3] == ["codex", "exec", "resume"]
+    assert Path(mission_command[0]).name == "codex"
+    assert mission_command[1:3] == ["exec", "resume"]
     assert "--json" not in mission_command
     assert "--skip-git-repo-check" not in mission_command
 
@@ -8875,7 +11801,11 @@ def test_collect_completed_run_issues_route_failure_evidence_for_quota_exhaustio
             [
                 json.dumps({"type": "thread.started", "thread_id": "t"}),
                 json.dumps({"type": "turn.started"}),
-                json.dumps({"type": "error", "message": "You've hit your usage limit. Try again later."}),
+                json.dumps({
+                    "type": "error",
+                    "code": "usage_limit_reached",
+                    "message": "You've hit your usage limit. Try again later.",
+                }),
                 json.dumps({"type": "turn.failed", "error": {"message": "You've hit your usage limit."}}),
             ]
         )

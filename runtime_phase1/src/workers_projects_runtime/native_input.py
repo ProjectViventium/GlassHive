@@ -44,10 +44,22 @@ def read_response(path: Path) -> dict:
     # Wait only for that publication window; permanent extra links remain invalid.
     deadline = time.monotonic() + 0.1
     while True:
+        before = path.lstat()
         try:
             return read_object(path)
         except NativeInputError:
             info = path.lstat()
+            if (
+                before.st_dev == info.st_dev
+                and before.st_ino == info.st_ino
+                and before.st_nlink == 2
+                and stat.S_ISREG(info.st_mode)
+                and info.st_uid == os.getuid()
+                and info.st_nlink == 1
+            ):
+                # The winning writer removed its temporary hard link between
+                # the first validation and this metadata refresh.
+                continue
             if info.st_nlink != 2 or info.st_uid != os.getuid() or time.monotonic() >= deadline:
                 raise
             # Recover a writer lost after link publication but before temp cleanup.

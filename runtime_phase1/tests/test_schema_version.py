@@ -146,6 +146,26 @@ def test_failed_store_migration_rolls_back_ledger_and_retries_safely(tmp_path, m
     ) == 8
 
 
+def test_runtime_store_reopens_legacy_workspace_gc_tombstones(tmp_path) -> None:
+    db_path = tmp_path / "legacy-workspace-gc.sqlite3"
+    Store(str(db_path))
+    with sqlite3.connect(db_path) as connection:
+        for column in ("state_dir", "workspace_dir", "workspace_root"):
+            connection.execute(
+                f"ALTER TABLE workspace_gc_tombstones DROP COLUMN {column}"
+            )
+
+    Store(str(db_path))
+    with sqlite3.connect(db_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(workspace_gc_tombstones)"
+            ).fetchall()
+        }
+    assert {"state_dir", "workspace_dir", "workspace_root"} <= columns
+
+
 @pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX permission contract")
 @pytest.mark.parametrize("factory", [Store, ControlPlaneStore])
 def test_split_service_state_permissions_are_group_accessible(tmp_path, monkeypatch, factory) -> None:
@@ -373,9 +393,15 @@ def test_parallel_schema_replaces_stale_callback_trace_triggers(tmp_path) -> Non
             payload_json="{}",
         )
 
-    # Legacy shape reproduced: the pre-run lifecycle callback trips the trace fence.
-    with pytest.raises(sqlite3.IntegrityError):
-        runless_callback(store, "cb-legacy")
+    # The idempotent insert now ignores the stale trigger's NULL trace row, but
+    # ordinary delivery bookkeeping still reproduces the legacy failure.
+    runless_callback(store, "cb-legacy")
+    with pytest.raises(sqlite3.IntegrityError), store._connect() as conn:
+        conn.execute(
+            "UPDATE callback_outbox SET attempts = attempts + 1 "
+            "WHERE callback_id = ?",
+            ("cb-legacy",),
+        )
 
     reopened = Store(str(db_path))
     with reopened._connect() as conn:
